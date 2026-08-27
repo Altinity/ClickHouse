@@ -24,6 +24,13 @@ The manifest file produced by the commit contains a summary field `clickhouse.ex
 
 The Iceberg manifest files contain statistics about the data. Exporting a merge tree partition is a non ephemeral long running task, in which nodes can be turned off and turned on. This means the stats of individual files need to be persisted somewhere in order to produce the final manifest. This is implemented through sidecars. Each data file exported will contain a "sibling" sidecar file named `<data_file_name>_clickhouse_export_part_sidecar.avro`. ClickHouse does not clean up these files, and they can be safely deleted once the data is comitted.
 
+#### Source partition key compatibility
+
+The source partition must not be split in the destination. This is validated at schedule time through two mechanisms:
+
+1. Structural match: in case the source and destination are identical, the destination expression is a subset of the source expression or the destination expression can be entirely computed using only constants and the exact values guaranteed (pinned) by the source.
+2. Dynamic proof: the destination expression is monotonic over the source partition min/max range.
+
 ### On plain object storage exports:
 
 Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<partition_id>_<transaction_id>`.
@@ -42,6 +49,14 @@ TO TABLE [destination_database.]destination_table
 - **`table_name`**: The source Replicated*MergeTree table containing the partition to export
 - **`partition_id`**: The partition identifier to export (e.g., `'2020'`, `'2021'`)
 - **`destination_table`**: The target table for the export (typically an S3, Azure, or other object storage table)
+
+## Requirements
+
+`EXPORT PARTITION` exports each part via the same mechanism as [`EXPORT PART`](/docs/en/antalya/part_export.md#requirements), so the source and destination tables must satisfy the same compatibility requirements. Column names may differ (columns are matched by position, not by name), and column types may differ as long as they are safely castable (or `export_merge_tree_part_allow_lossy_cast = 1` is set). Beyond that, the following requirements apply:
+
+1. **Column count** - source and destination must have the same number of columns by default. Set `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'` to allow a source table with extra trailing columns; the destination having more columns than the source is still rejected in this mode.
+2. **`PARTITION BY` expressions** - the whole source partition must land in a single destination partition. Identical expressions always satisfy this; otherwise the destination expression has to be computable from the values the source partition key pins, or be proven single-valued over the partition's min/max range. The same requirement applies to the partition fields and transforms of an Apache Iceberg destination. See [Source partition key compatibility](#source-partition-key-compatibility).
+3. **Partition key column positions and layouts** - every top-level column that provides a column or subcolumn used by the source table's partition key must have the same name at the same position in the destination table's schema. Named `Tuple` elements within such a column must also be declared in the same order, including tuples nested inside `Array` or `Map`. This applies even if both tables' `PARTITION BY` expressions are textually identical. See [`EXPORT PART` requirements](/docs/en/antalya/part_export.md#requirements) for a worked example and the corresponding exception message.
 
 ## Settings
 
@@ -119,6 +134,16 @@ Notes:
   When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use. This keeps the Iceberg metadata consistent with the data files.
 
   **Warning:** A lossy cast on a partition column remains semantically truncating. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into a destination `Int32` partition column, both the data files and the Iceberg metadata will contain the truncated `Int32` value (they agree with each other, but the original `Int64` value is lost). Such casts require `export_merge_tree_part_allow_lossy_cast = 1`.
+
+### `export_merge_tree_part_schema_mismatch_mode` (Optional)
+
+- **Type**: `MergeTreePartExportSchemaMismatchMode`
+- **Default**: `strict`
+- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` allows a column-count mismatch between the source `MergeTree` table and the destination table. Columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Possible values:
+  - `strict` - the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+  - `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
+
+  The extra trailing source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
 
 ## Examples
 
@@ -251,5 +276,4 @@ WHERE source_table = 'rmt_table' AND destination_table = 's3_table';
 
 ## Related Features
 
-- [ALTER TABLE EXPORT PART](/docs/en/engines/table-engines/mergetree-family/part_export.md) - Export individual parts (non-replicated)
-
+- [ALTER TABLE EXPORT PART](/docs/en/antalya/part_export.md) - Export individual parts (non-replicated)
