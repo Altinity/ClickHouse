@@ -21,13 +21,13 @@ ${CLICKHOUSE_CLIENT} -q "
            output_format_parquet_write_page_index = 1"
 
 run() {
-  local tag=$1 align=$2
+  local tag=$1 align=$2 extra_settings=${3:-}
   ${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR FILESYSTEM CACHE 'cache_for_readbigat'"
   ${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_${tag}" -q "
     SELECT sum(k), sum(c31) FROM s3(s3_conn, filename = '${FILE}', format = 'Parquet')
     SETTINGS enable_filesystem_cache = 1, filesystem_cache_name = 'cache_for_readbigat',
              filesystem_cache_boundary_alignment = ${align}, remote_read_min_bytes_for_seek = 65536,
-             use_parquet_metadata_cache = 0, max_threads = 4"
+             use_parquet_metadata_cache = 0, max_threads = 4${extra_settings}"
 }
 
 echo "-- results identical"
@@ -37,13 +37,18 @@ echo "-- results identical"
 # happens without a smart per-query override" baseline, pass it explicitly.
 run default 1048576
 run small 65536
+# Same (loose) 1 MiB alignment as `default`, but with background download of the segments'
+# leftover ranges disabled per query: the only difference from `default` is the background-download
+# flag, so any drop in `FilesystemCacheBackgroundDownloadQueuePush` is attributable to it.
+run nobg 1048576 ", filesystem_cache_allow_background_download = 0"
 
 echo "-- with a 64 KiB alignment the cache downloads at most 2x what the reader asked for; with the cache default (1 MiB) it downloads far more"
 ${CLICKHOUSE_CLIENT} -q "
   SYSTEM FLUSH LOGS query_log;
   SELECT replaceOne(query_id, '${CLICKHOUSE_TEST_UNIQUE_NAME}_', '') tag,
          ProfileEvents['CachedReadBufferReadFromSourceBytes'] <= 2 * ProfileEvents['ParquetReadTaskBytes'] AS tight,
-         ProfileEvents['CachedReadBufferReadFromSourceBytes'] >= 4 * ProfileEvents['ParquetReadTaskBytes'] AS loose
+         ProfileEvents['CachedReadBufferReadFromSourceBytes'] >= 4 * ProfileEvents['ParquetReadTaskBytes'] AS loose,
+         ProfileEvents['FilesystemCacheBackgroundDownloadQueuePush'] = 0 AS no_bg
   FROM system.query_log
   WHERE event_date >= yesterday() AND event_time >= now() - 600 AND type = 'QueryFinish'
     AND current_database = currentDatabase() AND query_id LIKE '${CLICKHOUSE_TEST_UNIQUE_NAME}_%'

@@ -201,6 +201,7 @@ bool CachedOnDiskReadBufferFromFile::nextFileSegmentsBatch()
             size,
             info.cache_settings.segments_batch_size,
             origin.user_id);
+        info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
     }
     else
     {
@@ -216,6 +217,7 @@ bool CachedOnDiskReadBufferFromFile::nextFileSegmentsBatch()
             info.cache_settings.segments_batch_size,
             origin,
             info.cache_settings.boundary_alignment);
+        info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
     }
 
     return !info.file_segments->empty();
@@ -1546,6 +1548,7 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
             /* size */n,
             /* batch_size */0,
             origin.user_id);
+        current_info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
     }
     else
     {
@@ -1563,6 +1566,7 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
             /* batch_size */0,
             origin,
             info.cache_settings.boundary_alignment);
+        current_info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
     }
 
     if (current_info.file_segments->empty())
