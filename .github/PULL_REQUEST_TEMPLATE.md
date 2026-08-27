@@ -1,11 +1,3 @@
-<!--
-Linked issues and pull requests. Use full GitHub URLs, one relationship per line; delete the lines you don't need.
-
-Closes: https://github.com/ClickHouse/ClickHouse/issues/NNNNN   (auto-closes the issue when this PR is merged into the default branch)
-Related: https://github.com/ClickHouse/ClickHouse/pull/NNNNN
--->
-
-
 ### Changelog category (leave one):
 - New Feature
 - Experimental Feature
@@ -34,10 +26,10 @@ Related: https://github.com/ClickHouse/ClickHouse/pull/NNNNN
 - [ ] <!---ci_exclude_stateful--> Stateful tests
 - [ ] <!---ci_exclude_performance--> Performance tests
 - [x] <!---ci_exclude_aarch64|arm-->  Aarch64 tests
-- [x] <!---ci_exclude_asan--> All with ASAN
+- [ ] <!---ci_exclude_asan--> All with ASAN
 - [x] <!---ci_exclude_tsan--> All with TSAN
 - [x] <!---ci_exclude_msan--> All with MSAN
-- [x] <!---ci_exclude_ubsan--> All with UBSAN
+- [ ] <!---ci_exclude_ubsan--> All with UBSAN
 - [x] <!---ci_exclude_coverage--> All with Coverage
 - [ ] <!---ci_exclude_regression--> All Regression
 - [ ] <!---no_ci_cache--> Disable CI Cache
@@ -47,6 +39,7 @@ Related: https://github.com/ClickHouse/ClickHouse/pull/NNNNN
 - [ ] <!---ci_regression_aggregate_functions--> Aggregate Functions (2h)
 - [ ] <!---ci_regression_alter--> Alter (1.5h)
 - [ ] <!---ci_regression_benchmark--> Benchmark (30m)
+- [ ] <!---ci_regression_cas--> CAS (content-addressed storage; Antalya only)
 - [ ] <!---ci_regression_clickhouse_keeper--> ClickHouse Keeper (1h)
 - [x] <!---ci_regression_iceberg--> Iceberg (2h)
 - [ ] <!---ci_regression_ldap--> LDAP (1h)

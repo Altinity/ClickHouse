@@ -110,6 +110,7 @@ class MMappedFileCache;
 class UncompressedCache;
 class IcebergMetadataFilesCache;
 class ParquetMetadataCache;
+class PuffinFilesCache;
 class VectorSimilarityIndexCache;
 class TextIndexTokensCache;
 class TextIndexHeaderCache;
@@ -129,6 +130,8 @@ class QueryMetricLog;
 class QueryThreadLog;
 class QueryViewsLog;
 class PartLog;
+class ContentAddressedGarbageCollectionLog;
+class ContentAddressedLog;
 class BackgroundSchedulePoolLog;
 class TextLog;
 class TraceLog;
@@ -1514,6 +1517,11 @@ public:
     void clearParquetMetadataCache() const;
 #endif
 
+    void setPuffinFilesCache(const String & cache_policy, size_t max_size_in_bytes, size_t max_entries, double size_ratio);
+    void updatePuffinFilesCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size);
+    std::shared_ptr<PuffinFilesCache> getPuffinFilesCache() const;
+    void clearPuffinFilesCache() const;
+
     void setAllowedDisksForTableEngines(std::unordered_set<String> && allowed_disks_) { allowed_disks = std::move(allowed_disks_); }
     const std::unordered_set<String> & getAllowedDisksForTableEngines() const { return allowed_disks; }
 
@@ -1627,6 +1635,8 @@ public:
     /// Returns an object used to log operations with parts if it possible.
     /// Provide table name to make required checks.
     std::shared_ptr<PartLog> getPartLog() const;
+    std::shared_ptr<ContentAddressedGarbageCollectionLog> getContentAddressedGarbageCollectionLog() const;
+    std::shared_ptr<ContentAddressedLog> getContentAddressedLog() const;
 
     std::shared_ptr<BackgroundSchedulePoolLog> getBackgroundSchedulePoolLog() const;
 

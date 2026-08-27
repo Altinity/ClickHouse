@@ -45,6 +45,7 @@ public:
         CLEAR_COMPILED_EXPRESSION_CACHE,
         CLEAR_ICEBERG_METADATA_CACHE,
         CLEAR_PARQUET_METADATA_CACHE,
+        CLEAR_PUFFIN_FILES_CACHE,
         CLEAR_FILESYSTEM_CACHE,
         CLEAR_DISTRIBUTED_CACHE,
         CLEAR_DISK_METADATA_CACHE,
@@ -150,6 +151,13 @@ public:
         INSTRUMENT_ADD,
         INSTRUMENT_REMOVE,
         RESET_DDL_WORKER,
+        CAS_GC_RUN,
+        CAS_GC_REBUILD,
+        CAS_DROP_POOL_MEMBER,
+        CAS_FSCK,
+        CAS_FORGET,
+        CAS_GC_STOP,
+        CAS_GC_START,
         END
     };
 
@@ -180,6 +188,9 @@ public:
     String storage_policy;
     String volume;
     String disk;
+    /// SYSTEM CAS GC REBUILD FORCE [<disk>] — the raw baseline-rebuild disaster
+    /// recovery command's optional FORCE keyword (bypass the "healthy state" refusal).
+    bool cas_gc_rebuild_force = false;
     UInt64 seconds{};
     UInt64 untracked_memory_size{};
 
