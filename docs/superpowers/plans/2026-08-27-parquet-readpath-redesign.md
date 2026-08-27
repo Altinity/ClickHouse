@@ -10,9 +10,9 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-27-parquet-readpath-redesign.md`
 
-## Amendments (2026-08-27, after the vig-test measurements — see spec Appendix A)
+## Amendments (2026-08-27/28)
 
-Tasks 1–3 (Phase 1) stand. Tasks 4–9 are superseded by spec §4.2 (planner covers index stages; bytes-in-flight target fitted from measured bandwidth × RTT; source-aware coalescing cost model), §4.2b (cross-file metadata prefetch), §4.2c (cache cooperation A–E) and the demotion of Phase 3; they will be re-cut into new tasks once Phase 1 is complete and reviewed. Until then treat Tasks 4–9 as design notes, not as executable steps. Execution order after Phase 1: 2c-A/B (legacy-path cache fixes, Antalya-only) → Phase 2 (planner against the `ReadTarget` seam) → 2b → upstream `ReaderExecutor` alignment (spec §4.2c) → Phase 3. Former 2c-C/D/E are dropped in favour of the upstream executor.
+Re-cut after the vig-test measurements (spec Appendix A) and the upstream `ReaderExecutor` review (spec §4.2c). Tasks 1–3 (Phase 1) stand. Tasks 4–6 are the patch-up for the legacy cache path and an interim coalescing rule; Tasks 7–10 are Phase 2 (pools, honest cap, read stats, issue controller); Task 11 validates on vig-test and force-pushes the branch to Altinity PR #2275 (user-authorized). Former Phase 3 tasks are kept under "Deferred" and are not executed.
 
 ## Global Constraints
 
@@ -426,9 +426,338 @@ git commit -s -m "Parquet: test that decoding starts on a coalesced read before 
 
 ---
 
-## Phase 2 — Lifetime pools and the issue queue in `ReadManager`
+## Patch-up — legacy cache path and interim coalescing (Phase 2c-A/B + interim)
 
-### Task 4: Replace per-stage memory usage with three pools
+These land first after Phase 1 and are what the Antalya 26.6 legacy read path runs; see spec §4.2c.
+
+### Task 4: `readBigAt` honours the per-query cache boundary alignment (2c-A)
+
+**Files:**
+- Modify: `src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp:1551-1561` (the `getOrSet` call inside `readBigAt`)
+- Test: `tests/queries/0_stateless/<N>_parquet_cache_readbigat_alignment.sh` via `./tests/queries/0_stateless/add-test parquet_cache_readbigat_alignment.sh`
+
+**Interfaces:**
+- Consumes: `FileCache::getOrSet(key, offset, size, file_size, settings, file_segments_limit, origin, std::optional<size_t> boundary_alignment_)` (`src/Interpreters/FileCache/FileCache.h:145-153`); `info.cache_settings.boundary_alignment` (`std::optional<size_t>`, from the query setting `filesystem_cache_boundary_alignment`, `StorageObjectStorageSource.cpp:1459`).
+- Produces: random-access reads create/lookup file segments aligned to the query's alignment, as sequential reads already do (`CachedOnDiskReadBufferFromFile.cpp:210-218`).
+
+Why: a `readBigAt` for 50 KiB in the middle of a 4 MiB-aligned segment must download from the segment's committed frontier (its start) up to the requested end before it can serve — ~2 MB per GET measured for 50 KiB requests (spec Appendix A). The sequential path passes the per-query alignment; the random-access path does not.
+
+- [ ] **Step 1: Write the failing test**
+
+```bash
+#!/usr/bin/env bash
+# Tags: no-fasttest, no-random-settings
+# - no-fasttest: needs S3 (s3_conn) and the `cache_for_readbigat` filesystem cache from storage_conf.xml
+# - no-random-settings: asserts on read byte counters
+
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+FILE="${CLICKHOUSE_TEST_UNIQUE_NAME}_align.parquet"
+# 64 columns x 200k rows, uncompressed, small pages: each row group is ~50 MB with 64 column chunks,
+# so reading 2 columns touches two ~800 KB chunks per row group that sit far apart in the file.
+${CLICKHOUSE_CLIENT} -q "
+  INSERT INTO FUNCTION s3(s3_conn, filename = '${FILE}', format = 'Parquet')
+  SELECT number AS k, $(for i in $(seq 1 62); do echo -n "number * $i AS c$i, "; done) toString(number) AS s
+  FROM numbers(200000)
+  SETTINGS s3_truncate_on_insert = 1, output_format_parquet_row_group_size = 100000,
+           output_format_parquet_compression_method = 'none', output_format_parquet_data_page_size = 65536,
+           output_format_parquet_write_page_index = 1"
+
+run() {
+  local tag=$1 align=$2
+  ${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR FILESYSTEM CACHE 'cache_for_readbigat'"
+  ${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_${tag}" -q "
+    SELECT sum(k), sum(c31) FROM s3(s3_conn, filename = '${FILE}', format = 'Parquet')
+    SETTINGS enable_filesystem_cache = 1, filesystem_cache_name = 'cache_for_readbigat',
+             filesystem_cache_boundary_alignment = ${align}, remote_read_min_bytes_for_seek = 65536,
+             use_parquet_metadata_cache = 0, max_threads = 4"
+}
+
+echo "-- results identical"
+run default 0
+run small 65536
+
+echo "-- with a 64 KiB alignment the cache downloads at most 2x what the reader asked for; with the cache default (1 MiB) it downloads far more"
+${CLICKHOUSE_CLIENT} -q "
+  SYSTEM FLUSH LOGS query_log;
+  SELECT replaceOne(query_id, '${CLICKHOUSE_TEST_UNIQUE_NAME}_', '') tag,
+         ProfileEvents['CachedReadBufferReadFromSourceBytes'] <= 2 * ProfileEvents['ParquetReadTaskBytes'] AS tight,
+         ProfileEvents['CachedReadBufferReadFromSourceBytes'] >= 4 * ProfileEvents['ParquetReadTaskBytes'] AS loose
+  FROM system.query_log
+  WHERE event_date >= yesterday() AND event_time >= now() - 600 AND type = 'QueryFinish'
+    AND current_database = currentDatabase() AND query_id LIKE '${CLICKHOUSE_TEST_UNIQUE_NAME}_%'
+  ORDER BY tag"
+```
+
+Reference:
+
+```
+-- results identical
+19999900000	619996900000
+19999900000	619996900000
+-- with a 64 KiB alignment the cache downloads at most 2x what the reader asked for; with the cache default (1 MiB) it downloads far more
+default	0	1
+small	1	0
+```
+
+(`cache_for_readbigat` has `boundary_alignment` 1 MiB in `tests/config/config.d/storage_conf.xml:173-178`. Sum of `c31` = 31 × 19999900000 = 619996900000.)
+
+- [ ] **Step 2: Run it to verify it fails**
+
+`./tests/clickhouse-test <N>_parquet_cache_readbigat_alignment > build/test_task4_red.log 2>&1`. Expected: FAIL — the `small` row shows `0 1` because the alignment is ignored.
+
+- [ ] **Step 3: Implement**
+
+In `readBigAt`, replace the `getOrSet` call:
+
+```cpp
+        CreateFileSegmentSettings create_settings(FileSegmentKind::Regular);
+        /// Random-access reads must honour the per-query alignment like the sequential path does
+        /// (nextFileSegmentsBatch): a small read in the middle of a large aligned segment has to
+        /// download from the segment's committed frontier up to the requested end before it can
+        /// be served, so the alignment is the read amplification for small ranges.
+        current_info.file_segments = cache->getOrSet(
+            info.cache_key,
+            /* offset */range_begin,
+            /* size */n,
+            file_size.value(),
+            create_settings,
+            /* batch_size */0,
+            origin,
+            info.cache_settings.boundary_alignment);
+```
+
+`batch_size` stays 0: `readBigAt` loops over exactly the segments it holds, so a batch limit would truncate the read.
+
+- [ ] **Step 4: Build, run test to verify it passes**
+
+`ninja clickhouse > build/build_task4.log 2>&1` (foreground, `timeout: 600000`; re-run if cut off); then `./tests/clickhouse-test <N>_parquet_cache_readbigat_alignment 03988_cached_read_big_at > build/test_task4.log 2>&1`. Expected: `OK`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp tests/queries/0_stateless/<N>_parquet_cache_readbigat_alignment.*
+git commit -s -m "Filesystem cache: honour the per-query boundary alignment on the readBigAt path"
+```
+
+### Task 5: `FileSegmentsHolder` honours `filesystem_cache_allow_background_download` (2c-B)
+
+**Files:**
+- Modify: `src/Interpreters/FileCache/FileSegment.h:323-362` (struct `FileSegmentsHolder`), `src/Interpreters/FileCache/FileSegment.cpp:1300-1325` (`reset`)
+- Modify: `src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp` — after every `info.file_segments = cache->get/getOrSet(...)` (`:198-218`) and `current_info.file_segments = ...` (`:1543-1561`)
+- Test: extend `<N>_parquet_cache_readbigat_alignment.sh` from Task 4 with a third run
+
+**Interfaces:**
+- Produces: `void FileSegmentsHolder::setAllowBackgroundDownload(bool)`; `reset` uses the stored flag instead of the hard-coded `true`.
+
+Why: `~FileSegmentsHolder` → `reset` → `completeAndPopFrontImpl(/*allow_background_download=*/true, …)` enqueues the rest of every partially read segment for background download regardless of the query setting; `readBigAt` holders are destroyed after every random read, so every 50 KiB read schedules up to a whole segment of background traffic. The existing comment in `reset` argues for `true` when another reader partially read the segment; keeping the default `true` and letting the reader opt out per query preserves that.
+
+- [ ] **Step 1: Extend the test (failing first)**
+
+Append to the test after the `small` run:
+
+```bash
+run nobg 65536
+```
+
+and change `run` to accept a third argument appended to `SETTINGS`: `run nobg 65536 ", filesystem_cache_allow_background_download = 0"`. Add to the readback query a column `ProfileEvents['FilesystemCacheBackgroundDownloadQueuePush'] = 0 AS no_bg`, and to the reference:
+
+```
+default	0	1	0
+nobg	1	0	1
+small	1	0	0
+```
+
+Run: expected FAIL (`nobg … 0` in the last column).
+
+- [ ] **Step 2: Implement**
+
+`FileSegment.h`, inside `FileSegmentsHolder`:
+
+```cpp
+    /// Whether segments left partially downloaded when this holder is destroyed may be queued for
+    /// background download. Defaults to true (see the comment in `reset`); a reader that knows its
+    /// reads are one-shot random accesses (`filesystem_cache_allow_background_download = 0`) opts out.
+    void setAllowBackgroundDownload(bool value) { allow_background_download_on_reset = value; }
+```
+
+and a private member `bool allow_background_download_on_reset = true;`. In `reset`:
+
+```cpp
+            file_segment_it = completeAndPopFrontImpl(allow_background_download_on_reset, /*force_shrink_to_downloaded_size=*/false);
+```
+
+(keep the existing comment, add one line: "`allow_background_download_on_reset` lets a reader opt out per query.")
+
+`CachedOnDiskReadBufferFromFile.cpp`: after each of the four holder assignments add
+
+```cpp
+    info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
+```
+
+(`current_info.file_segments->…` in `readBigAt`). Do not touch the two unread settings `filesystem_cache_enable_background_download_during_fetch` / `…_for_metadata_files_in_packed_storage`; note them in the report as dead.
+
+- [ ] **Step 3: Build, test, commit**
+
+`ninja clickhouse > build/build_task5.log 2>&1`; `./tests/clickhouse-test <N>_parquet_cache_readbigat_alignment 02240_filesystem_cache_bypass_cache_threshold 03988_cached_read_big_at > build/test_task5.log 2>&1` (the second exists on base; if not, run `./tests/clickhouse-test filesystem_cache > …` and report counts). Expected: all `OK`.
+
+```bash
+git add src/Interpreters/FileCache/FileSegment.h src/Interpreters/FileCache/FileSegment.cpp src/Disks/IO/CachedOnDiskReadBufferFromFile.cpp tests/queries/0_stateless/<N>_parquet_cache_readbigat_alignment.*
+git commit -s -m "Filesystem cache: let a reader opt out of background download of partially read segments"
+```
+
+### Task 6: Interim coalescing rule — amplification cap and a 2 MiB remote gap
+
+**Files:**
+- Modify: `src/Processors/Formats/Impl/Parquet/Prefetcher.h` (private members), `src/Processors/Formats/Impl/Parquet/Prefetcher.cpp` (`init` ~line 30, `pickRangesAndCreateTaskIfNotExists` ~lines 303-372)
+- Modify: `src/Processors/Formats/Impl/Parquet/ReadCommon.h` (`struct ReadOptions`: add `coalesce_gap_bytes`, `max_read_amplification`), `src/Processors/Formats/Impl/ParquetV3BlockInputFormat.cpp:57-62` (fill them)
+- Settings (four files per Global Constraints): `input_format_parquet_coalesce_gap_bytes` (UInt64, default `2097152`), `input_format_parquet_max_read_amplification` (Double, default `4`)
+- Test: `tests/queries/0_stateless/<N>_parquet_read_amplification.sh`
+
+**Interfaces:**
+- Produces: `ReadOptions::coalesce_gap_bytes`, `ReadOptions::max_read_amplification`; `Prefetcher::gap_bytes` (= `min(min_bytes_for_seek, coalesce_gap_bytes)`, or `min_bytes_for_seek` when the setting is 0).
+
+Why (spec §1.7, Appendix A): on S3 the cold optimum gap is ≈ bandwidth × RTT ≈ 2 MiB (4 MiB over-reads ~40% for no time gain); on a warm cache one 640-byte column bridged gaps into 3.5 MiB reads per row group (70× amplification). The cap bounds `task span / useful bytes` so a tiny column can never drag megabytes; the gap default trims the S3 case. Both are interim until the storage layer's cost model takes over (spec §4.2c).
+
+- [ ] **Step 1: Settings**
+
+```cpp
+    DECLARE(UInt64, input_format_parquet_coalesce_gap_bytes, 2097152, R"(
+Largest gap between two needed byte ranges of a Parquet file that the reader reads through in order to
+serve both with one request. Applied on top of the storage's min-bytes-for-seek (the smaller wins);
+`0` uses the storage value only. On object storage the useful gap is about one round trip's worth of
+bandwidth, ~2 MiB; reading through larger gaps costs bytes without saving time.
+)", 0) \
+    DECLARE(Double, input_format_parquet_max_read_amplification, 4, R"(
+Upper bound on `bytes read / bytes needed` for one coalesced Parquet read. Coalescing stops extending a
+read when the span would exceed this multiple of the useful bytes it covers, so a few small column chunks
+cannot drag megabytes of unrelated data through the cache or the network. `0` disables the bound.
+)", 0) \
+```
+
+`FormatSettings.h`: `size_t coalesce_gap_bytes = 2097152; double max_read_amplification = 4;`. `FormatFactory.cpp`: copy both. `SettingsChangesHistory.cpp` (Antalya block): `{"input_format_parquet_coalesce_gap_bytes", 0, 2097152, "New setting: cap on the gap the Parquet reader reads through when coalescing nearby ranges; previously the storage's min-bytes-for-seek (4 MiB on object storage) applied unconditionally."}`, `{"input_format_parquet_max_read_amplification", 0, 4, "New setting: bound on bytes read / bytes needed per coalesced Parquet read."}`.
+
+`ReadCommon.h` `struct ReadOptions`: add `size_t coalesce_gap_bytes = 0; double max_read_amplification = 0;`. `ParquetV3BlockInputFormat.cpp` after `read_options.bytes_per_read_task = …`:
+
+```cpp
+    read_options.coalesce_gap_bytes = format_settings.parquet.coalesce_gap_bytes;
+    read_options.max_read_amplification = format_settings.parquet.max_read_amplification;
+```
+
+- [ ] **Step 2: Prefetcher**
+
+`Prefetcher.h` private: `size_t gap_bytes{}; double max_read_amplification = 0;`. In `Prefetcher::init` after `bytes_per_read_task = options.bytes_per_read_task;`:
+
+```cpp
+    gap_bytes = options.coalesce_gap_bytes ? std::min(min_bytes_for_seek, options.coalesce_gap_bytes) : min_bytes_for_seek;
+    max_read_amplification = options.max_read_amplification;
+```
+
+In `pickRangesAndCreateTaskIfNotExists`, both loops: replace `min_bytes_for_seek` in the gap tests with `gap_bytes`, and add the amplification test. Left loop condition becomes:
+
+```cpp
+        if (r.end + gap_bytes <= start_offset || // gap too long to read through
+            r.start + bytes_per_read_task <= initial_offset || // task not too big
+            exceedsAmplification(std::max(end_offset, r.end) - std::min(start_offset, r.start), total_length_of_covered_ranges + r.length()) ||
+            !r.request->allow_incidental_read.load(std::memory_order_relaxed)) // range wants to be coalesced
+            break;
+```
+
+right loop:
+
+```cpp
+        if (end_offset + gap_bytes <= r.start ||
+            initial_offset + bytes_per_read_task <= r.end ||
+            exceedsAmplification(std::max(end_offset, r.end) - std::min(start_offset, r.start), total_length_of_covered_ranges + r.length()) ||
+            !r.request->allow_incidental_read.load(std::memory_order_relaxed))
+            break;
+```
+
+with a private helper:
+
+```cpp
+    /// True if a task spanning `span` bytes to serve `useful` bytes would exceed max_read_amplification.
+    bool exceedsAmplification(size_t span, size_t useful) const
+    {
+        return max_read_amplification > 0 && static_cast<double>(span) > max_read_amplification * static_cast<double>(useful);
+    }
+```
+
+Note `splitRange`'s "request already short" check (`range.length() < min_bytes_for_seek`, `Prefetcher.cpp:261`) keeps `min_bytes_for_seek` — it is about whether splitting is worth it, not about gaps.
+
+- [ ] **Step 3: Test**
+
+```bash
+#!/usr/bin/env bash
+# Tags: no-fasttest, no-random-settings
+
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+USER_FILES_PATH=$(${CLICKHOUSE_CLIENT} -q "SELECT value FROM system.server_settings WHERE name = 'user_files_path'" | sed 's|/$||')
+WORKING_DIR="${USER_FILES_PATH}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
+mkdir -p "${WORKING_DIR}"
+F="${WORKING_DIR}/amp.parquet"
+
+# 64 columns; we read k and c31 only, so useful bytes per row group are ~2 chunks of ~800 KB out of ~50 MB.
+${CLICKHOUSE_CLIENT} -q "
+  INSERT INTO FUNCTION file('${F}', Parquet)
+  SELECT number AS k, $(for i in $(seq 1 62); do echo -n "number * $i AS c$i, "; done) toString(number) AS s
+  FROM numbers(200000)
+  SETTINGS engine_file_truncate_on_insert = 1, output_format_parquet_row_group_size = 100000,
+           output_format_parquet_compression_method = 'none', output_format_parquet_data_page_size = 65536"
+
+Q="SELECT sum(k), sum(c31) FROM file('${F}', Parquet)"
+# Force the local path to behave like object storage: a 4 MiB seek threshold and 16 MiB tasks.
+BASE="input_format_parquet_local_file_min_bytes_for_seek = 4194304, input_format_parquet_bytes_per_read_task = 16777216, max_threads = 2"
+
+echo "-- results identical"
+${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_uncapped" -q "${Q} SETTINGS ${BASE}, input_format_parquet_max_read_amplification = 0, input_format_parquet_coalesce_gap_bytes = 0"
+${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_capped" -q "${Q} SETTINGS ${BASE}, input_format_parquet_max_read_amplification = 4, input_format_parquet_coalesce_gap_bytes = 0"
+${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_gap" -q "${Q} SETTINGS ${BASE}, input_format_parquet_max_read_amplification = 0, input_format_parquet_coalesce_gap_bytes = 65536"
+
+echo "-- the cap and the gap each cut bytes read by more than 2x versus uncapped"
+${CLICKHOUSE_CLIENT} -q "
+  SYSTEM FLUSH LOGS query_log;
+  WITH (SELECT ProfileEvents['ParquetReadTaskBytes'] FROM system.query_log WHERE event_date >= yesterday() AND type = 'QueryFinish' AND current_database = currentDatabase() AND query_id = '${CLICKHOUSE_TEST_UNIQUE_NAME}_uncapped') AS uncapped
+  SELECT replaceOne(query_id, '${CLICKHOUSE_TEST_UNIQUE_NAME}_', ''), ProfileEvents['ParquetReadTaskBytes'] * 2 < uncapped
+  FROM system.query_log
+  WHERE event_date >= yesterday() AND event_time >= now() - 600 AND type = 'QueryFinish' AND current_database = currentDatabase()
+    AND query_id IN ('${CLICKHOUSE_TEST_UNIQUE_NAME}_capped', '${CLICKHOUSE_TEST_UNIQUE_NAME}_gap')
+  ORDER BY 1"
+
+rm -rf "${WORKING_DIR}"
+```
+
+Reference:
+
+```
+-- results identical
+19999900000	619996900000
+19999900000	619996900000
+19999900000	619996900000
+-- the cap and the gap each cut bytes read by more than 2x versus uncapped
+capped	1
+gap	1
+```
+
+Run red first (expect the `capped`/`gap` rows `0` before the change — the settings don't exist yet, so the red run errors with unknown setting; record that), then build, then green.
+
+- [ ] **Step 4: Build, run `<N>_parquet_read_amplification` plus `03723_parquet_prefetcher_read_big_at` and the Phase 1 tests, commit**
+
+```bash
+git add src/Core/FormatFactorySettings.h src/Formats/FormatSettings.h src/Formats/FormatFactory.cpp src/Core/SettingsChangesHistory.cpp src/Processors/Formats/Impl/Parquet/ReadCommon.h src/Processors/Formats/Impl/Parquet/Prefetcher.h src/Processors/Formats/Impl/Parquet/Prefetcher.cpp src/Processors/Formats/Impl/ParquetV3BlockInputFormat.cpp tests/queries/0_stateless/<N>_parquet_read_amplification.*
+git commit -s -m "Parquet: bound read amplification and cap the coalescing gap at 2 MiB on remote storage"
+```
+
+---
+
+## Phase 2 — Lifetime pools, honest cap, and the issue controller
+
+### Task 7: Replace per-stage memory usage with three pools
 
 **Files:**
 - Modify: `src/Processors/Formats/Impl/Parquet/ReadCommon.h` (`ReadStage` enum ~line 82; `MemoryUsageDiff` ~line 112; `SharedResourcesExt` ~line 41)
@@ -555,7 +884,7 @@ handed to the query pipeline. Range `(0, 0.95)`.
 
 - [ ] **Step 5: Build, run the existing Parquet stateless suite**
 
-`ninja clickhouse > build/build_task4.log 2>&1`; then `./tests/clickhouse-test parquet > build/test_task4.log 2>&1` (substring match runs every parquet test). Expected: all `OK`.
+`ninja clickhouse > build/build_task7.log 2>&1`; then `./tests/clickhouse-test parquet > build/test_task7.log 2>&1` (substring match runs every parquet test). Expected: all `OK`.
 
 - [ ] **Step 6: Commit**
 
@@ -564,7 +893,7 @@ git add src/Processors/Formats/Impl/Parquet/ReadCommon.h src/Processors/Formats/
 git commit -s -m "Parquet: budget reader memory by lifetime (metadata / compressed / decoded) instead of by stage"
 ```
 
-### Task 5: Charge delivered chunks to the `Decoded` pool
+### Task 8: Charge delivered chunks to the `Decoded` pool
 
 **Files:**
 - Create: `src/Processors/Formats/Impl/Parquet/ChunkMemoryInfo.h`
@@ -683,235 +1012,79 @@ Before the change this query's `memory_usage` exceeds 2× the watermark (deliver
 
 - [ ] **Step 4: Build, run test, commit**
 
-`ninja clickhouse > build/build_task5.log 2>&1`; `./tests/clickhouse-test <N>_parquet_memory_cap_honest > build/test_task5.log 2>&1`. Expected: `OK`.
+`ninja clickhouse > build/build_task8.log 2>&1`; `./tests/clickhouse-test <N>_parquet_memory_cap_honest > build/test_task8.log 2>&1`. Expected: `OK`.
 
 ```bash
 git add src/Processors/Formats/Impl/Parquet/ChunkMemoryInfo.h src/Processors/Formats/Impl/Parquet/ReadManager.h src/Processors/Formats/Impl/Parquet/ReadManager.cpp tests/queries/0_stateless/<N>_parquet_memory_cap_honest.*
 git commit -s -m "Parquet: keep delivered chunks charged to the reader's memory budget until the pipeline drops them"
 ```
 
-### Task 6: Issue queue — plan all page reads of a row group at once
+### Task 9: `Prefetcher::ReadStats` — fitted bandwidth and round-trip time, bytes in flight
 
 **Files:**
-- Modify: `src/Processors/Formats/Impl/Parquet/Reader.h` (`struct RowSubgroup` add `std::atomic<bool> reads_issued {false}; std::atomic<bool> waiting_for_reads {false};`; add `struct PlannedRead`; declare `planPageReads`)
-- Modify: `src/Processors/Formats/Impl/Parquet/Reader.cpp` (add `planPageReads` after `determinePagesToPrefetch` ~line 1300)
-- Modify: `src/Processors/Formats/Impl/Parquet/ReadManager.h` (add `issue_queue`, `issue_mutex`, `pumpIssueQueue`)
-- Modify: `src/Processors/Formats/Impl/Parquet/ReadManager.cpp` (`addTasksToReadColumns` ~line 297; `finishRowSubgroupStage` ~line 372; `scheduleTask` ColumnDataPrefetch case ~line 740; `flushMemoryUsageDiff`)
-- Modify: `src/Processors/Formats/Impl/Parquet/ReadCommon.h` (remove `ReadStage::ColumnDataPrefetch`, update `poolOf`)
-- Modify: `src/Common/ProfileEvents.cpp` (`ParquetPlannedReads`, `ParquetIssueQueueStalls`)
+- Modify: `src/Processors/Formats/Impl/Parquet/Prefetcher.h` (public `struct ReadStats`, accessors), `src/Processors/Formats/Impl/Parquet/Prefetcher.cpp` (`runTask`, `publishBytesReady` from Task 2, `scheduleTask`)
+- Modify: `src/Common/ProfileEvents.cpp` (`ParquetReadFirstByteMicroseconds`, `ParquetReadTransferMicroseconds`)
 
 **Interfaces:**
 - Produces:
   ```cpp
-  struct Reader::PlannedRead
+  struct Prefetcher::ReadStats
   {
-      size_t row_group_idx;
-      size_t row_subgroup_idx;
-      size_t step_idx;
-      std::vector<PrefetchHandle *> handles;   // pages + dictionary + whole-chunk range as applicable
-      size_t bytes;                            // sum of handle lengths, for the budget check
+      /// EWMA (alpha 0.2) of time to the first progress callback (or completion) and of transfer
+      /// bandwidth after it, over tasks read from the source (cache-served tasks are excluded:
+      /// they complete in one shot with no first-byte gap).
+      double rtt_us = 50'000;            // prior: 50 ms
+      double bandwidth_bytes_per_us = 64; // prior: ~64 MB/s per stream
+      size_t samples = 0;
   };
-  /// Appends one PlannedRead per subgroup with rows_pass > 0 whose first_step_to_calculate == step_idx.
-  void Reader::planPageReads(RowGroup & row_group, size_t step_idx, std::vector<PlannedRead> & out);
-  void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff);
+  ReadStats Prefetcher::readStats() const;          // lock-free snapshot of atomics
+  size_t Prefetcher::bytesInFlight() const;         // sum of `length` of Scheduled/Running tasks
+  size_t Prefetcher::targetBytesInFlight(size_t concurrency) const; // bandwidth × rtt × concurrency × 2
   ```
-- Consumes: `Reader::determinePagesToPrefetch(ColumnChunk &, const RowSubgroup &, const RowGroup &, std::vector<PrefetchHandle *> &)` (cursor-based, existing).
+- Consumes: `Task::bytes_ready` and `publishBytesReady` (Task 2), `tasks_in_flight`-style accounting is new here (`bytes_in_flight` atomic, add in `scheduleTask`, subtract in `runTask` completion and in `decreaseTaskRefcount` when a `Scheduled` task is dropped — mirror the `tasks_in_flight` pattern from Altinity PR #2275 if you want a reference, but implement bytes, not counts).
 
-- [ ] **Step 1: `planPageReads`**
+- [ ] **Step 1:** add `std::atomic<size_t> bytes_in_flight{0}` and the stats atomics (`std::atomic<double>` not portable for fetch ops — store as `std::atomic<uint64_t>` micro-units and update under `ready_mutex`, which `publishBytesReady` already takes on notify; sampling once per task is cheap). In `runTask`: record `Stopwatch` at start; on the first `publishBytesReady` call for the task (bytes_ready went 0 → >0) record `first_byte_us`; at completion compute `transfer_us = total_us - first_byte_us` and update EWMAs when `task->cached_region` is not set and `read_mode == RandomRead`.
+- [ ] **Step 2:** `targetBytesInFlight(c) = size_t(bandwidth_bytes_per_us * rtt_us) * c * 2`, floored at `4 × bytes_per_read_task`.
+- [ ] **Step 3:** unit-free check via a stateless test is impractical; verify with `clickhouse local` on a local file that `bytesInFlight()` returns to 0 after a query (add `chassert(bytes_in_flight == 0)` in `~Prefetcher`), and that the two new profile events are non-zero on an S3 read in `03723_parquet_prefetcher_read_big_at` (add them to that test's SELECT? No — new test `<N>_parquet_read_stats.sql` on `s3_conn` asserting `ParquetReadFirstByteMicroseconds > 0`).
+- [ ] **Step 4:** build, run `03723`, `<N>_parquet_read_stats`, Phase 1 tests; commit `Parquet: measure per-read first-byte time and bandwidth in the prefetcher`.
 
-```cpp
-void Reader::planPageReads(RowGroup & row_group, size_t step_idx, std::vector<PlannedRead> & out)
-{
-    for (size_t sg = 0; sg < row_group.subgroups.size(); ++sg)
-    {
-        RowSubgroup & row_subgroup = row_group.subgroups[sg];
-        if (row_subgroup.filter.rows_pass == 0)
-            continue;
-        PlannedRead planned {.row_group_idx = row_group.row_group_idx_in_reader, .row_subgroup_idx = sg, .step_idx = step_idx};
-        for (size_t i = 0; i < primitive_columns.size(); ++i)
-        {
-            if (primitive_columns[i].first_step_to_calculate != step_idx)
-                continue;
-            ColumnChunk & column = row_group.columns.at(i);
-            determinePagesToPrefetch(column, row_subgroup, row_group, planned.handles);
-            if (!column.dictionary.isInitialized() && column.dictionary_page_prefetch)
-                planned.handles.push_back(&column.dictionary_page_prefetch);
-            if (column.data_pages.empty())
-                planned.handles.push_back(&column.data_pages_prefetch);
-        }
-        for (const PrefetchHandle * h : planned.handles)
-            if (*h)
-                planned.bytes += prefetcher.requestLength(*h);
-        ProfileEvents::increment(ProfileEvents::ParquetPlannedReads);
-        out.push_back(std::move(planned));
-    }
-}
-```
+### Task 10: Issue controller — pre-issue index and page reads for all row groups under a bytes-in-flight target
 
-Add `size_t Prefetcher::requestLength(const PrefetchHandle & h) const { return h.request->length; }` (public) and `size_t row_group_idx_in_reader` to `RowGroup` (set in `prefilterAndInitRowGroups` to the index in `row_groups`; `row_group_idx` is the index in the file). Handles pushed twice for the same subgroup (a page straddling subgroups is pushed by the earlier one only, because `determinePagesToPrefetch` advances the cursor) are fine: `startPrefetch` is idempotent.
+**Files:**
+- Modify: `src/Processors/Formats/Impl/Parquet/ReadManager.h` (`issue_queue`, `issue_mutex`, `pumpIssueQueue`, `enqueueRowGroupIndexReads`, `enqueueRowGroupPageReads`)
+- Modify: `src/Processors/Formats/Impl/Parquet/ReadManager.cpp` (`init` after row groups are initialised; `finishRowGroupStage` at the `OffsetIndex` transition; `flushMemoryUsageDiff`)
+- Modify: `src/Processors/Formats/Impl/Parquet/Reader.h/.cpp` (`planPageReads(RowGroup &, size_t step_idx, std::vector<PlannedRead> &)` as specified in the superseded Task 6 text of this plan's history — reproduce it here: for every subgroup with `rows_pass > 0`, call `determinePagesToPrefetch` for the step's columns and push dictionary/whole-chunk handles)
+- Settings: `input_format_parquet_min_bytes_in_flight` (UInt64, default `67108864`) — floor for the fitted target
+- Test: `tests/queries/0_stateless/<N>_parquet_issue_controller.sh`
 
-- [ ] **Step 2: The queue and the pump**
+**Design (spec §4.2, "Issue controller").** The stage machine is left intact. What changes is *when reads are started*: instead of each stage's `scheduleTask` calling `startPrefetch` for one row group at a time, a per-`ReadManager` FIFO holds `PlannedRead {stage, row_group_idx, row_subgroup_idx, handles, bytes}` in delivery order, and `pumpIssueQueue` starts them while `prefetcher.bytesInFlight() + planned.bytes ≤ max(prefetcher.targetBytesInFlight(io_threads), min_bytes_in_flight)` or the entry is privileged (`row_group_idx == first_incomplete_row_group`). `startPrefetch` is idempotent, so when a stage task later runs `scheduleTask` for the same handles, it finds them started and charges no memory twice (`if (!handle->memory)`).
 
-`ReadManager.h`:
+- On `init` (after `prefilterAndInitRowGroups`/`initializePrefetches`): for every row group in order, enqueue one `PlannedRead` per index stage with the handles `initializePrefetches` registered: `bloom_filter_header_prefetch`, then `column_index_prefetch`/`offset_index_prefetch` (stage `ColumnIndexAndOffsetIndex`), then `dictionary_page_prefetch` when `use_dictionary_filter`. Charged to the stage they belong to (`diff.cur_stage = stage` around `startPrefetch`), i.e. the `Metadata` pool from Task 7.
+- In `finishRowGroupStage` when the row group reaches `OffsetIndex` (subgroups exist): `reader.planPageReads(row_group, firstStep(), planned)` and enqueue, charged to `ColumnDataPrefetch` (`Compressed` pool). Later steps' pages are enqueued from `finishRowSubgroupStage`'s `OffsetIndex` case exactly as today via `scheduleTask`.
+- `pumpIssueQueue(diff)` is called at the end of `init`, after each enqueue, and from `flushMemoryUsageDiff` whenever a `Compressed` or `Metadata` deallocation is flushed (bytes in flight dropped).
+- Profile events: `ParquetPlannedReads`, `ParquetIssueQueueStalls`, `ParquetBytesInFlightTarget` (gauge-like: increment by the target once per pump; used only for diagnostics), added to `collectDeadlockDiagnostics` output with the queue length.
 
-```cpp
-    /// Data-page reads for every subgroup of a row group are planned at once (Reader::planPageReads)
-    /// and issued from here in delivery order while the Compressed pool has room. The subgroup at
-    /// (first_incomplete_row_group, read_ptr) is always issued so progress never depends on budget.
-    std::mutex issue_mutex;
-    std::deque<Reader::PlannedRead> issue_queue;
-    void pumpIssueQueue(MemoryUsageDiff & diff);
-```
+- [ ] **Step 1:** implement `planPageReads` and `PlannedRead` in `Reader`; `enqueue*`/`pumpIssueQueue` in `ReadManager`; wire the three call sites. Keep `scheduleTask`'s existing `startPrefetch` calls (they become no-ops for already-started handles).
+- [ ] **Step 2:** test — reuse the data generator from Task 6's test (many columns, 3 row groups, page index on, local file with `input_format_parquet_local_file_min_bytes_for_seek = 4194304`). Assert: results identical for `input_format_parquet_min_bytes_in_flight` in `4096`, `67108864`, `1073741824`, with and without a `WHERE` PREWHERE-able filter, `max_parsing_threads` 1 and default; `ParquetIssueQueueStalls > 0` at `4096` and `= 0` at `1 GiB`; `ParquetPlannedReads >= 3 × 2` (3 row groups × ≥2 stages).
+- [ ] **Step 3:** run the whole `parquet` stateless subset plus the Phase 1 and patch-up tests; run `03596_parquet_prewhere_page_skip_bug` and `02841_parquet_filter_pushdown` explicitly (PREWHERE drops whole subgroups).
+- [ ] **Step 4:** commit `Parquet: pre-issue index and page reads for all row groups under a bytes-in-flight target`.
 
-`ReadManager.cpp`:
+### Task 11: Validation on vig-test and hand-over to PR #2275
 
-```cpp
-void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
-{
-    const auto limits = poolLimits(MemoryPool::Compressed);
-    while (true)
-    {
-        Reader::PlannedRead planned;
-        {
-            std::lock_guard lock(issue_mutex);
-            if (issue_queue.empty())
-                return;
-            const auto & front = issue_queue.front();
-            const RowGroup & rg = reader.row_groups[front.row_group_idx];
-            const bool privileged = front.row_group_idx == first_incomplete_row_group.load()
-                && front.row_subgroup_idx == rg.read_ptr.load();
-            size_t in_use = size_t(std::max<ssize_t>(0, pool_usage[size_t(MemoryPool::Compressed)].load(std::memory_order_relaxed)))
-                + size_t(std::max<ssize_t>(0, diff.by_stage[size_t(ReadStage::ColumnData)]));
-            if (!privileged && in_use + front.bytes > limits.memory_high_watermark)
-            {
-                ProfileEvents::increment(ProfileEvents::ParquetIssueQueueStalls);
-                return;
-            }
-            planned = std::move(issue_queue.front());
-            issue_queue.pop_front();
-        }
+**Files:** none in-repo except the PR description. Scripts: `tmp/vig_cold/run.sh` family (arms are SQL `SETTINGS` clauses; caches dropped before each run).
 
-        /// Compressed bytes are charged to the ColumnData stage's diff slot but land in the Compressed
-        /// pool via poolOf. Tokens remember the stage, so release lands in the same pool.
-        const ReadStage saved = std::exchange(diff.cur_stage, ReadStage::ColumnData);
-        reader.prefetcher.startPrefetch(planned.handles, &diff);
-        diff.cur_stage = saved;
+- [ ] **Step 1: Build a release image or binary for the cluster** — coordinate with the user (the cluster is deployed from CI images `altinityinfra/clickhouse-server:<PR>-26.6.2.…altinityantalya`); pushing the branch to `parquet-v3-read-sizing` produces the image (Step 4), so run Step 4 first with the PR marked draft, then measure, then finalize the description.
+- [ ] **Step 2: Warm and true-cold runs**, 2 reps, all 23 queries, arms: base image (`0-26.6.2.…`) vs this branch at defaults. Record per query: wall, `ParquetReadTaskBytes`, `CachedReadBufferReadFromSourceBytes`, `ReadBufferFromS3Bytes`, GETs, `ParquetIssueQueueStalls`, in-flight (`ReadBufferFromS3Microseconds / wall`), `memory_usage`. Acceptance (spec §5, Appendix A): cold q4/q17/q20 in-flight ≥ 60 per node (from 25–29); warm q20 ≤ 1.5 s and cache-disk bytes ≤ 2 GB (from 4.5 s / 32 GB); no query slower than base by more than 5% on warm; `memory_usage` ≤ 1.25 × `input_format_parquet_memory_high_watermark` on the wide-file check from Task 8.
+- [ ] **Step 3: If acceptance fails**, stop and report the table — do not tune settings to pass.
+- [ ] **Step 4: Push** `git push --force-with-lease altinity parquet-reader-readpath-redesign:parquet-v3-read-sizing` (user-authorized force push; use `--force-with-lease`, never bare `--force`). Update the PR #2275 description from `.github/PULL_REQUEST_TEMPLATE.md`: what changed (Phase 1, patch-up, Phase 2), the measurement tables, `Performance Improvement` category, changelog entry naming every new setting and profile event, `Related:` links to #2266, #2235, upstream #102282 / #103706 / #115816, and the spec path.
 
-        RowSubgroup & row_subgroup = reader.row_groups[planned.row_group_idx].subgroups[planned.row_subgroup_idx];
-        row_subgroup.reads_issued.store(true, std::memory_order_release);
-        /// If admission got here first, it parked the subgroup; schedule its decode now.
-        if (row_subgroup.waiting_for_reads.exchange(false))
-            addTasksToReadColumns(planned.row_group_idx, planned.row_subgroup_idx, ReadStage::ColumnData, planned.step_idx, diff);
-    }
-}
-```
+## Deferred (not in this plan's execution)
 
-Since `poolOf(ReadStage::ColumnData)` must now return `Compressed` for prefetch tokens and `Decoded` for column tokens, charge column memory with `diff.cur_stage = ReadStage::Deliver` instead: change `poolOf` so `ColumnData → Compressed` and `Deliver → Decoded`, and in `scheduleTask`'s `ColumnData` case wrap the `MemoryUsageToken(column_memory, &diff)` creation in `std::exchange(diff.cur_stage, ReadStage::Deliver)` / restore. Remove the `chassert(d == 0)` for `Deliver` in `flushMemoryUsageDiff`. Remove `ReadStage::ColumnDataPrefetch` from the enum and every `switch`.
+### Phase 3 — Per-subgroup page cursor and parallel subgroup decode (deferred; spec §4.3)
 
-- [ ] **Step 3: Rewire admission**
+Kept as design notes. Not executed in this plan: no measured workload needs it (spec Appendix A).
 
-In `addTasksToReadColumns`, the `while (true)` loop: when `stage` falls through from `OffsetIndex` with no tasks, go to `ColumnData` (not `ColumnDataPrefetch`). Before pushing `ColumnData` tasks:
-
-```cpp
-        if (stage == ReadStage::ColumnData && !row_subgroup.reads_issued.load(std::memory_order_acquire))
-        {
-            /// Reads for this subgroup are still queued behind the Compressed budget. Park; the pump
-            /// schedules the decode when it issues them. Set the flag first, then re-check, so a pump
-            /// that issued in between sees the flag.
-            row_subgroup.waiting_for_reads.store(true, std::memory_order_release);
-            if (!row_subgroup.reads_issued.load(std::memory_order_acquire))
-                return;
-            if (!row_subgroup.waiting_for_reads.exchange(false))
-                return; // the pump took it
-        }
-```
-
-In `finishRowSubgroupStage`, `case ReadStage::OffsetIndex:` becomes: plan for this step, then admit decode:
-
-```cpp
-        case ReadStage::BloomFilterHeader:
-        case ReadStage::BloomFilterBlocksOrDictionary:
-        case ReadStage::ColumnIndexAndOffsetIndex:
-        case ReadStage::OffsetIndex:
-        {
-            /// Offset indexes for this step's columns are decoded; plan every subgroup's page reads for
-            /// the step once (the first subgroup to get here does it) and queue them.
-            bool expected = false;
-            if (row_group.steps_planned[step_idx].compare_exchange_strong(expected, true))
-            {
-                std::vector<Reader::PlannedRead> planned;
-                reader.planPageReads(row_group, step_idx, planned);
-                std::lock_guard lock(issue_mutex);
-                for (auto & p : planned)
-                    issue_queue.push_back(std::move(p));
-            }
-            pumpIssueQueue(diff);
-            addTasksToReadColumns(row_group_idx, row_subgroup_idx, ReadStage::ColumnData, step_idx, diff);
-            return;
-        }
-```
-
-Add `std::array<std::atomic<bool>, 8> steps_planned {};` to `RowGroup` (PREWHERE steps are few; `chassert(step_idx < 8)`). For steps > first step, planning for the whole row group at once uses each subgroup's *current* filter; subgroups that have not run the earlier step yet still have their page-index filter, which is a superset — acceptable over-read, same as today's per-subgroup planning would do for the first step. Reset `reads_issued`/`waiting_for_reads` to false when a subgroup moves to the next step (in `case ReadStage::ColumnData` after `applyPrewhere`).
-
-Call `pumpIssueQueue` also from `flushMemoryUsageDiff` when `d < 0` for a stage whose pool is `Compressed`.
-
-- [ ] **Step 4: Build; run the whole Parquet suite and the deadlock-prone tests under TSan if a TSan build exists**
-
-`ninja clickhouse > build/build_task6.log 2>&1`; `./tests/clickhouse-test parquet > build/test_task6.log 2>&1`. Expected: all `OK`. Watch `03596_parquet_prewhere_page_skip_bug` (PREWHERE drops entire subgroups) and `02841_parquet_filter_pushdown`.
-
-- [ ] **Step 5: Stateless test for the queue under a tiny compressed budget**
-
-Create via `add-test parquet_issue_queue_budget.sh`:
-
-```bash
-#!/usr/bin/env bash
-# Tags: no-fasttest
-
-CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../shell_config.sh
-. "$CUR_DIR"/../shell_config.sh
-
-USER_FILES_PATH=$(${CLICKHOUSE_CLIENT} -q "SELECT value FROM system.server_settings WHERE name = 'user_files_path'" | sed 's|/$||')
-WORKING_DIR="${USER_FILES_PATH}/${CLICKHOUSE_TEST_UNIQUE_NAME}"
-mkdir -p "${WORKING_DIR}"
-F="${WORKING_DIR}/q.parquet"
-
-${CLICKHOUSE_CLIENT} -q "
-  INSERT INTO FUNCTION file('${F}', Parquet)
-  SELECT number AS k, number * 7 % 1000 AS v, toString(number % 5000) AS s
-  FROM numbers(300000)
-  SETTINGS engine_file_truncate_on_insert = 1, output_format_parquet_row_group_size = 100000,
-           output_format_parquet_data_page_size = 8192, output_format_parquet_write_page_index = 1"
-
-S="k UInt64, v UInt64, s String"
-Q1="SELECT count(), sum(k), sum(v), sum(cityHash64(s)) FROM file('${F}', Parquet, '${S}')"
-Q2="SELECT count(), sum(k), sum(cityHash64(s)) FROM file('${F}', Parquet, '${S}') WHERE v < 100"
-
-for frac in 0.01 0.35 0.9; do
-  for threads in 1 8; do
-    echo "-- compressed_memory_fraction = ${frac}, max_parsing_threads = ${threads}"
-    ${CLICKHOUSE_CLIENT} -q "${Q1} SETTINGS input_format_parquet_compressed_memory_fraction = ${frac}, input_format_parquet_memory_high_watermark = 1048576, input_format_parquet_memory_low_watermark = 65536, input_format_parquet_max_block_size = 4096, input_format_parquet_prefer_block_bytes = 0, max_parsing_threads = ${threads}"
-    ${CLICKHOUSE_CLIENT} -q "${Q2} SETTINGS input_format_parquet_compressed_memory_fraction = ${frac}, input_format_parquet_memory_high_watermark = 1048576, input_format_parquet_memory_low_watermark = 65536, input_format_parquet_max_block_size = 4096, input_format_parquet_prefer_block_bytes = 0, max_parsing_threads = ${threads}"
-  done
-done
-
-rm -rf "${WORKING_DIR}"
-```
-
-Reference: six repetitions of the two result lines `300000	44999850000	149850000	<hash>` and `30000	<sumk>	<hash2>` under their headers; take the values from a run with defaults and confirm every repetition matches. With a 1 MiB watermark and `0.01` the compressed budget (~10 KiB) is smaller than one page, so this exercises the privileged path.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/Processors/Formats/Impl/Parquet/ tests/queries/0_stateless/<N>_parquet_issue_queue_budget.* src/Common/ProfileEvents.cpp
-git commit -s -m "Parquet: plan a row group's page reads at once and issue them from one budgeted queue"
-```
-
----
-
-## Phase 3 — Per-subgroup page cursor and parallel subgroup decode
-
-### Task 7: Move the page cursor into `ColumnSubchunk`
+#### (deferred) Move the page cursor into `ColumnSubchunk`
 
 **Files:**
 - Modify: `src/Processors/Formats/Impl/Parquet/Reader.h` (`struct ColumnChunk` lines 389-395; `struct ColumnSubchunk`; new `struct PageCursor`)
@@ -1038,7 +1211,7 @@ git add src/Processors/Formats/Impl/Parquet/Reader.h src/Processors/Formats/Impl
 git commit -s -m "Parquet: give each row subgroup its own page cursor"
 ```
 
-### Task 8: Admit several subgroups of a row group
+#### (deferred) Admit several subgroups of a row group
 
 **Files:**
 - Modify: `src/Processors/Formats/Impl/Parquet/Reader.h` (`struct RowGroup`: add `bool sequential_decode`, `std::atomic<size_t> subgroups_in_progress`, `std::atomic<size_t> subgroups_decoded_remaining`, `std::atomic<size_t> delivery_cursor`; `struct RowSubgroup`: add `std::atomic<bool> ready_for_delivery`)
@@ -1174,7 +1347,7 @@ git add src/Processors/Formats/Impl/Parquet/ src/Core/FormatFactorySettings.h sr
 git commit -s -m "Parquet: decode several row subgroups of a row group concurrently when the file has a page index"
 ```
 
-### Task 9: Performance evidence
+#### (deferred) Performance evidence — superseded by Task 11
 
 **Files:** none in-repo; results go into the PR descriptions.
 
@@ -1185,8 +1358,9 @@ git commit -s -m "Parquet: decode several row subgroups of a row group concurren
 
 ---
 
+
 ## Self-review notes
 
-- Spec §4.1 → Tasks 1–3. §4.2 → Tasks 4–6. §4.3 → Tasks 7–8. §4.4 settings → Tasks 1, 4, 8. §4.5 events → Tasks 2, 6, 8. §5 invariants 1–3 → Tasks 3, 6, 8 tests; invariant 4 → Task 5 test; invariant 5 → run the four new tests under a TSan build before each PR.
+- Spec §4.1 → Tasks 1–3. §4.2c-A/B → Tasks 4–5. §4.2 interim coalescing → Task 6. §4.2 pools/honest cap → Tasks 7–8. §4.2 bytes-in-flight + issue controller → Tasks 9–10. §5 invariants 1–3 → Tasks 3, 6, 10 tests; invariant 4 → Task 8 test; invariants 6–7 → Tasks 4–5 test; invariant 5 → run the new tests under a TSan build before pushing. §4.2b (cross-file metadata prefetch) has no task yet — add after Task 11's numbers.
 - `ReadStage::ColumnDataPrefetch` exists on base `antalya-26.6` (it arrived with #2235). Task 4 maps it to the `Compressed` pool; Task 6 removes it together with every `switch` case naming it (`finishRowGroupStage`, `finishRowSubgroupStage`, `scheduleTask`, `runTask`, `addTasksToReadColumns`).
 - Names used across tasks: `PlannedRead`, `planPageReads`, `pumpIssueQueue`, `reads_issued`, `waiting_for_reads`, `PageCursor`, `cursorFor`, `sequential_cursor`, `sequential_decode`, `subgroups_in_progress`, `subgroups_decoded_remaining`, `delivery_cursor`, `ready_for_delivery`, `pushReadySubgroupsInOrder`, `firstStepIdx`, `pool_usage`, `poolLimits`, `poolOf`, `ChunkMemoryInfo`, `delivered_bytes`, `publishBytesReady`, `waitForBytes`, `requestLength`, `io_threads`.
