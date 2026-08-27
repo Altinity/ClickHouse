@@ -41,9 +41,10 @@ public:
     /// Called at most once, after all registerRange calls and before all enqueue/getRangeData calls.
     void finalizeRanges();
 
-    /// Keeps one read from covering parts of two row groups. `bounds` is sorted: the start offset of
-    /// each row group, then the end of the last. Reads issued before this (metadata) are unconstrained.
-    void setRowGroupBounds(std::vector<size_t> bounds);
+    /// Keeps one read from covering parts of two row groups. `ranges` are the [start, end) byte
+    /// ranges of the row groups, sorted by start. Bytes outside every range (footer, page indexes,
+    /// bloom filters) belong to no row group and may be coalesced with either neighbour.
+    void setRowGroupRanges(std::vector<std::pair<size_t, size_t>> ranges);
 
     /// Replace a requested range with a set of disjoint smaller ranges contained within it.
     /// `subranges` must be sorted.
@@ -186,8 +187,8 @@ private:
     size_t min_bytes_for_seek{};
     size_t bytes_per_read_task{};
 
-    /// See setRowGroupBounds. Empty until it is called.
-    std::vector<size_t> row_group_bounds;
+    /// See setRowGroupRanges. Empty until it is called.
+    std::vector<std::pair<size_t, size_t>> row_group_ranges;
 
     /// Reads running or queued. Drives read-task size: smaller reads fill an idle pool faster, larger
     /// ones amortize the round trip once it is busy.
@@ -210,8 +211,9 @@ private:
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;
 
-    /// [lo, hi) of the row group containing `offset`, or the whole file if the layout isn't known yet.
-    std::pair<size_t, size_t> rowGroupBoundsFor(size_t offset) const;
+    /// Index of the row group whose byte range contains `offset`, or nullopt if `offset` is outside
+    /// every row group (metadata) or the layout isn't known yet. Called with `mutex` held.
+    std::optional<size_t> rowGroupIndexFor(size_t offset) const;
     size_t currentReadTaskBudget() const;
 
     void determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOptions & options);

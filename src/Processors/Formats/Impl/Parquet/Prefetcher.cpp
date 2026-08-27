@@ -43,23 +43,26 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
     range_sets.resize(1);
 }
 
-void Prefetcher::setRowGroupBounds(std::vector<size_t> bounds)
+void Prefetcher::setRowGroupRanges(std::vector<std::pair<size_t, size_t>> ranges)
 {
+    chassert(std::is_sorted(ranges.begin(), ranges.end()));
     std::lock_guard lock(mutex);
-    row_group_bounds = std::move(bounds);
+    row_group_ranges = std::move(ranges);
 }
 
-std::pair<size_t, size_t> Prefetcher::rowGroupBoundsFor(size_t offset) const
+std::optional<size_t> Prefetcher::rowGroupIndexFor(size_t offset) const
 {
-    /// Called with `mutex` held.
-    if (row_group_bounds.size() < 2)
-        return {0, std::numeric_limits<size_t>::max()};
-    auto hi = std::upper_bound(row_group_bounds.begin(), row_group_bounds.end(), offset);
-    if (hi == row_group_bounds.begin())
-        return {0, *hi}; // metadata, before the first row group
-    if (hi == row_group_bounds.end())
-        return {row_group_bounds.back(), std::numeric_limits<size_t>::max()};
-    return {*(hi - 1), *hi};
+    if (row_group_ranges.empty())
+        return std::nullopt;
+    /// First range starting after `offset`; the candidate is the one before it.
+    auto hi = std::upper_bound(row_group_ranges.begin(), row_group_ranges.end(), offset,
+        [](size_t off, const std::pair<size_t, size_t> & range) { return off < range.first; });
+    if (hi == row_group_ranges.begin())
+        return std::nullopt;
+    const auto & range = *(hi - 1);
+    if (offset >= range.second)
+        return std::nullopt; // gap between row groups, or after the last one
+    return size_t(hi - 1 - row_group_ranges.begin());
 }
 
 size_t Prefetcher::currentReadTaskBudget() const
@@ -352,14 +355,21 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
 
     /// One read must not span two row groups: `getRangeData` waits for the whole task, so the
     /// earlier row group would wait for the later one's bytes and delivery would serialize.
-    const auto [row_group_lo, row_group_hi] = rowGroupBoundsFor(start_offset);
+    /// Bytes outside every row group (page indexes, bloom filters, footer) don't count: they may join
+    /// whichever row group the task already covers. `claimed_row_group` is the one it covers so far.
+    std::optional<size_t> claimed_row_group = rowGroupIndexFor(start_offset);
+    auto other_row_group = [&](size_t offset)
+    {
+        auto rg = rowGroupIndexFor(offset);
+        return rg.has_value() && claimed_row_group.has_value() && *rg != *claimed_row_group;
+    };
 
     /// Go left.
     for (size_t idx = range_idx; idx > 0; --idx)
     {
         const RangeState & r = ranges[idx - 1];
         if (r.end + min_bytes_for_seek <= start_offset || // short gap
-            r.start < row_group_lo || // would reach into the previous row group
+            other_row_group(r.start) || // would reach into another row group
             end_offset - std::min(r.start, start_offset) > task_budget || // task not too big
             !r.request->allow_incidental_read.load(std::memory_order_relaxed)) // range wants to be coalesced
             break;
@@ -368,6 +378,8 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         if (s == RequestState::State::HasRange)
         {
             /// Include this range in the task.
+            if (!claimed_row_group.has_value())
+                claimed_row_group = rowGroupIndexFor(r.start);
             start_idx = idx - 1;
             total_length_of_covered_ranges += r.length();
             start_offset = std::min(start_offset, r.start);
@@ -394,7 +406,7 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     {
         const RangeState & r = ranges[end_idx];
         if (end_offset + min_bytes_for_seek <= r.start ||
-            r.end > row_group_hi || // would reach into the next row group
+            (r.end > r.start && other_row_group(r.end - 1)) || // would reach into another row group
             std::max(r.end, end_offset) - start_offset > task_budget ||
             !r.request->allow_incidental_read.load(std::memory_order_relaxed))
             break;
@@ -402,6 +414,8 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const auto s = r.request->state.load(std::memory_order_relaxed);
         if (s == RequestState::State::HasRange)
         {
+            if (!claimed_row_group.has_value() && r.end > r.start)
+                claimed_row_group = rowGroupIndexFor(r.end - 1);
             end_idx = idx + 1;
             total_length_of_covered_ranges += r.length();
             end_offset = std::max(end_offset, r.end);

@@ -468,10 +468,10 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     if (row_groups.empty())
         return; // all row groups were skipped
 
-    /// So a single read never covers parts of two row groups; see Prefetcher::setRowGroupBounds.
+    /// So a single read never covers parts of two row groups; see Prefetcher::setRowGroupRanges.
     {
-        std::vector<size_t> bounds;
-        bounds.reserve(file_metadata.row_groups.size() + 1);
+        std::vector<std::pair<size_t, size_t>> bounds;
+        bounds.reserve(file_metadata.row_groups.size());
         for (const auto & rg : file_metadata.row_groups)
         {
             size_t start = std::numeric_limits<size_t>::max();
@@ -488,21 +488,15 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
             }
             if (start == std::numeric_limits<size_t>::max() || end <= start)
                 continue; // unusable metadata
-            if (!bounds.empty() && start < bounds.back())
+            if (!bounds.empty() && start < bounds.back().second)
             {
-                bounds.clear(); // not laid out in order; don't guess
+                bounds.clear(); // not laid out in order, or overlapping; don't guess
                 break;
             }
-            bounds.push_back(start);
-            bounds.push_back(end);
+            bounds.emplace_back(start, end);
         }
         if (!bounds.empty())
-        {
-            /// Adjacent row groups share an offset.
-            std::sort(bounds.begin(), bounds.end());
-            bounds.erase(std::unique(bounds.begin(), bounds.end()), bounds.end());
-            prefetcher.setRowGroupBounds(std::move(bounds));
-        }
+            prefetcher.setRowGroupRanges(std::move(bounds));
     }
 
     if (options.format.parquet.bloom_filter_push_down && format_filter_info->key_condition)
