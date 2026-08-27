@@ -12,7 +12,7 @@
 
 ## Amendments (2026-08-27, after the vig-test measurements — see spec Appendix A)
 
-Tasks 1–3 (Phase 1) stand. Tasks 4–9 are superseded by spec §4.2 (planner covers index stages; bytes-in-flight target fitted from measured bandwidth × RTT; source-aware coalescing cost model), §4.2b (cross-file metadata prefetch), §4.2c (cache cooperation A–E) and the demotion of Phase 3; they will be re-cut into new tasks once Phase 1 is complete and reviewed. Until then treat Tasks 4–9 as design notes, not as executable steps. Execution order after Phase 1: 2c-A/B (standalone cache fixes) → Phase 2 → 2b → 2c-C/E → Phase 3.
+Tasks 1–3 (Phase 1) stand. Tasks 4–9 are superseded by spec §4.2 (planner covers index stages; bytes-in-flight target fitted from measured bandwidth × RTT; source-aware coalescing cost model), §4.2b (cross-file metadata prefetch), §4.2c (cache cooperation A–E) and the demotion of Phase 3; they will be re-cut into new tasks once Phase 1 is complete and reviewed. Until then treat Tasks 4–9 as design notes, not as executable steps. Execution order after Phase 1: 2c-A/B (legacy-path cache fixes, Antalya-only) → Phase 2 (planner against the `ReadTarget` seam) → 2b → upstream `ReaderExecutor` alignment (spec §4.2c) → Phase 3. Former 2c-C/D/E are dropped in favour of the upstream executor.
 
 ## Global Constraints
 
