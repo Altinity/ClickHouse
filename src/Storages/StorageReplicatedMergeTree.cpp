@@ -127,7 +127,6 @@
 
 #include <Common/CurrentThread.h>
 #include <Common/scope_guard_safe.h>
-#include "Functions/generateSnowflakeID.h"
 #include "Interpreters/StorageID.h"
 #include "QueryPipeline/QueryPlanResourceHolder.h"
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
@@ -214,10 +213,15 @@ namespace Setting
     extern const SettingsBool update_sequential_consistency;
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsBool export_merge_tree_partition_force_export;
-    extern const SettingsUInt64 export_merge_tree_partition_max_retries;
+    extern const SettingsUInt64 export_merge_tree_partition_retry_initial_backoff_seconds;
+    extern const SettingsUInt64 export_merge_tree_partition_retry_max_backoff_seconds;
     extern const SettingsUInt64 export_merge_tree_partition_task_timeout_seconds;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
+    extern const SettingsParquetCompression output_format_parquet_compression_method;
+    extern const SettingsUInt64 output_format_compression_level;
+    extern const SettingsUInt64 output_format_parquet_row_group_size;
+    extern const SettingsUInt64 output_format_parquet_row_group_size_bytes;
     extern const SettingsMaxThreads max_threads;
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
     extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
@@ -225,12 +229,15 @@ namespace Setting
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
     extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
     extern const SettingsBool allow_insert_into_iceberg;
     extern const SettingsUInt64 iceberg_insert_max_bytes_in_data_file;
     extern const SettingsUInt64 iceberg_insert_max_rows_in_data_file;
+    extern const SettingsTimezone iceberg_partition_timezone;
 }
 
 
@@ -4602,6 +4609,11 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
 void StorageReplicatedMergeTree::selectPartsToExport()
 {
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::selectPartsToExport");
+
+    /// Default tick interval; may be shortened below if a part's back-off expires sooner.
+    static constexpr int64_t default_reschedule_ms = 1000 * 5;
+    int64_t reschedule_ms = default_reschedule_ms;
+
     try
     {
         if (parts_mover.moves_blocker.isCancelled())
@@ -4610,7 +4622,16 @@ void StorageReplicatedMergeTree::selectPartsToExport()
         }
         else
         {
-            export_merge_tree_partition_task_scheduler->run();
+            const auto earliest_backoff_retry = export_merge_tree_partition_task_scheduler->run();
+
+            /// If a part is only waiting on its back-off deadline and that deadline is sooner than
+            /// the default tick, wake up earlier so the retry is not delayed by up to a full tick.
+            if (earliest_backoff_retry)
+            {
+                const auto now = time(nullptr);
+                const int64_t until_ms = (static_cast<int64_t>(*earliest_backoff_retry) - static_cast<int64_t>(now)) * 1000;
+                reschedule_ms = std::clamp<int64_t>(until_ms, 0, default_reschedule_ms);
+            }
         }
     }
     catch (...)
@@ -4618,7 +4639,7 @@ void StorageReplicatedMergeTree::selectPartsToExport()
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
     }
 
-    export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
+    export_merge_tree_partition_select_task->scheduleAfter(reschedule_ms);
 }
 
 void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
@@ -7273,7 +7294,12 @@ void StorageReplicatedMergeTree::restoreMetadataInZooKeeper(
         for (const auto & part_name : active_parts_names)
         {
             command.partition = make_intrusive<ASTLiteral>(part_name);
-            attachPartition(command, metadata_snapshot, getContext());
+            attachPartitionImpl(
+                command,
+                metadata_snapshot,
+                getContext(),
+                /* allow_attach_while_readonly */ true,
+                /* deduplicate_part */ false);
         }
     }
 
@@ -7379,8 +7405,18 @@ void StorageReplicatedMergeTree::truncate(
 PartitionCommandsResultInfo StorageReplicatedMergeTree::attachPartition(
     const PartitionCommand & command, const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context)
 {
-    /// Allow ATTACH PARTITION on readonly replica when restoring it.
-    if (!are_restoring_replica)
+    return attachPartitionImpl(
+        command, metadata_snapshot, query_context, /* allow_attach_while_readonly */ false, /* deduplicate_part */ true);
+}
+
+PartitionCommandsResultInfo StorageReplicatedMergeTree::attachPartitionImpl(
+    const PartitionCommand & command,
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr query_context,
+    bool allow_attach_while_readonly,
+    bool deduplicate_part)
+{
+    if (!allow_attach_while_readonly)
         assertNotReadonly();
 
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::attachPartition");
@@ -7400,7 +7436,7 @@ PartitionCommandsResultInfo StorageReplicatedMergeTree::attachPartition(
         /* majority_quorum */ false,
         query_context,
         /* is_attach */ true,
-        /* allow_attach_while_readonly */ true);
+        /* allow_attach_while_readonly */ allow_attach_while_readonly);
 
     results.reserve(loaded_parts.size());
 
@@ -7408,7 +7444,7 @@ PartitionCommandsResultInfo StorageReplicatedMergeTree::attachPartition(
     {
         const String old_name = loaded_parts[i]->name;
 
-        output.writeExistingPart(loaded_parts[i]);
+        output.writeExistingPart(loaded_parts[i], deduplicate_part);
 
         renamed_parts.old_and_new_names[i].old_dir.clear();
 
@@ -8375,25 +8411,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
-    auto query_to_string = [] (const ASTPtr & ast)
-    {
-        return ast ? ast->formatWithSecretsOneLine() : "";
-    };
-
     auto src_snapshot = getInMemoryMetadataPtr();
     auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
 
-    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
     ExportPartitionUtils::verifyExportSchemaCastable(
         src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
-
-    /// Iceberg partition compatibility is checked below; here we only need the
-    /// partition-key ASTs to match (partition-column types follow the lossy-cast gate).
-    if (!dest_storage->isDataLake())
-    {
-        if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
-    }
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 
@@ -8486,7 +8508,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     ExportReplicatedMergeTreePartitionManifest manifest;
 
-    manifest.transaction_id = generateSnowflakeIDString();
+    manifest.transaction_id = toString(UUIDHelpers::generateV4());
     manifest.query_id = query_context->getCurrentQueryId();
     manifest.partition_id = partition_id;
     manifest.destination_database = dest_database;
@@ -8495,11 +8517,16 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.number_of_parts = part_names.size();
     manifest.parts = part_names;
     manifest.create_time = time(nullptr);
-    manifest.max_retries = query_context->getSettingsRef()[Setting::export_merge_tree_partition_max_retries];
+    manifest.retry_initial_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_initial_backoff_seconds];
+    manifest.retry_max_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_max_backoff_seconds];
     manifest.task_timeout_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_task_timeout_seconds];
     manifest.max_threads = query_context->getSettingsRef()[Setting::max_threads];
     manifest.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];
     manifest.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];
+    manifest.parquet_compression_method = query_context->getSettingsRef()[Setting::output_format_parquet_compression_method].toString();
+    manifest.output_format_compression_level = query_context->getSettingsRef()[Setting::output_format_compression_level];
+    manifest.parquet_row_group_size = query_context->getSettingsRef()[Setting::output_format_parquet_row_group_size];
+    manifest.parquet_row_group_size_bytes = query_context->getSettingsRef()[Setting::output_format_parquet_row_group_size_bytes];
     manifest.max_bytes_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_bytes_per_file];
     manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_rows_per_file];
 
@@ -8507,6 +8534,9 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     manifest.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
     manifest.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
+    manifest.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
+    manifest.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
+    manifest.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;
 
     if (dest_storage->isDataLake())
     {
@@ -8541,7 +8571,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
         ExportPartitionUtils::verifyIcebergPartitionCompatibility(
             metadata_object,
-            src_snapshot->getPartitionKeyAST());
+            src_snapshot,
+            destination_snapshot,
+            parts,
+            partition_id,
+            query_context);
 
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
@@ -8554,6 +8588,15 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 #else
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
+    }
+    else
+    {
+        ExportPartitionUtils::verifyPlainPartitionCompatibility(
+            src_snapshot,
+            destination_snapshot,
+            parts,
+            partition_id,
+            query_context);
     }
 
     ops.emplace_back(zkutil::makeCreateRequest(
@@ -8578,7 +8621,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         ExportReplicatedMergeTreePartitionProcessingPartEntry entry;
         entry.status = ExportReplicatedMergeTreePartitionProcessingPartEntry::Status::PENDING;
         entry.part_name = part;
-        entry.retry_count = 0;
 
         ops.emplace_back(zkutil::makeCreateRequest(
             fs::path(partition_exports_path) / "processing" / part,
@@ -9501,7 +9543,7 @@ std::unique_ptr<ReplicatedMergeTreeLogEntryData> StorageReplicatedMergeTree::rep
             }
 
             UInt64 index = lock.getNumber();
-            MergeTreePartInfo dst_part_info(partition_id, index, index, src_part->info.level);
+            MergeTreePartInfo dst_part_info(partition_id, index, index, getLevelForAdoptedPart(src_data, src_part->info.level));
 
             IDataPartStorage::ClonePartParams clone_params
             {
@@ -9788,7 +9830,7 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
             }
 
             UInt64 index = lock.getNumber();
-            MergeTreePartInfo dst_part_info(partition_id, index, index, src_part->info.level);
+            MergeTreePartInfo dst_part_info(partition_id, index, index, dest_table_storage->getLevelForAdoptedPart(src_data, src_part->info.level));
 
             /// Don't do hardlinks in case of zero-copy at any side (defensive programming)
             bool zero_copy_enabled = (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
@@ -12199,8 +12241,8 @@ void StorageReplicatedMergeTree::attachRestoredParts(
         /* async_insert */ false, *this, metadata_snapshot, /* quorum */ 0, /* quorum_timeout_ms */ 0, /* max_parts_per_block */ 0, /* quorum_parallel */ false,
         /* majority_quorum */ false, getContext(), /* is_attach */ true, /* allow_attach_while_readonly */ false, zookeeper_retries_info);
 
-    for (auto part : parts)
-        sink->writeExistingPart(part);
+    for (auto & part : parts)
+        sink->writeExistingPart(part, /* deduplicate_part */ false);
 }
 
 }

@@ -1,16 +1,25 @@
 import logging
 import time
 import uuid
+from typing import NamedTuple
 
 import pytest
 
 from helpers.cluster import ClickHouseCluster
 from helpers.export_partition_helpers import (
+    first_partition_id,
+    make_rmt,
     wait_for_exception_count,
     wait_for_export_status,
     wait_for_export_to_start,
 )
 from helpers.network import PartitionManager
+
+
+EXTRA_SOURCE_COLUMN_MODES = [
+    pytest.param("POSITION", id="by-position"),
+    pytest.param("NAME", id="by-name"),
+]
 
 
 
@@ -196,11 +205,9 @@ def test_restart_nodes_during_export(cluster):
         
         export_queries = f"""
             ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2020' TO TABLE {s3_table}
-            SETTINGS export_merge_tree_partition_max_retries = 50;
+            EXPORT PARTITION ID '2020' TO TABLE {s3_table};
             ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2021' TO TABLE {s3_table}
-            SETTINGS export_merge_tree_partition_max_retries = 50;
+            EXPORT PARTITION ID '2021' TO TABLE {s3_table};
         """
 
         node.query(export_queries)
@@ -289,11 +296,9 @@ def test_kill_export(cluster):
         
         export_queries = f"""
             ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2020' TO TABLE {s3_table}
-            SETTINGS export_merge_tree_partition_max_retries = 50;
+            EXPORT PARTITION ID '2020' TO TABLE {s3_table};
             ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2021' TO TABLE {s3_table}
-            SETTINGS export_merge_tree_partition_max_retries = 50;
+            EXPORT PARTITION ID '2021' TO TABLE {s3_table};
         """
 
         node.query(export_queries)
@@ -356,7 +361,6 @@ def test_kill_export_resilient_to_status_handling_failure(cluster):
 
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-            f" SETTINGS export_merge_tree_partition_max_retries = 50"
         )
 
         node.query("SYSTEM ENABLE FAILPOINT export_partition_status_change_throw")
@@ -425,9 +429,9 @@ def test_drop_source_table_during_export(cluster):
         
         export_queries = f"""
             ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS s3_retry_attempts = 500, export_merge_tree_partition_max_retries = 50;
+            EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS s3_retry_attempts = 500;
             ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2021' TO TABLE {s3_table} SETTINGS s3_retry_attempts = 500, export_merge_tree_partition_max_retries = 50;
+            EXPORT PARTITION ID '2021' TO TABLE {s3_table} SETTINGS s3_retry_attempts = 500;
         """
 
         node.query(export_queries)
@@ -517,14 +521,22 @@ def test_failure_is_logged_in_system_table(cluster):
         }
         pm.add_rule(pm_rule_reject_requests)
 
+        # Blocked MinIO produces transient (retryable) S3 errors. There is no retry
+        # budget anymore, so the task keeps retrying and is only torn down once the
+        # absolute task timeout fires (transitioning to KILLED). Use a small timeout
+        # so the test does not wait for the default (a day).
         node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_max_retries=1;"
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5;"
         )
 
-        # Wait so that the export fails
-        wait_for_export_status(node, mt_table, s3_table, "2020", "FAILED", timeout=60)
+        # Wait for the timeout to kill the stuck task. The KILL is a Keeper operation
+        # (MinIO being blocked does not affect it); the status mirror needs roughly one
+        # manifest-updater poll cycle (~30s) plus watch propagation on top of the 5s
+        # timeout, so allow a generous budget.
+        wait_for_export_status(node, mt_table, s3_table, "2020", "KILLED", timeout=90)
 
-    # Network restored; verify the export is marked as FAILED in the system table
+    # Network restored; verify the export is marked as KILLED in the system table
     # Also verify we captured at least one exception and no commit file exists
     status = node.query(
         f"""
@@ -535,7 +547,7 @@ def test_failure_is_logged_in_system_table(cluster):
         """
     )
 
-    assert status.strip() == "FAILED", f"Expected FAILED status, got: {status!r}"
+    assert status.strip() == "KILLED", f"Expected KILLED status, got: {status!r}"
 
     exception_count = node.query(
         f"""
@@ -588,9 +600,10 @@ def test_inject_short_living_failures(cluster):
         }
         pm.add_rule(pm_rule_reject_requests)
 
-        # set big max_retries so that the export does not fail completely
+        # Transient (retryable) failures never fail the task on a budget; it keeps
+        # retrying until the network is restored and the export completes.
         node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_max_retries=100;"
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table};"
         )
 
         # wait for at least one exception to occur, but not enough to finish the export.
@@ -627,6 +640,85 @@ def test_inject_short_living_failures(cluster):
     assert int(exception_count.strip()) >= 1, "Expected at least one exception"
 
 
+def test_export_partition_retry_backoff(cluster):
+    """Verify the per-replica in-memory exponential back-off between failed part exports.
+
+    The back-off is local in-memory state (no ZooKeeper retry_count / next_retry_time
+    anymore), so it is not directly observable; instead we observe its effect. With a
+    large back-off, a part that keeps failing (object storage blocked) is parked for the
+    back-off window after its first failure and must NOT be retried on every ~5s
+    scheduler tick. We assert that exception_count stays low across a window that spans
+    several ticks. Once the network is restored and the back-off elapses, the export
+    completes (there is no retry budget to exhaust)."""
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"retry_backoff_mt_table_{postfix}"
+    s3_table = f"retry_backoff_s3_table_{postfix}"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # Large back-off so a single failed attempt parks the part well beyond the
+    # ~5s scheduler tick. Kept moderate so the export can still complete promptly
+    # once the network is restored.
+    initial_backoff_seconds = 30
+    max_backoff_seconds = 30
+
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm.add_rule({
+            "instance": node,
+            "destination": node.ip_address,
+            "protocol": "tcp",
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        })
+        # Also block requests to MinIO to fail fast
+        pm.add_rule({
+            "instance": node,
+            "destination": minio_ip,
+            "protocol": "tcp",
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        })
+
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+            f"SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = {initial_backoff_seconds}, "
+            f"export_merge_tree_partition_retry_max_backoff_seconds = {max_backoff_seconds}"
+        )
+
+        # Wait until the first failure is recorded.
+        count_after_first = wait_for_exception_count(
+            node, mt_table, s3_table, "2020", min_exception_count=1, timeout=60
+        )
+
+        # While the part is backing off (~30s) it must not be retried again. Observe
+        # across a window that spans several scheduler ticks: without back-off the
+        # ~5s tick would add roughly five more failures, so a small increase proves
+        # the back-off is pacing retries.
+        time.sleep(25)
+        count_during_backoff = int(node.query(
+            f"SELECT exception_count FROM system.replicated_partition_exports"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{s3_table}'"
+            f"   AND partition_id = '2020'"
+        ).strip())
+        assert count_during_backoff - count_after_first <= 2, (
+            f"exception_count jumped during the back-off window: "
+            f"{count_after_first} -> {count_during_backoff}; back-off was not applied"
+        )
+
+    # Network restored; once the back-off elapses the export should complete because
+    # there is no retry budget to exhaust.
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED", timeout=120)
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "3\n", "Export did not succeed"
+
+
 def test_export_partition_file_already_exists_policy(cluster):
     node = cluster.instances["replica1"]
 
@@ -656,6 +748,29 @@ def test_export_partition_file_already_exists_policy(cluster):
 
     # wait for the exports to finish
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
+
+    # plain object storage destinations surface the commit marker file path via
+    # system.replicated_partition_exports.committed_marker_file
+    committed_marker_file = node.query(
+        f"""
+        SELECT committed_marker_file FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    ).strip()
+    # `committed_marker_file` is the absolute key in the bucket (same convention as
+    # `destination_file_paths`); it may carry the s3_conn URL's in-bucket prefix on
+    # top of the table's `filename` argument, so use a "contains" check that does
+    # not depend on knowing that prefix.
+    assert f"{s3_table}/commit_2020_" in committed_marker_file, \
+        f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
+    # Path relative to the `s3_conn` URL, derived from the absolute key without
+    # assuming a particular URL prefix.
+    marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
+    assert node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{marker_relative_path}', format=LineAsString)"
+    ) == '1\n', f"Commit marker file does not exist at {committed_marker_file!r}"
 
     # try to export the partition
     node.query(
@@ -694,10 +809,11 @@ def test_export_partition_file_already_exists_policy(cluster):
         """
     ) == '1\n', "Expected the export to be marked as COMPLETED"
 
-    # last but not least, let's try with the error policy
-    # max retries = 1 so it fails fast
+    # last but not least, let's try with the error policy. FILE_ALREADY_EXISTS is a
+    # non-retryable error (retrying always hits the same existing file), so the task
+    # fails fast without needing a retry budget.
     node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='error', export_merge_tree_partition_max_retries=1",
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='error'",
     )
 
     # wait for the export to finish
@@ -1376,7 +1492,6 @@ def test_export_partition_resumes_after_stop_moves(cluster):
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-        f" SETTINGS export_merge_tree_partition_max_retries = 50"
     )
 
     wait_for_export_to_start(node, mt_table, s3_table, "2020")
@@ -1435,7 +1550,6 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster):
 
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-            f" SETTINGS export_merge_tree_partition_max_retries = 50"
         )
 
         wait_for_export_to_start(node, mt_table, s3_table, "2020")
@@ -1544,8 +1658,8 @@ def test_export_partition_partition_column_castable_type_mismatch(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' "
         f"TO TABLE {s3_table}"
     )
-    assert "BAD_ARGUMENTS" in error, (
-        f"Expected BAD_ARGUMENTS for a lossy partition-column cast, "
+    assert "INCOMPATIBLE_COLUMNS" in error, (
+        f"Expected INCOMPATIBLE_COLUMNS for a lossy partition-column cast, "
         f"got: {error!r}"
     )
     assert "requires a lossy cast" in error and "'year'" in error, (
@@ -1642,3 +1756,657 @@ def test_export_partition_all_failure_modes(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
         f" SETTINGS export_merge_tree_partition_all_on_error = 'skip_conflicts'"
     )
+
+
+# ---- Partition-key compatibility gate (unified with the Iceberg gate) --------------------------
+#
+# Plain (hive) object storage writes every row of a part to the single directory computed from the
+# destination PARTITION BY, so each source partition must map to exactly one destination partition.
+# The gate accepts equivalent or finer source keys (e.g. a source that adds partition columns on top
+# of the destination's) and rejects source partitions that would span several destination partitions
+# or that do not cover the destination partition column. Hive destinations partition by bare columns
+# only, so these cases exercise the column-subset and single-value paths.
+
+
+def _run_subset_accept(node, source_key):
+    """Export a source partitioned by *source_key* (a superset of the destination key ``year``) into a
+    hive destination partitioned by ``year``, then verify the full dataset, the hive directory layout,
+    and a round-trip back into MergeTree."""
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"subset_mt_{uid}"
+    s3_table = f"subset_s3_{uid}"
+    roundtrip = f"subset_roundtrip_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16, country String)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY {source_key} ORDER BY tuple()"
+    )
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, 2020, 'US'), (2, 2020, 'FR'), (3, 2021, 'US')"
+    )
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16, country String)"
+        f" ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')"
+        f" PARTITION BY year"
+    )
+
+    partition_ids = node.query(
+        f"SELECT DISTINCT partition_id FROM system.parts"
+        f" WHERE database = currentDatabase() AND table = '{mt_table}' AND active"
+    ).strip().split("\n")
+    assert len(partition_ids) == 3, f"expected 3 source partitions, got {partition_ids}"
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    for pid in partition_ids:
+        wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED", timeout=90)
+
+    src = node.query(f"SELECT id, year, country FROM {mt_table} ORDER BY id")
+    dst = node.query(f"SELECT id, year, country FROM {s3_table} ORDER BY id")
+    assert dst == src, f"destination rows differ from source:\nsrc={src!r}\ndst={dst!r}"
+
+    # The destination partitions by year only: rows land in the year=<value> hive directory.
+    rows_2020 = node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/year=2020/*.parquet', format='Parquet')"
+    ).strip()
+    rows_2021 = node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/year=2021/*.parquet', format='Parquet')"
+    ).strip()
+    assert rows_2020 == "2", f"expected 2 rows under year=2020, got {rows_2020}"
+    assert rows_2021 == "1", f"expected 1 row under year=2021, got {rows_2021}"
+
+    node.query(
+        f"CREATE TABLE {roundtrip} (id UInt64, year UInt16, country String)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{roundtrip}', 'replica1')"
+        f" PARTITION BY {source_key} ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {roundtrip} SELECT * FROM {s3_table}")
+    rt = node.query(f"SELECT id, year, country FROM {roundtrip} ORDER BY id")
+    assert rt == src, f"round-trip rows differ from source:\nsrc={src!r}\nrt={rt!r}"
+
+
+def test_export_partition_multicolumn_subset_accepted(cluster):
+    """Source partitions by (year, country); destination by year only - a coarser key that is covered
+    by the source key, so every source partition has a single year and maps to exactly one destination
+    partition. Accepted (this was rejected as a partition-key mismatch before the plain gate was
+    unified with the Iceberg one)."""
+    node = cluster.instances["replica1"]
+    _run_subset_accept(node, "(year, country)")
+
+
+def test_export_partition_subset_reversed_order_accepted(cluster):
+    """The subset match is order-independent: a source keyed by (country, year) still covers a
+    destination keyed by year."""
+    node = cluster.instances["replica1"]
+    _run_subset_accept(node, "(country, year)")
+
+
+def test_export_partition_coarser_source_rejected(cluster):
+    """Source partitions monthly (toYYYYMM(dt)); destination by the raw date. A single source part
+    holding two different days would map to two destination partitions, so the gate rejects the
+    export synchronously with BAD_ARGUMENTS and schedules nothing."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"coarser_mt_{uid}"
+    s3_table = f"coarser_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, dt Date)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY toYYYYMM(dt) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05'), (2, '2024-03-20')")
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, dt Date)"
+        f" ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')"
+        f" PARTITION BY dt"
+    )
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
+
+    scheduled = node.query(
+        f"SELECT count() FROM system.replicated_partition_exports"
+        f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
+    ).strip()
+    assert scheduled == "0", f"expected nothing scheduled after a synchronous reject, got {scheduled}"
+
+
+def test_export_partition_dest_column_not_in_source_key_rejected(cluster):
+    """Destination partitions by a column that is not part of the source partition key; the gate
+    rejects the export synchronously with BAD_ARGUMENTS naming the uncovered column."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"nocover_mt_{uid}"
+    s3_table = f"nocover_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16, country String)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY year ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, 'US'), (2, 2020, 'FR')")
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16, country String)"
+        f" ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')"
+        f" PARTITION BY country"
+    )
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
+    assert "country" in error, f"expected the error to name column 'country', got: {error!r}"
+
+
+def test_export_partition_column_timezone_rendered_in_destination_zone(cluster):
+    """A hive partition value lives as text in the object path and is read back in the destination
+    column's time zone, so the export has to spell it the way the destination would. Spelling it in the
+    source's zone names a different instant and the row reads back shifted by the offset between the
+    two zones. INSERT SELECT into an identical table is the reference behavior."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_mt_{uid}"
+    s3_export = f"tz_export_s3_{uid}"
+    s3_insert = f"tz_insert_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, ts DateTime('UTC'))"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY toDate(ts) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+    for table in (s3_export, s3_insert):
+        node.query(
+            f"CREATE TABLE {table} (id UInt64, ts DateTime('Asia/Tokyo'))"
+            f" ENGINE = S3(s3_conn, filename='{table}', format=Parquet, partition_strategy='hive')"
+            f" PARTITION BY ts"
+        )
+
+    pid = first_partition_id(node, mt_table)
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_export}")
+    wait_for_export_status(node, mt_table, s3_export, pid, "COMPLETED", timeout=90)
+
+    node.query(f"INSERT INTO {s3_insert} SELECT * FROM {mt_table}")
+
+    source_instant = node.query(f"SELECT toUnixTimestamp(ts) FROM {mt_table}").strip()
+    exported_instant = node.query(f"SELECT toUnixTimestamp(ts) FROM {s3_export}").strip()
+    inserted_instant = node.query(f"SELECT toUnixTimestamp(ts) FROM {s3_insert}").strip()
+    assert exported_instant == source_instant, (
+        f"the exported row moved in time: source {source_instant}, destination {exported_instant}"
+    )
+    assert inserted_instant == source_instant, (
+        f"INSERT SELECT must not move it either: source {source_instant},"
+        f" destination {inserted_instant}"
+    )
+
+    # 2024-03-05 15:00:00 UTC is 2024-03-06 00:00:00 in Tokyo.
+    exported_directory = node.query(
+        f"SELECT DISTINCT extract(_path, 'ts=[^/]*') FROM {s3_export}"
+    ).strip()
+    inserted_directory = node.query(
+        f"SELECT DISTINCT extract(_path, 'ts=[^/]*') FROM {s3_insert}"
+    ).strip()
+    assert exported_directory == "ts=2024-03-06 00:00:00", (
+        f"unexpected hive directory: {exported_directory!r}"
+    )
+    assert inserted_directory == exported_directory, (
+        f"export and INSERT SELECT disagree on the partition directory:"
+        f" {exported_directory!r} vs {inserted_directory!r}"
+    )
+
+
+def create_wildcard_destination(node, table, columns, partition_key):
+    """A wildcard destination, the only partition strategy that accepts an expression as its
+    partition key: the hive strategy allows storage columns only."""
+    node.query(
+        f"CREATE TABLE {table} ({columns})"
+        f" ENGINE = S3(s3_conn, filename='{table}/{{_partition_id}}/{{_file}}.parquet',"
+        f" format=Parquet, partition_strategy='wildcard')"
+        f" PARTITION BY {partition_key}"
+    )
+
+
+def test_export_partition_dest_argument_order_rejected(cluster):
+    """The destination key intDiv(x, 100) has to be validated as written. This source part holds
+    x in [201, 350], which covers the destination partitions 2 and 3, so the export must be rejected.
+    Reading the arguments in the reverse order would validate intDiv(100, x) instead, which is 0 at
+    both endpoints and would silently write both destination partitions into one directory."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"argorder_mt_{uid}"
+    s3_table = f"argorder_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, x UInt64)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY intDiv(x, 1000) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 201), (2, 350)")
+    create_wildcard_destination(node, s3_table, "id UInt64, x UInt64", "intDiv(x, 100)")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
+
+
+def test_export_partition_dest_finer_expression_single_partition_accepted(cluster):
+    """The same shape as the rejected case, with x in [100, 150]: the whole source partition maps to
+    the single destination partition 1, so it is accepted and every row lands in one directory. The
+    swapped-argument reading would refuse this one, since intDiv(100, 100) != intDiv(100, 150)."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"argorder_ok_mt_{uid}"
+    s3_table = f"argorder_ok_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, x UInt64)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY intDiv(x, 1000) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 100), (2, 150)")
+    create_wildcard_destination(node, s3_table, "id UInt64, x UInt64", "intDiv(x, 100)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED", timeout=90)
+
+    # A wildcard destination cannot be read as a table, so read the objects it wrote.
+    exported = f"s3(s3_conn, filename='{s3_table}/**/*.parquet', format='Parquet', structure='id UInt64, x UInt64')"
+    src = node.query(f"SELECT id, x FROM {mt_table} ORDER BY id")
+    dst = node.query(f"SELECT id, x FROM {exported} ORDER BY id")
+    assert dst == src, f"destination rows differ from source:\nsrc={src!r}\ndst={dst!r}"
+
+    directories = node.query(
+        f"SELECT DISTINCT extract(_path, '{s3_table}/[^/]*') FROM {exported}"
+    ).strip()
+    assert directories == f"{s3_table}/1", f"unexpected destination directories: {directories!r}"
+
+
+def test_export_partition_dest_nested_expression_accepted(cluster):
+    """A destination key that wraps the source key in a coarser transform - toYYYYMM(toDate(ts)) over
+    a source keyed by toDate(ts) - is a function of the source key, so every source partition sits
+    inside one destination partition whatever the data is."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"nested_mt_{uid}"
+    s3_table = f"nested_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, ts DateTime)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY toDate(ts) ORDER BY tuple()"
+    )
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')"
+    )
+    create_wildcard_destination(node, s3_table, "id UInt64, ts DateTime", "toYYYYMM(toDate(ts))")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED", timeout=90)
+
+    exported = f"s3(s3_conn, filename='{s3_table}/**/*.parquet', format='Parquet', structure='id UInt64, ts DateTime')"
+    src = node.query(f"SELECT id, ts FROM {mt_table} ORDER BY id")
+    dst = node.query(f"SELECT id, ts FROM {exported} ORDER BY id")
+    assert dst == src, f"destination rows differ from source:\nsrc={src!r}\ndst={dst!r}"
+
+    directories = node.query(
+        f"SELECT DISTINCT extract(_path, '{s3_table}/[^/]*') FROM {exported}"
+    ).strip()
+    assert directories == f"{s3_table}/202403", (
+        f"unexpected destination directories: {directories!r}"
+    )
+
+
+def test_export_partition_dest_term_over_two_columns_rejected(cluster):
+    """A destination expression over two columns is only single-valued when the source key pins both.
+    This source pins b but only intDiv(a, 100), so a spans [10, 90] within one source partition and
+    intDiv(a + b, 100) takes both 0 and 1 there. Per-column min/max cannot bound such an expression,
+    so it is rejected; a source keyed by (a, b) would be accepted, since it pins both columns."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"twocol_mt_{uid}"
+    s3_table = f"twocol_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, a UInt64, b UInt64)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY (intDiv(a, 100), b) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 10, 20), (2, 90, 20)")
+    create_wildcard_destination(
+        node, s3_table, "id UInt64, a UInt64, b UInt64", "intDiv(a + b, 100)"
+    )
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
+class RejectedPartitionExportCase(NamedTuple):
+    src_columns: str
+    src_partition_by: str
+    dst_columns: str
+    dst_partition_by: str
+    insert_values: str
+    error_substrings: tuple = ()
+
+
+REJECTED_PARTITION_EXPORT_CASES = [
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32",
+            src_partition_by="a",
+            dst_columns="b Int32, a Int32",
+            dst_partition_by="a",
+            insert_values="(1, 1), (1, 2)",
+            error_substrings=("partition key column",),
+        ),
+        id="same_partition_key_different_column_order_single_column",
+    ),
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b, c)",
+            dst_columns="c Int32, b Int32, a Int32, val String",
+            dst_partition_by="(a, b, c)",
+            insert_values="(1, 1, 1, 'x'), (1, 1, 1, 'y')",
+            error_substrings=("partition key column",),
+        ),
+        id="same_partition_key_different_column_order_multi_column",
+    ),
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b)",
+            dst_columns="a Int32, b Int32, c Int32, val String",
+            dst_partition_by="(a, b, c)",
+            insert_values="(1, 2, 3, 'x')",
+            error_substrings=(
+                "column 'c', which is not part of the source MergeTree partition key",
+            ),
+        ),
+        id="multi_column_partition_key_more_in_destination",
+    ),
+]
+
+
+@pytest.mark.parametrize("case", REJECTED_PARTITION_EXPORT_CASES)
+def test_export_partition_partition_key_mismatch_variants_are_rejected(cluster, case):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"rejected_mt_table_{postfix}"
+    s3_table = f"rejected_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} ({case.src_columns})
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY {case.src_partition_by}
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} ({case.dst_columns})
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY {case.dst_partition_by}
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES {case.insert_values}")
+
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    for substring in case.error_substrings:
+        assert substring in error, f"Expected {substring!r} in error, got: {error}"
+
+    error_all = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+
+
+@pytest.mark.parametrize(
+    "dst_partition_by",
+    ["(a, b, c)", "(c, b, a)", "(a, b)"],
+    ids=["same", "reordered", "coarser"],
+)
+def test_export_partition_multi_column_partition_key_success(cluster, dst_partition_by):
+    """The source key pins every column the destination partitions by, so the destination may
+    also name them in another order or leave some out: each destination expression is still
+    single-valued over a source partition."""
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multi_pkey_ok_mt_table_{postfix}"
+    s3_table = f"multi_pkey_ok_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY (a, b, c)
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY {dst_partition_by}
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x'), (1, 2, 3, 'y')")
+
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, partition_id, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 2, f"Expected 2 rows in destination after export, got {count}"
+
+    result = node.query(f"SELECT a, b, c, val FROM {s3_table} ORDER BY val").strip()
+    assert result == "1\t2\t3\tx\n1\t2\t3\ty", f"Unexpected exported data:\n{result}"
+
+
+def test_export_partition_multi_column_partition_key_success_all(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multi_pkey_ok_all_mt_table_{postfix}"
+    s3_table = f"multi_pkey_ok_all_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY (a, b, c)
+        ORDER BY tuple()
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY (a, b, c)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x'), (4, 5, 6, 'y')")
+
+    partition_ids = node.query(
+        f"SELECT DISTINCT partition_id FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY partition_id"
+    ).strip().split("\n")
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+
+    for pid in partition_ids:
+        wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 2, f"Expected 2 rows in destination after export, got {count}"
+
+    result = node.query(f"SELECT a, b, c, val FROM {s3_table} ORDER BY val").strip()
+    assert result == "1\t2\t3\tx\n4\t5\t6\ty", f"Unexpected exported data:\n{result}"
+
+
+@pytest.mark.parametrize("schema_match_mode", EXTRA_SOURCE_COLUMN_MODES)
+def test_export_partition_schema_match_mode_honored_by_non_initiating_replica(cluster, schema_match_mode):
+    replica1 = cluster.instances["replica1"]
+    replica2 = cluster.instances["replica2"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"schema_mode_cross_replica_mt_{postfix}"
+    s3_table = f"schema_mode_cross_replica_s3_{postfix}"
+
+    make_rmt(node=replica1, name=mt_table, columns="id UInt64, year UInt16, extra String",
+             partition_by="year", replica_name="replica1")
+    make_rmt(node=replica2, name=mt_table, columns="id UInt64, year UInt16, extra String",
+             partition_by="year", replica_name="replica2")
+    replica1.query(f"INSERT INTO {mt_table} VALUES (1, 2020, 'foo'), (2, 2020, 'bar'), (3, 2020, 'baz')")
+    replica2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    create_s3_table(node=replica1, s3_table=s3_table)
+    create_s3_table(node=replica2, s3_table=s3_table)
+
+    replica1.query(f"SYSTEM STOP MOVES {mt_table}")
+
+    replica1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+        f" SETTINGS export_merge_tree_part_schema_match_mode = '{schema_match_mode}',"
+        f" export_merge_tree_part_ignore_extra_source_columns = 1"
+    )
+
+    wait_for_export_status(node=replica1, source_table=mt_table, dest_table=s3_table,
+                            partition_id="2020", expected_status="COMPLETED", timeout=60)
+
+    count = int(replica1.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 3, f"Expected 3 rows in destination table after export, got {count}"
+
+    result = replica1.query(f"SELECT id, year FROM {s3_table} ORDER BY id").strip()
+    assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected data:\n{result}"
+
+    replica1.query(f"SYSTEM START MOVES {mt_table}")
+
+
+def test_export_partition_match_by_name_honored_by_non_initiating_replica(cluster):
+    replica1 = cluster.instances["replica1"]
+    replica2 = cluster.instances["replica2"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"match_by_name_cross_replica_mt_{postfix}"
+    s3_table = f"match_by_name_cross_replica_s3_{postfix}"
+
+    source_columns = "id UInt64, year UInt16, omitted String, payload String"
+    make_rmt(
+        node=replica1,
+        name=mt_table,
+        columns=source_columns,
+        partition_by="year",
+        replica_name="replica1",
+    )
+    make_rmt(
+        node=replica2,
+        name=mt_table,
+        columns=source_columns,
+        partition_by="year",
+        replica_name="replica2",
+    )
+    replica1.query(
+        f"INSERT INTO {mt_table} VALUES "
+        f"(1, 2020, 'left', 'first'), (2, 2020, 'right', 'second')"
+    )
+    replica2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    for replica in (replica1, replica2):
+        replica.query(
+            f"CREATE TABLE {s3_table} (payload String, year UInt16, id UInt64) "
+            f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, "
+            f"partition_strategy='hive') PARTITION BY year"
+        )
+
+    replica1.query(f"SYSTEM STOP MOVES {mt_table}")
+
+    replica1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+        f" SETTINGS export_merge_tree_part_schema_match_mode = 'NAME',"
+        f" export_merge_tree_part_ignore_extra_source_columns = 1"
+    )
+
+    wait_for_export_status(
+        node=replica1,
+        source_table=mt_table,
+        dest_table=s3_table,
+        partition_id="2020",
+        expected_status="COMPLETED",
+        timeout=60,
+    )
+
+    result = replica1.query(
+        f"SELECT payload, year, id FROM {s3_table} ORDER BY id"
+    ).strip()
+    assert result == "first\t2020\t1\nsecond\t2020\t2", f"Unexpected data:\n{result}"
+
+    replica1.query(f"SYSTEM START MOVES {mt_table}")
+
+
+def test_export_partition_match_by_name_with_equal_column_count_reordered(cluster):
+    """Test that match_by_name matches columns by name even with an equal source/destination column count."""
+    replica1 = cluster.instances["replica1"]
+    replica2 = cluster.instances["replica2"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"match_by_name_equal_count_mt_{postfix}"
+    s3_table = f"match_by_name_equal_count_s3_{postfix}"
+
+    source_columns = "id UInt64, year UInt16, payload String"
+    make_rmt(node=replica1, name=mt_table, columns=source_columns,
+             partition_by="year", replica_name="replica1")
+    make_rmt(node=replica2, name=mt_table, columns=source_columns,
+             partition_by="year", replica_name="replica2")
+    replica1.query(f"INSERT INTO {mt_table} VALUES (1, 2020, 'foo'), (2, 2020, 'bar')")
+    replica2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    for replica in (replica1, replica2):
+        replica.query(
+            f"CREATE TABLE {s3_table} (payload String, id UInt64, year UInt16) "
+            f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, "
+            f"partition_strategy='hive') PARTITION BY year"
+        )
+
+    replica1.query(f"SYSTEM STOP MOVES {mt_table}")
+
+    replica1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+        f" SETTINGS export_merge_tree_part_schema_match_mode = 'NAME'"
+    )
+
+    wait_for_export_status(node=replica1, source_table=mt_table, dest_table=s3_table,
+                            partition_id="2020", expected_status="COMPLETED", timeout=60)
+
+    result = replica1.query(f"SELECT id, year, payload FROM {s3_table} ORDER BY id").strip()
+    assert result == "1\t2020\tfoo\n2\t2020\tbar", f"Unexpected data:\n{result}"
+
+    replica1.query(f"SYSTEM START MOVES {mt_table}")

@@ -47,10 +47,29 @@ SETTINGS allow_experimental_export_merge_tree_part = 1
 
 ## Requirements
 
-Source and destination tables must be 100% compatible:
+Source and destination tables must support positional schema conversion. The following differences between the two schemas are allowed:
 
-1. **Identical schemas** - same columns, types, and order
-2. **Matching partition keys** - partition expressions must be identical
+- **Column names** may differ between source and destination for non-partition-key columns when `export_merge_tree_part_schema_match_mode = 'POSITION'` (the default) - columns are matched by position, similar to `INSERT INTO dest SELECT * FROM src`, not by name. Set `export_merge_tree_part_schema_match_mode = 'NAME'` to match columns by their exact, case-sensitive name instead, allowing destination columns to be declared in a different order than the source.
+- **Column types** may differ, as long as the source type is safely castable to the destination type. Set `export_merge_tree_part_allow_lossy_cast = 1` to also permit lossy casts.
+- **`Tuple` element names** may differ if either the source or destination declares the tuple without named elements: an unnamed `Tuple` (e.g. `Tuple(Int32, Int32)`) is matched against the destination by element position and type only, not by name. For example, exporting from `t Tuple(Int32, Int32)` to `t Tuple(x Int32, y Int32)` is allowed as long as element types match positionally.
+
+The following requirements apply to the source and destination:
+
+1. **Column count** - by default, every source column must have a corresponding destination column, and vice versa; a mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`. Which source column corresponds to which destination column is determined by `export_merge_tree_part_schema_match_mode`. Set `export_merge_tree_part_ignore_extra_source_columns = 1` to relax this in one direction: a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is always rejected, regardless of this setting.
+2. **`PARTITION BY` expressions** - the whole part must land in a single destination partition. Identical expressions always satisfy this; otherwise the destination expression has to be computable from the values the source partition key pins, or be proven single-valued over the part's min/max range. The same requirement applies to the partition fields and transforms of an Apache Iceberg destination. See [Source partition key compatibility](/docs/en/antalya/partition_export.md#source-partition-key-compatibility).
+3. **The position of every column backing the partition key** - it is not enough for the `PARTITION BY` expressions to be textually identical: every top-level column that provides a column or subcolumn used by the source table's partition key must have the same name at the same position in the destination table's schema. If such a column contains a named `Tuple`, its element names must also be declared in the same order (an unnamed `Tuple` on either side is exempt from this, per the allowance above). This comparison is recursive through nested tuples and through container types such as `Array` and `Map`.
+
+  For example, `CREATE TABLE src (a Int32, b Int32) ... PARTITION BY a` and `CREATE TABLE dst (b Int32, a Int32) ... PARTITION BY a` both have the expression `PARTITION BY a`, but `a` is at position 0 in `src` and position 1 in `dst`. The export is rejected with a `BAD_ARGUMENTS` exception whose message includes `Cannot export to <destination>: partition key column 'a' is at position 0 in the source table, but the destination's column at that position is named 'b'`.
+
+  This position check applies only to partition-key columns. A mismatch in the position of a non-partition-key column is allowed by name (see above) and is only rejected if the resulting types aren't castable. If two non-partition-key columns happen to have swapped positions but compatible types, the export succeeds and silently writes values into the wrong destination column, so keep the intended column order rather than relying on type compatibility alone.
+
+  For `PARTITION BY t.a`, this rule applies to the top-level owning column `t`. Exporting from `t Tuple(a Int32, b Int32)` to `t Tuple(b Int32, a Int32)` is rejected, even though `a` is accessed by name. Requiring a stable layout for every partition-key owner also protects positional expressions such as `tupleElement(t, 1)` from changing their meaning after conversion.
+
+  The same rule applies when the named tuple is nested inside a container. For example, `arr Array(Tuple(a Int32, b Int32))` and `arr Array(Tuple(b Int32, a Int32))` are incompatible when `arr` provides an input to the partition key. Likewise, tuple layouts in both the key and value types of `Map` are checked recursively.
+
+  In this case, the export throws a `BAD_ARGUMENTS` exception whose message includes `partition key column 't' has a different Tuple element layout in the source (Tuple(a Int32, b Int32)) and destination (Tuple(b Int32, a Int32)). Tuple element names must be declared in the same order in both tables`.
+
+  For partition expressions containing functions, the check applies to their input columns. For example, `PARTITION BY (toYYYYMM(ts), category)` requires both `ts` and `category` to have the same names at the same top-level positions in both tables.
 
 In case a table function is used as the destination, the schema can be omitted and it will be inferred from the source table.
 
@@ -116,6 +135,26 @@ In case a table function is used as the destination, the schema can be omitted a
   When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use. This keeps the Iceberg metadata consistent with the data files.
 
   **Warning:** A lossy cast on a partition column remains semantically truncating. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into a destination `Int32` partition column, both the data files and the Iceberg metadata will contain the truncated `Int32` value (they agree with each other, but the original `Int64` value is lost). Such casts require `export_merge_tree_part_allow_lossy_cast = 1`.
+
+### `export_merge_tree_part_schema_match_mode` (Optional)
+
+- **Type**: `MergeTreePartExportSchemaMatchMode`
+- **Default**: `POSITION`
+- **Description**: Controls how `EXPORT PART`/`EXPORT PARTITION` matches source `MergeTree` columns to destination columns. Possible values:
+  - `POSITION` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
+  - `NAME` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source, including when it was renamed, throws `THERE_IS_NO_COLUMN`; there is no positional fallback.
+
+  See `export_merge_tree_part_ignore_extra_source_columns` below for how a source column without a corresponding destination column is handled in each mode.
+
+### `export_merge_tree_part_ignore_extra_source_columns` (Optional)
+
+- **Type**: `Bool`
+- **Default**: `false`
+- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates a source `MergeTree` column that has no corresponding destination column.
+  - `false` (default) - such a source column is rejected: the source and destination must match exactly. A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+  - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is still always rejected.
+
+  Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion and `export_merge_tree_part_allow_lossy_cast` are applied after columns are matched.
 
 
 ## Examples

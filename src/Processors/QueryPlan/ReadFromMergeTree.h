@@ -259,6 +259,10 @@ public:
 
     const Names & getAllColumnNames() const { return all_column_names; }
 
+    /// True if a coordinator-side snapshot boundary is pinned (e.g. select_sequential_consistency).
+    /// Such a read cannot be distributed: a worker reads from its own snapshot and cannot reproduce it.
+    bool hasPinnedBlockNumbers() const { return max_block_numbers_to_read != nullptr; }
+
     StorageID getStorageID() const { return data.getStorageID(); }
     UInt64 getSelectedParts() const { return selected_parts; }
     UInt64 getSelectedRows() const { return selected_rows; }
@@ -381,6 +385,12 @@ public:
     bool isSkipIndexAvailableForTopK(const String & sort_column) const;
     const ProjectionIndexReadDescription & getProjectionIndexReadDescription() const { return projection_index_read_desc; }
     ProjectionIndexReadDescription & getProjectionIndexReadDescription() { return projection_index_read_desc; }
+    /// In distributed query plan, this step will be executed in a distributed manner - shards will be read in parallel.
+    void setDistributedRead(size_t bucket_count);
+    /// Parts (by name) every worker buckets over, so the partition is identical across replicas.
+    void setDistributedReadParts(Names part_names);
+    /// Makes a list of shards to read in parallel in distributed query plan
+    Strings getShardsForDistributedRead() const;
 
     bool canRemoveUnusedColumns() const override;
     RemovedUnusedColumns removeUnusedColumns(NameMultiSet required_outputs, bool remove_inputs) override;
@@ -392,6 +402,10 @@ public:
     void addStartingPartOffsetAndPartOffset(bool & added_part_starting_offset, bool & added_part_offset);
 
     void deferFiltersAfterFinalIfNeeded();
+
+    void serialize(Serialization & ctx) const override;
+    bool isSerializable() const override { return true; }
+    static std::unique_ptr<IQueryPlanStep> deserialize(Deserialization & ctx);
 
 private:
     MergeTreeSettingsPtr data_settings;
@@ -533,6 +547,11 @@ private:
 
     std::optional<TopKFilterInfo> top_k_filter_info;
     ProjectionIndexReadDescription projection_index_read_desc;
+    /// This is set when this step is part of a distributed query plan and it will be executed in a distributed manner.
+    /// "bucket_id" task parameter will be used to determine what part of the data to read.
+    size_t distributed_read_bucket_count = 0;
+    /// Coordinator-selected parts a distributed-read worker buckets over. Empty otherwise.
+    Names distributed_read_part_names;
 };
 
 }

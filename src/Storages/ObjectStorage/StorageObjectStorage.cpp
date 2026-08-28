@@ -1,6 +1,7 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
 #include <Common/logger_useful.h>
@@ -11,6 +12,7 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/castColumn.h>
 
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ReadFromObjectStorageStep.h>
@@ -597,7 +599,7 @@ bool StorageObjectStorage::optimize(
     bool /*cleanup*/,
     [[maybe_unused]] ContextPtr context)
 {
-    return configuration->optimize(metadata_snapshot, context, format_settings);
+    return configuration->optimize(object_storage, metadata_snapshot, context, format_settings);
 }
 
 bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
@@ -644,7 +646,24 @@ SinkToStoragePtr StorageObjectStorage::import(
 
     if (configuration->getPartitionStrategy())
     {
-        const auto column_with_partition_key = configuration->getPartitionStrategy()->computePartitionKey(block_with_partition_values);
+        /// The values still carry the source table's types, but the partition key is rendered as text into the
+        /// object path and read back in this table's types, so it must be expressed in them first. A DateTime
+        /// in another time zone is the sharpest case: the epoch is the same, yet its text names another instant.
+        Block block_in_destination_types = block_with_partition_values;
+        const auto destination_sample = getInMemoryMetadataPtr()->getSampleBlock();
+        for (auto & column : block_in_destination_types)
+        {
+            if (!destination_sample.has(column.name))
+                continue;
+
+            const auto & destination_type = destination_sample.getByName(column.name).type;
+            column.column = castColumn(column, destination_type);
+            /// castColumn is a no-op between types IDataType::equals considers equal, which includes DateTime
+            /// with different time zones, so relabel the column: serialization follows the type, not the values.
+            column.type = destination_type;
+        }
+
+        const auto column_with_partition_key = configuration->getPartitionStrategy()->computePartitionKey(block_in_destination_types);
 
         if (!column_with_partition_key->empty())
         {
@@ -668,7 +687,7 @@ SinkToStoragePtr StorageObjectStorage::import(
         local_context);
 }
 
-void StorageObjectStorage::commitExportPartitionTransaction(
+IStorage::ExportPartitionCommitInfo StorageObjectStorage::commitExportPartitionTransaction(
     const String & transaction_id,
     const String & partition_id,
     const Strings & exported_paths,
@@ -690,7 +709,7 @@ void StorageObjectStorage::commitExportPartitionTransaction(
         const auto partition_spec_id   = iceberg_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
 
         configuration->lazyInitializeIfNeeded(object_storage, local_context);
-        configuration->getExternalMetadata()->commitExportPartitionTransaction(
+        return configuration->getExternalMetadata()->commitExportPartitionTransaction(
             catalog,
             storage_id,
             transaction_id,
@@ -700,16 +719,20 @@ void StorageObjectStorage::commitExportPartitionTransaction(
             std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
             exported_paths,
             local_context);
-        return;
     }
 
     const String commit_object = configuration->getRawPath().path + "/commit_" + partition_id + "_" + transaction_id;
+
+    ExportPartitionCommitInfo result;
+    result.commit_marker_file = commit_object;
 
     /// if file already exists, nothing to be done
     if (object_storage->exists(StoredObject(commit_object)))
     {
         LOG_DEBUG(getLogger("StorageObjectStorage"), "Commit file already exists, nothing to be done: {}", commit_object);
-        return;
+        /// Still surface the path: observability does not require we wrote it,
+        /// only that it is the committed marker for this transaction.
+        return result;
     }
 
     auto out = object_storage->writeObject(StoredObject(commit_object), WriteMode::Rewrite, /* attributes= */ {}, DBMS_DEFAULT_BUFFER_SIZE, local_context->getWriteSettings());
@@ -719,6 +742,7 @@ void StorageObjectStorage::commitExportPartitionTransaction(
         out->write("\n", 1);
     }
     out->finalize();
+    return result;
 }
 
 void StorageObjectStorage::truncate(
@@ -902,7 +926,7 @@ void StorageObjectStorage::mutate([[maybe_unused]] const MutationCommands & comm
 
 void StorageObjectStorage::checkMutationIsPossible(const MutationCommands & commands, const Settings & /* settings */) const
 {
-    configuration->checkMutationIsPossible(commands);
+    configuration->checkMutationIsPossible(object_storage, CurrentThread::tryGetQueryContext(), commands);
 }
 
 Pipe StorageObjectStorage::executeCommand(const String & command_name, const ASTPtr & args, ContextPtr context)
@@ -918,7 +942,7 @@ void StorageObjectStorage::alter(const AlterCommands & params, ContextPtr contex
     StorageInMemoryMetadata new_metadata = getInMemoryMetadata();
     params.apply(new_metadata, context);
 
-    configuration->alter(params, context);
+    configuration->alter(object_storage, params, context);
 
     DatabaseCatalog::instance()
         .getDatabase(storage_id.database_name)
@@ -926,9 +950,9 @@ void StorageObjectStorage::alter(const AlterCommands & params, ContextPtr contex
     setInMemoryMetadata(new_metadata);
 }
 
-void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, ContextPtr /*context*/) const
+void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const
 {
-    configuration->checkAlterIsPossible(commands);
+    configuration->checkAlterIsPossible(object_storage, context, commands);
 }
 
 }

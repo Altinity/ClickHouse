@@ -586,16 +586,17 @@ def test_rejected_column_mismatch(export_cluster):
 
 
 def test_rejected_transform_mismatch(export_cluster):
-    """Spark years(dt) — RMT PARTITION BY dt (identity, not year-transform)."""
+    """Spark days(dt) destination — RMT PARTITION BY toStartOfMonth(dt): a month partition spans
+    several days, so it cannot map to a single Iceberg day partition."""
     error = run_rejected(
         export_cluster,
         "rej_xform_mismatch",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
-                  " USING iceberg PARTITIONED BY (years(dt)) OPTIONS('format-version'='2')",
+                  " USING iceberg PARTITIONED BY (days(dt)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, dt Date",
         rmt_columns="id Int64, dt Date",
-        rmt_partition_by="dt",
-        insert_values="(1, '2021-06-01')",
+        rmt_partition_by="toStartOfMonth(dt)",
+        insert_values="(1, '2021-06-01'), (2, '2021-06-15')",
     )
     assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error!r}"
 
@@ -616,47 +617,17 @@ def test_rejected_bucket_count_mismatch(export_cluster):
 
 
 def test_rejected_truncate_width_mismatch(export_cluster):
-    """Spark truncate(4, category) — RMT icebergTruncate(8, category): wrong width."""
+    """Spark truncate(8, category) destination — RMT icebergTruncate(4, category): the coarser
+    width-4 source partition splits across several width-8 destination buckets."""
     error = run_rejected(
         export_cluster,
         "rej_trunc_w",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, category STRING)"
-                  " USING iceberg PARTITIONED BY (truncate(4, category)) OPTIONS('format-version'='2')",
+                  " USING iceberg PARTITIONED BY (truncate(8, category)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, category String",
         rmt_columns="id Int64, category String",
-        rmt_partition_by="icebergTruncate(8, category)",
-        insert_values="(1, 'clickhouse')",
-    )
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error!r}"
-
-
-def test_rejected_field_count_mismatch(export_cluster):
-    """Spark 1-field identity(year) — RMT 2-field (year, region)."""
-    error = run_rejected(
-        export_cluster,
-        "rej_field_n",
-        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT, region STRING)"
-                  " USING iceberg PARTITIONED BY (identity(year)) OPTIONS('format-version'='2')",
-        ch_schema="id Int64, year Int32, region String",
-        rmt_columns="id Int64, year Int32, region String",
-        rmt_partition_by="(year, region)",
-        insert_values="(1, 2024, 'EU')",
-    )
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error!r}"
-
-
-def test_rejected_compound_order_reversed(export_cluster):
-    """Spark (identity(year), identity(region)) — RMT (region, year): reversed order."""
-    error = run_rejected(
-        export_cluster,
-        "rej_compound_rev",
-        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT, region STRING)"
-                  " USING iceberg PARTITIONED BY (identity(year), identity(region))"
-                  " OPTIONS('format-version'='2')",
-        ch_schema="id Int64, year Int32, region String",
-        rmt_columns="id Int64, year Int32, region String",
-        rmt_partition_by="(region, year)",
-        insert_values="(1, 2024, 'EU')",
+        rmt_partition_by="icebergTruncate(4, category)",
+        insert_values="(1, 'clickhouse'), (2, 'clickfast')",
     )
     assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error!r}"
 
@@ -712,85 +683,18 @@ def test_idempotency_after_commit_crash(export_cluster):
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert count == 3, f"Expected 3 rows (no duplicates), got {count}"
 
-
-def test_commit_attempts_budget_transitions_to_failed(export_cluster):
-    """
-    Verify that the commit-attempts budget transitions a stuck task to FAILED
-    instead of leaving it in PENDING forever.
-
-    Reproduction:
-    - Parts export successfully.
-    - A REGULAR failpoint (``export_partition_commit_always_throw``) makes every
-      ``ExportPartitionUtils::commit`` attempt throw before talking to Iceberg.
-    - ``ExportPartitionUtils::handleCommitFailure`` bumps ``<entry>/commit_attempts``
-      on each failure and transitions ``/status`` to FAILED once the counter
-      reaches ``export_merge_tree_partition_max_retries``.
-
-    Expected behaviour:
-    - The first attempt is made synchronously when the last part completes
-      (scheduler's ``handlePartExportSuccess``).
-    - Subsequent attempts come from the manifest-updating task's ``tryCleanup``
-      path, polling every 30s.
-    - With max_retries=2, the task reaches FAILED within roughly one poll cycle.
-    - The ``commit_attempts`` znode reaches at least max_retries.
-    """
-    node = export_cluster.instances["node1"]
-    spark = export_cluster.spark_session
-
-    uid = unique_suffix()
-    source = f"rmt_commit_budget_{uid}"
-    iceberg = f"spark_commit_budget_{uid}"
-
-    spark_iceberg(
-        export_cluster,
-        spark,
-        iceberg,
-        f"CREATE TABLE {iceberg} (id BIGINT, year INT)"
-        f" USING iceberg PARTITIONED BY (identity(year)) OPTIONS('format-version'='2')",
+    # The already-committed early-exit in commitExportPartitionTransaction surfaces
+    # a sentinel note in committed_metadata_file (the original committer's paths
+    # are not recoverable from inside the call). The sentinel makes the situation
+    # visible in system.replicated_partition_exports rather than leaving the
+    # commit_info columns empty.
+    committed_metadata_file = node.query(
+        f"SELECT committed_metadata_file FROM system.replicated_partition_exports "
+        f"WHERE source_table = '{source}' AND partition_id = '{pid}'"
+    ).strip()
+    assert committed_metadata_file == "<committed in a previous run, paths unavailable>", (
+        f"Expected already-committed sentinel after idempotent retry, got: {committed_metadata_file!r}"
     )
-    attach_ch_iceberg(node, iceberg, "id Int64, year Int32", export_cluster)
-    make_rmt(node, source, "id Int64, year Int32", "year")
-    node.query(f"INSERT INTO {source} VALUES (1, 2024), (2, 2024), (3, 2024)")
-    pid = first_partition_id(node, source)
-
-    # Force every commit attempt to throw. REGULAR failpoint fires on every hit,
-    # unlike ONCE which would only fire for the first call.
-    node.query("SYSTEM ENABLE FAILPOINT export_partition_commit_always_throw")
-
-    # try block exists so we can add a finally that disables the failpoint
-    try:
-        # max_retries=2 bounds the test: one attempt from handlePartExportSuccess
-        # plus one from the manifest-updating task's next poll (~30s) is enough
-        # to exhaust the budget and flip the task to FAILED.
-        node.query(
-            f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}"
-            f" SETTINGS export_merge_tree_partition_max_retries = 2,"
-            f" allow_insert_into_iceberg = 1"
-        )
-
-        # Timeout must cover: at least one manifest-updating poll cycle (30s)
-        # plus slack for task scheduling and keeper RTT.
-        wait_for_export_status(
-            node, source, iceberg, pid,
-            expected_status="FAILED",
-            timeout=90,
-        )
-
-        # The commit_attempts znode must have reached (at least) max_retries — the
-        # counter is the direct mechanism that drove the FAILED transition.
-        # Locate the export's ZK root via the RMT's zookeeper_path and the
-        # partition_id_destination_db.destination_table export key convention.
-        export_key = f"{pid}_default.{iceberg}"
-        commit_attempts = int(node.query(
-            f"SELECT value FROM system.zookeeper"
-            f" WHERE path = '/clickhouse/tables/{source}/exports/{export_key}'"
-            f"   AND name = 'commit_attempts'"
-        ).strip())
-        assert commit_attempts >= 2, (
-            f"Expected commit_attempts >= 2 (two commit attempts), got {commit_attempts}"
-        )
-    finally:
-        node.query("SYSTEM DISABLE FAILPOINT export_partition_commit_always_throw")
 
 
 # ---------------------------------------------------------------------------

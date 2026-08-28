@@ -1046,6 +1046,18 @@ Allows or restricts using [Variant](../../sql-reference/data-types/variant.md) a
     DECLARE(Bool, use_variant_default_implementation_for_comparisons, true, R"(
 Enables or disables default implementation for Variant type in comparison functions.
 )", 0) \
+    DECLARE(Bool, variant_throw_on_type_mismatch, true, R"(
+When applying a function to a [Variant](../../sql-reference/data-types/variant.md) column using the default implementation,
+controls what happens for rows whose actual type is incompatible with the function:
+- `true` (default) — throw an exception.
+- `false` — return `NULL` for those rows instead.
+)", 0) \
+    DECLARE(Bool, dynamic_throw_on_type_mismatch, true, R"(
+When applying a function to a [Dynamic](../../sql-reference/data-types/dynamic.md) column using the default implementation,
+controls what happens for rows whose actual type is incompatible with the function:
+- `true` (default) — throw an exception.
+- `false` — return `NULL` for those rows instead.
+)", 0) \
     DECLARE(Bool, compile_expressions, true, R"(
 Compile some scalar functions and operators to native code.
 )", 0) \
@@ -6876,7 +6888,7 @@ Traverse frozen data (shadow directory) in addition to actual table data when qu
 If all four arguments to `geoDistance`, `greatCircleDistance`, `greatCircleAngle` functions are Float64, return Float64 and use double precision for internal calculations. In previous ClickHouse versions, the functions always returned Float32.
 )", 0) \
     DECLARE(Bool, allow_get_client_http_header, false, R"(
-Allow to use the function `getClientHTTPHeader` which lets to obtain a value of an the current HTTP request's header. It is not enabled by default for security reasons, because some headers, such as `Cookie`, could contain sensitive info. Note that the `X-ClickHouse-*` and `Authentication` headers are always restricted and cannot be obtained with this function.
+Allow to use the function `getClientHTTPHeader` which lets to obtain a value of the current HTTP request's header. It is not enabled by default for security reasons, because some headers, such as `Cookie`, could contain sensitive info. Note that the `X-ClickHouse-*`, `Authentication` and `Authorization` headers are always restricted and cannot be obtained with this function.
 )", 0) \
     DECLARE(Bool, cast_string_to_dynamic_use_inference, false, R"(
 Use types inference during String to Dynamic conversion
@@ -6993,9 +7005,12 @@ Query Iceberg table using the snapshot that was current at a specific timestamp.
     DECLARE(Int64, iceberg_snapshot_id, 0, R"(
 Query Iceberg table using the specific snapshot id.
 )", 0) \
-    DECLARE_WITH_ALIAS(Bool, show_remote_databases_in_system_tables, false, R"(
-Enables showing remote databases (data lake catalogs, MySQL, PostgreSQL) in system tables.
-)", 0, show_data_lake_catalogs_in_system_tables) \
+    DECLARE(Bool, show_data_lake_catalogs_in_system_tables, false, R"(
+Enables showing data lake catalogs in system tables.
+)", 0) \
+    DECLARE(Bool, show_remote_databases_in_system_tables, true, R"(
+Enables showing `MySQL` and `PostgreSQL` databases in system tables.
+)", 0) \
     DECLARE(Bool, delta_lake_enable_expression_visitor_logging, false, R"(
 Enables Test level logs of DeltaLake expression visitor. These logs can be too verbose even for test logging.
 )", 0) \
@@ -7555,8 +7570,14 @@ Overwrite file if it already exists when exporting a merge tree part
     DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
 Ignore existing partition export and overwrite the zookeeper entry
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_max_retries, 3, R"(
-Maximum number of retries for exporting a merge tree part in an export partition task
+    DECLARE(UInt64, export_merge_tree_partition_retry_initial_backoff_seconds, 5, R"(
+Initial delay (in seconds) before retrying a failed part export in an export partition task.
+The delay grows exponentially with the per-replica retry count (capped doubling): `delay = min(initial << (attempts - 1), max)`, where `max` is `export_merge_tree_partition_retry_max_backoff_seconds`.
+The back-off is per-replica in-memory state: it only spaces this replica's retries out in time and never prevents another replica from attempting the same part. Retryable failures are retried until the task succeeds or `export_merge_tree_partition_task_timeout_seconds` elapses.
+To survive a long transient outage (e.g. object storage downtime), raise `export_merge_tree_partition_task_timeout_seconds`.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_retry_max_backoff_seconds, 300, R"(
+Maximum delay (in seconds) between retries of a failed part export in an export partition task. Caps the exponential growth controlled by `export_merge_tree_partition_retry_initial_backoff_seconds`.
 )", 0) \
     DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 86400, R"(
 Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
@@ -7605,6 +7626,21 @@ Pattern for the filename of the exported merge tree part. The `part_name` and `c
 Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
 
 When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use, so the metadata stays consistent with the data. A lossy cast on a partition column remains semantically truncating: both the data files and the metadata contain the truncated value, and such casts require this setting to be enabled.
+)", 0) \
+    DECLARE(MergeTreePartExportSchemaMatchMode, export_merge_tree_part_schema_match_mode, MergeTreePartExportSchemaMatchMode::POSITION, R"(
+Controls how `EXPORT PART`/`EXPORT PARTITION` matches source `MergeTree` columns to destination columns.
+Possible values:
+- `POSITION` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
+- `NAME` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source throws `THERE_IS_NO_COLUMN`, with no positional fallback.
+
+See also `export_merge_tree_part_ignore_extra_source_columns`, which controls whether a source column without a corresponding destination column is dropped or rejected.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_ignore_extra_source_columns, false, R"(
+Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates source `MergeTree` columns that have no corresponding destination column.
+- `false` (default) - such a source column is rejected: the source and destination must match exactly (in `export_merge_tree_part_schema_match_mode = 'POSITION'`, this means the same number of columns; in `'NAME'`, the same set of column names). A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+- `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. In `POSITION` mode, this allows a source with extra trailing columns (the destination having more columns than the source is still always rejected). In `NAME` mode, this allows source columns whose name has no destination counterpart.
+
+Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
 )", 0) \
     \
     /* ####################################################### */ \
@@ -7803,7 +7839,7 @@ Run all tasks of a distributed query plan locally. Useful for testing and debugg
     DECLARE(NonZeroUInt64, distributed_plan_default_shuffle_join_bucket_count, 8, R"(
 Default number of buckets for distributed shuffle-hash-join.
 )", EXPERIMENTAL) \
-    DECLARE(UInt64, distributed_plan_default_reader_bucket_count, 8, R"(
+    DECLARE(NonZeroUInt64, distributed_plan_default_reader_bucket_count, 8, R"(
 Default number of tasks for parallel reading in distributed query. Tasks are spread across between replicas.
 )", EXPERIMENTAL) \
     DECLARE(Bool, distributed_plan_optimize_exchanges, true, R"(
@@ -7944,6 +7980,7 @@ Maximum number of WebAssembly UDF instances that can run in parallel per functio
 #define OBSOLETE_SETTINGS(M, ALIAS) \
     /** Obsolete settings which are kept around for compatibility reasons. They have no effect anymore. */ \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_manifest_ttl, 86400) \
+    MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_max_retries, 3) \
     MAKE_OBSOLETE(M, Bool, query_condition_cache_store_conditions_as_plaintext, false) \
     MAKE_OBSOLETE(M, Bool, update_insert_deduplication_token_in_dependent_materialized_views, 0) \
     MAKE_OBSOLETE(M, UInt64, max_memory_usage_for_all_queries, 0) \

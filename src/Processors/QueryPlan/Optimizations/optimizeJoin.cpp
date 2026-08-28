@@ -36,6 +36,11 @@
 #include <Processors/QueryPlan/Optimizations/joinOrder.h>
 
 #include <Storages/StorageMemory.h>
+#include <Processors/QueryPlan/ReadFromObjectStorageStep.h>
+
+#include <Processors/QueryPlan/LogicalExchangeStep.h>
+#include <Processors/QueryPlan/ShuffleExchangeStep.h>
+#include <Processors/QueryPlan/GatherExchangeStep.h>
 
 #include <algorithm>
 #include <limits>
@@ -232,7 +237,8 @@ RelationStats estimateAggregatingStepStats(const AggregatingStep & aggregating_s
     return aggregation_stats;
 }
 
-RelationStats estimateReadRowsCount(QueryPlan::Node & node, const ActionsDAG::Node * filter = nullptr)
+RelationStats estimateReadRowsCount(QueryPlan::Node & node, const ActionsDAG::Node * filter = nullptr);
+RelationStats estimateReadRowsCount(QueryPlan::Node & node, const ActionsDAG::Node * filter)
 {
     IQueryPlanStep * step = node.step.get();
     if (const auto * reading = typeid_cast<const ReadFromMergeTree *>(step))
@@ -292,6 +298,9 @@ RelationStats estimateReadRowsCount(QueryPlan::Node & node, const ActionsDAG::No
 
         return RelationStats{.estimated_rows = analyzed_result->selected_rows, .table_name = table_display_name};
     }
+
+    if (typeid_cast<const ReadFromObjectStorageStep *>(step))
+        return RelationStats{};
 
     if (const auto * reading = typeid_cast<const ReadFromMemoryStorageStep *>(step))
     {
@@ -441,6 +450,8 @@ bool convertLogicalJoinToPhysical(
     const QueryPlanOptimizationSettings & optimization_settings)
 {
     bool keep_logical = optimization_settings.keep_logical_steps;
+    /// Distributed plan keeps logical joins steps. They are converted to physical steps afterwards, when plan fragment is executed by a worker.
+    keep_logical |= optimization_settings.make_distributed_plan;
     if (keep_logical)
         return false;
     if (!typeid_cast<JoinStepLogical *>(node.step.get()))
@@ -1220,6 +1231,28 @@ void optimizeJoinLogicalImpl(JoinStepLogical * join_step, QueryPlan::Node & node
     {
         join_step->setOptimized();
         return;
+    }
+
+    /// Skip join order optimization if children's output headers have overlapping column names.
+    /// The `JoinExpressionActions` constructor used during join reconstruction requires unique column names
+    /// across left and right sides. Overlapping names can occur when scalar subquery results and join
+    /// table aliases collide (e.g. both sides produce `__table2`).
+    {
+        auto left_header = node.children[0]->step->getOutputHeader();
+        auto right_header = node.children[1]->step->getOutputHeader();
+
+        std::unordered_set<std::string_view> left_names;
+        for (const auto & col : *left_header)
+            left_names.insert(col.name);
+
+        for (const auto & col : *right_header)
+        {
+            if (left_names.contains(col.name))
+            {
+                join_step->setOptimized();
+                return;
+            }
+        }
     }
 
     QueryGraphBuilder query_graph_builder(optimization_settings, node, join_step->getJoinSettings(), join_step->getSortingSettings());

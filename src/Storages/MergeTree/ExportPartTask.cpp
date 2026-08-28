@@ -1,5 +1,6 @@
 #include <mutex>
 #include <Storages/MergeTree/ExportPartTask.h>
+#include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
@@ -18,6 +19,7 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include "Common/setThreadName.h"
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ProfileEventsScope.h>
 #include <Databases/DatabaseReplicated.h>
 #include <Storages/MergeTree/ExportList.h>
@@ -43,6 +45,19 @@ namespace ErrorCodes
     extern const int FILE_ALREADY_EXISTS;
     extern const int LOGICAL_ERROR;
     extern const int QUERY_WAS_CANCELLED;
+    extern const int BAD_ARGUMENTS;
+    extern const int FAULT_INJECTED;
+}
+
+namespace FailPoints
+{
+    extern const char export_part_pause_before_schema_validation[];
+    /// Throw a non-retryable (denylisted) error from the part-export worker, so the whole
+    /// export task transitions to FAILED immediately regardless of any timeout.
+    extern const char export_part_non_retryable_throw[];
+    /// Throw a retryable error from the part-export worker, so the part is retried with the
+    /// per-replica back-off until the task succeeds or the absolute timeout fires.
+    extern const char export_part_retryable_throw[];
 }
 
 namespace Setting
@@ -52,6 +67,8 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
     extern const SettingsBool allow_experimental_analyzer;
     extern const SettingsString export_merge_tree_part_filename_pattern;
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
 }
 
 namespace
@@ -99,22 +116,68 @@ namespace
         }
     }
 
-    /// Mirrors `InterpreterInsertQuery::addInsertToSelectPipeline`: positional match,
-    /// destination header = `getSampleBlockNonMaterialized()`, all type bridging is done
-    /// by the CAST inside `makeConvertingActions`. No pre-validation, no per-column
-    /// lossy/non-lossy classification — restrictions are exactly what INSERT SELECT enforces.
     void addExportConvertingActions(
         QueryPlan & plan_for_part,
         const IStorage & destination_storage,
         const ContextPtr & local_context)
     {
+        FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
+
         const auto destination_header
             = destination_storage.getInMemoryMetadataPtr()->getSampleBlockNonMaterialized();
+        const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
+
+        const auto schema_match_mode =
+            local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
+        const bool ignore_extra_source_columns =
+            local_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
+
+        auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
+        const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
+
+        ExportPartitionUtils::checkExportSchemaColumnsCount(
+            source_columns.size(),
+            destination_columns.size(),
+            ignore_extra_source_columns);
+
+        const ActionsDAG::MatchColumnsMode mode = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME
+            ? ActionsDAG::MatchColumnsMode::Name
+            : ActionsDAG::MatchColumnsMode::Position;
+
+        // makeConvertingActions with postitional mode requires equal columns count,
+        if (ActionsDAG::MatchColumnsMode::Position == mode && ignore_extra_source_columns && src_has_extra_columns)
+        {
+            LOG_DEBUG(getLogger("ExportPartTask"),
+                "Source has {} columns while destination has {} columns, "
+                "the {} extra trailing source column(s) will be ignored",
+                source_columns.size(), destination_columns.size(),
+                source_columns.size() - destination_columns.size());
+
+            Names kept_names;
+            kept_names.reserve(destination_columns.size());
+            for (size_t i = 0; i < destination_columns.size(); ++i)
+                kept_names.push_back(source_columns[i].name);
+
+            /// `allow_remove_inputs = false` keeps the dropped columns registered as DAG
+            /// inputs (just not as outputs), so `ExpressionActions::execute` still
+            /// recognizes and consumes them from the block instead of passing them through
+            /// unchanged. See the `defaults_dag` merge above for the same pattern.
+            ActionsDAG trim_dag(source_columns);
+            trim_dag.removeUnusedActions(kept_names, false);
+
+            auto trim_step = std::make_unique<ExpressionStep>(
+                plan_for_part.getCurrentHeader(),
+                std::move(trim_dag));
+            trim_step->setStepDescription("Drop source columns beyond destination schema for export");
+            plan_for_part.addStep(std::move(trim_step));
+
+            source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
+        }
 
         auto dag = ActionsDAG::makeConvertingActions(
-            plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName(),
-            destination_header.getColumnsWithTypeAndName(),
-            ActionsDAG::MatchColumnsMode::Position,
+            source_columns,
+            destination_columns,
+            mode,
             local_context);
 
         auto expression_step = std::make_unique<ExpressionStep>(
@@ -234,6 +297,18 @@ bool ExportPartTask::executeStep()
     {
         ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_PART);
 
+        fiu_do_on(FailPoints::export_part_non_retryable_throw,
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Failpoint: export_part_non_retryable_throw");
+        });
+
+        fiu_do_on(FailPoints::export_part_retryable_throw,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED,
+                "Failpoint: export_part_retryable_throw");
+        });
+
         const auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
 
         sink = destination_storage->import(
@@ -286,8 +361,6 @@ bool ExportPartTask::executeStep()
         /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
         materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
 
-        /// Align the pipeline header with the destination's non-materialized sample block,
-        /// using the same `makeConvertingActions(Position)` call INSERT SELECT performs.
         addExportConvertingActions(plan_for_part, *destination_storage, local_context);
 
         QueryPlanOptimizationSettings optimization_settings(local_context);
