@@ -15,9 +15,10 @@ ships as a **generation reset**, not a generation bump; and C++ members follow a
 rule** — a member may be fuller than its wire key, never more cryptic. Revision 3 incorporates the
 review of revision 2: the known-field sentinels stay, both pool-meta gates keep their own tests,
 the member rule is enforced absolutely (at the cost of one rename), the closed value sets are
-completed, and the `ProvenanceOp` wire words move into one constexpr table. The exact-full-name
-alternative was independently implemented in Altinity PR #2288 and rejected for this design (see
-rejected alternatives).
+completed, and the `ProvenanceOp` wire words move into one constexpr table. Revision 4
+(2026-08-29) extends the member-rule audit to codec-local collector structs, adding three renames.
+The exact-full-name alternative was independently implemented in Altinity PR #2288 and rejected
+for this design (see rejected alternatives).
 
 ## Problem {#problem}
 
@@ -129,11 +130,18 @@ Consequences:
 - `ManifestRef::writer_epoch` ↔ wire `epoch`, `SourceEdgeRecord::source_id` ↔ wire `src`,
   `EnvelopeHeader::incarnation_tag` ↔ wire `tag` are all legal: the member out-explains the key.
 - A member spelled `cr` against a wire key `condemn_round` would be illegal; so would introducing
-  any new initialism member alongside a readable key. The rule is absolute, and this design itself
-  introduces exactly one violation to fix: the wire key `key_generation` out-explains the member
-  `RunRef::generation`, so that member is renamed `key_generation` rather than weakening the rule
-  to a contextual one. No other member rename is required; beyond that the rule is a review gate
-  for future codecs.
+  any new initialism member alongside a readable key. The rule is absolute rather than contextual,
+  and it covers the members of every struct and class — codec-local collector structs included.
+  Ordinary function-local variables are not members and are out of scope (the same spirit applies,
+  but the rule does not police them).
+- The audit against this design finds four renames to make. In the public types, the wire key
+  `key_generation` out-explains `RunRef::generation`, so that member is renamed `key_generation`.
+  In the codec-local collectors, whose members currently mirror the old wire spellings, the
+  `ManifestFields` members `me`/`mb`/`mo` (one copy each in the ref-log and ref-snapshot codecs)
+  become `epoch`/`build`/`ord`, and the `BindingFields` members `bk`/`rn`/`mf` become
+  `kind`/`ref`/`manifest_fields` — otherwise the renamed wire would out-explain the very structs
+  that parse it. No other member rename is required; beyond these the rule is a review gate for
+  future codecs.
 - Where a semantic wire word collides with a C++ keyword, the member uses the established
   abbreviation or a fuller form, both compliant: wire `namespace` ↔ member `ns` (an established
   fragment, not a cryptic invention), wire `class` ↔ member `classification`.
@@ -435,8 +443,7 @@ this seal *is*, while a run row's value is the generation whose key namespace ph
 run object — and the two genuinely diverge when an idle shard carries its parent's run forward
 verbatim. One word for both would read as corruption in exactly the situation the carry-forward is
 designed for. The validator continues to cross-check the row value against the run `key`. The C++
-member `RunRef::generation` is renamed `key_generation` in the same change — the one member rename
-this design requires (see the member rule).
+member `RunRef::generation` is renamed `key_generation` in the same change (see the member rule).
 
 A `ref_life` row becomes:
 
@@ -707,8 +714,9 @@ The change is complete when:
 - a maximum-width production blob descriptor fits 240 bytes (one spare byte) and a default
   descriptor fits 256 bytes with a 17-byte `ref` budget, with the worst case derived from the
   single constexpr `ProvenanceOp` wire-word table shared with the codec;
-- no C++ member is more cryptic than its wire key, including the one rename this requires
-  (`RunRef::generation` to `key_generation`);
+- no C++ member is more cryptic than its wire key, including the four renames this requires:
+  `RunRef::generation` to `key_generation`, both `ManifestFields` collectors' `me`/`mb`/`mo` to
+  `epoch`/`build`/`ord`, and `BindingFields`' `bk`/`rn`/`mf` to `kind`/`ref`/`manifest_fields`;
 - common, codec, corruption, byte-budget, and exact-encoding unit tests pass for all 17 formats,
   and the battery covers exactly the registry;
 - raw assertions in integration tests and `utils/ca-soak` use the new spellings;
