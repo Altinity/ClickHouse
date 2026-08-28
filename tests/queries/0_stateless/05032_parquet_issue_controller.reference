@@ -1,4 +1,4 @@
--- same results for every bytes-in-flight target, with and without a filter, 1 and default parsing threads
+-- same results for every bytes-in-flight target (0 = read-ahead planning off), with and without a filter, 1 and default parsing threads
 44999850000	149850000	1394995350000	300000
 4486485000	1485000	139081035000	30000
 44999850000	149850000	1394995350000	300000
@@ -11,8 +11,16 @@
 4486485000	1485000	139081035000	30000
 44999850000	149850000	1394995350000	300000
 4486485000	1485000	139081035000	30000
--- reads are planned ahead; the queue waits when a budget is full and never waits when it isn't
-44999850000	1394995350000
-44999850000	1394995350000
-stalled	1	1
-unstalled	0	1
+44999850000	149850000	1394995350000	300000
+4486485000	1485000	139081035000	30000
+44999850000	149850000	1394995350000	300000
+4486485000	1485000	139081035000	30000
+-- reads are planned ahead; the queue waits when a budget is full, never waits when none is, and plans nothing when disabled
+85139716200000
+85139716200000
+85139716200000
+85139716200000
+disabled	0	1
+no_stall	0	1
+stall_pool	1	1
+stall_target	1	1

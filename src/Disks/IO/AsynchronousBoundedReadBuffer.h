@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <mutex>
 #include <utility>
 #include <IO/AsynchronousReader.h>
 #include <IO/ReadBufferFromFile.h>
@@ -80,6 +81,11 @@ private:
     Memory<> prefetch_buffer;
     /// mutable: a pending prefetch may be consumed from the const readBigAt().
     mutable std::future<IAsynchronousReader::Result> prefetch_future;
+    /// `readBigAt` is called concurrently (the Parquet reader issues its positioned reads from an io
+    /// thread pool), and it consumes `prefetch_future` / `prefetch_buffer`, which are shared. Every
+    /// `readBigAt` passes through this mutex before touching `impl`, so that exactly one call claims
+    /// the pending prefetch and no call reads `impl` while the prefetch task is still using it.
+    mutable std::mutex prefetch_consume_mutex;
 
     /// When using userspace page cache, we directly use memory owned by the cache instead of
     /// allocating our own buffers.

@@ -285,8 +285,12 @@ cannot drag megabytes of unrelated data through the cache or the network. `0` di
 Lower bound for the Parquet reader's bytes-in-flight target: the reader issues the index and data-page
 reads it has planned ahead of time until this many bytes (or more, if the fitted bandwidth times
 round-trip time of the storage asks for more) are being read at once. Higher values give the storage
-more concurrent requests to work on, at the cost of holding more compressed bytes in memory; the reads
-of the row group that is next to be delivered are always issued regardless of this bound.
+more concurrent requests to work on, at the cost of holding more compressed bytes in memory; the index
+reads of the row group that is next to be delivered, and the pages of the subgroup it reads next, are
+always issued regardless of this bound.
+
+`0` disables read-ahead planning; the reader issues reads on demand as before. Values below the fitted
+floor of 4 x `input_format_parquet_bytes_per_read_task` have no additional effect.
 )", 0) \
     DECLARE(Bool, input_format_arrow_allow_missing_columns, true, R"(
 Allow missing columns while reading Arrow input formats

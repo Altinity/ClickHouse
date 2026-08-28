@@ -232,6 +232,13 @@ void ReadManager::finishRowGroupStage(size_t row_group_idx, ReadStage stage, Mem
                     /// has been scheduled for this row group yet (the tasks below are only queued;
                     /// `flushMemoryUsageDiff` schedules them), so we're the only thread touching
                     /// these column chunks.
+                    /// Only the columns whose offset index is already decoded (the ones with a
+                    /// column-index condition) can be planned here; the rest are planned by the
+                    /// second hook, in `finishRowSubgroupStage`, once the per-subgroup `OffsetIndex`
+                    /// stage has decoded them. Deliberately without setting `page_reads_planned`:
+                    /// that hook must still run for the remaining columns, and re-walking the ones
+                    /// planned here is a no-op because `determinePagesToPrefetch` has already
+                    /// advanced their page cursor to the end.
                     size_t first_step = reader.steps.empty() ? 0 : 1;
                     enqueueRowGroupPageReads(row_group_idx, first_step);
                     pumpIssueQueue(diff);
@@ -604,6 +611,12 @@ void ReadManager::advanceDeliveryPtrIfNeeded(size_t row_group_idx, MemoryUsageDi
 
 void ReadManager::enqueueRowGroupIndexReads(size_t row_group_idx)
 {
+    /// `input_format_parquet_min_bytes_in_flight = 0` turns read-ahead planning off: nothing is
+    /// queued, so `pumpIssueQueue` has nothing to issue and every read is started by the stage that
+    /// needs it, as it was before the issue controller existed.
+    if (reader.options.format.parquet.min_bytes_in_flight == 0)
+        return;
+
     RowGroup & row_group = reader.row_groups[row_group_idx];
     std::vector<PlannedRead> planned;
 
@@ -656,6 +669,10 @@ void ReadManager::enqueueRowGroupIndexReads(size_t row_group_idx)
 
 void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx)
 {
+    /// See `enqueueRowGroupIndexReads`: 0 disables read-ahead planning.
+    if (reader.options.format.parquet.min_bytes_in_flight == 0)
+        return;
+
     RowGroup & row_group = reader.row_groups[row_group_idx];
     std::vector<PlannedRead> planned;
 
@@ -742,6 +759,16 @@ void ReadManager::dropQueuedReads(size_t row_group_idx)
     std::erase_if(issue_queue, [&](const PlannedRead & p) { return p.row_group_idx == row_group_idx; });
 }
 
+bool ReadManager::hasQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx)
+{
+    std::lock_guard lock(issue_mutex);
+    return std::any_of(issue_queue.begin(), issue_queue.end(), [&](const PlannedRead & p)
+    {
+        return p.stage == stage && p.row_group_idx == row_group_idx &&
+            p.row_subgroup_idx == row_subgroup_idx && p.step_idx == step_idx;
+    });
+}
+
 size_t ReadManager::bytesInFlightTarget() const
 {
     /// `io_threads` is the size of the pool that actually executes the reads (0 before it's created).
@@ -751,16 +778,39 @@ size_t ReadManager::bytesInFlightTarget() const
         reader.options.format.parquet.min_bytes_in_flight);
 }
 
+bool ReadManager::isPrivilegedRead(const PlannedRead & planned) const
+{
+    /// Only the reads that the reader cannot make progress without bypass the budgets, and only for
+    /// the row group that has to be delivered next:
+    ///  * its index reads (`row_subgroup_idx == UINT64_MAX`), which are small and are the
+    ///    prerequisite of everything else in the row group;
+    ///  * the data pages of the one subgroup it is about to read (`read_ptr`).
+    /// The other subgroups' pages (which `enqueueRowGroupPageReads` plans all at once) obey both the
+    /// bytes-in-flight target and the memory pool cap: read-ahead must not be able to put a whole row
+    /// group's compressed data in flight past `input_format_parquet_memory_high_watermark`. Bypassing
+    /// isn't needed for them anyway -- the demand path (`takeQueuedReads` in `scheduleTask`) takes a
+    /// subgroup's planned reads out of the queue and starts them itself when the subgroup is admitted,
+    /// so no subgroup can ever be stuck waiting for the pump.
+    if (planned.row_group_idx != first_incomplete_row_group.load(std::memory_order_relaxed))
+        return false;
+    if (planned.row_subgroup_idx == UINT64_MAX)
+        return true;
+    return planned.row_subgroup_idx == reader.row_groups[planned.row_group_idx].read_ptr.load();
+}
+
 void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
 {
     {
-        /// Cheap early-out: this runs on every `flushMemoryUsageDiff`.
+        /// Cheap early-out: this runs on every `flushMemoryUsageDiff`. Also the whole of the
+        /// disabled case (`input_format_parquet_min_bytes_in_flight = 0`), where nothing is planned.
         std::lock_guard lock(issue_mutex);
         if (issue_queue.empty())
             return;
     }
 
     const size_t target = bytesInFlightTarget();
+    size_t issued = 0;
+    bool blocked = false;
 
     while (true)
     {
@@ -771,10 +821,9 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
 
         auto it = issue_queue.begin();
         if (it == issue_queue.end())
-            return;
+            break;
 
-        size_t first_incomplete = first_incomplete_row_group.load(std::memory_order_relaxed);
-        if (it->row_group_idx != first_incomplete)
+        if (!isPrivilegedRead(*it))
         {
             const MemoryPool pool = poolOf(it->stage);
             /// `pool_usage` doesn't include what this diff charged and hasn't flushed yet, so add it.
@@ -785,18 +834,24 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
             size_t pool_usage_now = size_t(std::max<ssize_t>(0,
                 pool_usage[size_t(pool)].load(std::memory_order_relaxed) + pool_pending));
 
+            /// `bytes` is the sum of the requested ranges' lengths, while the Prefetcher may coalesce
+            /// them into tasks that also span the gaps in between (and may serve some of them from
+            /// already-read ranges), so the bytes actually in flight for an entry can differ from
+            /// `bytes` in either direction -- the effective read depth is usually a bit deeper than
+            /// this target nominally allows. That's fine: the target is a fitted goal, not a limit
+            /// anything depends on. The pool cap below is the one that must hold, and it's checked
+            /// against the same tokens the pool is charged (`request->length` times amplification).
             if (reader.prefetcher.bytesInFlight() + it->bytes > target ||
                 pool_usage_now + it->bytes > poolLimits(pool).memory_high_watermark)
             {
-                ProfileEvents::increment(ProfileEvents::ParquetIssueQueueStalls);
-                /// The first incomplete row group is privileged: its reads are always issued, so that
-                /// progress (and therefore freeing memory and bytes in flight) never depends on the
-                /// budget. It isn't necessarily at the front of the queue -- a later row group's index
-                /// reads are planned before an earlier row group's page reads -- so look for it.
+                blocked = true;
+                /// A privileged entry isn't necessarily at the front of the queue -- a later row
+                /// group's index reads are planned before an earlier row group's page reads -- so
+                /// look for one before giving up.
                 it = std::find_if(issue_queue.begin(), issue_queue.end(),
-                    [&](const PlannedRead & p) { return p.row_group_idx == first_incomplete; });
+                    [&](const PlannedRead & p) { return isPrivilegedRead(p); });
                 if (it == issue_queue.end())
-                    return;
+                    break;
             }
         }
 
@@ -806,8 +861,14 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
         const ReadStage saved_stage = std::exchange(diff.cur_stage, planned.stage);
         reader.prefetcher.startPrefetch(planned.handles, &diff);
         diff.cur_stage = saved_stage;
+        ++issued;
         ProfileEvents::increment(ProfileEvents::ParquetPlannedReads);
     }
+
+    /// One event per pump that got nothing out (not one per entry it looked at), so the count reads
+    /// as "times read-ahead had to wait", not as a function of how deep the queue happens to be.
+    if (blocked && issued == 0)
+        ProfileEvents::increment(ProfileEvents::ParquetIssueQueueStalls);
 }
 
 static bool checkTaskSchedulingLimits(size_t memory_usage, size_t added_memory, size_t batches_in_progress, size_t added_tasks, const SharedResourcesExt::Limits & limits)
@@ -1087,7 +1148,17 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
             {
                 RowSubgroup & row_subgroup = row_group.subgroups.at(task.row_subgroup_idx);
                 if (row_subgroup.filter.rows_pass == 0)
+                {
+                    /// Returning without draining the queue is only safe because a subgroup that has
+                    /// no rows here never had a planned entry in the first place: the planner skips
+                    /// `rows_pass == 0` subgroups, and `rows_pass` can only be zeroed later, by
+                    /// `applyPrewhere` at a step after the one the planner plans (the first). This is
+                    /// the invariant that makes `ColumnChunk::dictionary_and_whole_chunk_planned`
+                    /// safe: the subgroup that claimed the column's dictionary and whole-chunk
+                    /// handles always reaches this stage and drains them.
+                    chassert(!hasQueuedReads(ReadStage::ColumnDataPrefetch, task.row_group_idx, task.row_subgroup_idx, task.step_idx));
                     break;
+                }
                 /// This subgroup's data-page reads were usually planned when the row group's offset
                 /// indexes landed (`enqueueRowGroupPageReads`) and issued by the pump long before
                 /// this task. Take whatever the pump hasn't got to yet out of the queue and issue it

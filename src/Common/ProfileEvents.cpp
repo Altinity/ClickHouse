@@ -1651,8 +1651,8 @@ The server successfully detected this situation and will download merged part fr
     M(ParquetReadTaskBytes, "Bytes covered by `ParquetReadTasks`, including bytes read to close short gaps between requested ranges", ValueType::Bytes) \
     M(ParquetReadFirstByteMicroseconds, "Sum of the time from starting a `DB::Parquet::Prefetcher` source read to its first progress callback (or to completion, if the transport never calls back), i.e. round-trip time to the first byte", ValueType::Microseconds) \
     M(ParquetReadTransferMicroseconds, "Sum of the time spent transferring bytes in a `DB::Parquet::Prefetcher` source read after the first byte arrived", ValueType::Microseconds) \
-    M(ParquetPlannedReads, "Groups of Parquet reads (the index reads of one row group, or the data pages one row subgroup needs) issued by the reader's issue controller ahead of the stage that consumes them", ValueType::Number) \
-    M(ParquetIssueQueueStalls, "Times the Parquet reader's issue controller stopped issuing planned reads because the bytes-in-flight target or the compressed memory pool was full", ValueType::Number) \
+    M(ParquetPlannedReads, "Groups of Parquet reads (the index reads of one row group, or the data pages one row subgroup needs) issued by the reader's issue controller ahead of the stage that consumes them. Counts only the groups the controller itself issued: a group that the stage needing it took over first is not counted", ValueType::Number) \
+    M(ParquetIssueQueueStalls, "Times the Parquet reader's issue controller could not issue any of the reads it had planned, because the bytes-in-flight target or the memory pool of the next read was full. Counted once per attempt, not per planned read left waiting", ValueType::Number) \
     M(ParquetRowsFilterExpression, "The total number of rows that were passed through filter", ValueType::Number) \
     M(ParquetColumnsFilterExpression, "The total number of columns that were passed through filter", ValueType::Number) \
     M(FilterTransformPassedRows, "Number of rows that passed the filter in the query", ValueType::Number) \

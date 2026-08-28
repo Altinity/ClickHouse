@@ -25,9 +25,12 @@ ${CLICKHOUSE_CLIENT} -q "
 
 # Force the local file to behave like object storage: a 4 MiB seek threshold.
 BASE="input_format_parquet_local_file_min_bytes_for_seek = 4194304"
+# One number, but it needs every column: the whole point of these four arms is a subgroup whose
+# pages are worth megabytes.
+WIDE="sum(k)$(for i in $(seq 1 61); do echo -n " + sum(c$i)"; done)"
 
-echo "-- same results for every bytes-in-flight target, with and without a filter, 1 and default parsing threads"
-for flight in 4096 67108864 1073741824; do
+echo "-- same results for every bytes-in-flight target (0 = read-ahead planning off), with and without a filter, 1 and default parsing threads"
+for flight in 0 4096 67108864 1073741824; do
   for threads in 1 0; do
     ${CLICKHOUSE_CLIENT} -q "
       SELECT sum(k), sum(v), sum(c31), count() FROM file('${F}', Parquet)
@@ -38,31 +41,45 @@ for flight in 4096 67108864 1073741824; do
   done
 done
 
-echo "-- reads are planned ahead; the queue waits when a budget is full and never waits when it isn't"
-# `_stalled` shrinks the memory budget instead of `input_format_parquet_min_bytes_in_flight`: the
-# bytes-in-flight target is the *larger* of the fitted target and that setting, and the fitted target
-# has its own floor of four read tasks, so lowering the setting alone cannot make the queue wait. A
-# compressed-pool cap below one subgroup's worth of pages does, for every row group except the
-# privileged one.
-${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_stalled" -q "
-  SELECT sum(k), sum(c31) FROM file('${F}', Parquet)
+echo "-- reads are planned ahead; the queue waits when a budget is full, never waits when none is, and plans nothing when disabled"
+# Two ways the queue can have to wait, one per budget:
+#  * `_stall_target`: the bytes-in-flight target. It is the *larger* of the fitted target and
+#    `input_format_parquet_min_bytes_in_flight`, and the fitted one is floored at four read tasks, so
+#    a small setting only bites together with a small `input_format_parquet_bytes_per_read_task`
+#    (65536 here -> a 256 KiB floor, well under one subgroup's pages).
+# All four read every column, so that one subgroup's pages are worth megabytes and the reads are
+# numerous enough for the fitted round-trip time to settle at the local file's real (small) value.
+#  * `_stall_pool`: the compressed memory pool, capped below one subgroup's worth of pages. Only the
+#    next subgroup to be read of the row group next to be delivered bypasses it (see
+#    `ReadManager::isPrivilegedRead`), so read-ahead for the other subgroups waits.
+${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_stall_target" -q "
+  SELECT ${WIDE} FROM file('${F}', Parquet)
+  SETTINGS ${BASE}, input_format_parquet_min_bytes_in_flight = 4096,
+           input_format_parquet_bytes_per_read_task = 65536"
+${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_stall_pool" -q "
+  SELECT ${WIDE} FROM file('${F}', Parquet)
   SETTINGS ${BASE}, input_format_parquet_min_bytes_in_flight = 4096,
            input_format_parquet_memory_high_watermark = 16777216, input_format_parquet_memory_low_watermark = 1048576"
-${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_unstalled" -q "
-  SELECT sum(k), sum(c31) FROM file('${F}', Parquet)
+${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_no_stall" -q "
+  SELECT ${WIDE} FROM file('${F}', Parquet)
   SETTINGS ${BASE}, input_format_parquet_min_bytes_in_flight = 1073741824"
+${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_disabled" -q "
+  SELECT ${WIDE} FROM file('${F}', Parquet)
+  SETTINGS ${BASE}, input_format_parquet_min_bytes_in_flight = 0"
 
 ${CLICKHOUSE_CLIENT} -q "
   SYSTEM FLUSH LOGS query_log;
   SELECT
     replaceOne(query_id, '${CLICKHOUSE_TEST_UNIQUE_NAME}_', ''),
     ProfileEvents['ParquetIssueQueueStalls'] > 0,
-    -- at least 3 row groups x 2 groups of reads (indexes, then data pages)
-    ProfileEvents['ParquetPlannedReads'] >= 6
+    -- disabled: nothing is planned, so the controller issues nothing at all.
+    -- otherwise: at least 3 row groups x 2 groups of reads (indexes, then data pages)
+    if(query_id LIKE '%_disabled', ProfileEvents['ParquetPlannedReads'] = 0, ProfileEvents['ParquetPlannedReads'] >= 6)
   FROM system.query_log
   WHERE event_date >= yesterday() AND event_time >= now() - 600 AND type = 'QueryFinish'
     AND current_database = currentDatabase()
-    AND query_id IN ('${CLICKHOUSE_TEST_UNIQUE_NAME}_stalled', '${CLICKHOUSE_TEST_UNIQUE_NAME}_unstalled')
+    AND query_id IN ('${CLICKHOUSE_TEST_UNIQUE_NAME}_stall_target', '${CLICKHOUSE_TEST_UNIQUE_NAME}_stall_pool',
+                     '${CLICKHOUSE_TEST_UNIQUE_NAME}_no_stall', '${CLICKHOUSE_TEST_UNIQUE_NAME}_disabled')
   ORDER BY 1"
 
 rm -rf "${WORKING_DIR}"

@@ -150,6 +150,9 @@ private:
     /// Bytes we want the Prefetcher to have in flight: the fitted bandwidth*rtt*concurrency target,
     /// floored by `input_format_parquet_min_bytes_in_flight`.
     size_t bytesInFlightTarget() const;
+    /// Whether this read must be issued even when the budgets are full, because the reader can't make
+    /// progress without it. See the definition for exactly which reads those are.
+    bool isPrivilegedRead(const PlannedRead & planned) const;
     /// Issue queued reads in order while `prefetcher.bytesInFlight() + planned.bytes` stays under the
     /// target and the read's memory pool has room (or the read belongs to the first incomplete row
     /// group, which is always issued so that progress never depends on the budget). Charges the bytes
@@ -167,6 +170,8 @@ private:
     /// Forget everything planned for this row group. Must be called before clearing its ColumnChunks:
     /// entries may point into `ColumnChunk::data_pages`, whose buffer clearing frees.
     void dropQueuedReads(size_t row_group_idx);
+    /// For assertions only: is anything still queued for this <stage, row group, subgroup, step>?
+    bool hasQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx);
 
     std::mutex delivery_mutex;
     std::priority_queue<Task, std::vector<Task>, Task::Comparator> delivery_queue;
