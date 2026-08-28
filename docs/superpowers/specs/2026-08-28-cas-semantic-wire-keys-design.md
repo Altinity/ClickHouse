@@ -33,8 +33,11 @@ word scan, and an enum's persisted and configuration spellings are separate cont
 helpers for the shared value types — bounded by an explicit helper-versus-framework rule and
 required to be codegen-neutral. Revision 10 (2026-08-29) closes that layer's API contracts:
 `writeStringField` for open strings, the two-stage match-plus-`build` collector contract, and
-codegen-neutrality extended to the match helpers. The exact-full-name alternative was independently
-implemented in Altinity PR #2288 and rejected for this design (see rejected alternatives).
+codegen-neutrality extended to the match helpers. Revision 11 (2026-08-29) settles the one
+requiredness divergence — `TokenFields::build` requires both fields, adjudicating the `GcOutcomes`
+tolerance as a bug tightened explicitly — and fixes the requiredness-boundary wording. The
+exact-full-name alternative was independently implemented in Altinity PR #2288 and rejected for
+this design (see rejected alternatives).
 
 ## Problem {#problem}
 
@@ -710,8 +713,14 @@ vocabulary item gains a single production carrier:
   codec — the copy-forgets-the-check failure mode disappears), the `CORRUPTED_DATA` taxonomy, and
   independence from key order. Requiredness thus remains an explicit call in the codec's grammar,
   at the variant point that demands it. This generalizes the collector-plus-`build` pattern the
-  ref codecs already use (`ManifestFields::build`). One bundle feeds both directions, so the
-  shared flat types are symmetric. The match helpers are defined inline next to the key bundles:
+  ref codecs already use (`ManifestFields::build`). `TokenFields::build` requires both
+  `token_type` and `token`: today `GcOutcomes` tolerates a missing token value and reads it as
+  empty while `cas_run` requires both — that divergence is adjudicated as a `GcOutcomes` reader
+  bug, since `writeTokenFields` has always emitted both fields, so the unified requirement rejects
+  only shapes no writer ever produced. The tightening is a deliberate, separately-landed change
+  with its own negative test — never a silent side effect of the mechanical helper move — and is
+  sequenced with the wire cut. One bundle feeds both directions, so the shared flat types are
+  symmetric. The match helpers are defined inline next to the key bundles:
   on the hot decode paths they must add no function call, allocation, or branch beyond the
   comparisons the inline chains make today; no stored callables, no maps.
 - `CasInspect` renders enum values through the same tables, so introspection cannot print `Merge`
@@ -729,10 +738,11 @@ What deliberately stays hand-written is the grammar: variant-dependent requiredn
 ordering, and payload zones remain explicit C++ in the readers. Of the schema triple
 required/optional/critical, only criticality survives into the carriers — via the `!` prefix in the
 key literal; the rest is validation logic, written once and readable. The line between a helper and
-a framework is fixed: a helper consumes one known field group and returns whether it matched; it
-never owns the read loop, never decides the unknown-key policy, and never tracks requiredness —
-those remain visible in each codec's grammar. Reader dispatch tables, stored callables, and fluent
-writer builders are out.
+a framework is fixed: a match helper consumes one known field and returns whether it matched; it
+never owns the read loop, never decides the unknown-key policy, and never tracks requiredness. The
+collector's `build` is where group requiredness is validated, and the codec keeps that requirement
+visible by explicitly invoking `build` at the variant point that demands it. Reader dispatch
+tables, stored callables, and fluent writer builders are out.
 
 Writer order remains canonical. Reader strictness remains exactly as registered in `CasFormat`.
 Unknown critical fields continue to fail before strict/tolerant handling, and exception taxonomy does
@@ -755,7 +765,8 @@ changes in one place.
    change-point history to the shared `BASELINE`, update the literal goldens and negative fixtures,
    keep the sentinels and both pool gates, and update `Formats/README.md` in the same change. The
    descriptor `static_assert` lands in this phase — the cut must not compile if it overflows the
-   floor.
+   floor. The `TokenFields` requiredness unification (the `GcOutcomes` tightening) lands here as
+   its own explicit change with its negative test.
 3. **Proof and measurement.** Cross-check the constexpr worst case against the real encoder, run
    the byte-delta and throughput measurements, and sweep the raw assertions in integration tests
    and `utils/ca-soak`.
@@ -792,7 +803,9 @@ Third, compatibility tests pin:
 - unknown ordinary fields retain strict/tolerant behavior;
 - unknown `!` fields still raise `UNKNOWN_FORMAT_VERSION`;
 - `!prev_epoch` and `!prev_seq` retain both-or-neither validation;
-- the known-field sentinels still reject `pl` on rows and `rte`/`rts` on the snapshot meta line.
+- the known-field sentinels still reject `pl` on rows and `rte`/`rts` on the snapshot meta line;
+- a `GcOutcomes` record missing `token` is rejected with `CORRUPTED_DATA` — the negative test of
+  the deliberate requiredness tightening.
 
 Fourth, blob-envelope boundary tests construct maximum-width mandatory values — deriving the
 longest `op` word from the shared constexpr `ProvenanceOp` wire-word table that replaces the two
@@ -942,4 +955,5 @@ The change is complete when:
   backlog no longer claim a universal 2–5-character or exact-full-member-name convention;
 - local before/after measurements report the decompressed bytes and encode/decode throughput of the
   representative high-cardinality formats, and the generated assembly of the hot `toWord` instances
-  is reviewed — with no timing assertion in CI.
+  and of the hot match helpers (`cas_run` token matching, `PartManifest` blob matching) is
+  reviewed — with no timing assertion in CI.
