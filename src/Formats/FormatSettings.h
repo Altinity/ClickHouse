@@ -363,6 +363,11 @@ struct FormatSettings
         size_t max_io_threads = 0;
         /// 0 = derive from the storage's min-bytes-for-seek.
         size_t bytes_per_read_task = 0;
+        /// Cap on the gap the reader reads through when coalescing nearby ranges (the smaller of
+        /// this and the storage's min-bytes-for-seek wins); 0 = use the storage's value only.
+        size_t coalesce_gap_bytes = 2097152;
+        /// Bound on bytes read / bytes needed per coalesced read; 0 = no bound.
+        double max_read_amplification = 4;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
         /// Reader scheduler knobs: share of the column-data memory budget given to compressed

@@ -264,6 +264,17 @@ does not delay the first row group of the read.
     DECLARE(Bool, input_format_parquet_enable_row_group_prefetch, true, R"(
 Enable row group prefetching during parquet parsing. Currently, only single-threaded parsing can prefetch.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_coalesce_gap_bytes, 2097152, R"(
+Largest gap between two needed byte ranges of a Parquet file that the reader reads through in order to
+serve both with one request. Applied on top of the storage's min-bytes-for-seek (the smaller wins);
+`0` uses the storage value only. On object storage the useful gap is about one round trip's worth of
+bandwidth, ~2 MiB; reading through larger gaps costs bytes without saving time.
+)", 0) \
+    DECLARE(Double, input_format_parquet_max_read_amplification, 4, R"(
+Upper bound on `bytes read / bytes needed` for one coalesced Parquet read. Coalescing stops extending a
+read when the span would exceed this multiple of the useful bytes it covers, so a few small column chunks
+cannot drag megabytes of unrelated data through the cache or the network. `0` disables the bound.
+)", 0) \
     DECLARE(Bool, input_format_arrow_allow_missing_columns, true, R"(
 Allow missing columns while reading Arrow input formats
 )", 0) \

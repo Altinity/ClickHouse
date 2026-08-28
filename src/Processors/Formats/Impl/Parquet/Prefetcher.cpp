@@ -34,6 +34,8 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
 {
     min_bytes_for_seek = options.min_bytes_for_seek;
     bytes_per_read_task = options.bytes_per_read_task;
+    gap_bytes = options.coalesce_gap_bytes ? std::min(min_bytes_for_seek, options.coalesce_gap_bytes) : min_bytes_for_seek;
+    max_read_amplification = options.max_read_amplification;
     parser_shared_resources = parser_shared_resources_;
     determineReadModeAndFileSize(reader_, options);
     range_sets.resize(1);
@@ -323,7 +325,8 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     }
 
     /// Try to extend the task's range in both directions to cover more request ranges, as long
-    /// as gaps between them are shorter than min_bytes_for_seek.
+    /// as gaps between them are shorter than gap_bytes and the task doesn't exceed
+    /// max_read_amplification.
 
     size_t start_idx = range_idx;
     size_t end_idx = range_idx + 1;
@@ -334,8 +337,9 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     for (size_t idx = range_idx; idx > 0; --idx)
     {
         const RangeState & r = ranges[idx - 1];
-        if (r.end + min_bytes_for_seek <= start_offset || // short gap
+        if (r.end + gap_bytes <= start_offset || // gap too long to read through
             r.start + bytes_per_read_task <= initial_offset || // task not too big
+            exceedsAmplification(std::max(end_offset, r.end) - std::min(start_offset, r.start), total_length_of_covered_ranges + r.length()) ||
             !r.request->allow_incidental_read.load(std::memory_order_relaxed)) // range wants to be coalesced
             break;
 
@@ -369,8 +373,9 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     for (size_t idx = range_idx + 1; idx < ranges.size(); ++idx)
     {
         const RangeState & r = ranges[end_idx];
-        if (end_offset + min_bytes_for_seek <= r.start ||
+        if (end_offset + gap_bytes <= r.start ||
             initial_offset + bytes_per_read_task <= r.end ||
+            exceedsAmplification(std::max(end_offset, r.end) - std::min(start_offset, r.start), total_length_of_covered_ranges + r.length()) ||
             !r.request->allow_incidental_read.load(std::memory_order_relaxed))
             break;
 

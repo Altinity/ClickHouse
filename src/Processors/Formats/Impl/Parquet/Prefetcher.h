@@ -190,6 +190,9 @@ private:
     size_t file_size{};
     size_t min_bytes_for_seek{};
     size_t bytes_per_read_task{};
+    /// min(min_bytes_for_seek, options.coalesce_gap_bytes), or min_bytes_for_seek if the setting is 0.
+    size_t gap_bytes{};
+    double max_read_amplification = 0;
 
     std::shared_ptr<ShutdownHelper> shutdown = std::make_shared<ShutdownHelper>();
 
@@ -223,6 +226,11 @@ private:
     /// If splitting, the request is being cancelled and replaced by a smaller range
     /// (splitAndPrefetchRange), and only subrange [subrange_start, subrange_end) needs to be read.
     void pickRangesAndCreateTaskIfNotExists(RequestState *, const PrefetchHandle &, bool splitting, size_t start_offset, size_t end_offset, std::unique_lock<std::mutex> lock);
+    /// True if a task spanning `span` bytes to serve `useful` bytes would exceed max_read_amplification.
+    bool exceedsAmplification(size_t span, size_t useful) const
+    {
+        return max_read_amplification > 0 && static_cast<double>(span) > max_read_amplification * static_cast<double>(useful);
+    }
     static void decreaseTaskRefcount(Task * task, size_t amount);
     void scheduleTask(Task * task);
     Task::State runTask(Task * task);

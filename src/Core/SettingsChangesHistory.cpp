@@ -44,6 +44,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
             {"input_format_parquet_max_io_threads", 0, 0, "New setting: size of the thread pool that issues reads for the Parquet reader. 0 derives it from `max_download_threads` and `max_parsing_threads`; the derived value is larger than the previous hard-coded `max_download_threads` (default 4)."},
             {"input_format_parquet_bytes_per_read_task", 0, 0, "New setting: target size of a single coalesced read issued by the Parquet reader. 0 derives it from the min-bytes-for-seek of the underlying storage, as before."},
+            {"input_format_parquet_coalesce_gap_bytes", 0, 2097152, "New setting: cap on the gap the Parquet reader reads through when coalescing nearby ranges; previously the storage's min-bytes-for-seek (4 MiB on object storage) applied unconditionally."},
+            {"input_format_parquet_max_read_amplification", 0, 4, "New setting: bound on bytes read / bytes needed per coalesced Parquet read."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

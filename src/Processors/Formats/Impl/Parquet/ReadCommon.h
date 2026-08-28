@@ -31,6 +31,12 @@ struct ReadOptions
     size_t min_bytes_for_seek = 64 << 10;
     size_t bytes_per_read_task = 4 << 20;
 
+    /// Cap on the gap the reader reads through when coalescing nearby ranges (the smaller of this
+    /// and min_bytes_for_seek wins); 0 means use min_bytes_for_seek only.
+    size_t coalesce_gap_bytes = 0;
+    /// Bound on bytes read / bytes needed per coalesced read; 0 means no bound.
+    double max_read_amplification = 0;
+
     /// Don't use bloom filter for `x IN (...)` if the set `(...)` is has more than this many
     /// elements. There's no point using bloom filter for big sets because false positive
     /// probability becomes very high. E.g. if bloom filter has 1% false positive probability,
