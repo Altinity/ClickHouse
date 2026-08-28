@@ -1,5 +1,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
+#include <Storages/PartitionCommands.h>
 
 #include <Common/CurrentThread.h>
 #include <Common/Exception.h>
@@ -993,6 +994,52 @@ void StorageObjectStorage::truncate(
         objects.emplace_back(key.path);
     }
     object_storage->removeObjectsIfExist(objects);
+}
+
+Pipe StorageObjectStorage::alterPartition(
+    const StorageMetadataPtr & /* metadata_snapshot */,
+    const PartitionCommands & commands,
+    ContextPtr local_context)
+{
+    updateExternalDynamicMetadataIfExists(local_context);
+
+    for (const auto & command : commands)
+    {
+        if (command.detach || command.part)
+        {
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Partition command '{}' is not supported by storage {}", command.typeToString(), getName());
+        }
+
+        if (command.type == PartitionCommand::DROP_PARTITION)
+        {
+            auto * data_lake_metadata = getExternalMetadata(local_context);
+            if (!data_lake_metadata || !data_lake_metadata->supportsDropPartition())
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP PARTITION is not supported for this data lake engine");
+
+            data_lake_metadata->dropPartition(command.partition, local_context, catalog, getStorageID());
+        }
+        else
+        {
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Partition command '{}' is not supported by storage {}", command.typeToString(), getName());
+        }
+    }
+    return {};
+}
+
+void StorageObjectStorage::checkAlterPartitionIsPossible(
+    const PartitionCommands & commands,
+    const StorageMetadataPtr & /* metadata_snapshot */,
+    const Settings & /* settings */,
+    ContextPtr /* local_context */) const
+{
+    if (!configuration->isDataLakeConfiguration())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Table engine {} doesn't support partitioning", getName());
+
+    for (const auto & command : commands)
+    {
+        if (command.type != PartitionCommand::DROP_PARTITION || command.detach || command.part)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Partition command '{}' is not supported by storage {}", command.typeToString(), getName());
+    }
 }
 
 void StorageObjectStorage::drop()

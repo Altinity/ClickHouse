@@ -1022,6 +1022,82 @@ static void writeAvroBytes(WriteBuffer & out, const String & s)
     out.write(s.data(), s.size());
 }
 
+ManifestRewriteResult rewriteManifestFileExcludingFiles(
+    ReadBuffer & source,
+    const std::unordered_set<String> & excluded_file_paths,
+    Int64 inherited_sequence_number,
+    Int64 inherited_snapshot_id,
+    WriteBuffer & out)
+{
+    auto input_stream = std::make_unique<AvroInputStreamReadBufferAdapter>(source);
+    auto reader_base = std::make_unique<avro::DataFileReaderBase>(std::move(input_stream), MAX_AVRO_SCHEMA_DEPTH);
+
+    auto * reader_base_ptr = reader_base.get();
+    avro::DataFileReader<avro::GenericDatum> reader(std::move(reader_base));
+
+    const avro::ValidSchema & schema = reader.dataSchema();
+
+    auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(out);
+    avro::DataFileWriter<avro::GenericDatum> writer(std::move(adapter), schema);
+
+    /// `avro.schema` and `avro.codec` are written by `DataFileWriter` itself
+    for (const auto & [key, value] : reader_base_ptr->metadata())
+    {
+        if (key.starts_with("avro."))
+            continue;
+        writer.setMetadata(key, String(value.begin(), value.end()));
+    }
+
+    ManifestRewriteResult result;
+    Int64 min_sequence_number = std::numeric_limits<Int64>::max();
+
+    avro::GenericDatum datum(schema);
+    while (reader.read(datum))
+    {
+        avro::GenericRecord & entry = datum.value<avro::GenericRecord>();
+        avro::GenericRecord & data_file = entry.field(Iceberg::f_data_file).value<avro::GenericRecord>();
+
+        if (excluded_file_paths.contains(data_file.field(Iceberg::f_file_path).value<std::string>()))
+        {
+            ++result.removed_entries;
+            continue;
+        }
+
+        auto materialize = [&](const String & field_name, Int64 inherited_value) -> Int64
+        {
+            if (!entry.hasField(field_name))
+                return inherited_value;
+
+            auto & field = entry.field(field_name);
+            if (!field.isUnion())
+                return field.value<Int64>();
+            if (field.unionBranch() != 0)
+                return field.value<Int64>();
+
+            field.selectBranch(1);
+            field.value<Int64>() = inherited_value;
+            return inherited_value;
+        };
+
+        const Int64 sequence_number = materialize(Iceberg::f_sequence_number, inherited_sequence_number);
+        materialize(Iceberg::f_file_sequence_number, inherited_sequence_number);
+        materialize(Iceberg::f_snapshot_id, inherited_snapshot_id);
+
+        entry.field(Iceberg::f_status) = avro::GenericDatum(static_cast<Int32>(Iceberg::ManifestEntryStatus::EXISTING));
+
+        ++result.surviving_entries;
+        result.surviving_rows += data_file.field(Iceberg::f_record_count).value<Int64>();
+        min_sequence_number = std::min(min_sequence_number, sequence_number);
+
+        writer.write(datum);
+    }
+
+    writer.close();
+
+    result.min_sequence_number = result.surviving_entries > 0 ? min_sequence_number : inherited_sequence_number;
+    return result;
+}
+
 void generateManifestList(
     const Iceberg::IcebergPathResolver & path_resolver,
     Poco::JSON::Object::Ptr metadata,
@@ -1038,7 +1114,8 @@ void generateManifestList(
     const std::vector<ManifestListEntryExistingCounts> & existing_entry_counts,
     const std::unordered_set<String> & carry_forward_manifest_paths,
     const std::vector<Int64> & entry_partition_spec_ids,
-    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries)
+    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries,
+    const PreviousManifestActions & previous_manifest_actions)
 {
     chassert(
         per_entry_content_types.empty() || per_entry_content_types.size() == manifest_entry_names.size(),
@@ -1256,6 +1333,24 @@ void generateManifestList(
                         if (!carry_forward_manifest_paths.empty()
                             && !carry_forward_manifest_paths.contains(old_entry.field(Iceberg::f_manifest_path).value<std::string>()))
                             return;
+
+                        const PreviousManifestAction * action = nullptr;
+                        if (!previous_manifest_actions.empty())
+                        {
+                            auto action_it = previous_manifest_actions.find(
+                                old_entry.field(Iceberg::f_manifest_path).value<std::string>());
+                            if (action_it != previous_manifest_actions.end())
+                                action = &action_it->second;
+                        }
+
+                        /// A manifest the caller asked to forget: leave it out of the new snapshot.
+                        if (action && action->kind == PreviousManifestAction::Kind::DROP)
+                            return;
+
+                        if (action && version == 1)
+                            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                                "Replacing a manifest of a format version 1 table is not supported");
+
                         avro::GenericDatum new_datum(schema.root());
                         avro::GenericRecord & new_entry = new_datum.value<avro::GenericRecord>();
                         new_entry.field(f_manifest_path) = old_entry.field(Iceberg::f_manifest_path);
@@ -1306,6 +1401,23 @@ void generateManifestList(
                             add_field_to_datum(Iceberg::f_sequence_number);
                             add_field_to_datum(Iceberg::f_min_sequence_number);
                         }
+
+                        if (action)
+                        {
+                            /// `content`, `sequence_number` and `added_snapshot_id` keep the copied
+                            /// values: the same files, added by the same snapshot. Every surviving
+                            /// entry is EXISTING now, so only the counts change.
+                            new_entry.field(Iceberg::f_manifest_path) = action->new_path.serialize();
+                            new_entry.field(Iceberg::f_manifest_length) = action->new_length;
+                            new_entry.field(Iceberg::f_added_files_count) = static_cast<Int32>(0);
+                            new_entry.field(Iceberg::f_existing_files_count) = action->new_existing_files_count;
+                            new_entry.field(Iceberg::f_deleted_files_count) = static_cast<Int32>(0);
+                            new_entry.field(Iceberg::f_added_rows_count) = static_cast<Int64>(0);
+                            new_entry.field(Iceberg::f_existing_rows_count) = action->new_existing_rows_count;
+                            new_entry.field(Iceberg::f_deleted_rows_count) = static_cast<Int64>(0);
+                            new_entry.field(Iceberg::f_min_sequence_number) = action->new_min_sequence_number;
+                        }
+
                         writer.write(new_datum);
                     });
                 break;

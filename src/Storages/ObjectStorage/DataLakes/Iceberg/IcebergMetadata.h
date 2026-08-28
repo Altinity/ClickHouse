@@ -36,6 +36,8 @@
 namespace DB
 {
 
+class ASTPartition;
+
 struct IcebergFileRecord
 {
     Int64 snapshot_id = 0;
@@ -111,6 +113,13 @@ public:
     bool supportsParallelInsert() const override { return true; }
     bool supportsTruncate() const override { return true; }
     void truncate(ContextPtr context, std::shared_ptr<DataLake::ICatalog> catalog, const StorageID & storage_id) override;
+
+    bool supportsDropPartition() const override { return true; }
+    void dropPartition(
+        const ASTPtr & partition,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id) override;
 
     IcebergHistory getHistory(ContextPtr local_context) const;
 
@@ -231,6 +240,12 @@ public:
     std::optional<String> sortingKey(ContextPtr) const override;
 
 private:
+    bool tryDropPartitionOnce(
+        const ASTPartition & partition_ast,
+        const ContextPtr & context,
+        const std::shared_ptr<DataLake::ICatalog> & catalog,
+        const StorageID & storage_id);
+
     static Iceberg::PersistentTableComponents initializePersistentTableComponents(
         ObjectStoragePtr object_storage,
         StorageObjectStorageConfigurationPtr configuration,

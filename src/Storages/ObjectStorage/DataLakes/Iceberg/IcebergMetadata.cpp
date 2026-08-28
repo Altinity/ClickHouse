@@ -51,7 +51,12 @@
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
+#include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTPartition.h>
+#include <Common/FieldAccurateComparison.h>
+#include <Interpreters/convertFieldToType.h>
+#include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/formatWithPossiblyHidingSecrets.h>
 #include <Interpreters/IcebergMetadataLog.h>
@@ -85,6 +90,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SnapshotFilesTraversal.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/FailPoint.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
@@ -125,6 +131,7 @@ extern const int SUPPORT_IS_DISABLED;
 extern const int METADATA_MISMATCH;
 extern const int UNFINISHED;
 extern const int INCORRECT_DATA;
+extern const int INVALID_PARTITION_VALUE;
 }
 
 namespace Setting
@@ -807,6 +814,643 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
     }
 }
 
+
+namespace
+{
+
+/// Find the partition spec object with the given spec-id inside a metadata JSON document.
+/// Throws METADATA_MISMATCH if the spec is not found (indicates metadata/spec-id mismatch).
+Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & meta, Int64 spec_id)
+{
+    auto specs = meta->getArray(f_partition_specs);
+    for (size_t i = 0; i < specs->size(); ++i)
+    {
+        auto spec = specs->getObject(static_cast<UInt32>(i));
+        if (spec->getValue<Int64>(f_spec_id) == spec_id)
+            return spec;
+    }
+    throw Exception(ErrorCodes::METADATA_MISMATCH,
+        "Partition spec with id {} not found in table metadata", spec_id);
+}
+
+Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & meta, Int64 schema_id)
+{
+    auto schemas = meta->getArray(f_schemas);
+    for (size_t i = 0; i < schemas->size(); ++i)
+    {
+        auto schema = schemas->getObject(static_cast<UInt32>(i));
+        if (schema->getValue<Int32>(f_schema_id) == schema_id)
+            return schema;
+    }
+
+    throw Exception(ErrorCodes::METADATA_MISMATCH,
+        "Schema with id {} not found in table metadata", schema_id);
+}
+
+using PartitionSpecSignature = std::vector<std::pair<Int32, String>>;
+
+/// (source column id, transform name) per partition field in spec order
+PartitionSpecSignature getPartitionSpecSignature(const Poco::JSON::Array::Ptr & spec_fields)
+{
+    PartitionSpecSignature signature;
+    signature.reserve(spec_fields->size());
+    for (UInt32 i = 0; i < spec_fields->size(); ++i)
+    {
+        auto spec_field = spec_fields->getObject(i);
+        signature.emplace_back(
+            spec_field->getValue<Int32>(f_source_id),
+            Poco::toLower(spec_field->getValue<String>(f_partition_transform)));
+    }
+    return signature;
+}
+
+constexpr size_t PARTITION_FIELD_NOT_IN_SPEC = std::numeric_limits<size_t>::max();
+
+/// Position of every target spec field inside a file's own partition tuple
+std::vector<size_t> mapTargetFieldsToSpecPositions(
+    const PartitionSpecification & entry_spec, const PartitionSpecSignature & signature)
+{
+    std::vector<size_t> positions(signature.size(), PARTITION_FIELD_NOT_IN_SPEC);
+    for (size_t i = 0; i < signature.size(); ++i)
+    {
+        for (size_t j = 0; j < entry_spec.size(); ++j)
+        {
+            if (entry_spec[j].source_id == signature[i].first
+                && Poco::toLower(entry_spec[j].transform_name) == signature[i].second)
+            {
+                positions[i] = j;
+                break;
+            }
+        }
+    }
+    return positions;
+}
+
+Block getPartitionSourceHeader(
+    const Poco::JSON::Array::Ptr & spec_fields,
+    const Poco::JSON::Array::Ptr & schema_fields,
+    const IcebergSchemaProcessor & schema_processor,
+    Int32 schema_id)
+{
+    std::unordered_map<Int32, String> column_name_by_source_id;
+    for (UInt32 i = 0; i < schema_fields->size(); ++i)
+    {
+        auto schema_field = schema_fields->getObject(i);
+        column_name_by_source_id[schema_field->getValue<Int32>(f_id)] = schema_field->getValue<String>(f_name);
+    }
+
+    ColumnsWithTypeAndName columns;
+    std::unordered_set<String> used_column_names;
+    for (UInt32 i = 0; i < spec_fields->size(); ++i)
+    {
+        auto spec_field = spec_fields->getObject(i);
+        auto source_id = spec_field->getValue<Int32>(f_source_id);
+
+        auto name_it = column_name_by_source_id.find(source_id);
+        if (name_it == column_name_by_source_id.end())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "DROP PARTITION is not supported for a partition spec whose source column (field id {}) is not a "
+                "top-level column of the current table schema", source_id);
+
+        const auto & column_name = name_it->second;
+
+        if (!used_column_names.insert(column_name).second)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "DROP PARTITION is not supported for a partition spec that uses column '{}' in more than one "
+                "partition field", column_name);
+
+        auto name_and_type = schema_processor.tryGetFieldCharacteristics(schema_id, source_id);
+        if (!name_and_type)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Partition source column '{}' (field id {}) is missing from Iceberg schema {}",
+                column_name, source_id, schema_id);
+
+        columns.emplace_back(name_and_type->type, column_name);
+    }
+
+    return Block(std::move(columns));
+}
+
+std::vector<Field> extractPartitionSourceValues(
+    const ASTPartition & partition_ast,
+    const Block & partition_source_header,
+    const ContextPtr & context)
+{
+    const size_t fields_count = partition_source_header.columns();
+
+    ASTPtr value_ast = partition_ast.value->clone();
+
+    /// Accept both `DROP PARTITION 'x'` and `DROP PARTITION ('x')`
+    if (fields_count == 1)
+    {
+        if (const auto * tuple_ast = value_ast->as<ASTFunction>(); tuple_ast && tuple_ast->name == "tuple")
+        {
+            if (!tuple_ast->arguments || tuple_ast->arguments->children.size() != 1)
+                throw Exception(ErrorCodes::INVALID_PARTITION_VALUE,
+                    "Wrong number of fields in the partition expression, must be: 1");
+            value_ast = tuple_ast->arguments->children[0];
+        }
+    }
+
+    Field partition_value = evaluateConstantExpression(value_ast, context).first;
+
+    std::vector<Field> source_values;
+    if (fields_count == 1 && partition_value.getType() != Field::Types::Tuple)
+    {
+        source_values.push_back(std::move(partition_value));
+    }
+    else
+    {
+        if (partition_value.getType() != Field::Types::Tuple)
+            throw Exception(ErrorCodes::INVALID_PARTITION_VALUE,
+                "Expected a tuple for a partition key with {} fields, got {}", fields_count, partition_value.getTypeName());
+
+        const auto & tuple_value = partition_value.safeGet<Tuple>();
+        source_values.assign(tuple_value.begin(), tuple_value.end());
+    }
+
+    if (source_values.size() != fields_count)
+        throw Exception(ErrorCodes::INVALID_PARTITION_VALUE,
+            "Wrong number of fields in the partition expression: {}, must be: {}", source_values.size(), fields_count);
+
+    for (size_t i = 0; i < fields_count; ++i)
+        source_values[i] = convertFieldToTypeOrThrow(source_values[i], *partition_source_header.getByPosition(i).type);
+
+    return source_values;
+}
+
+Row evaluateTargetPartitionKey(
+    ChunkPartitioner & partitioner,
+    const Block & partition_source_header,
+    const std::vector<Field> & source_values)
+{
+    Columns columns;
+    columns.reserve(partition_source_header.columns());
+    for (size_t i = 0; i < partition_source_header.columns(); ++i)
+    {
+        auto column = partition_source_header.getByPosition(i).type->createColumn();
+        column->insert(source_values[i]);
+        columns.push_back(std::move(column));
+    }
+
+    auto partitioned = partitioner.partitionChunk(Chunk(std::move(columns), 1));
+    if (partitioned.size() != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Iceberg partition transforms produced {} partitions for a single row, expected exactly one",
+            partitioned.size());
+
+    return partitioned.front().first;
+}
+
+String dumpPartitionTuple(const Row & partition_values)
+{
+    String result = "(";
+    for (size_t i = 0; i < partition_values.size(); ++i)
+    {
+        if (i)
+            result += ", ";
+        result += applyVisitor(FieldVisitorToString(), partition_values[i]);
+    }
+    result += ')';
+    return result;
+}
+
+}
+
+void IcebergMetadata::dropPartition(
+    const ASTPtr & partition,
+    ContextPtr context,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const StorageID & storage_id)
+{
+    if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg].value)
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "Iceberg dropPartition requires the allow_insert_into_iceberg setting to be enabled.");
+
+    const auto * partition_ast = partition->as<ASTPartition>();
+    if (!partition_ast)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected a partition expression in DROP PARTITION");
+
+    if (partition_ast->all)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP PARTITION ALL is not supported for Iceberg tables");
+
+    if (!partition_ast->value)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "DROP PARTITION for Iceberg requires partition values, not a partition ID");
+
+    for (size_t attempt = 0; attempt < MAX_TRANSACTION_RETRIES; ++attempt)
+    {
+        if (tryDropPartitionOnce(*partition_ast, context, catalog, storage_id))
+            return;
+
+        LOG_DEBUG(log, "Iceberg DROP PARTITION lost a commit race, retrying (attempt {})", attempt + 1);
+    }
+
+    throw Exception(ErrorCodes::UNFINISHED,
+        "Failed to commit the Iceberg DROP PARTITION snapshot after {} attempts due to repeated metadata conflicts",
+        MAX_TRANSACTION_RETRIES);
+}
+
+bool IcebergMetadata::tryDropPartitionOnce(
+    const ASTPartition & partition_ast,
+    const ContextPtr & context,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const StorageID & storage_id)
+{
+    auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
+        object_storage,
+        persistent_components.table_path,
+        data_lake_settings,
+        persistent_components.metadata_cache,
+        context,
+        log.get(),
+        persistent_components.table_uuid,
+        persistent_components.metadata_compression_method,
+        true,
+        true);
+
+    auto metadata_object = getMetadataJSONObject(metadata_path, object_storage, persistent_components.metadata_cache, context, log, compression_method, persistent_components.table_uuid);
+
+    if (!metadata_object->has(f_current_snapshot_id))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No snapshot exists for this Iceberg table");
+
+    const Int64 current_snapshot_id = metadata_object->getValue<Int64>(f_current_snapshot_id);
+    if (current_snapshot_id < 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No snapshot exists for this Iceberg table");
+
+    auto data_snapshot = getIcebergDataSnapshot(metadata_object, current_snapshot_id, context);
+    const auto schema_id = static_cast<Int32>(data_snapshot->schema_id_on_snapshot_commit);
+
+    const Int32 format_version = metadata_object->getValue<Int32>(f_format_version);
+    if (format_version < 2)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "DROP PARTITION is supported only for Iceberg format version 2 and above");
+
+    if (format_version >= 3)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "DROP PARTITION is not supported for Iceberg format version {}. Dropping Puffin deletion vectors "
+            "is not implemented yet", format_version);
+
+    /// Also registers every schema in the schema processor, needed for the type lookup below
+    const auto current_schema_id = parseTableSchema(metadata_object, *persistent_components.schema_processor, context, log);
+    const auto current_schema = lookupSchema(metadata_object, current_schema_id);
+
+    const Int64 partition_spec_id = metadata_object->getValue<Int64>(f_default_spec_id);
+    const auto partition_spec = lookupPartitionSpec(metadata_object, partition_spec_id);
+    auto spec_fields = partition_spec->getArray(f_fields);
+    if (!spec_fields || spec_fields->size() == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Cannot drop a partition of Iceberg table {}: the table is not partitioned", persistent_components.table_path);
+
+    const auto spec_signature = getPartitionSpecSignature(spec_fields);
+
+    const auto partition_source_header = getPartitionSourceHeader(
+        spec_fields,
+        current_schema->getArray(f_fields),
+        *persistent_components.schema_processor,
+        current_schema_id);
+
+    const auto source_values = extractPartitionSourceValues(partition_ast, partition_source_header, context);
+
+    ChunkPartitioner partitioner(
+        spec_fields, current_schema->getArray(f_fields), context, std::make_shared<const Block>(partition_source_header));
+
+    const auto target_partition_key = evaluateTargetPartitionKey(partitioner, partition_source_header, source_values);
+
+    LOG_INFO(log, "Iceberg DROP PARTITION requested for partition {} of spec {}",
+        dumpPartitionTuple(target_partition_key), partition_spec_id);
+
+    std::unordered_map<const PartitionSpecification *, std::vector<size_t>> spec_field_positions;
+
+    auto entry_is_in_target_partition = [&](const ProcessedManifestFileEntryPtr & entry)
+    {
+        const auto & entry_spec = entry->common_partition_specification;
+        if (!entry_spec)
+            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "File {} has no partition specification", entry->parsed_entry->file_path_key.serialize());
+
+        const auto & partition_key_value = entry->parsed_entry->partition_key_value;
+        if (partition_key_value.size() != entry_spec->size())
+            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "File {} has {} partition values, but its partition spec has {} fields",
+                entry->parsed_entry->file_path_key.serialize(), partition_key_value.size(), entry_spec->size());
+
+        auto [it, inserted] = spec_field_positions.try_emplace(entry_spec.get());
+        if (inserted)
+            it->second = mapTargetFieldsToSpecPositions(*entry_spec, spec_signature);
+
+        bool constrains_every_target_field = true;
+        for (size_t i = 0; i < spec_signature.size(); ++i)
+        {
+            const auto position = it->second[i];
+            if (position == PARTITION_FIELD_NOT_IN_SPEC)
+            {
+                constrains_every_target_field = false;
+                continue;
+            }
+            if (!accurateEquals(partition_key_value[position], target_partition_key[i]))
+                return false;
+        }
+
+        if (!constrains_every_target_field)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "DROP PARTITION is not supported for Iceberg table {}: file {} was written under a partition spec "
+                "that does not contain every field of the current spec ({}), so it spans more than the dropped partition",
+                persistent_components.table_path, entry->parsed_entry->file_path_key.serialize(), partition_spec_id);
+
+        return true;
+    };
+
+    PreviousManifestActions manifest_actions;
+    std::vector<std::pair<ManifestFileCacheKey, std::unordered_set<String>>> manifests_to_rewrite;
+    size_t kept_manifests = 0;
+    size_t matched_files = 0;
+    size_t matched_data_files = 0;
+    size_t matched_records = 0;
+    size_t matched_bytes = 0;
+    size_t matched_position_delete_files = 0;
+    size_t matched_position_deletes = 0;
+    size_t matched_equality_delete_files = 0;
+    size_t matched_equality_deletes = 0;
+    size_t total_files = 0;
+
+    for (const auto & manifest_list_entry : data_snapshot->manifest_list_entries)
+    {
+        auto entries_handle = getManifestFileEntriesHandle(
+            object_storage, persistent_components, context, log,
+            manifest_list_entry, schema_id, *secondary_storages);
+
+        const auto & data_entries = entries_handle.getFilesWithoutDeleted(FileContentType::DATA);
+        const auto & position_delete_entries = entries_handle.getFilesWithoutDeleted(FileContentType::POSITION_DELETE);
+        const auto & equality_delete_entries = entries_handle.getFilesWithoutDeleted(FileContentType::EQUALITY_DELETE);
+
+        std::unordered_set<String> matched_paths_in_manifest;
+
+        auto match_entries = [&](const std::vector<ProcessedManifestFileEntryPtr> & entries)
+        {
+            for (const auto & entry : entries)
+            {
+                ++total_files;
+                if (!entry_is_in_target_partition(entry))
+                    continue;
+
+                const auto & parsed = *entry->parsed_entry;
+                matched_paths_in_manifest.insert(parsed.file_path_key.serialize());
+                matched_bytes += parsed.file_size_in_bytes;
+
+                switch (parsed.content_type)
+                {
+                    case FileContentType::DATA:
+                        ++matched_data_files;
+                        matched_records += parsed.record_count;
+                        break;
+                    case FileContentType::POSITION_DELETE:
+                        ++matched_position_delete_files;
+                        matched_position_deletes += parsed.record_count;
+                        break;
+                    case FileContentType::EQUALITY_DELETE:
+                        ++matched_equality_delete_files;
+                        matched_equality_deletes += parsed.record_count;
+                        break;
+                }
+
+                LOG_TRACE(log, "Matched {} file: {} ({} records)",
+                    FileContentTypeToString(parsed.content_type), parsed.file_path_key.serialize(), parsed.record_count);
+            }
+        };
+
+        match_entries(data_entries);
+        match_entries(position_delete_entries);
+        match_entries(equality_delete_entries);
+
+        if (matched_paths_in_manifest.empty())
+        {
+            ++kept_manifests;
+            continue;
+        }
+
+        const size_t live_entries_in_manifest
+            = data_entries.size() + position_delete_entries.size() + equality_delete_entries.size();
+        const size_t matched_in_manifest = matched_paths_in_manifest.size();
+
+        if (matched_in_manifest == live_entries_in_manifest)
+        {
+            PreviousManifestAction drop_action;
+            drop_action.kind = PreviousManifestAction::Kind::DROP;
+            manifest_actions.emplace(manifest_list_entry.manifest_file_path.serialize(), drop_action);
+        }
+        else
+        {
+            manifests_to_rewrite.emplace_back(manifest_list_entry, std::move(matched_paths_in_manifest));
+        }
+
+        matched_files += matched_in_manifest;
+    }
+
+    if (matched_files == 0)
+    {
+        LOG_INFO(log, "No files belong to partition {} (scanned {} files), nothing to drop",
+            dumpPartitionTuple(target_partition_key), total_files);
+        return true;
+    }
+
+    LOG_INFO(log, "Dropping partition {}: {} data files ({} records), {} position delete files, {} equality delete "
+        "files, {} bytes; {} manifests dropped, {} rewritten, {} kept unchanged",
+        dumpPartitionTuple(target_partition_key), matched_data_files, matched_records,
+        matched_position_delete_files, matched_equality_delete_files, matched_bytes,
+        manifest_actions.size(), manifests_to_rewrite.size(), kept_manifests);
+
+    std::optional<SnapshotSummaryTotals> parent_totals;
+    {
+        auto snapshots = metadata_object->getArray(f_snapshots);
+        for (size_t i = 0; i < snapshots->size(); ++i)
+        {
+            auto snapshot = snapshots->getObject(static_cast<UInt32>(i));
+            if (snapshot->getValue<Int64>(f_metadata_snapshot_id) != current_snapshot_id || !snapshot->has(f_summary))
+                continue;
+
+            auto parent_summary = SnapshotSummary::fromJSON(*snapshot->getObject(f_summary));
+            if (!parent_summary)
+                throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "Cannot parse the summary of snapshot {}: {}", current_snapshot_id, parent_summary.error());
+            parent_totals = parent_summary->getTotals();
+            break;
+        }
+    }
+    if (!parent_totals)
+        throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Current snapshot {} has no summary to derive the new snapshot totals from", current_snapshot_id);
+
+    SnapshotSummary new_summary(
+        SnapshotSummaryUpdateDelete{
+            .deleted_data_files = matched_data_files,
+            .removed_records = matched_records,
+            .removed_files_size = matched_bytes,
+            .removed_position_delete_files = matched_position_delete_files,
+            .removed_position_deletes = matched_position_deletes,
+            .removed_equality_delete_files = matched_equality_delete_files,
+            .removed_equality_deletes = matched_equality_deletes,
+            .num_partitions = 1,
+        },
+        parent_totals);
+
+    const auto & resolver = persistent_components.path_resolver;
+    FileNamesGenerator filename_generator(
+        resolver.getTableLocation(),
+        catalog != nullptr && catalog->isTransactional(),
+        compression_method,
+        write_format);
+    filename_generator.setVersion(last_version + 1);
+
+    std::vector<String> written_objects;
+    auto cleanup_written_objects = [&]
+    {
+        for (const auto & written_object : written_objects)
+        {
+            try
+            {
+                object_storage->removeObjectIfExists(StoredObject(written_object));
+            }
+            catch (...)
+            {
+                LOG_DEBUG(log, "Failed to clean up {} after an aborted DROP PARTITION", written_object);
+            }
+        }
+    };
+
+    try
+    {
+        for (const auto & [source_manifest, excluded_file_paths] : manifests_to_rewrite)
+        {
+            auto [source_storage, source_key] = resolveObjectStorageForPath(
+                persistent_components.table_location,
+                source_manifest.manifest_file_path.serialize(),
+                object_storage,
+                *secondary_storages,
+                context,
+                resolver);
+
+            auto rewritten_path = filename_generator.generateManifestEntryName();
+            auto rewritten_storage_path = resolver.resolve(rewritten_path);
+            written_objects.push_back(rewritten_storage_path);
+
+            RelativePathWithMetadata source_object_info(source_key);
+            auto source_buf = createReadBuffer(source_object_info, source_storage, context, log);
+            auto rewritten_buf = object_storage->writeObject(
+                StoredObject(rewritten_storage_path),
+                WriteMode::Rewrite, std::nullopt,
+                DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+            auto rewrite_result = rewriteManifestFileExcludingFiles(
+                *source_buf,
+                excluded_file_paths,
+                source_manifest.added_sequence_number,
+                source_manifest.added_snapshot_id,
+                *rewritten_buf);
+            rewritten_buf->finalize();
+
+            if (rewrite_result.removed_entries != static_cast<Int64>(excluded_file_paths.size()))
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "Rewriting manifest {} removed {} entries, expected {}",
+                    source_manifest.manifest_file_path.serialize(), rewrite_result.removed_entries,
+                    excluded_file_paths.size());
+
+            auto rewritten_bytes = rewritten_buf->count();
+            if (rewritten_bytes == 0)
+            {
+                rewritten_bytes = object_storage->getObjectMetadata(rewritten_storage_path, /*with_tags=*/false).size_bytes;
+            }
+
+            LOG_TRACE(log, "Rewrote manifest {} as {}: {} entries kept, {} removed",
+                source_manifest.manifest_file_path.serialize(), rewritten_path.serialize(),
+                rewrite_result.surviving_entries, rewrite_result.removed_entries);
+
+            manifest_actions.emplace(
+                source_manifest.manifest_file_path.serialize(),
+                PreviousManifestAction{
+                    .kind = PreviousManifestAction::Kind::REPLACE,
+                    .new_path = rewritten_path,
+                    .new_length = static_cast<Int64>(rewritten_bytes),
+                    .new_existing_files_count = rewrite_result.surviving_entries,
+                    .new_existing_rows_count = rewrite_result.surviving_rows,
+                    .new_min_sequence_number = rewrite_result.min_sequence_number,
+                });
+        }
+    }
+    catch (...)
+    {
+        cleanup_written_objects();
+        throw;
+    }
+
+    auto metadata_info = filename_generator.generateMetadataPathWithInfo();
+
+    auto [new_snapshot, manifest_list_path] = MetadataGenerator(metadata_object).generateNextMetadata(
+        filename_generator, metadata_info.path, current_snapshot_id,
+        /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0,
+        /* num_partitions */ 1, /* added_delete_files */ 0, /* num_deleted_rows */ 0,
+        /* user_defined_snapshot_id */ std::nullopt, /* user_defined_timestamp */ std::nullopt,
+        /* is_truncate */ false, new_summary.toJSON());
+
+    auto storage_manifest_list_name = resolver.resolve(manifest_list_path);
+    written_objects.push_back(storage_manifest_list_name);
+
+    try
+    {
+        /// Data files are not physically deleted
+        {
+            auto buf = object_storage->writeObject(
+                StoredObject(storage_manifest_list_name),
+                WriteMode::Rewrite, std::nullopt,
+                DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+            generateManifestList(
+                resolver, metadata_object, object_storage, *secondary_storages, context,
+                /* manifest_entry_names */ {}, new_snapshot, /* manifest_entry_sizes */ {},
+                *buf, FileContentType::DATA,
+                /* use_previous_snapshots */ kept_manifests > 0 || !manifests_to_rewrite.empty(),
+                /* per_entry_content_types */ {},
+                /* existing_entry_counts */ {},
+                /* carry_forward_manifest_paths */ {},
+                /* entry_partition_spec_ids */ {},
+                /* entry_partition_summaries */ {},
+                manifest_actions);
+            buf->finalize();
+        }
+
+        if (!writeMetadataFileAndVersionHint(
+                resolver,
+                metadata_info,
+                dumpMetadataObjectToString(metadata_object),
+                filename_generator.generateVersionHint(),
+                object_storage,
+                context,
+                data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+        {
+            cleanup_written_objects();
+            return false;
+        }
+
+        if (catalog)
+        {
+            const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+            if (!catalog->updateMetadata(namespace_name, table_name, resolver.resolveForCatalog(metadata_info.path), new_snapshot))
+            {
+                cleanup_written_objects();
+                return false;
+            }
+        }
+    }
+    catch (...)
+    {
+        cleanup_written_objects();
+        throw;
+    }
+
+    LOG_INFO(log, "Dropped partition {} in snapshot {}",
+        dumpPartitionTuple(target_partition_key), new_snapshot->getValue<Int64>(f_metadata_snapshot_id));
+    return true;
+}
 
 void IcebergMetadata::checkMutationIsPossible(const MutationCommands & commands)
 {
@@ -1720,35 +2364,6 @@ namespace FailPoints
 
 namespace
 {
-
-/// Find the partition spec object with the given spec-id inside a metadata JSON document.
-/// Throws METADATA_MISMATCH if the spec is not found (indicates metadata/spec-id mismatch).
-Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & meta, Int64 spec_id)
-{
-    auto specs = meta->getArray(Iceberg::f_partition_specs);
-    for (size_t i = 0; i < specs->size(); ++i)
-    {
-        auto spec = specs->getObject(static_cast<UInt32>(i));
-        if (spec->getValue<Int64>(Iceberg::f_spec_id) == spec_id)
-            return spec;
-    }
-    throw Exception(ErrorCodes::METADATA_MISMATCH,
-        "Partition spec with id {} not found in table metadata", spec_id);
-}
-
-Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & meta, Int64 schema_id)
-{
-    auto schemas = meta->getArray(Iceberg::f_schemas);
-    for (size_t i = 0; i < schemas->size(); ++i)
-    {
-        auto schema = schemas->getObject(static_cast<UInt32>(i));
-        if (schema->getValue<Int32>(Iceberg::f_schema_id) == schema_id)
-            return schema;
-    }
-
-    throw Exception(ErrorCodes::METADATA_MISMATCH,
-        "Schema with id {} not found in table metadata", schema_id);
-}
 
 /// Derive the Iceberg partition tuple for an exported part from a representative source row.
 /// The MergeTree `partition.value` is the source partition-key expression result; it is neither
