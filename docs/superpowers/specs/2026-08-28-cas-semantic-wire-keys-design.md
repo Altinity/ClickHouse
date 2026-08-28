@@ -23,9 +23,11 @@ every key and every closed vocabulary, a compile-time descriptor-budget proof, o
 explicitly rejects declarative field schemas, generated goldens, and a golden key scanner.
 Revision 6 (2026-08-29) makes the enforcement layer unambiguous: full-key bundles replace prefix
 composition, enum coverage is proven by set equality rather than by count, the table-versus-constant
-split is stated exactly, and `kMinBlobHeaderLen` gets one compile-time owner. The exact-full-name
-alternative was independently implemented in Altinity PR #2288 and rejected for this design (see
-rejected alternatives).
+split is stated exactly, and `kMinBlobHeaderLen` gets one compile-time owner. Revision 7
+(2026-08-29) scopes the table rule to fully-serializable enum domains (`RefLifecycle`, the numeric
+classification, and `FormatId` are explicitly outside it), settles the run marker as a typed enum,
+and completes the Decision list. The exact-full-name alternative was independently implemented in
+Altinity PR #2288 and rejected for this design (see rejected alternatives).
 
 ## Problem {#problem}
 
@@ -62,8 +64,9 @@ The semantic-keys generation replaces opaque initialisms with a semantic wire vo
   same change;
 - C++ member names obey the asymmetric rule: at least as understandable as the wire key, and
   fuller wherever the wire is budget-compressed;
-- every vocabulary item has a single production carrier (a key constant or an enum wire table),
-  and goldens stay an independent byte oracle that never reads those carriers.
+- every vocabulary item has a single production carrier — a key constant, an enum wire table, or a
+  single word constant for non-enum words — and goldens stay an independent byte oracle that never
+  reads those carriers.
 
 The change is a pre-release hard cut shipped as a **generation reset**: `G_BUILD` returns to 1,
 the accumulated change-point history is erased, pools are recreated, and readers gain no aliases,
@@ -633,25 +636,34 @@ vocabulary item gains a single production carrier:
   shared vocabulary section) — never assembled from a prefix at write time. There is no central
   schema registry; locality is preserved.
 - **Enum wire tables.** The `ProvenanceOp` decision generalizes to every enum-backed persisted
-  vocabulary: `ProvenanceOp`, `TokenType`, `HoldReason`, `OutcomeKind`, `MetaState`, `NsState`,
-  `RefOpKind`, `RefOwnerKind`, `BlobHashAlgo` (whose word functions are today split between
-  `CasBlobDigest.cpp` and `CasWireVocab.cpp` — a live instance of the drift class this layer
-  removes), `ObjectKind`, `RefLifecycle`, and the placement words. Each moves from its
-  switch-plus-if pair into one constexpr table whose coverage is proven by compile-time **set
-  equality with `magic_enum::enum_values<E>()`** — every declared enumerator appears exactly once
-  and nothing else does. (Size-plus-uniqueness is not enough: an invalid casted value would satisfy
-  both while an enumerator goes missing. Set equality is the actual replacement for the `-Wswitch`
-  guarantee the switches provided.) The table also proves two-way uniqueness of words and gives
-  fail-closed `fromWord` (`CORRUPTED_DATA` on an unknown word; the defensive `toWord` throw stays
-  against out-of-range enum values). `magic_enum` may back these asserts in `.cpp` files and tests
-  only, never in production headers. Lookup is a linear scan over a handful of entries — no maps.
-- **Non-enum words.** Words with no backing enum — the record tags `entry`, `ref_life`,
-  `blob_run`, `condemned`, and single-value vocabularies such as `live` and `source_edge` — are
-  single constexpr word constants shared by writer and reader (the snapshot row tags `committed`
-  and `precommit` render through the `RefOwnerKind` table rather than a parallel spelling). The run
-  marker is today three raw `char` constants, so `magic_enum` does not apply to it: it either gains
-  a typed enum over the same pinned byte values (preferred — the standard table then works) or an
-  explicit `WireTable<char>` whose coverage is asserted against a local constexpr value list.
+  word vocabulary **whose entire enum domain is serializable**: `ProvenanceOp`, `TokenType`,
+  `HoldReason`, `OutcomeKind`, `MetaState`, `NsState`, `RefOpKind`, `RefOwnerKind`, `BlobHashAlgo`
+  (whose word functions are today split between `CasBlobDigest.cpp` and `CasWireVocab.cpp` — a
+  live instance of the drift class this layer removes), `ObjectKind`, the placement words, and the
+  new run-marker enum. Each moves from its switch-plus-if pair into one constexpr table whose
+  coverage is proven by compile-time **set equality with `magic_enum::enum_values<E>()`** — every
+  declared enumerator appears exactly once and nothing else does. (Size-plus-uniqueness is not
+  enough: an invalid casted value would satisfy both while an enumerator goes missing. Set
+  equality is the actual replacement for the `-Wswitch` guarantee the switches provided.) The
+  table also proves two-way uniqueness of words and gives fail-closed `fromWord`
+  (`CORRUPTED_DATA` on an unknown word; the defensive `toWord` throw stays against out-of-range
+  enum values). `magic_enum` may back these asserts in `.cpp` files and tests only, never in
+  production headers. Lookup is a linear scan over a handful of entries — no maps. Three
+  enum-adjacent cases are deliberately outside the table rule: `RefLifecycle`, whose wire domain
+  is a strict subset of the enum — `Removed` must never be serialized, so a table entry for it
+  would either open the wire to a forbidden state or break the coverage proof; the numeric
+  `classification`, which stays numeric by decision; and `FormatId`, whose type strings already
+  belong to the `TRAITS` registry rather than a separate wire table.
+- **Non-enum words.** Words with no backing fully-serializable enum — the record tags `entry`,
+  `ref_life`, `blob_run`, `condemned`, and single-value vocabularies such as `live` and
+  `source_edge` — are single constexpr word constants shared by writer and reader (the snapshot
+  row tags `committed` and `precommit` render through the `RefOwnerKind` table rather than a
+  parallel spelling). `live` additionally keeps the explicit `lifecycle == RefLifecycle::Live`
+  check, since the enum's `Removed` value must never reach the wire. The run marker — today three
+  raw `char` constants — becomes a typed enum over the same pinned byte values `0x00`, `0x01`,
+  `0x02` (the bytes also persist in the in-degree payload representation, so they are part of the
+  contract): an invalid marker becomes unrepresentable, and the marker's word table joins the
+  standard set-equality rule above.
 - `CasInspect` renders enum values through the same tables, so introspection cannot print `Merge`
   where the wire says `merge`. `system.cas_*` column names are deliberately NOT coupled to wire
   keys: the SQL surface and the persisted format have different compatibility contracts.
@@ -846,10 +858,12 @@ The change is complete when:
   `kMinBlobHeaderLen`, and the boundary test independently confirms the formula against the real
   encoder;
 - every wire key is read by its writer and reader from one constexpr constant — the
-  bare/`old_`/`new_` families through full-key bundles, never prefix assembly; every enum-backed
-  persisted vocabulary lives in one wire table whose values are proven set-equal to
+  bare/`old_`/`new_` families through full-key bundles, never prefix assembly; every fully
+  serializable enum-backed vocabulary — the run marker included, as a typed enum over the pinned
+  bytes `0x00`/`0x01`/`0x02` — lives in one wire table whose values are proven set-equal to
   `magic_enum::enum_values<E>()` with two-way word uniqueness (`magic_enum` confined to `.cpp`
-  files and tests; the char-based run marker asserted against an explicit local value list);
+  files and tests); `RefLifecycle`, the numeric classification, and `FormatId` stay outside the
+  table rule (`live` is a word constant guarded by the explicit `Live` check);
   non-enum tag and single-value words are single constexpr constants; `CasInspect` renders enum
   values through the tables; `kMinBlobHeaderLen` has one compile-time owner shared by the envelope
   encoder and `validatePoolBlobHeaderLen`; and all change points reference one shared `BASELINE`;
