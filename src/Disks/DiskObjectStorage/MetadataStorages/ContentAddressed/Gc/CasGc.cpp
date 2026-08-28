@@ -348,11 +348,205 @@ void Gc::runNamespaceJanitorPage(
     t.metric("leaked", janitor_result.leaked);
 }
 
+std::optional<Gc::LeaseContext> Gc::runLeasePhase(RoundReport & report, bool allow_steal)
+{
+    GcState gc_state;
+    Token gc_state_token;
+
+    /// PHASE 1/18 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
+    /// are correlated by `round_id` and not by the round number a follower never learns.
+    {
+        GcPhaseTimer t(phase_sink, "lease");
+        report.acquired_lease = acquireOrRenewLease(gc_state, gc_state_token, allow_steal);
+        t.metric("acquired", report.acquired_lease ? 1 : 0);
+        t.metric("steal_allowed", allow_steal ? 1 : 0);
+    }
+    if (!report.acquired_lease)
+        return std::nullopt;
+
+    const uint64_t next_round = gc_state.round + 1;
+    return LeaseContext{std::move(gc_state), std::move(gc_state_token), next_round};
+}
+
+void Gc::runPreFoldRefDrainPhase(const GcState & leased_state)
+{
+    /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
+    /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
+    /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
+    GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
+    const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(leased_state);
+    for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
+        store->invalidateRemovedCatalogLife(retired_life);
+    if (drain_result.authority_status != AuthorityStatus::Authoritative
+        || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
+        throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
+    t.metric("deleted", drain_result.deleted);
+}
+
+void Gc::runHeartbeatFloorPhase(const GcState & leased_state, uint64_t new_round, RoundReport & report)
+{
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    /// Token-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
+    /// rounds via `new_round`, not on heartbeat acks). Fencing no longer trusts a predecessor's stamped
+    /// `expires_at_ms` against our wall clock — it
+    /// fences ONLY once `mount_obs` has watched the mount's write-token hold unchanged for the full
+    /// threshold on THIS leader's own monotonic clock (mirrors `claimMountAwaitingExpiry`'s identical
+    /// `TTL + Drift` threshold for a mount's own reopen).
+    const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
+    /// The formula is shared with `claimMountAwaitingExpiry` via
+    /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).
+    const uint64_t stable_threshold_ms = mountObservationThresholdMs(
+        ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
+
+    /// PHASE 3/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
+    /// PUT per newly-fenced mount.
+    GcPhaseTimer t(phase_sink, "heartbeat_floor");
+    const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), mono_ms_fn(),
+                                                       stable_threshold_ms, mount_obs);
+    report.fence_outs = floor.fenced_now;
+    if (floor.fenced_now > 0)
+        ProfileEvents::increment(ProfileEvents::CASGCHeartbeatFenceOuts, floor.fenced_now);
+
+    /// GcFenceOut audit row per expired mount fenced-out this round: the round latched a fence-out to
+    /// re-arm a sleeper's write fence (its held token is now invalid). One row per srid so the log
+    /// reconstructs which mount was reclaimed.
+    for (const String & srid : floor.fenced_srids)
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::GcFenceOut;
+            e.object_kind = CasEventObjectKind::Snap;
+            e.round = new_round;
+            e.gen = leased_state.snap_generation;
+            e.outcome = "fenced";
+            e.reason = "expired mount lease past skew margin; token-guarded fence-out re-arms the write "
+                       "fence (prevents a resumed sleeper from mutating)";
+            e.detail = {{"server_root_id", srid}};
+        });
+
+    /// Emit the round's heartbeat classification (what mounts are live/terminated/fenced this round).
+    EventEmitter{*store}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::GcFence;
+        e.object_kind = CasEventObjectKind::Snap;
+        e.round = new_round;
+        e.gen = leased_state.snap_generation;
+        e.outcome = "floor";
+        e.reason = "R1: heartbeat classification (live/terminated/fenced mounts)";
+        e.detail = {{"live", std::to_string(floor.live)},
+                    {"terminated", std::to_string(floor.terminated)},
+                    {"fenced_now", std::to_string(floor.fenced_now)},
+                    {"already_fenced", std::to_string(floor.already_fenced)}};
+    });
+
+    t.metric("live", floor.live);
+    t.metric("terminated", floor.terminated);
+    t.metric("fenced_now", floor.fenced_now);
+    t.metric("already_fenced", floor.already_fenced);
+}
+
+Gc::DeferDecisionPhaseResult Gc::runDeferDecisionPhase(const GcState & gc_state, uint64_t new_round)
+{
+    /// Decide DEFER vs FOLD from cheap pre-fold signals.
+    /// A DEFER round re-adopts the sealed generation — no fold, no delete, no gc/state write — so a
+    /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
+    /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
+    ///
+    /// `listRefPrefix` is the round's one full enumeration of `cas/ns/stream/`. Its result is retained
+    /// (rather than discarded once the defer decision is taken) because `fold` regroups the very same
+    /// keys instead of listing the prefix again. A deferred round simply drops it.
+    ///
+    /// PHASE 4/18 `defer_decision`. The returned plan OUTLIVES the timer because the fold consumes it.
+    /// The verdict-dependent bookkeeping (`rounds_since_last_fold_`, `RoundReport::deferred`/`round`,
+    /// the deferred event) is applied by the caller so the timer wraps only the decision itself. This
+    /// phase also performs TWO of the round's reads of the adopted fold seal (`graduationDue` and
+    /// `listRefPrefix` each read the same key) -- see `fold_seal_reads` below.
+    GcPhaseTimer t(phase_sink, "defer_decision");
+    const bool graduation_due = graduationDue(gc_state, new_round);
+    RefPlan walk_plan = buildRefWalkPlan(listRefPrefix(gc_state));
+    reportStuckRemovals(walk_plan, gc_state.round);
+    const RefScanSummary & ref_scan = walk_plan.refScan();
+    const size_t changed = walk_plan.changedRows();
+    const bool defer_round = shouldDeferRound(
+        changed,
+        graduation_due,
+        rounds_since_last_fold_,
+        store->poolConfig().gc_fold_threshold,
+        store->poolConfig().gc_fold_max_defer_rounds);
+    uint64_t ref_log_keys = 0;
+    for (const auto & [scanned_life, ids] : ref_scan.logs_by_life)
+        ref_log_keys += ids.size();
+    t.metric("changed_shards", changed);
+    t.metric("namespaces_seen", ref_scan.max_log_by_life.size());
+    t.metric("ref_log_keys_listed", ref_log_keys);
+    t.metric("ref_keys_listed", ref_scan.keys.size());
+    t.metric("graduation_due", graduation_due ? 1 : 0);
+    t.metric("dead_life_debris", ref_scan.dead_life_debris);
+    t.metric("walk_plan_builds", 1);
+    t.metric("walk_plan_rows", walk_plan.size());
+    t.metric("walk_plan_dropped_parent_rows", walk_plan.droppedParentRows());
+    t.metric("walk_plan_dropped_listed_lives", walk_plan.droppedListedLives());
+    t.metric("walk_plan_dropped_tails", walk_plan.droppedTails());
+    t.metric("deferred", defer_round ? 1 : 0);
+    /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
+    /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
+    t.metric("rounds_deferred_before", rounds_since_last_fold_);
+    /// `graduationDue` and `listRefPrefix` each GET the adopted fold seal at the SAME
+    /// (generation, attempt). Recorded, not fixed -- see the `fold_seal_read` phase, which records
+    /// the other duplicate pair; the round GETs that one key FIVE times on a folding round.
+    t.metric("fold_seal_reads", 2);
+
+    if (defer_round)
+        return {.round_kind = RoundKind::Defer, .walk_plan = std::nullopt, .changed_shards = changed};
+
+    return {.round_kind = RoundKind::Fold, .walk_plan = std::move(walk_plan), .changed_shards = changed};
+}
+
+GcRoundWorkBudget Gc::buildRoundWorkBudget() const
+{
+    /// ONE budget instance for the WHOLE round, threaded into every destructive-or-observability-write
+    /// family below: `fold` (blob graduation/redelete, the `GcOutcomes` audit rows, the orphan-manifest
+    /// planner), `pruneSupersededGenerations`, the post-CAS hand-off reclaim (its OWN reserve, never
+    /// `pruneSupersededGenerations`' shared remainder), the post-CAS manifest-body cleanup, and
+    /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families or
+    /// shards. See `GcRoundWorkBudget`'s own comment for the fail-closed contract each family applies on
+    /// exhaustion.
+    GcRoundWorkBudget round_work_budget;
+    round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
+    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
+    round_work_budget.max_sweep_namespaces = store->poolConfig().gc_round_sweep_namespace_budget;
+    round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
+    round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
+    round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
+    round_work_budget.max_handoff_prefix_wholesale_objects = store->poolConfig().gc_round_handoff_prefix_wholesale_budget;
+    round_work_budget.max_outcome_entries = store->poolConfig().gc_round_outcome_entry_budget;
+    return round_work_budget;
+}
+
+std::vector<RunRef> Gc::runParentSealReadPhase(const GcState & gc_state)
+{
+    /// Capture the PARENT seal's run refs BEFORE fold mutates
+    /// `gc_state.snap_generation`/`snap_attempt` in-memory (CasGc.cpp:838). We compare these against the
+    /// NEW seal's refs post-CAS to detect a ref that moved OFF an already-pruned generation (the
+    /// wholesale prune skipped it while it was still referenced and its cursor advanced past it), and
+    /// hand-off delete that generation's now-unreferenced leftover. Absent parent seal => empty.
+    ///
+    /// PHASE 5/18 `parent_seal_read`: the round's THIRD GET of the adopted fold seal (`graduationDue`
+    /// and `listRefPrefix` already read it in `defer_decision`, and `fold` reads it twice more). One
+    /// small GET, given its own row rather than left untimed, because "the same key, five times a round"
+    /// is only actionable if each read is attributable to a phase.
+    std::vector<RunRef> parent_seal_runs;
+    GcPhaseTimer t(phase_sink, "parent_seal_read");
+    if (const auto parent_seal = readFoldSeal(gc_state.snap_generation, gc_state.snap_attempt))
+        parent_seal_runs = parent_seal->blob_target_runs;
+    t.metric("parent_runs", parent_seal_runs.size());
+    return parent_seal_runs;
+}
+
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy)
 {
     RoundReport report;
-    GcState state;
-    Token state_token;
 
     /// Every exit path waits for this round's meta jobs. The throwing `meta_pool_wait` phase below is
     /// a protocol barrier -- this round's condemns must be durable no later than the ledger they are
@@ -363,16 +557,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// never scheduled them.
     SCOPE_EXIT({ meta_writer->drainOnExitNoThrow(); });
 
-    /// PHASE 1/18 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
-    /// are correlated by `round_id` and not by the round number a follower never learns.
-    {
-        GcPhaseTimer t(phase_sink, "lease");
-        report.acquired_lease = acquireOrRenewLease(state, state_token, allow_steal);
-        t.metric("acquired", report.acquired_lease ? 1 : 0);
-        t.metric("steal_allowed", allow_steal ? 1 : 0);
-    }
-    if (!report.acquired_lease)
+    std::optional<LeaseContext> lease = runLeasePhase(report, allow_steal);
+    if (!lease)
         return report;
+
+    GcState gc_state = std::move(lease->state);
+    Token gc_state_token = std::move(lease->state_token);
 
     /// Baseline for the `meta_pool_wait` phase's job counts (the pool is per-`Gc`, the counters
     /// cumulative), taken before anything in this round can schedule a job.
@@ -394,220 +584,68 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
-    const uint64_t new_round = state.round + 1;
+    const uint64_t new_round = lease->next_round;
 
-    /// ONE budget instance for the WHOLE round, threaded into every destructive-or-observability-write
-    /// family below: `fold` (blob graduation/redelete, the `GcOutcomes` audit rows, the orphan-manifest
-    /// planner), `pruneSupersededGenerations`, the post-CAS hand-off reclaim (its OWN reserve, never
-    /// `pruneSupersededGenerations`' shared remainder), the post-CAS manifest-body cleanup, and
-    /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families or
-    /// shards. See `GcRoundWorkBudget`'s own comment for the fail-closed contract each family applies on
-    /// exhaustion.
-    GcRoundWorkBudget round_work_budget;
-    round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
-    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
-    round_work_budget.max_sweep_namespaces = store->poolConfig().gc_round_sweep_namespace_budget;
-    round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
-    round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
-    round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
-    round_work_budget.max_handoff_prefix_wholesale_objects = store->poolConfig().gc_round_handoff_prefix_wholesale_budget;
-    round_work_budget.max_outcome_entries = store->poolConfig().gc_round_outcome_entry_budget;
+    GcRoundWorkBudget round_work_budget = buildRoundWorkBudget();
 
-    /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
-    /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
-    /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
+    runPreFoldRefDrainPhase(gc_state);
+
+    runHeartbeatFloorPhase(gc_state, new_round, report);
+
+    const DeferDecisionPhaseResult defer_decision = runDeferDecisionPhase(gc_state, new_round);
+
+    if (defer_decision.round_kind == RoundKind::Defer)
     {
-        GcPhaseTimer t(phase_sink, "pre_fold_ref_drain");
-        const CatalogLifecycleReconcileResult drain_result = drainCompletedRemoving(state);
-        for (const NamespaceLifeId & retired_life : drain_result.retired_lives)
-            store->invalidateRemovedCatalogLife(retired_life);
-        if (drain_result.authority_status != AuthorityStatus::Authoritative
-            || drain_result.catalog_resolution != CatalogResolution::DrainComplete)
-            throwCasWriteRetryLater("CAS GC pre-fold drain lost authority before the catalog settled");
-        t.metric("deleted", drain_result.deleted);
-    }
-
-    /// Token-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
-    /// rounds via `new_round`, not on heartbeat acks). Fencing no longer trusts a predecessor's stamped
-    /// `expires_at_ms` against our wall clock — it
-    /// fences ONLY once `mount_obs` has watched the mount's write-token hold unchanged for the full
-    /// threshold on THIS leader's own monotonic clock (mirrors `claimMountAwaitingExpiry`'s identical
-    /// `TTL + Drift` threshold for a mount's own reopen).
-    const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
-    /// The formula is shared with `claimMountAwaitingExpiry` via
-    /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).
-    const uint64_t stable_threshold_ms = mountObservationThresholdMs(
-        ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
-
-    /// PHASE 3/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
-    /// PUT per newly-fenced mount.
-    {
-        GcPhaseTimer t(phase_sink, "heartbeat_floor");
-        const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), mono_ms_fn(),
-                                                           stable_threshold_ms, mount_obs);
-        report.fence_outs = floor.fenced_now;
-        if (floor.fenced_now > 0)
-            ProfileEvents::increment(ProfileEvents::CASGCHeartbeatFenceOuts, floor.fenced_now);
-
-        /// GcFenceOut audit row per expired mount fenced-out this round: the round latched a fence-out to
-        /// re-arm a sleeper's write fence (its held token is now invalid). One row per srid so the log
-        /// reconstructs which mount was reclaimed.
-        for (const String & srid : floor.fenced_srids)
-            EventEmitter{*store}.emit([&](CasEvent & e)
+        ++rounds_since_last_fold_;
+        report.deferred = true;
+        /// A DEFER round mints no new round -- unlike the fold path below (CasGc.cpp:642), which sets
+        /// `report.round = gc_state.round` only AFTER the round's single `gc/state` CAS has committed
+        /// `next.round = new_round` and `gc_state` was reassigned to that committed `next` (so on that
+        /// path `gc_state.round` reads the FRESH round number). Here the round CAS never runs, so `gc_state`
+        /// is still the round that was already adopted BEFORE this round started: `gc_state.round` is the
+        /// honest, already-durable round number, while `new_round` (`gc_state.round + 1`) would report a
+        /// round that never actually happened. Use `gc_state.round` so `RoundReport::round` and the
+        /// `system.cas_gc_log` row it feeds never print a fabricated
+        /// round number on a deferred round.
+        report.round = gc_state.round;
+        EventEmitter{*store}.emit(
+            [&](CasEvent & e)
             {
-                e.type = CasEventType::GcFenceOut;
+                e.type = CasEventType::GcFence; /// reuse the Snap round-event channel; outcome = "deferred"
                 e.object_kind = CasEventObjectKind::Snap;
-                e.round = new_round;
-                e.gen = state.snap_generation;
-                e.outcome = "fenced";
-                e.reason = "expired mount lease past skew margin; token-guarded fence-out re-arms the write "
-                           "fence (prevents a resumed sleeper from mutating)";
-                e.detail = {{"server_root_id", srid}};
-            });
-
-        /// Emit the round's heartbeat classification (what mounts are live/terminated/fenced this round).
-        EventEmitter{*store}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::GcFence;
-            e.object_kind = CasEventObjectKind::Snap;
-            e.round = new_round;
-            e.gen = state.snap_generation;
-            e.outcome = "floor";
-            e.reason = "R1: heartbeat classification (live/terminated/fenced mounts)";
-            e.detail = {{"live", std::to_string(floor.live)},
-                        {"terminated", std::to_string(floor.terminated)},
-                        {"fenced_now", std::to_string(floor.fenced_now)},
-                        {"already_fenced", std::to_string(floor.already_fenced)}};
-        });
-
-        t.metric("live", floor.live);
-        t.metric("terminated", floor.terminated);
-        t.metric("fenced_now", floor.fenced_now);
-        t.metric("already_fenced", floor.already_fenced);
-    }
-
-    /// Decide DEFER vs FOLD from cheap pre-fold signals.
-    /// A DEFER round re-adopts the sealed generation — no fold, no delete, no gc/state write — so a
-    /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
-    /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
-    ///
-    /// `listRefPrefix` is the round's one full enumeration of `cas/ns/stream/`. Its result is retained
-    /// (rather than discarded once the defer decision is taken) because `fold` regroups the very same
-    /// keys instead of listing the prefix again. A deferred round simply drops it.
-    ///
-    /// PHASE 4/18 `defer_decision`. `ref_scan` OUTLIVES the timer because the fold consumes it, and
-    /// `report.deferred` is set INSIDE the scope so the row already reflects the verdict when the
-    /// timer's destructor fires on the deferred round's early return. This phase also performs TWO of
-    /// the round's reads of the adopted fold seal (`graduationDue` and `listRefPrefix` each read the
-    /// same key) -- see `fold_seal_reads` below.
-    std::optional<RefPlan> walk_plan;
-    bool defer_round = false;
-    {
-        GcPhaseTimer t(phase_sink, "defer_decision");
-        const bool graduation_due = graduationDue(state, new_round);
-        walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)));
-        reportStuckRemovals(*walk_plan, state.round);
-        const RefScanSummary & ref_scan = walk_plan->refScan();
-        const size_t changed = walk_plan->changedRows();
-        defer_round = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
-                                       store->poolConfig().gc_fold_threshold,
-                                       store->poolConfig().gc_fold_max_defer_rounds);
-        uint64_t ref_log_keys = 0;
-        for (const auto & [scanned_life, ids] : ref_scan.logs_by_life)
-            ref_log_keys += ids.size();
-        t.metric("changed_shards", changed);
-        t.metric("namespaces_seen", ref_scan.max_log_by_life.size());
-        t.metric("ref_log_keys_listed", ref_log_keys);
-        t.metric("ref_keys_listed", ref_scan.keys.size());
-        t.metric("graduation_due", graduation_due ? 1 : 0);
-        t.metric("dead_life_debris", ref_scan.dead_life_debris);
-        t.metric("walk_plan_builds", 1);
-        t.metric("walk_plan_rows", walk_plan->size());
-        t.metric("walk_plan_dropped_parent_rows", walk_plan->droppedParentRows());
-        t.metric("walk_plan_dropped_listed_lives", walk_plan->droppedListedLives());
-        t.metric("walk_plan_dropped_tails", walk_plan->droppedTails());
-        t.metric("deferred", defer_round ? 1 : 0);
-        /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
-        /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
-        t.metric("rounds_deferred_before", rounds_since_last_fold_);
-        /// `graduationDue` and `listRefPrefix` each GET the adopted fold seal at the SAME
-        /// (generation, attempt). Recorded, not fixed -- see the `fold_seal_read` phase, which records
-        /// the other duplicate pair; the round GETs that one key FIVE times on a folding round.
-        t.metric("fold_seal_reads", 2);
-
-        if (defer_round)
-        {
-            ++rounds_since_last_fold_;
-            report.deferred = true;
-            /// A DEFER round mints no new round -- unlike the fold path below (CasGc.cpp:642), which sets
-            /// `report.round = state.round` only AFTER the round's single `gc/state` CAS has committed
-            /// `next.round = new_round` and `state` was reassigned to that committed `next` (so on that
-            /// path `state.round` reads the FRESH round number). Here the round CAS never runs, so `state`
-            /// is still the round that was already adopted BEFORE this round started: `state.round` is the
-            /// honest, already-durable round number, while `new_round` (`state.round + 1`) would report a
-            /// round that never actually happened. Use `state.round` so `RoundReport::round` and the
-            /// `system.cas_gc_log` row it feeds never print a fabricated
-            /// round number on a deferred round.
-            report.round = state.round;
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::GcFence;   /// reuse the Snap round-event channel; outcome = "deferred"
-                e.object_kind = CasEventObjectKind::Snap;
-                e.round = state.round;
-                e.gen = state.snap_generation;
+                e.round = gc_state.round;
+                e.gen = gc_state.snap_generation;
                 e.outcome = "deferred";
                 e.reason = "skip-unchanged: no changed shard reached the fold threshold and no graduation "
                            "is due; re-adopting the sealed generation (snapshot rebuild elided)";
-                e.detail = {{"changed_shards", std::to_string(changed)},
-                            {"rounds_since_last_fold", std::to_string(rounds_since_last_fold_)}};
+                e.detail
+                    = {{"changed_shards", std::to_string(defer_decision.changed_shards)},
+                       {"rounds_since_last_fold", std::to_string(rounds_since_last_fold_)}};
             });
-            /// Return after the timer scope so the independently timed janitor phase is not nested
-            /// inside `defer_decision`.
-        }
-        else
-            rounds_since_last_fold_ = 0;   /// this round folds
-    }
-
-    if (defer_round)
-    {
         /// DEFER has no `FoldResult`, hence no complete global destructive verdict. The janitor still
         /// takes its bounded page and catalog cut, but suppression keeps both deletes and valid-page
         /// cursor progress at the same position for the bounded forced fold to retry.
-        runNamespaceJanitorPage(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
-        return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
+        runNamespaceJanitorPage(gc_state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
+        return report; /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
     }
+
+    rounds_since_last_fold_ = 0;   /// this round folds
 
     /// Emit that the round's single pass begins.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::GcFoldBegin;
         e.object_kind = CasEventObjectKind::Snap;
-        e.round = state.round;
-        e.gen = state.snap_generation;
+        e.round = gc_state.round;
+        e.gen = gc_state.snap_generation;
         e.reason = "R2: one-pass fold (edges x deltas x retired) into a new durable generation";
     });
 
-    /// Capture the PARENT seal's run refs BEFORE fold mutates
-    /// `state.snap_generation`/`snap_attempt` in-memory (CasGc.cpp:838). We compare these against the
-    /// NEW seal's refs post-CAS to detect a ref that moved OFF an already-pruned generation (the
-    /// wholesale prune skipped it while it was still referenced and its cursor advanced past it), and
-    /// hand-off delete that generation's now-unreferenced leftover. Absent parent seal => empty.
-    ///
-    /// PHASE 5/18 `parent_seal_read`: the round's THIRD GET of the adopted fold seal (`graduationDue`
-    /// and `listRefPrefix` already read it in `defer_decision`, and `fold` reads it twice more). One
-    /// small GET, given its own row rather than left untimed, because "the same key, five times a round"
-    /// is only actionable if each read is attributable to a phase.
-    std::vector<RunRef> parent_seal_runs;
-    {
-        GcPhaseTimer t(phase_sink, "parent_seal_read");
-        if (const auto parent_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
-            parent_seal_runs = parent_seal->blob_target_runs;
-        t.metric("parent_runs", parent_seal_runs.size());
-    }
+    const std::vector<RunRef> parent_seal_runs = runParentSealReadPhase(gc_state);
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_token, report, new_round, *walk_plan, policy, round_work_budget);
+    FoldResult folded = fold(gc_state, gc_state_token, report, new_round, *defer_decision.walk_plan, policy, round_work_budget);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -619,16 +657,16 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         e.type = CasEventType::GcFoldEnd;
         e.object_kind = CasEventObjectKind::Snap;
-        e.round = state.round;
-        e.gen = state.snap_generation;
+        e.round = gc_state.round;
+        e.gen = gc_state.snap_generation;
         e.outcome = "ok";
         e.reason = "R2 complete";
         e.detail = {{"shards", std::to_string(folded.root_shards.size())},
                     {"anomalies", std::to_string(report.anomalies.size())}};
     });
 
-    const uint64_t generation = state.snap_generation;   /// set in-memory by fold; committed below
-    const uint64_t attempt = state.snap_attempt;
+    const uint64_t generation = gc_state.snap_generation;   /// set in-memory by fold; committed below
+    const uint64_t attempt = gc_state.snap_attempt;
 
     /// PRE-CAS deletes affect ONLY entries the PREVIOUS pass published as delete_pending (justified by
     /// durable state and safe at any leader staleness), plus outcome bookkeeping for
@@ -911,8 +949,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// separates the two costs inside the row.
     std::optional<GcPhaseTimer> round_commit_timer;
     round_commit_timer.emplace(phase_sink, "round_commit");
-    const String manifest_sweep_cursor_before = state.manifest_sweep_cursor;
-    GcState next = state;
+    const String manifest_sweep_cursor_before = gc_state.manifest_sweep_cursor;
+    GcState next = gc_state;
     next.round = new_round;
     if (!suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
         next.manifest_sweep_cursor = folded.orphan_sweep.next_cursor;
@@ -932,19 +970,19 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// then LOSES, the prune reclaimed one generation deeper than the durably-adopted generation would
     /// imply -- an accepted forensics-window slack, not a data-loss risk: every still-reachable
     /// run/blob is independently protected via `referenced_generations` (captured pre-fold above).
-    const uint64_t pruned_through_before = state.snap_pruned_through;
+    const uint64_t pruned_through_before = gc_state.snap_pruned_through;
     pruneSupersededGenerations(generation, attempt, next, referenced_generations, suppress_destructive,
                                round_work_budget);
     round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
     round_commit_timer->metric("pruned_through", next.snap_pruned_through);
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
-    const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
+    const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), gc_state_token);
     if (res.outcome != CasOutcome::Committed)
         throw Exception(ErrorCodes::ABORTED,
             "CAS gc round: gc/state moved during the round (another leader advanced it); retry next round");
-    state = std::move(next);
-    state_token = res.token;
-    report.round = state.round;
+    gc_state = std::move(next);
+    gc_state_token = res.token;
+    report.round = gc_state.round;
     round_commit_timer->metric("round", report.round);
     round_commit_timer->metric("generation", generation);
     round_commit_timer.reset();   /// emits the `round_commit` row
@@ -1000,7 +1038,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const RunRef & old_ref : handoff_candidates)
         {
             /// Only generations the wholesale prune already passed AND that no live ref still pins.
-            if (old_ref.generation > state.snap_pruned_through)
+            if (old_ref.generation > gc_state.snap_pruned_through)
                 continue;   /// not yet pruned-through: the normal prune will reclaim it when it ages out
             if (new_referenced_generations.contains(old_ref.generation))
                 continue;   /// still referenced by a (possibly different-shard) live ref: keep it
@@ -1083,14 +1121,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     uint64_t cleanup_evidence_rows = 0;
     for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
         cleanup_evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
-    runNamespaceJanitorPage(state, suppress_destructive, cleanup_evidence_rows);
+    runNamespaceJanitorPage(gc_state, suppress_destructive, cleanup_evidence_rows);
     /// PHASE 17/18 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
     /// what a reader of a round that reclaimed nothing needs to see.
     {
         GcPhaseTimer t(phase_sink, "ref_object_cleanup");
         if (trim_enabled)
-            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget);
+            cleanupRefObjects(folded, gc_state.lease, suppress_destructive, round_work_budget);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
         t.metric("trim_enabled", trim_enabled ? 1 : 0);
         t.metric("namespaces_planned", folded.ref_tables.size());
@@ -1129,7 +1167,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 ++sweep.skipped;
         }
         reportSweepRetention(sweep);
-        t.metric("cursor_advanced", state.manifest_sweep_cursor != manifest_sweep_cursor_before ? 1 : 0);
+        t.metric("cursor_advanced", gc_state.manifest_sweep_cursor != manifest_sweep_cursor_before ? 1 : 0);
         t.metric("list_budget_keys", store->poolConfig().manifest_sweep_list_budget_keys);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
         t.metric("listed", sweep.listed);
