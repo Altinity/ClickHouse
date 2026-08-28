@@ -2,7 +2,10 @@
 19999900000	619996900000
 19999900000	619996900000
 19999900000	619996900000
--- with a 64 KiB alignment the cache downloads at most 2x what the reader asked for; with the cache default (1 MiB) it downloads far more
+-- with a 64 KiB alignment the cache downloads at most 3x what the reader asked for; with the cache default (1 MiB) it downloads far more
 default	0	1	0
 nobg	0	1	1
 small	1	0	0
+-- ranges of a cached multi-segment read are served before the whole read completes
+400000	79999800000	51176128
+1

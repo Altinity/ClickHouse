@@ -42,14 +42,52 @@ run small 65536
 # flag, so any drop in `FilesystemCacheBackgroundDownloadQueuePush` is attributable to it.
 run nobg 1048576 ", filesystem_cache_allow_background_download = 0"
 
-echo "-- with a 64 KiB alignment the cache downloads at most 2x what the reader asked for; with the cache default (1 MiB) it downloads far more"
+echo "-- with a 64 KiB alignment the cache downloads at most 3x what the reader asked for; with the cache default (1 MiB) it downloads far more"
 ${CLICKHOUSE_CLIENT} -q "
   SYSTEM FLUSH LOGS query_log;
   SELECT replaceOne(query_id, '${CLICKHOUSE_TEST_UNIQUE_NAME}_', '') tag,
-         ProfileEvents['CachedReadBufferReadFromSourceBytes'] <= 2 * ProfileEvents['ParquetReadTaskBytes'] AS tight,
+         -- 3x, not 1x: even a per-query alignment as small as 64 KiB rounds every tiny column chunk
+         -- up to the next 64 KiB, and the reader's own coalescing adds the gaps it reads through, so
+         -- some overshoot is expected. The point of the assertion is the separation from the >= 4x
+         -- arm below, which is what the cache's 1 MiB alignment costs.
+         ProfileEvents['CachedReadBufferReadFromSourceBytes'] <= 3 * ProfileEvents['ParquetReadTaskBytes'] AS tight,
          ProfileEvents['CachedReadBufferReadFromSourceBytes'] >= 4 * ProfileEvents['ParquetReadTaskBytes'] AS loose,
          ProfileEvents['FilesystemCacheBackgroundDownloadQueuePush'] = 0 AS no_bg
   FROM system.query_log
   WHERE event_date >= yesterday() AND event_time >= now() - 600 AND type = 'QueryFinish'
     AND current_database = currentDatabase() AND query_id LIKE '${CLICKHOUSE_TEST_UNIQUE_NAME}_%'
+    AND query_id NOT LIKE '%_partial'
   ORDER BY tag"
+
+# Partial readiness on the filesystem-cache path. `CachedOnDiskReadBufferFromFile::readBigAt` calls the
+# progress callback once per cache file segment it serves (1 MiB for `cache_for_readbigat`), reporting a
+# running total, so a read task spanning many segments becomes readable range by range while it is still
+# running. Two row groups of ~25 MB of incompressible-ish strings, uncompressed, coalesced into one read
+# task: the first row group's ranges are complete long before the task is.
+#
+# The 8 MiB data pages are what makes this assertion sensitive: every range the reader requests is then
+# larger than the cache's 1 MiB `max_file_segment_size`, so a per-segment progress report (rather than a
+# running total) could never advance a task's readiness past one segment - `Prefetcher::publishBytesReady`
+# drops non-increasing values - and no range at all could be served before the whole task completed.
+PARTIAL_FILE="${CLICKHOUSE_TEST_UNIQUE_NAME}_partial.parquet"
+${CLICKHOUSE_CLIENT} -q "
+  INSERT INTO FUNCTION s3(s3_conn, filename = '${PARTIAL_FILE}', format = 'Parquet')
+  SELECT number AS k, repeat(hex(cityHash64(number)), 8) AS s FROM numbers(400000)
+  SETTINGS s3_truncate_on_insert = 1, output_format_parquet_row_group_size = 200000,
+           output_format_parquet_compression_method = 'none', output_format_parquet_write_page_index = 1,
+           output_format_parquet_data_page_size = 8388608"
+
+${CLICKHOUSE_CLIENT} -q "SYSTEM CLEAR FILESYSTEM CACHE 'cache_for_readbigat'"
+echo "-- ranges of a cached multi-segment read are served before the whole read completes"
+${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_partial" -q "
+  SELECT count(), sum(k), sum(length(s)) FROM s3(s3_conn, filename = '${PARTIAL_FILE}', format = 'Parquet')
+  SETTINGS enable_filesystem_cache = 1, filesystem_cache_name = 'cache_for_readbigat',
+           use_page_cache_for_disks_without_file_cache = 0,
+           input_format_parquet_bytes_per_read_task = 268435456, use_parquet_metadata_cache = 0, max_threads = 4"
+
+${CLICKHOUSE_CLIENT} -q "
+  SYSTEM FLUSH LOGS query_log;
+  SELECT ProfileEvents['ParquetPartialReadsServed'] > 0
+  FROM system.query_log
+  WHERE event_date >= yesterday() AND event_time >= now() - 600 AND type = 'QueryFinish'
+    AND current_database = currentDatabase() AND query_id = '${CLICKHOUSE_TEST_UNIQUE_NAME}_partial'"

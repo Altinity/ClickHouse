@@ -60,9 +60,13 @@ ${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_stall_pool" -q "
   SELECT ${WIDE} FROM file('${F}', Parquet)
   SETTINGS ${BASE}, input_format_parquet_min_bytes_in_flight = 4096,
            input_format_parquet_memory_high_watermark = 16777216, input_format_parquet_memory_low_watermark = 1048576"
+# `input_format_parquet_memory_high_watermark` pinned to its default: this arm asserts *no* stall, so
+# the compressed pool must be comfortably larger than everything the queue wants in flight, and the
+# watermark is what sizes it.
 ${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_no_stall" -q "
   SELECT ${WIDE} FROM file('${F}', Parquet)
-  SETTINGS ${BASE}, input_format_parquet_min_bytes_in_flight = 1073741824"
+  SETTINGS ${BASE}, input_format_parquet_min_bytes_in_flight = 1073741824,
+           input_format_parquet_memory_high_watermark = 4294967296"
 ${CLICKHOUSE_CLIENT} --query_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_disabled" -q "
   SELECT ${WIDE} FROM file('${F}', Parquet)
   SETTINGS ${BASE}, input_format_parquet_min_bytes_in_flight = 0"

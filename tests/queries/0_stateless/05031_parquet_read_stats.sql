@@ -18,7 +18,11 @@ SETTINGS s3_truncate_on_insert = 1, output_format_parquet_row_group_size = 50000
 -- answered from row group metadata alone, without reading any column data through the prefetcher).
 SELECT count(), sum(length(s))
 FROM t_parquet_read_stats
-SETTINGS log_comment = 'test_05031_parquet_read_stats', use_parquet_metadata_cache = 0;
+-- `use_page_cache_for_disks_without_file_cache = 0`: a read served from the in-memory page cache
+-- takes the zero-copy `readBigAtRetainCells` path, which has no wire transfer to time and is
+-- deliberately excluded from the fitted stats, so the events below would stay at 0.
+SETTINGS log_comment = 'test_05031_parquet_read_stats', use_parquet_metadata_cache = 0,
+         use_page_cache_for_disks_without_file_cache = 0;
 
 SYSTEM FLUSH LOGS query_log;
 
