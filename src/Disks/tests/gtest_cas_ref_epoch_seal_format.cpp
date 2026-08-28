@@ -165,16 +165,16 @@ TEST(CASRefEpochSealFormat, DecodeRejectsSealTxnWithTwoOpsSpliced)
     txn.ops.push_back(epochSealOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String op_line = "{\"op\":\"epoch_seal\"}\n";
+    const String op_line = "{\"operation\":\"epoch_seal\"}\n";
     const auto op_pos = bytes.find(op_line);
     ASSERT_NE(op_pos, String::npos);
     String tampered = bytes;
     tampered.insert(op_pos, op_line);   /// two consecutive "epoch_seal" op lines now
 
-    const String old_trailer = "{\"n\":1}\n";
+    const String old_trailer = "{\"record_count\":1}\n";
     const auto trailer_pos = tampered.find(old_trailer);
     ASSERT_NE(trailer_pos, String::npos);
-    tampered.replace(trailer_pos, old_trailer.size(), "{\"n\":2}\n");   /// keep the trailer honest
+    tampered.replace(trailer_pos, old_trailer.size(), "{\"record_count\":2}\n");   /// keep the trailer honest
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -189,16 +189,16 @@ TEST(CASRefEpochSealFormat, DecodeRejectsSealTxnWithSecondNonSealOpSpliced)
     txn.ops.push_back(epochSealOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String op_line = "{\"op\":\"epoch_seal\"}\n";
+    const String op_line = "{\"operation\":\"epoch_seal\"}\n";
     const auto op_pos = bytes.find(op_line);
     ASSERT_NE(op_pos, String::npos);
     String tampered = bytes;
-    tampered.insert(op_pos + op_line.size(), "{\"op\":\"namespace_birth\"}\n");
+    tampered.insert(op_pos + op_line.size(), "{\"operation\":\"namespace_birth\"}\n");
 
-    const String old_trailer = "{\"n\":1}\n";
+    const String old_trailer = "{\"record_count\":1}\n";
     const auto trailer_pos = tampered.find(old_trailer);
     ASSERT_NE(trailer_pos, String::npos);
-    tampered.replace(trailer_pos, old_trailer.size(), "{\"n\":2}\n");
+    tampered.replace(trailer_pos, old_trailer.size(), "{\"record_count\":2}\n");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -224,11 +224,11 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealAtNonUnitSequenceSpliced)
     txn.ops.push_back(namespaceBirthOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String needle = R"("rs":"2")";
+    const String needle = R"("ref_sequence":"2")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
-    tampered.insert(pos + needle.size(), R"(,"!pse":"1","!pss":"1")");
+    tampered.insert(pos + needle.size(), R"(,"!previous_seal_writer_epoch":"1","!previous_seal_ref_sequence":"1")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -267,7 +267,7 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
     txn.ops.push_back(epochSealOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String needle = R"(,"!pss":"9")";
+    const String needle = R"(,"!previous_seal_ref_sequence":"9")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
@@ -326,11 +326,11 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealSkippingImmediateEpochSpli
     txn.ops.push_back(namespaceBirthOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String needle = R"("rs":"1")";
+    const String needle = R"("ref_sequence":"1")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
-    tampered.insert(pos + needle.size(), R"(,"!pse":"3","!pss":"1")");
+    tampered.insert(pos + needle.size(), R"(,"!previous_seal_writer_epoch":"3","!previous_seal_ref_sequence":"1")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -346,11 +346,11 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealPointingAtSameOrFutureEpoc
     txn.ops.push_back(namespaceBirthOp());
     const String bytes = encodeRefLogTxn(txn);   /// valid: sequence 1, no prev_epoch_seal
 
-    const String needle = R"("rs":"1")";
+    const String needle = R"("ref_sequence":"1")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
-    tampered.insert(pos + needle.size(), R"(,"!pse":"5","!pss":"1")");   /// self-pointer
+    tampered.insert(pos + needle.size(), R"(,"!previous_seal_writer_epoch":"5","!previous_seal_ref_sequence":"1")");   /// self-pointer
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -437,7 +437,7 @@ TEST(CASRefEpochSealFormat, DecodeRejectsUnknownCriticalKeyInMetaLine)
     txn.ops.push_back(namespaceBirthOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String needle = R"("rs":"1")";
+    const String needle = R"("ref_sequence":"1")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
@@ -484,8 +484,8 @@ TEST(CASRefEpochSealFormat, FormatBatteryEpochSeal)
     runFormatBattery({FormatId::RefLog,
         [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
-        "{\"type\":\"cas_ref_log\",\"v\":10}\n"
-        "{\"ns\":\"ns\",\"we\":\"3\",\"rs\":\"1\",\"!pse\":\"2\",\"!pss\":\"9\"}\n"
-        "{\"op\":\"epoch_seal\"}\n"
-        "{\"n\":1}\n"});
+        "{\"type\":\"cas_ref_log\",\"version\":10}\n"
+        "{\"namespace\":\"ns\",\"writer_epoch\":\"3\",\"ref_sequence\":\"1\",\"!previous_seal_writer_epoch\":\"2\",\"!previous_seal_ref_sequence\":\"9\"}\n"
+        "{\"operation\":\"epoch_seal\"}\n"
+        "{\"record_count\":1}\n"});
 }

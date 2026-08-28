@@ -63,13 +63,13 @@ touches — it is reclaimed only by its own server's next mount.
 Every persisted CAS metadata object is text: a header line, a body, and an optional trailer.
 
 ```
-{"type":"cas_<object>","v":N}          <- header line, always present
+{"type":"cas_<object>","version":N}    <- header line, always present
 <body>                                  <- one JSON object, sorted NDJSON records,
                                             or a descriptor + raw payload zone
-{"n":…}                                 <- optional trailer (record/entry count)
+{"record_count":…}                      <- optional trailer (record/entry count)
 ```
 
-`v` is the only version field; a reader rejects `v` above what the build supports with
+`version` is the only version field; a reader rejects `version` above what the build supports with
 `UNKNOWN_FORMAT_VERSION`, checked before the body. A `.zst` key suffix means, exactly, that the
 object kind's compression policy is `Always`: the object is stored as one zstd frame with the
 checksum flag on, and its declared content size is checked against a per-kind cap before
@@ -77,10 +77,10 @@ allocation. Always-small and deterministic kinds (`cas_ref_ckpt`, `cas_blob_meta
 `cas_run`, …) are stored raw, with no `.zst` suffix.
 
 The blob envelope is a special case of the header/body shape: a JSON descriptor padded with ASCII
-spaces to a pool-constant `blob_header_len` (256 bytes, a `cas_pool_meta` field), terminated by
+spaces to the pool-constant `blob_header_length` (512 bytes, a `cas_pool_meta` field), terminated by
 `\n`, so the raw payload always starts at that fixed offset with no header parse needed to locate
 it. The part manifest is the other `PayloadHybrid` kind: text header, descriptor, sorted NDJSON
-entry records, `{"n":…}` trailer, then a banner-framed raw payload zone for small inline file
+entry records, `{"record_count":…}` trailer, then a banner-framed raw payload zone for small inline file
 bytes.
 
 ## Codec table {#codec-table}

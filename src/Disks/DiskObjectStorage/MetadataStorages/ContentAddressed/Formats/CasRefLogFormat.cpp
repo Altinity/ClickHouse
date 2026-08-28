@@ -73,9 +73,9 @@ void writeBindingFields(CasJsonWriter & out, bool & first, std::string_view pref
 {
     checkCanonicalRefName(b.ref_name, "RefLogTxn", "owner binding ref_name");
     checkManifestRef(b.manifest_ref, "RefLogTxn", "owner binding manifest_ref");
-    out.key(prefix, "bk", first);
+    out.key(prefix, "binding_kind", first);
     writeStringValue(out, refOwnerKindToWord(b.kind));
-    out.key(prefix, "rn", first);
+    out.key(prefix, "ref_name", first);
     writeStringValue(out, b.ref_name);
     writeManifestRefFields(out, first, prefix, b.manifest_ref);
 }
@@ -83,7 +83,7 @@ void writeBindingFields(CasJsonWriter & out, bool & first, std::string_view pref
 void writeOp(CasJsonWriter & out, const RefOp & op)
 {
     bool first = true;
-    writeKey(out, "op", first);
+    writeKey(out, "operation", first);
     writeStringValue(out, opKindToWord(op.kind));
     switch (op.kind)
     {
@@ -93,17 +93,17 @@ void writeOp(CasJsonWriter & out, const RefOp & op)
             break;
         case RefOpKind::OwnerTransition:
             if (op.old_binding)
-                writeBindingFields(out, first, "o", *op.old_binding);
+                writeBindingFields(out, first, "old_", *op.old_binding);
             if (op.new_binding)
-                writeBindingFields(out, first, "n", *op.new_binding);
+                writeBindingFields(out, first, "new_", *op.new_binding);
             break;
         case RefOpKind::SetPublishedAt:
             checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_published_at ref_name");
             checkManifestRef(op.expected_manifest_ref, "RefLogTxn", "set_published_at manifest_ref");
-            writeKey(out, "rn", first);
+            writeKey(out, "ref_name", first);
             writeStringValue(out, op.ref_name);
             writeManifestRefFields(out, first, "", op.expected_manifest_ref);
-            writeKey(out, "ts", first);
+            writeKey(out, "published_at_ms", first);
             writeIntText(op.published_at_ms, out);
             break;
     }
@@ -160,11 +160,11 @@ struct BindingFields
 void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id, const std::optional<RefTxnId> & prev_epoch_seal)
 {
     bool first = true;
-    writeKey(out, "ns", first);
+    writeKey(out, "namespace", first);
     writeStringValue(out, ns);
-    writeRefTxnIdFields(out, first, "we", "rs", txn_id);
+    writeRefTxnIdFields(out, first, "writer_epoch", "ref_sequence", txn_id);
     if (prev_epoch_seal)
-        writeRefTxnIdFields(out, first, "!pse", "!pss", *prev_epoch_seal);
+        writeRefTxnIdFields(out, first, "!previous_seal_writer_epoch", "!previous_seal_ref_sequence", *prev_epoch_seal);
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -185,22 +185,22 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "rn") sp_rn = r.readString();
-        else if (key == "me") sp_mf.me = r.readU64String();
-        else if (key == "mb") sp_mf.mb = r.readU64String();
-        else if (key == "mo") sp_mf.mo = r.readU64Number();
-        else if (key == "ts") sp_ts = r.readU64Number();
-        else if (key == "obk") ob.bk = r.readString();
-        else if (key == "orn") ob.rn = r.readString();
-        else if (key == "ome") ob.mf.me = r.readU64String();
-        else if (key == "omb") ob.mf.mb = r.readU64String();
-        else if (key == "omo") ob.mf.mo = r.readU64Number();
-        else if (key == "nbk") nb.bk = r.readString();
-        else if (key == "nrn") nb.rn = r.readString();
-        else if (key == "nme") nb.mf.me = r.readU64String();
-        else if (key == "nmb") nb.mf.mb = r.readU64String();
-        else if (key == "nmo") nb.mf.mo = r.readU64Number();
-        else if (key == "pl")
+        if (key == "ref_name") sp_rn = r.readString();
+        else if (key == "writer_epoch") sp_mf.me = r.readU64String();
+        else if (key == "build_sequence") sp_mf.mb = r.readU64String();
+        else if (key == "manifest_ordinal") sp_mf.mo = r.readU64Number();
+        else if (key == "published_at_ms") sp_ts = r.readU64Number();
+        else if (key == "old_binding_kind") ob.bk = r.readString();
+        else if (key == "old_ref_name") ob.rn = r.readString();
+        else if (key == "old_writer_epoch") ob.mf.me = r.readU64String();
+        else if (key == "old_build_sequence") ob.mf.mb = r.readU64String();
+        else if (key == "old_manifest_ordinal") ob.mf.mo = r.readU64Number();
+        else if (key == "new_binding_kind") nb.bk = r.readString();
+        else if (key == "new_ref_name") nb.rn = r.readString();
+        else if (key == "new_writer_epoch") nb.mf.me = r.readU64String();
+        else if (key == "new_build_sequence") nb.mf.mb = r.readU64String();
+        else if (key == "new_manifest_ordinal") nb.mf.mo = r.readU64Number();
+        else if (key == "payload")
             /// `"pl"` (payload) was removed from the op wire in stage-1 T12 (the `set_payload` op became
             /// `set_published_at`). The retired op WORD is already rejected by `opKindFromWord`, but this
             /// generic reader reads field keys before switching on kind, so a `"pl"` field paired with a
@@ -332,11 +332,11 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
         String key;
         while (r.nextKey(key))
         {
-            if (key == "ns") { txn.ns = r.readString(); saw_ns = true; }
-            else if (key == "we") { txn.txn_id.writer_epoch = r.readU64String(); saw_we = true; }
-            else if (key == "rs") { txn.txn_id.ref_sequence = r.readU64String(); saw_rs = true; }
-            else if (key == "!pse") pse = r.readU64String();
-            else if (key == "!pss") pss = r.readU64String();
+            if (key == "namespace") { txn.ns = r.readString(); saw_ns = true; }
+            else if (key == "writer_epoch") { txn.txn_id.writer_epoch = r.readU64String(); saw_we = true; }
+            else if (key == "ref_sequence") { txn.txn_id.ref_sequence = r.readU64String(); saw_rs = true; }
+            else if (key == "!previous_seal_writer_epoch") pse = r.readU64String();
+            else if (key == "!previous_seal_ref_sequence") pss = r.readU64String();
             else r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs)
@@ -373,7 +373,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
         String key;
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: empty line");
-        if (key == "n")
+        if (key == "record_count")
         {
             const uint64_t n = r.readU64Number();
             while (r.nextKey(key))
@@ -385,7 +385,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
                     "RefLogTxn: trailer count {} != {} ops", n, txn.ops.size());
             break;
         }
-        if (key != "op")
+        if (key != "operation")
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: record must start with \"op\"");
         const RefOpKind kind = opKindFromWord(r.readString());
         txn.ops.push_back(readOpRecord(r, kind));

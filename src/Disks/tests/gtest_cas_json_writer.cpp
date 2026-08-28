@@ -15,17 +15,18 @@ TEST(CASJsonWriter, KeyValueSequenceMatchesCanonicalShape)
 {
     CasJsonWriter w;
     bool first = true;
-    w.key("we", first);
+    w.key("writer_epoch", first);
     w.u64StringValue(7);
-    w.key("mo", first);
+    w.key("manifest_ordinal", first);
     w.u64Number(3);
     w.key("ok", first);
     w.boolValue(true);
-    w.key("o", "me", first);
+    w.key("old_", "writer_epoch", first);
     w.u64StringValue(1);
     w.closeObject(first);
     w.newline();
-    EXPECT_EQ(std::move(w).take(), "{\"we\":\"7\",\"mo\":3,\"ok\":true,\"ome\":\"1\"}\n");
+    EXPECT_EQ(std::move(w).take(),
+        "{\"writer_epoch\":\"7\",\"manifest_ordinal\":3,\"ok\":true,\"old_writer_epoch\":\"1\"}\n");
 }
 
 TEST(CASJsonWriter, EmptyObjectAndClear)

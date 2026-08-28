@@ -88,11 +88,11 @@ void insertRecordOnce(Map & map, const Key & key, Value && value, std::string_vi
 void writeRun(CasJsonWriter & out, std::string_view kind, const RunRef & r)
 {
     bool first = true;
-    writeKey(out, "k", first);     writeStringValue(out, kind);
+    writeKey(out, "kind", first);  writeStringValue(out, kind);
     writeKey(out, "key", first);   writeStringValue(out, r.key);
-    writeKey(out, "ck", first);    writeHex128Value(out, r.checksum);
+    writeKey(out, "checksum", first); writeHex128Value(out, r.checksum);
     writeKey(out, "shard", first); writeIntText(r.shard, out);
-    writeKey(out, "gen", first);   writeU64StringValue(out, r.generation);
+    writeKey(out, "generation", first); writeU64StringValue(out, r.generation);
     closeObject(out, first);
 }
 
@@ -205,8 +205,8 @@ String encodeFoldSeal(const CasFoldSeal & seal)
     /// meta line
     {
         bool first = true;
-        writeKey(out, "g", first);  writeU64StringValue(out, seal.generation);
-        writeKey(out, "pg", first); writeU64StringValue(out, seal.parent_generation);
+        writeKey(out, "generation", first);        writeU64StringValue(out, seal.generation);
+        writeKey(out, "parent_generation", first); writeU64StringValue(out, seal.parent_generation);
         closeObject(out, first);
         closeLine("meta");
     }
@@ -263,24 +263,24 @@ String encodeFoldSeal(const CasFoldSeal & seal)
                 life_state.cleanup_evidence->remove_txn_id.ref_sequence);
 
         bool first = true;
-        writeKey(out, "k", first);    writeStringValue(out, "rfl");
-        writeKey(out, "life", first); writeHex128Value(out, life_id);
-        writeKey(out, "cls", first);  writeIntText(static_cast<uint32_t>(cov.classification), out);
-        writeKey(out, "lfe", first);  writeU64StringValue(out, cov.last_folded_ref_id.writer_epoch);
-        writeKey(out, "lfs", first);  writeU64StringValue(out, cov.last_folded_ref_id.ref_sequence);
+        writeKey(out, "kind", first);                         writeStringValue(out, "rfl");
+        writeKey(out, "life_id", first);                      writeHex128Value(out, life_id);
+        writeKey(out, "classification", first);               writeIntText(static_cast<uint32_t>(cov.classification), out);
+        writeKey(out, "last_folded_writer_epoch", first);     writeU64StringValue(out, cov.last_folded_ref_id.writer_epoch);
+        writeKey(out, "last_folded_ref_sequence", first);     writeU64StringValue(out, cov.last_folded_ref_id.ref_sequence);
         if (cov.hold)
         {
-            writeKey(out, "hr", first);  writeStringValue(out, holdReasonToWord(cov.hold->reason));
-            writeKey(out, "hpe", first); writeU64StringValue(out, cov.hold->offending_position.writer_epoch);
-            writeKey(out, "hps", first); writeU64StringValue(out, cov.hold->offending_position.ref_sequence);
-            writeKey(out, "hrc", first); writeIntText(cov.hold->retry_count, out);
-            writeKey(out, "hnr", first); writeU64StringValue(out, cov.hold->next_retry_round);
+            writeKey(out, "hold_reason", first);                    writeStringValue(out, holdReasonToWord(cov.hold->reason));
+            writeKey(out, "hold_position_writer_epoch", first);     writeU64StringValue(out, cov.hold->offending_position.writer_epoch);
+            writeKey(out, "hold_position_ref_sequence", first);     writeU64StringValue(out, cov.hold->offending_position.ref_sequence);
+            writeKey(out, "hold_retry_count", first);               writeIntText(cov.hold->retry_count, out);
+            writeKey(out, "hold_next_retry_round", first);          writeU64StringValue(out, cov.hold->next_retry_round);
         }
         if (life_state.cleanup_evidence)
         {
-            writeKey(out, "rte", first);
+            writeKey(out, "remove_txn_writer_epoch", first);
             writeU64StringValue(out, life_state.cleanup_evidence->remove_txn_id.writer_epoch);
-            writeKey(out, "rts", first);
+            writeKey(out, "remove_txn_ref_sequence", first);
             writeU64StringValue(out, life_state.cleanup_evidence->remove_txn_id.ref_sequence);
         }
         closeObject(out, first);
@@ -303,11 +303,11 @@ String encodeFoldSeal(const CasFoldSeal & seal)
     for (const auto & [shard, s] : seal.condemned_summary)
     {
         bool first = true;
-        writeKey(out, "k", first);     writeStringValue(out, "cnd");
+        writeKey(out, "kind", first);  writeStringValue(out, "cnd");
         writeKey(out, "shard", first); writeIntText(shard, out);
-        writeKey(out, "ct", first);    writeIntText(s.condemned_total, out);
-        writeKey(out, "pt", first);    writeIntText(s.pending_total, out);
-        writeKey(out, "ocr", first);   writeU64StringValue(out, s.oldest_nonpending_condemn_round);
+        writeKey(out, "condemned_total", first);                   writeIntText(s.condemned_total, out);
+        writeKey(out, "pending_total", first);                     writeIntText(s.pending_total, out);
+        writeKey(out, "oldest_nonpending_condemn_round", first);   writeU64StringValue(out, s.oldest_nonpending_condemn_round);
         closeObject(out, first);
         closeLine("cnd");
         ++n;
@@ -338,8 +338,8 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
         String key;
         while (r.nextKey(key))
         {
-            if (key == "g") seal.generation = r.readU64String();
-            else if (key == "pg") seal.parent_generation = r.readU64String();
+            if (key == "generation") seal.generation = r.readU64String();
+            else if (key == "parent_generation") seal.parent_generation = r.readU64String();
             else r.skipUnknown(key);   /// Strict => any unknown key is CORRUPTED_DATA
         }
     }
@@ -354,7 +354,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: empty line");
 
-        if (key == "n")
+        if (key == "record_count")
         {
             const uint64_t n = r.readU64Number();
             if (r.nextKey(key))
@@ -370,7 +370,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                     seal.generation, *expected_generation);
             return seal;
         }
-        if (key != "k")
+        if (key != "kind")
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: record must start with \"k\"");
         const String kind = r.readString();
 
@@ -395,17 +395,17 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             std::optional<uint64_t> remove_txn_sequence;
             while (r.nextKey(key))
             {
-                if (key == "life") life_id = r.readHex128();
-                else if (key == "cls") classification = r.readU64Number();
-                else if (key == "lfe") cov.last_folded_ref_id.writer_epoch = r.readU64String();
-                else if (key == "lfs") cov.last_folded_ref_id.ref_sequence = r.readU64String();
-                else if (key == "hr") hold_reason = holdReasonFromWord(r.readString());
-                else if (key == "hpe") hold_epoch = r.readU64String();
-                else if (key == "hps") hold_sequence = r.readU64String();
-                else if (key == "hrc") hold_retry_count = r.readU32Number();
-                else if (key == "hnr") hold_next_retry_round = r.readU64String();
-                else if (key == "rte") remove_txn_epoch = r.readU64String();
-                else if (key == "rts") remove_txn_sequence = r.readU64String();
+                if (key == "life_id") life_id = r.readHex128();
+                else if (key == "classification") classification = r.readU64Number();
+                else if (key == "last_folded_writer_epoch") cov.last_folded_ref_id.writer_epoch = r.readU64String();
+                else if (key == "last_folded_ref_sequence") cov.last_folded_ref_id.ref_sequence = r.readU64String();
+                else if (key == "hold_reason") hold_reason = holdReasonFromWord(r.readString());
+                else if (key == "hold_position_writer_epoch") hold_epoch = r.readU64String();
+                else if (key == "hold_position_ref_sequence") hold_sequence = r.readU64String();
+                else if (key == "hold_retry_count") hold_retry_count = r.readU32Number();
+                else if (key == "hold_next_retry_round") hold_next_retry_round = r.readU64String();
+                else if (key == "remove_txn_writer_epoch") remove_txn_epoch = r.readU64String();
+                else if (key == "remove_txn_ref_sequence") remove_txn_sequence = r.readU64String();
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown rfl key '{}'", key);
             }
 
@@ -487,9 +487,9 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             while (r.nextKey(key))
             {
                 if (key == "key") run_key = r.readString();
-                else if (key == "ck") checksum = r.readHex128();
+                else if (key == "checksum") checksum = r.readHex128();
                 else if (key == "shard") shard = r.readU64Number();
-                else if (key == "gen") generation = r.readU64String();
+                else if (key == "generation") generation = r.readU64String();
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown run key '{}'", key);
             }
             if (!run_key || !checksum || !shard || !generation)
@@ -507,9 +507,9 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             while (r.nextKey(key))
             {
                 if (key == "shard") shard = r.readU64Number();
-                else if (key == "ct") condemned_total = r.readU64Number();
-                else if (key == "pt") pending_total = r.readU64Number();
-                else if (key == "ocr") oldest_nonpending_condemn_round = r.readU64String();
+                else if (key == "condemned_total") condemned_total = r.readU64Number();
+                else if (key == "pending_total") pending_total = r.readU64Number();
+                else if (key == "oldest_nonpending_condemn_round") oldest_nonpending_condemn_round = r.readU64String();
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown cnd key '{}'", key);
             }
             if (!shard || !condemned_total || !pending_total || !oldest_nonpending_condemn_round)

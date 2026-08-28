@@ -48,11 +48,11 @@ String encodeOutcomeLog(const OutcomeLog & log)
     for (const OutcomeEntry & e : log.entries)
     {
         bool first = true;
-        writeKey(out, "k", first);
+        writeKey(out, "kind", first);
         writeStringValue(out, objectKindToWord(e.kind));
         writeBlobRefFields(out, first, e.ref);   /// ha + h
         writeTokenFields(out, first, e.token);   /// tt + tv
-        writeKey(out, "oc", first);
+        writeKey(out, "outcome", first);
         writeStringValue(out, outcomeKindToWord(e.outcome));
         closeObject(out, first);
         writeChar('\n', out);
@@ -78,7 +78,7 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
         /// The first key distinguishes a trailer ("n") from a record ("k").
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: empty line");
-        if (key == "n")
+        if (key == "record_count")
         {
             const uint64_t n = r.readU64Number();
             while (r.nextKey(key))
@@ -101,12 +101,12 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
         TokenType tt{};
         do
         {
-            if (key == "k") e.kind = objectKindFromWord(r.readString(), "outcome log");
-            else if (key == "ha") { ha = r.readString(); have_ha = true; }
-            else if (key == "h") { hhex = r.readString(); have_h = true; }
-            else if (key == "tt") { tt = tokenTypeFromWord(r.readString(), "outcome log"); have_tt = true; }
-            else if (key == "tv") tv = r.readString();
-            else if (key == "oc") e.outcome = outcomeKindFromWord(r.readString());
+            if (key == "kind") e.kind = objectKindFromWord(r.readString(), "outcome log");
+            else if (key == "hash_algorithm") { ha = r.readString(); have_ha = true; }
+            else if (key == "hash") { hhex = r.readString(); have_h = true; }
+            else if (key == "token_type") { tt = tokenTypeFromWord(r.readString(), "outcome log"); have_tt = true; }
+            else if (key == "token_value") tv = r.readString();
+            else if (key == "outcome") e.outcome = outcomeKindFromWord(r.readString());
             else r.skipUnknown(key);
         } while (r.nextKey(key));
 

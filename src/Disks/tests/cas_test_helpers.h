@@ -749,7 +749,7 @@ inline void seedPoolMetaForRestart(
 {
     const DB::Cas::Layout layout(pool_prefix);
     DB::Cas::PoolMeta::createOrValidate(
-        backend, layout, /*blob_header_len=*/256, gc_shards,
+        backend, layout, /*blob_header_len=*/512, gc_shards,
         DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
     if (!backend.get(layout.refCatalogKey()))
         DB::Cas::CasRefCatalog::initializeEmptyForNewPool(backend, layout);
@@ -761,7 +761,7 @@ inline void seedPoolMetaForRestart(
 /// are arbitrary (GC never reads them); the hash is what the manifest entry references.
 inline void writeBlobBody(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash,
-    uint64_t blob_header_len = 256)
+    uint64_t blob_header_len = 512)
 {
     DB::Cas::EnvelopeHeader header;
     header.kind = DB::Cas::ObjectKind::Blob;

@@ -59,12 +59,12 @@ void writeCommittedRow(CasJsonWriter & out, const RefCommittedRow & row)
     checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
     checkManifestRef(row.manifest_ref, "RefTableSnapshot", "committed");
     bool first = true;
-    writeKey(out, "k", first);
+    writeKey(out, "kind", first);
     writeStringValue(out, "c");
-    writeKey(out, "rn", first);
+    writeKey(out, "ref_name", first);
     writeStringValue(out, row.ref_name);
     writeManifestRefFields(out, first, "", row.manifest_ref);
-    writeKey(out, "ts", first);
+    writeKey(out, "published_at_ms", first);
     writeIntText(row.published_at_ms, out);
     closeObject(out, first);
     writeChar('\n', out);
@@ -79,9 +79,9 @@ void writePrecommitRow(CasJsonWriter & out, const RefOwnerBinding & row)
     checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "precommit ref_name");
     checkManifestRef(row.manifest_ref, "RefTableSnapshot", "precommit");
     bool first = true;
-    writeKey(out, "k", first);
+    writeKey(out, "kind", first);
     writeStringValue(out, "p");
-    writeKey(out, "rn", first);
+    writeKey(out, "ref_name", first);
     writeStringValue(out, row.ref_name);
     writeManifestRefFields(out, first, "", row.manifest_ref);
     closeObject(out, first);
@@ -95,16 +95,16 @@ void writePrecommitRow(CasJsonWriter & out, const RefOwnerBinding & row)
 void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
 {
     bool first = true;
-    writeKey(out, "ns", first);
+    writeKey(out, "namespace", first);
     writeStringValue(out, snapshot.ns);
-    writeRefTxnIdFields(out, first, "we", "rs", snapshot.snapshot_id);
-    writeKey(out, "lc", first);
+    writeRefTxnIdFields(out, first, "writer_epoch", "ref_sequence", snapshot.snapshot_id);
+    writeKey(out, "lifecycle", first);
     writeStringValue(out, "live");
     closeObject(out, first);
     writeChar('\n', out);
 }
 
-/// Collector for a ManifestRef's three flat fields (bare "me"/"mb"/"mo").
+/// Collector for a `ManifestRef`'s three flat fields.
 struct ManifestFields
 {
     std::optional<uint64_t> me;
@@ -166,10 +166,10 @@ RefTableSnapshot decodeRefTableSnapshot(
         String key;
         while (r.nextKey(key))
         {
-            if (key == "ns") { snapshot.ns = r.readString(); saw_ns = true; }
-            else if (key == "we") { snapshot.snapshot_id.writer_epoch = r.readU64String(); saw_we = true; }
-            else if (key == "rs") { snapshot.snapshot_id.ref_sequence = r.readU64String(); saw_rs = true; }
-            else if (key == "lc")
+            if (key == "namespace") { snapshot.ns = r.readString(); saw_ns = true; }
+            else if (key == "writer_epoch") { snapshot.snapshot_id.writer_epoch = r.readU64String(); saw_we = true; }
+            else if (key == "ref_sequence") { snapshot.snapshot_id.ref_sequence = r.readU64String(); saw_rs = true; }
+            else if (key == "lifecycle")
             {
                 const String lifecycle = r.readString();
                 if (lifecycle != "live")
@@ -177,7 +177,7 @@ RefTableSnapshot decodeRefTableSnapshot(
                         "RefTableSnapshot: lifecycle must be exactly 'live', got '{}'", lifecycle);
                 saw_lc = true;
             }
-            else if (key == "rte" || key == "rts")
+            else if (key == "remove_txn_writer_epoch" || key == "remove_txn_ref_sequence")
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "RefTableSnapshot: meta carries retired terminal field '{}'", key);
             else r.skipUnknown(key);
@@ -198,7 +198,7 @@ RefTableSnapshot decodeRefTableSnapshot(
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: empty line");
 
-        if (key == "n")
+        if (key == "record_count")
         {
             const uint64_t n = r.readU64Number();
             while (r.nextKey(key))
@@ -210,7 +210,7 @@ RefTableSnapshot decodeRefTableSnapshot(
                     "RefTableSnapshot: trailer count {} != {} rows", n, snapshot.committed.size() + snapshot.precommits.size());
             break;
         }
-        if (key != "k")
+        if (key != "kind")
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: record must start with \"k\"");
         const String k = r.readString();
 
@@ -219,12 +219,12 @@ RefTableSnapshot decodeRefTableSnapshot(
         std::optional<uint64_t> ts;
         while (r.nextKey(key))
         {
-            if (key == "rn") rn = r.readString();
-            else if (key == "me") mf.me = r.readU64String();
-            else if (key == "mb") mf.mb = r.readU64String();
-            else if (key == "mo") mf.mo = r.readU64Number();
-            else if (key == "ts") ts = r.readU64Number();
-            else if (key == "pl")
+            if (key == "ref_name") rn = r.readString();
+            else if (key == "writer_epoch") mf.me = r.readU64String();
+            else if (key == "build_sequence") mf.mb = r.readU64String();
+            else if (key == "manifest_ordinal") mf.mo = r.readU64Number();
+            else if (key == "published_at_ms") ts = r.readU64Number();
+            else if (key == "payload")
                 /// `"pl"` (payload) was removed from the row wire in stage-1 T12. It is a KNOWN-removed
                 /// field, not a genuinely-unknown future one the tolerant reader may skip -- silently
                 /// discarding a persisted payload would lose data -- so reject it explicitly.

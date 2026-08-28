@@ -109,30 +109,30 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
         CasJsonWriter buf(256);
         bool first = true;
         writeKey(buf, "type", first); writeStringValue(buf, kBlobType);
-        writeKey(buf, "v", first);    writeIntText(currentCompatibilityVersion(), buf);
-        writeKey(buf, "tag", first);  writeHex128Value(buf, header.incarnation_tag);
-        writeKey(buf, "bld", first);  writeHex128Value(buf, header.build_id);
+        writeKey(buf, "version", first);         writeIntText(currentCompatibilityVersion(), buf);
+        writeKey(buf, "incarnation_tag", first); writeHex128Value(buf, header.incarnation_tag);
+        writeKey(buf, "build_id", first);        writeHex128Value(buf, header.build_id);
         if (header.provenance)
         {
-            writeKey(buf, "ts", first); writeIntText(header.provenance->created_at_ms, buf);
-            writeKey(buf, "by", first); writeHex128Value(buf, header.provenance->creator_server_id);
-            writeKey(buf, "op", first); writeStringValue(buf, opToWord(header.provenance->op));
-            writeKey(buf, "ch", first); writeIntText(header.provenance->ch_version, buf);
+            writeKey(buf, "created_at_ms", first);       writeIntText(header.provenance->created_at_ms, buf);
+            writeKey(buf, "creator_server_id", first);   writeHex128Value(buf, header.provenance->creator_server_id);
+            writeKey(buf, "operation", first);           writeStringValue(buf, opToWord(header.provenance->op));
+            writeKey(buf, "clickhouse_version", first);  writeIntText(header.provenance->ch_version, buf);
         }
         /// Test-only critical extension: an unknown `!`-key BEFORE `ref`.
         if (header.emit_unknown_critical_key)
         {
             writeKey(buf, "!x", first); writeStringValue(buf, "1");
         }
-        json = std::move(buf).take();   /// e.g. {"type":"cas_blob","v":3,...,"ch":26006001   (no ref, no closing brace)
+        json = std::move(buf).take();   /// e.g. {"type":"cas_blob","version":3,...,"clickhouse_version":26006001
     }
 
     /// Optional `ref`, truncated to the exact remaining budget. Layout after this block:
-    ///   json + `,"ref":` + `"` + <escaped ref, <= budget bytes> + `"` + `}`   must be <= blob_header_len-1
+    ///   json + `,"intended_ref":` + `"` + <escaped ref, <= budget bytes> + `"` + `}` must fit
     /// (byte blob_header_len-1 is reserved for '\n'; the pad zone fills the gap with spaces).
     if (header.intended_ref)
     {
-        static constexpr std::string_view ref_key = ",\"ref\":";
+        static constexpr std::string_view ref_key = ",\"intended_ref\":";
         /// +3 = opening quote + closing quote + closing brace.
         const size_t fixed = json.size() + ref_key.size() + 3;
         if (blob_header_len < 1 || fixed > static_cast<size_t>(blob_header_len) - 1)
@@ -181,37 +181,37 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
                     "CAS blob envelope: object is a '{}', not a '{}'", t, kBlobType);
             saw_type = true;
         }
-        else if (key == "v")
+        else if (key == "version")
         {
             h.compatibility_version = r.readU32Number();
             checkCompatibility(h.compatibility_version, "blob envelope");
             saw_v = true;
         }
-        else if (key == "tag")
+        else if (key == "incarnation_tag")
             h.incarnation_tag = r.readHex128();
-        else if (key == "bld")
+        else if (key == "build_id")
             h.build_id = r.readHex128();
-        else if (key == "ts")
+        else if (key == "created_at_ms")
         {
             prov.created_at_ms = r.readU64Number();
             have_prov = true;
         }
-        else if (key == "by")
+        else if (key == "creator_server_id")
         {
             prov.creator_server_id = r.readHex128();
             have_prov = true;
         }
-        else if (key == "op")
+        else if (key == "operation")
         {
             prov.op = opFromWord(r.readString());
             have_prov = true;
         }
-        else if (key == "ch")
+        else if (key == "clickhouse_version")
         {
             prov.ch_version = static_cast<uint32_t>(r.readU64Number());
             have_prov = true;
         }
-        else if (key == "ref")
+        else if (key == "intended_ref")
             h.intended_ref = r.readString();
         else
             r.skipUnknown(key);   /// `!`-key -> UNKNOWN_FORMAT_VERSION; unknown plain key -> skipped (tolerant)
@@ -219,7 +219,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
     if (!saw_type)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob envelope: missing type");
     if (!saw_v)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob envelope: missing v");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob envelope: missing version");
     if (h.kind != expected_kind)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS blob envelope: kind {} does not match expected {}",

@@ -127,12 +127,12 @@ TEST(CASPluggableHash, PoolMetaRoundTripsAlgosUsed)
 {
     PoolMeta pm;
     pm.pool_id = u128Of("pool-a");
-    pm.blob_header_len = 256;
+    pm.blob_header_len = 512;
     pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128), static_cast<uint8_t>(BlobHashAlgo::XXH3_128)};
 
     const PoolMeta back = decodePoolMeta(encodePoolMeta(pm));
     EXPECT_EQ(back.algos_used, pm.algos_used);
-    EXPECT_EQ(back.blob_header_len, 256u);
+    EXPECT_EQ(back.blob_header_len, 512u);
 }
 
 TEST(CASPluggableHash, CreateOrValidateRecordsConfigAlgoOnFreshPool)
@@ -140,11 +140,11 @@ TEST(CASPluggableHash, CreateOrValidateRecordsConfigAlgoOnFreshPool)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::XXH3_128, /*allow_new*/ false, /*allow_mint*/ true);
+    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 512, BlobHashAlgo::XXH3_128, /*allow_new*/ false, /*allow_mint*/ true);
     EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
 
     /// Reopening with the SAME algo is a no-op reopen: the recorded value comes back unchanged.
-    const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::XXH3_128);
+    const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::XXH3_128);
     EXPECT_EQ(reopened.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
     EXPECT_EQ(reopened.pool_id, pm.pool_id);
 }
@@ -154,7 +154,7 @@ TEST(CASPluggableHash, CreateOrValidateDefaultsToCityHash128)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
+    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
     EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 }
 
@@ -167,19 +167,19 @@ TEST(CASPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatchWithoutFlag)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
+    PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
 
     expectThrowsCodeWithMessage(
         DB::ErrorCodes::BAD_ARGUMENTS,
         "<cas_blob_hash_allow_new>1</cas_blob_hash_allow_new>",
         [&]
         {
-            PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::XXH3_128, /*allow_new*/ false);
+            PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::XXH3_128, /*allow_new*/ false);
         });
 
     /// The pool is untouched by the refused reopen: a subsequent open with the ORIGINAL algo still
     /// succeeds and returns the same pool_id.
-    const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128);
+    const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::CityHash128);
     EXPECT_EQ(reopened.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 }
 
@@ -189,18 +189,18 @@ TEST(CASPluggableHash, AdmissionIsFlagGated)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
-    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
+    PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
 
     /// without the flag: refuse, pool untouched
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
-    { PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, false); });
+    { PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::Sha256, false); });
 
     /// with the flag: admitted
-    const PoolMeta admitted = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, true);
+    const PoolMeta admitted = PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::Sha256, true);
     EXPECT_EQ(admitted.algos_used, (std::vector<uint8_t>{1, 3}));
 
     /// steady state: admitted algo reopens WITHOUT the flag
-    const PoolMeta steady = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, false);
+    const PoolMeta steady = PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::Sha256, false);
     EXPECT_EQ(steady.algos_used, (std::vector<uint8_t>{1, 3}));
 }
 
@@ -208,10 +208,10 @@ TEST(CASPluggableHash, ConcurrentAdmissionUnions)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
-    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, false, /*allow_mint*/ true);
-    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::XXH3_128, true);
-    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, true);
-    const PoolMeta final_pm = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, false);
+    PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::CityHash128, false, /*allow_mint*/ true);
+    PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::XXH3_128, true);
+    PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::Sha256, true);
+    const PoolMeta final_pm = PoolMeta::createOrValidate(*backend, layout, 512, BlobHashAlgo::CityHash128, false);
     EXPECT_EQ(final_pm.algos_used, (std::vector<uint8_t>{1, 2, 3}));   /// union, sorted, nothing lost
 }
 
@@ -714,7 +714,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
-        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
+        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 512, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
         pm.min_reader_generation = G_BUILD + 1;
         ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), encodePoolMeta(pm), backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
 
@@ -722,7 +722,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
         { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
     }
 
-    /// BACKWARD floor: a pool whose header `v` (compatibility_version) is BELOW `G_BUILD` was written
+    /// BACKWARD floor: a pool whose header `version` is BELOW `G_BUILD` was written
     /// by an older build this reader can no longer trust -- today that is one generation short of
     /// `kNamespaceLifeKeyedGeneration`, a pool whose ref-object keys carry no incarnation segment,
     /// which this build's parsers refuse as corruption rather than read. Craft it at the text layer:
@@ -731,11 +731,11 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
-        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
+        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 512, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
         const String fresh_bytes = encodePoolMeta(pm);
 
-        const String from = "\"v\":" + std::to_string(G_BUILD);
-        const String to = "\"v\":" + std::to_string(G_BUILD - 1);
+        const String from = "\"version\":" + std::to_string(G_BUILD);
+        const String to = "\"version\":" + std::to_string(G_BUILD - 1);
         const auto pos = fresh_bytes.find(from);
         ASSERT_NE(pos, String::npos);   // sanity: a fresh pool stamps the header at the floor
         String downgraded = fresh_bytes;

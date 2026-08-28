@@ -104,7 +104,7 @@ def _decode_mount(body):
     lines = body.decode().splitlines()
     assert len(lines) == 2, lines
     header = json.loads(lines[0])
-    assert header["type"] == "cas_mount_lease" and int(header["v"]) > 0, header
+    assert header["type"] == "cas_mount_lease" and int(header["version"]) > 0, header
     return json.loads(lines[1])
 
 
@@ -226,7 +226,7 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     assert mount_after["state"] == "live", mount_after
     assert mount_after["lifecycle"] == "live", mount_after
     assert mount_after["gc_fenced"] == 0, mount_after
-    assert int(mount_body["seq"]) == sequence
+    assert int(mount_body["sequence"]) == sequence
     assert token_after != token_before
     assert stats["faults"] == 1, stats
     assert stats["by_mode"].get("503") == 1, stats
@@ -311,7 +311,7 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     assert record["upstream_etag"].strip('"') == token_after, record
     assert body_after != body_before
     assert token_after != token_before
-    assert int(mount_body["seq"]) == sequence
+    assert int(mount_body["sequence"]) == sequence
 
     assert delta["CASMountRenewalAttempts"] == 1, delta
     assert delta["CASMountRenewalRetries"] == 0, delta

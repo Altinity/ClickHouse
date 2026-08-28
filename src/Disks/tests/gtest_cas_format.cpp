@@ -78,15 +78,15 @@ TEST(CASPoolMeta, GenerationNinePoolIsRejectedAtReaderFloor)
 {
     PoolMeta meta;
     meta.pool_id = UInt128{1};
-    meta.blob_header_len = 256;
+    meta.blob_header_len = 512;
     meta.gc_shards = 1;
     meta.min_reader_generation = 10;
     meta.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
     String encoded = encodePoolMeta(meta);
-    const String current = "\"v\":10";
+    const String current = "\"version\":10";
     const size_t version = encoded.find(current);
     ASSERT_NE(version, String::npos);
-    encoded.replace(version, current.size(), "\"v\":9");
+    encoded.replace(version, current.size(), "\"version\":9");
 
     try
     {

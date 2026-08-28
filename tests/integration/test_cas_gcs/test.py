@@ -469,7 +469,7 @@ def test_blob_publication_request_budget_and_default_mode(disk):
             for r in meta
             if r["method"] == "PUT"
             and r["headers"].get("x-goog-if-generation-match") == "0"
-            and '"st":"clean"' in r["request_body"]
+            and '"state":"clean"' in r["request_body"]
         ]
         assert len(creates) == 1, (key, meta)
 
@@ -524,7 +524,7 @@ def test_blob_publication_request_budget_and_default_mode(disk):
             for r in _meta_requests(retry, target)
             if r["method"] == "PUT"
             and r["headers"].get("x-goog-if-generation-match", "0") != "0"
-            and '"st":"clean"' in r["request_body"]
+            and '"state":"clean"' in r["request_body"]
         ]
         assert len(clean_cas) == 1, clean_cas
 

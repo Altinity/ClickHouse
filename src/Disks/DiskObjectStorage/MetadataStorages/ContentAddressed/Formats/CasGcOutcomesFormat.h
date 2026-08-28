@@ -17,7 +17,7 @@ namespace DB::Cas
 /// the one-pass merge found a live in-degree. The log is written before the round's single state CAS;
 /// `putIfAbsent` adopts an existing durable log on replay rather than treating a byte difference as
 /// an error. The uncompressed payload is a header line, one flat JSON record per entry in insertion
-/// order, and an `{"n":count}` trailer. `FormatId::GcOutcomes` stores the sealed payload in one zstd
+/// order, and a `{"record_count":count}` trailer. `FormatId::GcOutcomes` stores the sealed payload in one zstd
 /// frame, so its object-storage key has the `.zst` suffix.
 enum class OutcomeKind : uint8_t
 {

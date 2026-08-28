@@ -58,17 +58,17 @@ ObjectKind objectKindFromWord(std::string_view w, std::string_view what)
 
 void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t)
 {
-    writeKey(out, "tt", first);
+    writeKey(out, "token_type", first);
     writeStringValue(out, tokenTypeToWord(t.type));
-    writeKey(out, "tv", first);
+    writeKey(out, "token_value", first);
     writeStringValue(out, t.value);
 }
 
 void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r)
 {
-    writeKey(out, "ha", first);
+    writeKey(out, "hash_algorithm", first);
     writeStringValue(out, blobHashAlgoName(r.algo));
-    writeKey(out, "h", first);
+    writeKey(out, "hash", first);
     writeStringValue(out, codecFor(r.algo).toHex(r.digest));
 }
 
@@ -76,11 +76,11 @@ void writeManifestRefFields(CasJsonWriter & out, bool & first, std::string_view 
 {
     /// Unlike the WriteBuffer overload, the two-part key() form appends the prefix and name back
     /// to back with no composed String(prefix) + "..." temporary.
-    out.key(prefix, "me", first);
+    out.key(prefix, "writer_epoch", first);
     out.u64StringValue(r.writer_epoch);
-    out.key(prefix, "mb", first);
+    out.key(prefix, "build_sequence", first);
     out.u64StringValue(r.build_sequence);
-    out.key(prefix, "mo", first);
+    out.key(prefix, "manifest_ordinal", first);
     out.u64Number(r.manifest_ordinal);
 }
 

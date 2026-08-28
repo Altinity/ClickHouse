@@ -19,21 +19,22 @@ namespace DB::Cas
 /// Minimum `blob_header_len` that provably fits the v3 `cas_blob` JSON envelope's mandatory (always-
 /// written) non-ref fields, computed at type maxima from `encodeEnvelopeHeader` (CasBlobEnvelopeFormat.cpp):
 ///   {"type":"cas_blob"                                        18
-///   ,"v":<u32>          5 + 10 (currentCompatibilityVersion)  15
-///   ,"tag":"<32 hex>"   7 + 34                                41
-///   ,"bld":"<32 hex>"   7 + 34                                41
-///   ,"ts":<u64>         6 + 20 (created_at_ms)                26
-///   ,"by":"<32 hex>"    7 + 34                                41
-///   ,"op":"<word>"      6 + 10 (longest op word "mutation")   16
-///   ,"ch":<u32>         6 + 10 (VERSION_INTEGER)              16
-///                                            non-ref JSON  = 214 bytes
-/// The encoder then always frames the ref: `,"ref":` (7) + `""` (2) + `}` (1), and reserves byte
-/// blob_header_len-1 for '\n' (1) = 11 bytes. So the mandatory content needs 214 + 11 = 225 bytes;
+///   ,"version":<u32>                         11 + 10            21
+///   ,"incarnation_tag":"<32 hex>"           19 + 34            53
+///   ,"build_id":"<32 hex>"                  12 + 34            46
+///   ,"created_at_ms":<u64>                  17 + 20            37
+///   ,"creator_server_id":"<32 hex>"         21 + 34            55
+///   ,"operation":"<word>"                   13 + 10            23
+///   ,"clickhouse_version":<u32>             22 + 10            32
+///                                                  non-ref JSON = 285 bytes
+/// The encoder then always frames the ref: `,"intended_ref":` (16) + `""` (2) + `}` (1), and
+/// reserves byte blob_header_len-1 for '\n' (1) = 20 bytes. The mandatory content therefore needs
+/// 285 + 20 = 305 bytes;
 /// below that, encodeEnvelopeHeader throws LOGICAL_ERROR on the FIRST blob write (the old drop-and-retry
-/// that used to mask this is gone). We floor at 240 (a multiple of 8 comfortably above 225, leaving
-/// >= 15 bytes for the diagnostic ref even at type maxima, and well under the 256 default) so a
+/// that used to mask this is gone). We floor at 320 (a multiple of 8 comfortably above 305, leaving
+/// >= 15 bytes for the diagnostic ref even at type maxima, and well under the 512 default) so a
 /// misconfigured pool fails at CREATION with BAD_ARGUMENTS, not at first write with LOGICAL_ERROR.
-static constexpr uint64_t kMinBlobHeaderLen = 240;
+static constexpr uint64_t kMinBlobHeaderLen = 320;
 
 void validatePoolBlobHeaderLen(uint64_t blob_header_len, int error_code, std::string_view what)
 {
@@ -73,15 +74,15 @@ String encodePoolMeta(const PoolMeta & pm)
     writeHeaderLine(out, FormatId::PoolMeta);
 
     bool first = true;
-    writeKey(out, "pid", first);
+    writeKey(out, "pool_id", first);
     writeHex128Value(out, pm.pool_id);
-    writeKey(out, "hln", first);
+    writeKey(out, "blob_header_len", first);
     writeIntText(pm.blob_header_len, out);
-    writeKey(out, "gcs", first);
+    writeKey(out, "gc_shards", first);
     writeIntText(pm.gc_shards, out);
-    writeKey(out, "mrg", first);
+    writeKey(out, "min_reader_generation", first);
     writeIntText(pm.min_reader_generation, out);
-    writeKey(out, "alg", first);
+    writeKey(out, "algorithms_used", first);
     {
         /// Comma-joined algo words (tiny list, <=3): "ch128" or "ch128,sha256".
         String joined;
@@ -127,21 +128,21 @@ PoolMeta decodePoolMeta(std::string_view data)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "pid")
+        if (key == "pool_id")
         {
             pm.pool_id = r.readHex128();
             saw_pid = true;
         }
-        else if (key == "hln")
+        else if (key == "blob_header_len")
             pm.blob_header_len = r.readU64Number();
-        else if (key == "gcs")
+        else if (key == "gc_shards")
         {
             pm.gc_shards = r.readU64Number();
             saw_gc_shards = true;
         }
-        else if (key == "mrg")
+        else if (key == "min_reader_generation")
             pm.min_reader_generation = r.readU64Number();
-        else if (key == "alg")
+        else if (key == "algorithms_used")
         {
             const String joined = r.readString();
             size_t start = 0;
@@ -161,9 +162,9 @@ PoolMeta decodePoolMeta(std::string_view data)
             r.skipUnknown(key);
     }
     if (!saw_pid)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing pid");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing pool_id");
     if (!saw_gc_shards || pm.gc_shards == 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing or zero gcs");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing or zero gc_shards");
     if (!body_in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: junk after body object");
     if (!in.eof())

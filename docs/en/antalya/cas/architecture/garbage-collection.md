@@ -22,7 +22,7 @@ race over one blob is covered on the
 ## Leadership {#leadership}
 
 There is **no separate `GC` lease object**. The lease lives inside `gc/state` itself as
-`{owner, seq}`.
+`{lease_owner, lease_sequence}`.
 
 ```mermaid
 stateDiagram-v2
@@ -30,22 +30,22 @@ stateDiagram-v2
     Reading --> Creating: object absent, never observed before
     Creating --> Leader: casPut create-if-absent, cas_gc_shards fixed here, once
     Reading --> Renewing: lease owner is me
-    Renewing --> Leader: casPut seq+1, guarded by the observed token
+    Renewing --> Leader: casPut lease_sequence+1, guarded by the observed token
     Reading --> Evaluating: foreign owner
     Evaluating --> NotLeader: incumbent lease moved, or heartbeat moved, or steal not allowed
     Evaluating --> Stealing: both frozen across a full observation window
-    Stealing --> Leader: casPut owner=me seq+1, on the observed token
+    Stealing --> Leader: casPut lease_owner=me lease_sequence+1, on the observed token
     Stealing --> NotLeader: lost the CAS, re-read and re-arm
     Leader --> [*]: run the round
 ```
 
-Two independent liveness signals are consulted before a steal: whether `(owner, seq)` moved since
+Two independent liveness signals are consulted before a steal: whether `(lease_owner, lease_sequence)` moved since
 the last tick, and whether the separate `gc/hb` heartbeat moved. The heartbeat is compared only
 under the same remembered heartbeat owner, deliberately not against `lease.owner` — a deposed
 leader's heartbeat thread keeps pulsing, and that must not cause a live new leader's lease to be
 stolen. The paced background loop may steal; a manual `SYSTEM CAS GC RUN` may not, because the
 safety argument needs two observations separated by real wall time. Because every renew or steal
-bumps `seq`, `seq` doubles as the round's attempt id.
+bumps `lease_sequence`, `lease_sequence` doubles as the round's attempt id.
 
 **A deposed leader that keeps running cannot corrupt anything**, and the argument does not rely on
 exclusivity at all:

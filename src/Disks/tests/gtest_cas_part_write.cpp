@@ -341,7 +341,7 @@ TEST(CASPartWriteTxn, PutBlobWritesEnvelopeWithFixedHeader)
     auto raw = b->get(s->layout().blobKey(ref.ref));
     ASSERT_TRUE(raw.has_value());
     auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
-    EXPECT_EQ(h.header_len, s->poolMeta().blob_header_len);   /// 256
+    EXPECT_EQ(h.header_len, s->poolMeta().blob_header_len);   /// 512
     /// `logical_size`/`logical_hash` were dropped 2026-07-11, and `domain_id` in codecs-v3 phase 7
     /// (the pool id no longer travels in the envelope) — identity is the content key and the payload
     /// starts at the fixed offset `header_len`.

@@ -216,7 +216,7 @@ bytes, not inferred from occupancy alone as blob uploads do. Divergent bytes are
 correct operation and fail closed as `CORRUPTED_DATA`.
 
 This is the format-evolution **adoption pin**, documented in the persisted-format registry
-(`Formats/README.md`): on a `putDeterministicArtifact` conflict, the writer re-encodes at the `v`
+(`Formats/README.md`): on a `putDeterministicArtifact` conflict, the writer re-encodes at the `version`
 of the *existing* object rather than at its own current build's version, so two writers on
 different builds replaying the same deterministic round still land on byte-identical output.
 

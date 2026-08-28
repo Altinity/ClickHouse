@@ -247,12 +247,12 @@ TEST(CASNsFileIncarnation, LegacyUnqualifiedFileKeyIsRefusedAtOpen)
     /// one, so every other byte is exactly what that generation really wrote.
     PoolMeta meta;
     meta.pool_id = hexToU128("0123456789abcdef0123456789abcdef");
-    meta.blob_header_len = 256;
+    meta.blob_header_len = 512;
     meta.min_reader_generation = kNamespaceLifeKeyedGeneration - 1;
     meta.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
     String encoded = encodePoolMeta(meta);
-    const String current_v = "\"v\":" + std::to_string(G_BUILD);
-    const String legacy_v = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration);
+    const String current_v = "\"version\":" + std::to_string(G_BUILD);
+    const String legacy_v = "\"version\":" + std::to_string(kNamespaceLifeKeyedGeneration);
     const size_t at = encoded.find(current_v);
     /// Guard the substitution itself: a silent no-op here would leave a CURRENT-generation pool and the
     /// test would pass by opening a pool it believes it downgraded.

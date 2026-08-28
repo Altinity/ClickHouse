@@ -784,7 +784,10 @@ def handle_control(path, method, query):
             return _no_such_key(meta_key)
         text = entry["body"].decode("utf-8", "strict")
         rewritten, replacements = re.subn(
-            r'"st":"clean","cr":"[0-9]+"', '"st":"condemned","cr":"1"', text, count=1
+            r'"state":"clean","condemn_round":"[0-9]+"',
+            '"state":"condemned","condemn_round":"1"',
+            text,
+            count=1,
         )
         if replacements != 1:
             return _bad_request("blob metadata is not Clean: " + meta_key)

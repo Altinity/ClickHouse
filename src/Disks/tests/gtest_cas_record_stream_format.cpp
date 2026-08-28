@@ -70,7 +70,7 @@ TEST(CASRecordStream, EmptyRunRoundTripsAndChecksumMatches)
 {
     const String bytes = encodeRun({});
     EXPECT_EQ(bytes, fmt::format(
-        "{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n{{\"n\":0}}\n", currentCompatibilityVersion()));
+        "{{\"type\":\"cas_run\",\"version\":{},\"kind\":\"source_edge\"}}\n{{\"record_count\":0}}\n", currentCompatibilityVersion()));
 
     ReadBufferFromMemory in(bytes.data(), bytes.size());
     SourceEdgeRunReader reader(in);
@@ -159,9 +159,9 @@ TEST(CASRecordStream, SourceIdRendersAs32Hex)
 {
     const String bytes = encodeRun({edge(chRef(1), 10)});
     /// The source id 10 is a 32-char lowercase hex string ending in 'a'.
-    EXPECT_NE(bytes.find("\"s\":\"0000000000000000000000000000000a\""), String::npos);
-    /// The record key `b` for a ch128 ref is the algo byte 01 + a 32-hex digest (34 chars total).
-    EXPECT_NE(bytes.find("\"b\":\"01"), String::npos);
+    EXPECT_NE(bytes.find("\"source_id\":\"0000000000000000000000000000000a\""), String::npos);
+    /// The record key `blob_ref` for a `ch128` ref is the algorithm byte 01 + a 32-hex digest (34 chars total).
+    EXPECT_NE(bytes.find("\"blob_ref\":\"01"), String::npos);
 }
 
 TEST(CASRecordStream, SealChecksumMismatchFailsClosed)
@@ -195,8 +195,8 @@ TEST(CASRecordStream, TrailerCountMismatchIsCorruptData)
 {
     String bytes = encodeRun({edge(chRef(1), 10)});
     /// Rewrite the trailer count 1 -> 2.
-    const String from = "{\"n\":1}\n";
-    const String to = "{\"n\":2}\n";
+    const String from = "{\"record_count\":1}\n";
+    const String to = "{\"record_count\":2}\n";
     const size_t at = bytes.rfind(from);
     ASSERT_NE(at, String::npos);
     bytes.replace(at, from.size(), to);
@@ -207,7 +207,7 @@ TEST(CASRecordStream, TruncationAtLineBoundaryFailsClosed)
 {
     const String bytes = encodeRun({edge(chRef(1), 10), edge(chRef(1), 20)});
     /// Drop the trailer line entirely (truncate after the last record's newline).
-    const size_t trailer = bytes.rfind("{\"n\":");
+    const size_t trailer = bytes.rfind("{\"record_count\":");
     ASSERT_NE(trailer, String::npos);
     EXPECT_THROW(decodeRun(bytes.substr(0, trailer)), DB::Exception);
 }
@@ -216,18 +216,18 @@ TEST(CASRecordStream, HeaderGates)
 {
     /// Wrong type.
     {
-        const String s = "{\"type\":\"cas_pool_meta\",\"v\":3,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
+        const String s = "{\"type\":\"cas_pool_meta\",\"version\":3,\"kind\":\"source_edge\"}\n{\"record_count\":0}\n";
         EXPECT_THROW(decodeRun(s), DB::Exception);
     }
     /// Wrong kind.
     {
-        const String s = "{\"type\":\"cas_run\",\"v\":3,\"kind\":\"blob_delta\"}\n{\"n\":0}\n";
+        const String s = "{\"type\":\"cas_run\",\"version\":3,\"kind\":\"blob_delta\"}\n{\"record_count\":0}\n";
         EXPECT_THROW(decodeRun(s), DB::Exception);
     }
     /// Future version -> UNKNOWN_FORMAT_VERSION.
     {
         const String s = fmt::format(
-            "{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n{{\"n\":0}}\n", currentCompatibilityVersion() + 1);
+            "{{\"type\":\"cas_run\",\"version\":{},\"kind\":\"source_edge\"}}\n{{\"record_count\":0}}\n", currentCompatibilityVersion() + 1);
         ReadBufferFromMemory in(s.data(), s.size());
         try
         {
@@ -241,7 +241,7 @@ TEST(CASRecordStream, HeaderGates)
     }
     /// An out-of-range version must not narrow to a valid low u32 value.
     {
-        const String s = "{\"type\":\"cas_run\",\"v\":4294967299,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
+        const String s = "{\"type\":\"cas_run\",\"version\":4294967299,\"kind\":\"source_edge\"}\n{\"record_count\":0}\n";
         try
         {
             decodeRun(s);

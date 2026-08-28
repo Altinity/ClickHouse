@@ -9,11 +9,9 @@
 using namespace DB;
 using namespace DB::Cas;
 
-/// These literals pin the CANONICAL BYTES of the CAS text encoders as of the commit that
-/// introduced this file. The CasJsonWriter migration (2026-07-20 spec) must keep every one of
-/// them green UNMODIFIED: canonical text is byte-compared on retries and deterministic adoption,
-/// and the incremental ref budget counters assume these exact sizes. Never edit an expected
-/// string here to make a test pass — that means the encoder's bytes drifted, which is the bug.
+/// These literals pin the CANONICAL BYTES of the CAS text encoders. Canonical text is byte-compared
+/// on retries and deterministic adoption, and the incremental ref budget counters assume these
+/// exact sizes. Update an expected string only for an intentional format change.
 
 TEST(CASEncodingPins, RefLogTxnAllOpKinds)
 {
@@ -48,16 +46,16 @@ TEST(CASEncodingPins, RefLogTxnAllOpKinds)
     removal.kind = RefOpKind::RemoveNamespace;
     txn.ops.push_back(removal);
 
-    const String expected = fmt::format("{{\"type\":\"cas_ref_log\",\"v\":{}}}\n", currentCompatibilityVersion()) +
-        "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\"}\n"
-        "{\"op\":\"namespace_birth\"}\n"
-        "{\"op\":\"owner_transition\",\"obk\":\"precommit\",\"orn\":\"20260101_0_1_1_1\","
-        "\"ome\":\"1\",\"omb\":\"2\",\"omo\":3,\"nbk\":\"committed\",\"nrn\":\"20260101_0_1_1_1\","
-        "\"nme\":\"1\",\"nmb\":\"2\",\"nmo\":3}\n"
-        "{\"op\":\"set_published_at\",\"rn\":\"20260101_0_1_1_1\\\"c\\nd\\u0001e\\u2028f\","
-        "\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"ts\":1234}\n"
-        "{\"op\":\"remove_namespace\"}\n"
-        "{\"n\":4}\n";
+    const String expected = fmt::format("{{\"type\":\"cas_ref_log\",\"version\":{}}}\n", currentCompatibilityVersion()) +
+        "{\"namespace\":\"roots/pin\",\"writer_epoch\":\"7\",\"ref_sequence\":\"9\"}\n"
+        "{\"operation\":\"namespace_birth\"}\n"
+        "{\"operation\":\"owner_transition\",\"old_binding_kind\":\"precommit\",\"old_ref_name\":\"20260101_0_1_1_1\","
+        "\"old_writer_epoch\":\"1\",\"old_build_sequence\":\"2\",\"old_manifest_ordinal\":3,\"new_binding_kind\":\"committed\",\"new_ref_name\":\"20260101_0_1_1_1\","
+        "\"new_writer_epoch\":\"1\",\"new_build_sequence\":\"2\",\"new_manifest_ordinal\":3}\n"
+        "{\"operation\":\"set_published_at\",\"ref_name\":\"20260101_0_1_1_1\\\"c\\nd\\u0001e\\u2028f\","
+        "\"writer_epoch\":\"1\",\"build_sequence\":\"2\",\"manifest_ordinal\":3,\"published_at_ms\":1234}\n"
+        "{\"operation\":\"remove_namespace\"}\n"
+        "{\"record_count\":4}\n";
     EXPECT_EQ(encodeRefLogTxn(txn), expected);
 }
 
@@ -75,11 +73,11 @@ TEST(CASEncodingPins, RefSnapshotLive)
 
     snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "20260102_0_2_2_2", ManifestRef{4, 5, 6}});
 
-    const String expected = fmt::format("{{\"type\":\"cas_ref_snap\",\"v\":{}}}\n", currentCompatibilityVersion()) +
-        "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\",\"lc\":\"live\"}\n"
-        "{\"k\":\"c\",\"rn\":\"20260101_0_1_1_1\",\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"ts\":5}\n"
-        "{\"k\":\"p\",\"rn\":\"20260102_0_2_2_2\",\"me\":\"4\",\"mb\":\"5\",\"mo\":6}\n"
-        "{\"n\":2}\n";
+    const String expected = fmt::format("{{\"type\":\"cas_ref_snap\",\"version\":{}}}\n", currentCompatibilityVersion()) +
+        "{\"namespace\":\"roots/pin\",\"writer_epoch\":\"7\",\"ref_sequence\":\"9\",\"lifecycle\":\"live\"}\n"
+        "{\"kind\":\"c\",\"ref_name\":\"20260101_0_1_1_1\",\"writer_epoch\":\"1\",\"build_sequence\":\"2\",\"manifest_ordinal\":3,\"published_at_ms\":5}\n"
+        "{\"kind\":\"p\",\"ref_name\":\"20260102_0_2_2_2\",\"writer_epoch\":\"4\",\"build_sequence\":\"5\",\"manifest_ordinal\":6}\n"
+        "{\"record_count\":2}\n";
     EXPECT_EQ(encodeRefTableSnapshot(snap), expected);
 }
 
@@ -97,13 +95,13 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     writer.finish();
     out.finalize();
 
-    /// The exact "b" rendering (algo byte + digest hex) is pinned as a whole line; the point is
+    /// The exact `blob` rendering (algo byte + digest hex) is pinned as a whole line; the point is
     /// that Task 8's line-scratch rewrite must reproduce it byte-for-byte.
     const String text = out.str();
-    const String header = fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion());
+    const String header = fmt::format("{{\"type\":\"cas_run\",\"version\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion());
     const String expected_record =
-        "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n";
-    const String trailer = "{\"n\":1}\n";
+        "{\"blob_ref\":\"0100000000000000000000000000000002\",\"source_id\":\"00000000000000000000000000000005\",\"marker\":\"edge\"}\n";
+    const String trailer = "{\"record_count\":1}\n";
     /// There is exactly one record, so the whole buffer must be byte-identical to header + record + trailer.
     const String expected_full = header + expected_record + trailer;
     EXPECT_EQ(text, expected_full) << text;

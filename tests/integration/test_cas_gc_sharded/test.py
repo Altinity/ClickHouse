@@ -122,13 +122,13 @@ def get_rustfs_object(key):
 
 
 # `gc/state`'s wire format is a plain JSON-like text object (CasGcStateFormat.cpp), not a binary
-# blob: the two fields this test needs are literally spelled `"sg":"<digits>"` (snap_generation)
-# and `"sa":"<digits>"` (snap_attempt) in the object bytes, so a direct regex read is exact without
+# blob: the two fields this test needs are literally spelled `"snapshot_generation":"<digits>"`
+# and `"snapshot_attempt":"<digits>"` in the object bytes, so a direct regex read is exact without
 # needing the C++ decoder. This mirrors the production reader that resolves "the adopted seal"
 # (Gc/CasOrphanManifestSweep.cpp): read gc/state, take (snap_generation, snap_attempt), then look up
 # that exact fold seal -- the only two-hop lookup that names one authoritative adopted pair.
-_SNAP_GENERATION_RE = re.compile(r'"sg":"(\d+)"')
-_SNAP_ATTEMPT_RE = re.compile(r'"sa":"(\d+)"')
+_SNAP_GENERATION_RE = re.compile(r'"snapshot_generation":"(\d+)"')
+_SNAP_ATTEMPT_RE = re.compile(r'"snapshot_attempt":"(\d+)"')
 
 
 def read_adopted_generation_and_attempt():

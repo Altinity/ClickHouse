@@ -40,10 +40,9 @@ constexpr char kCondemned  = 0x02;
 /// leaking into the format implementation.
 ///
 /// File shape:
-///   {"type":"cas_run","v":3,"kind":"source_edge"}                      header line (type + v + kind gate)
-///   {"b":"01<digest-hex>","s":"<32hex>","m":"edge"}                    an active-edge / zero-marker row
-///   {"b":"01<digest-hex>","s":"00000000000000000000000000000000","m":"condemned","pend":false,"tt":"etag","tv":"...","sz":123,"cr":"7","mc":false}
-///   {"n":184267}                                                       trailer: record count
+///   {"type":"cas_run","version":3,"kind":"source_edge"} header line (type + version + kind gate)
+///   {"blob_ref":"01<digest-hex>","source_id":"<32hex>","marker":"edge"} an active-edge / zero-marker row
+///   {"record_count":184267} trailer: record count
 ///
 /// The record key `b` is the algo BYTE as two lowercase hex chars followed by the digest hex at the
 /// algo's width; `s` is the 32-hex source id. String-sorting records by (b, s) reproduces the current
@@ -71,7 +70,7 @@ struct SourceEdgeRecord
 /// The header-line `kind` word for the only live `cas_run` kind.
 inline constexpr std::string_view kSourceEdgeKindWord = "source_edge";
 
-/// Write the typed header line `{"type":"cas_run","v":G_BUILD,"kind":"<kind>"}\n` with a fixed key
+/// Write the typed header line `{"type":"cas_run","version":G_BUILD,"kind":"<kind>"}\n` with a fixed key
 /// order for byte-determinism. The `kind` field distinguishes the record schema within the run
 /// family, so a reader can reject a valid run of the wrong kind before interpreting any records.
 void writeRunHeaderLine(WriteBuffer & out, std::string_view kind);
@@ -86,7 +85,7 @@ void expectRunHeaderLine(ReadBuffer & in, std::string_view expected_kind);
 /// object checksum is `sourceEdgeRunChecksum` over the finished bytes, which keeps this writer free of a
 /// HashingWriteBuffer finalize-ordering hazard). `append` asserts records arrive in non-decreasing
 /// (ref, source_id) order and throws on a regression (this replaces the old `prev_key` monotonicity
-/// check). `finish` writes the `{"n":count}` trailer.
+/// check). `finish` writes the `{"record_count":count}` trailer.
 class SourceEdgeRunWriter
 {
 public:
@@ -126,7 +125,7 @@ UInt128 sourceEdgeRunChecksum(std::string_view stored_bytes);
 
 /// Sequential streaming reader over a caller-owned `ReadBuffer` (backend-free, O(one 4 KiB line)
 /// resident). The ctor reads + gates the typed header line. `next` yields records in stored order and
-/// returns false once the `{"n"}` trailer is consumed (the count is verified there — the line-truncation
+/// returns false once the `{"record_count"}` trailer is consumed (the count is verified there — the line-truncation
 /// guard). Every byte read is fed through a chained CityHash128; after the trailer, `verifyAgainst`
 /// compares the accumulated whole-object hash to the seal's `RunRef.checksum` and throws `CORRUPTED_DATA`
 /// on a mismatch — the caller calls it after draining and BEFORE acting on the records (the deletion

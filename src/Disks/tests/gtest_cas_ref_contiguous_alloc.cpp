@@ -296,7 +296,7 @@ TEST(CASRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
 {
     PoolMeta pm;
     pm.pool_id = UInt128{1, 2};
-    pm.blob_header_len = 256;
+    pm.blob_header_len = 512;
     pm.min_reader_generation = G_BUILD;
     pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
 
@@ -305,8 +305,8 @@ TEST(CASRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
 
     /// Rewrite the header-line generation to the last pre-contiguous one, exactly as an older build
     /// would have stamped it.
-    const String from = "\"v\":" + std::to_string(G_BUILD);
-    const String to = "\"v\":" + std::to_string(kContiguousRefStreamsGeneration - 1);
+    const String from = "\"version\":" + std::to_string(G_BUILD);
+    const String to = "\"version\":" + std::to_string(kContiguousRefStreamsGeneration - 1);
     const size_t at = current.find(from);
     ASSERT_NE(at, String::npos);
     String old_format = current;
@@ -333,7 +333,7 @@ TEST(CASRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRec
 {
     PoolMeta pm;
     pm.pool_id = UInt128{1, 2};
-    pm.blob_header_len = 256;
+    pm.blob_header_len = 512;
     pm.min_reader_generation = G_BUILD;
     pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
 
@@ -342,8 +342,8 @@ TEST(CASRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRec
 
     /// Rewrite the header to the immediately preceding generation, which used
     /// `cas/refs/<namespace>/<incarnation>/...`.
-    const String from = "\"v\":" + std::to_string(G_BUILD);
-    const String to = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration);
+    const String from = "\"version\":" + std::to_string(G_BUILD);
+    const String to = "\"version\":" + std::to_string(kNamespaceLifeKeyedGeneration);
     const size_t at = current.find(from);
     ASSERT_NE(at, String::npos);
     String old_format = current;
@@ -372,13 +372,13 @@ TEST(CASRefContiguousAlloc, GenerationSixSplitFoldSealPoolIsRefusedNamingRecreat
 {
     PoolMeta pm;
     pm.pool_id = UInt128{1, 2};
-    pm.blob_header_len = 256;
+    pm.blob_header_len = 512;
     pm.min_reader_generation = G_BUILD;
     pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
 
     const String current = encodePoolMeta(pm);
-    const String from = "\"v\":" + std::to_string(G_BUILD);
-    const String to = "\"v\":6";
+    const String from = "\"version\":" + std::to_string(G_BUILD);
+    const String to = "\"version\":6";
     const size_t at = current.find(from);
     ASSERT_NE(at, String::npos);
     String old_format = current;
@@ -402,12 +402,12 @@ TEST(CASPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
     InMemoryBackend backend;
     const Layout layout("p");
     const PoolMeta created = PoolMeta::createOrValidate(
-        backend, layout, /*blob_header_len=*/256, /*gc_shards=*/4,
+        backend, layout, /*blob_header_len=*/512, /*gc_shards=*/4,
         BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
     EXPECT_EQ(created.gc_shards, 4u);
 
     const PoolMeta reopened = PoolMeta::createOrValidate(
-        backend, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
+        backend, layout, /*blob_header_len=*/512, /*gc_shards=*/1,
         BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/false);
     EXPECT_EQ(reopened.gc_shards, 4u);
     EXPECT_EQ(decodePoolMeta(backend.get(layout.poolMetaKey())->bytes).gc_shards, 4u);

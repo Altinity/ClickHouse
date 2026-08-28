@@ -46,7 +46,7 @@ struct Provenance
 /// The blob envelope is a fixed-size JSON descriptor followed by the raw payload. The JSON object
 /// occupies bytes [0, json_len), ASCII spaces occupy [json_len, blob_header_len-1), and '\n' is at byte
 /// blob_header_len-1. The payload therefore begins at the pool-wide constant offset
-/// `blob_header_len` (256 for blob pools, a `PoolMeta` parameter), allowing the locate path to use a
+/// `blob_header_len` (512 by default for blob pools, a `PoolMeta` parameter), allowing the locate path to use a
 /// constant shift without reading an object-specific header first. The header is also the incarnation
 /// zone: it may differ between incarnations of one logical object, and each upload attempt gets a fresh
 /// random u128 `tag`, which is used as the exact-token delete identity.
@@ -73,7 +73,7 @@ struct EnvelopeHeader
     bool emit_unknown_critical_key = false;
 };
 
-/// Builds the fixed-length header for a pool whose `blob_header_len` is `blob_header_len` (256 for blob
+/// Builds the fixed-length header for a pool whose `blob_header_len` is `blob_header_len` (512 by default for blob
 /// pools). Sets `header.header_len = blob_header_len` and returns exactly that many bytes. The
 /// diagnostic `ref` is the only truncatable field and is shortened, never dropped, when necessary to
 /// preserve the fixed layout. The header is built without payload bytes, so an upload can stage the

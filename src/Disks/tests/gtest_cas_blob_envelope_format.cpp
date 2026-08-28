@@ -20,15 +20,15 @@ EnvelopeHeader sampleHeader(const String & ref)
     h.intended_ref = ref;
     return h;
 }
-constexpr uint32_t L = 256;
+constexpr uint32_t L = 512;
 
 /// The envelope has a fixed physical length. At generation 9 there is no unsupported one-digit
 /// version, so replacing `9` with `10` must consume one byte from the space pad rather than silently
-/// turning the 256-byte fixture into a different wire shape.
+/// turning the 512-byte fixture into a different wire shape.
 String blobEnvelopeWithFutureVersion(std::string_view text)
 {
-    const String v_now = fmt::format("\"v\":{}", currentCompatibilityVersion());
-    const String v_next = fmt::format("\"v\":{}", currentCompatibilityVersion() + 1);
+    const String v_now = fmt::format("\"version\":{}", currentCompatibilityVersion());
+    const String v_next = fmt::format("\"version\":{}", currentCompatibilityVersion() + 1);
     String future(text);
     const size_t version_pos = future.find(v_now);
     if (version_pos == String::npos || v_next.size() < v_now.size())
@@ -51,11 +51,11 @@ TEST(CASBlobEnvelopeFormat, FixedLengthAndPadZone)
     const String head = encodeEnvelopeHeader(h, L);
     ASSERT_EQ(head.size(), L);                       /// exactly blob_header_len
     EXPECT_EQ(head[L - 1], '\n');                     /// terminator at byte 255
-    const String json = fmt::format(R"({{"type":"cas_blob","v":{},)", currentCompatibilityVersion()) +
-                        "\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
-                        "\"bld\":\"1112131415161718191a1b1c1d1e1f20\",\"ts\":1752537600123,"
-                        "\"by\":\"2122232425262728292a2b2c2d2e2f30\",\"op\":\"merge\",\"ch\":26006001,"
-                        "\"ref\":\"t-abc/all_1_2_0\"}";
+    const String json = fmt::format(R"({{"type":"cas_blob","version":{},)", currentCompatibilityVersion()) +
+                        "\"incarnation_tag\":\"0102030405060708090a0b0c0d0e0f10\","
+                        "\"build_id\":\"1112131415161718191a1b1c1d1e1f20\",\"created_at_ms\":1752537600123,"
+                        "\"creator_server_id\":\"2122232425262728292a2b2c2d2e2f30\",\"operation\":\"merge\",\"clickhouse_version\":26006001,"
+                        "\"intended_ref\":\"t-abc/all_1_2_0\"}";
     ASSERT_LT(json.size(), L);
     EXPECT_EQ(head.substr(0, json.size()), json);                        /// '/' UNescaped (local escaper)
     EXPECT_EQ(head.substr(json.size(), (L - 1) - json.size()), String((L - 1) - json.size(), ' ')); /// pad = spaces
@@ -75,8 +75,8 @@ TEST(CASBlobEnvelopeFormat, FixedLengthAndPadZone)
 
 TEST(CASBlobEnvelopeFormat, RefTruncatedToExactBudget)
 {
-    /// A 200-char ref cannot fit; it is truncated so the header is EXACTLY 256 bytes and the pad holds.
-    EnvelopeHeader h = sampleHeader(String(200, 'a'));
+    /// A 600-char ref cannot fit; it is truncated so the header is EXACTLY 512 bytes and the pad holds.
+    EnvelopeHeader h = sampleHeader(String(600, 'a'));
     const String head = encodeEnvelopeHeader(h, L);
     ASSERT_EQ(head.size(), L);
     EXPECT_EQ(head[L - 1], '\n');
@@ -117,7 +117,7 @@ TEST(CASBlobEnvelopeFormat, GatesAndCriticalKey)
     String wrong_type = head;
     wrong_type.replace(wrong_type.find("cas_blob"), 8, "cas_xxxx");
     EXPECT_THROW(decodeEnvelopeHeader(wrong_type, wrong_type.size(), ObjectKind::Blob), DB::Exception);
-    const String current_version = fmt::format("\"v\":{}", currentCompatibilityVersion());
+    const String current_version = fmt::format("\"version\":{}", currentCompatibilityVersion());
     String future = blobEnvelopeWithFutureVersion(head);
     cas_battery_detail::expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { decodeEnvelopeHeader(future, future.size(), ObjectKind::Blob); }, "future blob-envelope version");
@@ -125,7 +125,7 @@ TEST(CASBlobEnvelopeFormat, GatesAndCriticalKey)
     String out_of_range = head;
     const size_t out_of_range_version_at = out_of_range.find(current_version);
     ASSERT_NE(out_of_range_version_at, String::npos);
-    out_of_range.replace(out_of_range_version_at, current_version.size(), "\"v\":4294967299");
+    out_of_range.replace(out_of_range_version_at, current_version.size(), "\"version\":4294967299");
     try
     {
         decodeEnvelopeHeader(out_of_range, out_of_range.size(), ObjectKind::Blob);
@@ -146,11 +146,11 @@ TEST(CASBlobEnvelopeFormat, RefEscaperAlphabetPinned)
 {
     /// Pins the LOCAL escaper's alphabet (§ref-escaper): " and \ escape, control chars -> \uXXXX,
     /// '/' passes VERBATIM. Goes RED if anyone "unifies" this with writeStringValue/FormatSettings —
-    /// the 256-byte budget arithmetic depends on this alphabet being codec-owned and frozen.
+    /// the 512-byte budget arithmetic depends on this alphabet being codec-owned and frozen.
     EnvelopeHeader h = sampleHeader(String("a/b\"c\\d") + '\x01' + "e");
     const String head = encodeEnvelopeHeader(h, L);
     const String expected_ref_json = R"("a/b\"c\\d\u0001e")";
-    EXPECT_NE(head.find("\"ref\":" + expected_ref_json), String::npos)
+    EXPECT_NE(head.find("\"intended_ref\":" + expected_ref_json), String::npos)
         << "escaper alphabet drifted: '/' must be verbatim, quote/backslash escaped, control -> \\uXXXX";
 }
 
@@ -159,11 +159,11 @@ TEST(CASFormatBattery, BlobEnvelope)
     /// The golden is CONSTRUCTED from the hand-pinned json literal (same one FixedLengthAndPadZone
     /// asserts) + the derived pad — NOT self-computed via encodeEnvelopeHeader, which would compare
     /// the encoder to itself and pin nothing.
-    const String json = fmt::format(R"({{"type":"cas_blob","v":{},)", currentCompatibilityVersion()) +
-                        "\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
-                        "\"bld\":\"1112131415161718191a1b1c1d1e1f20\",\"ts\":1752537600123,"
-                        "\"by\":\"2122232425262728292a2b2c2d2e2f30\",\"op\":\"merge\",\"ch\":26006001,"
-                        "\"ref\":\"t-abc/all_1_2_0\"}";
+    const String json = fmt::format(R"({{"type":"cas_blob","version":{},)", currentCompatibilityVersion()) +
+                        "\"incarnation_tag\":\"0102030405060708090a0b0c0d0e0f10\","
+                        "\"build_id\":\"1112131415161718191a1b1c1d1e1f20\",\"created_at_ms\":1752537600123,"
+                        "\"creator_server_id\":\"2122232425262728292a2b2c2d2e2f30\",\"operation\":\"merge\",\"clickhouse_version\":26006001,"
+                        "\"intended_ref\":\"t-abc/all_1_2_0\"}";
     const String golden = json + String((L - 1) - json.size(), ' ') + '\n';
     runFormatBattery(FormatBatteryCase{
         .id = FormatId::Blob,

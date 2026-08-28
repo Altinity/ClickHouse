@@ -11,7 +11,7 @@
 # SQL-level drop completed normally while the CAS catalog row leaked, one per create/drop cycle.
 #
 # The primary oracle is the pool's OWN plain-text `cas/ref_catalog` object, read directly off disk: the
-# exact `st` (lifecycle) field recorded for the table's logical namespace. `SYSTEM CAS FSCK`'s
+# exact `state` field recorded for the table's logical namespace. `SYSTEM CAS FSCK`'s
 # unreachable/dangling counts are a secondary check only -- fsck correctly regards a `live` leak as
 # CONSISTENT (nothing is unreachable; the row simply never dies), so it cannot detect this defect on its
 # own; `04290_cas_no_leftovers.sh`'s fsck-only oracle is exactly why FINDING #2 shipped unnoticed.
@@ -31,10 +31,10 @@ CATALOG_FILE="${POOL_DIR}/ca/cas/ref_catalog"
 
 # The pool's own plain-text catalog line for namespace $1, or empty if the namespace has no row at all.
 catalog_line() {
-    grep -F "\"ns\":\"$1\"" "${CATALOG_FILE}" 2>/dev/null || true
+    grep -F "\"namespace\":\"$1\"" "${CATALOG_FILE}" 2>/dev/null || true
 }
 
-# The `st` (lifecycle) word recorded for namespace $1: "live"/"creating"/"removing", or "absent" if the
+# The `state` word recorded for namespace $1: "live"/"creating"/"removing", or "absent" if the
 # namespace has no catalog row (matches `04290`'s field-by-name discipline: never assume a position).
 catalog_state() {
     local line
@@ -43,7 +43,7 @@ catalog_state() {
         echo "absent"
         return
     fi
-    echo "${line}" | grep -o '"st":"[a-z]*"' | head -1 | sed -E 's/"st":"([a-z]*)"/\1/'
+    echo "${line}" | grep -o '"state":"[a-z]*"' | head -1 | sed -E 's/"state":"([a-z]*)"/\1/'
 }
 
 # ClickHouse's own store/<u3>/<uuid> fanout with the CAS archive boundary marker, exactly as

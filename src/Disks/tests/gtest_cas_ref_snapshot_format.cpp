@@ -7,10 +7,10 @@
 /// v3 text codec tests for `cas_ref_snap` (codecs-v3 phase 3). Split out of the retired
 /// `gtest_cas_ref_codecs.cpp` and re-pointed at the TEXT codec. The encoder-side validation tests are
 /// format-agnostic and carry over verbatim; the old binary-offset byte-patch decode tests
-/// (`bytes[k] = 99`) are gone -- the shape-level corruption classes (truncation, `v`+1 forward-gate,
+/// (`bytes[k] = 99`) are gone -- the shape-level corruption classes (truncation, `version`+1 forward-gate,
 /// wrong type, leading garbage) are covered by the `CASFormatBattery.RefSnapshot` row below, which also
 /// subsumes the old `DecodeRejectsFutureFormatVersion`/`DecodeRejectsFormatVersionOne` pair (there is
-/// no `format_version` byte any more -- the header `v` gate is the single forward-compat mechanism).
+/// no `format_version` byte any more -- the header `version` gate is the single forward-compat mechanism).
 
 using namespace DB::Cas;
 using DB::Cas::tests::expectThrowsCode;
@@ -65,7 +65,7 @@ TEST(CASRefSnapshotCodec, DecodeRequiresLifecycleField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String field = R"(,"lc":"live")";
+    const String field = R"(,"lifecycle":"live")";
     const size_t at = bytes.find(field);
     ASSERT_NE(at, String::npos);
     bytes.erase(at, field.size());
@@ -78,10 +78,10 @@ TEST(CASRefSnapshotCodec, DecodeRejectsTerminalLifecycleWord)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String live = R"("lc":"live")";
+    const String live = R"("lifecycle":"live")";
     const size_t at = bytes.find(live);
     ASSERT_NE(at, String::npos);
-    bytes.replace(at, live.size(), R"("lc":"removed")");
+    bytes.replace(at, live.size(), R"("lifecycle":"removed")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
@@ -91,10 +91,10 @@ TEST(CASRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnEpochField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String live = R"("lc":"live")";
+    const String live = R"("lifecycle":"live")";
     const size_t at = bytes.find(live);
     ASSERT_NE(at, String::npos);
-    bytes.replace(at, live.size(), live + R"(,"rte":"7")");
+    bytes.replace(at, live.size(), live + R"(,"remove_txn_writer_epoch":"7")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
@@ -104,10 +104,10 @@ TEST(CASRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnSequenceField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String live = R"("lc":"live")";
+    const String live = R"("lifecycle":"live")";
     const size_t at = bytes.find(live);
     ASSERT_NE(at, String::npos);
-    bytes.replace(at, live.size(), live + R"(,"rts":"9")");
+    bytes.replace(at, live.size(), live + R"(,"remove_txn_ref_sequence":"9")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
@@ -117,10 +117,10 @@ TEST(CASRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnFieldPair)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String live = R"("lc":"live")";
+    const String live = R"("lifecycle":"live")";
     const size_t at = bytes.find(live);
     ASSERT_NE(at, String::npos);
-    bytes.replace(at, live.size(), live + R"(,"rte":"7","rts":"9")");
+    bytes.replace(at, live.size(), live + R"(,"remove_txn_writer_epoch":"7","remove_txn_ref_sequence":"9")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
@@ -143,10 +143,10 @@ TEST(CASRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)
 
     const String bytes = encodeRefTableSnapshot(s);
     /// Splice the retired `"pl"` field back into the committed record, just before its `"ts"` field.
-    const String needle = ",\"ts\":";
+    const String needle = ",\"published_at_ms\":";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
-    const String tampered = bytes.substr(0, pos) + R"(,"pl":"deadbeef")" + bytes.substr(pos);
+    const String tampered = bytes.substr(0, pos) + R"(,"payload":"deadbeef")" + bytes.substr(pos);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { decodeRefTableSnapshot(tampered, s.ns, s.snapshot_id); });
@@ -207,7 +207,7 @@ TEST(CASRefSnapshotFormat, MaximalRefSequenceRoundTripsAsADecimalString)
     const String text = encodeRefTableSnapshot(m);
     const RefTableSnapshot back = decodeRefTableSnapshot(text, m.ns, m.snapshot_id);
     EXPECT_EQ(back.snapshot_id.ref_sequence, std::numeric_limits<uint64_t>::max());
-    EXPECT_NE(text.find("\"rs\":\"18446744073709551615\""), String::npos);
+    EXPECT_NE(text.find("\"ref_sequence\":\"18446744073709551615\""), String::npos);
 }
 
 /// ===================================================================================
@@ -428,9 +428,9 @@ TEST(CASFormatBattery, RefSnapshot)
         [s] { return sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(s)); },
         [ns, id](std::string_view d) { decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, d), ns, id); },
         currentFormatHeader("cas_ref_snap") +
-        "{\"ns\":\"srv1/db/table@cas@\",\"we\":\"5\",\"rs\":\"200\",\"lc\":\"live\"}\n"
-        "{\"k\":\"c\",\"rn\":\"all_1_1_0\",\"me\":\"5\",\"mb\":\"10\",\"mo\":1,\"ts\":1717000000000}\n"
-        "{\"k\":\"c\",\"rn\":\"all_2_2_0\",\"me\":\"5\",\"mb\":\"11\",\"mo\":1,\"ts\":1717000000001}\n"
-        "{\"k\":\"p\",\"rn\":\"all_3_3_0\",\"me\":\"5\",\"mb\":\"12\",\"mo\":1}\n"
-        "{\"n\":3}\n"});
+        "{\"namespace\":\"srv1/db/table@cas@\",\"writer_epoch\":\"5\",\"ref_sequence\":\"200\",\"lifecycle\":\"live\"}\n"
+        "{\"kind\":\"c\",\"ref_name\":\"all_1_1_0\",\"writer_epoch\":\"5\",\"build_sequence\":\"10\",\"manifest_ordinal\":1,\"published_at_ms\":1717000000000}\n"
+        "{\"kind\":\"c\",\"ref_name\":\"all_2_2_0\",\"writer_epoch\":\"5\",\"build_sequence\":\"11\",\"manifest_ordinal\":1,\"published_at_ms\":1717000000001}\n"
+        "{\"kind\":\"p\",\"ref_name\":\"all_3_3_0\",\"writer_epoch\":\"5\",\"build_sequence\":\"12\",\"manifest_ordinal\":1}\n"
+        "{\"record_count\":3}\n"});
 }

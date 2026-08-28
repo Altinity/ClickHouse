@@ -39,23 +39,23 @@ EntryPlacement placementFromWord(std::string_view w)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: unknown placement '{}'", w);
 }
 
-/// One entry-record line: {"p","pm", then either the Blob's "ha"/"h"/"sz" or the Inline's "il"}.
+/// One entry-record line contains `path`, `placement`, and the placement-specific fields.
 void writeEntryRecord(CasJsonWriter & out, const ManifestEntry & e)
 {
     bool first = true;
-    writeKey(out, "p", first);
+    writeKey(out, "path", first);
     writeStringValue(out, e.path);
-    writeKey(out, "pm", first);
+    writeKey(out, "placement", first);
     writeStringValue(out, placementToWord(e.placement));
     if (e.placement == EntryPlacement::Blob)
     {
         writeBlobRefFields(out, first, e.ref);   /// ha + h
-        writeKey(out, "sz", first);
+        writeKey(out, "size", first);
         writeIntText(e.blob_size, out);
     }
     else
     {
-        writeKey(out, "il", first);
+        writeKey(out, "inline_length", first);
         writeIntText(e.inline_bytes.size(), out);
     }
     closeObject(out, first);
@@ -102,9 +102,9 @@ String encodePartManifest(const PartManifest & m)
     {
         bool first = true;
         writeManifestRefFields(out, first, "", m.ref);
-        writeKey(out, "ns", first);
+        writeKey(out, "namespace", first);
         writeStringValue(out, m.root_namespace_id.string());
-        writeKey(out, "pd", first);
+        writeKey(out, "payload_digest", first);
         writeHex128Value(out, m.payload_digest);
         closeObject(out, first);
         writeChar('\n', out);
@@ -152,11 +152,11 @@ PartManifest decodePartManifest(std::string_view data)
         String key;
         while (r.nextKey(key))
         {
-            if (key == "me") me = r.readU64String();
-            else if (key == "mb") mb = r.readU64String();
-            else if (key == "mo") mo = r.readU64Number();
-            else if (key == "ns") ns = r.readString();
-            else if (key == "pd") pd = r.readHex128();
+            if (key == "writer_epoch") me = r.readU64String();
+            else if (key == "build_sequence") mb = r.readU64String();
+            else if (key == "manifest_ordinal") mo = r.readU64Number();
+            else if (key == "namespace") ns = r.readString();
+            else if (key == "payload_digest") pd = r.readHex128();
             else r.skipUnknown(key);
         }
         if (!me || !mb || !mo)
@@ -185,7 +185,7 @@ PartManifest decodePartManifest(std::string_view data)
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: empty line");
 
-        if (key == "n")
+        if (key == "record_count")
         {
             const uint64_t declared_n = r.readU64Number();
             while (r.nextKey(key))
@@ -198,7 +198,7 @@ PartManifest decodePartManifest(std::string_view data)
             break;
         }
 
-        if (key != "p")
+        if (key != "path")
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"p\"");
         ManifestEntry e;
         e.path = r.readString();
@@ -224,11 +224,11 @@ PartManifest decodePartManifest(std::string_view data)
         std::optional<uint64_t> il;
         while (r.nextKey(key))
         {
-            if (key == "pm") pm = r.readString();
-            else if (key == "ha") ha = r.readString();
-            else if (key == "h") h = r.readString();
-            else if (key == "sz") sz = r.readU64Number();
-            else if (key == "il") il = r.readU64Number();
+            if (key == "placement") pm = r.readString();
+            else if (key == "hash_algorithm") ha = r.readString();
+            else if (key == "hash") h = r.readString();
+            else if (key == "size") sz = r.readU64Number();
+            else if (key == "inline_length") il = r.readU64Number();
             else r.skipUnknown(key);
         }
         if (!l.eof())

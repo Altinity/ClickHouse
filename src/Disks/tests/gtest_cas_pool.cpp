@@ -440,12 +440,12 @@ TEST(CASPoolMeta, CreateThenReopen)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
-    PoolMeta created = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 256,
+    PoolMeta created = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 512,
         BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
     EXPECT_NE(created.pool_id, UInt128{});
-    PoolMeta reopened = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 512);
+    PoolMeta reopened = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 1024);
     EXPECT_EQ(reopened.pool_id, created.pool_id);     /// pool is authoritative — config ignored on reopen
-    EXPECT_EQ(reopened.blob_header_len, 256u);
+    EXPECT_EQ(reopened.blob_header_len, 512u);
 }
 
 TEST(CASPoolMeta, FailClosed)
@@ -457,14 +457,14 @@ TEST(CASPoolMeta, FailClosed)
     auto b2 = std::make_shared<InMemoryBackend>();
     b2->putIfAbsent(layout.poolMetaKey(), "garbage");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { PoolMeta::createOrValidate(*b2, layout, 256); });
+        [&] { PoolMeta::createOrValidate(*b2, layout, 512); });
 }
 
 TEST(CASPoolMeta, RoundTripAndReadability)
 {
     PoolMeta pm;
     pm.pool_id = hexToU128("0123456789abcdeffedcba9876543210");
-    pm.blob_header_len = 256;
+    pm.blob_header_len = 512;
     pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
 
     const String encoded = encodePoolMeta(pm);
@@ -485,13 +485,13 @@ TEST(CASPoolMeta, RejectsBadConstantsAtCreation)
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
 
-    /// not 8-aligned (above the floor, so it is the alignment rule that rejects it)
+    /// not 8-aligned (above the full-key envelope floor, so it is the alignment rule that rejects it)
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
-        [&] { PoolMeta::createOrValidate(*b, layout, 250); });
-    /// below the v3 envelope floor (240) but 8-aligned: rejected by the floor, not the alignment rule.
+        [&] { PoolMeta::createOrValidate(*b, layout, 506); });
+    /// below the full-key envelope floor but 8-aligned: rejected by the floor, not the alignment rule.
     /// Without the raised floor this pool would pass creation and LOGICAL_ERROR on the first blob write.
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
-        [&] { PoolMeta::createOrValidate(*b, layout, 128); });
+        [&] { PoolMeta::createOrValidate(*b, layout, 256); });
     /// well below the floor
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
         [&] { PoolMeta::createOrValidate(*b, layout, 64); });
@@ -513,7 +513,7 @@ TEST(CASPoolMeta, RejectsBadConstantsOnDecode)
     bad_pm.blob_header_len = 100;   /// violates 8-alignment invariant
     b->putIfAbsent(layout.poolMetaKey(), encodePoolMeta(bad_pm));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { PoolMeta::createOrValidate(*b, layout, 256); });
+        [&] { PoolMeta::createOrValidate(*b, layout, 512); });
 }
 
 TEST(CASPoolMeta, DecodeGarbageFails)
@@ -534,13 +534,13 @@ TEST(CASPoolMeta, ConcurrentCreateRace)
     const UInt128 foreign = hexToU128("0123456789abcdeffedcba9876543210");
     PoolMeta foreign_pm;
     foreign_pm.pool_id = foreign;
-    foreign_pm.blob_header_len = 256;
+    foreign_pm.blob_header_len = 512;
     foreign_pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
     b->putIfAbsent(layout.poolMetaKey(), encodePoolMeta(foreign_pm));
 
-    PoolMeta result = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 512);
+    PoolMeta result = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 1024);
     EXPECT_EQ(result.pool_id, foreign);
-    EXPECT_EQ(result.blob_header_len, 256u);     /// the foreign pool's constants win
+    EXPECT_EQ(result.blob_header_len, 512u);     /// the foreign pool's constants win
 }
 
 TEST(CASPoolMeta, CasConflictReReadsWinner)
@@ -575,18 +575,18 @@ TEST(CASPoolMeta, CasConflictReReadsWinner)
     const UInt128 winner = hexToU128("0123456789abcdeffedcba9876543210");
     PoolMeta winner_pm;
     winner_pm.pool_id = winner;
-    winner_pm.blob_header_len = 256;
+    winner_pm.blob_header_len = 512;
     winner_pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
 
     auto b = std::make_shared<RacingBackend>();
     b->winner_bytes = encodePoolMeta(winner_pm);
     Layout layout("p");
 
-    /// Our config (512) is what we WOULD have minted, but we lose the race and inherit the winner.
-    PoolMeta result = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 512,
+    /// Our config (1024) is what we WOULD have minted, but we lose the race and inherit the winner.
+    PoolMeta result = PoolMeta::createOrValidate(*b, layout, /*blob_header_len*/ 1024,
         BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
     EXPECT_EQ(result.pool_id, winner);
-    EXPECT_EQ(result.blob_header_len, 256u);
+    EXPECT_EQ(result.blob_header_len, 512u);
 }
 
 TEST(CASPool, OpenFailsClosedOnNonEnforcingBackend)

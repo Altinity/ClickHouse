@@ -10,7 +10,7 @@
 /// `gtest_cas_ref_codecs.cpp` and re-pointed at the TEXT codec: the encoder-side validation tests are
 /// format-agnostic (they only assert `encodeRefLogTxn` throws) and carry over verbatim; the old
 /// binary-offset byte-patch decode tests (`bytes[k] = 99`) are gone — the shape-level corruption
-/// classes (truncation, `v`+1 forward-gate, wrong type, leading garbage) are now covered by the
+/// classes (truncation, `version`+1 forward-gate, wrong type, leading garbage) are now covered by the
 /// `CASFormatBattery.RefLog` row below. `RefTxnId` render/parse coverage lives here too (it rode in
 /// the same suite and is independent of either ref codec).
 
@@ -205,10 +205,10 @@ TEST(CASRefCodec, DecodeRejectsRemovedPayloadFieldInOpRecord)
 
     const String bytes = encodeRefLogTxn(txn);
     /// Splice the retired `"pl"` field back into the op record, just before its `"ts"` field.
-    const String needle = ",\"ts\":";
+    const String needle = ",\"published_at_ms\":";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
-    const String tampered = bytes.substr(0, pos) + R"(,"pl":"deadbeef")" + bytes.substr(pos);
+    const String tampered = bytes.substr(0, pos) + R"(,"payload":"deadbeef")" + bytes.substr(pos);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -784,7 +784,7 @@ TEST(CASFormatBattery, RefLog)
         [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
         currentFormatHeader("cas_ref_log") +
-        "{\"ns\":\"ns\",\"we\":\"1\",\"rs\":\"1\"}\n"
-        "{\"op\":\"set_published_at\",\"rn\":\"all_1_1_0\",\"me\":\"1\",\"mb\":\"1\",\"mo\":1,\"ts\":42}\n"
-        "{\"n\":1}\n"});
+        "{\"namespace\":\"ns\",\"writer_epoch\":\"1\",\"ref_sequence\":\"1\"}\n"
+        "{\"operation\":\"set_published_at\",\"ref_name\":\"all_1_1_0\",\"writer_epoch\":\"1\",\"build_sequence\":\"1\",\"manifest_ordinal\":1,\"published_at_ms\":42}\n"
+        "{\"record_count\":1}\n"});
 }

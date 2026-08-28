@@ -107,7 +107,7 @@ void writeRunHeaderLine(WriteBuffer & out, std::string_view kind)
     bool first = true;
     writeKey(line, "type", first);
     writeStringValue(line, t.type);
-    writeKey(line, "v", first);
+    writeKey(line, "version", first);
     writeIntText(currentCompatibilityVersion(), line);
     writeKey(line, "kind", first);
     writeStringValue(line, kind);
@@ -131,7 +131,7 @@ void expectRunHeaderLine(ReadBuffer & in, std::string_view expected_kind)
     if (type != t.type)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: object is a '{}', not a '{}'", type, t.type);
 
-    if (!r.nextKey(key) || key != "v")
+    if (!r.nextKey(key) || key != "version")
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: header line must carry \"v\" second");
     const uint32_t v = r.readU32Number();
     checkCompatibility(v, t.type);
@@ -174,22 +174,22 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
 
     scratch.clear();
     bool first = true;
-    writeKey(scratch, "b", first);
+    writeKey(scratch, "blob_ref", first);
     writeStringValue(scratch, renderB(rec.ref));
-    writeKey(scratch, "s", first);
+    writeKey(scratch, "source_id", first);
     writeHex128Value(scratch, rec.source_id);
-    writeKey(scratch, "m", first);
+    writeKey(scratch, "marker", first);
     writeStringValue(scratch, markerToWord(rec.marker));
     if (rec.marker == kCondemned)
     {
-        writeKey(scratch, "pend", first);
+        writeKey(scratch, "delete_pending", first);
         writeBoolValue(scratch, rec.delete_pending);
         writeTokenFields(scratch, first, rec.token);   /// tt + tv
-        writeKey(scratch, "sz", first);
+        writeKey(scratch, "size", first);
         writeIntText(rec.size, scratch);
-        writeKey(scratch, "cr", first);
+        writeKey(scratch, "condemn_round", first);
         writeU64StringValue(scratch, rec.condemn_round);
-        writeKey(scratch, "mc", first);
+        writeKey(scratch, "marker_confirmed", first);
         writeBoolValue(scratch, rec.marker_confirmed);
     }
     closeObject(scratch, first);
@@ -243,7 +243,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     if (!r.nextKey(key))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: empty line");
 
-    if (key == "n")
+    if (key == "record_count")
     {
         const uint64_t n = r.readU64Number();
         if (r.nextKey(key))
@@ -276,15 +276,15 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     TokenType tt{};
     do
     {
-        if (key == "b") { b = r.readString(); have_b = true; }
-        else if (key == "s") { out.source_id = r.readHex128(); have_s = true; }
-        else if (key == "m") { out.marker = markerFromWord(r.readString()); have_m = true; }
-        else if (key == "pend") { out.delete_pending = r.readBool(); have_pend = true; }
-        else if (key == "tt") { tt = tokenTypeFromWord(r.readString(), "cas_run"); have_tt = true; }
-        else if (key == "tv") { tv = r.readString(); have_tv = true; }
-        else if (key == "sz") { out.size = r.readU64Number(); have_sz = true; }
-        else if (key == "cr") { out.condemn_round = r.readU64String(); have_cr = true; }
-        else if (key == "mc") { out.marker_confirmed = r.readBool(); have_mc = true; }
+        if (key == "blob_ref") { b = r.readString(); have_b = true; }
+        else if (key == "source_id") { out.source_id = r.readHex128(); have_s = true; }
+        else if (key == "marker") { out.marker = markerFromWord(r.readString()); have_m = true; }
+        else if (key == "delete_pending") { out.delete_pending = r.readBool(); have_pend = true; }
+        else if (key == "token_type") { tt = tokenTypeFromWord(r.readString(), "cas_run"); have_tt = true; }
+        else if (key == "token_value") { tv = r.readString(); have_tv = true; }
+        else if (key == "size") { out.size = r.readU64Number(); have_sz = true; }
+        else if (key == "condemn_round") { out.condemn_round = r.readU64String(); have_cr = true; }
+        else if (key == "marker_confirmed") { out.marker_confirmed = r.readBool(); have_mc = true; }
         else r.skipUnknown(key);   /// Strict => any unknown key is CORRUPTED_DATA
     } while (r.nextKey(key));
 

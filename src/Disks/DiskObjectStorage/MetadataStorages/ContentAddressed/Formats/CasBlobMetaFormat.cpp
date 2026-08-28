@@ -46,11 +46,11 @@ String encodeBlobMeta(const BlobMeta & meta)
     // `version` is represented by the header line. The JSON body contains only fields that describe
     // the current marker and its accounting data.
     bool first = true;
-    writeKey(out, "st", first);
+    writeKey(out, "state", first);
     writeStringValue(out, metaStateToWord(meta.state));
-    writeKey(out, "cr", first);
+    writeKey(out, "condemn_round", first);
     writeU64StringValue(out, meta.condemn_round);
-    writeKey(out, "sz", first);
+    writeKey(out, "size", first);
     writeU64StringValue(out, meta.size);
     closeObject(out, first);
     writeChar('\n', out);
@@ -72,14 +72,14 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "st")
+        if (key == "state")
         {
             m.state = metaStateFromWord(r.readString());
             saw_state = true;
         }
-        else if (key == "cr")
+        else if (key == "condemn_round")
             m.condemn_round = r.readU64String();
-        else if (key == "sz")
+        else if (key == "size")
             m.size = r.readU64String();
         else
             r.skipUnknown(key);

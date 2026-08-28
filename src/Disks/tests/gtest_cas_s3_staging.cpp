@@ -691,7 +691,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     const std::string staging_key = "p/staging/mount1/ccc.tmp";
 
     /// The staging object holds `[header][payload]` (as `writeFile` now emits it). The staging header is
-    /// a fixed 256-byte CABL envelope with its OWN incarnation_tag.
+    /// a fixed 512-byte CABL envelope with its OWN `incarnation_tag`.
     DB::Cas::EnvelopeHeader staging_h;
     staging_h.kind = DB::Cas::ObjectKind::Blob;
     staging_h.incarnation_tag = DB::UInt128(0xC0FFEE);   /// the create-time tag

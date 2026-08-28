@@ -62,7 +62,7 @@ Each row (`CatalogEntry`) carries:
 
 | Field | Meaning |
 |---|---|
-| `ns` | The namespace name |
+| `namespace` | The namespace name |
 | `state` | `Creating`, `Live`, or `Removing` — see below |
 | `incarnation` | The `life_id` for this row, nonzero, never reused |
 | `creator` | The mounted writer's fence identity (server root, writer epoch, admission fence generation) that is creating this row — **required** iff `state == Creating`, **forbidden** otherwise |

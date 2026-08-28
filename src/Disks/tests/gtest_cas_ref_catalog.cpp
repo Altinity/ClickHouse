@@ -62,9 +62,9 @@ String rawEntLine(const String & ns, const String & state, const String & inc_he
                    std::optional<std::tuple<String, uint64_t, uint64_t>> creator = std::nullopt)
 {
     if (!creator)
-        return fmt::format(R"({{"k":"ent","ns":"{}","st":"{}","inc":"{}"}})", ns, state, inc_hex);
+        return fmt::format(R"({{"kind":"ent","namespace":"{}","state":"{}","incarnation":"{}"}})", ns, state, inc_hex);
     const auto & [srid, we, fg] = *creator;
-    return fmt::format(R"({{"k":"ent","ns":"{}","st":"{}","inc":"{}","csr":"{}","cwe":"{}","cfg":"{}"}})",
+    return fmt::format(R"({{"kind":"ent","namespace":"{}","state":"{}","incarnation":"{}","creator_server_root_id":"{}","creator_writer_epoch":"{}","creator_fence_generation":"{}"}})",
                         ns, state, inc_hex, srid, we, fg);
 }
 
@@ -73,10 +73,10 @@ String rawEntLine(const String & ns, const String & state, const String & inc_he
 /// `gtest_cas_fold_seal_format.cpp`'s `RejectsOutOfRangeNsCleanupState` uses for the same reason.
 String rawCatalog(const std::vector<String> & ent_lines)
 {
-    String out = R"({"type":"cas_ref_catalog","v":1})" "\n";
+    String out = R"({"type":"cas_ref_catalog","version":1})" "\n";
     for (const String & l : ent_lines)
         out += l + "\n";
-    out += fmt::format("{{\"n\":{}}}\n", ent_lines.size());
+    out += fmt::format("{{\"record_count\":{}}}\n", ent_lines.size());
     return out;
 }
 
@@ -84,7 +84,7 @@ String withRemovalStartedRound(String line, uint64_t round)
 {
     const size_t close = line.rfind('}');
     EXPECT_NE(close, String::npos);
-    line.insert(close, fmt::format(R"(,"rsr":"{}")", round));
+    line.insert(close, fmt::format(R"(,"removal_started_round":"{}")", round));
     return line;
 }
 
@@ -221,10 +221,10 @@ TEST(CASFormatBattery, RefCatalog)
         [&] { return sealObject(FormatId::RefCatalog, encodeRefCatalog(c)); },
         [](std::string_view s) { decodeRefCatalog(std::string(openObject(FormatId::RefCatalog, s))); },
         currentFormatHeader("cas_ref_catalog") +
-        "{\"k\":\"ent\",\"ns\":\"a\",\"st\":\"creating\",\"inc\":\"00000000000000000000000000000001\","
-        "\"csr\":\"srv1\",\"cwe\":\"5\",\"cfg\":\"2\"}\n"
-        "{\"k\":\"ent\",\"ns\":\"b\",\"st\":\"live\",\"inc\":\"00000000000000000000000000000002\"}\n"
-        "{\"n\":2}\n"});
+        "{\"kind\":\"ent\",\"namespace\":\"a\",\"state\":\"creating\",\"incarnation\":\"00000000000000000000000000000001\","
+        "\"creator_server_root_id\":\"srv1\",\"creator_writer_epoch\":\"5\",\"creator_fence_generation\":\"2\"}\n"
+        "{\"kind\":\"ent\",\"namespace\":\"b\",\"state\":\"live\",\"incarnation\":\"00000000000000000000000000000002\"}\n"
+        "{\"record_count\":2}\n"});
 }
 
 /// ---------- codec round-trip ----------
@@ -260,7 +260,7 @@ TEST(CASRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
         .removal_started_round = 19};
     const RefCatalog catalog{.entries = {removing}};
     const String encoded = encodeRefCatalog(catalog);
-    EXPECT_NE(encoded.find("\"rsr\":\"19\""), String::npos);
+    EXPECT_NE(encoded.find("\"removal_started_round\":\"19\""), String::npos);
     EXPECT_EQ(decodeRefCatalog(encoded), catalog);
 
     const String inc = "00000000000000000000000000000009";
@@ -546,7 +546,7 @@ TEST(CASRefCatalogFormat, DecodeRejectsEmptyNamespace)
 TEST(CASRefCatalogFormat, DecodeRejectsMissingNamespaceKey)
 {
     /// No "ns" key at all -- must be refused exactly like an explicit empty one, not read as "".
-    const String bad = rawCatalog({R"({"k":"ent","st":"live","inc":")" + u128ToHex(UInt128(1)) + "\"}"});
+    const String bad = rawCatalog({R"({"kind":"ent","state":"live","incarnation":")" + u128ToHex(UInt128(1)) + "\"}"});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 

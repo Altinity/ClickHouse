@@ -1132,9 +1132,9 @@ TEST(CASGCFrontierGate, AMalformedCatalogNeverDecodesIntoAnEmptyProof)
 
     const String type_needle = fmt::format("\"type\":\"{}\"", traitsFor(FormatId::RefCatalog).type);
     ASSERT_NE(empty_base.find(type_needle), String::npos);
-    const String version_needle = fmt::format("\"v\":{}", currentCompatibilityVersion());
+    const String version_needle = fmt::format("\"version\":{}", currentCompatibilityVersion());
     ASSERT_NE(empty_base.find(version_needle), String::npos);
-    ASSERT_NE(base.find("\"n\":1"), String::npos);
+    ASSERT_NE(base.find("\"record_count\":1"), String::npos);
 
     const auto replaceOnce = [](const String & haystack, const String & needle, const String & replacement) -> String
     {
@@ -1150,10 +1150,10 @@ TEST(CASGCFrontierGate, AMalformedCatalogNeverDecodesIntoAnEmptyProof)
         {"wrong-type", replaceOnce(empty_base, type_needle, "\"type\":\"cas_ref_ckpt\"")},
         /// The one version case the CURRENT (unmodified) gate actually enforces: a version ABOVE
         /// `G_BUILD` is refused by `checkCompatibility` before decode proceeds.
-        {"future-version", replaceOnce(empty_base, version_needle, "\"v\":999999")},
-        {"trailer-count-mismatch", replaceOnce(base, "\"n\":1", "\"n\":2")},
+        {"future-version", replaceOnce(empty_base, version_needle, "\"version\":999999")},
+        {"trailer-count-mismatch", replaceOnce(base, "\"record_count\":1", "\"record_count\":2")},
         /// The trailer line entirely gone: decode's post-entry loop expects another line and hits EOF.
-        {"missing-trailer", base.substr(0, base.rfind("{\"n\":1}\n"))},
+        {"missing-trailer", base.substr(0, base.rfind("{\"record_count\":1}\n"))},
         /// The trailer present but its own line has no terminator: EOF strictly inside a line.
         {"truncated-mid-line", base.substr(0, base.size() - 2)},
     };

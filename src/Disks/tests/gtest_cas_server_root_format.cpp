@@ -16,7 +16,7 @@ TEST(CASFormatBattery, Owner)
     OwnerObject o;
     o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
     const String golden = currentFormatHeader("cas_owner") +
-        "{\"su\":\"0123456789abcdeffedcba9876543210\"}\n";
+        "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\"}\n";
     EXPECT_EQ(encodeOwner(o), golden);
     EXPECT_FALSE(decodeOwner(golden).retired_at_ms.has_value());
     runFormatBattery({FormatId::Owner,
@@ -43,7 +43,7 @@ TEST(CASFormatBattery, ServerEpoch)
     runFormatBattery({FormatId::ServerEpoch,
         [&] { return sealObject(FormatId::ServerEpoch, encodeServerEpoch(e)); },
         [](std::string_view s) { decodeServerEpoch(std::string(openObject(FormatId::ServerEpoch, s))); },
-        currentFormatHeader("cas_epoch") + "{\"nwe\":\"7\"}\n"});
+        currentFormatHeader("cas_epoch") + "{\"next_writer_epoch\":\"7\"}\n"});
 }
 
 TEST(CASFormatBattery, MountLease)
@@ -55,8 +55,8 @@ TEST(CASFormatBattery, MountLease)
         [&] { return sealObject(FormatId::MountLease, encodeMountLease(m)); },
         [](std::string_view s) { decodeMountLease(std::string(openObject(FormatId::MountLease, s))); },
         currentFormatHeader("cas_mount_lease") +
-        "{\"su\":\"0123456789abcdeffedcba9876543210\",\"we\":\"7\",\"hn\":\"host-1\",\"pid\":4242,"
-        "\"sat\":1752537600000,\"seq\":\"5\",\"eat\":1752537630000,\"ma\":\"9\",\"fen\":false,"
+        "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\",\"writer_epoch\":\"7\",\"hostname\":\"host-1\",\"process_id\":4242,"
+        "\"started_at_ms\":1752537600000,\"sequence\":\"5\",\"expires_at_ms\":1752537630000,\"min_active\":\"9\",\"gc_fenced\":false,"
         "\"write_attempt_id\":\"00112233445566778899aabbccddeeff\"}\n"});
 }
 
@@ -85,8 +85,8 @@ TEST(CASMountLeaseFormat, WriteAttemptIdIsRequiredAndCanonical)
     EXPECT_EQ(decodeMountLease(encoded).write_attempt_id, m.write_attempt_id);
 
     const String without_attempt_id = currentFormatHeader("cas_mount_lease") +
-        "{\"su\":\"0123456789abcdeffedcba9876543210\",\"we\":\"7\",\"hn\":\"\",\"pid\":0,"
-        "\"sat\":0,\"seq\":\"0\",\"eat\":0,\"ma\":\"0\",\"fen\":false}\n";
+        "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\",\"writer_epoch\":\"7\",\"hostname\":\"\",\"process_id\":0,"
+        "\"started_at_ms\":0,\"sequence\":\"0\",\"expires_at_ms\":0,\"min_active\":\"0\",\"gc_fenced\":false}\n";
     try
     {
         decodeMountLease(without_attempt_id);
@@ -101,8 +101,8 @@ TEST(CASMountLeaseFormat, WriteAttemptIdIsRequiredAndCanonical)
 TEST(CASMountLeaseFormat, ZeroWriteAttemptIdIsRejected)
 {
     const String data = currentFormatHeader("cas_mount_lease") +
-        "{\"su\":\"0123456789abcdeffedcba9876543210\",\"we\":\"7\",\"hn\":\"\",\"pid\":0,"
-        "\"sat\":0,\"seq\":\"0\",\"eat\":0,\"ma\":\"0\",\"fen\":false,"
+        "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\",\"writer_epoch\":\"7\",\"hostname\":\"\",\"process_id\":0,"
+        "\"started_at_ms\":0,\"sequence\":\"0\",\"expires_at_ms\":0,\"min_active\":\"0\",\"gc_fenced\":false,"
         "\"write_attempt_id\":\"00000000000000000000000000000000\"}\n";
     try
     {
@@ -130,9 +130,9 @@ TEST(CASMountLeaseFormat, UnknownFieldsRemainTolerated)
 
 TEST(CASMountLeaseFormat, RejectsMissingIdentityFields)
 {
-    const String header = "{\"type\":\"cas_mount_lease\",\"v\":3}\n";
-    const String fields = "\"hn\":\"host-1\",\"pid\":4242,\"sat\":1752537600000,"
-                          "\"seq\":\"5\",\"eat\":1752537630000,\"ma\":\"9\",\"fen\":false}";
+    const String header = "{\"type\":\"cas_mount_lease\",\"version\":3}\n";
+    const String fields = "\"hostname\":\"host-1\",\"process_id\":4242,\"started_at_ms\":1752537600000,"
+                          "\"sequence\":\"5\",\"expires_at_ms\":1752537630000,\"min_active\":\"9\",\"gc_fenced\":false}";
 
     const auto expectCorrupted = [](const String & data)
     {
@@ -147,6 +147,6 @@ TEST(CASMountLeaseFormat, RejectsMissingIdentityFields)
         }
     };
 
-    expectCorrupted(header + R"({"we":"7",)" + fields + "\n");
-    expectCorrupted(header + R"({"su":"0123456789abcdeffedcba9876543210",)" + fields + "\n");
+    expectCorrupted(header + R"({"writer_epoch":"7",)" + fields + "\n");
+    expectCorrupted(header + R"({"server_uuid":"0123456789abcdeffedcba9876543210",)" + fields + "\n");
 }

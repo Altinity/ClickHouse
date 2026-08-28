@@ -553,11 +553,11 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
         .ops = publishCommittedOps("phantom", phantom),
         .prev_epoch_seal = RefTxnId{6, 1}};
     String malformed_later_link = encodeRefLogTxn(direct_later_link);
-    const String encoded_predecessor{R"("!pse":"6")"};
+    const String encoded_predecessor{R"("!previous_seal_writer_epoch":"6")"};
     const size_t predecessor_pos = malformed_later_link.find(encoded_predecessor);
     ASSERT_NE(predecessor_pos, String::npos);
     malformed_later_link.replace(
-        predecessor_pos, encoded_predecessor.size(), R"("!pse":"2")");
+        predecessor_pos, encoded_predecessor.size(), R"("!previous_seal_writer_epoch":"2")");
     ASSERT_EQ(backend->putIfAbsent(
         store->layout().refLogKey(life, RefTxnId{7, 1}), sealObject(FormatId::RefLog, malformed_later_link)).outcome,
         PutOutcome::Done);

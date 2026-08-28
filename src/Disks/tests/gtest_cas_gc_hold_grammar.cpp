@@ -268,7 +268,7 @@ String sealTextWith(const String & prototype, const std::vector<String> & record
     String text = headerAndMetaOf(prototype);
     for (const String & record : records)
         text += record + "\n";
-    return text + "{\"n\":" + std::to_string(records.size()) + "}\n";
+    return text + "{\"record_count\":" + std::to_string(records.size()) + "}\n";
 }
 
 /// Replace the coverage row's `cls` value with `raw`, VERBATIM. The point is to write integers no
@@ -277,9 +277,9 @@ String sealTextWith(const String & prototype, const std::vector<String> & record
 /// the value always ends at a comma.
 String withRawClassification(const String & encoded, std::string_view raw)
 {
-    const size_t at = encoded.find("\"cls\":");
+    const size_t at = encoded.find("\"classification\":");
     EXPECT_NE(at, String::npos);
-    const size_t begin = at + strlen("\"cls\":");
+    const size_t begin = at + strlen("\"classification\":");
     const size_t end = encoded.find(',', begin);
     EXPECT_NE(end, String::npos);
     return encoded.substr(0, begin) + String{raw} + encoded.substr(end);
@@ -437,7 +437,7 @@ TEST(CASGCHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedByTheDecoder)
                        .retry_count = 0, .next_retry_round = 1};
     fixtureCoverage(seal, "ns/0") = cov;
     String text = encodeFoldSeal(seal);
-    const size_t at = text.find("\"cls\":4");
+    const size_t at = text.find("\"classification\":4");
     ASSERT_NE(at, String::npos);
     text[at + 6] = '2';
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(text); });
@@ -456,8 +456,8 @@ TEST(CASGCHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
                        .retry_count = 3, .next_retry_round = 4};
     fixtureCoverage(seal, "ns/0") = cov;
     const String whole = encodeFoldSeal(seal);
-    for (const String & field : {String(R"("hr":"body_undecodable")"), String(R"("hpe":"1")"),
-                                 String(R"("hps":"2")"), String(R"("hrc":3)"), String(R"("hnr":"4")")})
+    for (const String & field : {String(R"("hold_reason":"body_undecodable")"), String(R"("hold_position_writer_epoch":"1")"),
+                                 String(R"("hold_position_ref_sequence":"2")"), String(R"("hold_retry_count":3)"), String(R"("hold_next_retry_round":"4")")})
     {
         SCOPED_TRACE("without " + field);
         const size_t at = whole.find(field);
@@ -479,12 +479,12 @@ TEST(CASGCHoldGrammar, DuplicateHoldKeyIsCorruptedData)
     fixtureCoverage(seal, "ns/0") = cov;
 
     const String whole = encodeFoldSeal(seal);
-    const String field = R"("hr":"gap_below_witness")";
+    const String field = R"("hold_reason":"gap_below_witness")";
     const size_t at = whole.find(field);
     ASSERT_NE(at, String::npos);
     /// The same key twice, with a DIFFERENT value: last-wins would silently rewrite the reason.
     String doubled = whole;
-    doubled.insert(at, R"("hr":"witness_disappeared",)");
+    doubled.insert(at, R"("hold_reason":"witness_disappeared",)");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(doubled); });
 }
 
@@ -548,10 +548,10 @@ TEST(CASGCHoldGrammar, AClassificationOutsideTheGrammarIsCorruptedData)
 TEST(CASGCHoldGrammar, ACoverageRowWithoutAClassificationIsCorruptedData)
 {
     const String clean = encodeFoldSeal(cleanSeal("ns/0"));
-    const size_t at = clean.find("\"cls\":2,");
+    const size_t at = clean.find("\"classification\":2,");
     ASSERT_NE(at, String::npos);
     String without = clean;
-    without.erase(at, strlen("\"cls\":2,"));
+    without.erase(at, strlen("\"classification\":2,"));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(without); });
 }
 
@@ -567,13 +567,13 @@ TEST(CASGCHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedDa
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        decodeFoldSeal(withField(withField(held, R"("hpe":"4")", R"("hpe":"0")"),
-                                 R"("hps":"6")", R"("hps":"0")"));
+        decodeFoldSeal(withField(withField(held, R"("hold_position_writer_epoch":"4")", R"("hold_position_writer_epoch":"0")"),
+                                 R"("hold_position_ref_sequence":"6")", R"("hold_position_ref_sequence":"0")"));
     });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(held, R"("hpe":"4")", R"("hpe":"0")")); });
+                     [&] { decodeFoldSeal(withField(held, R"("hold_position_writer_epoch":"4")", R"("hold_position_writer_epoch":"0")")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(held, R"("hps":"6")", R"("hps":"0")")); });
+                     [&] { decodeFoldSeal(withField(held, R"("hold_position_ref_sequence":"6")", R"("hold_position_ref_sequence":"0")")); });
 }
 
 /// (3) The duplicate row. Two `cov` records for the same (namespace, shard) — held first, clean second —
@@ -647,12 +647,12 @@ TEST(CASGCHoldGrammar, CleanupEvidenceWithAZeroRemovalIdIsCorruptedData)
     const String encoded = encodeFoldSeal(seal);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rte":"2")", R"("rte":"0")")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_txn_writer_epoch":"2")", R"("remove_txn_writer_epoch":"0")")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rts":"3")", R"("rts":"0")")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_txn_ref_sequence":"3")", R"("remove_txn_ref_sequence":"0")")); });
     /// Omitted entirely is the same thing: the fields default to zero.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rte":"2",)", "")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_txn_writer_epoch":"2",)", "")); });
 }
 
 /// The OBJECT cap bounds the whole seal. Nothing on the fold-seal READ path enforces it (the seal
@@ -1398,7 +1398,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWithAnUndecodablePriorSeal)
 
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":4}\nthis is not a seal body\n",
+    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"version\":4}\nthis is not a seal body\n",
                           backend->head(seal_key).token);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.rebuildBaseline(/*force=*/true); });
@@ -1470,7 +1470,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsL
 
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":4}\nthis is not a seal body\n",
+    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"version\":4}\nthis is not a seal body\n",
                           backend->head(seal_key).token);
     const HeadResult sh = backend->head(layout.gcStateKey());
     ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);

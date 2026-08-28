@@ -13,7 +13,7 @@ namespace DB::Cas
 {
 
 /// Shared container mechanics for versioned content-addressed text objects: a header line
-/// {"type":"cas_<x>","v":N}, a body, an optional trailer line, and, for formats whose registry
+/// {"type":"cas_<x>","version":N}, a body, an optional trailer line, and, for formats whose registry
 /// policy requires it, one zstd frame around the whole object. This is the only code that knows
 /// that container shape; per-object codecs add only key mappings and object-specific invariants.
 ///
@@ -59,7 +59,7 @@ public:
         append("\":");
     }
 
-    /// Same, for the prefixed key vocabulary ("o"/"n" + "me"/"mb"/"mo"/"bk"/"rn") — the
+    /// Same, for prefixed keys such as `old_writer_epoch` and `new_binding_kind` — the
     /// prefix and name are appended back to back, no composed temporary.
     void key(std::string_view prefix, std::string_view name, bool & first)
     {

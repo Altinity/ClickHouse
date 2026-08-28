@@ -14,7 +14,7 @@ namespace DB::Cas
 /// Text codec for `cas_ref_snap`, the complete per-namespace ref table snapshot at
 /// `_snap/<snapshot_id>`. The object is read whole rather than streamed and belongs to the Control
 /// family: callers store the encoded text as an Always/`.zst` object. Its canonical text consists of
-/// a header, a metadata line, committed and precommit row lines, and a `{"n":count}` trailer.
+/// a header, a metadata line, committed and precommit row lines, and a `{"record_count":count}` trailer.
 ///
 /// There is no such thing as a "seal snapshot". An epoch is closed IN-BAND, by an `EpochSeal`
 /// transaction the recovery CAS-walk places at `{E, T+1}` in the `_log` stream (INV-2) -- the exact key

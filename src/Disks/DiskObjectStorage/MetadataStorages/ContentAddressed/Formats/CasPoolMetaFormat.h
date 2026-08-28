@@ -15,7 +15,8 @@ class Layout;
 
 /// `_pool_meta` — the pool identity and the pool-wide constants that every reader and writer must
 /// agree on. The v3 text representation is a header line followed by one JSON body object:
-/// {"pid":"<32hex>","hln":<blob_header_len>,"mrg":<min_reader_generation>,"alg":"<algo-words>"}.
+/// {"pool_id":"<32hex>","blob_header_len":<blob_header_len>,"min_reader_generation":<generation>,
+///  "algorithms_used":"<algo-words>"}.
 ///
 /// The persisted object is authoritative after creation. On reopen, `createOrValidate` uses its
 /// `blob_header_len` and reader-generation floor rather than replacing them with local configuration;

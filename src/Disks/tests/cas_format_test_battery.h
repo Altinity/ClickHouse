@@ -33,7 +33,7 @@ struct FormatBatteryCase
 /// self-derived expectation.
 inline String currentFormatHeader(std::string_view type)
 {
-    return fmt::format("{{\"type\":\"{}\",\"v\":{}}}\n", type, DB::Cas::currentCompatibilityVersion());
+    return fmt::format("{{\"type\":\"{}\",\"version\":{}}}\n", type, DB::Cas::currentCompatibilityVersion());
 }
 
 namespace cas_battery_detail
@@ -85,8 +85,8 @@ inline void runFormatBattery(const FormatBatteryCase & c)
             [&] { c.decode(text.substr(0, i)); }, fmt::format("{}: cut inside header at {}", t.type, i));
 
     /// v+1 gate.
-    const String v_now = fmt::format("\"v\":{}", currentCompatibilityVersion());
-    const String v_next = fmt::format("\"v\":{}", currentCompatibilityVersion() + 1);
+    const String v_now = fmt::format("\"version\":{}", currentCompatibilityVersion());
+    const String v_next = fmt::format("\"version\":{}", currentCompatibilityVersion() + 1);
     String future;
     if (c.make_future_version)
         future = c.make_future_version(text);

@@ -189,7 +189,7 @@ TEST(CASTextHeader, WriteExpectSniffGate)
     CasJsonWriter out;
     writeHeaderLine(out, FormatId::PoolMeta);
     const String rendered = std::move(out).take();
-    EXPECT_EQ(rendered, fmt::format("{{\"type\":\"cas_pool_meta\",\"v\":{}}}\n", currentCompatibilityVersion()));
+    EXPECT_EQ(rendered, fmt::format("{{\"type\":\"cas_pool_meta\",\"version\":{}}}\n", currentCompatibilityVersion()));
 
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     const TextHeader h = expectHeaderLine(in, FormatId::PoolMeta);
@@ -205,14 +205,14 @@ TEST(CASTextHeader, WriteExpectSniffGate)
     /// wrong type -> CORRUPTED_DATA; future v -> UNKNOWN_FORMAT_VERSION
     /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
     /// the header gate, which is the point — the BODY is what has to fail here.
-    const String wrong = "{\"type\":\"cas_owner\",\"v\":3}\n";
+    const String wrong = "{\"type\":\"cas_owner\",\"version\":3}\n";
     DB::ReadBufferFromMemory in2(wrong.data(), wrong.size());
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { expectHeaderLine(in2, FormatId::PoolMeta); });
-    const String future = fmt::format("{{\"type\":\"cas_pool_meta\",\"v\":{}}}\n", currentCompatibilityVersion() + 1);
+    const String future = fmt::format("{{\"type\":\"cas_pool_meta\",\"version\":{}}}\n", currentCompatibilityVersion() + 1);
     DB::ReadBufferFromMemory in3(future.data(), future.size());
     expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { expectHeaderLine(in3, FormatId::PoolMeta); });
 
-    const String out_of_range = "{\"type\":\"cas_pool_meta\",\"v\":4294967299}\n";
+    const String out_of_range = "{\"type\":\"cas_pool_meta\",\"version\":4294967299}\n";
     DB::ReadBufferFromMemory in4(out_of_range.data(), out_of_range.size());
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { expectHeaderLine(in4, FormatId::PoolMeta); });
 }
@@ -221,7 +221,7 @@ TEST(CASTextLines, ReadLineAndTrailer)
 {
     CasJsonWriter out;
     writeTrailerLine(out, 42);
-    EXPECT_EQ(std::move(out).take(), "{\"n\":42}\n");
+    EXPECT_EQ(std::move(out).take(), "{\"record_count\":42}\n");
 
     const String two = "abc\ndef\n";
     DB::ReadBufferFromMemory in(two.data(), two.size());
@@ -247,13 +247,13 @@ TEST(CASZstdArm, SealOpenPolicyAndCaps)
     /// `changePoints` at decode time yet -- the gate is `v > G_BUILD` alone. Once a per-class floor is
     /// wired in, this literal must move to `G_BUILD`; the test's subject is the truncated BODY, not the
     /// version.
-    const String small = "{\"type\":\"cas_ref_snap\",\"v\":3}\n{}\n";
+    const String small = "{\"type\":\"cas_ref_snap\",\"version\":3}\n{}\n";
     const String sealed_small = sealObject(FormatId::RefSnapshot, small);
     ASSERT_TRUE(looksZstd(sealed_small));
     EXPECT_EQ(openObject(FormatId::RefSnapshot, sealed_small), small);
     EXPECT_EQ(openObject(FormatId::RefSnapshot, small), small);
 
-    String big = "{\"type\":\"cas_ref_snap\",\"v\":3}\n{\"pad\":\"";
+    String big = "{\"type\":\"cas_ref_snap\",\"version\":3}\n{\"pad\":\"";
     big += String(8192, 'a');
     big += "\"}\n";
     const String sealed = sealObject(FormatId::RefSnapshot, big);

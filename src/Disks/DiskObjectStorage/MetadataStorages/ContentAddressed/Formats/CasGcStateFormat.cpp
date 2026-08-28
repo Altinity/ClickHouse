@@ -23,14 +23,14 @@ String encodeGcState(const GcState & state)
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::GcState);
     bool first = true;
-    writeKey(out, "rnd", first); writeU64StringValue(out, state.round);
-    writeKey(out, "gcs", first); writeIntText(state.gc_shards, out);
-    writeKey(out, "sg", first);  writeU64StringValue(out, state.snap_generation);
-    writeKey(out, "spt", first); writeU64StringValue(out, state.snap_pruned_through);
-    writeKey(out, "sa", first);  writeU64StringValue(out, state.snap_attempt);
-    writeKey(out, "msc", first); writeStringValue(out, state.manifest_sweep_cursor);
-    writeKey(out, "lo", first);  writeHex128Value(out, state.lease.owner);
-    writeKey(out, "ls", first);  writeU64StringValue(out, state.lease.seq);
+    writeKey(out, "round", first);                   writeU64StringValue(out, state.round);
+    writeKey(out, "gc_shards", first);               writeIntText(state.gc_shards, out);
+    writeKey(out, "snapshot_generation", first);     writeU64StringValue(out, state.snap_generation);
+    writeKey(out, "snapshot_pruned_through", first); writeU64StringValue(out, state.snap_pruned_through);
+    writeKey(out, "snapshot_attempt", first);        writeU64StringValue(out, state.snap_attempt);
+    writeKey(out, "manifest_sweep_cursor", first);   writeStringValue(out, state.manifest_sweep_cursor);
+    writeKey(out, "lease_owner", first);             writeHex128Value(out, state.lease.owner);
+    writeKey(out, "lease_sequence", first);          writeU64StringValue(out, state.lease.seq);
     closeObject(out, first);
     writeChar('\n', out);
     return std::move(out).take();
@@ -49,14 +49,14 @@ GcState decodeGcState(std::string_view data)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "rnd") state.round = r.readU64String();
-        else if (key == "gcs") { state.gc_shards = r.readU64Number(); saw_gcs = true; }
-        else if (key == "sg") state.snap_generation = r.readU64String();
-        else if (key == "spt") state.snap_pruned_through = r.readU64String();
-        else if (key == "sa") state.snap_attempt = r.readU64String();
-        else if (key == "msc") state.manifest_sweep_cursor = r.readString();
-        else if (key == "lo") state.lease.owner = r.readHex128();
-        else if (key == "ls") state.lease.seq = r.readU64String();
+        if (key == "round") state.round = r.readU64String();
+        else if (key == "gc_shards") { state.gc_shards = r.readU64Number(); saw_gcs = true; }
+        else if (key == "snapshot_generation") state.snap_generation = r.readU64String();
+        else if (key == "snapshot_pruned_through") state.snap_pruned_through = r.readU64String();
+        else if (key == "snapshot_attempt") state.snap_attempt = r.readU64String();
+        else if (key == "manifest_sweep_cursor") state.manifest_sweep_cursor = r.readString();
+        else if (key == "lease_owner") state.lease.owner = r.readHex128();
+        else if (key == "lease_sequence") state.lease.seq = r.readU64String();
         else r.skipUnknown(key);
     }
     /// Fail closed on an absent gcs: the writer always emits it, so a missing key means a corrupt object.
@@ -75,8 +75,8 @@ String encodeGcHeartbeat(const GcHeartbeat & hb)
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::GcHeartbeat);
     bool first = true;
-    writeKey(out, "by", first);  writeHex128Value(out, hb.owner);
-    writeKey(out, "seq", first); writeU64StringValue(out, hb.hb_seq);
+    writeKey(out, "owner", first);              writeHex128Value(out, hb.owner);
+    writeKey(out, "heartbeat_sequence", first); writeU64StringValue(out, hb.hb_seq);
     closeObject(out, first);
     writeChar('\n', out);
     return std::move(out).take();
@@ -96,12 +96,12 @@ GcHeartbeat decodeGcHeartbeat(std::string_view data)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "by")
+        if (key == "owner")
         {
             hb.owner = r.readHex128();
             saw_by = true;
         }
-        else if (key == "seq")
+        else if (key == "heartbeat_sequence")
         {
             hb.hb_seq = r.readU64String();
             saw_seq = true;

@@ -65,10 +65,10 @@ TEST(CASFormatBattery, PartManifest)
     /// stays self-consistent with whatever sample() produces, now that decode verifies payload_digest.
     const String golden =
         currentFormatHeader("cas_part_manifest") +
-        "{\"me\":\"5\",\"mb\":\"15\",\"mo\":1,\"ns\":\"00/aa@cas@\",\"pd\":\"" + u128ToHex(m.payload_digest) + "\"}\n" // NOLINT(modernize-raw-string-literal): mixes '\"' quoting with '\n' line endings across this concatenated literal; a raw string can't hold the newline as-is.
-        "{\"p\":\"a/b.bin\",\"pm\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\",\"sz\":4096}\n"
-        "{\"p\":\"c/small.txt\",\"pm\":\"inline\",\"il\":12}\n"
-        "{\"n\":2}\n"
+        "{\"writer_epoch\":\"5\",\"build_sequence\":\"15\",\"manifest_ordinal\":1,\"namespace\":\"00/aa@cas@\",\"payload_digest\":\"" + u128ToHex(m.payload_digest) + "\"}\n" // NOLINT(modernize-raw-string-literal): mixes '\"' quoting with '\n' line endings across this concatenated literal; a raw string can't hold the newline as-is.
+        "{\"path\":\"a/b.bin\",\"placement\":\"blob\",\"hash_algorithm\":\"ch128\",\"hash\":\"00112233445566778899aabbccddeeff\",\"size\":4096}\n"
+        "{\"path\":\"c/small.txt\",\"placement\":\"inline\",\"inline_length\":12}\n"
+        "{\"record_count\":2}\n"
         "==> \"c/small.txt\" il=12 <==\n"
         "hello world!\n";
     runFormatBattery({FormatId::PartManifest,
@@ -113,14 +113,14 @@ TEST(CASPartManifestFormat, EmptyEntriesRoundTrips)
 TEST(CASPartManifestFormat, PlacementWordsRenderAndRejectUnknown)
 {
     const String text = encodePartManifest(sample());
-    EXPECT_NE(text.find("\"pm\":\"blob\""), String::npos);
-    EXPECT_NE(text.find("\"pm\":\"inline\""), String::npos);
+    EXPECT_NE(text.find("\"placement\":\"blob\""), String::npos);
+    EXPECT_NE(text.find("\"placement\":\"inline\""), String::npos);
 
     /// An unknown placement word fails closed.
     String bad = text;
-    const size_t pos = bad.find(R"("pm":"blob")");
+    const size_t pos = bad.find(R"("placement":"blob")");
     ASSERT_NE(pos, String::npos);
-    bad.replace(pos, String(R"("pm":"blob")").size(), R"("pm":"bogus")");
+    bad.replace(pos, String(R"("placement":"blob")").size(), R"("placement":"bogus")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 
@@ -320,8 +320,8 @@ TEST(CASPartManifestFormat, DecodeRejectsOutOfOrderEntries)
     m.payload_digest = computePayloadDigest(m);
 
     const String text = encodePartManifest(m);
-    const size_t pos_a = text.find(R"("p":"a/one.bin")");
-    const size_t pos_b = text.find(R"("p":"b/two.bin")");
+    const size_t pos_a = text.find(R"("path":"a/one.bin")");
+    const size_t pos_b = text.find(R"("path":"b/two.bin")");
     ASSERT_NE(pos_a, String::npos);
     ASSERT_NE(pos_b, String::npos);
 
@@ -364,10 +364,10 @@ TEST(CASPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
     m.payload_digest = computePayloadDigest(m);
 
     String forged = encodePartManifest(m);
-    const String needle = R"("p":"ccc/three.bin")";
+    const String needle = R"("path":"ccc/three.bin")";
     const size_t pos = forged.find(needle);
     ASSERT_NE(pos, String::npos);
-    forged.replace(pos, needle.size(), R"("p":"aaa/one.bin")");
+    forged.replace(pos, needle.size(), R"("path":"aaa/one.bin")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(forged); });
 }
@@ -375,10 +375,10 @@ TEST(CASPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
 TEST(CASPartManifestFormat, UnknownEntryAlgoFailsClosed)
 {
     String bad = encodePartManifest(sample());
-    const String needle = R"("ha":"ch128")";
+    const String needle = R"("hash_algorithm":"ch128")";
     const size_t pos = bad.find(needle);
     ASSERT_NE(pos, String::npos);
-    bad.replace(pos, needle.size(), R"("ha":"bogus")");
+    bad.replace(pos, needle.size(), R"("hash_algorithm":"bogus")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 
@@ -388,7 +388,7 @@ TEST(CASPartManifestFormat, UnknownEntryAlgoFailsClosed)
 TEST(CASPartManifestFormat, DigestHexWidthMismatchFailsClosedNotBadArguments)
 {
     String bad = encodePartManifest(sample());
-    const String key = R"("h":")";
+    const String key = R"("hash":")";
     const size_t key_pos = bad.find(key);
     ASSERT_NE(key_pos, String::npos);
     const size_t hex_start = key_pos + key.size();
@@ -435,10 +435,10 @@ TEST(CASPartManifestFormat, TrailingByteAfterPayloadZoneFailsClosed)
 TEST(CASPartManifestFormat, InlineRecordIlMismatchWithPayloadZoneBannerFailsClosed)
 {
     String bad = encodePartManifest(sample());
-    const String needle = "\"il\":12";
+    const String needle = "\"inline_length\":12";
     const size_t pos = bad.find(needle);
     ASSERT_NE(pos, String::npos);
-    bad.replace(pos, needle.size(), "\"il\":13");
+    bad.replace(pos, needle.size(), "\"inline_length\":13");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 

@@ -22,7 +22,7 @@ String encodeGcMaintenanceState(const GcMaintenanceState & state)
     CasJsonWriter out;
     writeHeaderLine(out, FormatId::GcMaintenanceState);
     bool first = true;
-    writeKey(out, "cur", first);
+    writeKey(out, "janitor_cursor", first);
     writeStringValue(out, state.janitor_cursor);
     closeObject(out, first);
     writeChar('\n', out);
@@ -46,7 +46,7 @@ GcMaintenanceState decodeGcMaintenanceState(std::string_view data)
     String key;
     while (reader.nextKey(key))
     {
-        if (key == "cur")
+        if (key == "janitor_cursor")
         {
             result.janitor_cursor = reader.readString();
             has_cursor = true;

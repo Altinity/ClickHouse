@@ -263,7 +263,7 @@ void writeHeaderLine(CasJsonWriter & out, FormatId id)
     bool first = true;
     writeKey(out, "type", first);
     writeStringValue(out, t.type);
-    writeKey(out, "v", first);
+    writeKey(out, "version", first);
     writeIntText(currentCompatibilityVersion(), out);
     closeObject(out, first);
     writeChar('\n', out);
@@ -272,7 +272,7 @@ void writeHeaderLine(CasJsonWriter & out, FormatId id)
 void writeTrailerLine(CasJsonWriter & out, uint64_t n)
 {
     bool first = true;
-    writeKey(out, "n", first);
+    writeKey(out, "record_count", first);
     writeIntText(n, out);
     closeObject(out, first);
     writeChar('\n', out);
@@ -306,7 +306,7 @@ TextHeader parseHeaderObject(std::string_view line, std::string_view what)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: header line must start with \"type\"", what);
     TextHeader h;
     h.type = r.readString();
-    if (!r.nextKey(key) || key != "v")
+    if (!r.nextKey(key) || key != "version")
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: header line must carry \"v\" second", what);
     h.v = r.readU32Number();
     while (r.nextKey(key))

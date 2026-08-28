@@ -1,7 +1,7 @@
 # CAS persisted formats — the living registry
 
-Every persisted CAS object is a text file: header line `{"type":"cas_<object>","v":N}`, body
-(one JSON object / sorted NDJSON records / raw payload zone), optional `{"n":…}` trailer.
+Every persisted CAS object is a text file: header line `{"type":"cas_<object>","version":N}`, body
+(one JSON object / sorted NDJSON records / raw payload zone), optional `{"record_count":…}` trailer.
 Can-grow-large types are stored under a **`.zst` key suffix** and are ALWAYS one zstd frame
 (checksum on; declared content size checked against the cap before allocation); always-small and
 deterministic types are raw. `CasTextFormat.{h,cpp}` is the only code that knows this shape.
@@ -9,7 +9,7 @@ deterministic types are raw. `CasTextFormat.{h,cpp}` is the only code that knows
 The object inventory is text end to end — there are no binary CAS formats and no protobuf
 dependency. The GC source-edge data plane (`cas_run`) is sorted NDJSON written and read as a
 stream (no seek); its integrity check is the whole-file seal checksum. The part manifest is the
-one `PayloadHybrid` object: text header + descriptor meta + sorted entry records + `{"n":…}`
+one `PayloadHybrid` object: text header + descriptor meta + sorted entry records + `{"record_count":…}`
 trailer, followed by a banner-framed raw payload zone for inline file bytes.
 
 **Rule:** any change to a persisted format lands in the SAME commit as its row here.
@@ -37,22 +37,22 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 ## Codec table
 
 Authoritative per-format traits (type string, family, strictness, compression policy, caps) live
-in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`. Key naming: keys
-2–5 chars; fixed-width `UInt128` identities = 32-char lowercase hex strings; blob digests =
+in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`. Key naming uses
+full descriptive names; fixed-width `UInt128` identities = 32-char lowercase hex strings; blob digests =
 algo-width hex (two chars per digest byte), rendered with their algo name (`sha256:ab12…`) wherever
 a bare hex would be ambiguous; unbounded u64 = decimal strings; bounded counts/lengths/ms-timestamps
 = numbers; units documented here per object as codecs land.
 
 ## Evolution rules (one screen)
 
-- `v` (header line) is the ONLY version field; reader gate: `v > G_BUILD` →
+- `version` (header line) is the ONLY version field; reader gate: `version > G_BUILD` →
   `UNKNOWN_FORMAT_VERSION`, checked before the body.
-- Additive change = new tolerant key, no `v` bump; on MUTABLE objects the field is best-effort
+- Additive change = new tolerant key, no `version` bump; on MUTABLE objects the field is best-effort
   until the pool floor rises (an old writer's fresh re-encode drops it).
-- Breaking change = `v` bump + `changePoints` + write-down-to-floor; the floor raise is what
-  fences old builds out (mount gates: `min_reader_generation` forward, pool-meta `v` backward).
+- Breaking change = `version` bump + `changePoints` + write-down-to-floor; the floor raise is what
+  fences old builds out (mount gates: `min_reader_generation` forward, pool-meta `version` backward).
 - Deterministic formats (`cas_fold_seal`, `cas_run`): strict keys, pinned raw, and the adoption
-  pin — on a `putDeterministicArtifact` conflict, re-encode at the `v` of the EXISTING object.
+  pin — on a `putDeterministicArtifact` conflict, re-encode at the `version` of the EXISTING object.
 - A key prefixed `!` is critical: a reader that does not understand it fails closed.
 - Padding zones (blob header pad, manifest banners) are deterministic and verified — no
   unaccounted bytes in any object.

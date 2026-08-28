@@ -13,8 +13,8 @@ namespace DB::Cas
 
 /// Text codec for `cas_ref_log`, the immutable object stored at `_log/<txn_id>`. Each object contains
 /// exactly one committed transaction: its namespace, transaction id, and the batch of `RefOp`s applied
-/// by that commit. The body has a header, a meta line `{"ns","we","rs",["!pse","!pss"]}`, one JSON
-/// record per op, and a `{"n":count}` trailer. Records are emitted in the transaction's stored order
+/// by that commit. The body has a header, a metadata line with namespace and transaction identity, one JSON
+/// record per operation, and a `{"record_count":count}` trailer. Records are emitted in stored order
 /// and contain no codec-generated timestamps, so encoding the same value is byte-identical. This
 /// determinism is a property of the representation, not an adoption gate: ref commits use
 /// `putIfAbsentControlled`, and the caller applies the `Always`/`.zst` storage policy by sealing the

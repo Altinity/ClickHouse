@@ -14,13 +14,11 @@ namespace DB::Cas
 /// made of JSON lines followed by a raw payload zone. The public types and helper signatures remain
 /// stable for the surrounding CAS protocol.
 ///
-///   header line                 {"type":"cas_part_manifest","v":N}
-///   descriptor meta line         {"me","mb","mo"} (the ManifestRef, shared rendering with
-///                                refsnaplog, `CasWireVocab.h`) + "ns" (root namespace) + "pd"
+///   header line                 {"type":"cas_part_manifest","version":N}
+///   descriptor meta line         the `ManifestRef` fields plus `namespace` and `payload_digest`
 ///                                (payload digest, 32 lowercase hex)
-///   one entry-record line each   {"p":path,"pm":placement-word, then either the Blob's
-///                                {"ha","h","sz"} or the Inline's {"il"}}, in canonical path order
-///   trailer line                 {"n":entry-count}
+///   one entry-record line each   `path`, `placement`, and placement-specific fields, in path order
+///   trailer line                 {"record_count":entry-count}
 ///   PAYLOAD ZONE (raw, follows the trailer): for each Inline entry, in path order, a
 ///                                `head -v`-style banner line `==> "<escaped path>" il=<n> <==\n`, then
 ///                                exactly `n` raw bytes, then `\n`. The path uses the same writer as

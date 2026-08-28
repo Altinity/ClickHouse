@@ -32,11 +32,11 @@ String encodeOwner(const OwnerObject & o)
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::Owner);
     bool first = true;
-    writeKey(out, "su", first);
+    writeKey(out, "server_uuid", first);
     writeHex128Value(out, o.server_uuid);
     if (o.retired_at_ms)
     {
-        writeKey(out, "rt", first);
+        writeKey(out, "retired_at_ms", first);
         writeIntText(*o.retired_at_ms, out);
     }
     closeObject(out, first);
@@ -58,12 +58,12 @@ OwnerObject decodeOwner(std::string_view data)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "su")
+        if (key == "server_uuid")
         {
             o.server_uuid = r.readHex128();
             saw = true;
         }
-        else if (key == "rt")
+        else if (key == "retired_at_ms")
             rt = r.readU64Number();
         else
             r.skipUnknown(key);
@@ -81,7 +81,7 @@ String encodeServerEpoch(const ServerEpoch & e)
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::ServerEpoch);
     bool first = true;
-    writeKey(out, "nwe", first);
+    writeKey(out, "next_writer_epoch", first);
     writeU64StringValue(out, e.next_writer_epoch);
     closeObject(out, first);
     writeChar('\n', out);
@@ -101,7 +101,7 @@ ServerEpoch decodeServerEpoch(std::string_view data)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "nwe")
+        if (key == "next_writer_epoch")
         {
             e.next_writer_epoch = r.readU64String();
             saw = true;
@@ -121,15 +121,15 @@ String encodeMountLease(const MountLease & m)
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::MountLease);
     bool first = true;
-    writeKey(out, "su", first);  writeHex128Value(out, m.server_uuid);
-    writeKey(out, "we", first);  writeU64StringValue(out, m.writer_epoch);
-    writeKey(out, "hn", first);  writeStringValue(out, m.hostname);
-    writeKey(out, "pid", first); writeIntText(m.pid, out);
-    writeKey(out, "sat", first); writeIntText(m.started_at_ms, out);
-    writeKey(out, "seq", first); writeU64StringValue(out, m.seq);
-    writeKey(out, "eat", first); writeIntText(m.expires_at_ms, out);
-    writeKey(out, "ma", first);  writeU64StringValue(out, m.min_active);
-    writeKey(out, "fen", first); writeBoolValue(out, m.gc_fenced);
+    writeKey(out, "server_uuid", first);    writeHex128Value(out, m.server_uuid);
+    writeKey(out, "writer_epoch", first);   writeU64StringValue(out, m.writer_epoch);
+    writeKey(out, "hostname", first);       writeStringValue(out, m.hostname);
+    writeKey(out, "process_id", first);     writeIntText(m.pid, out);
+    writeKey(out, "started_at_ms", first);  writeIntText(m.started_at_ms, out);
+    writeKey(out, "sequence", first);       writeU64StringValue(out, m.seq);
+    writeKey(out, "expires_at_ms", first);  writeIntText(m.expires_at_ms, out);
+    writeKey(out, "min_active", first);     writeU64StringValue(out, m.min_active);
+    writeKey(out, "gc_fenced", first);      writeBoolValue(out, m.gc_fenced);
     writeKey(out, "write_attempt_id", first); writeHex128Value(out, m.write_attempt_id);
     closeObject(out, first);
     writeChar('\n', out);
@@ -151,23 +151,23 @@ MountLease decodeMountLease(std::string_view data)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "su")
+        if (key == "server_uuid")
         {
             m.server_uuid = r.readHex128();
             saw_su = true;
         }
-        else if (key == "we")
+        else if (key == "writer_epoch")
         {
             m.writer_epoch = r.readU64String();
             saw_we = true;
         }
-        else if (key == "hn") m.hostname = r.readString();
-        else if (key == "pid") m.pid = r.readU64Number();
-        else if (key == "sat") m.started_at_ms = r.readU64Number();
-        else if (key == "seq") m.seq = r.readU64String();
-        else if (key == "eat") m.expires_at_ms = r.readU64Number();
-        else if (key == "ma") m.min_active = r.readU64String();
-        else if (key == "fen") m.gc_fenced = r.readBool();
+        else if (key == "hostname") m.hostname = r.readString();
+        else if (key == "process_id") m.pid = r.readU64Number();
+        else if (key == "started_at_ms") m.started_at_ms = r.readU64Number();
+        else if (key == "sequence") m.seq = r.readU64String();
+        else if (key == "expires_at_ms") m.expires_at_ms = r.readU64Number();
+        else if (key == "min_active") m.min_active = r.readU64String();
+        else if (key == "gc_fenced") m.gc_fenced = r.readBool();
         else if (key == "write_attempt_id")
         {
             m.write_attempt_id = r.readHex128();

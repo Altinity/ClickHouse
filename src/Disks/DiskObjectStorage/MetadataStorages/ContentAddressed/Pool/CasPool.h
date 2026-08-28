@@ -55,7 +55,7 @@ struct PoolConfig
     /// (clean relative path); `ServerUUID`/`server_id` is demoted to an
     /// owner token. Validated via `Cas::validateServerRootId`.
     String server_root_id;
-    uint64_t blob_header_len = 256;           /// creation-time only; the pool is authoritative on reopen
+    uint64_t blob_header_len = 512;           /// creation-time only; the pool is authoritative on reopen
     /// CAS mixed-algo pools: the
     /// NODE-LOCAL algo this Pool writes NEW content with (`Pool::writeAlgo()`). NOT durable pool
     /// state -- two live nodes may intentionally write with different (already-admitted) algos, so

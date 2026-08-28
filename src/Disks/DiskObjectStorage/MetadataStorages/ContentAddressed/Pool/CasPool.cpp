@@ -1605,8 +1605,9 @@ namespace
 /// a tolerant, read-only peek at the
 /// `cas_ref_log` TEXT object (codecs-v3 phase 3) WITHOUT `decodeRefLogTxn`'s expected-value cross-check
 /// -- the whole point of this diagnostic is that the body is NOT expected to match this key's identity.
-/// It `openObject`s the stored `.zst`, skips the header line, and reads `ns`/`we`/`rs` off the meta
-/// line (`we`/`rs` are decimal u64 strings). Never validates the header `v`, never reads past the meta
+/// It `openObject`s the stored `.zst`, skips the header line, and reads `namespace`/`writer_epoch`/
+/// `ref_sequence` off the meta line (the ids are decimal u64 strings). Never validates the header
+/// `version`, never reads past the meta
 /// line (the ops are irrelevant to identifying the writer), and swallows any truncation/garbage: this
 /// is a background diagnostic only, never a decode anything else depends on.
 struct ForeignRefLogHeaderPeek
@@ -1634,9 +1635,9 @@ std::optional<ForeignRefLogHeaderPeek> peekForeignRefLogHeader(const String & by
         String key;
         while (r.nextKey(key))
         {
-            if (key == "ns") { peek.ns = r.readString(); saw_ns = true; }
-            else if (key == "we") { peek.writer_epoch = r.readU64String(); saw_we = true; }
-            else if (key == "rs") { peek.ref_sequence = r.readU64String(); saw_rs = true; }
+            if (key == "namespace") { peek.ns = r.readString(); saw_ns = true; }
+            else if (key == "writer_epoch") { peek.writer_epoch = r.readU64String(); saw_we = true; }
+            else if (key == "ref_sequence") { peek.ref_sequence = r.readU64String(); saw_rs = true; }
             else r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs)

@@ -136,19 +136,19 @@ String encodeRefCatalog(const RefCatalog & catalog)
                 e.ns.string(), nsStateToWord(e.state), e.removal_started_round ? "carries" : "lacks");
 
         bool first = true;
-        writeKey(out, "k", first);   writeStringValue(out, "ent");
-        writeKey(out, "ns", first);  writeStringValue(out, e.ns.string());
-        writeKey(out, "st", first);  writeStringValue(out, nsStateToWord(e.state));
-        writeKey(out, "inc", first); writeHex128Value(out, e.incarnation);
+        writeKey(out, "kind", first);        writeStringValue(out, "ent");
+        writeKey(out, "namespace", first);   writeStringValue(out, e.ns.string());
+        writeKey(out, "state", first);       writeStringValue(out, nsStateToWord(e.state));
+        writeKey(out, "incarnation", first); writeHex128Value(out, e.incarnation);
         if (e.removal_started_round)
         {
-            writeKey(out, "rsr", first); writeU64StringValue(out, *e.removal_started_round);
+            writeKey(out, "removal_started_round", first); writeU64StringValue(out, *e.removal_started_round);
         }
         if (e.creator)
         {
-            writeKey(out, "csr", first); writeStringValue(out, e.creator->server_root_id);
-            writeKey(out, "cwe", first); writeU64StringValue(out, e.creator->writer_epoch);
-            writeKey(out, "cfg", first); writeU64StringValue(out, e.creator->fence_generation);
+            writeKey(out, "creator_server_root_id", first);  writeStringValue(out, e.creator->server_root_id);
+            writeKey(out, "creator_writer_epoch", first);    writeU64StringValue(out, e.creator->writer_epoch);
+            writeKey(out, "creator_fence_generation", first); writeU64StringValue(out, e.creator->fence_generation);
         }
         closeObject(out, first);
         closeLine("ent");
@@ -178,7 +178,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: empty line");
 
-        if (key == "n")
+        if (key == "record_count")
         {
             const uint64_t n = r.readU64Number();
             if (r.nextKey(key))
@@ -190,7 +190,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
                     "CAS ref catalog: trailer count {} != {} records", n, seen);
             return catalog;
         }
-        if (key != "k")
+        if (key != "kind")
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: record must start with \"k\"");
         const String kind = r.readString();
         if (kind != "ent")
@@ -205,13 +205,13 @@ RefCatalog decodeRefCatalog(std::string_view data)
         std::optional<uint64_t> removal_started_round;
         while (r.nextKey(key))
         {
-            if (key == "ns") ns_str = r.readString();
-            else if (key == "st") st_word = r.readString();
-            else if (key == "inc") inc = r.readHex128();
-            else if (key == "csr") csr = r.readString();
-            else if (key == "cwe") cwe = r.readU64String();
-            else if (key == "cfg") cfg = r.readU64String();
-            else if (key == "rsr") removal_started_round = r.readU64String();
+            if (key == "namespace") ns_str = r.readString();
+            else if (key == "state") st_word = r.readString();
+            else if (key == "incarnation") inc = r.readHex128();
+            else if (key == "creator_server_root_id") csr = r.readString();
+            else if (key == "creator_writer_epoch") cwe = r.readU64String();
+            else if (key == "creator_fence_generation") cfg = r.readU64String();
+            else if (key == "removal_started_round") removal_started_round = r.readU64String();
             else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ent key '{}'", key);
         }
         if (!l.eof())
@@ -221,7 +221,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing st", ns_str);
         const NsState state = nsStateFromWord(*st_word);   /// throws CORRUPTED_DATA on an unknown word
 
-        /// A missing "ns" key reads as the same empty string a present-but-empty one would, and both
+        /// A missing `namespace` key reads as the same empty string a present-but-empty one would, and both
         /// are refused identically here -- an empty namespace would sort first (every non-empty
         /// namespace compares strictly greater than ""), passing the canonical-order check below, and
         /// then wedge every later catalog-driven pass that tries to build a ref/namespace-file key
@@ -295,7 +295,7 @@ uint64_t foldSealFixedBytes()
         seal.generation = std::numeric_limits<uint64_t>::max();
         seal.parent_generation = std::numeric_limits<uint64_t>::max();
         const uint64_t empty_bytes = encodeFoldSeal(seal).size();
-        /// The empty trailer is `{"n":0}`. A real seal may carry a 20-digit record count.
+        /// The empty trailer is `{"record_count":0}`. A real seal may carry a 20-digit record count.
         return addByteBudget(empty_bytes, std::numeric_limits<uint64_t>::digits10);
     }();
     return bytes;

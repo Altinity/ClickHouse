@@ -99,7 +99,7 @@ CondemnedRow decodeCondemnedRow(std::string_view payload);
 class SourceEdgeRunView
 {
 public:
-    /// false once the run's `{"n"}` trailer is consumed (the trailer count is verified there). `key` is
+    /// false once the run's `{"record_count"}` trailer is consumed (the trailer count is verified there). `key` is
     /// the reconstructed `SourceEdgeKeyCodec::key(ref, source_id)`; `payload` is the original marker byte
     /// or `encodeCondemnedRow` bytes.
     bool next(String & key, String & payload);

@@ -67,7 +67,7 @@ Two failure modes this closes:
 
 One object, `gc/server-roots/<server_root_id>/mount`, carries **both** the liveness lease and the build
 watermark — there is no separate watermark object. `MountLease` fields: `server_uuid`,
-`writer_epoch`, `write_attempt_id`, `hostname`, `pid`, `started_at_ms`, renewal `seq`,
+`writer_epoch`, `write_attempt_id`, `hostname`, `process_id`, `started_at_ms`, renewal `sequence`,
 `expires_at_ms`, `min_active` (the build-watermark floor), and `gc_fenced`.
 
 - **Logical renewal identity.** Each holder-originated body has a fresh nonzero
@@ -165,8 +165,8 @@ the claim outcomes above and is shown here as behavior, not as a type in the cod
 ```mermaid
 stateDiagram-v2
     [*] --> Absent
-    Absent --> Live: claimMount putIfAbsent, seq=1
-    Live --> Live: keeper beat, putOverwrite seq+1
+    Absent --> Live: claimMount putIfAbsent, sequence=1
+    Live --> Live: keeper beat, putOverwrite sequence+1
     Live --> Fenced: GC observes a stable token past threshold, gc_fenced=1, body preserved
     Live --> Terminated: certified drain, terminal farewell (expires_at=now, min_active=MAX)
     Fenced --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim

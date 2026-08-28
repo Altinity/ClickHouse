@@ -29,7 +29,7 @@ TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
     closeObject(out, first);
     const String rendered = std::move(out).take();
     EXPECT_EQ(rendered,
-        R"({"tt":"etag","tv":"etag-abc\"x","ha":"ch128","h":"00112233445566778899aabbccddeeff"})");
+        R"({"token_type":"etag","token_value":"etag-abc\"x","hash_algorithm":"ch128","hash":"00112233445566778899aabbccddeeff"})");
 
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     JsonObjectReader r(in, KeyStrictness::Tolerant, "t");

@@ -42,11 +42,11 @@ TEST(CASFormatBattery, FoldSeal)
         [&] { return sealObject(FormatId::FoldSeal, encodeFoldSeal(seal)); },
         [](std::string_view s) { decodeFoldSeal(std::string(openObject(FormatId::FoldSeal, s))); },
         currentFormatHeader("cas_fold_seal") +
-        "{\"g\":\"5\",\"pg\":\"4\"}\n"
-        "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\"}\n"
-        "{\"k\":\"btr\",\"key\":\"r0\",\"ck\":\"0000000000000000000000000000000f\",\"shard\":0,\"gen\":\"5\"}\n"
-        "{\"k\":\"cnd\",\"shard\":0,\"ct\":3,\"pt\":1,\"ocr\":\"4\"}\n"
-        "{\"n\":3}\n"});
+        "{\"generation\":\"5\",\"parent_generation\":\"4\"}\n"
+        "{\"kind\":\"rfl\",\"life_id\":\"00000000000000000000000000000001\",\"classification\":2,\"last_folded_writer_epoch\":\"7\",\"last_folded_ref_sequence\":\"11\"}\n"
+        "{\"kind\":\"btr\",\"key\":\"r0\",\"checksum\":\"0000000000000000000000000000000f\",\"shard\":0,\"generation\":\"5\"}\n"
+        "{\"kind\":\"cnd\",\"shard\":0,\"condemned_total\":3,\"pending_total\":1,\"oldest_nonpending_condemn_round\":\"4\"}\n"
+        "{\"record_count\":3}\n"});
 }
 
 TEST(CASFoldSealFormat, RoundTripsAllFields)
@@ -123,11 +123,11 @@ TEST(CASFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryFiel
 
     for (const std::string_view field : {
         R"(,"key":"p/gc/gen/7/attempt/1/blob_target/0/0")",
-        R"(,"ck":"00000000000000000000000000000001")",
-        R"(,"gen":"7")",
-        ",\"ct\":0",
-        ",\"pt\":0",
-        R"(,"ocr":"18446744073709551615")"})
+        R"(,"checksum":"00000000000000000000000000000001")",
+        R"(,"generation":"7")",
+        ",\"condemned_total\":0",
+        ",\"pending_total\":0",
+        R"(,"oldest_nonpending_condemn_round":"18446744073709551615")"})
     {
         String malformed = valid;
         eraseRequiredField(malformed, field);
@@ -291,11 +291,11 @@ TEST(CASFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{9, 10}}});
 
     const String expected = currentFormatHeader("cas_fold_seal") +
-        "{\"g\":\"8\",\"pg\":\"7\"}\n"
-        "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000001234\",\"cls\":4,"
-        "\"lfe\":\"3\",\"lfs\":\"4\",\"hr\":\"manifest_body_missing\",\"hpe\":\"5\","
-        "\"hps\":\"6\",\"hrc\":7,\"hnr\":\"8\",\"rte\":\"9\",\"rts\":\"10\"}\n"
-        "{\"n\":1}\n";
+        "{\"generation\":\"8\",\"parent_generation\":\"7\"}\n"
+        "{\"kind\":\"rfl\",\"life_id\":\"00000000000000000000000000001234\",\"classification\":4,"
+        "\"last_folded_writer_epoch\":\"3\",\"last_folded_ref_sequence\":\"4\",\"hold_reason\":\"manifest_body_missing\",\"hold_position_writer_epoch\":\"5\","
+        "\"hold_position_ref_sequence\":\"6\",\"hold_retry_count\":7,\"hold_next_retry_round\":\"8\",\"remove_txn_writer_epoch\":\"9\",\"remove_txn_ref_sequence\":\"10\"}\n"
+        "{\"record_count\":1}\n";
 
     EXPECT_EQ(encodeFoldSeal(seal), expected);
     EXPECT_EQ(decodeFoldSeal(expected), seal);
@@ -306,10 +306,10 @@ TEST(CASFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
 TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyCoverageRecord)
 {
     const String old =
-        "{\"type\":\"cas_fold_seal\",\"v\":7}\n"
-        "{\"g\":\"8\",\"pg\":\"7\"}\n"
-        "{\"k\":\"cov\",\"key\":\"name/0\",\"cls\":2,\"lfe\":\"3\",\"lfs\":\"4\"}\n"
-        "{\"n\":1}\n";
+        "{\"type\":\"cas_fold_seal\",\"version\":7}\n"
+        "{\"generation\":\"8\",\"parent_generation\":\"7\"}\n"
+        "{\"kind\":\"cov\",\"key\":\"name/0\",\"classification\":2,\"last_folded_writer_epoch\":\"3\",\"last_folded_ref_sequence\":\"4\"}\n"
+        "{\"record_count\":1}\n";
     cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(old); }, "legacy coverage");
 }
 
@@ -318,10 +318,10 @@ TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyCoverageRecord)
 TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyNamespaceCleanupRecord)
 {
     const String old =
-        "{\"type\":\"cas_fold_seal\",\"v\":7}\n"
-        "{\"g\":\"8\",\"pg\":\"7\"}\n"
-        "{\"k\":\"nsc\",\"ns\":\"name\",\"rte\":\"3\",\"rts\":\"4\",\"st\":\"completed\"}\n"
-        "{\"n\":1}\n";
+        "{\"type\":\"cas_fold_seal\",\"version\":7}\n"
+        "{\"generation\":\"8\",\"parent_generation\":\"7\"}\n"
+        "{\"kind\":\"nsc\",\"namespace\":\"name\",\"remove_txn_writer_epoch\":\"3\",\"remove_txn_ref_sequence\":\"4\",\"status\":\"completed\"}\n"
+        "{\"record_count\":1}\n";
     cas_battery_detail::expectCode(
         DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(old); }, "legacy namespace cleanup");
 }
