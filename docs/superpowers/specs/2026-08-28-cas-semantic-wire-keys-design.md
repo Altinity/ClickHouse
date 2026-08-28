@@ -1,5 +1,5 @@
 ---
-description: 'Generation-11 design for readable but byte-conscious CAS persisted field names'
+description: 'Semantic ("sufficiently full") CAS persisted field names, shipped as a generation reset, with an asymmetric C++ member-naming rule'
 sidebar_label: 'CAS semantic wire keys'
 sidebar_position: 10
 slug: /superpowers/specs/cas-semantic-wire-keys
@@ -8,6 +8,13 @@ doc_type: 'guide'
 ---
 
 # CAS semantic wire keys design {#cas-semantic-wire-keys-design}
+
+Revision 2 (2026-08-28). Supersedes revision 1 of the same date, after three adjudications:
+keys must be *sufficiently full for understanding*, not exact C++ member names; there are no
+existing installations, so the change ships as a **generation reset**, not a generation bump; and
+C++ members follow an **asymmetric rule** — a member may be fuller than its wire key, never more
+cryptic. The exact-full-name alternative was independently implemented in Altinity PR #2288 and
+rejected (see rejected alternatives).
 
 ## Problem {#problem}
 
@@ -33,7 +40,7 @@ verbose JSON.
 
 ## Decision {#decision}
 
-Generation 11 replaces opaque initialisms with a semantic wire vocabulary:
+The semantic-keys generation replaces opaque initialisms with a semantic wire vocabulary:
 
 - metadata written once per object uses descriptive names;
 - repeated record fields use short, recognizable words whose meaning is clear in the record;
@@ -41,11 +48,14 @@ Generation 11 replaces opaque initialisms with a semantic wire vocabulary:
 - common framing remains `type`, `v`, and `n`;
 - `!` remains the must-understand prefix for critical fields;
 - abbreviated record-tag values that would otherwise keep a row opaque are made readable in the
-  same breaking generation.
+  same change;
+- C++ member names obey the asymmetric rule: at least as understandable as the wire key, and
+  fuller wherever the wire is budget-compressed.
 
-The change is a pre-release hard cut. Every live persisted format is generation 11, old pools are
-recreated, and readers gain no aliases, dual-read branches, migration path, or write-down path for
-the old spellings.
+The change is a pre-release hard cut shipped as a **generation reset**: `G_BUILD` returns to 1,
+the accumulated change-point history is erased, pools are recreated, and readers gain no aliases,
+dual-read branches, migration path, or write-down path for the old spellings. There are no
+existing installations (adjudicated 2026-08-28), so nothing needs to survive the cut.
 
 ## Goals and non-goals {#goals-and-non-goals}
 
@@ -56,7 +66,9 @@ The goals are:
 - preserve all existing object paths, value encodings, ordering rules, strictness, compression
   policies, and byte caps;
 - preserve the 240-byte minimum and 256-byte default `blob_header_len`;
-- make the complete generation-11 vocabulary explicit and testable.
+- make the complete post-reset vocabulary — keys, record tags, and closed value sets — explicit
+  and testable;
+- guarantee that no C++ member is more cryptic than its wire key.
 
 The following are not goals:
 
@@ -65,8 +77,10 @@ The following are not goals:
 - changing numeric, string, hexadecimal, or enum representations except the record-tag words listed
   below;
 - changing object-store keys or suffixes;
-- increasing byte caps to offset longer names;
-- adding a general schema-description framework or runtime compact/full naming profile.
+- increasing byte caps or the payload offset to offset longer names;
+- adding a general schema-description framework or runtime compact/full naming profile;
+- renaming existing full-name C++ members to shorter forms (the member rule is a floor, not a
+  mirror).
 
 ## Naming rules {#naming-rules}
 
@@ -89,25 +103,50 @@ The approved compact vocabulary is:
 | `ref` | reference or reference name, as determined by the containing record |
 | `chver` | ClickHouse version in the fixed blob descriptor |
 
-Established protocol and unit fragments such as `id`, `uuid`, `ms`, `gc`, `hb`, `snap`, and `txn`
-retain their conventional meanings in compound names. No new single-letter body key is allowed. `v`
-and `n` are framing exceptions, not examples for body fields. A new compact word outside these two
-sets requires a format-design decision rather than being introduced incidentally by a codec author.
+Established protocol and unit fragments such as `id`, `uuid`, `ms`, `gc`, `hb`, `snap`, `txn`, and
+`pid` (the OS process id) retain their conventional meanings in compound names. No new
+single-letter body key is allowed. `v` and `n` are framing exceptions, not examples for body
+fields. A new compact word outside these two sets requires a format-design decision rather than
+being introduced incidentally by a codec author.
 
 Fields repeated per record need not reproduce a C++ member name, but must be understandable from the
 object type and record tag. Fields written once per object should normally use the complete semantic
 name unless the fixed blob budget applies.
+
+## C++ member naming {#cpp-member-naming}
+
+The wire compresses under byte budgets; C++ has no byte budget. The rule binding the two is
+asymmetric:
+
+> A C++ member may be fuller or longer than its wire key — and should be, wherever the wire key is
+> budget-compressed — but a member must **never be more cryptic than its JSON key**.
+
+Consequences:
+
+- `ManifestRef::writer_epoch` ↔ wire `epoch`, `SourceEdgeRecord::source_id` ↔ wire `src`,
+  `EnvelopeHeader::incarnation_tag` ↔ wire `tag` are all legal: the member out-explains the key.
+- A member spelled `cr` against a wire key `condemn_round` would be illegal; so would introducing
+  any new initialism member alongside a readable key. The rule is a review gate for future codecs;
+  today's members already satisfy it, so no rename pass is required.
+- Where a semantic wire word collides with a C++ keyword, the member uses the established
+  abbreviation or a fuller form, both compliant: wire `namespace` ↔ member `ns` (an established
+  fragment, not a cryptic invention), wire `class` ↔ member `classification`.
+- Flattened wire keys correspond to member paths (`lease.seq` ↔ `lease_seq`,
+  `hold->reason` ↔ `hold_reason`); the path segments obey the same rule.
+- Where neither side is budget-constrained, prefer the same word on both sides.
 
 ## Common framing and critical fields {#common-framing-and-critical-fields}
 
 `CasTextFormat` keeps the common shapes unchanged:
 
 ```json
-{"type":"cas_ref_log","v":11}
+{"type":"cas_ref_log","v":1}
 {"n":42}
 ```
 
-The keys `type`, `v`, and `n` therefore do not participate in the rename.
+The keys `type`, `v`, and `n` therefore do not participate in the rename. The header `v` is the
+single mechanism every reader uses to refuse what it cannot parse; it stays byte-identical across
+this and any future cut.
 
 A leading `!` continues to mean “must understand”. A tolerant reader skips an unknown ordinary key,
 but an unknown `!` key raises `UNKNOWN_FORMAT_VERSION`. The prefix is orthogonal to the field name and
@@ -121,22 +160,23 @@ inject names such as `!future_critical_field` to exercise the generic fail-close
 
 The flat shared value types use the same keys in every repeated record:
 
-| Value type | Current keys | Generation-11 keys |
+| Value type | Old keys | New keys |
 |---|---|---|
 | `BlobRef` | `ha`, `h` | `algo`, `digest` |
 | `Token` | `tt`, `tv` | `token_type`, `token` |
 | `ManifestRef` | `me`, `mb`, `mo` | `epoch`, `build`, `ord` |
 
 `writeBlobRefFields`, `writeTokenFields`, and `writeManifestRefFields` remain the single writers for
-these flat representations. `writeManifestRefFields` retains its prefix argument; owner-transition
-bindings pass `old_` or `new_`, producing `old_epoch`, `old_build`, `old_ord`, and their `new_`
-counterparts. There is no runtime naming mode.
+these flat representations. `writeManifestRefFields` retains its prefix argument (the same prefix
+also feeds `writeBindingFields`, which prefixes the binding kind and ref name); owner-transition
+bindings pass `old_` or `new_`, producing `old_kind`, `old_ref`, `old_epoch`, `old_build`,
+`old_ord`, and their `new_` counterparts. There is no runtime naming mode.
 
 ## Fixed blob descriptor {#fixed-blob-descriptor}
 
-The generation-11 descriptor vocabulary is:
+The new descriptor vocabulary is:
 
-| Current | Generation 11 | Meaning |
+| Old | New | Meaning |
 |---|---|---|
 | `type` | `type` | object type |
 | `v` | `v` | compatibility generation |
@@ -151,33 +191,38 @@ The generation-11 descriptor vocabulary is:
 The canonical shape is:
 
 ```json
-{"type":"cas_blob","v":11,"tag":"…","build":"…","time_ms":123,"creator":"…","op":"merge","chver":26008000,"ref":"…"}
+{"type":"cas_blob","v":1,"tag":"…","build":"…","time_ms":123,"creator":"…","op":"merge","chver":26008000,"ref":"…"}
 ```
 
-At maximum legal value widths, the current non-`ref` JSON consumes 214 bytes. The four renames add
-exactly 15 bytes: `bld` to `build` adds 2, `ts` to `time_ms` adds 5, `by` to `creator` adds 5, and
-`ch` to `chver` adds 3. The generation-11 non-`ref` JSON is therefore 229 bytes. The `ref` key,
-empty quotes, closing brace, and final newline require another 11 bytes, for an exact mandatory
-worst case of 240 bytes.
+At maximum legal value widths, the current non-`ref` JSON consumes 213 bytes. (The in-code
+worst-case table at the top of `CasPoolMetaFormat.cpp` says 214 and 225; it charges the `,"by":`
+prefix 7 bytes where a 2-character key costs 6 — the same off-by-one must be fixed in the same
+change.) The four renames add exactly 15 bytes: `bld` to `build` adds 2, `ts` to `time_ms` adds 5,
+`by` to `creator` adds 5, and `ch` to `chver` adds 3. The new non-`ref` JSON is therefore
+228 bytes. The `ref` key framing, empty quotes, closing brace, and final newline require another
+11 bytes, for an exact mandatory worst case of **239 bytes**.
 
 Consequences:
 
-- the existing minimum `blob_header_len = 240` remains valid, with a zero-byte diagnostic `ref`
+- the existing minimum `blob_header_len = 240` remains valid, with a one-byte diagnostic `ref`
   budget at maximum field widths;
-- the default `blob_header_len = 256` leaves 16 escaped bytes for the diagnostic `ref`;
+- the default `blob_header_len = 256` leaves 17 escaped bytes for the diagnostic `ref`;
 - the encoded descriptor remains exactly `blob_header_len` bytes after space padding;
 - the payload offset and every existing range-read calculation remain unchanged;
 - `validatePoolBlobHeaderLen` keeps its numeric bounds, but its rationale and boundary tests change
-  from a 225-byte to a 240-byte mandatory descriptor.
+  from a 224-byte to a 239-byte mandatory descriptor.
 
-The production descriptor must fit 240 bytes without relying on omission of provenance fields. The
+The production descriptor must fit 240 bytes without relying on omission of provenance fields.
+Because the worst case now sits one byte under the floor, the boundary test must derive the longest
+`op` word by iterating the `ProvenanceOp` table (today `mutation`) rather than hard-coding it, so a
+future longer provenance word trips a test instead of overflowing minimum-configured pools. The
 test-only `!x` extension is exercised with a 256-byte header, where it also fits.
 
 ## Singleton control objects {#singleton-control-objects}
 
 These fields occur once per small control object and use descriptive names:
 
-| Format | Current | Generation 11 |
+| Format | Old | New |
 |---|---|---|
 | `cas_blob_meta` | `st`, `cr`, `sz` | `state`, `condemn_round`, `size` |
 | `cas_pool_meta` | `pid`, `hln`, `gcs`, `mrg`, `alg` | `pool_id`, `blob_header_len`, `gc_shards`, `min_reader_generation`, `algos_used` |
@@ -188,14 +233,20 @@ These fields occur once per small control object and use descriptive names:
 | `cas_epoch` | `nwe` | `next_writer_epoch` |
 | `cas_mount_lease` | `su`, `we`, `hn`, `pid`, `sat`, `seq`, `eat`, `ma`, `fen`, `write_attempt_id` | `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active`, `gc_fenced`, `write_attempt_id` |
 
+The mount lease keeps `pid` (an established fragment: the OS process id) and `seq` (approved
+vocabulary). `min_active` mirrors the member `MountLease::min_active`; its `UINT64_MAX`
+clean-farewell sentinel is part of the field contract and stays documented at the codec.
+
 The value encodings do not change. In particular, full-range counters that are currently decimal JSON
 strings remain strings, bounded values remain numbers, and IDs remain lowercase fixed-width hex.
+`cas_owner`'s `retired_at_ms` remains conditionally emitted (a never-retired owner's body is the
+one-key object).
 
 ## Ref checkpoint {#ref-checkpoint}
 
-`cas_ref_ckpt` is a small strict singleton. Its optional pairs become:
+`cas_ref_ckpt` is a small strict singleton. Its optional fields become:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `le` | `life_epoch` |
 | `cte`, `cts` | `committed_epoch`, `committed_seq` |
@@ -208,7 +259,7 @@ The existing both-or-neither rules for each `RefTxnId` pair remain unchanged.
 
 The once-per-object metadata line changes as follows:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `ns` | `namespace` |
 | `we`, `rs` | `txn_epoch`, `txn_seq` |
@@ -219,21 +270,23 @@ chain evidence.
 
 Operation rows are high-cardinality and use semantic compact names:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `op` | `op` |
 | `obk`, `orn`, `ome`, `omb`, `omo` | `old_kind`, `old_ref`, `old_epoch`, `old_build`, `old_ord` |
 | `nbk`, `nrn`, `nme`, `nmb`, `nmo` | `new_kind`, `new_ref`, `new_epoch`, `new_build`, `new_ord` |
 | `rn`, `me`, `mb`, `mo`, `ts` in `set_published_at` | `ref`, `epoch`, `build`, `ord`, `published_ms` |
 
-Operation values such as `owner_transition`, `set_published_at`, and `epoch_seal`, and owner-kind
-values `committed` and `precommit`, are already descriptive and do not change.
+The complete closed set of `op` values — `namespace_birth`, `owner_transition`,
+`set_published_at`, `remove_namespace`, `epoch_seal` — and the owner-kind values `committed` and
+`precommit` are already descriptive and do not change. (`namespace_birth`, `remove_namespace`, and
+`epoch_seal` rows are body-less: the row is the `op` key alone.)
 
 ## Ref snapshot {#ref-snapshot}
 
 The once-per-object metadata line becomes:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `ns` | `namespace` |
 | `we`, `rs` | `snapshot_epoch`, `snapshot_seq` |
@@ -241,7 +294,7 @@ The once-per-object metadata line becomes:
 
 Repeated rows become:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `k` | `kind` |
 | `rn` | `ref` |
@@ -249,17 +302,17 @@ Repeated rows become:
 | `ts` | `published_ms` |
 
 The abbreviated row-tag values also change: `c` becomes `committed`, and `p` becomes `precommit`.
+`published_ms` remains committed-only, exactly as `ts` is today.
 
-The reader-only retired fields `rte`, `rts`, and `pl` remain explicit rejection sentinels. They are
-not live generation-11 fields, are never written, and are not aliases. Keeping their rejection paths
-prevents a malformed current-generation object from silently reintroducing retired semantics through
-the tolerant reader.
+The reader-only retired sentinels `rte`, `rts`, and `pl` are **deleted together with their tests**
+as part of the generation reset: after the reset, no object that ever carried those fields can
+exist, so the guard has nothing left to guard (see the reset section).
 
 ## Part manifest {#part-manifest}
 
 The once-per-object descriptor line becomes:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `me`, `mb`, `mo` | `epoch`, `build`, `ord` |
 | `ns` | `root_namespace` |
@@ -267,7 +320,7 @@ The once-per-object descriptor line becomes:
 
 Repeated entry rows become:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `p` | `path` |
 | `pm` | `place` |
@@ -279,28 +332,30 @@ Both placements therefore use one `size` key. For a blob it remains the raw blob
 inline entry it remains the following payload length. The placement word determines which case is
 valid, exactly as it determines whether `sz` or `il` is valid today.
 
-The payload-zone banner changes from `il=<n>` to `size=<n>`. It is rebuilt from the decoded path and
-size and compared byte-for-byte as before. Placement values `inline` and `blob`, raw payload framing,
-entry ordering, and the `n` trailer do not change.
+The payload-zone banner changes from `il=<n>` to `size=<n>`, so the abbreviation does not survive
+in the payload zone alone. It is rebuilt from the decoded path and size and compared byte-for-byte
+as before. Placement values `inline` and `blob`, raw payload framing, entry ordering, and the `n`
+trailer do not change.
 
 ## GC outcome log {#gc-outcome-log}
 
 Each repeated outcome row becomes:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `k` | `kind` |
 | `ha`, `h` | `algo`, `digest` |
 | `tt`, `tv` | `token_type`, `token` |
 | `oc` | `outcome` |
 
-The existing full-word values `blob`, `deleted`, `absent`, `replaced`, and `spared` do not change.
+The `kind` value set has a single word, `blob`; the complete `outcome` set is `deleted`, `absent`,
+`replaced`, and `spared`. None of these change.
 
 ## Ref catalog {#ref-catalog}
 
 `cas_ref_catalog` can grow to many raw rows, so each row uses compact semantic context:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `k` | `kind` |
 | `ent` tag value | `entry` |
@@ -313,14 +368,15 @@ The existing full-word values `blob`, `deleted`, `absent`, `replaced`, and `spar
 | `cfg` | `creator_fence` |
 
 Within an `entry` row, `life` is the opaque namespace-life identity, while `creator` is the creator's
-server-root ID. The existing creator/state and removal/state pairing rules remain unchanged.
+server-root ID. The existing creator/state and removal/state pairing rules remain unchanged, and the
+`state` value set stays `creating`, `live`, `removing`.
 
 ## Source-edge run {#source-edge-run}
 
 The `cas_run` header retains `type`, `v`, and `kind`; the existing `source_edge` kind value also
 remains unchanged. Repeated rows become:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `b` | `ref` |
 | `s` | `src` |
@@ -328,8 +384,13 @@ remains unchanged. Repeated rows become:
 | `pend` | `pending` |
 | `tt`, `tv` | `token_type`, `token` |
 | `sz` | `size` |
-| `cr` | `round` |
+| `cr` | `condemn_round` |
 | `mc` | `confirmed` |
+
+`cr` maps to the same member concept as `cas_blob_meta`'s `condemn_round` — the GC round that
+condemned the object — so both formats spell it `condemn_round`; giving the same concept two wire
+spellings would defeat cross-format greppability. The field appears only on condemned rows, which
+are a small fraction of a run, so the longer word does not touch the dominant active-row cost.
 
 Marker values `edge`, `zero`, and `condemned` remain unchanged. The serialized `ref` value remains
 the algorithm byte followed by the digest, so lexical `(ref, src)` ordering continues to equal the
@@ -342,7 +403,7 @@ The once-per-object metadata line changes from `g` and `pg` to `generation` and
 
 Every repeated record uses `kind` instead of `k`. The record tags change as follows:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `rfl` | `ref_life` |
 | `btr` | `blob_run` |
@@ -350,52 +411,84 @@ Every repeated record uses `kind` instead of `k`. The record tags change as foll
 
 A `blob_run` row becomes:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `key` | `key` |
 | `ck` | `checksum` |
 | `shard` | `shard` |
-| `gen` | `generation` |
+| `gen` | `key_generation` |
+
+`key_generation` is deliberately **not** `generation`: the metadata `generation` is the generation
+this seal *is*, while a run row's value is the generation whose key namespace physically holds the
+run object — and the two genuinely diverge when an idle shard carries its parent's run forward
+verbatim. One word for both would read as corruption in exactly the situation the carry-forward is
+designed for. The validator continues to cross-check the row value against the run `key`.
 
 A `ref_life` row becomes:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `life` | `life` |
 | `cls` | `class` |
 | `lfe`, `lfs` | `fold_epoch`, `fold_seq` |
-| `hr` | `hold` |
+| `hr` | `hold_reason` |
 | `hpe`, `hps` | `hold_epoch`, `hold_seq` |
 | `hrc` | `retries` |
 | `hnr` | `retry_round` |
 | `rte`, `rts` | `remove_epoch`, `remove_seq` |
 
+`hold_reason` (not a bare `hold`) because the value is a reason word such as
+`witness_disappeared` — a key named `hold` reads as a boolean. It also matches the member path
+`hold->reason`. The `class` values remain the closed numeric set `{0, 1, 2, 4}` (a machine
+classification consumed by GC logic, documented at `CasFoldSealFormat.h`); the C++ member stays
+`classification`, which the asymmetric member rule permits and the `class` keyword requires.
+
 A `condemned` summary row becomes:
 
-| Current | Generation 11 |
+| Old | New |
 |---|---|
 | `shard` | `shard` |
 | `ct` | `condemned` |
 | `pt` | `pending` |
 | `ocr` | `oldest_round` |
 
-The context supplied by `kind` makes `class`, `hold`, `retries`, `condemned`, `pending`, and
+The context supplied by `kind` makes `class`, `hold_reason`, `retries`, `condemned`, `pending`, and
 `oldest_round` unambiguous without repeating the full C++ nesting in every raw row. All ordering,
 closed-set, both-or-neither, hold, cleanup-evidence, and shard-total validation remains unchanged.
+
+## Closed value sets {#closed-value-sets}
+
+Value representations do not change, but the complete vocabulary goal includes them, so the closed
+sets are pinned here and in the goldens:
+
+- `op` (ref log): `namespace_birth`, `owner_transition`, `set_published_at`, `remove_namespace`,
+  `epoch_seal`;
+- binding kinds (`old_kind`/`new_kind`): `committed`, `precommit`;
+- `token_type`: `etag`, `generation`, `emulated`;
+- `algo` (and the leading algorithm byte in a run `ref`): `ch128`, `xxh3`, `sha256`;
+- `mark`: `edge`, `zero`, `condemned`;
+- `outcome`: `deleted`, `absent`, `replaced`, `spared`; outcome `kind`: `blob` (sole value);
+- catalog `state`: `creating`, `live`, `removing`;
+- `lifecycle`: `live` (sole value, hard-required);
+- `hold_reason` (append-only): `gap_below_witness`, `unconsumed_seal_crossing`,
+  `witness_disappeared`, `body_undecodable`, `manifest_body_missing`, `checkpoint_undecodable`;
+- `class`: numeric `{0, 1, 2, 4}` — deliberately not words (see fold seal);
+- `place`: `inline`, `blob`; run header `kind`: `source_edge`; blob descriptor `op`: `other`,
+  `insert`, `merge`, `mutation`, `attach`, `repack`.
 
 ## Decompressed-byte accounting {#decompressed-byte-accounting}
 
 Compression policy is not used to decide whether a repeated key may be long. The relevant quantity is
-the number of key and tag bytes emitted after decompression. The generation-11 mappings deliberately
-remain substantially smaller than exact member names.
+the number of key and tag bytes emitted after decompression. The mappings deliberately remain
+substantially smaller than exact member names.
 
 The following deltas count only key and changed record-tag bytes; JSON punctuation and values are
 unchanged:
 
-| Repeated record | Generation-11 increase |
+| Repeated record | Increase |
 |---|---:|
 | active `cas_run` row | 7 bytes |
-| condemned `cas_run` row | 33 bytes |
+| condemned `cas_run` row | 41 bytes |
 | blob `PartManifest` entry | 15 bytes |
 | inline `PartManifest` entry | 8 bytes, plus 2 bytes in its payload banner |
 | `GcOutcomes` row | 26 bytes |
@@ -411,37 +504,47 @@ Numeric object and line caps do not increase. Consequently, a canonical object n
 uncompressed byte limit may admit fewer records after the rename. This is intentional: increasing a
 cap would increase whole-read memory and line-allocation exposure merely to compensate for spelling.
 Admission estimators and fold-seal reservation helpers must continue measuring through the real
-generation-11 encoders rather than using hand-maintained byte constants.
+encoders rather than using hand-maintained byte constants.
 
 Implementation verification records before/after encode and decode throughput for representative
 large `cas_run`, `RefSnapshot`, and `PartManifest` inputs. These measurements are review evidence,
 not a timing assertion in CI. Exact encoded-byte deltas and boundary sizes are pinned in deterministic
 unit tests.
 
-## Compatibility and generation floor {#compatibility-and-generation-floor}
+## Generation reset {#compatibility-and-generation-floor}
 
-This is a breaking generation-11 change to every live codec. Implementation must:
+There are no existing installations and no persisted data that must survive, so the breaking change
+ships as a reset, not a bump. Implementation must:
 
-- set `G_BUILD` to 11 and introduce a named generation constant for the semantic-key change;
-- append `{11, 11}` to the immutable change-point history of all 17 registered formats:
-  `Blob`, `BlobMeta`, `PoolMeta`, `RefLog`, `RefSnapshot`, `RefCkpt`, `RefCatalog`,
-  `GcMaintenanceState`, `PartManifest`, `RunFile`, `FoldSeal`, `GcState`, `GcHeartbeat`,
-  `GcOutcomes`, `Owner`, `ServerEpoch`, and `MountLease`;
-- leave the reserved `Roster` identifier without traits or a codec;
-- raise the pool-wide backward floor enforced by `decodePoolMeta` from generation 10 to generation
-  11 and describe the semantic-wire-key boundary in its exception;
-- stamp every newly encoded object with `v:11` through `currentCompatibilityVersion`;
-- keep the normal forward gate, so an older reader rejects `v:11` with
-  `UNKNOWN_FORMAT_VERSION` before reading a body.
+- set `G_BUILD` to 1; `currentCompatibilityVersion` and `currentWriterVersion` stamp every newly
+  encoded object with `v:1`;
+- collapse the change-point history of all 17 registered formats (and the reserved `Roster` row) to
+  the `{1, 1}` baseline, and delete the named legacy generation constants
+  (`kContiguousRefStreamsGeneration` through `kMountWriteAttemptIdGeneration`) together with every
+  reference to them;
+- keep the floor machinery itself — `decodePoolMeta`'s backward gate and the
+  `min_reader_generation` forward gate — dormant at 1 for the next real breaking change; new pools
+  mint `min_reader_generation = 1`;
+- keep the normal forward gate, so a reader rejects `v` above `G_BUILD` with
+  `UNKNOWN_FORMAT_VERSION` before reading a body;
+- delete the retired-field rejection sentinels (`pl` on ref-log and ref-snapshot rows, `rte`/`rts`
+  on the ref-snapshot meta line) and their tests: post-reset, no object that ever carried those
+  fields can exist, and a sentinel guarding a spelling that cannot occur is dead scaffolding;
+- delete the legacy-generation refusal tests (the pre-contiguous, generation-five, generation-six,
+  and reader-floor pool fixtures): their subject matter no longer exists, and their fixtures could
+  only be kept by encoding objects no generation ever wrote;
+- re-stamp every test fixture that uses a historical header version (the `"v":3`-style literals
+  whose comments say "any version <= G_BUILD passes the gate") to 1, since the forward gate at
+  `G_BUILD = 1` would otherwise reject them before the body under test;
+- replace the per-generation history table in `Formats/README.md` with a single note recording the
+  reset.
 
-A generation-11 reader never mounts a generation-10 pool: `_pool_meta` is checked before other pool
-objects are interpreted. There is no supported mixed-generation state. CAS is pre-release, so the
-operator recreates the pool rather than migrating persisted objects.
-
-Readers recognize only generation-11 live spellings. They do not accept old keys as aliases. In a
+Readers recognize only the new live spellings. They do not accept old keys as aliases. In a
 tolerant format, an old optional spelling has the same behavior as any unknown ordinary key: it may
 be skipped, but it never populates the renamed field. Required-field validation and strict formats
-continue to reject incomplete or unknown shapes according to their existing policies.
+continue to reject incomplete or unknown shapes according to their existing policies. A stray
+pre-reset object or pool — which should not exist — fails closed as `CORRUPTED_DATA` or
+`UNKNOWN_FORMAT_VERSION`; no friendlier taxonomy is owed to data that was never released.
 
 ## Codec structure {#codec-structure}
 
@@ -464,26 +567,30 @@ not change.
 The implementation updates every exact-byte fixture and adds coverage in five layers.
 
 First, each of the 17 registered formats receives or retains a canonical encode/decode golden that
-pins the generation-11 header, field order, key spelling, tag spelling, and value representation.
+pins the post-reset header, field order, key spelling, tag spelling, and value representation.
 Goldens remain inline with the codec unit tests; no generated golden-update command is introduced.
 
 Second, `cas_format_test_battery` must cover the same set of `FormatId` values as the live traits
 registry. The current omissions for `RefCkpt`, `GcMaintenanceState`, and `RunFile` are closed, and a
 set-equality assertion prevents another registered codec from silently missing the common battery.
+(The registry's `TRAITS` table currently lives in an anonymous namespace with no enumeration
+accessor; the assertion needs one small export.)
 
 Third, compatibility tests pin:
 
-- generation-10 `_pool_meta` is rejected before its body is interpreted;
-- generation-11 objects use only new live spellings;
-- representative old spellings are not aliases;
+- the forward gate: `v:2` is rejected with `UNKNOWN_FORMAT_VERSION` before the body;
+- objects use only new live spellings, stamped `v:1`;
+- representative old spellings are not aliases — a tolerant reader skips them without populating
+  the renamed field, a strict reader rejects them;
 - unknown ordinary fields retain strict/tolerant behavior;
 - unknown `!` fields still raise `UNKNOWN_FORMAT_VERSION`;
 - `!prev_epoch` and `!prev_seq` retain both-or-neither validation.
 
-Fourth, blob-envelope boundary tests construct maximum-width mandatory values and assert:
+Fourth, blob-envelope boundary tests construct maximum-width mandatory values — deriving the
+longest `op` word from the `ProvenanceOp` table — and assert:
 
-- `blob_header_len = 240` succeeds with an empty truncated `ref`;
-- `blob_header_len = 256` succeeds and permits exactly 16 escaped `ref` bytes at the mandatory
+- `blob_header_len = 240` succeeds with a one-byte truncated `ref` budget;
+- `blob_header_len = 256` succeeds and permits exactly 17 escaped `ref` bytes at the mandatory
   maximum;
 - the returned header is exactly the configured length and the payload offset is unchanged;
 - the 256-byte test-only unknown-critical descriptor still fits and fails decode as
@@ -504,18 +611,20 @@ registry/battery equality, and the documented vocabulary are the enforcement mec
 
 ## Documentation changes {#documentation-changes}
 
-`Formats/README.md` replaces “keys 2–5 chars” with the generation-11 naming rule:
+`Formats/README.md` replaces “keys 2–5 chars” with the naming rule:
 
 - descriptive names for once-per-object metadata;
 - semantic compact words for repeated records;
 - the explicitly budgeted blob descriptor vocabulary;
 - fixed framing `type`, `v`, and `n`;
-- `!` as the must-understand prefix.
+- `!` as the must-understand prefix;
+- the asymmetric C++ member rule.
 
-The README object examples and per-format comments are updated to generation-11 spellings in the same
-commit as the codecs. The backlog item at `wire-keys-full-words` is resolved by pointing to this
-design and recording that exact full member names were deliberately rejected for repeated records
-and the fixed blob descriptor.
+The README object examples, per-format comments, and the generation-history table are updated in the
+same commit as the codecs, and the descriptor worst-case comment in `CasPoolMetaFormat.cpp` is
+corrected (213/224, becoming 228/239) in the same change. The backlog item at
+`wire-keys-full-words` is resolved by pointing to this design and recording that exact full member
+names were deliberately rejected for repeated records and the fixed blob descriptor.
 
 ## Rejected alternatives {#rejected-alternatives}
 
@@ -524,6 +633,14 @@ and the fixed blob descriptor.
 This maximizes local readability but makes the fixed blob descriptor exceed 256 bytes, inflates raw
 record streams, increases decompression and parser traffic, and changes effective record capacity
 under uncompressed byte caps. It also leaks incidental C++ nesting into a wire contract.
+
+This alternative was independently implemented in Altinity PR #2288 and rejected by decision on
+2026-08-28 ("достаточно полные" keys, not full names). The PR's own consequences illustrate the
+costs: the descriptor no longer fit, so the default payload offset grew from 256 to 384 and the
+floor from 240 to 320; active run rows grew ~20%; and the framing rename `v`→`version` made the
+version gate itself unreadable across the cut. Its useful parts are adopted here instead: the
+thoroughness of its golden/splice/integration sweep sets the bar for the test strategy, and its
+key-collision resolutions informed `condemn_round`, `hold_reason`, and `key_generation`.
 
 ### Keep all current keys and add a mapping table {#keep-all-current-keys-and-add-a-mapping-table}
 
@@ -540,20 +657,31 @@ and gives fixed headers and repeated rows explicit treatment.
 ### Compact and full runtime profiles {#compact-and-full-runtime-profiles}
 
 Allowing the same value type to serialize under selectable key profiles adds schema state and reader
-branches without a protocol need. Generation 11 has one canonical spelling per containing format.
+branches without a protocol need. There is one canonical spelling per containing format.
+
+### Mirroring the wire vocabulary back into C++ members {#mirroring-wire-vocabulary-into-members}
+
+Renaming `ManifestRef::writer_epoch` to `epoch` and the like would make the two sides byte-identical
+but shortens code that has no byte budget. The asymmetric member rule keeps the C++ side at least as
+readable as the wire without a churn-only rename pass.
 
 ## Acceptance criteria {#acceptance-criteria}
 
 The change is complete when:
 
-- every production writer and corresponding reader uses the generation-11 tables in this document;
-- every live `FormatId` has a generation-11 breaking change point;
-- generation-10 pools fail at the pool floor and no old key alias exists;
-- a maximum-width production blob descriptor fits 240 bytes and a default descriptor fits 256 bytes
-  with the documented `ref` budget;
-- common, codec, corruption, byte-budget, and exact-encoding unit tests pass for all 17 formats;
-- raw assertions in integration tests and `utils/ca-soak` use generation-11 spellings;
-- `Formats/README.md`, codec comments, and the backlog no longer claim a universal 2–5-character or
-  exact-full-member-name convention;
+- every production writer and corresponding reader uses the key tables in this document;
+- `G_BUILD == 1`, every change-point history is the `{1, 1}` baseline, the legacy generation
+  constants, legacy-refusal tests, and retired-field sentinels are deleted, and all fixtures stamp
+  `v:1`;
+- a maximum-width production blob descriptor fits 240 bytes (one spare byte) and a default
+  descriptor fits 256 bytes with a 17-byte `ref` budget, with the worst case derived from the
+  `ProvenanceOp` table;
+- no C++ member is more cryptic than its wire key (review gate; no member renames are required by
+  this change);
+- common, codec, corruption, byte-budget, and exact-encoding unit tests pass for all 17 formats,
+  and the battery covers exactly the registry;
+- raw assertions in integration tests and `utils/ca-soak` use the new spellings;
+- `Formats/README.md`, codec comments, the `CasPoolMetaFormat.cpp` worst-case table, and the
+  backlog no longer claim a universal 2–5-character or exact-full-member-name convention;
 - local before/after measurements report the decompressed bytes and encode/decode throughput of the
   representative high-cardinality formats for review.
