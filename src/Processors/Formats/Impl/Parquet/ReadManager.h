@@ -112,6 +112,14 @@ private:
     std::array<std::atomic<ssize_t>, NUM_MEMORY_POOLS> pool_usage {};
     std::array<double, NUM_MEMORY_POOLS> pool_fraction {};
 
+    /// Bytes of delivered chunks that are still held by the pipeline (not yet consumed/dropped).
+    /// Charged to the `Decoded` pool in addition to `pool_usage`, via `ChunkMemoryInfo` attached to
+    /// each delivered `Chunk`. Kept separate (not folded into `pool_usage`) because it's decremented
+    /// by chunk destructors running on arbitrary threads outside of `flushMemoryUsageDiff`, and
+    /// because it must outlive `ReadManager` for chunks that are still alive after the reader is
+    /// destroyed -- hence the `shared_ptr`.
+    std::shared_ptr<std::atomic<ssize_t>> delivered_bytes = std::make_shared<std::atomic<ssize_t>>(0);
+
     SharedResourcesExt::Limits poolLimits(MemoryPool pool) const;
 
     std::mutex delivery_mutex;

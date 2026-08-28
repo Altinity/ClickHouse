@@ -1,5 +1,6 @@
 #include <Processors/Formats/Impl/Parquet/ReadManager.h>
 
+#include <Processors/Formats/Impl/Parquet/ChunkMemoryInfo.h>
 #include <Common/BitHelpers.h>
 #include <Common/Logger.h>
 #include <Common/ProfileEvents.h>
@@ -603,8 +604,11 @@ void ReadManager::flushMemoryUsageDiff(MemoryUsageDiff && diff)
             const auto & stage = stages[i];
             auto limits = poolLimits(pool);
             limits.parsing_threads = SharedResourcesExt::getLimitsPerReader(*parser_shared_resources, 1.0, stage.thread_target_fraction).parsing_threads;
+            size_t memory_usage = size_t(std::max<ssize_t>(0, pool_usage[size_t(pool)].load(std::memory_order_relaxed)));
+            if (pool == MemoryPool::Decoded)
+                memory_usage += size_t(std::max<ssize_t>(0, delivered_bytes->load(std::memory_order_relaxed)));
             bool should_schedule = checkTaskSchedulingLimits(
-                size_t(std::max<ssize_t>(0, pool_usage[size_t(pool)].load(std::memory_order_relaxed))), 0,
+                memory_usage, 0,
                 stage.batches_in_progress.load(std::memory_order_relaxed), 0, limits);
             if (should_schedule)
             {
@@ -633,6 +637,8 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
     auto limits = poolLimits(poolOf(stage_idx));
     limits.parsing_threads = SharedResourcesExt::getLimitsPerReader(*parser_shared_resources, 1.0, stage.thread_target_fraction).parsing_threads;
     size_t memory_usage = size_t(std::max<ssize_t>(0, pool_usage[size_t(poolOf(stage_idx))].load(std::memory_order_relaxed)));
+    if (poolOf(stage_idx) == MemoryPool::Decoded)
+        memory_usage += size_t(std::max<ssize_t>(0, delivered_bytes->load(std::memory_order_relaxed)));
     size_t batches_in_progress = stage.batches_in_progress.load(std::memory_order_relaxed);
 
     LOG_TEST(getLogger("ParquetReadManager"), "scheduleTasksIfNeeded: stage={} memory_usage={} batches_in_progress={} limits: mem_low={} mem_high={} threads={}",
@@ -1034,6 +1040,7 @@ std::string ReadManager::collectDeadlockDiagnostics()
     result += " pools:";
     for (size_t p = 0; p < NUM_MEMORY_POOLS; ++p)
         result += " " + std::string(magic_enum::enum_name(MemoryPool(p))) + "=" + std::to_string(pool_usage[p].load(std::memory_order_relaxed));
+    result += " delivered_bytes=" + std::to_string(delivered_bytes->load(std::memory_order_relaxed));
 
     result += " stages: ";
     for (size_t i = 0; i < size_t(ReadStage::Deallocated); ++i)
@@ -1210,6 +1217,11 @@ ReadManager::ReadResult ReadManager::read()
         row_numbers_info->applied_filter = std::move(row_subgroup.filter.filter);
     }
     chunk.getChunkInfos().add(std::move(row_numbers_info));
+
+    /// The ColumnData token for this subgroup is released below (clearRowSubgroup), but the columns
+    /// live on inside `chunk`. Keep them charged to the Decoded pool until the pipeline drops the
+    /// chunk (see `poolOf` and the `delivered_bytes` uses in `scheduleTasksIfNeeded`/`flushMemoryUsageDiff`).
+    chunk.getChunkInfos().add(std::make_shared<ChunkMemoryInfo>(delivered_bytes, chunk.allocatedBytes()));
 
     /// This is a terrible hack to make progress indication kind of work.
     ///
