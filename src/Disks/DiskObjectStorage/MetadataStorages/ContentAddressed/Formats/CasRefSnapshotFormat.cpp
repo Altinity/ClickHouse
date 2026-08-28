@@ -117,7 +117,8 @@ struct ManifestFields
     ManifestRef build(std::string_view what) const
     {
         if (!me || !mb || !mo)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: {} manifest_ref missing me/mb/mo", what);
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableSnapshot: {} manifest_ref missing writer_epoch/build_sequence/manifest_ordinal", what);
         return manifestRefFromFields(*me, *mb, *mo, "RefTableSnapshot", what);
     }
 };
@@ -183,7 +184,8 @@ RefTableSnapshot decodeRefTableSnapshot(
             else r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs || !saw_lc)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: meta line missing ns/we/rs/lc");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableSnapshot: meta line missing namespace/writer_epoch/ref_sequence/lifecycle");
         if (!meta_buf.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: junk after meta line");
     }
@@ -211,7 +213,7 @@ RefTableSnapshot decodeRefTableSnapshot(
             break;
         }
         if (key != "kind")
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: record must start with \"k\"");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: record must start with \"kind\"");
         const String k = r.readString();
 
         std::optional<String> rn;
@@ -225,11 +227,11 @@ RefTableSnapshot decodeRefTableSnapshot(
             else if (key == "manifest_ordinal") mf.mo = r.readU64Number();
             else if (key == "published_at_ms") ts = r.readU64Number();
             else if (key == "payload")
-                /// `"pl"` (payload) was removed from the row wire in stage-1 T12. It is a KNOWN-removed
+                /// `payload` was removed from the row wire in stage-1 T12. It is a known removed
                 /// field, not a genuinely-unknown future one the tolerant reader may skip -- silently
                 /// discarding a persisted payload would lose data -- so reject it explicitly.
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "RefTableSnapshot: record carries the removed \"pl\" (payload) field");
+                    "RefTableSnapshot: record carries the removed \"payload\" field");
             else r.skipUnknown(key);
         }
         if (!l.eof())
@@ -238,7 +240,8 @@ RefTableSnapshot decodeRefTableSnapshot(
         if (k == "c")
         {
             if (!rn || !ts)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: committed row missing rn/ts");
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "RefTableSnapshot: committed row missing ref_name/published_at_ms");
             RefCommittedRow row;
             row.ref_name = *rn;
             checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
@@ -249,7 +252,7 @@ RefTableSnapshot decodeRefTableSnapshot(
         else if (k == "p")
         {
             if (!rn)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: precommit row missing rn");
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: precommit row missing ref_name");
             RefOwnerBinding row;
             row.kind = RefOwnerKind::Precommit;
             row.ref_name = *rn;

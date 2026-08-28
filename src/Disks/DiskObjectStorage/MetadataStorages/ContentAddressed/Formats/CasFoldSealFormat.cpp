@@ -371,7 +371,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             return seal;
         }
         if (key != "kind")
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: record must start with \"k\"");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: record must start with \"kind\"");
         const String kind = r.readString();
 
         if (kind == "rfl")
@@ -417,7 +417,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             /// `cls` is required, not defaulted: an absent one would read as 0 ("no round folded this
             /// namespace"), which is a claim about a fold, not the absence of one.
             if (!classification)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: rfl '{}' missing cls", life_hex);
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: rfl '{}' missing classification", life_hex);
             if (!isKnownClassification(*classification))
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS fold seal: coverage '{}' has classification {}, which is not one of the four "

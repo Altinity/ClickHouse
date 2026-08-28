@@ -307,7 +307,7 @@ TextHeader parseHeaderObject(std::string_view line, std::string_view what)
     TextHeader h;
     h.type = r.readString();
     if (!r.nextKey(key) || key != "version")
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: header line must carry \"v\" second", what);
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: header line must carry \"version\" second", what);
     h.v = r.readU32Number();
     while (r.nextKey(key))
         r.skipUnknown(key);

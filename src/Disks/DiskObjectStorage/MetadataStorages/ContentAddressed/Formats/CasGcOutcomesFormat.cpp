@@ -111,7 +111,8 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
         } while (r.nextKey(key));
 
         if (!have_ha || !have_h || !have_tt)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: record missing ha/h/tt");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS outcome log: record missing hash_algorithm/hash/token_type");
         const BlobHashAlgo algo = blobHashAlgoFromWord(ha, "outcome log");
         /// Validate the digest width before `fromHex`: a width mismatch must surface as the
         /// CORRUPTED_DATA required for malformed serialized input, not fromHex's BAD_ARGUMENTS.

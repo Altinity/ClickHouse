@@ -160,11 +160,12 @@ PartManifest decodePartManifest(std::string_view data)
             else r.skipUnknown(key);
         }
         if (!me || !mb || !mo)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing me/mb/mo");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "PartManifest: descriptor missing writer_epoch/build_sequence/manifest_ordinal");
         if (!ns)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing ns");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing namespace");
         if (!pd)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing pd");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing payload_digest");
         m.ref = manifestRefFromFields(*me, *mb, *mo, "PartManifest", "descriptor");
         m.root_namespace_id = RootNamespace(*ns);
         m.payload_digest = *pd;
@@ -199,7 +200,7 @@ PartManifest decodePartManifest(std::string_view data)
         }
 
         if (key != "path")
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"p\"");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"path\"");
         ManifestEntry e;
         e.path = r.readString();
 
@@ -234,13 +235,14 @@ PartManifest decodePartManifest(std::string_view data)
         if (!l.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: junk after record");
         if (!pm)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: entry '{}' missing pm", e.path);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: entry '{}' missing placement", e.path);
         e.placement = placementFromWord(*pm);
 
         if (e.placement == EntryPlacement::Blob)
         {
             if (!ha || !h || !sz)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: blob entry '{}' missing ha/h/sz", e.path);
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "PartManifest: blob entry '{}' missing hash_algorithm/hash/size", e.path);
             const BlobHashAlgo algo = blobHashAlgoFromWord(*ha, "PartManifest entry");
             /// Validate the digest width before calling `fromHex`. A width mismatch otherwise
             /// produces `BAD_ARGUMENTS` instead of the `CORRUPTED_DATA` required for malformed
@@ -258,7 +260,7 @@ PartManifest decodePartManifest(std::string_view data)
         else
         {
             if (!il)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: inline entry '{}' missing il", e.path);
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: inline entry '{}' missing inline_length", e.path);
             inline_lens.push_back(*il);   /// bytes filled from the payload zone below
         }
 

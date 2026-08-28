@@ -25,15 +25,16 @@ namespace DB::Cas
 ///   ,"created_at_ms":<u64>                  17 + 20            37
 ///   ,"creator_server_id":"<32 hex>"         21 + 34            55
 ///   ,"operation":"<word>"                   13 + 10            23
+///                                      (`mutation`: 8 + 2 quotes)
 ///   ,"clickhouse_version":<u32>             22 + 10            32
 ///                                                  non-ref JSON = 285 bytes
 /// The encoder then always frames the ref: `,"intended_ref":` (16) + `""` (2) + `}` (1), and
 /// reserves byte blob_header_len-1 for '\n' (1) = 20 bytes. The mandatory content therefore needs
-/// 285 + 20 = 305 bytes;
-/// below that, encodeEnvelopeHeader throws LOGICAL_ERROR on the FIRST blob write (the old drop-and-retry
-/// that used to mask this is gone). We floor at 320 (a multiple of 8 comfortably above 305, leaving
-/// >= 15 bytes for the diagnostic ref even at type maxima, and well under the 512 default) so a
-/// misconfigured pool fails at CREATION with BAD_ARGUMENTS, not at first write with LOGICAL_ERROR.
+/// 285 + 20 = 305 bytes. Below that, `encodeEnvelopeHeader` throws `LOGICAL_ERROR` on the first blob
+/// write (the old drop-and-retry that used to mask this is gone). We floor at 320, a multiple of 8
+/// comfortably above 305. This leaves exactly 15 bytes for the diagnostic ref at the floor (and more
+/// above it) and is well under the 384 default, so a misconfigured pool fails at creation with
+/// `BAD_ARGUMENTS`, not at the first write with `LOGICAL_ERROR`.
 static constexpr uint64_t kMinBlobHeaderLen = 320;
 
 void validatePoolBlobHeaderLen(uint64_t blob_header_len, int error_code, std::string_view what)

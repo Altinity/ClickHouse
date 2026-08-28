@@ -154,19 +154,22 @@ RefCkpt decodeRefCkpt(std::string_view data)
     if (cse || css)
     {
         if (!cse || !css)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: checkpoint_snapshot_id needs both cse and css");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS cas_ref_ckpt: checkpoint snapshot needs both checkpoint_snapshot_writer_epoch and checkpoint_snapshot_ref_sequence");
         ckpt.checkpoint_snapshot_id = RefTxnId{*cse, *css};
     }
     if (cte || cts)
     {
         if (!cte || !cts)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: committed_through needs both cte and cts");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS cas_ref_ckpt: committed frontier needs both committed_through_writer_epoch and committed_through_ref_sequence");
         ckpt.committed_through = RefTxnId{*cte, *cts};
     }
     if (lse || lss)
     {
         if (!lse || !lss)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: last_epoch_seal needs both lse and lss");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS cas_ref_ckpt: last epoch seal needs both last_epoch_seal_writer_epoch and last_epoch_seal_ref_sequence");
         ckpt.last_epoch_seal = RefTxnId{*lse, *lss};
     }
     if (!body_in.eof() || !in.eof())

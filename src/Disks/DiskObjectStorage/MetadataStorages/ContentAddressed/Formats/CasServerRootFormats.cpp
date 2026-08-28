@@ -70,7 +70,7 @@ OwnerObject decodeOwner(std::string_view data)
     }
     o.retired_at_ms = rt;
     if (!saw)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: missing su");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: missing server_uuid");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: trailing bytes");
     return o;
@@ -110,7 +110,7 @@ ServerEpoch decodeServerEpoch(std::string_view data)
             r.skipUnknown(key);
     }
     if (!saw)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: missing nwe");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: missing next_writer_epoch");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: trailing bytes");
     return e;

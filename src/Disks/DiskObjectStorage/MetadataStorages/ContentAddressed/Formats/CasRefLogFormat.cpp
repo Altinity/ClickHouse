@@ -30,7 +30,7 @@ std::string_view opKindToWord(RefOpKind k)
         case RefOpKind::RemoveNamespace: return "remove_namespace";
         case RefOpKind::EpochSeal:       return "epoch_seal";
     }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind {}", static_cast<uint8_t>(k));
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown operation kind {}", static_cast<uint8_t>(k));
 }
 
 RefOpKind opKindFromWord(std::string_view w)
@@ -40,7 +40,7 @@ RefOpKind opKindFromWord(std::string_view w)
     if (w == "set_published_at")  return RefOpKind::SetPublishedAt;
     if (w == "remove_namespace")  return RefOpKind::RemoveNamespace;
     if (w == "epoch_seal")        return RefOpKind::EpochSeal;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind '{}'", w);
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown operation kind '{}'", w);
 }
 
 /// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
@@ -122,7 +122,8 @@ struct ManifestFields
     ManifestRef build(std::string_view what) const
     {
         if (!me || !mb || !mo)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: {} manifest_ref missing me/mb/mo", what);
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: {} manifest_ref missing writer_epoch/build_sequence/manifest_ordinal", what);
         return manifestRefFromFields(*me, *mb, *mo, "RefLogTxn", what);
     }
 };
@@ -138,7 +139,7 @@ struct BindingFields
     RefOwnerBinding build(std::string_view what) const
     {
         if (!bk || !rn)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: {} binding missing bk/rn", what);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: {} binding missing binding_kind/ref_name", what);
         RefOwnerBinding b;
         b.kind = refOwnerKindFromWord(*bk, "RefLogTxn owner binding");
         b.ref_name = *rn;
@@ -151,7 +152,8 @@ struct BindingFields
 /// The log transaction's header-object meta line (ns + txn_id + the optional `prev_epoch_seal`
 /// chain). Shared by `encodeRefLogTxn` and `removalFramingSize` so the two never disagree by a byte;
 /// `removalFramingSize` always passes `std::nullopt` -- a removal transaction is never a sequence-1
-/// epoch-transition record. Additive: the `"!pse"`/`"!pss"` pair is emitted only when
+/// epoch-transition record. Additive: the `"!previous_seal_writer_epoch"`/
+/// `"!previous_seal_ref_sequence"` pair is emitted only when
 /// `prev_epoch_seal` is set, so a body without it is byte-identical to the pre-EpochSeal wire shape.
 /// `!`-prefixed: `prev_epoch_seal` is INV-2 chain evidence, not cosmetic metadata -- a decoder that
 /// doesn't understand it must refuse the object rather than silently drop the chain link while
@@ -201,13 +203,13 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
         else if (key == "new_build_sequence") nb.mf.mb = r.readU64String();
         else if (key == "new_manifest_ordinal") nb.mf.mo = r.readU64Number();
         else if (key == "payload")
-            /// `"pl"` (payload) was removed from the op wire in stage-1 T12 (the `set_payload` op became
-            /// `set_published_at`). The retired op WORD is already rejected by `opKindFromWord`, but this
-            /// generic reader reads field keys before switching on kind, so a `"pl"` field paired with a
-            /// still-recognized op word would otherwise be `skipUnknown`'d. It is a KNOWN-removed field,
+            /// `payload` was removed from the operation wire in stage-1 T12 (the `set_payload` operation became
+            /// `set_published_at`). The retired operation word is already rejected by `opKindFromWord`, but this
+            /// generic reader reads field keys before switching on kind, so a `"payload"` field paired with a
+            /// still-recognized operation word would otherwise be `skipUnknown`'d. It is a known removed field,
             /// not a genuinely-unknown one -- reject it explicitly rather than silently discard it.
             throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "RefLogTxn: op record carries the removed \"pl\" (payload) field");
+                "RefLogTxn: operation record carries the removed \"payload\" field");
         else r.skipUnknown(key);
     }
 
@@ -225,7 +227,7 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
             break;
         case RefOpKind::SetPublishedAt:
             if (!sp_rn || !sp_ts)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: set_published_at missing rn/ts");
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: set_published_at missing ref_name/published_at_ms");
             op.ref_name = *sp_rn;
             checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_published_at ref_name");
             op.expected_manifest_ref = sp_mf.build("set_published_at manifest_ref");
@@ -340,13 +342,16 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
             else r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: meta line missing ns/we/rs");
-        /// Both-or-neither: `nextKey` already rejects a repeated "!pse"/"!pss" (duplicate-key check), so
-        /// this only guards against a body carrying exactly one of the pair.
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: meta line missing namespace/writer_epoch/ref_sequence");
+        /// Both-or-neither: `nextKey` already rejects a repeated `"!previous_seal_writer_epoch"` or
+        /// `"!previous_seal_ref_sequence"` (duplicate-key check), so this only guards against a body
+        /// carrying exactly one of the pair.
         if (pse || pss)
         {
             if (!pse || !pss)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: prev_epoch_seal needs both !pse and !pss");
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "RefLogTxn: previous epoch seal needs both !previous_seal_writer_epoch and !previous_seal_ref_sequence");
             txn.prev_epoch_seal = RefTxnId{*pse, *pss};
         }
         if (!m.eof())
@@ -386,11 +391,11 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
             break;
         }
         if (key != "operation")
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: record must start with \"op\"");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: record must start with \"operation\"");
         const RefOpKind kind = opKindFromWord(r.readString());
         txn.ops.push_back(readOpRecord(r, kind));
         if (!l.eof())
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after op record");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after operation record");
     }
 
     /// Finalization: `txn.ops` is now complete, so the context-free seal grammar (which needs the

@@ -77,7 +77,7 @@ allocation. Always-small and deterministic kinds (`cas_ref_ckpt`, `cas_blob_meta
 `cas_run`, …) are stored raw, with no `.zst` suffix.
 
 The blob envelope is a special case of the header/body shape: a JSON descriptor padded with ASCII
-spaces to the pool-constant `blob_header_length` (512 bytes, a `cas_pool_meta` field), terminated by
+spaces to the pool-constant `blob_header_length` (384 bytes by default, a `cas_pool_meta` field), terminated by
 `\n`, so the raw payload always starts at that fixed offset with no header parse needed to locate
 it. The part manifest is the other `PayloadHybrid` kind: text header, descriptor, sorted NDJSON
 entry records, `{"record_count":…}` trailer, then a banner-framed raw payload zone for small inline file

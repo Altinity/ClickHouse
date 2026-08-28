@@ -132,7 +132,7 @@ void expectRunHeaderLine(ReadBuffer & in, std::string_view expected_kind)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: object is a '{}', not a '{}'", type, t.type);
 
     if (!r.nextKey(key) || key != "version")
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: header line must carry \"v\" second");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: header line must carry \"version\" second");
     const uint32_t v = r.readU32Number();
     checkCompatibility(v, t.type);
 
@@ -184,7 +184,7 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
     {
         writeKey(scratch, "delete_pending", first);
         writeBoolValue(scratch, rec.delete_pending);
-        writeTokenFields(scratch, first, rec.token);   /// tt + tv
+        writeTokenFields(scratch, first, rec.token);   /// token_type + token_value
         writeKey(scratch, "size", first);
         writeIntText(rec.size, scratch);
         writeKey(scratch, "condemn_round", first);
@@ -289,12 +289,13 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     } while (r.nextKey(key));
 
     if (!have_b || !have_s || !have_m)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: record missing b/s/m");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: record missing blob_ref/source_id/marker");
     out.ref = parseB(b);
     if (out.marker == kCondemned)
     {
         if (!have_pend || !have_tt || !have_tv || !have_sz || !have_cr || !have_mc)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pend/tt/tv/sz/cr/mc");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS cas_run: condemned record missing delete_pending/token_type/token_value/size/condemn_round/marker_confirmed");
         out.token = Token{tv, tt};
     }
     else if (have_pend || have_tt || have_tv || have_sz || have_cr || have_mc)

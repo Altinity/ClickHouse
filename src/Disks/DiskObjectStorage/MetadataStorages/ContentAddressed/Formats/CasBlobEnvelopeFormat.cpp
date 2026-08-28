@@ -42,7 +42,7 @@ ProvenanceOp opFromWord(std::string_view w)
     if (w == "mutation") return ProvenanceOp::Mutation;
     if (w == "attach")   return ProvenanceOp::Attach;
     if (w == "repack")   return ProvenanceOp::Repack;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob envelope: unknown op '{}'", w);
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob envelope: unknown operation '{}'", w);
 }
 
 /// The escaped byte-length of one raw ref char under the frozen envelope alphabet (see writeEnvelopeRefField).

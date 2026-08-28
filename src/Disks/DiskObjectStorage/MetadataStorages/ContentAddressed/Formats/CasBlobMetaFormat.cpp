@@ -85,7 +85,7 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
             r.skipUnknown(key);
     }
     if (!saw_state)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: missing st");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: missing state");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: trailing bytes");
     return m;

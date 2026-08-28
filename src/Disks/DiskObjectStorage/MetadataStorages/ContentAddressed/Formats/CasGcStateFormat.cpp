@@ -59,10 +59,10 @@ GcState decodeGcState(std::string_view data)
         else if (key == "lease_sequence") state.lease.seq = r.readU64String();
         else r.skipUnknown(key);
     }
-    /// Fail closed on an absent gcs: the writer always emits it, so a missing key means a corrupt object.
+    /// Fail closed on an absent `gc_shards`: the writer always emits it, so a missing key means a corrupt object.
     /// Do NOT silently keep the struct default (1) — that would hide corruption (no-fallback principle).
     if (!saw_gcs)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: missing gcs");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: missing gc_shards");
     if (state.gc_shards == 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: gc_shards must be >= 1");
     if (!body_in.eof() || !in.eof())

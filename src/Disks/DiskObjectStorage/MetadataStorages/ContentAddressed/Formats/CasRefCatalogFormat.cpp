@@ -191,7 +191,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
             return catalog;
         }
         if (key != "kind")
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: record must start with \"k\"");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: record must start with \"kind\"");
         const String kind = r.readString();
         if (kind != "ent")
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown record kind '{}'", kind);
@@ -212,13 +212,13 @@ RefCatalog decodeRefCatalog(std::string_view data)
             else if (key == "creator_writer_epoch") cwe = r.readU64String();
             else if (key == "creator_fence_generation") cfg = r.readU64String();
             else if (key == "removal_started_round") removal_started_round = r.readU64String();
-            else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ent key '{}'", key);
+            else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown entry key '{}'", key);
         }
         if (!l.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: junk after record");
 
         if (!st_word)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing st", ns_str);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing state", ns_str);
         const NsState state = nsStateFromWord(*st_word);   /// throws CORRUPTED_DATA on an unknown word
 
         /// A missing `namespace` key reads as the same empty string a present-but-empty one would, and both
@@ -234,7 +234,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
                 ns_str, ns_str.size(), kMaxNamespaceBytes);
 
         if (!inc)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing inc", ns_str);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing incarnation", ns_str);
         if (*inc == 0)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS ref catalog: namespace '{}' has a zero incarnation -- 0 never names a life", ns_str);

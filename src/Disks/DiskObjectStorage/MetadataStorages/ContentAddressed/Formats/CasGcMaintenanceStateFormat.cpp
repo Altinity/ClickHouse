@@ -55,7 +55,7 @@ GcMaintenanceState decodeGcMaintenanceState(std::string_view data)
             reader.skipUnknown(key);
     }
     if (!has_cursor)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc maintenance state: missing cur");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc maintenance state: missing janitor_cursor");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc maintenance state: trailing bytes");
     if (result.janitor_cursor.size() > kMaxGcMaintenanceCursorBytes)

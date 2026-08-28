@@ -44,12 +44,14 @@ constexpr char kCondemned  = 0x02;
 ///   {"blob_ref":"01<digest-hex>","source_id":"<32hex>","marker":"edge"} an active-edge / zero-marker row
 ///   {"record_count":184267} trailer: record count
 ///
-/// The record key `b` is the algo BYTE as two lowercase hex chars followed by the digest hex at the
-/// algo's width; `s` is the 32-hex source id. String-sorting records by (b, s) reproduces the current
+/// The record key `blob_ref` is the algorithm byte as two lowercase hex chars followed by the digest
+/// hex at the algorithm's width; `source_id` is the 32-hex source id. String-sorting records by
+/// (`blob_ref`, `source_id`) reproduces the current
 /// `(algorithm, digest, source_id)` byte order (lowercase hex preserves unsigned byte order and the
 /// algorithm byte is emitted first) — the invariant the fold's two-cursor merge depends on. The row-tag word
-/// `m` maps to the `kEdgeActive`/`kZeroMarker`/`kCondemned` bytes; a `condemned` row additionally
-/// carries the retired incarnation (`pend`/`tt`/`tv`/`sz`/`cr`) and the durable condemn-marker
+/// `marker` maps to the `kEdgeActive`/`kZeroMarker`/`kCondemned` bytes; a `condemned` row additionally
+/// carries the retired incarnation (`delete_pending`/`token_type`/`token_value`/`size`/`condemn_round`)
+/// and the durable condemn-marker
 /// confirmation bit (`mc`).
 
 /// One decoded source-edge row. All fields are identifier-layer types so the codec stays backend-free.
