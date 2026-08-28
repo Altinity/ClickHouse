@@ -26,8 +26,11 @@ composition, enum coverage is proven by set equality rather than by count, the t
 split is stated exactly, and `kMinBlobHeaderLen` gets one compile-time owner. Revision 7
 (2026-08-29) scopes the table rule to fully-serializable enum domains (`RefLifecycle`, the numeric
 classification, and `FormatId` are explicitly outside it), settles the run marker as a typed enum,
-and completes the Decision list. The exact-full-name alternative was independently implemented in
-Altinity PR #2288 and rejected for this design (see rejected alternatives).
+and completes the Decision list. Revision 8 (2026-08-29) pins the tables' performance profile:
+`toWord` is a direct indexed lookup over statically-proven-dense enums, `fromWord` stays a linear
+word scan, and an enum's persisted and configuration spellings are separate contracts. The
+exact-full-name alternative was independently implemented in Altinity PR #2288 and rejected for
+this design (see rejected alternatives).
 
 ## Problem {#problem}
 
@@ -583,7 +586,10 @@ encoders rather than using hand-maintained byte constants.
 Implementation verification records before/after encode and decode throughput for representative
 large `cas_run`, `RefSnapshot`, and `PartManifest` inputs. These measurements are review evidence,
 not a timing assertion in CI. Exact encoded-byte deltas and boundary sizes are pinned in deterministic
-unit tests.
+unit tests. The dominant performance risk of the whole change is the longer keys themselves — extra
+bytes written, compressed, decompressed, and key-compared — which these measurements cover; the enum
+tables must not add to it, so the review also inspects the generated assembly of the hot `toWord`
+instances (the `cas_run` marker first). No timing assertion is added to CI.
 
 ## Generation reset {#compatibility-and-generation-floor}
 
@@ -648,7 +654,16 @@ vocabulary item gains a single production carrier:
   table also proves two-way uniqueness of words and gives fail-closed `fromWord`
   (`CORRUPTED_DATA` on an unknown word; the defensive `toWord` throw stays against out-of-range
   enum values). `magic_enum` may back these asserts in `.cpp` files and tests only, never in
-  production headers. Lookup is a linear scan over a handful of entries — no maps. Three
+  production headers. Access is asymmetric by design: all these enums are dense, so `toWord` —
+  which sits on the encode hot path (`cas_run` renders a marker word on every row) — is a direct
+  indexed lookup (bounds check, index arithmetic from the first entry's underlying value, one
+  defensive identity guard), never a scan; `fromWord` stays a linear pass over the handful of
+  words, matching today's `if` chain. The compile-time asserts therefore additionally prove
+  density and sorted-by-underlying-value order, making the index arithmetic valid by construction.
+  No maps, no hashing, no allocation on either path; the exception paths stay cold. One enum may
+  also carry several word contracts, and the wire table owns only the persisted spelling:
+  `BlobHashAlgo`'s persisted `ch128` and its configuration spelling `cityhash128`
+  (`ContentAddressedSettings`) are different contracts and are not merged into one table. Three
   enum-adjacent cases are deliberately outside the table rule: `RefLifecycle`, whose wire domain
   is a strict subset of the enum — `Removed` must never be serialized, so a table entry for it
   would either open the wire to a forbidden state or break the coverage proof; the numeric
@@ -861,9 +876,11 @@ The change is complete when:
   bare/`old_`/`new_` families through full-key bundles, never prefix assembly; every fully
   serializable enum-backed vocabulary — the run marker included, as a typed enum over the pinned
   bytes `0x00`/`0x01`/`0x02` — lives in one wire table whose values are proven set-equal to
-  `magic_enum::enum_values<E>()` with two-way word uniqueness (`magic_enum` confined to `.cpp`
+  `magic_enum::enum_values<E>()` with two-way word uniqueness, density, and ordering statically
+  asserted, so that `toWord` is a direct indexed lookup (`magic_enum` confined to `.cpp`
   files and tests); `RefLifecycle`, the numeric classification, and `FormatId` stay outside the
-  table rule (`live` is a word constant guarded by the explicit `Live` check);
+  table rule (`live` is a word constant guarded by the explicit `Live` check), and configuration
+  spellings are never merged into wire tables;
   non-enum tag and single-value words are single constexpr constants; `CasInspect` renders enum
   values through the tables; `kMinBlobHeaderLen` has one compile-time owner shared by the envelope
   encoder and `validatePoolBlobHeaderLen`; and all change points reference one shared `BASELINE`;
@@ -877,4 +894,5 @@ The change is complete when:
 - `Formats/README.md`, codec comments, the `CasPoolMetaFormat.cpp` worst-case table, and the
   backlog no longer claim a universal 2–5-character or exact-full-member-name convention;
 - local before/after measurements report the decompressed bytes and encode/decode throughput of the
-  representative high-cardinality formats for review.
+  representative high-cardinality formats, and the generated assembly of the hot `toWord` instances
+  is reviewed — with no timing assertion in CI.
