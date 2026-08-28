@@ -28,9 +28,11 @@ split is stated exactly, and `kMinBlobHeaderLen` gets one compile-time owner. Re
 classification, and `FormatId` are explicitly outside it), settles the run marker as a typed enum,
 and completes the Decision list. Revision 8 (2026-08-29) pins the tables' performance profile:
 `toWord` is a direct indexed lookup over statically-proven-dense enums, `fromWord` stays a linear
-word scan, and an enum's persisted and configuration spellings are separate contracts. The
-exact-full-name alternative was independently implemented in Altinity PR #2288 and rejected for
-this design (see rejected alternatives).
+word scan, and an enum's persisted and configuration spellings are separate contracts. Revision 9
+(2026-08-29) adds the codec readability layer — per-encoding field write helpers and paired match
+helpers for the shared value types — bounded by an explicit helper-versus-framework rule and
+required to be codegen-neutral. The exact-full-name alternative was independently implemented in
+Altinity PR #2288 and rejected for this design (see rejected alternatives).
 
 ## Problem {#problem}
 
@@ -679,6 +681,23 @@ vocabulary item gains a single production carrier:
   `0x02` (the bytes also persist in the in-degree payload representation, so they are part of the
   contract): an invalid marker becomes unrepresentable, and the marker's word table joins the
   standard set-equality rule above.
+- **Field write helpers.** Each writer line becomes one call that names its encoding —
+  `writeWordField`, `writeU64StringField`, `writeNumberField`, `writeHex128Field`,
+  `writeBoolField` — collapsing today's `writeKey`-plus-value pairs so a codec's writer reads as
+  the format's field list in canonical order. There is deliberately no type-overloaded
+  `writeField`: the encoding rule is range-driven, not type-driven (`seq` is a decimal string and
+  `expires_at_ms` a number, both `uint64_t`), so the encoding must be named at the call site — an
+  overload would pick one silently. The helpers are thin inline forwarders over the existing
+  writer primitives: no allocation, no added branching, codegen-equivalent to the pairs they
+  replace, and the `cas_run` row writer is the hot path on which that equivalence must hold.
+- **Paired match helpers for shared value types.** `CasWireVocab`'s three write helpers gain read
+  counterparts — `matchBlobRefFields`, `matchTokenFields`, and
+  `matchManifestRefFields(key, reader, bundle, collector)`, each returning whether it consumed the
+  key — so the shared flat types become symmetric: one bundle feeds both directions. This also
+  centralizes the digest-width validation that today is copied into each codec ahead of `fromHex`,
+  removing the copy-forgets-the-check failure mode while keeping the `CORRUPTED_DATA` taxonomy.
+  The helpers take the reader and collector by reference and compare against the constexpr
+  constants — the same comparisons the inline chains make today; no stored callables, no maps.
 - `CasInspect` renders enum values through the same tables, so introspection cannot print `Merge`
   where the wire says `merge`. `system.cas_*` column names are deliberately NOT coupled to wire
   keys: the SQL surface and the persisted format have different compatibility contracts.
@@ -693,7 +712,11 @@ What deliberately stays hand-written is the grammar: variant-dependent requiredn
 (`published_ms` on committed rows only, the condemned-row sextet), both-or-neither pairs, record
 ordering, and payload zones remain explicit C++ in the readers. Of the schema triple
 required/optional/critical, only criticality survives into the carriers — via the `!` prefix in the
-key literal; the rest is validation logic, written once and readable.
+key literal; the rest is validation logic, written once and readable. The line between a helper and
+a framework is fixed: a helper consumes one known field group and returns whether it matched; it
+never owns the read loop, never decides the unknown-key policy, and never tracks requiredness —
+those remain visible in each codec's grammar. Reader dispatch tables, stored callables, and fluent
+writer builders are out.
 
 Writer order remains canonical. Reader strictness remains exactly as registered in `CasFormat`.
 Unknown critical fields continue to fail before strict/tolerant handling, and exception taxonomy does
@@ -707,9 +730,11 @@ changes in one place.
 
 1. **Behavior-preserving preparation.** Introduce the key constants with the OLD spellings —
    including the full-key bundles for the `old_`/`new_` families — and move every writer and reader
-   onto them; introduce the enum wire tables keeping the current words; perform the four member
-   renames; close the battery omissions and add the registry set-equality assertion. Goldens stay
-   byte-identical throughout — a green suite is the proof that preparation changed no wire byte.
+   onto them; introduce the enum wire tables keeping the current words; introduce the per-encoding
+   field write helpers and the shared-type match helpers; perform the four member renames; close
+   the battery omissions and add the registry set-equality assertion. Goldens stay byte-identical
+   throughout — a green suite is the proof that preparation (helpers included) changed no wire
+   byte.
 2. **Atomic wire cut.** Flip the constant values and the record-tag words, reset `G_BUILD` and the
    change-point history to the shared `BASELINE`, update the literal goldens and negative fixtures,
    keep the sentinels and both pool gates, and update `Formats/README.md` in the same change. The
@@ -885,6 +910,9 @@ The change is complete when:
   values through the tables; `kMinBlobHeaderLen` has one compile-time owner shared by the envelope
   encoder and `validatePoolBlobHeaderLen`; and all change points reference one shared `BASELINE`;
 - goldens spell their bytes literally and reference no production carrier;
+- writers use the per-encoding field helpers (no type-overloaded `writeField` exists), the three
+  shared value types have paired match helpers used by every reader that parses them, and no
+  reader dispatch table, stored-callable, or fluent-builder machinery exists;
 - no C++ member is more cryptic than its wire key, including the four renames this requires:
   `RunRef::generation` to `key_generation`, both `ManifestFields` collectors' `me`/`mb`/`mo` to
   `epoch`/`build`/`ord`, and `BindingFields`' `bk`/`rn`/`mf` to `kind`/`ref`/`manifest_fields`;
