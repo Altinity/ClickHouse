@@ -1649,6 +1649,8 @@ The server successfully detected this situation and will download merged part fr
     M(ParquetPartialReadsServed, "Times the Parquet reader started decoding from a coalesced read before that read had finished, because the requested bytes had already arrived", ValueType::Number) \
     M(ParquetReadTasks, "Coalesced read tasks created by the Parquet reader", ValueType::Number) \
     M(ParquetReadTaskBytes, "Bytes covered by `ParquetReadTasks`, including bytes read to close short gaps between requested ranges", ValueType::Bytes) \
+    M(ParquetReadFirstByteMicroseconds, "Sum of the time from starting a `DB::Parquet::Prefetcher` source read to its first progress callback (or to completion, if the transport never calls back), i.e. round-trip time to the first byte", ValueType::Microseconds) \
+    M(ParquetReadTransferMicroseconds, "Sum of the time spent transferring bytes in a `DB::Parquet::Prefetcher` source read after the first byte arrived", ValueType::Microseconds) \
     M(ParquetRowsFilterExpression, "The total number of rows that were passed through filter", ValueType::Number) \
     M(ParquetColumnsFilterExpression, "The total number of columns that were passed through filter", ValueType::Number) \
     M(FilterTransformPassedRows, "Number of rows that passed the filter in the query", ValueType::Number) \

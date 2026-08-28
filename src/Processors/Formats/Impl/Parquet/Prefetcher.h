@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Common/PODArray.h>
+#include <Common/Stopwatch.h>
 #include <Processors/Formats/Impl/Parquet/ReadCommon.h>
 
 #include <condition_variable>
@@ -65,6 +66,26 @@ public:
 
     size_t getFileSize() const { return file_size; }
 
+    /// Fitted round-trip time and bandwidth of source reads, EWMA (alpha 0.2) over tasks read from
+    /// the source (cache-served zero-copy tasks are excluded: they complete in one shot with no
+    /// first-byte gap). Used to size the number of concurrently in-flight reads (see
+    /// `targetBytesInFlight`).
+    struct ReadStats
+    {
+        double rtt_us = 50'000;            // prior: 50 ms
+        double bandwidth_bytes_per_us = 64; // prior: ~64 MB/s per stream
+        size_t samples = 0;
+    };
+    /// Lock-free-ish snapshot (takes a small mutex shared with the rare per-task stats update).
+    ReadStats readStats() const;
+    /// Sum of `length` of tasks that are `Scheduled` or `Running` (queued or currently reading).
+    size_t bytesInFlight() const { return bytes_in_flight.load(std::memory_order_relaxed); }
+    /// How many bytes we'd like to have in flight at once, given `concurrency` concurrent readers:
+    /// bandwidth * round-trip time is the amount of data one stream keeps "in the pipe"; multiplying
+    /// by `concurrency` and by a headroom factor of 2 keeps all streams busy despite jitter. Floored
+    /// at 4 read tasks so we don't undershoot before any samples have been collected.
+    size_t targetBytesInFlight(size_t concurrency) const;
+
 private:
     friend class PrefetchHandle;
 
@@ -125,6 +146,11 @@ private:
             Deallocated,
         };
 
+        /// Back-pointer to the owning Prefetcher, needed by `decreaseTaskRefcount` (static, called
+        /// from `PrefetchHandle::reset` which doesn't otherwise have a Prefetcher to reach) to
+        /// subtract from `bytes_in_flight` when a `Scheduled` task is dropped before anyone runs it.
+        Prefetcher * owner = nullptr;
+
         size_t offset{};
         size_t length{};
         double memory_amplification = 1;
@@ -162,6 +188,18 @@ private:
         /// waiter still re-checks its own `need` against `bytes_ready` after waking (see `waitForBytes`).
         std::atomic<size_t> waiters {0};
         std::exception_ptr exception;
+
+        /// Restarted in `runTask` right before the source read starts. Only ever touched by the one
+        /// thread executing `runTask` for this task (and by `publishBytesReady`, which is called
+        /// only from that same thread), so no synchronization is needed for the timer itself.
+        Stopwatch stopwatch;
+        /// Microseconds from `stopwatch`'s restart to the first `publishBytesReady` call for this
+        /// task (`bytes_ready` going from 0 to nonzero). Left at 0 if never set: either the task
+        /// completed via the zero-copy `cached_region` path (no `publishBytesReady` call at all), or
+        /// the transport never invoked the progress callback (local `pread`, Azure, HDFS). Same
+        /// single-writer-thread reasoning as `stopwatch`; atomic only so a debugger/future reader
+        /// doesn't need to reason about tearing.
+        std::atomic<uint64_t> first_byte_us {0};
     };
 
     enum class ReadMode
@@ -205,6 +243,21 @@ private:
     std::deque<RangeSet> range_sets;
 
     std::atomic<bool> ranges_finalized {false};
+
+    /// Sum of `length` of tasks that are `Scheduled` or `Running`: incremented in `scheduleTask`,
+    /// decremented exactly once per task, either at the end of `runTask` (success or exception) or,
+    /// if the task is dropped before any thread runs it, in `decreaseTaskRefcount`.
+    std::atomic<size_t> bytes_in_flight {0};
+
+    /// Protects the ReadStats accumulators below. Updated at most once per completed task (rare),
+    /// so a mutex is simpler than lock-free fixed-point atomics.
+    mutable std::mutex stats_mutex;
+    double stat_rtt_us = 50'000;
+    double stat_bandwidth_bytes_per_us = 64;
+    size_t stat_samples = 0;
+    /// Folds one task's timing into the EWMAs above and into the profile events. Called at the end
+    /// of `runTask` for tasks read from the source (see call site for the exact conditions).
+    void updateReadStats(const Task * task, uint64_t total_us);
 
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;

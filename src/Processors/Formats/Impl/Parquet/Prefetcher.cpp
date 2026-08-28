@@ -25,6 +25,8 @@ namespace ProfileEvents
     extern const Event ParquetPartialReadsServed;
     extern const Event ParquetReadTasks;
     extern const Event ParquetReadTaskBytes;
+    extern const Event ParquetReadFirstByteMicroseconds;
+    extern const Event ParquetReadTransferMicroseconds;
 }
 
 namespace DB::Parquet
@@ -50,6 +52,46 @@ Prefetcher::~Prefetcher()
     {
         return req.state.load(std::memory_order_relaxed) == RequestState::State::Cancelled;
     }));
+    /// Every `bytes_in_flight` increment (`scheduleTask`) must be matched by exactly one decrement
+    /// (`runTask` completion or `decreaseTaskRefcount` for a task dropped while `Scheduled`); by the
+    /// time all PrefetchHandle-s are gone (checked above) and `shutdown->shutdown()` has waited out
+    /// any still-running tasks, none should be left in flight.
+    chassert(bytes_in_flight.load(std::memory_order_relaxed) == 0);
+}
+
+Prefetcher::ReadStats Prefetcher::readStats() const
+{
+    std::lock_guard lock(stats_mutex);
+    return ReadStats{.rtt_us = stat_rtt_us, .bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us, .samples = stat_samples};
+}
+
+size_t Prefetcher::targetBytesInFlight(size_t concurrency) const
+{
+    ReadStats stats = readStats();
+    size_t target = static_cast<size_t>(stats.bandwidth_bytes_per_us * stats.rtt_us) * concurrency * 2;
+    return std::max(target, 4 * bytes_per_read_task);
+}
+
+void Prefetcher::updateReadStats(const Task * task, uint64_t total_us)
+{
+    uint64_t first_byte_us = task->first_byte_us.load(std::memory_order_relaxed);
+    /// The transport never called the progress callback: readiness equals completion, so the whole
+    /// duration is round-trip time and there's no separate transfer phase to measure bandwidth from.
+    uint64_t rtt_sample_us = first_byte_us > 0 ? first_byte_us : total_us;
+    uint64_t transfer_us = (first_byte_us > 0 && total_us > first_byte_us) ? (total_us - first_byte_us) : 0;
+
+    ProfileEvents::increment(ProfileEvents::ParquetReadFirstByteMicroseconds, rtt_sample_us);
+    ProfileEvents::increment(ProfileEvents::ParquetReadTransferMicroseconds, transfer_us);
+
+    constexpr double alpha = 0.2;
+    std::lock_guard lock(stats_mutex);
+    stat_rtt_us = stat_rtt_us * (1 - alpha) + static_cast<double>(rtt_sample_us) * alpha;
+    if (first_byte_us > 0 && transfer_us > 0)
+    {
+        double bandwidth_sample = static_cast<double>(task->length) / static_cast<double>(transfer_us);
+        stat_bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us * (1 - alpha) + bandwidth_sample * alpha;
+    }
+    ++stat_samples;
 }
 
 void Prefetcher::determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOptions & options)
@@ -397,6 +439,7 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
 
     /// Create task.
     Task & task = tasks.emplace_back();
+    task.owner = this;
     task.offset = start_offset;
     task.length = end_offset - task.offset;
     ProfileEvents::increment(ProfileEvents::ParquetReadTasks);
@@ -435,11 +478,21 @@ void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount)
     if (c != amount)
         return;
 
-    if (task->state.exchange(Task::State::Deallocated) != Task::State::Running)
+    Task::State prev_state = task->state.exchange(Task::State::Deallocated);
+    if (prev_state != Task::State::Running)
     {
         task->buf = {};
         task->cached_region.reset();
     }
+
+    /// If the task was still `Scheduled`, it was dropped before any thread got to run it (the
+    /// `Scheduled` -> `Running` CAS at the top of `runTask` will now fail and return early without
+    /// touching `bytes_in_flight`): `scheduleTask` already added its bytes, and nobody else will
+    /// subtract them, so we must do it here. If the previous state was `Running`, `runTask` is still
+    /// executing (or about to) and will subtract them itself when it finishes; if it was `Done` or
+    /// `Exception`, `runTask` already did.
+    if (prev_state == Task::State::Scheduled)
+        task->owner->bytes_in_flight.fetch_sub(task->length, std::memory_order_relaxed);
 
     /// This path only runs when no `PrefetchHandle` references the task any more, so nobody can be
     /// blocked in `waitForBytes` for it.
@@ -458,6 +511,8 @@ void Prefetcher::publishBytesReady(Task * task, size_t bytes_ready)
     size_t prev = task->bytes_ready.load(std::memory_order_relaxed);
     if (bytes_ready <= prev)
         return;
+    if (prev == 0)
+        task->first_byte_us.store(task->stopwatch.elapsedMicroseconds(), std::memory_order_relaxed);
     /// The store here and the `waiters` load below must not be reordered with each other (nor with
     /// the paired increment-then-load in `waitForBytes`), or a waiter could go to sleep just after
     /// we've already published enough bytes and just before it increments `waiters`, and never get
@@ -496,6 +551,11 @@ Prefetcher::Task::State Prefetcher::waitForBytes(Task * task, size_t need)
 
 void Prefetcher::scheduleTask(Task * task)
 {
+    /// Matched by exactly one `fetch_sub`: either at the end of `runTask` (this task is guaranteed
+    /// to reach `runTask` exactly once, whether scheduled onto `io_runner` here or run synchronously
+    /// from `getRangeData`), or in `decreaseTaskRefcount` if the task is dropped before that happens.
+    bytes_in_flight.fetch_add(task->length, std::memory_order_relaxed);
+
     if (parser_shared_resources && !parser_shared_resources->io_runner.isDisabled())
         parser_shared_resources->io_runner([this, task, _shutdown = shutdown]
             {
@@ -559,6 +619,9 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
     auto s = Task::State::Scheduled;
     if (!task->state.compare_exchange_strong(s, Task::State::Running))
         return s;
+
+    task->stopwatch.restart();
+
     auto final_state = Task::State::Done;
     try
     {
@@ -623,6 +686,22 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
         std::lock_guard lock(exception_mutex);
         task->exception = std::current_exception();
     }
+
+    uint64_t total_us = task->stopwatch.elapsedMicroseconds();
+
+    /// Matches the `fetch_add` in `scheduleTask`. Exactly one of {here, `decreaseTaskRefcount`}
+    /// subtracts this task's bytes, since we only get here once (the CAS above succeeds for exactly
+    /// one caller) and the early return above (CAS failed) skips this.
+    bytes_in_flight.fetch_sub(task->length, std::memory_order_relaxed);
+
+    /// Fold this task's timing into the fitted round-trip-time/bandwidth stats, but only for reads
+    /// that actually went over the wire and can be timed meaningfully: not on exception, only for
+    /// `RandomRead` (the mode `readBigAt`'s progress callback is wired up for), and excluding the
+    /// zero-copy `cached_region` path (no data movement to time -- see the comment in the `try` block
+    /// above for why `publishBytesReady` isn't even called there).
+    if (final_state != Task::State::Exception && read_mode == ReadMode::RandomRead
+        && !task->cached_region.has_value() && task->bytes_ready.load(std::memory_order_relaxed) > 0)
+        updateReadStats(task, total_us);
 
     s = Task::State::Running;
     if (task->state.compare_exchange_strong(s, final_state))
