@@ -831,7 +831,7 @@ InterpreterSelectQuery::InterpreterSelectQuery(
                 current_info.syntax_analyzer_result = syntax_analyzer_result;
 
                 Names queried_columns = syntax_analyzer_result->requiredSourceColumns();
-                const auto & supported_prewhere_columns = storage->supportedPrewhereColumns();
+                const auto & supported_prewhere_columns = storage->supportedAutomaticPrewhereColumns(storage_snapshot->metadata);
 
                 RangesInDataParts parts_for_estimator;
                 if (storage_snapshot->data)

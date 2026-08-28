@@ -957,8 +957,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             if (requested_columns_copy.empty()
                 && (!format_filter_info || (!format_filter_info->row_level_filter && !format_filter_info->prewhere_info)))
                 need_only_count = true;
+            }
         }
-    }
 
     std::optional<size_t> num_rows_from_cache
         = need_only_count && context_->getSettingsRef()[Setting::use_cache_for_count_from_files] ? try_get_num_rows_from_cache() : std::nullopt;

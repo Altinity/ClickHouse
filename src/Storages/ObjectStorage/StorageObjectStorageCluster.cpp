@@ -1062,6 +1062,13 @@ std::optional<NameSet> StorageObjectStorageCluster::supportedPrewhereColumns() c
     return IStorageCluster::supportedPrewhereColumns();
 }
 
+std::optional<NameSet> StorageObjectStorageCluster::supportedAutomaticPrewhereColumns(const StorageMetadataPtr & metadata) const
+{
+    if (pure_storage)
+        return pure_storage->supportedAutomaticPrewhereColumns(metadata);
+    return IStorageCluster::supportedAutomaticPrewhereColumns(metadata);
+}
+
 IStorageCluster::ColumnSizeByName StorageObjectStorageCluster::getColumnSizes() const
 {
     if (pure_storage)

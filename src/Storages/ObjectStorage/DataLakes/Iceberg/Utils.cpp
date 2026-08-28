@@ -109,6 +109,53 @@ static constexpr auto MAX_TRANSACTION_RETRIES = 100;
 namespace DB::Iceberg
 {
 using namespace DB;
+
+namespace
+{
+struct ResolvedPartitionSpec
+{
+    Poco::JSON::Array::Ptr fields;
+    std::unordered_map<Int64, String> source_id_to_column_name;
+};
+
+std::optional<ResolvedPartitionSpec> resolveDefaultPartitionSpec(const Poco::JSON::Object::Ptr & metadata_object)
+{
+    if (!metadata_object->has(f_partition_specs) || !metadata_object->has(f_default_spec_id))
+        return std::nullopt;
+
+    auto partition_spec_id = metadata_object->getValue<Int64>(f_default_spec_id);
+    Poco::JSON::Array::Ptr partition_specs = metadata_object->getArray(f_partition_specs);
+    if (!partition_specs)
+        return std::nullopt;
+
+    std::unordered_map<Int64, String> source_id_to_column_name;
+    auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
+    auto mapper = createColumnMapper(schema)->getStorageColumnEncoding();
+    for (const auto & [col_name, source_id] : mapper)
+        source_id_to_column_name[source_id] = col_name;
+
+    Poco::JSON::Object::Ptr partition_spec;
+    for (size_t i = 0; i < partition_specs->size(); ++i)
+    {
+        auto spec = partition_specs->getObject(static_cast<UInt32>(i));
+        if (spec && spec->getValue<Int64>(f_spec_id) == partition_spec_id)
+        {
+            partition_spec = spec;
+            break;
+        }
+    }
+
+    if (!partition_spec || !partition_spec->has(f_fields))
+        return std::nullopt;
+
+    auto fields = partition_spec->getArray(f_fields);
+    if (!fields || fields->size() == 0)
+        return std::nullopt;
+
+    return ResolvedPartitionSpec{fields, std::move(source_id_to_column_name)};
+}
+}
+
 static CompressionMethod getCompressionMethodFromMetadataFile(const String & path)
 {
     constexpr std::string_view metadata_suffix = ".metadata.json";
@@ -1427,50 +1474,47 @@ static String formatPartitionFieldDisplay(const String & iceberg_transform_name,
 
 std::optional<String> getPartitionKeyStringFromMetadata(Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & /* ch_schema */, ContextPtr /* local_context */)
 {
-    if (!metadata_object->has(f_partition_specs) || !metadata_object->has(f_default_spec_id))
-        return std::nullopt;
-    auto partition_spec_id = metadata_object->getValue<Int64>(f_default_spec_id);
-    Poco::JSON::Array::Ptr partition_specs = metadata_object->getArray(f_partition_specs);
-    std::unordered_map<Int64, String> source_id_to_column_name;
-    auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
-    auto mapper = createColumnMapper(schema)->getStorageColumnEncoding();
-    for (const auto & [col_name, source_id] : mapper)
-        source_id_to_column_name[source_id] = col_name;
-
-    Poco::JSON::Object::Ptr partition_spec;
-    for (size_t i = 0; i < partition_specs->size(); ++i)
-    {
-        auto spec = partition_specs->getObject(static_cast<UInt32>(i));
-        if (spec->getValue<Int64>(f_spec_id) == partition_spec_id)
-        {
-            partition_spec = spec;
-            break;
-        }
-    }
-    if (!partition_spec || !partition_spec->has(f_fields))
-        return std::nullopt;
-    auto fields = partition_spec->getArray(f_fields);
-    if (fields->size() == 0)
+    auto resolved = resolveDefaultPartitionSpec(metadata_object);
+    if (!resolved)
         return std::nullopt;
 
     std::vector<String> part_exprs;
-    for (UInt32 i = 0; i < fields->size(); ++i)
+    for (UInt32 i = 0; i < resolved->fields->size(); ++i)
     {
-        auto field = fields->getObject(i);
-        auto source_id = field->getValue<Int64>(f_source_id);
-        auto it = source_id_to_column_name.find(source_id);
-        if (it == source_id_to_column_name.end())
+        auto field = resolved->fields->getObject(i);
+        auto it = resolved->source_id_to_column_name.find(field->getValue<Int64>(f_source_id));
+        if (it == resolved->source_id_to_column_name.end())
             return std::nullopt;
-        String column_name = it->second;
-        auto iceberg_transform_name = field->getValue<String>(f_transform);
-        part_exprs.push_back(formatPartitionFieldDisplay(iceberg_transform_name, column_name));
+        part_exprs.push_back(formatPartitionFieldDisplay(field->getValue<String>(f_transform), it->second));
     }
+
     String result;
     for (size_t i = 0; i < part_exprs.size(); ++i)
     {
         if (i != 0)
             result += ", ";
         result += part_exprs[i];
+    }
+    return result;
+}
+
+Names getIdentityPartitionColumnsFromMetadata(Poco::JSON::Object::Ptr metadata_object)
+{
+    auto resolved = resolveDefaultPartitionSpec(metadata_object);
+    if (!resolved)
+        return {};
+
+    Names result;
+    for (UInt32 i = 0; i < resolved->fields->size(); ++i)
+    {
+        auto field = resolved->fields->getObject(i);
+
+        if (Poco::toLower(field->getValue<String>(f_transform)) != "identity")
+            continue;
+
+        if (auto it = resolved->source_id_to_column_name.find(field->getValue<Int64>(f_source_id));
+            it != resolved->source_id_to_column_name.end())
+            result.push_back(it->second);
     }
     return result;
 }
