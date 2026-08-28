@@ -79,7 +79,7 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
     /// Decode holds large columns -> bounded memory but most threads (only CPU-bound stage);
     /// index/bloom/prefetch only issue async reads -> fixed small shares. decode_thread_fraction
     /// is decode's thread share (issuers split the rest). Memory is budgeted separately, by pool
-    /// (see MemoryPool / pool_fraction below), not per stage.
+    /// (see `MemoryPool` / `pool_fraction` below), not per stage.
     const double decode_thread_fraction = reader.options.format.parquet.decode_thread_fraction;
     if (!(decode_thread_fraction >= 0 && decode_thread_fraction <= 1))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -106,7 +106,7 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
     for (Stage & stage : stages)
         stage.thread_target_fraction /= thread_sum;
 
-    /// Memory is budgeted by lifetime, not by stage: see MemoryPool. Metadata (bloom filters,
+    /// Memory is budgeted by lifetime, not by stage: see `MemoryPool`. Metadata (bloom filters,
     /// indexes, dictionary pages) gets a fixed small share; the rest splits between compressed
     /// data pages in flight (bounds read-ahead depth) and decoded columns (including chunks
     /// already delivered to the pipeline but not yet consumed).
@@ -574,6 +574,15 @@ void ReadManager::flushMemoryUsageDiff(MemoryUsageDiff && diff)
 {
     chassert(!diff.finalized);
     diff.finalized = true;
+
+    /// Stages to call scheduleTasksIfNeeded for, decided below. Collected into a bitmask (instead
+    /// of calling scheduleTasksIfNeeded eagerly per stage) for two reasons: (1) `pool_usage` should
+    /// reflect the whole diff before we make any scheduling decision, and (2) a pool is shared by
+    /// several stages (see `poolOf`), so freeing memory charged to one stage can unblock a *different*
+    /// stage on the same pool -- we want to wake all of them exactly once, not just the one whose
+    /// own by_stage went negative.
+    UInt64 stages_to_schedule = diff.stages_to_schedule;
+
     for (size_t i = 0; i < diff.by_stage.size(); ++i)
     {
         ssize_t d = diff.by_stage[i];
@@ -588,19 +597,29 @@ void ReadManager::flushMemoryUsageDiff(MemoryUsageDiff && diff)
             pool_usage[size_t(pool)].fetch_add(d, std::memory_order_relaxed);
         }
 
-        bool should_schedule = (diff.stages_to_schedule & (1ul << i)) != 0;
-        if (!should_schedule && d < 0)
+        bool already_scheduled = (stages_to_schedule & (1ull << i)) != 0;
+        if (!already_scheduled && d < 0)
         {
             const auto & stage = stages[i];
             auto limits = poolLimits(pool);
             limits.parsing_threads = SharedResourcesExt::getLimitsPerReader(*parser_shared_resources, 1.0, stage.thread_target_fraction).parsing_threads;
-            should_schedule = checkTaskSchedulingLimits(
+            bool should_schedule = checkTaskSchedulingLimits(
                 size_t(std::max<ssize_t>(0, pool_usage[size_t(pool)].load(std::memory_order_relaxed))), 0,
                 stage.batches_in_progress.load(std::memory_order_relaxed), 0, limits);
+            if (should_schedule)
+            {
+                for (size_t j = 0; j < diff.by_stage.size(); ++j)
+                    if (j != size_t(ReadStage::Deliver) && poolOf(ReadStage(j)) == pool)
+                        stages_to_schedule |= (1ull << j);
+            }
         }
-        if (should_schedule)
-            scheduleTasksIfNeeded(ReadStage(i));
     }
+
+    /// Deliver (and anything at/after it) is never schedulable -- scheduleTasksIfNeeded asserts
+    /// stage_idx < Deliver -- so stop short of it even though scheduleAllStages() sets every bit.
+    for (size_t i = 0; i < size_t(ReadStage::Deliver); ++i)
+        if ((stages_to_schedule & (1ull << i)) != 0)
+            scheduleTasksIfNeeded(ReadStage(i));
 }
 
 void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
@@ -623,6 +642,13 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
     /// because memory usage is high, while memory usage can't decrease because tasks can't be scheduled.
     /// The way we prevent it is by always allowing scheduling tasks for the lowest-numbered
     /// <row group, row subgroup> pair that hasn't been completed (delivered or skipped) yet.
+    /// Below ColumnData, a row group is privileged unconditionally (not just when read_ptr ==
+    /// delivery_ptr): pools are shared across several ReadStages (see `poolOf`), so memory held by
+    /// one metadata stage (e.g. dictionary-page prefetch, released only in ColumnData) can block a
+    /// *different* metadata stage the lowest incomplete row group still needs to pass through to
+    /// ever reach ColumnData. Without this, that row group -- and thus the whole pool, since nothing
+    /// downstream can free it -- could get stuck forever. Once in ColumnData or later, we go back to
+    /// requiring read_ptr == delivery_ptr, to avoid over-admitting decode work ahead of delivery.
     auto is_privileged_task = [&](size_t row_group_idx)
     {
         size_t i = first_incomplete_row_group.load();
@@ -632,7 +658,7 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
         /// Must check stage first so that read_ptr is meaningful (we start advancing it in finishRowSubgroupStage).
         /// Using acquire ordering to synchronize with the release (seq_cst) store in `finishRowGroupStage`.
         if (row_group.stage.load(std::memory_order_acquire) < ReadStage::ColumnData)
-            return false;
+            return true;
         return row_group.read_ptr.load() == row_group.delivery_ptr.load();
     };
 
@@ -1104,6 +1130,14 @@ ReadManager::ReadResult ReadManager::read()
                 shutdown->shutdown();
                 lock.lock();
 
+                /// Memory is tracked per `MemoryPool`, not per stage (see `poolOf`); check each pool once.
+                for (size_t p = 0; p < NUM_MEMORY_POOLS; ++p)
+                {
+                    ssize_t mem = pool_usage[p].load(std::memory_order_relaxed);
+                    if (mem != 0)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "Leak in memory accounting in parquet reader: got {} bytes in pool {}", mem, magic_enum::enum_name(MemoryPool(p)));
+                }
+
                 for (const RowGroup & row_group : reader.row_groups)
                 {
                     chassert(row_group.stage.load(std::memory_order_relaxed) == ReadStage::Deallocated);
@@ -1112,15 +1146,12 @@ ReadManager::ReadResult ReadManager::read()
                         chassert(subgroup.stage.load(std::memory_order_relaxed) == ReadStage::Deallocated);
                     for (size_t i = 0; i < stages.size(); ++i)
                     {
-                        /// Memory is now tracked per pool, not per stage; several stages share a pool
-                        /// (see poolOf), so this may re-check the same pool for each of them.
-                        ssize_t mem = pool_usage[size_t(poolOf(ReadStage(i)))].load(std::memory_order_relaxed);
                         size_t batches = stages[i].batches_in_progress.load(std::memory_order_relaxed);
                         size_t unsched = 0;
                         for (const auto & tasks : stages[i].row_group_tasks_to_schedule)
                             unsched += tasks.size();
-                        if (mem != 0 || batches != 0 || unsched != 0)
-                            throw Exception(ErrorCodes::LOGICAL_ERROR, "Leak in memory or task accounting in parquet reader: got {} bytes, {} batches, {} tasks in stage {}", mem, batches, unsched, i);
+                        if (batches != 0 || unsched != 0)
+                            throw Exception(ErrorCodes::LOGICAL_ERROR, "Leak in task accounting in parquet reader: got {} batches, {} tasks in stage {}", batches, unsched, magic_enum::enum_name(ReadStage(i)));
                     }
                 }
                 return {};

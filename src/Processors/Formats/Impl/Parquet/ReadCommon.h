@@ -81,7 +81,7 @@ struct SharedResourcesExt
 /// But also we don't want to get into a situation where e.g. most of the memory budget is used by
 /// column indexes and there's not enough left to read main data for a few row groups in parallel.
 /// To solve these two problems at once, we do memory accounting separately for each of a few pools
-/// grouping stages by how long their memory lives (see MemoryPool, ReadManager::pool_usage), so
+/// grouping stages by how long their memory lives (see `MemoryPool`, `ReadManager::pool_usage`), so
 /// e.g. small short-lived index/bloom-filter reads don't compete for budget with column data.
 /// Memory is attributed to the stage that allocated it. E.g. ReadManager::read() (Deliver stage)
 /// may release a column that was allocated by PrewhereData stage, reducing PrewhereData's memory
@@ -118,6 +118,7 @@ enum class MemoryPool : UInt8
     Decoded,
 };
 constexpr size_t NUM_MEMORY_POOLS = 3;
+static_assert(NUM_MEMORY_POOLS == magic_enum::enum_count<MemoryPool>());
 
 constexpr MemoryPool poolOf(ReadStage stage)
 {
@@ -128,7 +129,7 @@ constexpr MemoryPool poolOf(ReadStage stage)
         case ReadStage::ColumnIndexAndOffsetIndex:
         case ReadStage::OffsetIndex:
             return MemoryPool::Metadata;
-        /// ColumnDataPrefetch is removed in a later task; until then it maps to Compressed.
+        /// `ColumnDataPrefetch` is removed in a later task; until then it maps to `Compressed`.
         case ReadStage::ColumnDataPrefetch:
             return MemoryPool::Compressed;
         case ReadStage::NotStarted:
@@ -142,7 +143,7 @@ constexpr MemoryPool poolOf(ReadStage stage)
 
 /// We track approximate current memory usage per ReadStage that allocated the memory (*).
 /// This struct aggregates how much memory was allocated by some operation.
-/// ReadManager then uses it to update the per-MemoryPool (see poolOf) std::atomic counters.
+/// ReadManager then uses it to update the per-`MemoryPool` (see `poolOf`) std::atomic counters.
 /// (We do this instead of updating the std::atomics directly to reduce contention on the atomics.
 ///  I haven't checked whether this makes a difference.)
 ///

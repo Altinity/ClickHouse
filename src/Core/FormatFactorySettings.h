@@ -202,7 +202,7 @@ Schedule prefetches more aggressively if memory usage is below than threshold. P
 Approximate memory limit for the Parquet reader. Limits how many row groups or columns can be read in parallel. When reading multiple files in one query, the limit is on total memory usage across those files.
 )", 0) \
     DECLARE(Double, input_format_parquet_prefetch_memory_fraction, 0.6, R"(
-Advanced tuning knob for the Parquet reader scheduler. Superseded by `input_format_parquet_compressed_memory_fraction`; kept for compatibility. Must be in [0, 1].
+Advanced tuning knob for the Parquet reader scheduler. Superseded by `input_format_parquet_compressed_memory_fraction`; kept for compatibility. No longer validated or used to size any memory budget -- any value is accepted and ignored.
 )", 0) \
     DECLARE(Double, input_format_parquet_compressed_memory_fraction, 0.35, R"(
 Share of `input_format_parquet_memory_high_watermark` the Parquet reader may hold as compressed data

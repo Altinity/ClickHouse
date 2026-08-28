@@ -46,7 +46,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"input_format_parquet_bytes_per_read_task", 0, 0, "New setting: target size of a single coalesced read issued by the Parquet reader. 0 derives it from the min-bytes-for-seek of the underlying storage, as before."},
             {"input_format_parquet_coalesce_gap_bytes", 0, 2097152, "New setting: cap on the gap the Parquet reader reads through when coalescing nearby ranges; previously the storage's min-bytes-for-seek (4 MiB on object storage) applied unconditionally."},
             {"input_format_parquet_max_read_amplification", 0, 4, "New setting: bound on bytes read / bytes needed per coalesced Parquet read."},
-            {"input_format_parquet_compressed_memory_fraction", 0.35, 0.35, "New setting: share of the Parquet reader memory budget held as compressed pages in flight; replaces the previous fixed per-stage split, which gave the data read 20% of the budget."},
+            {"input_format_parquet_compressed_memory_fraction", 0.35, 0.35, "New setting: share of the Parquet reader memory budget held as compressed pages in flight; replaces the previous per-stage split (`data_memory_fraction`=0.75 x default `prefetch_memory_fraction`=0.6), which gave the compressed read-ahead 45% of the budget."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

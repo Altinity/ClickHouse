@@ -107,7 +107,7 @@ private:
     /// First row group that hasn't reached Deallocated stage.
     std::atomic<size_t> first_incomplete_row_group {0};
 
-    /// See MemoryPool. Signed because deallocations can be flushed before the matching allocation
+    /// See `MemoryPool`. Signed because deallocations can be flushed before the matching allocation
     /// on another thread.
     std::array<std::atomic<ssize_t>, NUM_MEMORY_POOLS> pool_usage {};
     std::array<double, NUM_MEMORY_POOLS> pool_fraction {};
