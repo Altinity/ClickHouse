@@ -43,7 +43,7 @@ public:
         std::optional<Int64> user_defined_timestamp = std::nullopt,
         bool is_truncate = false);
 
-    void generateAddColumnMetadata(const String & column_name, DataTypePtr type);
+    void generateAddColumnMetadata(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {});
     void generateDropColumnMetadata(const String & column_name);
     /// Returns false when the column already has the requested type (no metadata change).
     /// `context` supplies the settings used to map the stored Iceberg type back to a ClickHouse

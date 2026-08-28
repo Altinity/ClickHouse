@@ -410,6 +410,73 @@ void expectModifyRejected(
 
 }
 
+TEST(IcebergMetadataGenerator, AddColumnFirstPlacesFieldAtIndexZero)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    gen.generateAddColumnMetadata("z", makeNullable(std::make_shared<DataTypeInt64>()), /* first */ true);
+
+    auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
+    auto schemas = metadata->getArray(f_schemas);
+    Poco::JSON::Object::Ptr current_schema;
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+    {
+        if (schemas->getObject(i)->getValue<Int32>(f_schema_id) == current_schema_id)
+        {
+            current_schema = schemas->getObject(i);
+            break;
+        }
+    }
+    ASSERT_TRUE(current_schema);
+
+    auto fields = current_schema->getArray(f_fields);
+    ASSERT_GE(fields->size(), 1u);
+    EXPECT_EQ(fields->getObject(0)->getValue<String>(f_name), "z");
+    EXPECT_EQ(fields->getObject(1)->getValue<String>(f_name), "x");
+    EXPECT_EQ(fields->getObject(2)->getValue<String>(f_name), "y");
+}
+
+
+TEST(IcebergMetadataGenerator, AddColumnAfterPlacesFieldAfterNamedColumn)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    gen.generateAddColumnMetadata("z", makeNullable(std::make_shared<DataTypeInt64>()), /* first */ false, /* after_column */ "x");
+
+    auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
+    auto schemas = metadata->getArray(f_schemas);
+    Poco::JSON::Object::Ptr current_schema;
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+    {
+        if (schemas->getObject(i)->getValue<Int32>(f_schema_id) == current_schema_id)
+        {
+            current_schema = schemas->getObject(i);
+            break;
+        }
+    }
+    ASSERT_TRUE(current_schema);
+
+    auto fields = current_schema->getArray(f_fields);
+    ASSERT_EQ(fields->size(), 3u);
+    EXPECT_EQ(fields->getObject(0)->getValue<String>(f_name), "x");
+    EXPECT_EQ(fields->getObject(1)->getValue<String>(f_name), "z");
+    EXPECT_EQ(fields->getObject(2)->getValue<String>(f_name), "y");
+}
+
+
+TEST(IcebergMetadataGenerator, AddColumnAfterNonexistentColumnThrows)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    EXPECT_THROW(
+        gen.generateAddColumnMetadata("z", makeNullable(std::make_shared<DataTypeInt64>()), /* first */ false, /* after_column */ "nonexistent"),
+        DB::Exception);
+}
+
+
 TEST(IcebergMetadataGenerator, ModifyColumnAppliedRecognisesTypeAlreadyInSchema)
 {
     /// The schema already says `long`, so a MODIFY to Int64 has taken effect.

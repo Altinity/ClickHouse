@@ -564,7 +564,7 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
     metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
 }
 
-void MetadataGenerator::generateAddColumnMetadata(const String & column_name, DataTypePtr type)
+void MetadataGenerator::generateAddColumnMetadata(const String & column_name, DataTypePtr type, bool first, const String & after_column)
 {
     if (!type->isNullable())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow to add non-nullable columns");
@@ -590,7 +590,37 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
 
     metadata_object->set(Iceberg::f_last_column_id, last_column_id + 1);
 
-    current_schema->getArray(Iceberg::f_fields)->add(new_field);
+    if (first || !after_column.empty())
+    {
+        Poco::JSON::Array::Ptr new_fields = new Poco::JSON::Array;
+        if (first)
+        {
+            new_fields->add(new_field);
+            for (UInt32 i = 0; i < existing_fields->size(); ++i)
+                new_fields->add(existing_fields->get(i));
+        }
+        else
+        {
+            bool inserted = false;
+            for (UInt32 i = 0; i < existing_fields->size(); ++i)
+            {
+                new_fields->add(existing_fields->get(i));
+                if (existing_fields->getObject(i)->getValue<String>(Iceberg::f_name) == after_column)
+                {
+                    new_fields->add(new_field);
+                    inserted = true;
+                }
+            }
+            if (!inserted)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Column {} not found for AFTER positioning", after_column);
+        }
+        current_schema->set(Iceberg::f_fields, new_fields);
+    }
+    else
+    {
+        existing_fields->add(new_field);
+    }
+
     current_schema->set(Iceberg::f_schema_id, next_schema_id);
     metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
     metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);

@@ -900,7 +900,7 @@ void alter(
         switch (params[0].type)
         {
             case AlterCommand::Type::ADD_COLUMN:
-                metadata_json_generator.generateAddColumnMetadata(params[0].column_name, params[0].data_type);
+                metadata_json_generator.generateAddColumnMetadata(params[0].column_name, params[0].data_type, params[0].first, params[0].after_column);
                 break;
             case AlterCommand::Type::DROP_COLUMN:
                 if (params[0].clear)
