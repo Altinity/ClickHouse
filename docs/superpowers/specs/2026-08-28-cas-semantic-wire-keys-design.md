@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS semantic wire keys design {#cas-semantic-wire-keys-design}
 
-Revision 12 (2026-08-29). Three adjudications shape the design: keys must be *sufficiently full
+Revision 13 (2026-08-29). Three adjudications shape the design: keys must be *sufficiently full
 for understanding*, not exact C++ member names; there are no existing installations, so the change
 ships as a **generation reset**, not a generation bump; and C++ members follow an **asymmetric
 rule** — a member may be fuller than its wire key, never more cryptic. The exact-full-name
@@ -73,9 +73,9 @@ The goals are:
   and testable;
 - guarantee that no C++ member is more cryptic than its wire key;
 - make spelling drift impossible for all code that reads the carriers — writer, reader, and
-  introspection read each vocabulary item from one place — and make bypassing the carriers loud
-  (the `WireKey` type; see codec structure) rather than pretending bypass is impossible, while
-  tests remain an independent proof of the wire contract.
+  introspection read each vocabulary item from one place — with write-side bypass made loud (the
+  `WireKey` type) and read-side discipline held by goldens and review, rather than pretending
+  bypass is impossible, while tests remain an independent proof of the wire contract.
 
 The following are not goals:
 
@@ -144,7 +144,8 @@ Consequences:
   become `epoch`/`build`/`ord`, and the `BindingFields` members `bk`/`rn`/`mf` become
   `kind`/`ref`/`manifest_fields` — otherwise the renamed wire would out-explain the very structs
   that parse it. One further rename follows a wire decision rather than this audit:
-  `MountLease::min_active` becomes `min_active_build_sequence`, tracking its renamed key. No other
+  `MountLease::min_active` becomes `min_active_build_sequence`, tracking its renamed key, and
+  lands with the wire cut (phase 2) rather than with the audit-driven four (phase 1). No other
   member rename is required; beyond these the rule is a review gate for future codecs.
 - Where a semantic wire word collides with a C++ keyword, the member uses the established
   abbreviation or a fuller form, both compliant: wire `namespace` ↔ member `ns` (an established
@@ -190,10 +191,10 @@ from a prefix at write time — that would leave the composed spelling without a
 the reader compares full literals. Instead they are declared as bundles of full-key constants:
 
 ```cpp
-struct ManifestRefWireKeys { std::string_view epoch, build, ord; };
-constexpr ManifestRefWireKeys kBareManifestRefKeys{"epoch", "build", "ord"};
-constexpr ManifestRefWireKeys kOldManifestRefKeys{"old_epoch", "old_build", "old_ord"};
-constexpr ManifestRefWireKeys kNewManifestRefKeys{"new_epoch", "new_build", "new_ord"};
+struct ManifestRefWireKeys { WireKey epoch, build, ord; };
+constexpr ManifestRefWireKeys kBareManifestRefKeys{WireKey{"epoch"}, WireKey{"build"}, WireKey{"ord"}};
+constexpr ManifestRefWireKeys kOldManifestRefKeys{WireKey{"old_epoch"}, WireKey{"old_build"}, WireKey{"old_ord"}};
+constexpr ManifestRefWireKeys kNewManifestRefKeys{WireKey{"new_epoch"}, WireKey{"new_build"}, WireKey{"new_ord"}};
 ```
 
 `writeManifestRefFields` takes a bundle rather than a prefix, and the analogous binding bundle
@@ -504,15 +505,20 @@ A `ref_life` row becomes:
 `hold->reason`. The `class` values become words — `absent`, `unchanged`, `folded`, `clamped`,
 taken verbatim from the documented semantics at `CasFoldSealFormat.h` (0 means absent, 1 unchanged,
 2 folded through the observed cursor, 4 clamped below the ref-log cursor) — closing the last field
-a raw-object reader needed the sources for. The capacity calculation that gated this: the words add
-7–10 bytes to a roughly 110-byte `ref_life` row, moving the 256 MiB seal cap's worst case from
-about 2.4M to about 2.25M namespace lives — both orders of magnitude beyond any realistic
-population — and the fold-seal reservation helpers measure through the real encoder, so admission
-adjusts itself. The C++ side gains the matching typed enum (`CoverageClass`: `Absent`, `Unchanged`,
-`Folded`, `Clamped`; the member keeps the name `classification`, since `class` is a keyword), the
-magic numbers disappear from GC and sweep logic, and the vocabulary joins the enum wire tables. The
-set stays closed exactly as before — an unknown word is `CORRUPTED_DATA` — and the wide-integer
-truncation hazard the header documents cannot occur with words.
+a raw-object reader needed the sources for. The capacity calculation that gated this counts the
+whole rename, not just the word: an old maximum-width base `ref_life` row is 120 bytes and the
+renamed row is 149–152 (22 bytes of keys and tags plus 7–10 for the word), so the 256 MiB seal
+cap's worst case moves from about 2.24M to about 1.77M namespace lives — roughly a fifth lower and
+still orders of magnitude beyond any realistic population — and the fold-seal reservation helpers
+measure through the real encoder, so admission adjusts itself. The C++ side gains the matching
+typed enum, and it is deliberately dense: `CoverageClass { Absent = 0, Unchanged = 1, Folded = 2,
+Clamped = 3 }`. The old byte value 4 belongs to the numeric wire being deleted, not to any other
+contract — nothing outside this JSON persists the raw classification byte — so the enum satisfies
+the tables' density requirement and the indexed `toWord`, and every `== 0` / `== 4` comparison in
+GC and sweep logic becomes a typed comparison (the member keeps the name `classification`, since
+`class` is a keyword). The set stays closed exactly as before — an unknown word is
+`CORRUPTED_DATA` — and the wide-integer truncation hazard the header documents cannot occur with
+words.
 
 A `condemned` summary row becomes:
 
@@ -705,7 +711,7 @@ by what an old tolerant reader does with it:
 
 | Change | Old tolerant reader | Contract |
 |---|---|---|
-| new optional ordinary key | skips it | may be additive: no `v` bump; best-effort on mutable objects until the floor rises |
+| new *semantically ignorable* optional ordinary key — omission preserves exactly the safe old semantics, and no writer depends on old readers honoring it | skips it | may be additive: no `v` bump; best-effort on mutable objects until the floor rises. An optional key that affects fencing, retention, or deletion is not ignorable — route it through `!` or a breaking change |
 | new key in a strict format | rejects (`CORRUPTED_DATA`) | breaking: bump plus change point |
 | new enum or tag word | rejects as corruption (`fromWord` fails closed) | breaking: bump plus change point. Append-only declarations such as `hold_reason` promise only that values are never renumbered or reused — not that appending is compatible |
 | new required field, or new meaning of an existing value | may misread the object | breaking: bump, change point, and a pool-floor raise |
@@ -738,9 +744,11 @@ vocabulary item gains a single production carrier:
   constexpr constructor — so a raw string literal cannot be passed silently; an inline
   `WireKey{"..."}` at a call site still compiles, but it is visually loud and review rejects it.
   The honest scope of the guarantee: for codecs that read the carriers, writer/reader divergence
-  is impossible; nothing physically prevents a future codec from bypassing them — the type makes
-  bypass conspicuous, and goldens plus review close the rest. There is no central schema registry;
-  locality is preserved.
+  is impossible; nothing physically prevents a future codec from bypassing them. `WireKey` makes
+  the write-side bypass conspicuous; on the read side a literal comparison still compiles
+  silently, so reader carrier discipline is held by the codec structure, the goldens, and review —
+  a symmetric read-key type was considered and judged excess machinery. There is no central schema
+  registry; locality is preserved.
 - **Enum wire tables.** The `ProvenanceOp` decision generalizes to every enum-backed persisted
   word vocabulary **whose entire enum domain is serializable**: `ProvenanceOp`, `TokenType`,
   `HoldReason`, `OutcomeKind`, `MetaState`, `NsState`, `RefOpKind`, `RefOwnerKind`, `BlobHashAlgo`
@@ -849,16 +857,18 @@ changes in one place.
 1. **Behavior-preserving preparation.** Introduce the key constants with the OLD spellings —
    including the full-key bundles for the `old_`/`new_` families — and move every writer and reader
    onto them; introduce the enum wire tables keeping the current words; introduce the per-encoding
-   field write helpers and the shared-type match helpers; perform the four member renames; close
-   the battery omissions and add the registry set-equality assertion. Goldens stay byte-identical
-   throughout — a green suite is the proof that preparation (helpers included) changed no wire
-   byte.
+   field write helpers and the shared-type match helpers; perform the four audit-driven member
+   renames; close the battery omissions and add the registry set-equality assertion. Goldens stay
+   byte-identical throughout — a green suite is the proof that preparation (helpers included)
+   changed no wire byte.
 2. **Atomic wire cut.** Flip the constant values and the record-tag words, reset `G_BUILD` and the
    change-point history to the shared `BASELINE`, update the literal goldens and negative fixtures,
    keep the sentinels and both pool gates, and update `Formats/README.md` in the same change. The
    descriptor `static_assert` lands in this phase — the cut must not compile if it overflows the
    floor. The `TokenFields` requiredness unification (the `GcOutcomes` tightening) lands here as
-   its own explicit change with its negative test.
+   its own explicit change with its negative test, and `MountLease::min_active` is renamed to
+   `min_active_build_sequence` together with its wire key — the fifth member rename tracks the cut,
+   not the audit.
 3. **Proof and measurement.** Cross-check the constexpr worst case against the real encoder, run
    the byte-delta and throughput measurements, and sweep the raw assertions in integration tests
    and `utils/ca-soak`.
@@ -1082,3 +1092,8 @@ The change is complete when:
   vocabulary-evolution matrix and codec-author checklist; `WireKey` and the honestly-scoped
   by-construction claim; `algos_used` becomes a JSON array; `min_active` becomes
   `min_active_build_sequence`; canonical examples added; the revision history moved here.
+- Revision 13: `CoverageClass` settled as a dense enum (`Clamped = 3`; the old byte 4 dies with
+  the numeric wire); the capacity arithmetic corrected to count the whole rename (120 → 149–152
+  bytes per row, about 2.24M → 1.77M lives); the additive-evolution row narrowed to semantically
+  ignorable keys; `WireKey` propagated into the bundles and its guarantee split honestly between
+  the write and read sides; the fifth member rename sequenced into phase 2.
