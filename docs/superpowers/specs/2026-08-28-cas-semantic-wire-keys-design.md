@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS semantic wire keys design {#cas-semantic-wire-keys-design}
 
-Revision 13 (2026-08-29). Three adjudications shape the design: keys must be *sufficiently full
+Revision 14 (2026-08-29). Three adjudications shape the design: keys must be *sufficiently full
 for understanding*, not exact C++ member names; there are no existing installations, so the change
 ships as a **generation reset**, not a generation bump; and C++ members follow an **asymmetric
 rule** — a member may be fuller than its wire key, never more cryptic. The exact-full-name
@@ -67,7 +67,8 @@ The goals are:
 - make a raw object understandable without a source-level abbreviation table;
 - keep high-cardinality records materially smaller than an exact-member-name encoding;
 - preserve all existing object paths, value encodings, ordering rules, strictness, compression
-  policies, and byte caps;
+  policies, and byte caps — with exactly two listed value-representation exceptions, the `class`
+  words and the `algos_used` array;
 - preserve the 240-byte minimum and 256-byte default `blob_header_len`;
 - make the complete post-reset vocabulary — keys, record tags, and closed value sets — explicit
   and testable;
@@ -191,7 +192,12 @@ from a prefix at write time — that would leave the composed spelling without a
 the reader compares full literals. Instead they are declared as bundles of full-key constants:
 
 ```cpp
-struct ManifestRefWireKeys { WireKey epoch, build, ord; };
+struct ManifestRefWireKeys
+{
+    WireKey epoch;
+    WireKey build;
+    WireKey ord;
+};
 constexpr ManifestRefWireKeys kBareManifestRefKeys{WireKey{"epoch"}, WireKey{"build"}, WireKey{"ord"}};
 constexpr ManifestRefWireKeys kOldManifestRefKeys{WireKey{"old_epoch"}, WireKey{"old_build"}, WireKey{"old_ord"}};
 constexpr ManifestRefWireKeys kNewManifestRefKeys{WireKey{"new_epoch"}, WireKey{"new_build"}, WireKey{"new_ord"}};
@@ -291,11 +297,16 @@ brevity here, and a bare `min_active` under-names what is specifically a build-s
 member follows (`MountLease::min_active` becomes `min_active_build_sequence`), and its `UINT64_MAX`
 clean-farewell sentinel remains part of the field contract, documented at the codec.
 
-The value encodings do not change, with one exception. `algos_used` stops being a comma-joined list
+The value encodings change in exactly the two places this design lists — here `algos_used`, and the
+fold-seal `class` words in their own section. `algos_used` stops being a comma-joined list
 inside a JSON string and becomes a JSON array of algo words (`["ch128","sha256"]`): the hand-rolled
 mini-grammar inside a JSON value disappears, `jq` reads it natively, and the cost is single-digit
-bytes in a tiny singleton. This adds one small string-array primitive to `CasTextFormat`, used by
-exactly this field. Everything else holds: full-range counters that are currently decimal JSON
+bytes in a tiny singleton. The carrier API is `writeWordArrayField` plus
+`JsonObjectReader::readStringArray`; the writer streams the elements straight into the output with
+no intermediate joined string, and the reader fails closed (`CORRUPTED_DATA`) on the old
+comma-joined string form, a non-string element, an empty, unsorted, or duplicated array, and an
+unknown algo word — exactly the set the writer can never produce. Everything else holds:
+full-range counters that are currently decimal JSON
 strings remain strings, bounded values remain numbers, and IDs remain lowercase fixed-width hex.
 `cas_owner`'s `retired_at_ms` remains conditionally emitted (a never-retired owner's body is the
 one-key object).
@@ -535,8 +546,9 @@ closed-set, both-or-neither, hold, cleanup-evidence, and shard-total validation 
 
 ## Closed value sets {#closed-value-sets}
 
-Value representations do not change, but the complete vocabulary goal includes them, so the closed
-sets are pinned here and in the goldens:
+Value representations change only where listed (the `class` words and the `algos_used` array); the
+complete vocabulary goal includes the values, so the closed sets are pinned here and in the
+goldens:
 
 - `op` (ref log): `namespace_birth`, `owner_transition`, `set_published_at`, `remove_namespace`,
   `epoch_seal`;
@@ -625,7 +637,7 @@ the number of key and tag bytes emitted after decompression. The mappings delibe
 substantially smaller than exact member names.
 
 The following deltas count only key and changed record-tag bytes; JSON punctuation and values are
-unchanged:
+unchanged apart from the `class` word, which the `ref_life` row counts separately:
 
 | Repeated record | Increase |
 |---|---:|
@@ -734,7 +746,7 @@ The codec-author checklist for any vocabulary change, in one place:
 The implementation remains a mechanical codec change rather than a new schema subsystem, but every
 vocabulary item gains a single production carrier:
 
-- **Key constants.** Each wire key is one format-local `constexpr std::string_view` (shared fields
+- **Key constants.** Each wire key is one format-local `constexpr WireKey` (shared fields
   in `CasWireVocab`, format-local ones next to their codec), read by both the writer and the
   reader, so a writer/reader spelling divergence is impossible by construction. Critical keys carry
   the `!` prefix inside the literal (`"!prev_epoch"`), making criticality part of the single
@@ -790,7 +802,9 @@ vocabulary item gains a single production carrier:
   standard set-equality rule above.
 - **Field write helpers.** Each writer line becomes one call that names its encoding —
   `writeWordField`, `writeStringField`, `writeU64StringField`, `writeNumberField`,
-  `writeHex128Field`, `writeBoolField` — collapsing today's `writeKey`-plus-value pairs so a
+  `writeHex128Field`, `writeBoolField`, and `writeWordArrayField` (with the reader counterpart
+  `JsonObjectReader::readStringArray`; used today by exactly one field, `algos_used`) —
+  collapsing today's `writeKey`-plus-value pairs so a
   codec's writer reads as the format's field list in canonical order. `writeWordField` takes a
   wire-table word; `writeStringField` takes an arbitrary escaped string — paths, namespaces,
   hostnames, ref names, token values, cursors — because spelling an open string through the word
@@ -907,7 +921,9 @@ Third, compatibility tests pin:
 - `!prev_epoch` and `!prev_seq` retain both-or-neither validation;
 - the known-field sentinels still reject `pl` on rows and `rte`/`rts` on the snapshot meta line;
 - a `GcOutcomes` record missing `token` is rejected with `CORRUPTED_DATA` — the negative test of
-  the deliberate requiredness tightening.
+  the deliberate requiredness tightening;
+- the `algos_used` array rejects the old comma-joined string form, a non-string element, an empty,
+  unsorted, or duplicated array, and an unknown algo word, each with `CORRUPTED_DATA`.
 
 Fourth, blob-envelope boundary tests construct maximum-width mandatory values — deriving the
 longest `op` word from the shared constexpr `ProvenanceOp` wire-word table that replaces the two
@@ -1097,3 +1113,7 @@ The change is complete when:
   bytes per row, about 2.24M → 1.77M lives); the additive-evolution row narrowed to semantically
   ignorable keys; `WireKey` propagated into the bundles and its guarantee split honestly between
   the write and read sides; the fifth member rename sequenced into phase 2.
+- Revision 14: the blanket value-encoding claims name their two exceptions (`class` words,
+  `algos_used` array); the array gets its carrier API (`writeWordArrayField` /
+  `readStringArray`, streaming, no joined string) and its negative-test set; the key-constant type
+  reads `WireKey` everywhere; the bundle example moved to Allman style.
