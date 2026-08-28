@@ -16,6 +16,8 @@
 
 #include <Disks/IVolume.h>
 
+#include <Functions/FunctionFactory.h>
+
 #include <Storages/Distributed/DistributedSettings.h>
 #include <Storages/Distributed/DistributedSink.h>
 #include <Storages/StorageFactory.h>
@@ -161,7 +163,8 @@ void replaceCurrentDatabaseFunction(ASTPtr & ast, const ContextPtr & context)
 
     if (auto * func = ast->as<ASTFunction>())
     {
-        if (func->name == "currentDatabase")
+        /// `currentDatabase` is reachable through its aliases, so get a canonical name
+        if (getFunctionCanonicalNameIfAny(func->name) == "currentDatabase")
         {
             ast = evaluateConstantExpressionForDatabaseName(ast, context);
             return;
@@ -2699,12 +2702,12 @@ void registerStorageHybrid(StorageFactory & factory)
                                     "Argument #{}: additional table function must be a valid table function, got: {}", i, func->name);
                 }
 
-                // Normalize arguments (evaluate `currentDatabase()`, expand named collections, etc.).
-                // TableFunctionFactory::get mutates the AST in-place inside TableFunctionRemote::parseArguments.
-                ASTPtr normalized_table_function_ast = table_function_ast->clone();
+                // Evaluate `currentDatabase()` on the original argument, since that one is serialized to metadata.
+                // The clone is for TableFunctionFactory::get, which mutates the AST in-place inside TableFunctionRemote::parseArguments.
+                replaceCurrentDatabaseFunction(engine_args[i], local_context);
+                ASTPtr normalized_table_function_ast = engine_args[i]->clone();
                 auto additional_table_function = TableFunctionFactory::instance().get(normalized_table_function_ast, local_context);
                 ColumnsDescription segment_columns = additional_table_function->getActualTableStructure(local_context, true);
-                replaceCurrentDatabaseFunction(normalized_table_function_ast, local_context);
 
                 validate_segment_schema(segment_columns, normalized_table_function_ast->formatForLogging());
 
