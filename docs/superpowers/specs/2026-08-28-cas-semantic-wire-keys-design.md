@@ -17,7 +17,11 @@ review of revision 2: the known-field sentinels stay, both pool-meta gates keep 
 the member rule is enforced absolutely (at the cost of one rename), the closed value sets are
 completed, and the `ProvenanceOp` wire words move into one constexpr table. Revision 4
 (2026-08-29) extends the member-rule audit to codec-local collector structs, adding three renames.
-The exact-full-name alternative was independently implemented in Altinity PR #2288 and rejected
+Revision 5 (2026-08-29) adds the constructive-enforcement layer — a single production carrier for
+every key and every closed vocabulary, a compile-time descriptor-budget proof, one shared
+`BASELINE`, enum renderers reused by introspection, and a three-phase implementation shape — and
+explicitly rejects declarative field schemas, generated goldens, and a golden key scanner. The
+exact-full-name alternative was independently implemented in Altinity PR #2288 and rejected
 for this design (see rejected alternatives).
 
 ## Problem {#problem}
@@ -54,7 +58,9 @@ The semantic-keys generation replaces opaque initialisms with a semantic wire vo
 - abbreviated record-tag values that would otherwise keep a row opaque are made readable in the
   same change;
 - C++ member names obey the asymmetric rule: at least as understandable as the wire key, and
-  fuller wherever the wire is budget-compressed.
+  fuller wherever the wire is budget-compressed;
+- every vocabulary item has a single production carrier (a key constant or an enum wire table),
+  and goldens stay an independent byte oracle that never reads those carriers.
 
 The change is a pre-release hard cut shipped as a **generation reset**: `G_BUILD` returns to 1,
 the accumulated change-point history is erased, pools are recreated, and readers gain no aliases,
@@ -72,7 +78,10 @@ The goals are:
 - preserve the 240-byte minimum and 256-byte default `blob_header_len`;
 - make the complete post-reset vocabulary — keys, record tags, and closed value sets — explicit
   and testable;
-- guarantee that no C++ member is more cryptic than its wire key.
+- guarantee that no C++ member is more cryptic than its wire key;
+- make spelling drift inside production code impossible by construction — writer, reader, and
+  introspection read each vocabulary item from one carrier — while tests remain an independent
+  proof of the wire contract.
 
 The following are not goals:
 
@@ -229,9 +238,20 @@ Consequences:
 The production descriptor must fit 240 bytes without relying on omission of provenance fields.
 Because the worst case now sits one byte under the floor, the `ProvenanceOp` wire words must live
 in a single constexpr table shared by the encoder, the decoder, and the boundary test — today they
-are two hand-maintained switches in `CasBlobEnvelopeFormat.cpp` — and the boundary test must derive
-the longest word (today `mutation`) from that table rather than hard-coding it, so a future longer
-provenance word trips a test instead of overflowing minimum-configured pools. The
+are two hand-maintained switches in `CasBlobEnvelopeFormat.cpp`. Every component of the worst case
+is then a compile-time constant (key lengths, 34 bytes per quoted `hex128`, 20 digits per u64, 10
+per u32, the table's longest word, the `ref` framing, the brace, and the newline), so the mandatory
+worst case is a constexpr expression guarded in the same change as the wire cut:
+
+```cpp
+static_assert(mandatory_descriptor_worst_case <= kMinBlobHeaderLen - 1);
+```
+
+A future longer provenance word then fails to compile instead of overflowing minimum-configured
+pools. The boundary test stays as the independent half of the proof: it feeds maximum-width values
+through the real encoder and checks that the formula matches the bytes — 239 mandatory bytes, a
+240-byte header encodes, a 256-byte header leaves 17 escaped `ref` bytes, and the payload offset is
+exact. The compiler proves the formula; the test proves the formula describes the encoder. The
 test-only `!x` extension is exercised with a 256-byte header, where it also fits.
 
 ## Singleton control objects {#singleton-control-objects}
@@ -462,7 +482,11 @@ A `ref_life` row becomes:
 `witness_disappeared` — a key named `hold` reads as a boolean. It also matches the member path
 `hold->reason`. The `class` values remain the closed numeric set `{0, 1, 2, 4}` (a machine
 classification consumed by GC logic, documented at `CasFoldSealFormat.h`); the C++ member stays
-`classification`, which the asymmetric member rule permits and the `class` keyword requires.
+`classification`, which the asymmetric member rule permits and the `class` keyword requires. On the
+C++ side the classification gains a typed enum — enumerator names taken from the documented
+semantics at `CasFoldSealFormat.h`, not invented — so the magic numbers disappear from GC and sweep
+logic while the wire stays numeric. (Wire words for these values would add 7–10 bytes to every raw
+`ref_life` row and are deferred pending a capacity calculation.)
 
 A `condemned` summary row becomes:
 
@@ -544,7 +568,7 @@ ships as a reset, not a bump. Implementation must:
 - set `G_BUILD` to 1; `currentCompatibilityVersion` and `currentWriterVersion` stamp every newly
   encoded object with `v:1`;
 - collapse the change-point history of all 17 registered formats (and the reserved `Roster` row) to
-  the `{1, 1}` baseline, and delete the named legacy generation constants
+  one shared `BASELINE` constant holding `{1, 1}`, and delete the named legacy generation constants
   (`kContiguousRefStreamsGeneration` through `kMountWriteAttemptIdGeneration`) together with every
   reference to them;
 - keep the floor machinery itself — `decodePoolMeta`'s backward gate and the
@@ -576,21 +600,62 @@ pre-reset object or pool — which should not exist — fails closed as `CORRUPT
 
 ## Codec structure {#codec-structure}
 
-The implementation remains a mechanical codec change rather than a new schema subsystem:
+The implementation remains a mechanical codec change rather than a new schema subsystem, but every
+vocabulary item gains a single production carrier:
 
-- `CasTextFormat` retains `type`, `v`, `n`, and the existing `!` handling;
-- `CasWireVocab` owns the shared `BlobRef`, `Token`, and `ManifestRef` spellings;
-- `CasRefWireVocab` continues to own value representation and validation for `RefTxnId`, while each
-  containing format supplies contextual keys such as `txn_epoch`, `snapshot_epoch`, or
-  `committed_epoch`;
-- each codec keeps its format-local record names and tag values next to its writer and reader;
-- the `ProvenanceOp` wire words move from two switches into one constexpr table read by the
-  encoder, the decoder, and the boundary test;
+- **Key constants.** Each wire key is one format-local `constexpr std::string_view` (shared fields
+  in `CasWireVocab`, format-local ones next to their codec), read by both the writer and the
+  reader, so a writer/reader spelling divergence is impossible by construction. Critical keys carry
+  the `!` prefix inside the literal (`"!prev_epoch"`), making criticality part of the single
+  spelling. There is no central schema registry; locality is preserved.
+- **Enum wire tables.** The `ProvenanceOp` decision generalizes: every closed persisted vocabulary
+  (`ProvenanceOp`, `TokenType`, `HoldReason`, `OutcomeKind`, `MetaState`, `NsState`, `RefOpKind`,
+  `RefOwnerKind`, marker and placement words) moves from its switch-plus-if pair into one constexpr
+  table that constructively proves enum exhaustiveness (a `static_assert` against the enum count —
+  the replacement for the `-Wswitch` guarantee the switches provided), two-way uniqueness of values
+  and words, and fail-closed `fromWord` (`CORRUPTED_DATA` on an unknown word; the defensive
+  `toWord` throw stays against out-of-range enum values). `magic_enum` may back the count assert in
+  `.cpp` files and tests only, never in production headers. Lookup is a linear scan over a handful
+  of entries — no maps.
+- `CasInspect` renders enum values through the same tables, so introspection cannot print `Merge`
+  where the wire says `merge`. `system.cas_*` column names are deliberately NOT coupled to wire
+  keys: the SQL surface and the persisted format have different compatibility contracts.
+- `CasTextFormat` retains `type`, `v`, `n`, and the existing `!` handling; `CasRefWireVocab`
+  continues to own value representation and validation for `RefTxnId`, while each containing format
+  supplies contextual keys such as `txn_epoch`, `snapshot_epoch`, or `committed_epoch`;
+- after the reset, all change-point rows reference one shared `BASELINE` constant instead of
+  per-format copies of the same `{1, 1}` history;
 - no map lookup, schema object, heap allocation, or runtime branch is added to select key names.
+
+What deliberately stays hand-written is the grammar: variant-dependent requiredness
+(`published_ms` on committed rows only, the condemned-row sextet), both-or-neither pairs, record
+ordering, and payload zones remain explicit C++ in the readers. Of the schema triple
+required/optional/critical, only criticality survives into the carriers — via the `!` prefix in the
+key literal; the rest is validation logic, written once and readable.
 
 Writer order remains canonical. Reader strictness remains exactly as registered in `CasFormat`.
 Unknown critical fields continue to fail before strict/tolerant handling, and exception taxonomy does
 not change.
+
+## Implementation shape {#implementation-shape}
+
+The change lands in three phases, so the mechanical part stops being hundreds of independent
+replacements: first the writers and readers are bound to one vocabulary, then the vocabulary
+changes in one place.
+
+1. **Behavior-preserving preparation.** Introduce the key constants with the OLD spellings and move
+   every writer and reader onto them; introduce the enum wire tables keeping the current words;
+   perform the four member renames; close the battery omissions and add the registry set-equality
+   assertion. Goldens stay byte-identical throughout — a green suite is the proof that preparation
+   changed no wire byte.
+2. **Atomic wire cut.** Flip the constant values and the record-tag words, reset `G_BUILD` and the
+   change-point history to the shared `BASELINE`, update the literal goldens and negative fixtures,
+   keep the sentinels and both pool gates, and update `Formats/README.md` in the same change. The
+   descriptor `static_assert` lands in this phase — the cut must not compile if it overflows the
+   floor.
+3. **Proof and measurement.** Cross-check the constexpr worst case against the real encoder, run
+   the byte-delta and throughput measurements, and sweep the raw assertions in integration tests
+   and `utils/ca-soak`.
 
 ## Test strategy {#test-strategy}
 
@@ -599,6 +664,10 @@ The implementation updates every exact-byte fixture and adds coverage in five la
 First, each of the 17 registered formats receives or retains a canonical encode/decode golden that
 pins the post-reset header, field order, key spelling, tag spelling, and value representation.
 Goldens remain inline with the codec unit tests; no generated golden-update command is introduced.
+Goldens spell their bytes literally and must not be constructed from the production key constants
+or enum tables: a golden built from the carriers would compare the encoder to itself and could not
+catch a wrongly chosen name. (The envelope battery already states this principle for itself; it
+becomes format-wide.)
 
 Second, `cas_format_test_battery` must cover the same set of `FormatId` values as the live traits
 registry. The current omissions for `RefCkpt`, `GcMaintenanceState`, and `RunFile` are closed, and a
@@ -636,7 +705,9 @@ switches in `CasBlobEnvelopeFormat.cpp` — and assert:
 Fifth, byte-budget tests pin the repeated-row deltas listed above, all existing line and object cap
 boundaries, `RefLog` and `RefSnapshot` encoded-size helpers, `RefCatalog` admission reservations, and
 fold-seal worst-case reservation helpers. The tests validate the real encoder output rather than
-duplicating a second byte formula.
+duplicating a second byte formula. Value-set tests iterate each enum wire table — every entry
+round-trips through `toWord` and `fromWord`, and the word list is pinned against the closed sets in
+this document.
 
 Raw JSON assertions outside the codec tests must be updated, notably encoding pins, ref-seal splice
 tests, catalog raw-row helpers, the orphan-manifest sweep splice, and the GCS mock that rewrites
@@ -697,6 +768,29 @@ and gives fixed headers and repeated rows explicit treatment.
 Allowing the same value type to serialize under selectable key profiles adds schema state and reader
 branches without a protocol need. There is one canonical spelling per containing format.
 
+### Declarative field schema {#declarative-field-schema}
+
+A compile-time table of `field → key → required/optional/critical` looks like the natural next step
+after key constants, but requiredness here is variant-dependent (`published_ms` is required on
+committed rows and forbidden on precommit ones; the condemned sextet exists only under
+`mark: condemned`; `old_`/`new_` obey a group grammar; `!prev_epoch`/`!prev_seq` are positional),
+so expressing it declaratively means inventing conditional schemas, pair groups, ordering rules,
+and payload transitions — a DSL beside which the hand-written validation would still exist, turning
+the schema into a second source of truth. The grammar stays explicit C++. Of the schema triple,
+only criticality survives into the carriers, via the `!` prefix inside the key literal.
+
+### Generated goldens and a golden key scanner {#generated-goldens-and-a-golden-key-scanner}
+
+Generating goldens from the production carriers is rejected outright: goldens are the independent
+wire oracle, and an oracle derived from the thing it checks pins nothing. A repository-wide golden
+key scanner (walk every golden, assert each key belongs to the declared vocabulary and each
+declared key appears somewhere) is deferred, not adopted: to walk real objects it would need to
+understand zstd framing, NDJSON, the padded blob header, the `PartManifest` payload zone, mutually
+exclusive record variants, and test-only keys — a second, incomplete parser. Full-coverage literal
+goldens, the registry/battery set-equality, and per-table round-trip tests provide nearly the same
+protection more simply. Because the scanner is deferred, no enumerable per-format key arrays are
+introduced either — scaffolding without a consumer.
+
 ### Mirroring the wire vocabulary back into C++ members {#mirroring-wire-vocabulary-into-members}
 
 Renaming `ManifestRef::writer_epoch` to `epoch` and the like would make the two sides byte-identical
@@ -712,8 +806,15 @@ The change is complete when:
   constants and the generation-3–10 refusal tests are deleted, the known-field sentinels and both
   pool gates are retained with post-reset tests, and all fixtures stamp `v:1`;
 - a maximum-width production blob descriptor fits 240 bytes (one spare byte) and a default
-  descriptor fits 256 bytes with a 17-byte `ref` budget, with the worst case derived from the
-  single constexpr `ProvenanceOp` wire-word table shared with the codec;
+  descriptor fits 256 bytes with a 17-byte `ref` budget; the mandatory worst case is a constexpr
+  expression over the shared `ProvenanceOp` wire-word table, guarded by `static_assert` against
+  `kMinBlobHeaderLen`, and the boundary test independently confirms the formula against the real
+  encoder;
+- every wire key is read by its writer and reader from one constexpr constant, every closed
+  persisted vocabulary lives in one enum wire table with exhaustiveness and two-way-uniqueness
+  proofs (`magic_enum` confined to `.cpp` files and tests), `CasInspect` renders enum values
+  through those tables, and all change points reference one shared `BASELINE`;
+- goldens spell their bytes literally and reference no production carrier;
 - no C++ member is more cryptic than its wire key, including the four renames this requires:
   `RunRef::generation` to `key_generation`, both `ManifestFields` collectors' `me`/`mb`/`mo` to
   `epoch`/`build`/`ord`, and `BindingFields`' `bk`/`rn`/`mf` to `kind`/`ref`/`manifest_fields`;
