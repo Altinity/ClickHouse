@@ -223,7 +223,6 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.enable_json_parsing = settings[Setting::input_format_parquet_enable_json_parsing];
     format_settings.parquet.memory_low_watermark = settings[Setting::input_format_parquet_memory_low_watermark];
     format_settings.parquet.memory_high_watermark = settings[Setting::input_format_parquet_memory_high_watermark];
-    format_settings.parquet.prefetch_memory_fraction = settings[Setting::input_format_parquet_prefetch_memory_fraction];
     format_settings.parquet.decode_thread_fraction = settings[Setting::input_format_parquet_decode_thread_fraction];
     format_settings.parquet.compressed_memory_fraction = settings[Setting::input_format_parquet_compressed_memory_fraction];
     format_settings.parquet.min_bytes_in_flight = settings[Setting::input_format_parquet_min_bytes_in_flight];

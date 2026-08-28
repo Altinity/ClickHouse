@@ -154,19 +154,20 @@ private:
     /// progress without it. See the definition for exactly which reads those are.
     bool isPrivilegedRead(const PlannedRead & planned) const;
     /// Issue queued reads in order while `prefetcher.bytesInFlight() + planned.bytes` stays under the
-    /// target and the read's memory pool has room (or the read belongs to the first incomplete row
-    /// group, which is always issued so that progress never depends on the budget). Charges the bytes
-    /// to `poolOf(planned.stage)` via `diff`. Never calls `flushMemoryUsageDiff` (the caller owns the
-    /// diff), so it can be called from it.
+    /// target and the read's memory pool has room. Reads that the reader cannot make progress without
+    /// are issued regardless of both bounds -- those are the index entries and, of the first incomplete
+    /// row group, the page reads of the subgroup at `read_ptr` (see `isPrivilegedRead`), not everything
+    /// belonging to that row group. Charges the bytes to `poolOf(planned.stage)` via `diff`. Never calls
+    /// `flushMemoryUsageDiff` (the caller owns the diff), so it can be called from it.
     void pumpIssueQueue(MemoryUsageDiff & diff);
     void enqueueRowGroupIndexReads(size_t row_group_idx);
     void enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx);
-    /// Take the handles planned for this <stage, row group, subgroup, step> out of the queue, for the
-    /// demand path to start right away when the pump hasn't got to them yet. Every stage that starts
-    /// or resets a handle the planner may have queued must do this first: the handles are not
-    /// protected against being started by two threads at once, and a stage that resets one would
-    /// leave the queue holding an entry the pump could then try to issue.
-    void takeQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx, std::vector<PrefetchHandle *> & out);
+    /// Start the reads planned for this <stage, row group, subgroup, step> and take them out of the
+    /// queue: the demand path calls this when the pump hasn't got to them yet, bypassing the budget.
+    /// Every stage that starts or resets a handle the planner may have queued must do this first: the
+    /// handles are not protected against being started by two threads at once, and a stage that resets
+    /// one would leave the queue holding an entry the pump could then try to issue.
+    void takeQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx, MemoryUsageDiff & diff);
     /// Forget everything planned for this row group. Must be called before clearing its ColumnChunks:
     /// entries may point into `ColumnChunk::data_pages`, whose buffer clearing frees.
     void dropQueuedReads(size_t row_group_idx);

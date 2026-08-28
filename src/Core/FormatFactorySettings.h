@@ -201,9 +201,6 @@ Schedule prefetches more aggressively if memory usage is below than threshold. P
     DECLARE(UInt64, input_format_parquet_memory_high_watermark, 4ul << 30, R"(
 Approximate memory limit for the Parquet reader. Limits how many row groups or columns can be read in parallel. When reading multiple files in one query, the limit is on total memory usage across those files.
 )", 0) \
-    DECLARE(Double, input_format_parquet_prefetch_memory_fraction, 0.6, R"(
-Advanced tuning knob for the Parquet reader scheduler. Superseded by `input_format_parquet_compressed_memory_fraction`; kept for compatibility. No longer validated or used to size any memory budget -- any value is accepted and ignored.
-)", 0) \
     DECLARE(Double, input_format_parquet_compressed_memory_fraction, 0.35, R"(
 Share of `input_format_parquet_memory_high_watermark` the Parquet reader may hold as compressed data
 pages that are in flight or waiting to be decoded. This bounds how far ahead of decoding the reader
@@ -279,7 +276,8 @@ bandwidth, ~2 MiB; reading through larger gaps costs bytes without saving time.
     DECLARE(Double, input_format_parquet_max_read_amplification, 4, R"(
 Upper bound on `bytes read / bytes needed` for one coalesced Parquet read. Coalescing stops extending a
 read when the span would exceed this multiple of the useful bytes it covers, so a few small column chunks
-cannot drag megabytes of unrelated data through the cache or the network. `0` disables the bound.
+cannot drag megabytes of unrelated data through the cache or the network. `0` disables the bound. Any other
+value must be `>= 1` (a read always spans at least the bytes it serves); values in `(0, 1)` are rejected.
 )", 0) \
     DECLARE(UInt64, input_format_parquet_min_bytes_in_flight, 67108864, R"(
 Lower bound for the Parquet reader's bytes-in-flight target: the reader issues the index and data-page
@@ -1696,6 +1694,7 @@ Supported modes:
     MAKE_OBSOLETE(M, ParquetVersion, output_format_parquet_version, "2.latest") \
     MAKE_OBSOLETE(M, Bool, output_format_parquet_compliant_nested_types, true) \
     MAKE_OBSOLETE(M, Bool, output_format_parquet_unsupported_types_as_binary, false) \
+    MAKE_OBSOLETE(M, Double, input_format_parquet_prefetch_memory_fraction, 0.6) \
 
 #endif // __CLION_IDE__
 

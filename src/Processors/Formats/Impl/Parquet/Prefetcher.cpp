@@ -12,6 +12,7 @@
 
 namespace DB::ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
 }
@@ -37,6 +38,12 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
     min_bytes_for_seek = options.min_bytes_for_seek;
     bytes_per_read_task = options.bytes_per_read_task;
     gap_bytes = options.coalesce_gap_bytes ? std::min(min_bytes_for_seek, options.coalesce_gap_bytes) : min_bytes_for_seek;
+    /// Values in (0, 1) would ask a coalesced read to span fewer bytes than the ranges it serves,
+    /// which is impossible; they'd disable coalescing entirely in a way that looks like a typo for
+    /// "disabled" (0). Reject them instead of silently reading every range on its own.
+    if (!(options.max_read_amplification == 0 || options.max_read_amplification >= 1))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "input_format_parquet_max_read_amplification must be 0 (disabled) or >= 1, got {}", options.max_read_amplification);
     max_read_amplification = options.max_read_amplification;
     parser_shared_resources = parser_shared_resources_;
     determineReadModeAndFileSize(reader_, options);
@@ -163,9 +170,10 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset, const std::functio
     {
         case ReadMode::RandomRead:
         {
-            /// `readBigAt`'s progress callback reports bytes copied so far, but only within the
-            /// current attempt: `ReadBufferFromS3::readBigAt` restarts the count near zero on every
-            /// retry, so it isn't cumulative across the whole call. `publishBytesReady`'s guard
+            /// `readBigAt`'s progress callback reports bytes copied so far, cumulative over the
+            /// call (`ReadBufferFromS3`, `ReadWriteBufferFromHTTP`, `CachedOnDiskReadBufferFromFile`).
+            /// One exception: `ReadBufferFromS3::readBigAt` restarts the count near zero on every
+            /// retry attempt, so it isn't monotonic across attempts. `publishBytesReady`'s guard
             /// against non-increasing values absorbs that. Not every transport calls the callback at
             /// all (local `pread`, Azure, HDFS don't), in which case readiness equals completion.
             std::function<bool(size_t)> progress;
@@ -521,9 +529,9 @@ void Prefetcher::publishBytesReady(Task * task, size_t bytes_ready)
     /// `Running` CAS and the progress callback both run there), so this read-modify-write of
     /// `bytes_ready` doesn't race with another writer.
     ///
-    /// `bytes_ready` isn't necessarily increasing from call to call: the S3/HTTP progress callback
-    /// restarts near zero on every retry attempt inside `readBigAt` (see `readSync`). This guard
-    /// against non-increasing values is what makes that safe.
+    /// `bytes_ready` is cumulative over the `readBigAt` call, but isn't necessarily increasing from
+    /// call to call: `ReadBufferFromS3` restarts the count near zero on every retry attempt inside
+    /// `readBigAt` (see `readSync`). This guard against non-increasing values is what makes that safe.
     size_t prev = task->bytes_ready.load(std::memory_order_relaxed);
     if (bytes_ready <= prev)
         return;

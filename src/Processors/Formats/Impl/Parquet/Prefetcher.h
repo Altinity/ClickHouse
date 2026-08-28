@@ -62,7 +62,13 @@ public:
     std::span<const char> getRangeData(const PrefetchHandle & request);
 
     /// Pass-through read from the underlying ReadBuffer.
-    void readSync(char * to, size_t n, size_t offset, const std::function<void(size_t /*cumulative*/)> & on_progress = {});
+    /// `on_progress(m)` reports that the first `m` bytes of `to` have been filled, i.e. a count
+    /// cumulative over the whole call, per `SeekableReadBuffer::readBigAt`'s contract. `ReadBufferFromS3`,
+    /// `ReadWriteBufferFromHTTP` and `CachedOnDiskReadBufferFromFile` report progress mid-transfer;
+    /// `ReadBufferFromS3` restarts the count near zero on each retry attempt, so the value can go
+    /// backwards and `publishBytesReady`'s monotonic guard absorbs that. Transports that never call
+    /// it (local `pread`, Azure, HDFS) make readiness equal completion.
+    void readSync(char * to, size_t n, size_t offset, const std::function<void(size_t /*bytes filled so far*/)> & on_progress = {});
 
     size_t getFileSize() const { return file_size; }
 

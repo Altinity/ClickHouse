@@ -129,7 +129,9 @@ constexpr MemoryPool poolOf(ReadStage stage)
         case ReadStage::ColumnIndexAndOffsetIndex:
         case ReadStage::OffsetIndex:
             return MemoryPool::Metadata;
-        /// `ColumnDataPrefetch` is removed in a later task; until then it maps to `Compressed`.
+        /// `ColumnDataPrefetch` no longer issues the data-page reads (the issue queue does), but the
+        /// stage is kept: it is where a subgroup waits for its planned reads to be issued, and the
+        /// compressed pages it holds are charged to `Compressed`.
         case ReadStage::ColumnDataPrefetch:
             return MemoryPool::Compressed;
         case ReadStage::NotStarted:
@@ -143,7 +145,7 @@ constexpr MemoryPool poolOf(ReadStage stage)
 
 /// We track approximate current memory usage per ReadStage that allocated the memory (*).
 /// This struct aggregates how much memory was allocated by some operation.
-/// ReadManager then uses it to update the per-`MemoryPool` (see `poolOf`) std::atomic counters.
+/// `ReadManager` then uses it to update the per-`MemoryPool` (see `poolOf(ReadStage)`) atomic counters.
 /// (We do this instead of updating the std::atomics directly to reduce contention on the atomics.
 ///  I haven't checked whether this makes a difference.)
 ///

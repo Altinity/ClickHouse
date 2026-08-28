@@ -1677,8 +1677,14 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
                 offset, range_begin, read_bytes, n);
         }
 
+        /// The contract in `SeekableReadBuffer::readBigAt` is that the callback reports how much of
+        /// `to` has been filled so far, with increasing values -- not the size of the last chunk.
+        /// `read_bytes` was already advanced by `size` above, so it is exactly that cumulative
+        /// count. Callers such as the Parquet `Prefetcher` (`publishBytesReady`) treat the value as
+        /// cumulative and drop non-increasing reports, so passing the per-file-segment delta made
+        /// every report after the first one inert for a multi-segment read.
         if (progress_callback)
-            cancelled = progress_callback(size);
+            cancelled = progress_callback(read_bytes);
     }
 
     return read_bytes;

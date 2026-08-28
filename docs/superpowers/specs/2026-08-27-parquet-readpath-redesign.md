@@ -23,7 +23,7 @@ The v3 reader is latency-bound on object storage for structural reasons:
 - Memory bounded by a cap the reader honours: two budgets by *lifetime class* — compressed bytes in flight, decoded bytes live (including delivered chunks) — plus a small fixed share for metadata.
 - Subgroups of one row group decodable in parallel when a page index is present; delivery order unchanged.
 - A filesystem-cache-backed deployment pays for exactly the bytes a query reads (plus ≤ one alignment unit per range), and still ends up with those bytes cached; cold time ≈ cache-off time.
-- No behaviour change for local files at defaults beyond fewer syscalls; identical query results everywhere.
+- Identical query results everywhere. Local files at defaults do change behaviour, in three bounded ways: the read-amplification cap (`input_format_parquet_max_read_amplification = 4`) is active, so coalescing that would pull in more than 4x the useful bytes is cut short; the IO pool grows from `max_download_threads` (4) to `max(max_download_threads, min(max_parsing_threads, 16))`; and the reader plans reads ahead up to `input_format_parquet_min_bytes_in_flight` (64 MiB) instead of issuing them per subgroup on demand.
 - Every phase independently shippable and default-safe; every new setting has a `SettingsChangesHistory` entry and a `DECLARE` doc string.
 
 ## 3. Non-goals
@@ -38,7 +38,7 @@ The v3 reader is latency-bound on object storage for structural reasons:
 
 A task's ranges are sorted by offset and an HTTP body streams in offset order, so "bytes landed" is one monotonic counter per task.
 
-- `Task::bytes_ready` (`std::atomic<size_t>`), advanced by the `readBigAt` progress callback (`ReadBufferFromS3::readBigAt` and `ReadWriteBufferFromHTTP` already call `copyFromIStreamWithProgressCallback` per ~1 MiB chunk; `CachedInMemoryReadBufferFromFile` calls it once; local `pread`, Azure and HDFS never call it — readiness then equals completion, today's behaviour).
+- `Task::bytes_ready` (`std::atomic<size_t>`), advanced by the `readBigAt` progress callback (`ReadBufferFromS3::readBigAt` and `ReadWriteBufferFromHTTP` already call `copyFromIStreamWithProgressCallback` per ~1 MiB chunk; `CachedInMemoryReadBufferFromFile` calls it once; local `pread`, Azure and HDFS never call it — readiness then equals completion, today's behaviour). `CachedOnDiskReadBufferFromFile::readBigAt` reports once per file segment it copies from, so a filesystem-cache-backed read becomes partially ready as its segments are served — it had to be fixed to report the running total rather than the per-segment delta, since the contract (and `publishBytesReady`'s monotonic guard) is cumulative.
 - `getRangeData(handle)` needs `bytes_ready >= task_offset + length` **or** state `Done`. Waiting uses one per-task `min_waiting_threshold` (atomic, lowest pending threshold) and the `Prefetcher`-wide `ready_mutex`/`ready_cv`; the producer notifies only when `bytes_ready` crosses `min_waiting_threshold`. `Exception` and `Deallocated` wake everyone.
 - Zero-copy cache path (`readBigAtRetainCells`) and `SeekAndRead`/`EntireFileIsInMemory` set `bytes_ready = length` at completion.
 - Consequence: coalescing may span row groups without serializing delivery. `bytes_per_read_task` becomes purely a bandwidth/GET-count knob.

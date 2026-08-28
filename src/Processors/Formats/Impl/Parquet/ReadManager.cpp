@@ -738,14 +738,21 @@ void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx
         issue_queue.push_back(std::move(p));
 }
 
-void ReadManager::takeQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx, std::vector<PrefetchHandle *> & out)
+void ReadManager::takeQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx, MemoryUsageDiff & diff)
 {
     std::lock_guard lock(issue_mutex);
     for (auto it = issue_queue.begin(); it != issue_queue.end();)
     {
         if (it->stage == stage && it->row_group_idx == row_group_idx && it->row_subgroup_idx == row_subgroup_idx && it->step_idx == step_idx)
         {
-            out.insert(out.end(), it->handles.begin(), it->handles.end());
+            /// Issue first, erase after, as in `pumpIssueQueue`: if `startPrefetch` throws, the entry
+            /// stays in the queue, so its handles are still reachable instead of being lost with the
+            /// popped entry -- nobody would have started them and nobody could reach them any more.
+            /// The bytes are charged to the stage the planner queued the entry under, exactly as the
+            /// pump charges them, so which of the two issued the read doesn't change the accounting.
+            const ReadStage saved_stage = std::exchange(diff.cur_stage, it->stage);
+            reader.prefetcher.startPrefetch(it->handles, &diff);
+            diff.cur_stage = saved_stage;
             it = issue_queue.erase(it);
         }
         else
@@ -809,12 +816,10 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
     }
 
     const size_t target = bytesInFlightTarget();
-    size_t issued = 0;
     bool blocked = false;
 
     while (true)
     {
-        PlannedRead planned;
         /// Held across `startPrefetch` so that `dropQueuedReads` can rely on the queue being the only
         /// way this function reaches a row group's handles.
         std::lock_guard lock(issue_mutex);
@@ -839,8 +844,14 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
             /// already-read ranges), so the bytes actually in flight for an entry can differ from
             /// `bytes` in either direction -- the effective read depth is usually a bit deeper than
             /// this target nominally allows. That's fine: the target is a fitted goal, not a limit
-            /// anything depends on. The pool cap below is the one that must hold, and it's checked
-            /// against the same tokens the pool is charged (`request->length` times amplification).
+            /// anything depends on.
+            /// The pool cap below is the one that must hold, and it holds only approximately for the
+            /// same reason: `PlannedRead::bytes` sums the requested lengths, while the tokens actually
+            /// charged to the pool are `request->length` times the task's `memory_amplification` (the
+            /// coalesced span divided by the useful bytes in it). So one entry can overshoot the cap by
+            /// up to its own size times that amplification, which `input_format_parquet_max_read_amplification`
+            /// bounds; the overshoot is at most one entry's worth because the next iteration sees the
+            /// real usage.
             if (reader.prefetcher.bytesInFlight() + it->bytes > target ||
                 pool_usage_now + it->bytes > poolLimits(pool).memory_high_watermark)
             {
@@ -855,19 +866,22 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
             }
         }
 
-        planned = std::move(*it);
-        issue_queue.erase(it);
-
-        const ReadStage saved_stage = std::exchange(diff.cur_stage, planned.stage);
-        reader.prefetcher.startPrefetch(planned.handles, &diff);
+        /// Issue first, erase after: if `startPrefetch` throws, the entry stays in the queue, so its
+        /// handles are still reachable (for `dropQueuedReads`, and for a later pump to retry) instead
+        /// of being lost together with the popped entry. `issue_mutex` is held throughout, so `it`
+        /// stays valid across the call.
+        const ReadStage saved_stage = std::exchange(diff.cur_stage, it->stage);
+        reader.prefetcher.startPrefetch(it->handles, &diff);
         diff.cur_stage = saved_stage;
-        ++issued;
+        issue_queue.erase(it);
         ProfileEvents::increment(ProfileEvents::ParquetPlannedReads);
     }
 
-    /// One event per pump that got nothing out (not one per entry it looked at), so the count reads
-    /// as "times read-ahead had to wait", not as a function of how deep the queue happens to be.
-    if (blocked && issued == 0)
+    /// One event per pump that ran into a full budget (not one per entry it looked at), so the count
+    /// reads as "times read-ahead had to wait", not as a function of how deep the queue happens to be.
+    /// Counted even if the pump then issued a privileged entry: read-ahead was still blocked, which is
+    /// what the event is about.
+    if (blocked)
         ProfileEvents::increment(ProfileEvents::ParquetIssueQueueStalls);
 }
 
@@ -895,7 +909,7 @@ void ReadManager::flushMemoryUsageDiff(MemoryUsageDiff && diff)
     /// Stages to call scheduleTasksIfNeeded for, decided below. Collected into a bitmask (instead
     /// of calling scheduleTasksIfNeeded eagerly per stage) for two reasons: (1) `pool_usage` should
     /// reflect the whole diff before we make any scheduling decision, and (2) a pool is shared by
-    /// several stages (see `poolOf`), so freeing memory charged to one stage can unblock a *different*
+    /// several stages (see `poolOf(ReadStage)`), so freeing memory charged to one stage can unblock a *different*
     /// stage on the same pool -- we want to wake all of them exactly once, not just the one whose
     /// own by_stage went negative.
     UInt64 stages_to_schedule = diff.stages_to_schedule;
@@ -988,7 +1002,7 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
     /// The way we prevent it is by always allowing scheduling tasks for the lowest-numbered
     /// <row group, row subgroup> pair that hasn't been completed (delivered or skipped) yet.
     /// Below ColumnData, a row group is privileged unconditionally (not just when read_ptr ==
-    /// delivery_ptr): pools are shared across several ReadStages (see `poolOf`), so memory held by
+    /// delivery_ptr): pools are shared across several `ReadStage`s (see `poolOf(ReadStage)`), so memory held by
     /// one metadata stage (e.g. dictionary-page prefetch, released only in ColumnData) can block a
     /// *different* metadata stage the lowest incomplete row group still needs to pass through to
     /// ever reach ColumnData. Without this, that row group -- and thus the whole pool, since nothing
@@ -1121,11 +1135,11 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
             case ReadStage::BloomFilterHeader:
                 /// This stage's tasks read (and then reset) the handles the planner queued for the
                 /// whole row group at init, so take that entry rather than leave it for the pump.
-                takeQueuedReads(ReadStage::BloomFilterHeader, task.row_group_idx, UINT64_MAX, 0, prefetches);
+                takeQueuedReads(ReadStage::BloomFilterHeader, task.row_group_idx, UINT64_MAX, 0, diff);
                 prefetches.push_back(&column.bloom_filter_header_prefetch);
                 break;
             case ReadStage::BloomFilterBlocksOrDictionary:
-                takeQueuedReads(ReadStage::BloomFilterBlocksOrDictionary, task.row_group_idx, UINT64_MAX, 0, prefetches);
+                takeQueuedReads(ReadStage::BloomFilterBlocksOrDictionary, task.row_group_idx, UINT64_MAX, 0, diff);
                 if (column.use_dictionary_filter)
                     prefetches.push_back(&column.dictionary_page_prefetch);
                 for (auto & b : column.bloom_filter_blocks)
@@ -1133,7 +1147,7 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
                 break;
             case ReadStage::ColumnIndexAndOffsetIndex:
             {
-                takeQueuedReads(ReadStage::ColumnIndexAndOffsetIndex, task.row_group_idx, UINT64_MAX, 0, prefetches);
+                takeQueuedReads(ReadStage::ColumnIndexAndOffsetIndex, task.row_group_idx, UINT64_MAX, 0, diff);
                 prefetches.push_back(&column.column_index_prefetch);
                 prefetches.push_back(&column.offset_index_prefetch);
                 break;
@@ -1141,7 +1155,7 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
             case ReadStage::OffsetIndex:
                 /// The offset index handles live in the row-group-level index entry (the planner puts
                 /// both indexes of every column there), and this stage resets them after decoding.
-                takeQueuedReads(ReadStage::ColumnIndexAndOffsetIndex, task.row_group_idx, UINT64_MAX, 0, prefetches);
+                takeQueuedReads(ReadStage::ColumnIndexAndOffsetIndex, task.row_group_idx, UINT64_MAX, 0, diff);
                 prefetches.push_back(&column.offset_index_prefetch);
                 break;
             case ReadStage::ColumnDataPrefetch:
@@ -1164,7 +1178,7 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
                 /// this task. Take whatever the pump hasn't got to yet out of the queue and issue it
                 /// here: this task is the demand path, so it must not wait for the budget, and the
                 /// decoder that follows requires every page handle it uses to have been started.
-                takeQueuedReads(ReadStage::ColumnDataPrefetch, task.row_group_idx, task.row_subgroup_idx, task.step_idx, prefetches);
+                takeQueuedReads(ReadStage::ColumnDataPrefetch, task.row_group_idx, task.row_subgroup_idx, task.step_idx, diff);
                 /// Queue this subgroup's data-page reads; startPrefetch (below) issues them and charges
                 /// compressed bytes to the ColumnDataPrefetch budget, separate from the decode budget,
                 /// so many row groups prefetch ahead while only a few decode at once.
@@ -1517,7 +1531,7 @@ ReadManager::ReadResult ReadManager::read()
                 shutdown->shutdown();
                 lock.lock();
 
-                /// Memory is tracked per `MemoryPool`, not per stage (see `poolOf`); check each pool once.
+                /// Memory is tracked per `MemoryPool`, not per stage (see `poolOf(ReadStage)`); check each pool once.
                 for (size_t p = 0; p < NUM_MEMORY_POOLS; ++p)
                 {
                     ssize_t mem = pool_usage[p].load(std::memory_order_relaxed);
@@ -1600,7 +1614,7 @@ ReadManager::ReadResult ReadManager::read()
 
     /// The ColumnData token for this subgroup is released below (clearRowSubgroup), but the columns
     /// live on inside `chunk`. Keep them charged to the Decoded pool until the pipeline drops the
-    /// chunk (see `poolOf` and the `delivered_bytes` uses in `scheduleTasksIfNeeded`/`flushMemoryUsageDiff`).
+    /// chunk (see `poolOf(ReadStage)` and the `delivered_bytes` uses in `scheduleTasksIfNeeded`/`flushMemoryUsageDiff`).
     chunk.getChunkInfos().add(std::make_shared<ChunkMemoryInfo>(delivered_bytes, chunk.allocatedBytes()));
 
     /// This is a terrible hack to make progress indication kind of work.

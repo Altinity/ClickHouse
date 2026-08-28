@@ -366,16 +366,14 @@ struct FormatSettings
         /// Cap on the gap the reader reads through when coalescing nearby ranges (the smaller of
         /// this and the storage's min-bytes-for-seek wins); 0 = use the storage's value only.
         size_t coalesce_gap_bytes = 2097152;
-        /// Bound on bytes read / bytes needed per coalesced read; 0 = no bound.
+        /// Bound on bytes read / bytes needed per coalesced read; 0 = no bound, otherwise >= 1.
         double max_read_amplification = 4;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
-        /// Superseded by compressed_memory_fraction; kept for compatibility, no longer affects memory.
-        double prefetch_memory_fraction = 0.6;
         /// Reader scheduler knob: share of the parsing thread pool given to column decoding.
         double decode_thread_fraction = 0.375;
         /// Share of the memory budget held as compressed data pages in flight or awaiting decode
-        /// (the rest, minus a fixed 5% for metadata, holds decoded columns). See MemoryPool.
+        /// (the rest, minus a fixed 5% for metadata, holds decoded columns). See `MemoryPool`.
         double compressed_memory_fraction = 0.35;
         /// Lower bound for the reader's bytes-in-flight target (see `ReadManager::pumpIssueQueue`
         /// and `Prefetcher::targetBytesInFlight`), used before the fitted round-trip time and
