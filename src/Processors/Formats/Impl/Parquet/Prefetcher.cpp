@@ -68,17 +68,28 @@ Prefetcher::ReadStats Prefetcher::readStats() const
 size_t Prefetcher::targetBytesInFlight(size_t concurrency) const
 {
     ReadStats stats = readStats();
-    size_t target = static_cast<size_t>(stats.bandwidth_bytes_per_us * stats.rtt_us) * concurrency * 2;
+    /// Clamp the fitted bandwidth*rtt product before casting to `size_t` and multiplying by
+    /// `concurrency`: a single bad sample (e.g. a near-zero transfer time producing a huge bandwidth
+    /// sample) could otherwise blow up the EWMA into a value that overflows or produces a target far
+    /// beyond anything sane to keep in flight.
+    constexpr double max_product_bytes = 1024.0 * 1024 * 1024; // 1 GiB, per-stream ceiling
+    double product = std::min(stats.bandwidth_bytes_per_us * stats.rtt_us, max_product_bytes);
+    size_t target = static_cast<size_t>(product) * concurrency * 2;
     return std::max(target, 4 * bytes_per_read_task);
 }
 
-void Prefetcher::updateReadStats(const Task * task, uint64_t total_us)
+void Prefetcher::updateReadStats(const Task * task, uint64_t total_us, bool transport_progress)
 {
     uint64_t first_byte_us = task->first_byte_us.load(std::memory_order_relaxed);
-    /// The transport never called the progress callback: readiness equals completion, so the whole
-    /// duration is round-trip time and there's no separate transfer phase to measure bandwidth from.
-    uint64_t rtt_sample_us = first_byte_us > 0 ? first_byte_us : total_us;
-    uint64_t transfer_us = (first_byte_us > 0 && total_us > first_byte_us) ? (total_us - first_byte_us) : 0;
+    /// Only trust `first_byte_us` as a genuine time-to-first-byte boundary if the transport actually
+    /// reported progress mid-transfer (`transport_progress`). Otherwise the only `publishBytesReady`
+    /// call for this task was the unconditional completion call at the end of `readSync` (a
+    /// transport that never reports progress, or one that happened to deliver everything in a single
+    /// burst) -- there's no meaningful separate transfer phase to measure in that case, and treating
+    /// the near-zero gap between "first byte" and "total" as a transfer duration would produce
+    /// absurd bandwidth samples (bytes / ~1 microsecond).
+    uint64_t rtt_sample_us = transport_progress ? first_byte_us : total_us;
+    uint64_t transfer_us = (transport_progress && total_us > first_byte_us) ? (total_us - first_byte_us) : 0;
 
     ProfileEvents::increment(ProfileEvents::ParquetReadFirstByteMicroseconds, rtt_sample_us);
     ProfileEvents::increment(ProfileEvents::ParquetReadTransferMicroseconds, transfer_us);
@@ -86,7 +97,7 @@ void Prefetcher::updateReadStats(const Task * task, uint64_t total_us)
     constexpr double alpha = 0.2;
     std::lock_guard lock(stats_mutex);
     stat_rtt_us = stat_rtt_us * (1 - alpha) + static_cast<double>(rtt_sample_us) * alpha;
-    if (first_byte_us > 0 && transfer_us > 0)
+    if (transport_progress && transfer_us > 0)
     {
         double bandwidth_sample = static_cast<double>(task->length) / static_cast<double>(transfer_us);
         stat_bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us * (1 - alpha) + bandwidth_sample * alpha;
@@ -512,7 +523,9 @@ void Prefetcher::publishBytesReady(Task * task, size_t bytes_ready)
     if (bytes_ready <= prev)
         return;
     if (prev == 0)
-        task->first_byte_us.store(task->stopwatch.elapsedMicroseconds(), std::memory_order_relaxed);
+        /// `max(1, ...)`: keep 0 available as an unambiguous "never set" sentinel even if the clock
+        /// reads back an elapsed time of 0 (sub-microsecond first byte).
+        task->first_byte_us.store(std::max<uint64_t>(1, task->stopwatch.elapsedMicroseconds()), std::memory_order_relaxed);
     /// The store here and the `waiters` load below must not be reordered with each other (nor with
     /// the paired increment-then-load in `waitForBytes`), or a waiter could go to sleep just after
     /// we've already published enough bytes and just before it increments `waiters`, and never get
@@ -551,6 +564,14 @@ Prefetcher::Task::State Prefetcher::waitForBytes(Task * task, size_t need)
 
 void Prefetcher::scheduleTask(Task * task)
 {
+    /// The calling thread (pickRangesAndCreateTaskIfNotExists) still holds, via the `PrefetchHandle`
+    /// it was passed, a reference that keeps `refcount` >= 1 until that handle is later reset by its
+    /// owner -- which can't happen before this call returns, since the owner is the caller further
+    /// up the same call stack. So `refcount` can't have dropped to zero and raced ahead of the
+    /// `fetch_add` below via `decreaseTaskRefcount` in this window between the lock being released
+    /// and `scheduleTask` running.
+    chassert(task->refcount.load(std::memory_order_relaxed) > 0);
+
     /// Matched by exactly one `fetch_sub`: either at the end of `runTask` (this task is guaranteed
     /// to reach `runTask` exactly once, whether scheduled onto `io_runner` here or run synchronously
     /// from `getRangeData`), or in `decreaseTaskRefcount` if the task is dropped before that happens.
@@ -623,12 +644,27 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
     task->stopwatch.restart();
 
     auto final_state = Task::State::Done;
+    /// Set in the `supportsReadAtRetainCells` branch below (both the single-cell zero-copy case and
+    /// the multi-cell memcpy-assembled case): a task served from the cache has no meaningful
+    /// round-trip-time/bandwidth to measure (no wire transfer, or a fast local memcpy that would
+    /// otherwise pollute the fitted stats), so it's excluded from `updateReadStats` regardless of
+    /// whether it happened to land in one cell (no `cached_region`-based exclusion needed) or many.
+    bool served_from_cache = false;
+    /// Set from the buffered (`readSync`) branch's progress callback: true only if the transport
+    /// invoked it with a partial count at least once. Distinguishes a genuine mid-transfer progress
+    /// report from the single synthetic completion call that `readSync` always makes at the end (see
+    /// its call to `on_progress(n)`), which transports that never report progress (local `pread`,
+    /// Azure, HDFS) rely on as their only callback. Without this, that synthetic call could look like
+    /// "first byte arrived a few nanoseconds before completion", turning a normal read into a
+    /// bandwidth sample of `length / ~1 microsecond`.
+    bool transport_progress = false;
     try
     {
         /// When the reader supports zero-copy cached reads, get retained cache cells
         /// instead of allocating a buffer and copying data into it.
         if (read_mode == ReadMode::RandomRead && reader->supportsReadAtRetainCells() && task->length > 0)
         {
+            served_from_cache = true;
             auto cached_regions = reader->readBigAtRetainCells(task->length, task->offset);
             chassert(!cached_regions.empty());
 
@@ -677,7 +713,12 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
         {
             task->buf.resize(task->length);
             readSync(task->buf.data(), task->length, task->offset,
-                [this, task](size_t copied) { publishBytesReady(task, copied); });
+                [this, task, &transport_progress](size_t copied)
+                {
+                    if (copied < task->length)
+                        transport_progress = true;
+                    publishBytesReady(task, copied);
+                });
         }
     }
     catch (...)
@@ -696,12 +737,14 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
 
     /// Fold this task's timing into the fitted round-trip-time/bandwidth stats, but only for reads
     /// that actually went over the wire and can be timed meaningfully: not on exception, only for
-    /// `RandomRead` (the mode `readBigAt`'s progress callback is wired up for), and excluding the
-    /// zero-copy `cached_region` path (no data movement to time -- see the comment in the `try` block
-    /// above for why `publishBytesReady` isn't even called there).
-    if (final_state != Task::State::Exception && read_mode == ReadMode::RandomRead
-        && !task->cached_region.has_value() && task->bytes_ready.load(std::memory_order_relaxed) > 0)
-        updateReadStats(task, total_us);
+    /// `RandomRead` (the mode `readBigAt`'s progress callback is wired up for), and excluding tasks
+    /// served from the cache (`served_from_cache`, set above -- no wire transfer to time, or a fast
+    /// local memcpy that isn't representative of the source's bandwidth). Computed now (`bytes_ready`
+    /// isn't touched by the state CAS or the deallocation below) but the update itself is deferred
+    /// past that CAS and the `notify_all` so waiters aren't held up by the stats mutex or the
+    /// profile-event increments.
+    const bool should_update_stats = final_state != Task::State::Exception && read_mode == ReadMode::RandomRead
+        && !served_from_cache && task->bytes_ready.load(std::memory_order_relaxed) > 0;
 
     s = Task::State::Running;
     if (task->state.compare_exchange_strong(s, final_state))
@@ -722,6 +765,9 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
     }
 
     task->completion.notify();
+
+    if (should_update_stats)
+        updateReadStats(task, total_us, transport_progress);
 
     return s;
 }

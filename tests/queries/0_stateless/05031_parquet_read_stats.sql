@@ -22,9 +22,14 @@ SETTINGS log_comment = 'test_05031_parquet_read_stats', use_parquet_metadata_cac
 
 SYSTEM FLUSH LOGS query_log;
 
+-- Sanity-bound the two new events against the query's own wall-clock duration, generously scaled up
+-- (reads from multiple tasks/threads can sum to more than one wall-clock duration's worth of
+-- microseconds, and MinIO round-trips are fast) so this stays deterministic while still catching a
+-- units/overflow-class bug (e.g. a bogus bandwidth sample turning a normal read into a bogus,
+-- wildly larger stored time) rather than a plain non-negativity check that any value satisfies.
 SELECT
     ProfileEvents['ParquetReadFirstByteMicroseconds'] > 0,
-    ProfileEvents['ParquetReadTransferMicroseconds'] >= 0
+    ProfileEvents['ParquetReadFirstByteMicroseconds'] + ProfileEvents['ParquetReadTransferMicroseconds'] <= (query_duration_ms + 1) * 1000 * 100
 FROM system.query_log
 WHERE type = 'QueryFinish' AND event_date >= yesterday() AND event_time >= now() - 600 AND query_kind = 'Select' AND current_database = currentDatabase()
     AND log_comment = 'test_05031_parquet_read_stats'

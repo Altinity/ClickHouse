@@ -67,18 +67,21 @@ public:
     size_t getFileSize() const { return file_size; }
 
     /// Fitted round-trip time and bandwidth of source reads, EWMA (alpha 0.2) over tasks read from
-    /// the source (cache-served zero-copy tasks are excluded: they complete in one shot with no
-    /// first-byte gap). Used to size the number of concurrently in-flight reads (see
-    /// `targetBytesInFlight`).
+    /// the source. Tasks served from the cache are excluded (both the single-cell zero-copy path and
+    /// the multi-cell memcpy-assembled path of `readBigAtRetainCells`): they either have no wire
+    /// transfer at all, or a fast local memcpy that isn't representative of the source's bandwidth.
+    /// Used to size the number of concurrently in-flight reads (see `targetBytesInFlight`).
     struct ReadStats
     {
         double rtt_us = 50'000;            // prior: 50 ms
         double bandwidth_bytes_per_us = 64; // prior: ~64 MB/s per stream
         size_t samples = 0;
     };
-    /// Lock-free-ish snapshot (takes a small mutex shared with the rare per-task stats update).
+    /// Snapshot of the fitted stats; takes `stats_mutex` (shared with the rare per-task update).
     ReadStats readStats() const;
-    /// Sum of `length` of tasks that are `Scheduled` or `Running` (queued or currently reading).
+    /// Sum of `length` of tasks that have started (`scheduleTask`) but not yet finished reading:
+    /// counts from scheduling until `runTask` finishes the read, i.e. up to (but not including) the
+    /// final state CAS to `Done`/`Exception` there.
     size_t bytesInFlight() const { return bytes_in_flight.load(std::memory_order_relaxed); }
     /// How many bytes we'd like to have in flight at once, given `concurrency` concurrent readers:
     /// bandwidth * round-trip time is the amount of data one stream keeps "in the pipe"; multiplying
@@ -194,11 +197,16 @@ private:
         /// only from that same thread), so no synchronization is needed for the timer itself.
         Stopwatch stopwatch;
         /// Microseconds from `stopwatch`'s restart to the first `publishBytesReady` call for this
-        /// task (`bytes_ready` going from 0 to nonzero). Left at 0 if never set: either the task
-        /// completed via the zero-copy `cached_region` path (no `publishBytesReady` call at all), or
-        /// the transport never invoked the progress callback (local `pread`, Azure, HDFS). Same
-        /// single-writer-thread reasoning as `stopwatch`; atomic only so a debugger/future reader
-        /// doesn't need to reason about tearing.
+        /// task (`bytes_ready` going from 0 to nonzero), floored to 1 so 0 stays available as an
+        /// unambiguous "never set" sentinel. Left at 0 only for tasks served from the cache (no
+        /// `publishBytesReady` call at all in the single-cell zero-copy case; the multi-cell case
+        /// does call it, but at the very end, and is excluded from stats by `served_from_cache`
+        /// regardless). For the buffered (`readSync`) path this is always eventually set, even when
+        /// the transport never reports progress mid-transfer (local `pread`, Azure, HDFS): `readSync`
+        /// makes one unconditional completion call at the end either way. Whether that lone call is a
+        /// genuine first byte or just the completion marker is `transport_progress`'s job to tell
+        /// apart, not this field's. Same single-writer-thread reasoning as `stopwatch`; atomic only so
+        /// a debugger/future reader doesn't need to reason about tearing.
         std::atomic<uint64_t> first_byte_us {0};
     };
 
@@ -257,7 +265,7 @@ private:
     size_t stat_samples = 0;
     /// Folds one task's timing into the EWMAs above and into the profile events. Called at the end
     /// of `runTask` for tasks read from the source (see call site for the exact conditions).
-    void updateReadStats(const Task * task, uint64_t total_us);
+    void updateReadStats(const Task * task, uint64_t total_us, bool transport_progress);
 
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;
