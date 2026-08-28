@@ -35,7 +35,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -47,6 +47,7 @@ jobs:
           test_name: "Config Workflow"
 
       - name: Note report location to summary
+        if: ${{ !failure() && env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -87,13 +88,13 @@ jobs:
   dockers_build_amd:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
     name: "Dockers Build (amd)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -132,13 +133,13 @@ jobs:
   dockers_build_arm:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
     name: "Dockers Build (arm)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -177,13 +178,13 @@ jobs:
   fast_test:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RmFzdCB0ZXN0') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RmFzdCB0ZXN0') }}
     name: "Fast test"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -222,13 +223,13 @@ jobs:
   build_amd_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
     name: "Build (amd_binary)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -267,13 +268,13 @@ jobs:
   finish_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, fast_test, build_amd_binary]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.config_workflow.result != 'skipped' }}
     name: "Finish Workflow"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 

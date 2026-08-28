@@ -33,7 +33,7 @@ jobs:
           EOF
           echo "DRY_RUN=true" >> "$GITHUB_ENV"
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0  # full history needed
       - name: Debug Info

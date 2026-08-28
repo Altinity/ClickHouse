@@ -22,6 +22,7 @@ class AltinityWorkflowTemplates:
     # Additional pre steps for config workflow job
     ADDITIONAL_CI_CONFIG_STEPS = r"""
       - name: Note report location to summary
+        if: ${{ !failure() && env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -40,7 +41,7 @@ class AltinityWorkflowTemplates:
         "GrypeScan": r"""
   GrypeScanServer:
     needs: [config_workflow, docker_server_image]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +54,7 @@ class AltinityWorkflowTemplates:
       tag-suffix: ${{ matrix.suffix }}
   GrypeScanKeeper:
       needs: [config_workflow, docker_keeper_image]
-      if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
+      if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
       uses: ./.github/workflows/grype_scan.yml
       secrets: inherit
       with:
@@ -63,7 +64,7 @@ class AltinityWorkflowTemplates:
         "Regression": r"""
   RegressionTestsRelease:
     needs: [config_workflow, build_amd_binary]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'regression')}}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'regression')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -75,7 +76,7 @@ class AltinityWorkflowTemplates:
       workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_binary]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'aarch64')}}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -89,7 +90,7 @@ class AltinityWorkflowTemplates:
         "SignRelease": r"""
   SignRelease:
     needs: [config_workflow, build_amd_release]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' }}
     uses: ./.github/workflows/reusable_sign.yml
     secrets: inherit
     with:
@@ -98,7 +99,7 @@ class AltinityWorkflowTemplates:
       data: ${{ needs.config_workflow.outputs.data }}
   SignAarch64:
     needs: [config_workflow, build_arm_release]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' }}
     uses: ./.github/workflows/reusable_sign.yml
     secrets: inherit
     with:
@@ -108,15 +109,15 @@ class AltinityWorkflowTemplates:
 """,
         "CIReport": r"""
   FinishCIReport:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.config_workflow.result != 'skipped' }}
     needs:
 {ALL_JOBS}
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        uses: actions/checkout@v6
         with:
-          clear-repository: true
+          clean: true
       - name: Finalize workflow report
         if: ${{ !cancelled() }}
         uses: ./.github/actions/create_workflow_report
@@ -127,7 +128,7 @@ class AltinityWorkflowTemplates:
         "SourceUpload": r"""
   SourceUpload:
     needs: [config_workflow, build_amd_release]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' }}
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     env:
         COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -135,9 +136,9 @@ class AltinityWorkflowTemplates:
         VERSION: ${{ fromJson(needs.config_workflow.outputs.data).custom_data.version.string }}
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        uses: actions/checkout@v6
         with:
-          clear-repository: true
+          clean: true
           ref: ${{ fromJson(needs.config_workflow.outputs.data).git_ref }}
           submodules: true
           fetch-depth: 0
