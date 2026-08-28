@@ -9,12 +9,15 @@ doc_type: 'guide'
 
 # CAS semantic wire keys design {#cas-semantic-wire-keys-design}
 
-Revision 2 (2026-08-28). Supersedes revision 1 of the same date, after three adjudications:
-keys must be *sufficiently full for understanding*, not exact C++ member names; there are no
-existing installations, so the change ships as a **generation reset**, not a generation bump; and
-C++ members follow an **asymmetric rule** — a member may be fuller than its wire key, never more
-cryptic. The exact-full-name alternative was independently implemented in Altinity PR #2288 and
-rejected (see rejected alternatives).
+Revision 3 (2026-08-29). Revision 2 encoded three adjudications: keys must be *sufficiently full
+for understanding*, not exact C++ member names; there are no existing installations, so the change
+ships as a **generation reset**, not a generation bump; and C++ members follow an **asymmetric
+rule** — a member may be fuller than its wire key, never more cryptic. Revision 3 incorporates the
+review of revision 2: the known-field sentinels stay, both pool-meta gates keep their own tests,
+the member rule is enforced absolutely (at the cost of one rename), the closed value sets are
+completed, and the `ProvenanceOp` wire words move into one constexpr table. The exact-full-name
+alternative was independently implemented in Altinity PR #2288 and rejected for this design (see
+rejected alternatives).
 
 ## Problem {#problem}
 
@@ -126,8 +129,11 @@ Consequences:
 - `ManifestRef::writer_epoch` ↔ wire `epoch`, `SourceEdgeRecord::source_id` ↔ wire `src`,
   `EnvelopeHeader::incarnation_tag` ↔ wire `tag` are all legal: the member out-explains the key.
 - A member spelled `cr` against a wire key `condemn_round` would be illegal; so would introducing
-  any new initialism member alongside a readable key. The rule is a review gate for future codecs;
-  today's members already satisfy it, so no rename pass is required.
+  any new initialism member alongside a readable key. The rule is absolute, and this design itself
+  introduces exactly one violation to fix: the wire key `key_generation` out-explains the member
+  `RunRef::generation`, so that member is renamed `key_generation` rather than weakening the rule
+  to a contextual one. No other member rename is required; beyond that the rule is a review gate
+  for future codecs.
 - Where a semantic wire word collides with a C++ keyword, the member uses the established
   abbreviation or a fuller form, both compliant: wire `namespace` ↔ member `ns` (an established
   fragment, not a cryptic invention), wire `class` ↔ member `classification`.
@@ -213,9 +219,11 @@ Consequences:
   from a 224-byte to a 239-byte mandatory descriptor.
 
 The production descriptor must fit 240 bytes without relying on omission of provenance fields.
-Because the worst case now sits one byte under the floor, the boundary test must derive the longest
-`op` word by iterating the `ProvenanceOp` table (today `mutation`) rather than hard-coding it, so a
-future longer provenance word trips a test instead of overflowing minimum-configured pools. The
+Because the worst case now sits one byte under the floor, the `ProvenanceOp` wire words must live
+in a single constexpr table shared by the encoder, the decoder, and the boundary test — today they
+are two hand-maintained switches in `CasBlobEnvelopeFormat.cpp` — and the boundary test must derive
+the longest word (today `mutation`) from that table rather than hard-coding it, so a future longer
+provenance word trips a test instead of overflowing minimum-configured pools. The
 test-only `!x` extension is exercised with a 256-byte header, where it also fits.
 
 ## Singleton control objects {#singleton-control-objects}
@@ -304,9 +312,13 @@ Repeated rows become:
 The abbreviated row-tag values also change: `c` becomes `committed`, and `p` becomes `precommit`.
 `published_ms` remains committed-only, exactly as `ts` is today.
 
-The reader-only retired sentinels `rte`, `rts`, and `pl` are **deleted together with their tests**
-as part of the generation reset: after the reset, no object that ever carried those fields can
-exist, so the guard has nothing left to guard (see the reset section).
+The reader-only sentinels are **retained together with their tests** and reclassified: they are
+not compatibility scaffolding but **permanently forbidden known-field guards**. A tolerant reader
+that merely skipped them as unknown keys would silently drop a persisted payload (`pl`, rejected on
+ref-log and ref-snapshot rows) or silently accept removed terminal-lifecycle semantics (`rte`/`rts`,
+rejected on the snapshot meta line) in a malformed, hand-edited, or erroneously produced
+current-generation object. The absence of old installations removes the legitimate old writer; it
+does not make such objects impossible. The sentinel spellings are not live vocabulary.
 
 ## Part manifest {#part-manifest}
 
@@ -422,7 +434,9 @@ A `blob_run` row becomes:
 this seal *is*, while a run row's value is the generation whose key namespace physically holds the
 run object — and the two genuinely diverge when an idle shard carries its parent's run forward
 verbatim. One word for both would read as corruption in exactly the situation the carry-forward is
-designed for. The validator continues to cross-check the row value against the run `key`.
+designed for. The validator continues to cross-check the row value against the run `key`. The C++
+member `RunRef::generation` is renamed `key_generation` in the same change — the one member rename
+this design requires (see the member rule).
 
 A `ref_life` row becomes:
 
@@ -464,17 +478,21 @@ sets are pinned here and in the goldens:
 - `op` (ref log): `namespace_birth`, `owner_transition`, `set_published_at`, `remove_namespace`,
   `epoch_seal`;
 - binding kinds (`old_kind`/`new_kind`): `committed`, `precommit`;
+- snapshot row `kind`: `committed`, `precommit`; catalog row `kind`: `entry` (sole value);
+- fold-seal record `kind`: `ref_life`, `blob_run`, `condemned`;
 - `token_type`: `etag`, `generation`, `emulated`;
 - `algo` (and the leading algorithm byte in a run `ref`): `ch128`, `xxh3`, `sha256`;
 - `mark`: `edge`, `zero`, `condemned`;
 - `outcome`: `deleted`, `absent`, `replaced`, `spared`; outcome `kind`: `blob` (sole value);
 - catalog `state`: `creating`, `live`, `removing`;
+- `cas_blob_meta` `state`: `clean`, `condemned`;
 - `lifecycle`: `live` (sole value, hard-required);
 - `hold_reason` (append-only): `gap_below_witness`, `unconsumed_seal_crossing`,
   `witness_disappeared`, `body_undecodable`, `manifest_body_missing`, `checkpoint_undecodable`;
 - `class`: numeric `{0, 1, 2, 4}` — deliberately not words (see fold seal);
 - `place`: `inline`, `blob`; run header `kind`: `source_edge`; blob descriptor `op`: `other`,
-  `insert`, `merge`, `mutation`, `attach`, `repack`.
+  `insert`, `merge`, `mutation`, `attach`, `repack`;
+- object `type` values: exactly the seventeen registry type strings in `CasFormat.cpp`.
 
 ## Decompressed-byte accounting {#decompressed-byte-accounting}
 
@@ -527,12 +545,15 @@ ships as a reset, not a bump. Implementation must:
   mint `min_reader_generation = 1`;
 - keep the normal forward gate, so a reader rejects `v` above `G_BUILD` with
   `UNKNOWN_FORMAT_VERSION` before reading a body;
-- delete the retired-field rejection sentinels (`pl` on ref-log and ref-snapshot rows, `rte`/`rts`
-  on the ref-snapshot meta line) and their tests: post-reset, no object that ever carried those
-  fields can exist, and a sentinel guarding a spelling that cannot occur is dead scaffolding;
-- delete the legacy-generation refusal tests (the pre-contiguous, generation-five, generation-six,
-  and reader-floor pool fixtures): their subject matter no longer exists, and their fixtures could
-  only be kept by encoding objects no generation ever wrote;
+- keep the known-field rejection sentinels (`pl` on ref-log and ref-snapshot rows, `rte`/`rts` on
+  the ref-snapshot meta line) and their tests: they are forbidden-field guards against malformed or
+  hand-edited current-generation objects, not compatibility scaffolding (see the ref snapshot
+  section);
+- delete only the refusal tests specific to historical generations 3–10 (the pre-contiguous,
+  generation-five, and generation-six pool fixtures): their subject matter no longer exists, and
+  their fixtures could only be kept by encoding objects no generation ever wrote. The two pool
+  gates themselves keep their own post-reset tests (see the test strategy) — deleting the
+  historical fixtures must not delete the last test of either gate;
 - re-stamp every test fixture that uses a historical header version (the `"v":3`-style literals
   whose comments say "any version <= G_BUILD passes the gate") to 1, since the forward gate at
   `G_BUILD = 1` would otherwise reject them before the body under test;
@@ -556,6 +577,8 @@ The implementation remains a mechanical codec change rather than a new schema su
   containing format supplies contextual keys such as `txn_epoch`, `snapshot_epoch`, or
   `committed_epoch`;
 - each codec keeps its format-local record names and tag values next to its writer and reader;
+- the `ProvenanceOp` wire words move from two switches into one constexpr table read by the
+  encoder, the decoder, and the boundary test;
 - no map lookup, schema object, heap allocation, or runtime branch is added to select key names.
 
 Writer order remains canonical. Reader strictness remains exactly as registered in `CasFormat`.
@@ -579,15 +602,22 @@ accessor; the assertion needs one small export.)
 Third, compatibility tests pin:
 
 - the forward gate: `v:2` is rejected with `UNKNOWN_FORMAT_VERSION` before the body;
+- the pool forward gate separately: a pool meta with `v:1` and `min_reader_generation: 2` is
+  rejected with `UNKNOWN_FORMAT_VERSION` — this is `decodePoolMeta`'s own check, distinct from the
+  header gate, and the `v:2` test cannot catch its removal;
+- the dormant backward gate: a header stamped `v:0` is rejected with `UNKNOWN_FORMAT_VERSION`;
+- a freshly created pool mints `min_reader_generation: 1`;
 - objects use only new live spellings, stamped `v:1`;
 - representative old spellings are not aliases — a tolerant reader skips them without populating
   the renamed field, a strict reader rejects them;
 - unknown ordinary fields retain strict/tolerant behavior;
 - unknown `!` fields still raise `UNKNOWN_FORMAT_VERSION`;
-- `!prev_epoch` and `!prev_seq` retain both-or-neither validation.
+- `!prev_epoch` and `!prev_seq` retain both-or-neither validation;
+- the known-field sentinels still reject `pl` on rows and `rte`/`rts` on the snapshot meta line.
 
 Fourth, blob-envelope boundary tests construct maximum-width mandatory values — deriving the
-longest `op` word from the `ProvenanceOp` table — and assert:
+longest `op` word from the shared constexpr `ProvenanceOp` wire-word table that replaces the two
+switches in `CasBlobEnvelopeFormat.cpp` — and assert:
 
 - `blob_header_len = 240` succeeds with a one-byte truncated `ref` budget;
 - `blob_header_len = 256` succeeds and permits exactly 17 escaped `ref` bytes at the mandatory
@@ -634,8 +664,9 @@ This maximizes local readability but makes the fixed blob descriptor exceed 256 
 record streams, increases decompression and parser traffic, and changes effective record capacity
 under uncompressed byte caps. It also leaks incidental C++ nesting into a wire contract.
 
-This alternative was independently implemented in Altinity PR #2288 and rejected by decision on
-2026-08-28 ("достаточно полные" keys, not full names). The PR's own consequences illustrate the
+This alternative was independently implemented in Altinity PR #2288 (an open draft at the time of
+writing) and rejected for this design by the 2026-08-28 decision ("достаточно полные" keys, not
+full names); the fate of the PR itself is adjudicated separately. The PR's own consequences illustrate the
 costs: the descriptor no longer fit, so the default payload offset grew from 256 to 384 and the
 floor from 240 to 320; active run rows grew ~20%; and the framing rename `v`→`version` made the
 version gate itself unreadable across the cut. Its useful parts are adopted here instead: the
@@ -671,13 +702,13 @@ The change is complete when:
 
 - every production writer and corresponding reader uses the key tables in this document;
 - `G_BUILD == 1`, every change-point history is the `{1, 1}` baseline, the legacy generation
-  constants, legacy-refusal tests, and retired-field sentinels are deleted, and all fixtures stamp
-  `v:1`;
+  constants and the generation-3–10 refusal tests are deleted, the known-field sentinels and both
+  pool gates are retained with post-reset tests, and all fixtures stamp `v:1`;
 - a maximum-width production blob descriptor fits 240 bytes (one spare byte) and a default
   descriptor fits 256 bytes with a 17-byte `ref` budget, with the worst case derived from the
-  `ProvenanceOp` table;
-- no C++ member is more cryptic than its wire key (review gate; no member renames are required by
-  this change);
+  single constexpr `ProvenanceOp` wire-word table shared with the codec;
+- no C++ member is more cryptic than its wire key, including the one rename this requires
+  (`RunRef::generation` to `key_generation`);
 - common, codec, corruption, byte-budget, and exact-encoding unit tests pass for all 17 formats,
   and the battery covers exactly the registry;
 - raw assertions in integration tests and `utils/ca-soak` use the new spellings;
