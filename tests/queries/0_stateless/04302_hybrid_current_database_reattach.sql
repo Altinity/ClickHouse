@@ -24,15 +24,31 @@ SETTINGS hybrid_watermark_hot = '2025-09-01';
 
 SELECT count() FROM {CLICKHOUSE_DATABASE:Identifier}.hybrid_t;
 
+-- Same table through the DATABASE() alias of currentDatabase(): the metadata rewrite
+-- has to canonicalize the function name instead of comparing it literally.
+CREATE TABLE {CLICKHOUSE_DATABASE:Identifier}.hybrid_alias_t (ts DateTime, value UInt64)
+ENGINE = Hybrid(
+    remote('localhost:9000', {CLICKHOUSE_DATABASE:String}, 'local_hot'),
+        ts > hybridParam('hybrid_watermark_hot', 'DateTime'),
+    remote('localhost:9000', DATABASE(), 'local_cold'),
+        ts <= hybridParam('hybrid_watermark_hot', 'DateTime')
+)
+SETTINGS hybrid_watermark_hot = '2025-09-01';
+
+SELECT count() FROM {CLICKHOUSE_DATABASE:Identifier}.hybrid_alias_t;
+
 -- Detach, switch the current database, then re-attach. currentDatabase() in the
 -- stored metadata now resolves against the other database, whose local_cold does
 -- not exist. With the fix the metadata holds the resolved name, so this succeeds.
 DETACH TABLE {CLICKHOUSE_DATABASE:Identifier}.hybrid_t;
+DETACH TABLE {CLICKHOUSE_DATABASE:Identifier}.hybrid_alias_t;
 CREATE DATABASE IF NOT EXISTS {CLICKHOUSE_DATABASE_1:Identifier};
 USE {CLICKHOUSE_DATABASE_1:Identifier};
 ATTACH TABLE {CLICKHOUSE_DATABASE:Identifier}.hybrid_t;
+ATTACH TABLE {CLICKHOUSE_DATABASE:Identifier}.hybrid_alias_t;
 
 SELECT count() FROM {CLICKHOUSE_DATABASE:Identifier}.hybrid_t;
+SELECT count() FROM {CLICKHOUSE_DATABASE:Identifier}.hybrid_alias_t;
 
 USE {CLICKHOUSE_DATABASE:Identifier};
 DROP DATABASE {CLICKHOUSE_DATABASE_1:Identifier};
