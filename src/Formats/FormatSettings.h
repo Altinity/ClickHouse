@@ -377,6 +377,10 @@ struct FormatSettings
         /// Share of the memory budget held as compressed data pages in flight or awaiting decode
         /// (the rest, minus a fixed 5% for metadata, holds decoded columns). See MemoryPool.
         double compressed_memory_fraction = 0.35;
+        /// Lower bound for the reader's bytes-in-flight target (see `ReadManager::pumpIssueQueue`
+        /// and `Prefetcher::targetBytesInFlight`), used before the fitted round-trip time and
+        /// bandwidth are trustworthy and on storage whose fitted product is tiny.
+        size_t min_bytes_in_flight = 67108864;
 
         /// Write.
         UInt64 row_group_rows = 1000000;

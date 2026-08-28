@@ -65,6 +65,11 @@ Prefetcher::ReadStats Prefetcher::readStats() const
     return ReadStats{.rtt_us = stat_rtt_us, .bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us, .samples = stat_samples};
 }
 
+size_t Prefetcher::requestLength(const PrefetchHandle & handle) const
+{
+    return handle ? handle.request->length : 0;
+}
+
 size_t Prefetcher::targetBytesInFlight(size_t concurrency) const
 {
     ReadStats stats = readStats();

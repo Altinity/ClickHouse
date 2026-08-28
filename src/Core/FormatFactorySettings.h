@@ -281,6 +281,13 @@ Upper bound on `bytes read / bytes needed` for one coalesced Parquet read. Coale
 read when the span would exceed this multiple of the useful bytes it covers, so a few small column chunks
 cannot drag megabytes of unrelated data through the cache or the network. `0` disables the bound.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_min_bytes_in_flight, 67108864, R"(
+Lower bound for the Parquet reader's bytes-in-flight target: the reader issues the index and data-page
+reads it has planned ahead of time until this many bytes (or more, if the fitted bandwidth times
+round-trip time of the storage asks for more) are being read at once. Higher values give the storage
+more concurrent requests to work on, at the cost of holding more compressed bytes in memory; the reads
+of the row group that is next to be delivered are always issued regardless of this bound.
+)", 0) \
     DECLARE(Bool, input_format_arrow_allow_missing_columns, true, R"(
 Allow missing columns while reading Arrow input formats
 )", 0) \

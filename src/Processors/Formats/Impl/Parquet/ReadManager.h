@@ -122,6 +122,52 @@ private:
 
     SharedResourcesExt::Limits poolLimits(MemoryPool pool) const;
 
+    /// One unit of read issue: the prefetch handles a <row group, subgroup, step, stage> needs,
+    /// issued together. Planned in delivery order; issued by `pumpIssueQueue` under the
+    /// bytes-in-flight target. The handles are pointers into `Reader::row_groups`, which outlives
+    /// the queue; see `dropQueuedReads` for how they're kept from outliving the ColumnChunk they
+    /// point into.
+    struct PlannedRead
+    {
+        ReadStage stage{};           /// stage whose budget the bytes are charged to (`poolOf(stage)`)
+        size_t row_group_idx = 0;
+        size_t row_subgroup_idx = UINT64_MAX; /// UINT64_MAX for row-group-level (index) reads
+        size_t step_idx = 0;
+        std::vector<PrefetchHandle *> handles;
+        size_t bytes = 0;            /// sum of the handles' request lengths
+    };
+
+    /// Protects `issue_queue` and the issuing of the reads in it: a thread holds it while it calls
+    /// `Prefetcher::startPrefetch` for an entry it just popped, so that `dropQueuedReads` (called
+    /// before a row group's `ColumnChunk`s are cleared) can be sure that no one is touching that row
+    /// group's handles through the queue any more.
+    std::mutex issue_mutex;
+    std::deque<PlannedRead> issue_queue;
+    /// Row groups whose data-page reads for the first step have been planned (`enqueueRowGroupPageReads`
+    /// covers all subgroups at once, so it must happen only once per row group).
+    AtomicBitSet page_reads_planned;
+
+    /// Bytes we want the Prefetcher to have in flight: the fitted bandwidth*rtt*concurrency target,
+    /// floored by `input_format_parquet_min_bytes_in_flight`.
+    size_t bytesInFlightTarget() const;
+    /// Issue queued reads in order while `prefetcher.bytesInFlight() + planned.bytes` stays under the
+    /// target and the read's memory pool has room (or the read belongs to the first incomplete row
+    /// group, which is always issued so that progress never depends on the budget). Charges the bytes
+    /// to `poolOf(planned.stage)` via `diff`. Never calls `flushMemoryUsageDiff` (the caller owns the
+    /// diff), so it can be called from it.
+    void pumpIssueQueue(MemoryUsageDiff & diff);
+    void enqueueRowGroupIndexReads(size_t row_group_idx);
+    void enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx);
+    /// Take the handles planned for this <stage, row group, subgroup, step> out of the queue, for the
+    /// demand path to start right away when the pump hasn't got to them yet. Every stage that starts
+    /// or resets a handle the planner may have queued must do this first: the handles are not
+    /// protected against being started by two threads at once, and a stage that resets one would
+    /// leave the queue holding an entry the pump could then try to issue.
+    void takeQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx, std::vector<PrefetchHandle *> & out);
+    /// Forget everything planned for this row group. Must be called before clearing its ColumnChunks:
+    /// entries may point into `ColumnChunk::data_pages`, whose buffer clearing frees.
+    void dropQueuedReads(size_t row_group_idx);
+
     std::mutex delivery_mutex;
     std::priority_queue<Task, std::vector<Task>, Task::Comparator> delivery_queue;
     std::condition_variable delivery_cv;

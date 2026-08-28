@@ -83,6 +83,9 @@ public:
     /// counts from scheduling until `runTask` finishes the read, i.e. up to (but not including) the
     /// final state CAS to `Done`/`Exception` there.
     size_t bytesInFlight() const { return bytes_in_flight.load(std::memory_order_relaxed); }
+    /// Length of the range a handle pins, 0 for an empty handle. Doesn't touch the handle's task or
+    /// any other shared state, so the read-path planner can use it to size reads it hasn't started.
+    size_t requestLength(const PrefetchHandle & handle) const;
     /// How many bytes we'd like to have in flight at once, given `concurrency` concurrent readers:
     /// bandwidth * round-trip time is the amount of data one stream keeps "in the pipe"; multiplying
     /// by `concurrency` and by a headroom factor of 2 keeps all streams busy despite jitter. Floored

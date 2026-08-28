@@ -10,6 +10,8 @@
 #include <Processors/Formats/IInputFormat.h>
 #include <Common/logger_useful.h>
 
+#include <algorithm>
+#include <deque>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -29,6 +31,8 @@ namespace ProfileEvents
     extern const Event ParquetDecodingTaskBatches;
     extern const Event ParquetReadRowGroups;
     extern const Event ParquetPrunedRowGroups;
+    extern const Event ParquetPlannedReads;
+    extern const Event ParquetIssueQueueStalls;
 }
 
 namespace DB::Parquet
@@ -70,6 +74,7 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
     ProfileEvents::increment(ProfileEvents::ParquetPrunedRowGroups, reader.file_metadata.row_groups.size() - reader.row_groups.size());
 
     size_t num_row_groups = reader.row_groups.size();
+    page_reads_planned.resize(num_row_groups);
     for (size_t i = size_t(ReadStage::NotStarted) + 1; i < size_t(ReadStage::Deliver); ++i)
     {
         stages[i].schedulable_row_groups.resize(num_row_groups);
@@ -119,10 +124,19 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
     pool_fraction[size_t(MemoryPool::Compressed)] = compressed_fraction;
     pool_fraction[size_t(MemoryPool::Decoded)] = 1.0 - 0.05 - compressed_fraction;
 
+    /// Plan the index reads (bloom filter headers, column indexes, offset indexes, dictionary pages)
+    /// of *every* row group up front, in delivery order. These are the reads that serialize row
+    /// groups if they're issued stage by stage, one row group at a time: each is only a few KB, but
+    /// each costs a round trip. `pumpIssueQueue` below issues as many of them as the bytes-in-flight
+    /// target allows, and the rest follow as earlier reads land.
+    for (size_t i = 0; i < reader.row_groups.size(); ++i)
+        enqueueRowGroupIndexReads(i);
+
     /// The NotStarted stage completed for all row groups, transition to next stage.
     MemoryUsageDiff diff(ReadStage::NotStarted);
     for (size_t i = 0; i < reader.row_groups.size(); ++i)
         finishRowGroupStage(i, ReadStage::NotStarted, diff);
+    pumpIssueQueue(diff);
     flushMemoryUsageDiff(std::move(diff));
 }
 
@@ -212,6 +226,16 @@ void ReadManager::finishRowGroupStage(size_t row_group_idx, ReadStage stage, Mem
                 reader.intersectColumnIndexResultsAndInitSubgroups(row_group);
                 if (!row_group.subgroups.empty())
                 {
+                    /// The offset indexes of this row group are decoded and its subgroups are known,
+                    /// so the byte ranges of the data pages every subgroup needs are known too: plan
+                    /// them all now (in subgroup order) instead of one subgroup at a time. Nothing
+                    /// has been scheduled for this row group yet (the tasks below are only queued;
+                    /// `flushMemoryUsageDiff` schedules them), so we're the only thread touching
+                    /// these column chunks.
+                    size_t first_step = reader.steps.empty() ? 0 : 1;
+                    enqueueRowGroupPageReads(row_group_idx, first_step);
+                    pumpIssueQueue(diff);
+
                     row_group.stage.store(ReadStage::ColumnData);
                     row_group.stage_tasks_remaining.store(row_group.subgroups.size(), std::memory_order_relaxed);
                     /// Start the first subgroup.
@@ -230,6 +254,10 @@ void ReadManager::finishRowGroupStage(size_t row_group_idx, ReadStage stage, Mem
                 /// not without adding some mutexes.
                 if (row_group.subgroups.empty())
                 {
+                    /// Before clearing: the queue may still hold this row group's index reads (e.g.
+                    /// the row group was filtered out by its bloom filter, so the column index reads
+                    /// planned at init were never needed).
+                    dropQueuedReads(row_group_idx);
                     for (auto & c : row_group.columns)
                         clearColumnChunk(c, diff);
                 }
@@ -461,6 +489,21 @@ void ReadManager::finishRowSubgroupStage(size_t row_group_idx, size_t row_subgro
         case ReadStage::ColumnIndexAndOffsetIndex:
         case ReadStage::OffsetIndex:
         {
+            /// The offset indexes of this step's columns are decoded now. For the first step that
+            /// means the page ranges of *every* subgroup of this row group are known: their filters
+            /// come from the column index only, and PREWHERE (which is what narrows them further)
+            /// runs after this step. So plan all of them, once per row group, instead of one
+            /// subgroup at a time. Later steps must wait for their own PREWHERE result, so they keep
+            /// planning per subgroup (through `scheduleTask`), as before.
+            /// Subgroups of one row group are read strictly one at a time, so no other thread is
+            /// looking at these column chunks.
+            const size_t first_step = reader.steps.empty() ? 0 : 1;
+            if (step_idx == first_step && page_reads_planned.set(row_group_idx, std::memory_order_relaxed))
+            {
+                enqueueRowGroupPageReads(row_group_idx, step_idx);
+                pumpIssueQueue(diff);
+            }
+
             /// Prerequisites read; issue the compressed data-page reads (but don't decode yet).
             addTasksToReadColumns(row_group_idx, row_subgroup_idx, ReadStage::ColumnDataPrefetch, step_idx, diff);
             return;
@@ -516,6 +559,10 @@ void ReadManager::finishRowSubgroupStage(size_t row_group_idx, size_t row_subgro
             /// If we've read (not necessarily delivered) all subgroups, we can deallocate things
             /// like dictionary page and offset index. Clear all columns (including PREWHERE-only),
             /// since we scheduled ColumnData prefetches for all of them and must release the memory.
+            /// Every subgroup went through ColumnDataPrefetch, which takes its planned reads out of
+            /// the queue, so there should be nothing left for this row group; drop anyway, because
+            /// clearing frees the `data_pages` some queue entries point into.
+            dropQueuedReads(row_group_idx);
             for (size_t i = 0; i < reader.primitive_columns.size(); ++i)
                 clearColumnChunk(row_group.columns.at(i), diff);
         }
@@ -552,6 +599,214 @@ void ReadManager::advanceDeliveryPtrIfNeeded(size_t row_group_idx, MemoryUsageDi
     {
         LOG_TEST(getLogger("ParquetReadManager"), "advanceDeliveryPtrIfNeeded: rg={} final delivery_ptr={} read_ptr={}",
                   row_group_idx, row_group.delivery_ptr.load(), row_group.read_ptr.load());
+    }
+}
+
+void ReadManager::enqueueRowGroupIndexReads(size_t row_group_idx)
+{
+    RowGroup & row_group = reader.row_groups[row_group_idx];
+    std::vector<PlannedRead> planned;
+
+    auto plan = [&](ReadStage stage, std::vector<PrefetchHandle *> handles)
+    {
+        std::erase_if(handles, [](const PrefetchHandle * h) { return !*h; });
+        if (handles.empty())
+            return;
+        size_t bytes = 0;
+        for (const PrefetchHandle * h : handles)
+            bytes += reader.prefetcher.requestLength(*h);
+        planned.push_back(PlannedRead {
+            .stage = stage, .row_group_idx = row_group_idx, .row_subgroup_idx = UINT64_MAX,
+            .step_idx = 0, .handles = std::move(handles), .bytes = bytes});
+    };
+
+    std::vector<PrefetchHandle *> handles;
+    handles.reserve(row_group.columns.size() * 2);
+
+    for (auto & c : row_group.columns)
+        handles.push_back(&c.bloom_filter_header_prefetch);
+    plan(ReadStage::BloomFilterHeader, std::move(handles));
+
+    /// Both indexes of a column are read by one task (the `ColumnIndexAndOffsetIndex` stage reads
+    /// them for columns with a column-index condition), and the offset index of every other column
+    /// is read by the per-subgroup `OffsetIndex` stage. Plan them all here: the offset index is what
+    /// the data-page reads need, and reading it one row group at a time is what limits read depth.
+    handles = {};
+    for (auto & c : row_group.columns)
+    {
+        handles.push_back(&c.column_index_prefetch);
+        handles.push_back(&c.offset_index_prefetch);
+    }
+    plan(ReadStage::ColumnIndexAndOffsetIndex, std::move(handles));
+
+    /// Bloom filter blocks aren't planned here: which blocks are needed is only known after the
+    /// header is decoded.
+    handles = {};
+    for (auto & c : row_group.columns)
+        if (c.use_dictionary_filter)
+            handles.push_back(&c.dictionary_page_prefetch);
+    plan(ReadStage::BloomFilterBlocksOrDictionary, std::move(handles));
+
+    if (planned.empty())
+        return;
+    std::lock_guard lock(issue_mutex);
+    for (PlannedRead & p : planned)
+        issue_queue.push_back(std::move(p));
+}
+
+void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx)
+{
+    RowGroup & row_group = reader.row_groups[row_group_idx];
+    std::vector<PlannedRead> planned;
+
+    for (size_t subgroup_idx = 0; subgroup_idx < row_group.subgroups.size(); ++subgroup_idx)
+    {
+        RowSubgroup & row_subgroup = row_group.subgroups[subgroup_idx];
+        if (row_subgroup.filter.rows_pass == 0)
+            continue;
+
+        std::vector<PrefetchHandle *> handles;
+        for (size_t i = 0; i < reader.primitive_columns.size(); ++i)
+        {
+            if (reader.primitive_columns[i].first_step_to_calculate != step_idx)
+                continue;
+            ColumnChunk & column = row_group.columns.at(i);
+
+            /// Skip a column whose offset index hasn't been decoded yet: `determinePagesToPrefetch`
+            /// needs `offset_index.page_locations` to split the column chunk into page ranges, and
+            /// this column will get its offset index read by the per-subgroup `OffsetIndex` stage,
+            /// which then issues its pages the usual way (`scheduleTask`).
+            if (column.offset_index_prefetch && column.offset_index.page_locations.empty())
+                continue;
+
+            reader.determinePagesToPrefetch(column, row_subgroup, row_group, handles);
+
+            /// The dictionary page and the whole-column-chunk read (the latter only when there's no
+            /// offset index to read pages individually with) are one read for the whole column
+            /// chunk, not one per subgroup: plan them with the first subgroup that needs the column,
+            /// and tell the per-subgroup path in `scheduleTask` to leave them to us.
+            if (!column.dictionary_and_whole_chunk_planned)
+            {
+                bool pushed = false;
+                if (!column.dictionary.isInitialized() && column.dictionary_page_prefetch)
+                {
+                    handles.push_back(&column.dictionary_page_prefetch);
+                    pushed = true;
+                }
+                if (column.data_pages.empty() && column.data_pages_prefetch)
+                {
+                    handles.push_back(&column.data_pages_prefetch);
+                    pushed = true;
+                }
+                column.dictionary_and_whole_chunk_planned = pushed;
+            }
+        }
+
+        std::erase_if(handles, [](const PrefetchHandle * h) { return !*h; });
+        if (handles.empty())
+            continue;
+        size_t bytes = 0;
+        for (const PrefetchHandle * h : handles)
+            bytes += reader.prefetcher.requestLength(*h);
+        planned.push_back(PlannedRead {
+            .stage = ReadStage::ColumnDataPrefetch, .row_group_idx = row_group_idx,
+            .row_subgroup_idx = subgroup_idx, .step_idx = step_idx,
+            .handles = std::move(handles), .bytes = bytes});
+    }
+
+    if (planned.empty())
+        return;
+    std::lock_guard lock(issue_mutex);
+    for (PlannedRead & p : planned)
+        issue_queue.push_back(std::move(p));
+}
+
+void ReadManager::takeQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx, std::vector<PrefetchHandle *> & out)
+{
+    std::lock_guard lock(issue_mutex);
+    for (auto it = issue_queue.begin(); it != issue_queue.end();)
+    {
+        if (it->stage == stage && it->row_group_idx == row_group_idx && it->row_subgroup_idx == row_subgroup_idx && it->step_idx == step_idx)
+        {
+            out.insert(out.end(), it->handles.begin(), it->handles.end());
+            it = issue_queue.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
+void ReadManager::dropQueuedReads(size_t row_group_idx)
+{
+    std::lock_guard lock(issue_mutex);
+    std::erase_if(issue_queue, [&](const PlannedRead & p) { return p.row_group_idx == row_group_idx; });
+}
+
+size_t ReadManager::bytesInFlightTarget() const
+{
+    /// `io_threads` is the size of the pool that actually executes the reads (0 before it's created).
+    size_t io_threads = std::max<size_t>(1, parser_shared_resources->io_threads.load(std::memory_order_relaxed));
+    return std::max(
+        reader.prefetcher.targetBytesInFlight(io_threads),
+        reader.options.format.parquet.min_bytes_in_flight);
+}
+
+void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
+{
+    {
+        /// Cheap early-out: this runs on every `flushMemoryUsageDiff`.
+        std::lock_guard lock(issue_mutex);
+        if (issue_queue.empty())
+            return;
+    }
+
+    const size_t target = bytesInFlightTarget();
+
+    while (true)
+    {
+        PlannedRead planned;
+        /// Held across `startPrefetch` so that `dropQueuedReads` can rely on the queue being the only
+        /// way this function reaches a row group's handles.
+        std::lock_guard lock(issue_mutex);
+
+        auto it = issue_queue.begin();
+        if (it == issue_queue.end())
+            return;
+
+        size_t first_incomplete = first_incomplete_row_group.load(std::memory_order_relaxed);
+        if (it->row_group_idx != first_incomplete)
+        {
+            const MemoryPool pool = poolOf(it->stage);
+            /// `pool_usage` doesn't include what this diff charged and hasn't flushed yet, so add it.
+            ssize_t pool_pending = 0;
+            for (size_t i = 0; i < diff.by_stage.size(); ++i)
+                if (i != size_t(ReadStage::Deliver) && poolOf(ReadStage(i)) == pool)
+                    pool_pending += diff.by_stage[i];
+            size_t pool_usage_now = size_t(std::max<ssize_t>(0,
+                pool_usage[size_t(pool)].load(std::memory_order_relaxed) + pool_pending));
+
+            if (reader.prefetcher.bytesInFlight() + it->bytes > target ||
+                pool_usage_now + it->bytes > poolLimits(pool).memory_high_watermark)
+            {
+                ProfileEvents::increment(ProfileEvents::ParquetIssueQueueStalls);
+                /// The first incomplete row group is privileged: its reads are always issued, so that
+                /// progress (and therefore freeing memory and bytes in flight) never depends on the
+                /// budget. It isn't necessarily at the front of the queue -- a later row group's index
+                /// reads are planned before an earlier row group's page reads -- so look for it.
+                it = std::find_if(issue_queue.begin(), issue_queue.end(),
+                    [&](const PlannedRead & p) { return p.row_group_idx == first_incomplete; });
+                if (it == issue_queue.end())
+                    return;
+            }
+        }
+
+        planned = std::move(*it);
+        issue_queue.erase(it);
+
+        const ReadStage saved_stage = std::exchange(diff.cur_stage, planned.stage);
+        reader.prefetcher.startPrefetch(planned.handles, &diff);
+        diff.cur_stage = saved_stage;
+        ProfileEvents::increment(ProfileEvents::ParquetPlannedReads);
     }
 }
 
@@ -616,6 +871,29 @@ void ReadManager::flushMemoryUsageDiff(MemoryUsageDiff && diff)
                     if (j != size_t(ReadStage::Deliver) && poolOf(ReadStage(j)) == pool)
                         stages_to_schedule |= (1ull << j);
             }
+        }
+    }
+
+    /// Every flush is a chance to issue more planned reads: reads landing and pages being decoded
+    /// free bytes in flight and pool memory, and completed row groups advance
+    /// `first_incomplete_row_group`, which is what makes the next row group's reads privileged.
+    /// (Unconditional rather than only on a Metadata/Compressed deallocation: a flush that only
+    /// frees Decoded memory can still be the one that advanced `first_incomplete_row_group`, and
+    /// missing that wakeup can leave the queue stalled with nothing else coming to nudge it.
+    /// `pumpIssueQueue` returns immediately when the queue is empty, which is the common case.)
+    /// A second diff, because `pumpIssueQueue` must not call this function (recursion); it only
+    /// allocates, so applying it to `pool_usage` here is all that's needed -- `startPrefetch`
+    /// schedules no tasks.
+    MemoryUsageDiff pump_diff(ReadStage::ColumnDataPrefetch);
+    pumpIssueQueue(pump_diff);
+    pump_diff.finalized = true;
+    for (size_t i = 0; i < pump_diff.by_stage.size(); ++i)
+    {
+        chassert(pump_diff.by_stage[i] >= 0); // pumpIssueQueue doesn't do tracked deallocations
+        if (pump_diff.by_stage[i] != 0)
+        {
+            chassert(i != size_t(ReadStage::Deliver));
+            pool_usage[size_t(poolOf(ReadStage(i)))].fetch_add(pump_diff.by_stage[i], std::memory_order_relaxed);
         }
     }
 
@@ -780,9 +1058,13 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
         switch (task.stage)
         {
             case ReadStage::BloomFilterHeader:
+                /// This stage's tasks read (and then reset) the handles the planner queued for the
+                /// whole row group at init, so take that entry rather than leave it for the pump.
+                takeQueuedReads(ReadStage::BloomFilterHeader, task.row_group_idx, UINT64_MAX, 0, prefetches);
                 prefetches.push_back(&column.bloom_filter_header_prefetch);
                 break;
             case ReadStage::BloomFilterBlocksOrDictionary:
+                takeQueuedReads(ReadStage::BloomFilterBlocksOrDictionary, task.row_group_idx, UINT64_MAX, 0, prefetches);
                 if (column.use_dictionary_filter)
                     prefetches.push_back(&column.dictionary_page_prefetch);
                 for (auto & b : column.bloom_filter_blocks)
@@ -790,11 +1072,15 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
                 break;
             case ReadStage::ColumnIndexAndOffsetIndex:
             {
+                takeQueuedReads(ReadStage::ColumnIndexAndOffsetIndex, task.row_group_idx, UINT64_MAX, 0, prefetches);
                 prefetches.push_back(&column.column_index_prefetch);
                 prefetches.push_back(&column.offset_index_prefetch);
                 break;
             }
             case ReadStage::OffsetIndex:
+                /// The offset index handles live in the row-group-level index entry (the planner puts
+                /// both indexes of every column there), and this stage resets them after decoding.
+                takeQueuedReads(ReadStage::ColumnIndexAndOffsetIndex, task.row_group_idx, UINT64_MAX, 0, prefetches);
                 prefetches.push_back(&column.offset_index_prefetch);
                 break;
             case ReadStage::ColumnDataPrefetch:
@@ -802,9 +1088,16 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
                 RowSubgroup & row_subgroup = row_group.subgroups.at(task.row_subgroup_idx);
                 if (row_subgroup.filter.rows_pass == 0)
                     break;
+                /// This subgroup's data-page reads were usually planned when the row group's offset
+                /// indexes landed (`enqueueRowGroupPageReads`) and issued by the pump long before
+                /// this task. Take whatever the pump hasn't got to yet out of the queue and issue it
+                /// here: this task is the demand path, so it must not wait for the budget, and the
+                /// decoder that follows requires every page handle it uses to have been started.
+                takeQueuedReads(ReadStage::ColumnDataPrefetch, task.row_group_idx, task.row_subgroup_idx, task.step_idx, prefetches);
                 /// Queue this subgroup's data-page reads; startPrefetch (below) issues them and charges
                 /// compressed bytes to the ColumnDataPrefetch budget, separate from the decode budget,
                 /// so many row groups prefetch ahead while only a few decode at once.
+                /// (A no-op for a column the planner already walked: it advanced the page cursor.)
                 reader.determinePagesToPrefetch(column, row_subgroup, row_group, prefetches);
 
                 /// Side note: would be nice to avoid reading the dictionary if all dictionary-encoded
@@ -812,14 +1105,20 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
                 /// typically only the first ~1 MB would be dictionary-encoded; if we only need a few
                 /// rows, we likely won't hit that 1 MB). But AFAICT parquet metadata doesn't have
                 /// enough information for that (there's no page encoding in offset/column indexes).
-                if (!column.dictionary.isInitialized() && column.dictionary_page_prefetch)
+                /// The planner claims these two handles for the whole column chunk when it plans the
+                /// column's pages (see `dictionary_and_whole_chunk_planned`); pushing them here as
+                /// well could have two threads start the same handle at once.
+                if (!column.dictionary_and_whole_chunk_planned)
                 {
-                    prefetches.push_back(&column.dictionary_page_prefetch);
-                }
+                    if (!column.dictionary.isInitialized() && column.dictionary_page_prefetch)
+                    {
+                        prefetches.push_back(&column.dictionary_page_prefetch);
+                    }
 
-                if (column.data_pages.empty())
-                {
-                    prefetches.push_back(&column.data_pages_prefetch);
+                    if (column.data_pages.empty())
+                    {
+                        prefetches.push_back(&column.data_pages_prefetch);
+                    }
                 }
                 break;
             }
@@ -1041,6 +1340,16 @@ std::string ReadManager::collectDeadlockDiagnostics()
     for (size_t p = 0; p < NUM_MEMORY_POOLS; ++p)
         result += " " + std::string(magic_enum::enum_name(MemoryPool(p))) + "=" + std::to_string(pool_usage[p].load(std::memory_order_relaxed));
     result += " delivered_bytes=" + std::to_string(delivered_bytes->load(std::memory_order_relaxed));
+
+    {
+        std::lock_guard lock(issue_mutex);
+        size_t queued_bytes = 0;
+        for (const PlannedRead & p : issue_queue)
+            queued_bytes += p.bytes;
+        result += " issue_queue: " + std::to_string(issue_queue.size()) + " reads, " + std::to_string(queued_bytes) + " bytes";
+    }
+    result += " bytes_in_flight: " + std::to_string(reader.prefetcher.bytesInFlight()) +
+        "/" + std::to_string(bytesInFlightTarget());
 
     result += " stages: ";
     for (size_t i = 0; i < size_t(ReadStage::Deallocated); ++i)
