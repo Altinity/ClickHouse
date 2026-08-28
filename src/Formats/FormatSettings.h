@@ -370,10 +370,13 @@ struct FormatSettings
         double max_read_amplification = 4;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
-        /// Reader scheduler knobs: share of the column-data memory budget given to compressed
-        /// read-ahead vs decode, and ColumnData's share of the parsing thread pool.
+        /// Superseded by compressed_memory_fraction; kept for compatibility, no longer affects memory.
         double prefetch_memory_fraction = 0.6;
+        /// Reader scheduler knob: share of the parsing thread pool given to column decoding.
         double decode_thread_fraction = 0.375;
+        /// Share of the memory budget held as compressed data pages in flight or awaiting decode
+        /// (the rest, minus a fixed 5% for metadata, holds decoded columns). See MemoryPool.
+        double compressed_memory_fraction = 0.35;
 
         /// Write.
         UInt64 row_group_rows = 1000000;

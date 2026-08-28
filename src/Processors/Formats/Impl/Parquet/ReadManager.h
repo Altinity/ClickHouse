@@ -84,14 +84,10 @@ private:
 
     struct Stage
     {
-        std::atomic<size_t> memory_usage {0};
         /// Tasks that are either in thread pool's queue or executing.
         std::atomic<size_t> batches_in_progress {0};
 
-        /// Share of the query-global memory budget for this stage, kept separate from the thread
-        /// share so a stage needing parallelism but little memory isn't forced to trade one off.
-        double memory_target_fraction = 1;
-        /// Share of the parsing thread pool for this stage, independent of the memory share.
+        /// Share of the parsing thread pool for this stage, independent of the memory pools.
         double thread_target_fraction = 1;
 
         /// We take advantage of the fact that each <row group, stage> pair can have at most one group
@@ -110,6 +106,13 @@ private:
     std::array<Stage, size_t(ReadStage::Deallocated)> stages;
     /// First row group that hasn't reached Deallocated stage.
     std::atomic<size_t> first_incomplete_row_group {0};
+
+    /// See MemoryPool. Signed because deallocations can be flushed before the matching allocation
+    /// on another thread.
+    std::array<std::atomic<ssize_t>, NUM_MEMORY_POOLS> pool_usage {};
+    std::array<double, NUM_MEMORY_POOLS> pool_fraction {};
+
+    SharedResourcesExt::Limits poolLimits(MemoryPool pool) const;
 
     std::mutex delivery_mutex;
     std::priority_queue<Task, std::vector<Task>, Task::Comparator> delivery_queue;

@@ -75,50 +75,48 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
         stages[i].row_group_tasks_to_schedule.resize(num_row_groups);
     }
 
-    /// Per-stage memory/thread budgets (each resource sums to 1) so no stage starves the others.
-    /// Prefetch holds small compressed pages -> most memory (keep reads outstanding, hide latency);
-    /// decode holds large columns -> bounded memory but most threads (only CPU-bound stage);
-    /// index/bloom only issue async reads -> fixed small shares. Two knobs re-balance the data stages:
-    /// prefetch_memory_fraction splits the 0.75 data-memory budget prefetch/decode; decode_thread_fraction
-    /// is decode's thread share (issuers split the rest). Defaults preserve the old hard-coded fractions.
-    const double prefetch_memory_fraction = reader.options.format.parquet.prefetch_memory_fraction;
+    /// Per-stage thread budgets (sum to 1) so no stage starves the others of parallelism.
+    /// Decode holds large columns -> bounded memory but most threads (only CPU-bound stage);
+    /// index/bloom/prefetch only issue async reads -> fixed small shares. decode_thread_fraction
+    /// is decode's thread share (issuers split the rest). Memory is budgeted separately, by pool
+    /// (see MemoryPool / pool_fraction below), not per stage.
     const double decode_thread_fraction = reader.options.format.parquet.decode_thread_fraction;
-    if (!(prefetch_memory_fraction >= 0 && prefetch_memory_fraction <= 1))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "input_format_parquet_prefetch_memory_fraction must be in [0, 1], got {}", prefetch_memory_fraction);
     if (!(decode_thread_fraction >= 0 && decode_thread_fraction <= 1))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "input_format_parquet_decode_thread_fraction must be in [0, 1], got {}", decode_thread_fraction);
 
-    auto set_fractions = [&](ReadStage s, double memory_fraction, double thread_fraction)
+    auto set_thread_fraction = [&](ReadStage s, double thread_fraction)
     {
-        stages[size_t(s)].memory_target_fraction = memory_fraction;
         stages[size_t(s)].thread_target_fraction = thread_fraction;
     };
-    const double data_memory_fraction = 0.75;                                        // index/bloom take the remaining 0.25
     const double issuer_thread_fraction = (1.0 - decode_thread_fraction) / 5.0;      // five read-issuing stages split the rest
-    set_fractions(ReadStage::NotStarted, 0, 0);
-    set_fractions(ReadStage::BloomFilterHeader, 0.05, issuer_thread_fraction);
-    set_fractions(ReadStage::BloomFilterBlocksOrDictionary, 0.10, issuer_thread_fraction);
-    set_fractions(ReadStage::ColumnIndexAndOffsetIndex, 0.05, issuer_thread_fraction);
-    set_fractions(ReadStage::OffsetIndex, 0.05, issuer_thread_fraction);
-    set_fractions(ReadStage::ColumnDataPrefetch, data_memory_fraction * prefetch_memory_fraction, issuer_thread_fraction);
-    set_fractions(ReadStage::ColumnData, data_memory_fraction * (1.0 - prefetch_memory_fraction), decode_thread_fraction);
-    set_fractions(ReadStage::Deliver, 0, 0);
+    set_thread_fraction(ReadStage::NotStarted, 0);
+    set_thread_fraction(ReadStage::BloomFilterHeader, issuer_thread_fraction);
+    set_thread_fraction(ReadStage::BloomFilterBlocksOrDictionary, issuer_thread_fraction);
+    set_thread_fraction(ReadStage::ColumnIndexAndOffsetIndex, issuer_thread_fraction);
+    set_thread_fraction(ReadStage::OffsetIndex, issuer_thread_fraction);
+    set_thread_fraction(ReadStage::ColumnDataPrefetch, issuer_thread_fraction);
+    set_thread_fraction(ReadStage::ColumnData, decode_thread_fraction);
+    set_thread_fraction(ReadStage::Deliver, 0);
 
-    /// Normalize (defensive: the fractions already sum to 1 within each resource).
-    double memory_sum = 0;
+    /// Normalize (defensive: the fractions already sum to 1).
     double thread_sum = 0;
     for (const Stage & stage : stages)
-    {
-        memory_sum += stage.memory_target_fraction;
         thread_sum += stage.thread_target_fraction;
-    }
     for (Stage & stage : stages)
-    {
-        stage.memory_target_fraction /= memory_sum;
         stage.thread_target_fraction /= thread_sum;
-    }
+
+    /// Memory is budgeted by lifetime, not by stage: see MemoryPool. Metadata (bloom filters,
+    /// indexes, dictionary pages) gets a fixed small share; the rest splits between compressed
+    /// data pages in flight (bounds read-ahead depth) and decoded columns (including chunks
+    /// already delivered to the pipeline but not yet consumed).
+    const double compressed_fraction = reader.options.format.parquet.compressed_memory_fraction;
+    if (!(compressed_fraction > 0 && compressed_fraction < 0.95))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "input_format_parquet_compressed_memory_fraction must be in (0, 0.95), got {}", compressed_fraction);
+    pool_fraction[size_t(MemoryPool::Metadata)] = 0.05;
+    pool_fraction[size_t(MemoryPool::Compressed)] = compressed_fraction;
+    pool_fraction[size_t(MemoryPool::Decoded)] = 1.0 - 0.05 - compressed_fraction;
 
     /// The NotStarted stage completed for all row groups, transition to next stage.
     MemoryUsageDiff diff(ReadStage::NotStarted);
@@ -130,6 +128,12 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
 ReadManager::~ReadManager()
 {
     shutdown->shutdown();
+}
+
+SharedResourcesExt::Limits ReadManager::poolLimits(MemoryPool pool) const
+{
+    /// Thread fraction is per stage, not per pool; callers that need it read Stage::thread_target_fraction.
+    return SharedResourcesExt::getLimitsPerReader(*parser_shared_resources, pool_fraction[size_t(pool)], /*thread_fraction=*/ 1.0);
 }
 
 void ReadManager::cancel() noexcept
@@ -578,18 +582,20 @@ void ReadManager::flushMemoryUsageDiff(MemoryUsageDiff && diff)
             chassert(d == 0);
             continue;
         }
+        MemoryPool pool = poolOf(ReadStage(i));
         if (d != 0)
         {
-            stages[i].memory_usage.fetch_add(d, std::memory_order_relaxed);
+            pool_usage[size_t(pool)].fetch_add(d, std::memory_order_relaxed);
         }
 
         bool should_schedule = (diff.stages_to_schedule & (1ul << i)) != 0;
         if (!should_schedule && d < 0)
         {
             const auto & stage = stages[i];
-            auto limits = SharedResourcesExt::getLimitsPerReader(*parser_shared_resources, stage.memory_target_fraction, stage.thread_target_fraction);
+            auto limits = poolLimits(pool);
+            limits.parsing_threads = SharedResourcesExt::getLimitsPerReader(*parser_shared_resources, 1.0, stage.thread_target_fraction).parsing_threads;
             should_schedule = checkTaskSchedulingLimits(
-                stage.memory_usage.load(std::memory_order_relaxed), 0,
+                size_t(std::max<ssize_t>(0, pool_usage[size_t(pool)].load(std::memory_order_relaxed))), 0,
                 stage.batches_in_progress.load(std::memory_order_relaxed), 0, limits);
         }
         if (should_schedule)
@@ -605,8 +611,9 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
     MemoryUsageDiff diff(stage_idx);
     std::vector<Task> tasks;
 
-    auto limits = SharedResourcesExt::getLimitsPerReader(*parser_shared_resources, stage.memory_target_fraction, stage.thread_target_fraction);
-    size_t memory_usage = stage.memory_usage.load(std::memory_order_relaxed);
+    auto limits = poolLimits(poolOf(stage_idx));
+    limits.parsing_threads = SharedResourcesExt::getLimitsPerReader(*parser_shared_resources, 1.0, stage.thread_target_fraction).parsing_threads;
+    size_t memory_usage = size_t(std::max<ssize_t>(0, pool_usage[size_t(poolOf(stage_idx))].load(std::memory_order_relaxed)));
     size_t batches_in_progress = stage.batches_in_progress.load(std::memory_order_relaxed);
 
     LOG_TEST(getLogger("ParquetReadManager"), "scheduleTasksIfNeeded: stage={} memory_usage={} batches_in_progress={} limits: mem_low={} mem_high={} threads={}",
@@ -672,7 +679,7 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
         if (diff.by_stage[i] != 0)
         {
             chassert(i != size_t(ReadStage::Deliver));
-            stages[i].memory_usage.fetch_add(diff.by_stage[i], std::memory_order_relaxed);
+            pool_usage[size_t(poolOf(ReadStage(i)))].fetch_add(diff.by_stage[i], std::memory_order_relaxed);
         }
     }
 
@@ -998,6 +1005,10 @@ std::string ReadManager::collectDeadlockDiagnostics()
     }
     result += " tot_rgs: " + std::to_string(reader.row_groups.size());
 
+    result += " pools:";
+    for (size_t p = 0; p < NUM_MEMORY_POOLS; ++p)
+        result += " " + std::string(magic_enum::enum_name(MemoryPool(p))) + "=" + std::to_string(pool_usage[p].load(std::memory_order_relaxed));
+
     result += " stages: ";
     for (size_t i = 0; i < size_t(ReadStage::Deallocated); ++i)
     {
@@ -1009,7 +1020,6 @@ std::string ReadManager::collectDeadlockDiagnostics()
             schedulable_count += __builtin_popcountll(bits);
         }
         result += " st " + std::to_string(i) + " (" + std::string(magic_enum::enum_name(ReadStage(i))) + "):";
-        result += " mem_u: " + std::to_string(stage.memory_usage.load(std::memory_order_relaxed));
         result += " btch: " + std::to_string(stage.batches_in_progress.load(std::memory_order_relaxed));
         result += " rgs_sch: " + std::to_string(schedulable_count) + "\t";
         size_t tasks_to_schedule = 0;
@@ -1102,7 +1112,9 @@ ReadManager::ReadResult ReadManager::read()
                         chassert(subgroup.stage.load(std::memory_order_relaxed) == ReadStage::Deallocated);
                     for (size_t i = 0; i < stages.size(); ++i)
                     {
-                        size_t mem = stages[i].memory_usage.load(std::memory_order_relaxed);
+                        /// Memory is now tracked per pool, not per stage; several stages share a pool
+                        /// (see poolOf), so this may re-check the same pool for each of them.
+                        ssize_t mem = pool_usage[size_t(poolOf(ReadStage(i)))].load(std::memory_order_relaxed);
                         size_t batches = stages[i].batches_in_progress.load(std::memory_order_relaxed);
                         size_t unsched = 0;
                         for (const auto & tasks : stages[i].row_group_tasks_to_schedule)
