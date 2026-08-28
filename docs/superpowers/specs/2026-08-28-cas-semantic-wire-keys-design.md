@@ -31,8 +31,10 @@ and completes the Decision list. Revision 8 (2026-08-29) pins the tables' perfor
 word scan, and an enum's persisted and configuration spellings are separate contracts. Revision 9
 (2026-08-29) adds the codec readability layer — per-encoding field write helpers and paired match
 helpers for the shared value types — bounded by an explicit helper-versus-framework rule and
-required to be codegen-neutral. The exact-full-name alternative was independently implemented in
-Altinity PR #2288 and rejected for this design (see rejected alternatives).
+required to be codegen-neutral. Revision 10 (2026-08-29) closes that layer's API contracts:
+`writeStringField` for open strings, the two-stage match-plus-`build` collector contract, and
+codegen-neutrality extended to the match helpers. The exact-full-name alternative was independently
+implemented in Altinity PR #2288 and rejected for this design (see rejected alternatives).
 
 ## Problem {#problem}
 
@@ -591,7 +593,9 @@ not a timing assertion in CI. Exact encoded-byte deltas and boundary sizes are p
 unit tests. The dominant performance risk of the whole change is the longer keys themselves — extra
 bytes written, compressed, decompressed, and key-compared — which these measurements cover; the enum
 tables must not add to it, so the review also inspects the generated assembly of the hot `toWord`
-instances (the `cas_run` marker first). No timing assertion is added to CI.
+instances (the `cas_run` marker first) and of the hot match helpers (`cas_run` token matching and
+`PartManifest` blob matching), with decode throughput staying the primary evidence. No timing
+assertion is added to CI.
 
 ## Generation reset {#compatibility-and-generation-floor}
 
@@ -682,22 +686,34 @@ vocabulary item gains a single production carrier:
   contract): an invalid marker becomes unrepresentable, and the marker's word table joins the
   standard set-equality rule above.
 - **Field write helpers.** Each writer line becomes one call that names its encoding —
-  `writeWordField`, `writeU64StringField`, `writeNumberField`, `writeHex128Field`,
-  `writeBoolField` — collapsing today's `writeKey`-plus-value pairs so a codec's writer reads as
-  the format's field list in canonical order. There is deliberately no type-overloaded
+  `writeWordField`, `writeStringField`, `writeU64StringField`, `writeNumberField`,
+  `writeHex128Field`, `writeBoolField` — collapsing today's `writeKey`-plus-value pairs so a
+  codec's writer reads as the format's field list in canonical order. `writeWordField` takes a
+  wire-table word; `writeStringField` takes an arbitrary escaped string — paths, namespaces,
+  hostnames, ref names, token values, cursors — because spelling an open string through the word
+  helper would misstate its contract. Two writers stay codec-owned, outside the field-helper rule:
+  the blob envelope's frozen truncated-`ref` writer (its escaper and budget arithmetic are part of
+  the envelope contract) and the raw payload zones. There is deliberately no type-overloaded
   `writeField`: the encoding rule is range-driven, not type-driven (`seq` is a decimal string and
   `expires_at_ms` a number, both `uint64_t`), so the encoding must be named at the call site — an
   overload would pick one silently. The helpers are thin inline forwarders over the existing
   writer primitives: no allocation, no added branching, codegen-equivalent to the pairs they
   replace, and the `cas_run` row writer is the hot path on which that equivalence must hold.
-- **Paired match helpers for shared value types.** `CasWireVocab`'s three write helpers gain read
-  counterparts — `matchBlobRefFields`, `matchTokenFields`, and
-  `matchManifestRefFields(key, reader, bundle, collector)`, each returning whether it consumed the
-  key — so the shared flat types become symmetric: one bundle feeds both directions. This also
-  centralizes the digest-width validation that today is copied into each codec ahead of `fromHex`,
-  removing the copy-forgets-the-check failure mode while keeping the `CORRUPTED_DATA` taxonomy.
-  The helpers take the reader and collector by reference and compare against the constexpr
-  constants — the same comparisons the inline chains make today; no stored callables, no maps.
+- **Paired match-and-build helpers for shared value types.** `CasWireVocab`'s three write helpers
+  gain read counterparts with a two-stage contract. `matchBlobRefFields`, `matchTokenFields`, and
+  `matchManifestRefFields(key, reader, bundle, collector)` each consume exactly one recognized
+  field into a `Fields` collector and return whether the key was theirs — the codec's read loop
+  stays in charge, and no single field can validate the group (the digest width needs both `algo`
+  and `digest`, in any key order). At the point its grammar requires the group, the codec calls
+  `fields.build(what)`, and `build` owns everything that needs the whole group: group
+  requiredness, word parsing, the digest-width validation before `fromHex` (today copied into each
+  codec — the copy-forgets-the-check failure mode disappears), the `CORRUPTED_DATA` taxonomy, and
+  independence from key order. Requiredness thus remains an explicit call in the codec's grammar,
+  at the variant point that demands it. This generalizes the collector-plus-`build` pattern the
+  ref codecs already use (`ManifestFields::build`). One bundle feeds both directions, so the
+  shared flat types are symmetric. The match helpers are defined inline next to the key bundles:
+  on the hot decode paths they must add no function call, allocation, or branch beyond the
+  comparisons the inline chains make today; no stored callables, no maps.
 - `CasInspect` renders enum values through the same tables, so introspection cannot print `Merge`
   where the wire says `merge`. `system.cas_*` column names are deliberately NOT coupled to wire
   keys: the SQL surface and the persisted format have different compatibility contracts.
@@ -910,9 +926,12 @@ The change is complete when:
   values through the tables; `kMinBlobHeaderLen` has one compile-time owner shared by the envelope
   encoder and `validatePoolBlobHeaderLen`; and all change points reference one shared `BASELINE`;
 - goldens spell their bytes literally and reference no production carrier;
-- writers use the per-encoding field helpers (no type-overloaded `writeField` exists), the three
-  shared value types have paired match helpers used by every reader that parses them, and no
-  reader dispatch table, stored-callable, or fluent-builder machinery exists;
+- writers use the per-encoding field helpers including `writeStringField` (no type-overloaded
+  `writeField` exists; the envelope `ref` writer and the payload zones stay codec-owned), the
+  three shared value types follow the match-plus-`build` contract — `build` owning group
+  requiredness and the digest-width check — with the match helpers inline and adding no call,
+  allocation, or branch on hot decode paths, and no reader dispatch table, stored-callable, or
+  fluent-builder machinery exists;
 - no C++ member is more cryptic than its wire key, including the four renames this requires:
   `RunRef::generation` to `key_generation`, both `ManifestFields` collectors' `me`/`mb`/`mo` to
   `epoch`/`build`/`ord`, and `BindingFields`' `bk`/`rn`/`mf` to `kind`/`ref`/`manifest_fields`;
