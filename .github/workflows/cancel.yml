@@ -6,14 +6,30 @@ env:
 
 on: # yamllint disable-line rule:truthy
   workflow_run:
-    workflows: ["PR","PullRequestCI", "ReleaseBranchCI", "DocsCheck", "BackportPR"]
+    workflows: ["PR", "Community PR", "PullRequestCI", "ReleaseBranchCI", "DocsCheck", "BackportPR"]
     types:
       - requested
 jobs:
   cancel:
     runs-on: ubuntu-latest
     steps:
-      - uses: styfle/cancel-workflow-action@0.9.1
+      - uses: actions/github-script@v8
         with:
-          all_but_latest: true
-          workflow_id: ${{ github.event.workflow.id }}
+          script: |
+            const workflow_id = context.payload.workflow.id
+            const { owner, repo } = context.repo
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              { owner, repo, workflow_id, per_page: 100 }
+            )
+            const active = runs.filter((r) =>
+              ["queued", "in_progress", "waiting", "pending"].includes(r.status)
+            )
+            active.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+            for (const run of active.slice(1)) {
+              await github.rest.actions.cancelWorkflowRun({
+                owner,
+                repo,
+                run_id: run.id,
+              })
+            }

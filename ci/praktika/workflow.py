@@ -26,6 +26,7 @@ class Workflow:
         event: str
         jobs: List[Job.Config]
         additional_jobs: List[str] = field(default_factory=list)
+        if_condition: str = ""
         branches: List[str] = field(default_factory=list)
         base_branches: List[str] = field(default_factory=list)
         tags: List[str] = field(default_factory=list)
