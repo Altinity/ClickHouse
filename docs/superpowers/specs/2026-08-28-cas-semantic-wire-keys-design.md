@@ -9,35 +9,12 @@ doc_type: 'guide'
 
 # CAS semantic wire keys design {#cas-semantic-wire-keys-design}
 
-Revision 3 (2026-08-29). Revision 2 encoded three adjudications: keys must be *sufficiently full
+Revision 12 (2026-08-29). Three adjudications shape the design: keys must be *sufficiently full
 for understanding*, not exact C++ member names; there are no existing installations, so the change
 ships as a **generation reset**, not a generation bump; and C++ members follow an **asymmetric
-rule** — a member may be fuller than its wire key, never more cryptic. Revision 3 incorporates the
-review of revision 2: the known-field sentinels stay, both pool-meta gates keep their own tests,
-the member rule is enforced absolutely (at the cost of one rename), the closed value sets are
-completed, and the `ProvenanceOp` wire words move into one constexpr table. Revision 4
-(2026-08-29) extends the member-rule audit to codec-local collector structs, adding three renames.
-Revision 5 (2026-08-29) adds the constructive-enforcement layer — a single production carrier for
-every key and every closed vocabulary, a compile-time descriptor-budget proof, one shared
-`BASELINE`, enum renderers reused by introspection, and a three-phase implementation shape — and
-explicitly rejects declarative field schemas, generated goldens, and a golden key scanner.
-Revision 6 (2026-08-29) makes the enforcement layer unambiguous: full-key bundles replace prefix
-composition, enum coverage is proven by set equality rather than by count, the table-versus-constant
-split is stated exactly, and `kMinBlobHeaderLen` gets one compile-time owner. Revision 7
-(2026-08-29) scopes the table rule to fully-serializable enum domains (`RefLifecycle`, the numeric
-classification, and `FormatId` are explicitly outside it), settles the run marker as a typed enum,
-and completes the Decision list. Revision 8 (2026-08-29) pins the tables' performance profile:
-`toWord` is a direct indexed lookup over statically-proven-dense enums, `fromWord` stays a linear
-word scan, and an enum's persisted and configuration spellings are separate contracts. Revision 9
-(2026-08-29) adds the codec readability layer — per-encoding field write helpers and paired match
-helpers for the shared value types — bounded by an explicit helper-versus-framework rule and
-required to be codegen-neutral. Revision 10 (2026-08-29) closes that layer's API contracts:
-`writeStringField` for open strings, the two-stage match-plus-`build` collector contract, and
-codegen-neutrality extended to the match helpers. Revision 11 (2026-08-29) settles the one
-requiredness divergence — `TokenFields::build` requires both fields, adjudicating the `GcOutcomes`
-tolerance as a bug tightened explicitly — and fixes the requiredness-boundary wording. The
-exact-full-name alternative was independently implemented in Altinity PR #2288 and rejected for
-this design (see rejected alternatives).
+rule** — a member may be fuller than its wire key, never more cryptic. The exact-full-name
+alternative was independently implemented in Altinity PR #2288 and rejected for this design (see
+rejected alternatives). The per-revision history is at the end of the document.
 
 ## Problem {#problem}
 
@@ -95,16 +72,17 @@ The goals are:
 - make the complete post-reset vocabulary — keys, record tags, and closed value sets — explicit
   and testable;
 - guarantee that no C++ member is more cryptic than its wire key;
-- make spelling drift inside production code impossible by construction — writer, reader, and
-  introspection read each vocabulary item from one carrier — while tests remain an independent
-  proof of the wire contract.
+- make spelling drift impossible for all code that reads the carriers — writer, reader, and
+  introspection read each vocabulary item from one place — and make bypassing the carriers loud
+  (the `WireKey` type; see codec structure) rather than pretending bypass is impossible, while
+  tests remain an independent proof of the wire contract.
 
 The following are not goals:
 
 - mirroring C++ nesting or member names mechanically;
 - changing JSON into nested objects;
-- changing numeric, string, hexadecimal, or enum representations except the record-tag words listed
-  below;
+- changing numeric, string, hexadecimal, or enum representations except the record-tag and `class`
+  words and the `algos_used` array listed below;
 - changing object-store keys or suffixes;
 - increasing byte caps or the payload offset to offset longer names;
 - adding a general schema-description framework or runtime compact/full naming profile;
@@ -165,8 +143,9 @@ Consequences:
   `ManifestFields` members `me`/`mb`/`mo` (one copy each in the ref-log and ref-snapshot codecs)
   become `epoch`/`build`/`ord`, and the `BindingFields` members `bk`/`rn`/`mf` become
   `kind`/`ref`/`manifest_fields` — otherwise the renamed wire would out-explain the very structs
-  that parse it. No other member rename is required; beyond these the rule is a review gate for
-  future codecs.
+  that parse it. One further rename follows a wire decision rather than this audit:
+  `MountLease::min_active` becomes `min_active_build_sequence`, tracking its renamed key. No other
+  member rename is required; beyond these the rule is a review gate for future codecs.
 - Where a semantic wire word collides with a C++ keyword, the member uses the established
   abbreviation or a fuller form, both compliant: wire `namespace` ↔ member `ns` (an established
   fragment, not a cryptic invention), wire `class` ↔ member `classification`.
@@ -302,13 +281,20 @@ These fields occur once per small control object and use descriptive names:
 | `cas_gc_maintenance_state` | `cur` | `janitor_cursor` |
 | `cas_owner` | `su`, `rt` | `server_uuid`, `retired_at_ms` |
 | `cas_epoch` | `nwe` | `next_writer_epoch` |
-| `cas_mount_lease` | `su`, `we`, `hn`, `pid`, `sat`, `seq`, `eat`, `ma`, `fen`, `write_attempt_id` | `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active`, `gc_fenced`, `write_attempt_id` |
+| `cas_mount_lease` | `su`, `we`, `hn`, `pid`, `sat`, `seq`, `eat`, `ma`, `fen`, `write_attempt_id` | `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id` |
 
-The mount lease keeps `pid` (an established fragment: the OS process id) and `seq` (approved
-vocabulary). `min_active` mirrors the member `MountLease::min_active`; its `UINT64_MAX`
-clean-farewell sentinel is part of the field contract and stays documented at the codec.
+The mount lease keeps `pid` (an established fragment: the OS process id) and `seq` — the object
+*is* the lease, so a `lease_seq` spelling would restate its own container; both stay per the
+context rule. `ma` becomes `min_active_build_sequence`: the singleton descriptive rule outranks
+brevity here, and a bare `min_active` under-names what is specifically a build-sequence floor. The
+member follows (`MountLease::min_active` becomes `min_active_build_sequence`), and its `UINT64_MAX`
+clean-farewell sentinel remains part of the field contract, documented at the codec.
 
-The value encodings do not change. In particular, full-range counters that are currently decimal JSON
+The value encodings do not change, with one exception. `algos_used` stops being a comma-joined list
+inside a JSON string and becomes a JSON array of algo words (`["ch128","sha256"]`): the hand-rolled
+mini-grammar inside a JSON value disappears, `jq` reads it natively, and the cost is single-digit
+bytes in a tiny singleton. This adds one small string-array primitive to `CasTextFormat`, used by
+exactly this field. Everything else holds: full-range counters that are currently decimal JSON
 strings remain strings, bounded values remain numbers, and IDs remain lowercase fixed-width hex.
 `cas_owner`'s `retired_at_ms` remains conditionally emitted (a never-retired owner's body is the
 one-key object).
@@ -515,13 +501,18 @@ A `ref_life` row becomes:
 
 `hold_reason` (not a bare `hold`) because the value is a reason word such as
 `witness_disappeared` — a key named `hold` reads as a boolean. It also matches the member path
-`hold->reason`. The `class` values remain the closed numeric set `{0, 1, 2, 4}` (a machine
-classification consumed by GC logic, documented at `CasFoldSealFormat.h`); the C++ member stays
-`classification`, which the asymmetric member rule permits and the `class` keyword requires. On the
-C++ side the classification gains a typed enum — enumerator names taken from the documented
-semantics at `CasFoldSealFormat.h`, not invented — so the magic numbers disappear from GC and sweep
-logic while the wire stays numeric. (Wire words for these values would add 7–10 bytes to every raw
-`ref_life` row and are deferred pending a capacity calculation.)
+`hold->reason`. The `class` values become words — `absent`, `unchanged`, `folded`, `clamped`,
+taken verbatim from the documented semantics at `CasFoldSealFormat.h` (0 means absent, 1 unchanged,
+2 folded through the observed cursor, 4 clamped below the ref-log cursor) — closing the last field
+a raw-object reader needed the sources for. The capacity calculation that gated this: the words add
+7–10 bytes to a roughly 110-byte `ref_life` row, moving the 256 MiB seal cap's worst case from
+about 2.4M to about 2.25M namespace lives — both orders of magnitude beyond any realistic
+population — and the fold-seal reservation helpers measure through the real encoder, so admission
+adjusts itself. The C++ side gains the matching typed enum (`CoverageClass`: `Absent`, `Unchanged`,
+`Folded`, `Clamped`; the member keeps the name `classification`, since `class` is a keyword), the
+magic numbers disappear from GC and sweep logic, and the vocabulary joins the enum wire tables. The
+set stays closed exactly as before — an unknown word is `CORRUPTED_DATA` — and the wide-integer
+truncation hazard the header documents cannot occur with words.
 
 A `condemned` summary row becomes:
 
@@ -555,10 +546,71 @@ sets are pinned here and in the goldens:
 - `lifecycle`: `live` (sole value, hard-required);
 - `hold_reason` (append-only): `gap_below_witness`, `unconsumed_seal_crossing`,
   `witness_disappeared`, `body_undecodable`, `manifest_body_missing`, `checkpoint_undecodable`;
-- `class`: numeric `{0, 1, 2, 4}` — deliberately not words (see fold seal);
+- `class`: `absent`, `unchanged`, `folded`, `clamped`;
 - `place`: `inline`, `blob`; run header `kind`: `source_edge`; blob descriptor `op`: `other`,
   `insert`, `merge`, `mutation`, `attach`, `repack`;
 - object `type` values: exactly the seventeen registry type strings in `CasFormat.cpp`.
+
+## Canonical examples {#canonical-examples}
+
+Shapes as an operator sees them. Identifier values are illustrative and abbreviated with `…`; real
+`hex128` values are 32 characters.
+
+An active and a condemned `cas_run` row between the run header and trailer:
+
+```json
+{"type":"cas_run","v":1,"kind":"source_edge"}
+{"ref":"01aa…","src":"0000…0007","mark":"edge"}
+{"ref":"01cc…","src":"0000…0009","mark":"condemned","pending":false,"token_type":"etag","token":"e-42","size":4096,"condemn_round":"7","confirmed":true}
+{"n":2}
+```
+
+The three `ref_life` fold-seal variants — base, hold-bearing, and with cleanup evidence:
+
+```json
+{"kind":"ref_life","life":"0000…1234","class":"folded","fold_epoch":"7","fold_seq":"11"}
+{"kind":"ref_life","life":"0000…1234","class":"clamped","fold_epoch":"3","fold_seq":"4","hold_reason":"manifest_body_missing","hold_epoch":"5","hold_seq":"6","retries":2,"retry_round":"8"}
+{"kind":"ref_life","life":"0000…1234","class":"folded","fold_epoch":"9","fold_seq":"12","remove_epoch":"9","remove_seq":"10"}
+```
+
+A creating-state ref-catalog entry:
+
+```json
+{"kind":"entry","ns":"srv1/db/table@cas@","state":"creating","life":"0000…0001","creator":"srv1","creator_epoch":"5","creator_fence":"2"}
+```
+
+And what a codec looks like under the carriers and helpers — the `cas_blob_meta` writer and reader
+(a sketch, not normative code):
+
+```cpp
+namespace BlobMetaWire
+{
+    constexpr WireKey state{"state"};
+    constexpr WireKey condemn_round{"condemn_round"};
+    constexpr WireKey size{"size"};
+}
+
+writeWordField(out, BlobMetaWire::state, meta_states.toWord(meta.state), first);
+writeU64StringField(out, BlobMetaWire::condemn_round, meta.condemn_round, first);
+writeU64StringField(out, BlobMetaWire::size, meta.size, first);
+
+while (r.nextKey(key))
+{
+    if (key == BlobMetaWire::state)
+    {
+        m.state = meta_states.fromWord(r.readString(), "blob meta");
+        saw_state = true;
+    }
+    else if (key == BlobMetaWire::condemn_round)
+        m.condemn_round = r.readU64String();
+    else if (key == BlobMetaWire::size)
+        m.size = r.readU64String();
+    else
+        r.skipUnknown(key);
+}
+if (!saw_state)
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: missing state");
+```
 
 ## Decompressed-byte accounting {#decompressed-byte-accounting}
 
@@ -579,6 +631,11 @@ unchanged:
 | committed ref-snapshot row | 29 bytes including `c` to `committed` |
 | precommit ref-snapshot row | 19 bytes including `p` to `precommit` |
 | base ref-catalog row | 9 bytes including `ent` to `entry` |
+| base `ref_life` fold-seal row | 22 bytes of keys and tags, plus 7–10 for the `class` word |
+| hold-bearing `ref_life` additions | 33 bytes |
+| cleanup-evidence `ref_life` additions | 16 bytes |
+| `blob_run` fold-seal row | 25 bytes |
+| `condemned` fold-seal summary row | 30 bytes |
 
 These are accepted readability costs. Exact-member-name alternatives are rejected because they add
 another tens of bytes per row, particularly for `source_id`, `delete_pending`,
@@ -590,8 +647,11 @@ cap would increase whole-read memory and line-allocation exposure merely to comp
 Admission estimators and fold-seal reservation helpers must continue measuring through the real
 encoders rather than using hand-maintained byte constants.
 
-Implementation verification records before/after encode and decode throughput for representative
-large `cas_run`, `RefSnapshot`, and `PartManifest` inputs. These measurements are review evidence,
+Implementation verification records before/after encode and decode throughput and records per
+second for representative large `cas_run`, `RefSnapshot`, `PartManifest`, `FoldSeal` (with a
+realistic distribution of `ref_life` row variants), and `RefCatalog` inputs, together with the
+maximum record count under each object cap before and after, and — for `.zst` formats — the stored
+bytes alongside the decompressed bytes. These measurements are review evidence,
 not a timing assertion in CI. Exact encoded-byte deltas and boundary sizes are pinned in deterministic
 unit tests. The dominant performance risk of the whole change is the longer keys themselves — extra
 bytes written, compressed, decompressed, and key-compared — which these measurements cover; the enum
@@ -638,6 +698,31 @@ continue to reject incomplete or unknown shapes according to their existing poli
 pre-reset object or pool — which should not exist — fails closed as `CORRUPTED_DATA` or
 `UNKNOWN_FORMAT_VERSION`; no friendlier taxonomy is owed to data that was never released.
 
+## Vocabulary evolution {#vocabulary-evolution}
+
+The reset erases the history, not the rules for the next change. What a change costs is determined
+by what an old tolerant reader does with it:
+
+| Change | Old tolerant reader | Contract |
+|---|---|---|
+| new optional ordinary key | skips it | may be additive: no `v` bump; best-effort on mutable objects until the floor rises |
+| new key in a strict format | rejects (`CORRUPTED_DATA`) | breaking: bump plus change point |
+| new enum or tag word | rejects as corruption (`fromWord` fails closed) | breaking: bump plus change point. Append-only declarations such as `hold_reason` promise only that values are never renumbered or reused — not that appending is compatible |
+| new required field, or new meaning of an existing value | may misread the object | breaking: bump, change point, and a pool-floor raise |
+| new `!` key | `UNKNOWN_FORMAT_VERSION` on exactly the objects that carry it | additive-critical: objects without the key stay readable, objects with it fail closed. This does not replace a bump — use `!` when old readers must not misread new objects, and a bump plus floor when old builds must be fenced from the pool entirely |
+
+The codec-author checklist for any vocabulary change, in one place:
+
+1. extend the enum wire table or the word constant (the set-equality assert will not let a table
+   lag its enum);
+2. pick the row above; for a breaking row, bump `G_BUILD`, append the change point, and raise the
+   pool floor when old builds must be fenced;
+3. update the goldens and the negative fixtures;
+4. re-check the byte budgets: the descriptor `static_assert` and the reservation helpers recompute
+   themselves, the delta table in this document does not;
+5. confirm introspection renders the new value through the shared table;
+6. update the `Formats/README.md` row and this document's tables in the same commit.
+
 ## Codec structure {#codec-structure}
 
 The implementation remains a mechanical codec change rather than a new schema subsystem, but every
@@ -648,8 +733,14 @@ vocabulary item gains a single production carrier:
   reader, so a writer/reader spelling divergence is impossible by construction. Critical keys carry
   the `!` prefix inside the literal (`"!prev_epoch"`), making criticality part of the single
   spelling. Keys existing in bare/`old_`/`new_` forms are declared as full-key bundles (see the
-  shared vocabulary section) — never assembled from a prefix at write time. There is no central
-  schema registry; locality is preserved.
+  shared vocabulary section) — never assembled from a prefix at write time. The key parameter of
+  `writeKey` and of every field helper is a `WireKey` — a thin strong type with an explicit
+  constexpr constructor — so a raw string literal cannot be passed silently; an inline
+  `WireKey{"..."}` at a call site still compiles, but it is visually loud and review rejects it.
+  The honest scope of the guarantee: for codecs that read the carriers, writer/reader divergence
+  is impossible; nothing physically prevents a future codec from bypassing them — the type makes
+  bypass conspicuous, and goldens plus review close the rest. There is no central schema registry;
+  locality is preserved.
 - **Enum wire tables.** The `ProvenanceOp` decision generalizes to every enum-backed persisted
   word vocabulary **whose entire enum domain is serializable**: `ProvenanceOp`, `TokenType`,
   `HoldReason`, `OutcomeKind`, `MetaState`, `NsState`, `RefOpKind`, `RefOwnerKind`, `BlobHashAlgo`
@@ -672,12 +763,13 @@ vocabulary item gains a single production carrier:
   No maps, no hashing, no allocation on either path; the exception paths stay cold. One enum may
   also carry several word contracts, and the wire table owns only the persisted spelling:
   `BlobHashAlgo`'s persisted `ch128` and its configuration spelling `cityhash128`
-  (`ContentAddressedSettings`) are different contracts and are not merged into one table. Three
+  (`ContentAddressedSettings`) are different contracts and are not merged into one table. Two
   enum-adjacent cases are deliberately outside the table rule: `RefLifecycle`, whose wire domain
   is a strict subset of the enum — `Removed` must never be serialized, so a table entry for it
-  would either open the wire to a forbidden state or break the coverage proof; the numeric
-  `classification`, which stays numeric by decision; and `FormatId`, whose type strings already
-  belong to the `TRAITS` registry rather than a separate wire table.
+  would either open the wire to a forbidden state or break the coverage proof; and `FormatId`,
+  whose type strings already belong to the `TRAITS` registry rather than a separate wire table.
+  (The fold-seal classification, numeric in earlier revisions, becomes a word vocabulary and joins
+  the tables — see the fold seal section.)
 - **Non-enum words.** Words with no backing fully-serializable enum — the record tags `entry`,
   `ref_life`, `blob_run`, `condemned`, and single-value vocabularies such as `live` and
   `source_edge` — are single constexpr word constants shared by writer and reader (the snapshot
@@ -932,9 +1024,10 @@ The change is complete when:
   bytes `0x00`/`0x01`/`0x02` — lives in one wire table whose values are proven set-equal to
   `magic_enum::enum_values<E>()` with two-way word uniqueness, density, and ordering statically
   asserted, so that `toWord` is a direct indexed lookup (`magic_enum` confined to `.cpp`
-  files and tests); `RefLifecycle`, the numeric classification, and `FormatId` stay outside the
-  table rule (`live` is a word constant guarded by the explicit `Live` check), and configuration
-  spellings are never merged into wire tables;
+  files and tests); `RefLifecycle` and `FormatId` stay outside the table rule (`live` is a word
+  constant guarded by the explicit `Live` check), the fold-seal `class` values are the four words
+  from the documented semantics, `algos_used` is a JSON array, and configuration spellings are
+  never merged into wire tables;
   non-enum tag and single-value words are single constexpr constants; `CasInspect` renders enum
   values through the tables; `kMinBlobHeaderLen` has one compile-time owner shared by the envelope
   encoder and `validatePoolBlobHeaderLen`; and all change points reference one shared `BASELINE`;
@@ -945,15 +1038,47 @@ The change is complete when:
   requiredness and the digest-width check — with the match helpers inline and adding no call,
   allocation, or branch on hot decode paths, and no reader dispatch table, stored-callable, or
   fluent-builder machinery exists;
-- no C++ member is more cryptic than its wire key, including the four renames this requires:
-  `RunRef::generation` to `key_generation`, both `ManifestFields` collectors' `me`/`mb`/`mo` to
-  `epoch`/`build`/`ord`, and `BindingFields`' `bk`/`rn`/`mf` to `kind`/`ref`/`manifest_fields`;
+- no C++ member is more cryptic than its wire key, including the five member renames this
+  requires: `RunRef::generation` to `key_generation`, both `ManifestFields` collectors'
+  `me`/`mb`/`mo` to `epoch`/`build`/`ord`, `BindingFields`' `bk`/`rn`/`mf` to
+  `kind`/`ref`/`manifest_fields`, and `MountLease::min_active` to `min_active_build_sequence`
+  (following its wire key);
 - common, codec, corruption, byte-budget, and exact-encoding unit tests pass for all 17 formats,
   and the battery covers exactly the registry;
 - raw assertions in integration tests and `utils/ca-soak` use the new spellings;
 - `Formats/README.md`, codec comments, the `CasPoolMetaFormat.cpp` worst-case table, and the
   backlog no longer claim a universal 2–5-character or exact-full-member-name convention;
-- local before/after measurements report the decompressed bytes and encode/decode throughput of the
-  representative high-cardinality formats, and the generated assembly of the hot `toWord` instances
-  and of the hot match helpers (`cas_run` token matching, `PartManifest` blob matching) is
-  reviewed — with no timing assertion in CI.
+- local before/after measurements report the decompressed and (for `.zst` formats) stored bytes,
+  encode/decode throughput, records per second, and the maximum record count under each cap for
+  `cas_run`, `RefSnapshot`, `PartManifest`, `FoldSeal` with realistic row-variant distributions,
+  and `RefCatalog`; the generated assembly of the hot `toWord` instances and of the hot match
+  helpers (`cas_run` token matching, `PartManifest` blob matching) is reviewed — with no timing
+  assertion in CI.
+
+## Revision history {#revision-history}
+
+- Revision 1 (2026-08-28): initial semantic-vocabulary design, framed as a generation-11 bump.
+- Revision 2 (2026-08-28): the three adjudications — sufficiently-full keys, generation reset,
+  asymmetric member rule.
+- Revision 3 (2026-08-29): sentinels kept as forbidden-field guards, pool-gate tests, absolute
+  member rule, value sets completed, `ProvenanceOp` constexpr table.
+- Revision 4: member-rule audit extended to codec-local collector structs.
+- Revision 5: constructive-enforcement layer; declarative schemas, generated goldens, and a golden
+  key scanner rejected.
+- Revision 6: full-key bundles, set-equality coverage proof, exact table/constant split, one owner
+  for `kMinBlobHeaderLen`.
+- Revision 7: table rule scoped to fully-serializable enum domains; run marker settled as a typed
+  enum.
+- Revision 8: performance profile — indexed `toWord`, linear `fromWord`, persisted versus
+  configuration spellings separated.
+- Revision 9: codec readability layer — field write helpers, match helpers, the
+  helper-versus-framework boundary.
+- Revision 10: `writeStringField`, the match-plus-`build` collector contract, codegen-neutral
+  match helpers.
+- Revision 11: `TokenFields::build` requires both fields (the `GcOutcomes` tightening); boundary
+  wording fixed.
+- Revision 12: `class` becomes words with the capacity calculation done; fold seal and catalog
+  join the deltas and measurements (stored bytes, records per second, capacity under caps); the
+  vocabulary-evolution matrix and codec-author checklist; `WireKey` and the honestly-scoped
+  by-construction claim; `algos_used` becomes a JSON array; `min_active` becomes
+  `min_active_build_sequence`; canonical examples added; the revision history moved here.
