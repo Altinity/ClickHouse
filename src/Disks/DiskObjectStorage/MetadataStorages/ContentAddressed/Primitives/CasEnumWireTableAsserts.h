@@ -1,0 +1,33 @@
+#pragma once
+
+/// Compile-time coverage proof for EnumWireTable: SET EQUALITY with the enum's declared values.
+/// Size-plus-uniqueness is not enough (an invalid casted value satisfies both while an enumerator
+/// goes missing). This header pulls in magic_enum and therefore MUST be included only from .cpp
+/// files and tests, never from another header.
+
+#include <magic_enum.hpp>
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h>
+
+namespace DB::Cas
+{
+
+template <const auto & Table, typename Enum>
+consteval bool casEnumTableCoversEnum()
+{
+    constexpr auto declared = magic_enum::enum_values<Enum>();
+    if (declared.size() != Table.entries.size())
+        return false;
+    for (size_t i = 0; i < declared.size(); ++i)
+    {
+        bool found = false;
+        for (const auto & entry : Table.entries)
+            if (entry.value == declared[i])
+                found = true;
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+}
