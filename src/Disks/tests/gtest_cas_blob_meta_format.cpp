@@ -6,6 +6,8 @@ using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
 
+CAS_BATTERY_COVERS(BlobMeta);
+
 TEST(CASFormatBattery, BlobMeta)
 {
     BlobMeta m;

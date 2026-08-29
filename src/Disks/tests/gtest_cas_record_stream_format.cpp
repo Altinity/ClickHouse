@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -64,6 +65,19 @@ std::vector<SourceEdgeRecord> decodeRun(const String & bytes)
     return out;
 }
 
+}
+
+CAS_BATTERY_COVERS(RunFile);
+
+TEST(CASFormatBattery, RunFile)
+{
+    const std::vector<SourceEdgeRecord> records{edge(chRef(2), 5)};
+    runFormatBattery({FormatId::RunFile,
+        [&] { return sealObject(FormatId::RunFile, encodeRun(records)); },
+        [](std::string_view s) { decodeRun(std::string(openObject(FormatId::RunFile, s))); },
+        fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion()) +
+        "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n"
+        "{\"n\":1}\n"});
 }
 
 TEST(CASRecordStream, EmptyRunRoundTripsAndChecksumMatches)

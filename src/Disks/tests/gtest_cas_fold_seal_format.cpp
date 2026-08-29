@@ -29,6 +29,8 @@ void eraseRequiredField(String & encoded, std::string_view field)
 }
 }
 
+CAS_BATTERY_COVERS(FoldSeal);
+
 TEST(CASFormatBattery, FoldSeal)
 {
     CasFoldSeal seal;

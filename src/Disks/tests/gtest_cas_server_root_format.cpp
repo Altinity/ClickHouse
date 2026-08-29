@@ -11,6 +11,8 @@ namespace DB::ErrorCodes
     extern const int CORRUPTED_DATA;
 }
 
+CAS_BATTERY_COVERS(Owner);
+
 TEST(CASFormatBattery, Owner)
 {
     OwnerObject o;
@@ -38,6 +40,8 @@ TEST(CASOwnerFormat, RetiredAtRoundTrip)
     EXPECT_EQ(back.retired_at_ms, o.retired_at_ms);
 }
 
+CAS_BATTERY_COVERS(ServerEpoch);
+
 TEST(CASFormatBattery, ServerEpoch)
 {
     ServerEpoch e;
@@ -47,6 +51,8 @@ TEST(CASFormatBattery, ServerEpoch)
         [](std::string_view s) { decodeServerEpoch(std::string(openObject(FormatId::ServerEpoch, s))); },
         currentFormatHeader("cas_epoch") + "{\"nwe\":\"7\"}\n"});
 }
+
+CAS_BATTERY_COVERS(MountLease);
 
 TEST(CASFormatBattery, MountLease)
 {

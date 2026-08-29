@@ -24,6 +24,8 @@ void expectThrowsCode(int expected_code, F && fn)
 /// The real cas_pool_meta case replaces the phase-1 toy proving instance. Every other control-plane
 /// format registers its own battery row in its own gtest_cas_<object>_format.cpp file (Tasks 3-6).
 
+CAS_BATTERY_COVERS(PoolMeta);
+
 TEST(CASFormatBattery, PoolMeta)
 {
     PoolMeta pm;

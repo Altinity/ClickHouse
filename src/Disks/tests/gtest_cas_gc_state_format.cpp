@@ -10,6 +10,8 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+CAS_BATTERY_COVERS(GcState);
+
 TEST(CASFormatBattery, GcState)
 {
     GcState s;
@@ -27,6 +29,8 @@ TEST(CASFormatBattery, GcState)
         "{\"rnd\":\"4\",\"gcs\":1,\"sg\":\"9\",\"spt\":\"7\",\"sa\":\"3\",\"msc\":\"\","
         "\"lo\":\"00000000000000000000000000000001\",\"ls\":\"12\"}\n"});
 }
+
+CAS_BATTERY_COVERS(GcHeartbeat);
 
 TEST(CASFormatBattery, GcHeartbeat)
 {

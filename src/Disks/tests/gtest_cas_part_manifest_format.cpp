@@ -58,6 +58,8 @@ PartManifest sample()
 
 }
 
+CAS_BATTERY_COVERS(PartManifest);
+
 TEST(CASFormatBattery, PartManifest)
 {
     const PartManifest m = sample();

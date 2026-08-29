@@ -210,6 +210,8 @@ private:
 
 /// ---------- format-battery registration ----------
 
+CAS_BATTERY_COVERS(RefCatalog);
+
 TEST(CASFormatBattery, RefCatalog)
 {
     RefCatalog c;

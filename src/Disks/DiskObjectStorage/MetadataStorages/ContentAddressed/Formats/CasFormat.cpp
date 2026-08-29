@@ -1,6 +1,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Common/Exception.h>
 
+#include <array>
+
 namespace DB
 {
 namespace ErrorCodes
@@ -195,6 +197,18 @@ const FormatTraits * traitsForType(std::string_view type)
         if (t.type == type)
             return &t;
     return nullptr;
+}
+
+std::span<const FormatId> allRegisteredFormatIds()
+{
+    static const auto ids = []
+    {
+        std::array<FormatId, std::size(TRAITS)> out{};
+        for (size_t i = 0; i < std::size(TRAITS); ++i)
+            out[i] = TRAITS[i].id;
+        return out;
+    }();
+    return ids;
 }
 
 std::string_view storedSuffix(FormatId id)
