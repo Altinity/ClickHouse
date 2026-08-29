@@ -61,6 +61,8 @@ Append new items here — quick adds and concurrent-agent findings land in this 
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 
+- PROSE (wire-keys phase-1, CasBlobMetaFormat.h): public delegate `metaStateToWireWord` undocumented — sibling `blobHashAlgoName` documents its LOGICAL_ERROR contract; add the same one-liner (surfaces for the CasInspect task's call site).
+
 - PROSE IMPRECISE (wire-keys phase-1, CasWireVocab.h match helpers): "must not gain a function-call boundary" overstates — `inline` is linkage, not an inlining guarantee; intent (header-defined, inlinable at per-key dispatch) is right.
 
 - PROSE (wire-keys phase-1, CasPoolMetaFormat.cpp fence comment): "is exactly the unvalidated input this function must reject cleanly" overstates — no unvalidated byte reaches it today (decoder fromWord-gates first); reword as "validates a raw byte vector, so it must reject cleanly rather than abort".
