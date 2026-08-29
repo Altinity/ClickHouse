@@ -351,9 +351,14 @@ TEST(CASRefCheckpoint, RejectsAnUnknownKey)
 /// pair would make an old writer's checkpoint appear to have no committed frontier.
 TEST(CASRefCheckpoint, RejectsOldCommittedEpochKeyRatherThanAliasingIt)
 {
-    String with_old_key = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
-                                                .committed_through = ID_1_1,
-                                                .checkpoint_snapshot_id = ID_1_1,
+    /// The values are chosen so ALIASING would be harmless: the spliced `"cte":"9"` re-assigns the
+    /// epoch the object already carries, leaving a valid checkpoint. A reader that honoured the old
+    /// spelling would therefore DECODE, and this test fails; only the strict unknown-key rejection
+    /// makes it throw. Values under which aliasing corrupts the object would let the invariant
+    /// checker throw the same code and hide the alias.
+    String with_old_key = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{9},
+                                                .committed_through = RefTxnId{9, 1},
+                                                .checkpoint_snapshot_id = RefTxnId{9, 1},
                                                 .last_epoch_seal = std::nullopt});
     with_old_key.replace(with_old_key.rfind('}'), 1, R"(,"cte":"9"})");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(with_old_key); });

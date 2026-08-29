@@ -68,7 +68,7 @@ Two failure modes this closes:
 One object, `gc/server-roots/<server_root_id>/mount`, carries **both** the liveness lease and the build
 watermark — there is no separate watermark object. `MountLease` fields: `server_uuid`,
 `writer_epoch`, `write_attempt_id`, `hostname`, `pid`, `started_at_ms`, renewal `seq`,
-`expires_at_ms`, `min_active` (the build-watermark floor), and `gc_fenced`.
+`expires_at_ms`, `min_active_build_sequence` (the build-watermark floor), and `gc_fenced`.
 
 - **Logical renewal identity.** Each holder-originated body has a fresh nonzero
   `write_attempt_id`. One logical renewal fixes one immutable `(key, bytes, expected token,
@@ -133,9 +133,9 @@ into "not found".
 
 Global build ordering is the **pair** `(writer_epoch, build_seq)` compared lexicographically — the
 exact comparison GC uses for eligibility. The durable authority for both is the mount object
-itself: no mount means no deletion authority means nothing is swept. `min_active`, the oldest
+itself: no mount means no deletion authority means nothing is swept. `min_active_build_sequence`, the oldest
 in-flight `build_seq`, rides in the same mount object as the watermark floor; `UINT64_MAX` in
-`min_active` is the farewell/retired sentinel, not a real build.
+`min_active_build_sequence` is the farewell/retired sentinel, not a real build.
 
 ## Mount claim outcomes {#claim-outcomes}
 
@@ -153,7 +153,7 @@ a `MountClaimResult::Kind` together with a `MountPriorState` describing which ce
 | `MountPriorState` | Certificate that justified the reclaim |
 |---|---|
 | `None` | no reclaim needed (fresh claim or same-epoch refresh) |
-| `Clean` | the predecessor's own graceful farewell (`min_active == UINT64_MAX`) |
+| `Clean` | the predecessor's own graceful farewell (`min_active_build_sequence == UINT64_MAX`) |
 | `Fenced` | GC's own threshold-gated fence-out (`gc_fenced`) |
 | `UncleanObserved` | this claimant's own token-stability observation held for the full `TTL + drift` window |
 
@@ -168,7 +168,7 @@ stateDiagram-v2
     Absent --> Live: claimMount putIfAbsent, seq=1
     Live --> Live: keeper beat, putOverwrite seq+1
     Live --> Fenced: GC observes a stable token past threshold, gc_fenced=1, body preserved
-    Live --> Terminated: certified drain, terminal farewell (expires_at=now, min_active=MAX)
+    Live --> Terminated: certified drain, terminal farewell (expires_at=now, min_active_build_sequence=MAX)
     Fenced --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
     Terminated --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
     Live --> Live: same-uuid claim, proven-dead token via UncleanObserved
@@ -218,7 +218,7 @@ processed before renewal resumes.
 
 **Clean unmount:** request stop and join both persistent workers, drain the ref lanes, and only if
 the drain *certified* quiescence call `MountLeaseKeeper::release` on an `Active` keeper to write the
-terminal farewell (`expires_at_ms` already expired, `min_active = UINT64_MAX`). That sentinel is what
+terminal farewell (`expires_at_ms` already expired, `min_active_build_sequence = UINT64_MAX`). That sentinel is what
 lets a successor reclaim instantly. A `RenewalTerminal` keeper, an unresolved ref write, or a sent
 renewal ambiguity writes no farewell — an unearned farewell would let a successor start mutating
 while a stale conditional request from the predecessor is still in flight.
