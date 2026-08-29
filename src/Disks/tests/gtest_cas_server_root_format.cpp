@@ -31,6 +31,8 @@ TEST(CASOwnerFormat, RetiredAtRoundTrip)
     o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
     o.retired_at_ms = 1752537600000ULL;
 
+    EXPECT_EQ(encodeOwner(o), currentFormatHeader("cas_owner")
+        + "{\"su\":\"0123456789abcdeffedcba9876543210\",\"rt\":1752537600000}\n");
     const OwnerObject back = decodeOwner(encodeOwner(o));
     EXPECT_EQ(back.server_uuid, o.server_uuid);
     EXPECT_EQ(back.retired_at_ms, o.retired_at_ms);
