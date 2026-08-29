@@ -42,8 +42,8 @@ TEST(CASFormatBattery, GcOutcomes)
         [&] { return sealObject(FormatId::GcOutcomes, encodeOutcomeLog(log)); },
         [](std::string_view d) { decodeOutcomeLog(std::string(openObject(FormatId::GcOutcomes, d))); },
         currentFormatHeader("cas_gc_outcomes") +
-        "{\"k\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
-        "\"token_type\":\"etag\",\"token\":\"e-1\",\"oc\":\"deleted\"}\n{\"n\":1}\n"});
+        "{\"kind\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
+        "\"token_type\":\"etag\",\"token\":\"e-1\",\"outcome\":\"deleted\"}\n{\"n\":1}\n"});
 }
 
 TEST(CASGCOutcomesFormat, EmptyRoundTrips)
@@ -119,8 +119,8 @@ TEST(CASGCOutcomesFormat, GarbageAndUnknownWordsFailClosed)
     EXPECT_THROW(decodeOutcomeLog(String("not a cas object\n")), DB::Exception);
     /// A record with an unknown outcome word fails closed.
     const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
-                       "{\"k\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
-                       "\"token_type\":\"etag\",\"token\":\"x\",\"oc\":\"bogus\"}\n{\"n\":1}\n";
+                       "{\"kind\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
+                       "\"token_type\":\"etag\",\"token\":\"x\",\"outcome\":\"bogus\"}\n{\"n\":1}\n";
     EXPECT_THROW(decodeOutcomeLog(bad), DB::Exception);
     /// A trailer count mismatch fails closed.
     const String miscount = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n{\"n\":5}\n";
@@ -133,7 +133,7 @@ TEST(CASGCOutcomesFormat, DigestWidthMismatchFailsClosedWithCorruptedData)
     /// to 30 hex chars. Must surface as CORRUPTED_DATA (malformed serialized input), not
     /// `fromHex`'s BAD_ARGUMENTS.
     const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
-                       "{\"k\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddee\","
-                       "\"token_type\":\"etag\",\"token\":\"x\",\"oc\":\"deleted\"}\n{\"n\":1}\n";
+                       "{\"kind\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddee\","
+                       "\"token_type\":\"etag\",\"token\":\"x\",\"outcome\":\"deleted\"}\n{\"n\":1}\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bad); });
 }

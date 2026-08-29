@@ -70,3 +70,27 @@ Gate:
 ```
 
 There was no `[  FAILED  ]` line. No deviations.
+
+## Task 12 — `cas_gc_outcomes`
+
+Status: complete.
+
+Inventory: the raw/escaped `k` worklist contained only the outcome test fixtures plus unrelated
+ref-catalog and fold-seal formats; `oc` occurred only in the outcome fixtures. Bare-token scans of
+integration and soak code found no outcome-log reader. Context-overloaded `k` hits (SQL/table data,
+the soak workload, ref-catalog) were left unchanged.
+
+Files: `CasGcOutcomesFormat.cpp`, `gtest_cas_gc_outcomes_format.cpp`, and `Formats/README.md`.
+
+Rows now write and read `kind: "blob"` and `outcome: "deleted"|"absent"|"replaced"|"spared"`.
+The battery and malformed-outcome/digest fixtures changed only those literals. Token requiredness
+was not changed: the existing optional `token` behavior and its pins remain as before.
+
+Gate:
+
+```text
+[==========] 2212 tests from 284 test suites ran. (162761 ms total)
+[  PASSED  ] 2212 tests.
+```
+
+There was no `[  FAILED  ]` line. No derived byte pin changed and no deviations.

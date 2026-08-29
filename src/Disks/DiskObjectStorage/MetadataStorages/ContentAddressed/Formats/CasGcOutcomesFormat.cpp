@@ -21,8 +21,8 @@ namespace
 
 namespace GcOutcomesWire
 {
-    constexpr WireKey kind{"k"};
-    constexpr WireKey outcome{"oc"};
+    constexpr WireKey kind{"kind"};
+    constexpr WireKey outcome{"outcome"};
 }
 
 constexpr EnumWireTable<OutcomeKind, 4> kOutcomeKindWords{{{
@@ -78,7 +78,7 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
         JsonObjectReader r(line_in, KeyStrictness::Tolerant, "outcome log");
 
         String key;
-        /// The first key distinguishes a trailer ("n") from a record ("k").
+        /// The first key distinguishes a trailer (`n`) from a record (`kind`).
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: empty line");
         if (key == "n")
