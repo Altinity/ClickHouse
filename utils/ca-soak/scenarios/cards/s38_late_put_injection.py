@@ -45,7 +45,7 @@ and step 1 still asserts it: an unclean predecessor's lease is observed rather t
 
 The injected body is built by taking a real ref-log object the server itself wrote in that epoch and
 rewriting only its sequence number, then dropping the ops. That keeps the card honest about a wire
-format it does not own — everything but `rs` comes from a body the product produced — while an
+format it does not own — everything but `txn_seq` comes from a body the product produced — while an
 op-count of zero means the transaction can never poison a real later fold even if some path does GET
 and decode it (`manifestEdgesOfTxn` of an empty op list is empty). The body duplicates the id, and
 `decodeRefLogTxn` rejects a body whose id does not match the key it was read from, which is why the

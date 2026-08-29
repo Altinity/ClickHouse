@@ -332,6 +332,35 @@ TEST(CASRefCodec, OwnerTransitionBindingGroupsAreAbsentOrComplete)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(incomplete_new, txn.ns, txn.txn_id); });
 }
 
+/// The anomaly diagnostic identifies an object found at a key it should not occupy by reading the
+/// meta line's three identity fields. It reads them through the codec's own key constants, so this
+/// test is what proves the reader did not quietly stop matching when those keys were renamed: with a
+/// stale spelling the tolerant reader skips every real key and the peek answers nullopt on a
+/// perfectly good ref-log.
+TEST(CASRefCodec, PeekReadsTheMetaIdentityOfASealedRefLog)
+{
+    RefLogTxn txn;
+    txn.ns = "srv1/db/table@cas@";
+    txn.txn_id = RefTxnId{4, 9};
+    RefOp birth;
+    birth.kind = RefOpKind::NamespaceBirth;
+    txn.ops.push_back(birth);
+
+    const auto peek = peekRefLogMeta(sealObject(FormatId::RefLog, encodeRefLogTxn(txn)));
+    ASSERT_TRUE(peek.has_value()) << "a well-formed ref-log must identify its own writer";
+    EXPECT_EQ(peek->ns, "srv1/db/table@cas@");
+    EXPECT_EQ(peek->writer_epoch, 4u);
+    EXPECT_EQ(peek->ref_sequence, 9u);
+}
+
+/// The other half of its contract: it identifies a writer, it never certifies an object, so anything
+/// it cannot read is `nullopt` rather than an exception escaping into the anomaly report.
+TEST(CASRefCodec, PeekAnswersNulloptForBytesThatAreNotARefLog)
+{
+    EXPECT_FALSE(peekRefLogMeta("not a sealed cas object at all").has_value());
+    EXPECT_FALSE(peekRefLogMeta(sealObject(FormatId::RefLog, "{\"type\":\"cas_ref_log\",\"v\":1}\n")).has_value());
+}
+
 TEST(CASRefCodec, RoundTripMultipleOpsInOneTransaction)
 {
     RefLogTxn txn;

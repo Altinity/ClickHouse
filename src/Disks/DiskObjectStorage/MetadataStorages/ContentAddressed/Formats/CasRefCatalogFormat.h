@@ -92,7 +92,7 @@ struct RefCatalog
     bool operator==(const RefCatalog &) const = default;
 };
 
-/// Encodes `catalog` as the canonical `cas_ref_catalog` text object: a header line, one "ent" record
+/// Encodes `catalog` as the canonical `cas_ref_catalog` text object: a header line, one "entry" record
 /// per entry in canonical (ns-sorted) order, and a record-count trailer -- the same tagged-record
 /// container `encodeFoldSeal` uses. Enforces the FULL strict grammar on the way out: canonical order
 /// and no duplicate namespace, a non-empty namespace within the `kMaxNamespaceBytes` bound, nonzero

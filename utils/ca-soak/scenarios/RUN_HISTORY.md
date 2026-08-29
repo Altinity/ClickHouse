@@ -503,3 +503,5 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-08-03T11:26:55 | S45 | 2 | dev | 300s | fail | d7673bd9ede3 | 20260803T112545_S45_seed2 |  |
 | 2026-08-03T11:28:36 | S45 | 3 | dev | 300s | fail | d7673bd9ede3 | 20260803T112822_S45_seed3 | Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table default.s45_victim_0 does not exist. (UNKNOWN_TABLE) (version 26.6.1.20000.altinityantalya) / sql=SYSTEM SYNC REPLICA s45_victim_0 |
 | 2026-08-03T11:31:03 | S45 | 4 | dev | 300s | pass | d7673bd9ede3 | 20260803T112949_S45_seed4 |  |
+| 2026-08-24T13:58:41 | S39 | 2244 | dev | 900s | pass | 80601d38ed03 | 20260824T135648_S39_seed2244 |  |
+| 2026-08-24T14:49:58 | S39 | 2244 | dev | 900s | pass | 9a17584246cb | 20260824T143451_S39_seed2244 |  |

@@ -43,13 +43,13 @@ catalog_state() {
         echo "absent"
         return
     fi
+    # The pipeline's exit status is `sed`'s, which is 0 even on empty input, so emptiness is the only
+    # usable signal that the row exists but its state field could not be read -- a stale key spelling
+    # here must be loud, never mistaken for "absent".
     local state
-    if ! state=$(echo "${line}" | grep -o '"state":"[a-z]*"' | head -1 | sed -E 's/"state":"([a-z]*)"/\1/'); then
-        echo "catalog row for namespace $1 has no readable state field" >&2
-        return 1
-    fi
+    state=$(echo "${line}" | grep -o '"state":"[a-z]*"' | head -1 | sed -E 's/"state":"([a-z]*)"/\1/')
     if [ -z "${state}" ]; then
-        echo "catalog row for namespace $1 has no readable state field" >&2
+        echo "catalog row for namespace $1 exists but has no readable state field" >&2
         return 1
     fi
     echo "${state}"
@@ -154,7 +154,10 @@ for i in 1 2 3; do
     CYCLE_NS_LIST+=("${CYCLE_NS}")
 
     $CLICKHOUSE_CLIENT --query "DROP TABLE t_dropns_cycle SYNC"
-    if [ "$(catalog_state "${CYCLE_NS}")" = "live" ]; then
+    # Read the state into a variable first: `$(...)` inside a test swallows a non-zero return, so an
+    # unreadable row would count as "not live" and this counter would pass while the reader is broken.
+    CYCLE_STATE=$(catalog_state "${CYCLE_NS}") || exit 1
+    if [ "${CYCLE_STATE}" = "live" ]; then
         CYCLE_LEAK_COUNT=$((CYCLE_LEAK_COUNT + 1))
     fi
 done

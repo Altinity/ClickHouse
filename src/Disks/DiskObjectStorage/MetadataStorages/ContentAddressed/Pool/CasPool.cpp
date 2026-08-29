@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
@@ -1600,56 +1601,6 @@ BlobLocation Pool::locate(const ManifestEntry & entry) const
     return manifest_reader.locate(entry);
 }
 
-namespace
-{
-/// a tolerant, read-only peek at the
-/// `cas_ref_log` TEXT object (codecs-v3 phase 3) WITHOUT `decodeRefLogTxn`'s expected-value cross-check
-/// -- the whole point of this diagnostic is that the body is NOT expected to match this key's identity.
-/// It `openObject`s the stored `.zst`, skips the header line, and reads `ns`/`we`/`rs` off the meta
-/// line (`we`/`rs` are decimal u64 strings). Never validates the header `v`, never reads past the meta
-/// line (the ops are irrelevant to identifying the writer), and swallows any truncation/garbage: this
-/// is a background diagnostic only, never a decode anything else depends on.
-struct ForeignRefLogHeaderPeek
-{
-    String ns;
-    uint64_t writer_epoch = 0;
-    uint64_t ref_sequence = 0;
-};
-
-std::optional<ForeignRefLogHeaderPeek> peekForeignRefLogHeader(const String & bytes)
-{
-    try
-    {
-        const String text = openObject(FormatId::RefLog, bytes);
-        ReadBufferFromMemory in(text.data(), text.size());
-        const uint64_t line_cap = traitsFor(FormatId::RefLog).line_cap;
-        readLine(in, line_cap, "cas_ref_log");   /// header line -- skip
-        const String meta = readLine(in, line_cap, "cas_ref_log");
-        ReadBufferFromMemory m(meta.data(), meta.size());
-        JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_log");
-        ForeignRefLogHeaderPeek peek;
-        bool saw_ns = false;
-        bool saw_we = false;
-        bool saw_rs = false;
-        String key;
-        while (r.nextKey(key))
-        {
-            if (key == "ns") { peek.ns = r.readString(); saw_ns = true; }
-            else if (key == "we") { peek.writer_epoch = r.readU64String(); saw_we = true; }
-            else if (key == "rs") { peek.ref_sequence = r.readU64String(); saw_rs = true; }
-            else r.skipUnknown(key);
-        }
-        if (!saw_ns || !saw_we || !saw_rs)
-            return std::nullopt;
-        return peek;
-    }
-    catch (...)
-    {
-        return std::nullopt;
-    }
-}
-}
-
 void Pool::reportImpossibleInterference(const String & key, const String & reason,
                                           const std::optional<String> & offending_ns)
 {
@@ -1693,7 +1644,7 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
                         "time the background diagnostic GET ran", key);
                     return;
                 }
-                if (const auto peek = peekForeignRefLogHeader(got->bytes))
+                if (const auto peek = peekRefLogMeta(got->bytes))
                     LOG_ERROR(getLogger("CasPool"),
                         "CAS anomaly diagnostics: offending object at '{}' ({} bytes) decodes as a ref-log "
                         "header: namespace='{}', writer_epoch={}, ref_sequence={}",

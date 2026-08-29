@@ -178,4 +178,22 @@ void validateEpochSealGrammarStructural(const RefLogTxn & txn);
 /// mint a sequence-1 transaction. Throws CORRUPTED_DATA on violation.
 void validateEpochSealGrammarContextual(const RefLogTxn & txn, uint64_t life_epoch);
 
+/// The three identity fields of a `cas_ref_log` meta line, read WITHOUT trusting the object: this is
+/// the anomaly diagnostic's view of an object found at a key it should not occupy, so the body is not
+/// expected to match that key's identity.
+struct RefLogMetaPeek
+{
+    String ns;
+    uint64_t writer_epoch = 0;
+    uint64_t ref_sequence = 0;
+};
+
+/// Best-effort identification of a sealed `cas_ref_log` object: opens it, skips the header line, and
+/// reads the meta line's three identity fields. Never validates the header version, never reads past
+/// the meta line, and answers `nullopt` for anything it cannot read -- truncation, garbage, a
+/// different format, or a meta line missing one of the three. It lives HERE, beside the key
+/// constants, because a caller that spelled those keys itself would silently stop matching the first
+/// time they are renamed, and this reader has no output an ordinary test would miss.
+std::optional<RefLogMetaPeek> peekRefLogMeta(const String & sealed_bytes);
+
 }

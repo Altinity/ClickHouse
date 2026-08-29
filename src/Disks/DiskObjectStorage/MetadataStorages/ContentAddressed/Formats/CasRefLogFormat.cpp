@@ -440,4 +440,41 @@ size_t removalFramingSize(const String & ns, const RefTxnId & txn_id, uint64_t o
     return out.size();
 }
 
+std::optional<RefLogMetaPeek> peekRefLogMeta(const String & sealed_bytes)
+{
+    try
+    {
+        const String text = openObject(FormatId::RefLog, sealed_bytes);
+        ReadBufferFromMemory in(text.data(), text.size());
+        const uint64_t line_cap = traitsFor(FormatId::RefLog).line_cap;
+        readLine(in, line_cap, "cas_ref_log");   /// header line -- skipped, the version is not judged here
+        const String meta = readLine(in, line_cap, "cas_ref_log");
+        ReadBufferFromMemory m(meta.data(), meta.size());
+        JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_log");
+        RefLogMetaPeek peek;
+        bool saw_ns = false;
+        bool saw_epoch = false;
+        bool saw_seq = false;
+        String key;
+        while (r.nextKey(key))
+        {
+            if (key == RefLogWire::ns) { peek.ns = r.readString(); saw_ns = true; }
+            else if (key == RefLogWire::txn_epoch) { peek.writer_epoch = r.readU64String(); saw_epoch = true; }
+            else if (key == RefLogWire::txn_seq) { peek.ref_sequence = r.readU64String(); saw_seq = true; }
+            else r.skipUnknown(key);
+        }
+        if (!saw_ns || !saw_epoch || !saw_seq)
+            return std::nullopt;
+        return peek;
+    }
+    catch (...)
+    {
+        /// Deliberately total: a diagnostic that throws while explaining an anomaly replaces the
+        /// anomaly's report with its own. A seal-linked txn reaches here too -- its `!`-prefixed chain
+        /// keys make the tolerant reader refuse the line -- and answering `nullopt` is correct: this
+        /// peek identifies a writer, it does not certify an object.
+        return std::nullopt;
+    }
+}
+
 }

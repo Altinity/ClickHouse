@@ -58,6 +58,15 @@ def read_catalog(node):
     entries = []
     for m in _ENTRY_RE.finditer(text):
         entries.append({"ns": m.group(1), "state": m.group(2), "incarnation": m.group(3)})
+    if not entries and '"kind":"entry"' in text:
+        # The catalog carries entry rows this regex can no longer read: the wire vocabulary moved and
+        # this reader did not follow. Say so instead of returning "no entries", which the caller
+        # cannot tell from an empty catalog and which flips the whole discrimination to the opposite
+        # conclusion.
+        raise AssertionError(
+            "catalog contains entry rows but none matched the reader's field pattern; the ref-catalog "
+            "key spelling changed and this script is stale: " + text[:400]
+        )
     return entries
 
 
