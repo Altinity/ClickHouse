@@ -60,6 +60,7 @@ as a confirmation note rather than inserted separately. Full triage record:
 Append new items here — quick adds and concurrent-agent findings land in this section, unformatted
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
+isn't referenced elsewhere first.
 
 - PHASE-2 PLAN INPUTS (wire-keys, from the phase-1 final review — fold into `...-cas-wire-keys-phase2-cut.md` when written): (a) constant for the snapshot `lc == "live"` word; (b) Wire-namespace placement rule for NEW codec files — wire namespaces + tables go inside the codec `.cpp`'s anonymous namespace, public delegates in headers; (c) optionally single-site the reader-side `key == "n"` trailer-detection literal (seven readers, one writer `writeTrailerLine` today — framing, not vocabulary); (d) negative fixture for an unknown envelope `op` word; (e) outcomes token-group requiredness flips to both-required WITH its own negative test; (f) phase-1 pins that phase 2 must flip are enumerated per-file in the phase-1 plan's task list.
 - WORDING pass (phase 2): `BindingFields::build`'s message "binding missing bk/rn" names deleted members; group-message texts unify with the cut.
@@ -68,8 +69,6 @@ from here without triaging; do not hand-sort into a topic file without checking 
 
 - PROSE (wire-keys phase-1, CasEnvelopeLimits.h): doc comment claims "read by BOTH validatePoolBlobHeaderLen and the blob-envelope codec" — false until the phase-2 static_assert lands (one reader today); self-heals in phase 2, else reword as purpose.
 - PROSE (wire-keys phase-2 TODO, CasPoolMetaFormat.{h,cpp}): the floor derivation comment is split from the value it derives (and its 214/225 numbers carry the known off-by-one — spec mandates 213/224); phase 2 should move the derivation into CasEnvelopeLimits.h beside the constant and erase the duplicated "240" prose in CasPoolMetaFormat.h.
-
-isn't referenced elsewhere first.
 
 The eleven items below are untouched since the 2026-08-04 consolidation-audit findings that produced
 them; the nine below those are the "found during the 2026-08 documentation consolidation" batch from
