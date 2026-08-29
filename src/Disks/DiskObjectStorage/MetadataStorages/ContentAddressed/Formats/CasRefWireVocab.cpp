@@ -51,6 +51,11 @@ void writeRefTxnIdFields(CasJsonWriter & out, bool & first, std::string_view epo
     writeU64StringValue(out, id.ref_sequence);
 }
 
+void writeRefTxnIdFields(CasJsonWriter & out, bool & first, WireKey epoch_key, WireKey seq_key, const RefTxnId & id)
+{
+    writeRefTxnIdFields(out, first, epoch_key.text, seq_key.text, id);
+}
+
 void writeBindingFields(CasJsonWriter & out, bool & first, const BindingWireKeys & keys, const RefOwnerBinding & binding)
 {
     checkCanonicalRefName(binding.ref_name, "RefLogTxn", "owner binding ref_name");

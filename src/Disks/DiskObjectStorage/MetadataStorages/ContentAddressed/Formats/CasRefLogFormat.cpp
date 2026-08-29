@@ -136,9 +136,9 @@ void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_i
 {
     bool first = true;
     writeStringField(out, RefLogWire::ns, ns, first);
-    writeRefTxnIdFields(out, first, RefLogWire::txn_epoch.text, RefLogWire::txn_seq.text, txn_id);
+    writeRefTxnIdFields(out, first, RefLogWire::txn_epoch, RefLogWire::txn_seq, txn_id);
     if (prev_epoch_seal)
-        writeRefTxnIdFields(out, first, RefLogWire::prev_epoch.text, RefLogWire::prev_seq.text, *prev_epoch_seal);
+        writeRefTxnIdFields(out, first, RefLogWire::prev_epoch, RefLogWire::prev_seq, *prev_epoch_seal);
     closeObject(out, first);
     writeChar('\n', out);
 }
