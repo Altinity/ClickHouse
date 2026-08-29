@@ -67,8 +67,8 @@ TEST(CASFormatBattery, PartManifest)
     /// stays self-consistent with whatever sample() produces, now that decode verifies payload_digest.
     const String golden =
         currentFormatHeader("cas_part_manifest") +
-        "{\"me\":\"5\",\"mb\":\"15\",\"mo\":1,\"ns\":\"00/aa@cas@\",\"pd\":\"" + u128ToHex(m.payload_digest) + "\"}\n" // NOLINT(modernize-raw-string-literal): mixes '\"' quoting with '\n' line endings across this concatenated literal; a raw string can't hold the newline as-is.
-        "{\"p\":\"a/b.bin\",\"pm\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\",\"sz\":4096}\n"
+        "{\"epoch\":\"5\",\"build\":\"15\",\"ord\":1,\"ns\":\"00/aa@cas@\",\"pd\":\"" + u128ToHex(m.payload_digest) + "\"}\n" // NOLINT(modernize-raw-string-literal): mixes '\"' quoting with '\n' line endings across this concatenated literal; a raw string can't hold the newline as-is.
+        "{\"p\":\"a/b.bin\",\"pm\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\",\"sz\":4096}\n"
         "{\"p\":\"c/small.txt\",\"pm\":\"inline\",\"il\":12}\n"
         "{\"n\":2}\n"
         "==> \"c/small.txt\" il=12 <==\n"
@@ -377,10 +377,10 @@ TEST(CASPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
 TEST(CASPartManifestFormat, UnknownEntryAlgoFailsClosed)
 {
     String bad = encodePartManifest(sample());
-    const String needle = R"("ha":"ch128")";
+    const String needle = R"("algo":"ch128")";
     const size_t pos = bad.find(needle);
     ASSERT_NE(pos, String::npos);
-    bad.replace(pos, needle.size(), R"("ha":"bogus")");
+    bad.replace(pos, needle.size(), R"("algo":"bogus")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 
@@ -390,7 +390,7 @@ TEST(CASPartManifestFormat, UnknownEntryAlgoFailsClosed)
 TEST(CASPartManifestFormat, DigestHexWidthMismatchFailsClosedNotBadArguments)
 {
     String bad = encodePartManifest(sample());
-    const String key = R"("h":")";
+    const String key = R"("digest":")";
     const size_t key_pos = bad.find(key);
     ASSERT_NE(key_pos, String::npos);
     const size_t hex_start = key_pos + key.size();

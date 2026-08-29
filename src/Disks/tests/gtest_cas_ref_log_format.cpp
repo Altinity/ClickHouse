@@ -297,7 +297,7 @@ TEST(CASRefCodec, OwnerTransitionBindingGroupsAreAbsentOrComplete)
     txn.ops.push_back(op);
     const String bytes = encodeRefLogTxn(txn);
 
-    const String old_group = R"(,"obk":"precommit","orn":"old","ome":"1","omb":"1","omo":1)";
+    const String old_group = R"(,"old_kind":"precommit","old_ref":"old","old_epoch":"1","old_build":"1","old_ord":1)";
     const auto old_group_pos = bytes.find(old_group);
     ASSERT_NE(old_group_pos, String::npos);
     String old_absent = bytes;
@@ -307,14 +307,14 @@ TEST(CASRefCodec, OwnerTransitionBindingGroupsAreAbsentOrComplete)
     EXPECT_FALSE(without_old.ops[0].old_binding.has_value());
     EXPECT_TRUE(without_old.ops[0].new_binding.has_value());
 
-    const String old_ref = R"(,"orn":"old")";
+    const String old_ref = R"(,"old_ref":"old")";
     const auto old_ref_pos = bytes.find(old_ref);
     ASSERT_NE(old_ref_pos, String::npos);
     String incomplete_old = bytes;
     incomplete_old.erase(old_ref_pos, old_ref.size());
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(incomplete_old, txn.ns, txn.txn_id); });
 
-    const String new_group = R"(,"nbk":"committed","nrn":"new","nme":"1","nmb":"1","nmo":1)";
+    const String new_group = R"(,"new_kind":"committed","new_ref":"new","new_epoch":"1","new_build":"1","new_ord":1)";
     const auto new_group_pos = bytes.find(new_group);
     ASSERT_NE(new_group_pos, String::npos);
     String new_absent = bytes;
@@ -324,7 +324,7 @@ TEST(CASRefCodec, OwnerTransitionBindingGroupsAreAbsentOrComplete)
     EXPECT_TRUE(without_new.ops[0].old_binding.has_value());
     EXPECT_FALSE(without_new.ops[0].new_binding.has_value());
 
-    const String new_ref = R"(,"nrn":"new")";
+    const String new_ref = R"(,"new_ref":"new")";
     const auto new_ref_pos = bytes.find(new_ref);
     ASSERT_NE(new_ref_pos, String::npos);
     String incomplete_new = bytes;
@@ -834,6 +834,6 @@ TEST(CASFormatBattery, RefLog)
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
         currentFormatHeader("cas_ref_log") +
         "{\"ns\":\"ns\",\"we\":\"1\",\"rs\":\"1\"}\n"
-        "{\"op\":\"set_published_at\",\"rn\":\"all_1_1_0\",\"me\":\"1\",\"mb\":\"1\",\"mo\":1,\"ts\":42}\n"
+        "{\"op\":\"set_published_at\",\"rn\":\"all_1_1_0\",\"epoch\":\"1\",\"build\":\"1\",\"ord\":1,\"ts\":42}\n"
         "{\"n\":1}\n"});
 }

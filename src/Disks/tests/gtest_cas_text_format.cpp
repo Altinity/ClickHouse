@@ -180,7 +180,7 @@ TEST(CASJsonVocab, FailClosedRules)
         r.nextKey(k);
     }); });
     /// bad hex width / junk in u64 string
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"h":"0102"})", KeyStrictness::Tolerant, [](auto & r)
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"digest":"0102"})", KeyStrictness::Tolerant, [](auto & r)
     {
         String k;
         r.nextKey(k); r.readHex128();

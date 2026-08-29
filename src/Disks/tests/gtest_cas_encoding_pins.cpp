@@ -51,11 +51,11 @@ TEST(CASEncodingPins, RefLogTxnAllOpKinds)
     const String expected = fmt::format("{{\"type\":\"cas_ref_log\",\"v\":{}}}\n", currentCompatibilityVersion()) +
         "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\"}\n"
         "{\"op\":\"namespace_birth\"}\n"
-        "{\"op\":\"owner_transition\",\"obk\":\"precommit\",\"orn\":\"20260101_0_1_1_1\","
-        "\"ome\":\"1\",\"omb\":\"2\",\"omo\":3,\"nbk\":\"committed\",\"nrn\":\"20260101_0_1_1_1\","
-        "\"nme\":\"1\",\"nmb\":\"2\",\"nmo\":3}\n"
+        "{\"op\":\"owner_transition\",\"old_kind\":\"precommit\",\"old_ref\":\"20260101_0_1_1_1\","
+        "\"old_epoch\":\"1\",\"old_build\":\"2\",\"old_ord\":3,\"new_kind\":\"committed\",\"new_ref\":\"20260101_0_1_1_1\","
+        "\"new_epoch\":\"1\",\"new_build\":\"2\",\"new_ord\":3}\n"
         "{\"op\":\"set_published_at\",\"rn\":\"20260101_0_1_1_1\\\"c\\nd\\u0001e\\u2028f\","
-        "\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"ts\":1234}\n"
+        "\"epoch\":\"1\",\"build\":\"2\",\"ord\":3,\"ts\":1234}\n"
         "{\"op\":\"remove_namespace\"}\n"
         "{\"n\":4}\n";
     EXPECT_EQ(encodeRefLogTxn(txn), expected);
@@ -77,8 +77,8 @@ TEST(CASEncodingPins, RefSnapshotLive)
 
     const String expected = fmt::format("{{\"type\":\"cas_ref_snap\",\"v\":{}}}\n", currentCompatibilityVersion()) +
         "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\",\"lc\":\"live\"}\n"
-        "{\"k\":\"c\",\"rn\":\"20260101_0_1_1_1\",\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"ts\":5}\n"
-        "{\"k\":\"p\",\"rn\":\"20260102_0_2_2_2\",\"me\":\"4\",\"mb\":\"5\",\"mo\":6}\n"
+        "{\"k\":\"c\",\"rn\":\"20260101_0_1_1_1\",\"epoch\":\"1\",\"build\":\"2\",\"ord\":3,\"ts\":5}\n"
+        "{\"k\":\"p\",\"rn\":\"20260102_0_2_2_2\",\"epoch\":\"4\",\"build\":\"5\",\"ord\":6}\n"
         "{\"n\":2}\n";
     EXPECT_EQ(encodeRefTableSnapshot(snap), expected);
 }
@@ -115,7 +115,7 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     const String expected_record =
         "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n";
     const String expected_condemned =
-        "{\"b\":\"0100000000000000000000000000000003\",\"s\":\"00000000000000000000000000000000\",\"m\":\"condemned\",\"pend\":true,\"tt\":\"etag\",\"tv\":\"token\",\"sz\":9,\"cr\":\"7\",\"mc\":true}\n";
+        "{\"b\":\"0100000000000000000000000000000003\",\"s\":\"00000000000000000000000000000000\",\"m\":\"condemned\",\"pend\":true,\"token_type\":\"etag\",\"token\":\"token\",\"sz\":9,\"cr\":\"7\",\"mc\":true}\n";
     const String trailer = "{\"n\":2}\n";
     /// Both records must remain byte-identical to their canonical stored representation.
     const String expected_full = header + expected_record + expected_condemned + trailer;

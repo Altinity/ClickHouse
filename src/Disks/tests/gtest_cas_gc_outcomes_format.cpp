@@ -42,8 +42,8 @@ TEST(CASFormatBattery, GcOutcomes)
         [&] { return sealObject(FormatId::GcOutcomes, encodeOutcomeLog(log)); },
         [](std::string_view d) { decodeOutcomeLog(std::string(openObject(FormatId::GcOutcomes, d))); },
         currentFormatHeader("cas_gc_outcomes") +
-        "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\","
-        "\"tt\":\"etag\",\"tv\":\"e-1\",\"oc\":\"deleted\"}\n{\"n\":1}\n"});
+        "{\"k\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
+        "\"token_type\":\"etag\",\"token\":\"e-1\",\"oc\":\"deleted\"}\n{\"n\":1}\n"});
 }
 
 TEST(CASGCOutcomesFormat, EmptyRoundTrips)
@@ -85,7 +85,7 @@ TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
         Token{"e-1", TokenType::ETag}, OutcomeKind::Deleted});
     const String bytes = encodeOutcomeLog(log);
 
-    const String token_value = R"(,"tv":"e-1")";
+    const String token_value = R"(,"token":"e-1")";
     const auto token_value_pos = bytes.find(token_value);
     ASSERT_NE(token_value_pos, String::npos);
     String missing_token_value = bytes;
@@ -94,7 +94,7 @@ TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
     ASSERT_EQ(decoded.entries.size(), 1u);
     EXPECT_EQ(decoded.entries[0].token.value, "");
 
-    for (const String & field : {String(R"(,"ha":"ch128")"), String(R"(,"h":"00112233445566778899aabbccddeeff")"), String(R"(,"tt":"etag")")})
+    for (const String & field : {String(R"(,"algo":"ch128")"), String(R"(,"digest":"00112233445566778899aabbccddeeff")"), String(R"(,"token_type":"etag")")})
     {
         const auto pos = bytes.find(field);
         ASSERT_NE(pos, String::npos);
@@ -119,8 +119,8 @@ TEST(CASGCOutcomesFormat, GarbageAndUnknownWordsFailClosed)
     EXPECT_THROW(decodeOutcomeLog(String("not a cas object\n")), DB::Exception);
     /// A record with an unknown outcome word fails closed.
     const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
-                       "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\","
-                       "\"tt\":\"etag\",\"tv\":\"x\",\"oc\":\"bogus\"}\n{\"n\":1}\n";
+                       "{\"k\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
+                       "\"token_type\":\"etag\",\"token\":\"x\",\"oc\":\"bogus\"}\n{\"n\":1}\n";
     EXPECT_THROW(decodeOutcomeLog(bad), DB::Exception);
     /// A trailer count mismatch fails closed.
     const String miscount = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n{\"n\":5}\n";
@@ -129,11 +129,11 @@ TEST(CASGCOutcomesFormat, GarbageAndUnknownWordsFailClosed)
 
 TEST(CASGCOutcomesFormat, DigestWidthMismatchFailsClosedWithCorruptedData)
 {
-    /// `ch128` (CityHash128) digests are 16 bytes = 32 hex chars; here the "h" field is truncated
+    /// `ch128` (CityHash128) digests are 16 bytes = 32 hex chars; here the `digest` field is truncated
     /// to 30 hex chars. Must surface as CORRUPTED_DATA (malformed serialized input), not
     /// `fromHex`'s BAD_ARGUMENTS.
     const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
-                       "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddee\","
-                       "\"tt\":\"etag\",\"tv\":\"x\",\"oc\":\"deleted\"}\n{\"n\":1}\n";
+                       "{\"k\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddee\","
+                       "\"token_type\":\"etag\",\"token\":\"x\",\"oc\":\"deleted\"}\n{\"n\":1}\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bad); });
 }

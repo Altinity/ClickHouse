@@ -64,7 +64,7 @@ inline RunMarker runMarkerFromByte(char byte, std::string_view what)
 /// File shape:
 ///   {"type":"cas_run","v":3,"kind":"source_edge"}                      header line (type + v + kind gate)
 ///   {"b":"01<digest-hex>","s":"<32hex>","m":"edge"}                    an active-edge / zero-marker row
-///   {"b":"01<digest-hex>","s":"00000000000000000000000000000000","m":"condemned","pend":false,"tt":"etag","tv":"...","sz":123,"cr":"7","mc":false}
+///   {"b":"01<digest-hex>","s":"00000000000000000000000000000000","m":"condemned","pend":false,"token_type":"etag","token":"...","sz":123,"cr":"7","mc":false}
 ///   {"n":184267}                                                       trailer: record count
 ///
 /// The record key `b` is the algo BYTE as two lowercase hex chars followed by the digest hex at the

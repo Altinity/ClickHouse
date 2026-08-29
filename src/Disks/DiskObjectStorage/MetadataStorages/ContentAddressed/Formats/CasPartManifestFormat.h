@@ -15,11 +15,11 @@ namespace DB::Cas
 /// stable for the surrounding CAS protocol.
 ///
 ///   header line                 {"type":"cas_part_manifest","v":N}
-///   descriptor meta line         {"me","mb","mo"} (the ManifestRef, shared rendering with
+///   descriptor meta line         {"epoch","build","ord"} (the ManifestRef, shared rendering with
 ///                                refsnaplog, `CasWireVocab.h`) + "ns" (root namespace) + "pd"
 ///                                (payload digest, 32 lowercase hex)
 ///   one entry-record line each   {"p":path,"pm":placement-word, then either the Blob's
-///                                {"ha","h","sz"} or the Inline's {"il"}}, in canonical path order
+///                                {"algo","digest","sz"} or the Inline's {"il"}}, in canonical path order
 ///   trailer line                 {"n":entry-count}
 ///   PAYLOAD ZONE (raw, follows the trailer): for each Inline entry, in path order, a
 ///                                `head -v`-style banner line `==> "<escaped path>" il=<n> <==\n`, then

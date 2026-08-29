@@ -50,22 +50,22 @@ std::string_view objectKindToWord(ObjectKind k);
 /// the `CORRUPTED_DATA` exception; unknown words are rejected rather than treated as a default kind.
 ObjectKind objectKindFromWord(std::string_view w, std::string_view what);
 
-/// Append the sibling fields `tt` and `tv` to an in-progress JSON object. The caller owns `first`,
+/// Append the sibling fields `token_type` and `token` to an in-progress JSON object. The caller owns `first`,
 /// which must describe the fields already written to that object; the token value is JSON-escaped.
 void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t);
 
-/// Append the sibling fields `ha` and `h` to an in-progress JSON object. The algorithm word and
+/// Append the sibling fields `algo` and `digest` to an in-progress JSON object. The algorithm word and
 /// lowercase digest are canonical, and the digest is rendered at the width required by `r.algo`.
 void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r);
 
-/// The `ha`/`h` and `tt`/`tv` key spellings, named once so `writeBlobRefFields`/`writeTokenFields`
+/// The `algo`/`digest` and `token_type`/`token` key spellings, named once so `writeBlobRefFields`/`writeTokenFields`
 /// and the `match*Fields` collectors below can never drift apart on the literal.
 namespace SharedWire
 {
-    inline constexpr WireKey algo{"ha"};
-    inline constexpr WireKey digest{"h"};
-    inline constexpr WireKey token_type{"tt"};
-    inline constexpr WireKey token{"tv"};
+    inline constexpr WireKey algo{"algo"};
+    inline constexpr WireKey digest{"digest"};
+    inline constexpr WireKey token_type{"token_type"};
+    inline constexpr WireKey token{"token"};
 }
 
 /// One `ManifestRef`'s three flat key names. Every bundle spells the SAME wire representation
@@ -79,13 +79,13 @@ struct ManifestRefWireKeys
     WireKey ord;
 };
 
-/// The unprefixed `me`/`mb`/`mo` spelling used by part manifests, snapshot rows, and the
+/// The unprefixed `epoch`/`build`/`ord` spelling used by part manifests, snapshot rows, and the
 /// `set_published_at` ref-log op.
-inline constexpr ManifestRefWireKeys kBareManifestRefKeys{WireKey{"me"}, WireKey{"mb"}, WireKey{"mo"}};
-/// The `ome`/`omb`/`omo` spelling for a ref-log owner_transition's OLD binding.
-inline constexpr ManifestRefWireKeys kOldManifestRefKeys{WireKey{"ome"}, WireKey{"omb"}, WireKey{"omo"}};
-/// The `nme`/`nmb`/`nmo` spelling for a ref-log owner_transition's NEW binding.
-inline constexpr ManifestRefWireKeys kNewManifestRefKeys{WireKey{"nme"}, WireKey{"nmb"}, WireKey{"nmo"}};
+inline constexpr ManifestRefWireKeys kBareManifestRefKeys{WireKey{"epoch"}, WireKey{"build"}, WireKey{"ord"}};
+/// The `old_epoch`/`old_build`/`old_ord` spelling for a ref-log owner_transition's OLD binding.
+inline constexpr ManifestRefWireKeys kOldManifestRefKeys{WireKey{"old_epoch"}, WireKey{"old_build"}, WireKey{"old_ord"}};
+/// The `new_epoch`/`new_build`/`new_ord` spelling for a ref-log owner_transition's NEW binding.
+inline constexpr ManifestRefWireKeys kNewManifestRefKeys{WireKey{"new_epoch"}, WireKey{"new_build"}, WireKey{"new_ord"}};
 
 /// One owner binding's key names: the owner-kind word, the ref name, and its nested `ManifestRef`
 /// bundle. Only the ref-log owner_transition op uses this bundle (old/new binding sides).
@@ -96,10 +96,10 @@ struct BindingWireKeys
     ManifestRefWireKeys manifest;
 };
 
-/// The `obk`/`orn`/`ome`/`omb`/`omo` spelling for the OLD binding side.
-inline constexpr BindingWireKeys kOldBindingKeys{WireKey{"obk"}, WireKey{"orn"}, kOldManifestRefKeys};
-/// The `nbk`/`nrn`/`nme`/`nmb`/`nmo` spelling for the NEW binding side.
-inline constexpr BindingWireKeys kNewBindingKeys{WireKey{"nbk"}, WireKey{"nrn"}, kNewManifestRefKeys};
+/// The `old_kind`/`old_ref`/`old_epoch`/`old_build`/`old_ord` spelling for the OLD binding side.
+inline constexpr BindingWireKeys kOldBindingKeys{WireKey{"old_kind"}, WireKey{"old_ref"}, kOldManifestRefKeys};
+/// The `new_kind`/`new_ref`/`new_epoch`/`new_build`/`new_ord` spelling for the NEW binding side.
+inline constexpr BindingWireKeys kNewBindingKeys{WireKey{"new_kind"}, WireKey{"new_ref"}, kNewManifestRefKeys};
 
 /// Append the three flat `ManifestRef` fields named by `keys` to an in-progress JSON object. The
 /// two unbounded `uint64_t` values are decimal JSON strings; the bounded ordinal is a JSON number.
@@ -132,7 +132,7 @@ struct ManifestRefFields
     ManifestRef buildRef(std::string_view what, std::string_view context) const;
 };
 
-/// Collector for one `BlobRef`'s two flat fields (`ha`/`h`), filled in by `matchBlobRefFields`.
+/// Collector for one `BlobRef`'s two flat fields (`algo`/`digest`), filled in by `matchBlobRefFields`.
 struct BlobRefFields
 {
     std::optional<String> algo_word;
@@ -145,7 +145,7 @@ struct BlobRefFields
     BlobRef build(std::string_view what) const;
 };
 
-/// Collector for one `Token`'s two flat fields (`tt`/`tv`), filled in by `matchTokenFields`. Phase 1
+/// Collector for one `Token`'s two flat fields (`token_type`/`token`), filled in by `matchTokenFields`. Phase 1
 /// deliberately has no `build`: callers keep their own local requiredness checks until the unified
 /// both-required build is introduced.
 struct TokenFields

@@ -431,8 +431,8 @@ TEST(CASFormatBattery, RefSnapshot)
         [ns, id](std::string_view d) { decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, d), ns, id); },
         currentFormatHeader("cas_ref_snap") +
         "{\"ns\":\"srv1/db/table@cas@\",\"we\":\"5\",\"rs\":\"200\",\"lc\":\"live\"}\n"
-        "{\"k\":\"c\",\"rn\":\"all_1_1_0\",\"me\":\"5\",\"mb\":\"10\",\"mo\":1,\"ts\":1717000000000}\n"
-        "{\"k\":\"c\",\"rn\":\"all_2_2_0\",\"me\":\"5\",\"mb\":\"11\",\"mo\":1,\"ts\":1717000000001}\n"
-        "{\"k\":\"p\",\"rn\":\"all_3_3_0\",\"me\":\"5\",\"mb\":\"12\",\"mo\":1}\n"
+        "{\"k\":\"c\",\"rn\":\"all_1_1_0\",\"epoch\":\"5\",\"build\":\"10\",\"ord\":1,\"ts\":1717000000000}\n"
+        "{\"k\":\"c\",\"rn\":\"all_2_2_0\",\"epoch\":\"5\",\"build\":\"11\",\"ord\":1,\"ts\":1717000000001}\n"
+        "{\"k\":\"p\",\"rn\":\"all_3_3_0\",\"epoch\":\"5\",\"build\":\"12\",\"ord\":1}\n"
         "{\"n\":3}\n"});
 }

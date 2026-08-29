@@ -40,7 +40,7 @@ constexpr EnumWireTable<EntryPlacement, 2> kEntryPlacementWords{{{
 
 static_assert(casEnumTableCoversEnum<kEntryPlacementWords, EntryPlacement>());
 
-/// One entry-record line: {"p","pm", then either the Blob's "ha"/"h"/"sz" or the Inline's "il"}.
+/// One entry-record line: {"p","pm", then either the Blob's "algo"/"digest"/"sz" or the Inline's "il"}.
 void writeEntryRecord(CasJsonWriter & out, const ManifestEntry & e)
 {
     bool first = true;

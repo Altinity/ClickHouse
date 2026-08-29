@@ -1234,8 +1234,8 @@ TEST(CASRefCheckpoint, CommitRefChunkDurableBytesUnchangedByExtraction)
     EXPECT_EQ(plaintext, R"({"type":"cas_ref_log","v":1}
 {"ns":"test/golden@cas@","we":"1","rs":"1"}
 {"op":"namespace_birth"}
-{"op":"owner_transition","nbk":"precommit","nrn":"gold_ref","nme":"1","nmb":"7","nmo":1}
-{"op":"owner_transition","obk":"precommit","orn":"gold_ref","ome":"1","omb":"7","omo":1,"nbk":"committed","nrn":"gold_ref","nme":"1","nmb":"7","nmo":1}
+{"op":"owner_transition","new_kind":"precommit","new_ref":"gold_ref","new_epoch":"1","new_build":"7","new_ord":1}
+{"op":"owner_transition","old_kind":"precommit","old_ref":"gold_ref","old_epoch":"1","old_build":"7","old_ord":1,"new_kind":"committed","new_ref":"gold_ref","new_epoch":"1","new_build":"7","new_ord":1}
 {"n":3}
 )") << "the sealed ref-log plaintext changed";
     EXPECT_EQ(got->bytes.size(), 178u) << "the sealed ref-log body changed size";

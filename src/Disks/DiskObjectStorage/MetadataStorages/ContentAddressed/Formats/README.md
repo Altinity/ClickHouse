@@ -43,6 +43,10 @@ algo-width hex (two chars per digest byte), rendered with their algo name (`sha2
 a bare hex would be ambiguous; unbounded u64 = decimal strings; bounded counts/lengths/ms-timestamps
 = numbers; units documented here per object as codecs land.
 
+`CasWireVocab.{h,cpp}` owns repeated value fields: `BlobRef` uses `algo`/`digest`, `Token` uses
+`token_type`/`token`, `ManifestRef` uses `epoch`/`build`/`ord`, and owner-transition bindings use
+the corresponding `old_*` and `new_*` key bundles.
+
 ## Evolution rules (one screen)
 
 - `v` (header line) is the ONLY version field; reader gate: `v > G_BUILD` →
