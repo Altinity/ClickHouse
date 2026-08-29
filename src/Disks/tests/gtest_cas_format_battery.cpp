@@ -49,6 +49,8 @@ TEST(CASPoolMeta, RejectsInvalidAlgoArrays)
             "{\"pool_id\":\"00112233445566778899aabbccddeeff\",\"blob_header_len\":256,\"gc_shards\":1,\"min_reader_generation\":1,\"algos_used\":" + String(algos_used) + "}\n");
     };
 
+    /// The first value is the field's PREVIOUS encoding -- a comma-joined string inside one JSON
+    /// value. It must fail closed rather than round-trip; the rest are malformed arrays.
     for (const std::string_view bad : {"\"ch128,sha256\"", "[\"ch128\",1]", "[]", "[\"sha256\",\"ch128\"]", "[\"ch128\",\"ch128\"]", "[\"unknown\"]"})
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(bad); });
 }

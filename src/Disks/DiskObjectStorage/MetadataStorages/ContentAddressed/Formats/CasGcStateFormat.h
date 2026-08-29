@@ -45,7 +45,7 @@ String encodeGcState(const GcState & state);
 
 /// Decode a complete `cas_gc_state` text object. The header and size limits are checked before the
 /// body is parsed; unknown non-reserved fields are tolerated for forward evolution, but malformed
-/// input, trailing bytes, a missing `gcs`, or a zero shard count raises `CORRUPTED_DATA` rather than
+/// input, trailing bytes, a missing `gc_shards`, or a zero shard count raises `CORRUPTED_DATA` rather than
 /// falling back to a default state.
 GcState decodeGcState(std::string_view data);
 

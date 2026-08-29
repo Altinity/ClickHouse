@@ -90,6 +90,9 @@ String encodePoolMeta(const PoolMeta & pm)
     writeNumberField(out, PoolMetaWire::blob_header_len, pm.blob_header_len, first);
     writeNumberField(out, PoolMetaWire::gc_shards, pm.gc_shards, first);
     writeNumberField(out, PoolMetaWire::min_reader_generation, pm.min_reader_generation, first);
+    /// Sized by the whole algo vocabulary and safe to index by `algos_used`: the validation above
+    /// admits only known algo bytes in strictly increasing order, so the vector cannot be longer
+    /// than the table. Relaxing that check to non-strict ordering would overrun this array.
     std::array<std::string_view, kBlobHashAlgoWords.entries.size()> algo_words;
     for (size_t i = 0; i < pm.algos_used.size(); ++i)
         algo_words[i] = kBlobHashAlgoWords.toWord(static_cast<BlobHashAlgo>(pm.algos_used[i]), "CAS pool meta");

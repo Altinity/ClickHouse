@@ -67,6 +67,7 @@ isn't referenced elsewhere first.
 
 - LATER PHASE (wire-keys, Formats/CasLayout.cpp blobRefFromKey): hand-rolled reimplementation of kBlobHashAlgoWords.fromWord ("one name authority" comment now stale) — replacing is a nullopt→throw posture flip needing a wedge audit of every caller; do not do casually.
 
+- PROSE provenance (pre-existing, wire-keys phase-2 sweep): "spec §2 [C4][D2]"-style citations in `CasPoolMetaFormat.h` and `Pool/CasPoolMeta.cpp`, and a plan-path citation in `utils/ca-soak/scenarios/cards/s28_s33_corner.py` — drop the citations, keep the meaning. Also `CasPoolMetaFormat.h`'s body example renders `] }` where the encoder emits `]}`.
 - PROSE provenance (pre-existing): `gtest_cas_ref_epoch_seal_format.cpp` carries a `/// codex r2 finding 2:` comment — drop the citation, keep the reason (comment policy: no internal references).
 - PROSE stale-generation narrative (post-reset): `gtest_cas_namespace_life_id.cpp:208,315` comments still cite "Generation-5/6" parser history — reword to the timeless opaque-life-layout vocabulary (same class as the fixed `CasLayout.cpp` message).
 - PROSE (wire-keys phase-1, CasEnvelopeLimits.h): doc comment claims "read by BOTH validatePoolBlobHeaderLen and the blob-envelope codec" — false until the phase-2 static_assert lands (one reader today); self-heals in phase 2, else reword as purpose.
