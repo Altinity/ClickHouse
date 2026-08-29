@@ -46,7 +46,7 @@ String encodeBlobMeta(const BlobMeta & meta)
     // `version` is represented by the header line. The JSON body contains only fields that describe
     // the current marker and its accounting data.
     bool first = true;
-    writeWordField(out, BlobMetaWire::state, kMetaStateWords.toWord(meta.state, "CAS blob meta"), first);
+    writeWordField(out, BlobMetaWire::state, metaStateToWireWord(meta.state), first);
     writeU64StringField(out, BlobMetaWire::condemn_round, meta.condemn_round, first);
     writeU64StringField(out, BlobMetaWire::size, meta.size, first);
     closeObject(out, first);

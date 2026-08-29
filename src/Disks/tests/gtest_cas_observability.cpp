@@ -428,7 +428,7 @@ TEST(CASObservability, CaInspectDecodesRefLogToJson)
     const String json = caInspectToJson(
         layout, key, encodeRefLogTxn(txn), DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find("ref_log"), String::npos);
-    EXPECT_NE(json.find("OwnerTransition"), String::npos);
+    EXPECT_NE(json.find("owner_transition"), String::npos);
     EXPECT_NE(json.find("all_0_0_0"), String::npos);
 }
 
@@ -440,11 +440,16 @@ TEST(CASObservability, CaInspectDecodesPartManifestToJson)
     PartManifest m;
     m.ref = ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 3};
     m.root_namespace_id = ns;
-    ManifestEntry e;
-    e.path = "data.bin";
-    e.placement = EntryPlacement::Inline;
-    e.inline_bytes = "hello";
-    m.entries = {e};
+    ManifestEntry inline_entry;
+    inline_entry.path = "data.bin";
+    inline_entry.placement = EntryPlacement::Inline;
+    inline_entry.inline_bytes = "hello";
+    ManifestEntry blob_entry;
+    blob_entry.path = "payload.bin";
+    blob_entry.placement = EntryPlacement::Blob;
+    blob_entry.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload.bin"))};
+    blob_entry.blob_size = 5;
+    m.entries = {inline_entry, blob_entry};
     m.payload_digest = computePayloadDigest(m);
 
     const ManifestId id{.root_namespace = ns, .ref = m.ref};
@@ -453,6 +458,9 @@ TEST(CASObservability, CaInspectDecodesPartManifestToJson)
     EXPECT_NE(json.find("\"root_namespace_id\""), String::npos);
     EXPECT_NE(json.find("data.bin"), String::npos);
     EXPECT_NE(json.find("\"manifest_ordinal\":3"), String::npos);
+    /// `EntryPlacement` renders as its full wire word (`inline`/`blob`), not the enumerator spelling.
+    EXPECT_NE(json.find(R"("placement":"inline")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("placement":"blob")"), String::npos) << json;
 }
 
 TEST(CASObservability, CaInspectDecodesMountLeaseToJson)
@@ -483,6 +491,36 @@ TEST(CASObservability, CaInspectDecodesGcStateToJson)
     const String json = caInspectToJson(layout, key, encodeGcState(state));
     EXPECT_NE(json.find("\"round\":42"), String::npos);
     EXPECT_NE(json.find("\"gc_shards\":4"), String::npos);
+}
+
+/// `ObjectKind`/`ProvenanceOp` render as their full wire words, not the enumerator spelling. Loops
+/// over every `ProvenanceOp` value so each one ends up pinned, not just whichever one a single case
+/// would have picked.
+TEST(CASObservability, CaInspectDecodesEnvelopeHeaderWithEveryProvenanceOpWord)
+{
+    Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("envelope-inspect"))};
+    const String key = layout.blobKey(ref);
+
+    const std::vector<std::pair<ProvenanceOp, String>> ops = {
+        {ProvenanceOp::Other, "other"},
+        {ProvenanceOp::Insert, "insert"},
+        {ProvenanceOp::Merge, "merge"},
+        {ProvenanceOp::Mutation, "mutation"},
+        {ProvenanceOp::Attach, "attach"},
+        {ProvenanceOp::Repack, "repack"},
+    };
+    for (const auto & [op, word] : ops)
+    {
+        EnvelopeHeader h;
+        h.kind = ObjectKind::Blob;
+        h.provenance = Provenance{.op = op};
+        const String bytes = encodeEnvelopeHeader(h, 256);
+
+        const String json = caInspectToJson(layout, key, bytes);
+        EXPECT_NE(json.find(R"("kind":"blob")"), String::npos) << json;
+        EXPECT_NE(json.find("\"op\":\"" + word + "\""), String::npos) << json;
+    }
 }
 
 TEST(CASObservability, CaInspectUnknownKeyThrows)

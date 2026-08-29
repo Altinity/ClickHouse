@@ -121,7 +121,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
         {
             writeKey(buf, EnvelopeWire::time_ms, first); writeIntText(header.provenance->created_at_ms, buf);
             writeKey(buf, EnvelopeWire::creator, first); writeHex128Value(buf, header.provenance->creator_server_id);
-            writeKey(buf, EnvelopeWire::op, first); writeStringValue(buf, kProvenanceOpWords.toWord(header.provenance->op, "CAS blob envelope"));
+            writeKey(buf, EnvelopeWire::op, first); writeStringValue(buf, provenanceOpToWireWord(header.provenance->op));
             writeKey(buf, EnvelopeWire::chver, first); writeIntText(header.provenance->ch_version, buf);
         }
         /// Test-only critical extension: an unknown `!`-key BEFORE `ref`.
