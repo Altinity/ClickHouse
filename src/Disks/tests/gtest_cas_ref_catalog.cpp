@@ -261,6 +261,7 @@ TEST(CASRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
     const RefCatalog catalog{.entries = {removing}};
     const String encoded = encodeRefCatalog(catalog);
     EXPECT_NE(encoded.find("\"rsr\":\"19\""), String::npos);
+    EXPECT_NE(encoded.find("\"st\":\"removing\""), String::npos);
     EXPECT_EQ(decodeRefCatalog(encoded), catalog);
 
     const String inc = "00000000000000000000000000000009";

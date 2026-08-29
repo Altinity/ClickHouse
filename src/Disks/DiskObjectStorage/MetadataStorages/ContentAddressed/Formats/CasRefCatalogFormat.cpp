@@ -78,14 +78,7 @@ std::string_view nsStateToWord(NsState s)
 
 NsState nsStateFromWord(std::string_view w)
 {
-    try
-    {
-        return kNsStateWords.fromWord(w, "CAS ref catalog");
-    }
-    catch (const Exception &)
-    {
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ns state '{}'", w);
-    }
+    return kNsStateWords.fromWord(w, "CAS ref catalog ns state");
 }
 
 String encodeRefCatalog(const RefCatalog & catalog)

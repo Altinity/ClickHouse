@@ -105,7 +105,7 @@ void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
 {
     bool first = true;
     writeStringField(out, RefSnapWire::ns, snapshot.ns, first);
-    writeRefTxnIdFields(out, first, RefSnapWire::snapshot_epoch.text, RefSnapWire::snapshot_seq.text, snapshot.snapshot_id);
+    writeRefTxnIdFields(out, first, RefSnapWire::snapshot_epoch, RefSnapWire::snapshot_seq, snapshot.snapshot_id);
     writeStringField(out, RefSnapWire::lifecycle, "live", first);
     closeObject(out, first);
     writeChar('\n', out);
