@@ -63,6 +63,8 @@ from here without triaging; do not hand-sort into a topic file without checking 
 
 - PROSE internal-ref sweep (pre-existing): `gtest_cas_ref_catalog.cpp` section comment cites "[codex r2/r3 finding 9]"; `CasRefCatalogFormat.h` cites "(spec §3)" — drop the citations, keep the meaning (comment policy: no internal references). Also `/// Retired-in-snapshot (T4): …` provenance comments in `gtest_cas_gc_leak.cpp`, `gtest_cas_gc_resume.cpp`, `gtest_cas_gc_shard_plan.cpp`, `gtest_cas_gc_attempt.cpp`, `gtest_cas_event_log.cpp`, `gtest_cas_truncate_reclaim.cpp`; and a "Task 8's line-scratch rewrite" provenance comment in `gtest_cas_encoding_pins.cpp`; and "Task-1 review finding M5" / "Stage A task 5 (spec INV-4)" references in `Tools/CasInspect.cpp`.
 
+- PROSE (wire-keys phase-1, CasTextFormat.h `WireKey`): doc comment overclaims — the raw `writeKey(string_view)` overload still accepts literals until the phase-2 cut; also the string_view-borrow lifetime constraint (the key text must outlive the WireKey) is unstated.
+- PROSE IMPRECISE (wire-keys phase-1, CasEnumWireTableAsserts.h): header comment overclaims `magic_enum` coverage — `enum_values` sees only the reflectable range (default -128..127); note the caveat so a far-valued enumerator is not silently missed by the proof premise.
 - PROSE FALSE sweep (wire-keys phase-1): three toWord delegates still documented as "Throws CORRUPTED_DATA" — `refOwnerKindToWord` (CasRefWireVocab.h, falsified by task 11), `tokenTypeToWord`/`objectKindToWord` (CasWireVocab.h, earlier task) — all throw LOGICAL_ERROR via the table now; sweep the three together.
 - WORDING pass (phase 2): `BindingFields::build`'s message "binding missing bk/rn" names deleted members; group-message texts unify with the cut.
 

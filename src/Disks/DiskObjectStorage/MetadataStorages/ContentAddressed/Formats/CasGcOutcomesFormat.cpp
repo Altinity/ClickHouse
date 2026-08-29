@@ -43,7 +43,7 @@ OutcomeKind outcomeKindFromWord(std::string_view w)
 
 std::string_view outcomeKindToWireWord(OutcomeKind outcome)
 {
-    return kOutcomeKindWords.toWord(outcome, "CAS outcome log: unknown OutcomeKind");
+    return kOutcomeKindWords.toWord(outcome, "CAS outcome log outcome kind");
 }
 
 String encodeOutcomeLog(const OutcomeLog & log)

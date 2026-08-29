@@ -137,6 +137,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
     /// (byte blob_header_len-1 is reserved for '\n'; the pad zone fills the gap with spaces).
     if (header.intended_ref)
     {
+        /// 4 = the `,"` before and `":` after the key text — the `,"ref":` framing minus the key itself.
         constexpr size_t ref_key_size = 4 + EnvelopeWire::ref.text.size();
         /// +3 = opening quote + closing quote + closing brace.
         const size_t fixed = json.size() + ref_key_size + 3;

@@ -31,6 +31,10 @@ struct EnumWireTable
 
     std::array<Entry, N> entries;
 
+    /// An empty table would make `denseAndOrdered`/`wordsUnique` vacuously true and `toWord`'s
+    /// index arithmetic read past the array — no wire vocabulary is empty, so reject at compile time.
+    static_assert(N > 0, "EnumWireTable must hold at least one entry");
+
     constexpr bool denseAndOrdered() const
     {
         for (size_t i = 0; i < N; ++i)

@@ -170,6 +170,7 @@ PartManifest decodePartManifest(std::string_view data)
     /// the payload zone below can read exactly that many raw bytes back into `inline_bytes`.
     /// Index-aligned with `m.entries` (Blob entries push an unused 0 placeholder).
     std::vector<uint64_t> inline_lens;
+    String blob_ref_what;   /// reused across Blob entries so the error context does not allocate per row
     while (true)
     {
         const String line = readLine(in, line_cap, "cas_part_manifest");
@@ -233,7 +234,9 @@ PartManifest decodePartManifest(std::string_view data)
         {
             if (!sz)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: blob entry '{}' missing sz", e.path);
-            const String blob_ref_what = "PartManifest entry '" + e.path + "'";
+            blob_ref_what.assign("PartManifest entry '");
+            blob_ref_what += e.path;
+            blob_ref_what += '\'';
             e.ref = blob_ref.build(blob_ref_what);
             e.blob_size = *sz;
             inline_lens.push_back(0);   /// unused for Blob; keeps inline_lens index-aligned with entries

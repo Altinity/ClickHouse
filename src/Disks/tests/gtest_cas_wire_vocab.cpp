@@ -53,8 +53,8 @@ TEST(CASWireVocab, EnumWordsRoundTrip)
     for (BlobHashAlgo a : {BlobHashAlgo::CityHash128, BlobHashAlgo::XXH3_128, BlobHashAlgo::Sha256})
         EXPECT_EQ(blobHashAlgoFromWord(blobHashAlgoName(a), "a"), a);
     EXPECT_EQ(objectKindFromWord(objectKindToWord(ObjectKind::Blob), "k"), ObjectKind::Blob);
-    EXPECT_THROW(tokenTypeFromWord("nope", "t"), DB::Exception);
-    EXPECT_THROW(blobHashAlgoFromWord("nope", "a"), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { tokenTypeFromWord("nope", "t"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { blobHashAlgoFromWord("nope", "a"); });
 }
 
 TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
