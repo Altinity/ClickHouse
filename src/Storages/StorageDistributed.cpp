@@ -55,7 +55,6 @@
 #include <Parsers/parseQuery.h>
 
 #include <Analyzer/ColumnNode.h>
-#include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/TableFunctionNode.h>
@@ -840,6 +839,8 @@ StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataP
 namespace
 {
 
+/// Rebuild alias ColumnNode references into expression nodes and optionally
+/// wrap them with __aliasMarker for distributed SQL transport.
 class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasColumnsVisitor>
 {
     QueryTreeNodePtr getColumnNodeAliasExpression(const QueryTreeNodePtr & node) const
@@ -855,40 +856,35 @@ class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasCo
             return nullptr;
 
         auto column_expression = column_node->getExpression();
-        const auto & column_name = column_node->getColumnName();
+        const String output_alias = column_node->hasAlias() ? column_node->getAlias() : String{};
 
-        if (!context->getSettingsRef()[Setting::enable_alias_marker])
+        const auto & settings = context->getSettingsRef();
+        const bool use_alias_marker = settings[Setting::enable_alias_marker];
+        if (!use_alias_marker)
         {
-            column_expression->setAlias(column_name);
-            return column_expression;
-        }
-
-        String alias_id;
-        const auto & source_alias = column_source->getAlias();
-        if (!source_alias.empty())
-            alias_id = source_alias + "." + column_name;
-        else
-            alias_id = column_name;
-
-        if (auto * function_node = column_expression->as<FunctionNode>();
-            function_node && function_node->getFunctionName() == "__aliasMarker")
-        {
-            auto & arguments = function_node->getArguments().getNodes();
-            if (arguments.size() == 2)
-                arguments[1] = std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>());
-
-            column_expression->setAlias(column_name);
-            return column_expression;
+            auto column_expression_with_alias = column_expression->clone();
+            column_expression_with_alias->removeAlias();
+            if (!output_alias.empty())
+                column_expression_with_alias->setAlias(output_alias);
+            return column_expression_with_alias;
         }
 
         QueryTreeNodes arguments;
         arguments.reserve(2);
-        arguments.emplace_back(std::move(column_expression));
-        arguments.emplace_back(std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>()));
+        /// Preserve the original column reference in arg2 so normal analyzer passes
+        /// (alias/source uniquification) can still transform it consistently.
+        /// Before query is sent to shard this ColumnNode is materialized to String ConstantNode.
+        /// Clone the expression before mutating its alias below: getExpression() may return a node
+        /// shared elsewhere in the tree, and removeAlias() would otherwise be a side effect on it.
+        arguments.emplace_back(column_expression->clone());
+        arguments.emplace_back(std::make_shared<ColumnNode>(column_node->getColumn(), column_source));
 
         auto alias_marker_node = std::make_shared<FunctionNode>("__aliasMarker");
-        alias_marker_node->getArguments().getNodes() = std::move(arguments);
-        alias_marker_node->setAlias(column_name);
+        auto & nodes = alias_marker_node->getArguments().getNodes();
+        nodes = std::move(arguments);
+        nodes[0]->removeAlias();
+        if (!output_alias.empty())
+            alias_marker_node->setAlias(output_alias);
         resolveOrdinaryFunctionNodeByName(*alias_marker_node, "__aliasMarker", context);
 
         return alias_marker_node;
@@ -901,6 +897,22 @@ public:
     {
         if (auto column_expression = getColumnNodeAliasExpression(node))
             node = column_expression;
+    }
+
+    static bool needChildVisit(const QueryTreeNodePtr & parent_node, const QueryTreeNodePtr & child_node)
+    {
+        auto * function_node = parent_node->as<FunctionNode>();
+        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
+            return true;
+
+        const auto & arguments = function_node->getArguments().getNodes();
+        if (arguments.size() < 2)
+            return true;
+
+        /// Do not recurse into __aliasMarker arg2.
+        /// It is an internal column-reference payload used only for later id materialization,
+        /// and visiting it here can re-expand aliases or create recursive rewrites.
+        return child_node.get() != arguments[1].get();
     }
 
 private:
@@ -1165,7 +1177,9 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         rewriteJoinToGlobalJoinIfNeeded(query_node.getJoinTree());
     }
 
-    return buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
+    auto shard_query_tree = buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
+    finalizeAliasMarkersForDistributedSerialization(shard_query_tree, query_context);
+    return shard_query_tree;
 
 }
 
