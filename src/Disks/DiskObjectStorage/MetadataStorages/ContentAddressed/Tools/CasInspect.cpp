@@ -168,7 +168,7 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .str();
 }
 
-/// The namespace's checkpoint (spec INV-4). Every field is optional and each absence means something
+/// The namespace's checkpoint. Every field is optional and each absence means something
 /// different an operator needs to see: no `life_epoch` means no writer that knew this namespace's
 /// genesis epoch has written here yet, no `committed_through` means the life has no committed
 /// transaction, no `checkpoint_snapshot_id` means recovery has no snapshot base, and no

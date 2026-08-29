@@ -35,9 +35,8 @@ struct RefOwnerBinding
     bool operator==(const RefOwnerBinding &) const = default;
 };
 
-/// Convert an owner-kind discriminator to its canonical text word. Throws `CORRUPTED_DATA` for a
-/// value not represented by this format; accepting an unknown value would produce an ambiguous wire
-/// record.
+/// Convert an owner-kind discriminator to its canonical text word. Throws `LOGICAL_ERROR` for an
+/// out-of-range enum value.
 std::string_view refOwnerKindToWord(RefOwnerKind k);
 
 /// Parse a canonical owner-kind word. `what` identifies the containing field in the

@@ -109,7 +109,7 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     out.finalize();
 
     /// The exact "b" rendering (algo byte + digest hex) is pinned as a whole line; the point is
-    /// that Task 8's line-scratch rewrite must reproduce it byte-for-byte.
+    /// that the line-scratch rendering must reproduce it byte-for-byte.
     const String text = out.str();
     const String header = fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion());
     const String expected_record =

@@ -44,7 +44,7 @@ std::string_view nsStateToWord(NsState s);
 /// Inverse of `nsStateToWord`; throws `CORRUPTED_DATA` for anything but the three registered words.
 NsState nsStateFromWord(std::string_view w);
 
-/// The fence identity of the mounted writer CREATING one namespace (spec §3): the server root plus
+/// The fence identity of the mounted writer CREATING one namespace: the server root plus
 /// the writer epoch and admission fence generation captured at the moment `Creating` was minted. It
 /// is what a reconciler compares against `CasServerRoot`'s liveness/fence machinery before a stalled
 /// `Creating` entry may be CAS-reconciled away (INV-3: "stalled creators occupy entries until

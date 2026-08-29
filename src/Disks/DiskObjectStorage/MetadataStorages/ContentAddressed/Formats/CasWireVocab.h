@@ -29,8 +29,8 @@ inline constexpr EnumWireTable<ObjectKind, 1> kObjectKindWords{{{
     {ObjectKind::Blob, "blob"},
 }}};
 
-/// Convert a token discriminator to its canonical wire word. Throws `CORRUPTED_DATA` if `t` is not
-/// one of the token types understood by this build.
+/// Convert a token discriminator to its canonical wire word. Throws `LOGICAL_ERROR` for an
+/// out-of-range enum value.
 std::string_view tokenTypeToWord(TokenType t);
 
 /// Parse a canonical token-type word. `what` identifies the containing codec or field in the
@@ -42,8 +42,8 @@ TokenType tokenTypeFromWord(std::string_view w, std::string_view what);
 /// `CORRUPTED_DATA` exception.
 BlobHashAlgo blobHashAlgoFromWord(std::string_view w, std::string_view what);
 
-/// Convert an envelope object-kind discriminator to its canonical wire word. Throws
-/// `CORRUPTED_DATA` if `k` is not represented by this format.
+/// Convert an envelope object-kind discriminator to its canonical wire word. Throws `LOGICAL_ERROR`
+/// for an out-of-range enum value.
 std::string_view objectKindToWord(ObjectKind k);
 
 /// Parse a canonical envelope object-kind word. `what` identifies the containing codec or field in
@@ -158,7 +158,7 @@ struct TokenFields
 /// value on a match via `r`, and reports whether it recognized the key. None of them loop over an
 /// object's keys or validate a completed group -- that is the caller's (tolerant-reader loop) and
 /// the collector's `build`/`buildRef` job respectively. Defined inline: a decoder's per-key dispatch
-/// is a hot path and must not gain a function-call boundary here.
+/// is a hot path, so the helpers are header-defined for the per-key dispatch to inline them.
 
 inline bool matchManifestRefFields(std::string_view key, JsonObjectReader & r, const ManifestRefWireKeys & keys, ManifestRefFields & fields)
 {

@@ -61,35 +61,14 @@ Append new items here — quick adds and concurrent-agent findings land in this 
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 
-- PROSE internal-ref sweep (pre-existing): `gtest_cas_ref_catalog.cpp` section comment cites "[codex r2/r3 finding 9]"; `CasRefCatalogFormat.h` cites "(spec §3)" — drop the citations, keep the meaning (comment policy: no internal references). Also `/// Retired-in-snapshot (T4): …` provenance comments in `gtest_cas_gc_leak.cpp`, `gtest_cas_gc_resume.cpp`, `gtest_cas_gc_shard_plan.cpp`, `gtest_cas_gc_attempt.cpp`, `gtest_cas_event_log.cpp`, `gtest_cas_truncate_reclaim.cpp`; and a "Task 8's line-scratch rewrite" provenance comment in `gtest_cas_encoding_pins.cpp`; and "Task-1 review finding M5" / "Stage A task 5 (spec INV-4)" references in `Tools/CasInspect.cpp`.
-
 - PHASE-2 PLAN INPUTS (wire-keys, from the phase-1 final review — fold into `...-cas-wire-keys-phase2-cut.md` when written): (a) constant for the snapshot `lc == "live"` word; (b) Wire-namespace placement rule for NEW codec files — wire namespaces + tables go inside the codec `.cpp`'s anonymous namespace, public delegates in headers; (c) optionally single-site the reader-side `key == "n"` trailer-detection literal (seven readers, one writer `writeTrailerLine` today — framing, not vocabulary); (d) negative fixture for an unknown envelope `op` word; (e) outcomes token-group requiredness flips to both-required WITH its own negative test; (f) phase-1 pins that phase 2 must flip are enumerated per-file in the phase-1 plan's task list.
-- PROSE (wire-keys phase-1, CasTextFormat.h `WireKey`): doc comment overclaims — the raw `writeKey(string_view)` overload still accepts literals until the phase-2 cut; also the string_view-borrow lifetime constraint (the key text must outlive the WireKey) is unstated.
-- PROSE IMPRECISE (wire-keys phase-1, CasEnumWireTableAsserts.h): header comment overclaims `magic_enum` coverage — `enum_values` sees only the reflectable range (default -128..127); note the caveat so a far-valued enumerator is not silently missed by the proof premise.
-- PROSE FALSE sweep (wire-keys phase-1): three toWord delegates still documented as "Throws CORRUPTED_DATA" — `refOwnerKindToWord` (CasRefWireVocab.h, falsified by task 11), `tokenTypeToWord`/`objectKindToWord` (CasWireVocab.h, earlier task) — all throw LOGICAL_ERROR via the table now; sweep the three together.
 - WORDING pass (phase 2): `BindingFields::build`'s message "binding missing bk/rn" names deleted members; group-message texts unify with the cut.
 
-- PROSE (wire-keys phase-1, CasBlobMetaFormat.h): public delegate `metaStateToWireWord` undocumented — sibling `blobHashAlgoName` documents its LOGICAL_ERROR contract; add the same one-liner (surfaces for the CasInspect task's call site).
-
-- PROSE IMPRECISE (wire-keys phase-1, CasWireVocab.h match helpers): "must not gain a function-call boundary" overstates — `inline` is linkage, not an inlining guarantee; intent (header-defined, inlinable at per-key dispatch) is right.
-
-- PROSE (wire-keys phase-1, CasPoolMetaFormat.cpp fence comment): "is exactly the unvalidated input this function must reject cleanly" overstates — no unvalidated byte reaches it today (decoder fromWord-gates first); reword as "validates a raw byte vector, so it must reject cleanly rather than abort".
-- PROSE FALSE (wire-keys phase-1, Pool/CasPoolMeta.cpp createOrValidate): comment claims blobHashAlgoName throws BAD_ARGUMENTS as garbage-cast defense — it throws LOGICAL_ERROR now (aborts debug/sanitizer); same unkeepable-fence shape as the fixed validatePoolAlgosUsed; comment must state programming-error semantics.
 - LATER PHASE (wire-keys, Formats/CasLayout.cpp blobRefFromKey): hand-rolled reimplementation of kBlobHashAlgoWords.fromWord ("one name authority" comment now stale) — replacing is a nullopt→throw posture flip needing a wedge audit of every caller; do not do casually.
-
-- PROSE (wire-keys phase-1, CasWireVocab.h): `tokenTypeToWord`/`objectKindToWord` doc comments still say "Throws CORRUPTED_DATA" — both now throw LOGICAL_ERROR via the table.
-- PROSE (wire-keys phase-1, CasBlobDigest.h): `blobHashLenFor` comment claims it preserves "the fail-closed contract of blobHashAlgoName" — no longer true (BAD_ARGUMENTS vs LOGICAL_ERROR); note 4 functions over BlobHashAlgo now intentionally diverge on the defensive code.
-- PROSE (wire-keys phase-1, CasGc.cpp fold comment): names the wrong function AND code — decoder fail-close is `blobHashAlgoFromWord` → CORRUPTED_DATA, not `blobHashAlgoName` (pre-existing, widened by the taxonomy change).
 
 - PROSE (wire-keys phase-1, CasEnvelopeLimits.h): doc comment claims "read by BOTH validatePoolBlobHeaderLen and the blob-envelope codec" — false until the phase-2 static_assert lands (one reader today); self-heals in phase 2, else reword as purpose.
 - PROSE (wire-keys phase-2 TODO, CasPoolMetaFormat.{h,cpp}): the floor derivation comment is split from the value it derives (and its 214/225 numbers carry the known off-by-one — spec mandates 213/224); phase 2 should move the derivation into CasEnvelopeLimits.h beside the constant and erase the duplicated "240" prose in CasPoolMetaFormat.h.
 
-- PROSE (wire-keys phase-1, gtest_cas_enum_wire_table.cpp `bad_tables`): comment "The two cases
-  above fail the folded density check" has a stale referent count after round-3 asserts — name the
-  cases: "`dup_value` and `invalid_value` fail the folded density check…" (plan copy already fixed).
-- PROSE (wire-keys phase-1, task-2-report.md fix-round-3 self-review): "size comparison … both
-  directions now have a witness" overstates `missing_enumerator` (reaches, doesn't discriminate;
-  only `extra_entry` guards the size line) — keep so nobody deletes `extra_entry` as a duplicate.
 isn't referenced elsewhere first.
 
 The eleven items below are untouched since the 2026-08-04 consolidation-audit findings that produced

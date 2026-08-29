@@ -3,7 +3,8 @@
 /// Compile-time coverage proof for EnumWireTable: SET EQUALITY with the enum's declared values.
 /// Size-plus-uniqueness is not enough (an invalid casted value satisfies both while an enumerator
 /// goes missing). This header pulls in magic_enum and therefore MUST be included only from .cpp
-/// files and tests, never from another header.
+/// files and tests, never from another header. The proof assumes every enumerator is in
+/// magic_enum's reflectable range (by default -128..127), because `enum_values` sees only that range.
 
 #include <magic_enum.hpp>
 

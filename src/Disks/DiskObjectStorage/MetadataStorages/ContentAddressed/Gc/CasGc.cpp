@@ -1194,8 +1194,8 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
             "CAS gc fold: manifest body namespace mismatch at {} (manifestNamespaceMatches fail-closed)", key);
     /// The manifest-wide `blob_hash_len` foreign-width gate is GONE (the field
     /// itself was deleted — entries now carry their own per-entry algo/width). `decodePartManifest`
-    /// already fail-closes on an algo byte this BUILD does not know (`blobHashAlgoName` throws
-    /// CORRUPTED_DATA there) -- but a known algo may still not be ADMITTED to THIS pool yet (a stale
+    /// already fail-closes on an algo byte this BUILD does not know (`blobHashAlgoFromWord` throws
+    /// `CORRUPTED_DATA` there) -- but a known algo may still not be ADMITTED to THIS pool yet (a stale
     /// in-memory `admitted_algos` cache reading a manifest another node already admitted a new algo
     /// for). Per-entry admission validation refreshes on miss BEFORE
     /// failing closed, so a genuinely fresh admission is never mistaken for corruption.

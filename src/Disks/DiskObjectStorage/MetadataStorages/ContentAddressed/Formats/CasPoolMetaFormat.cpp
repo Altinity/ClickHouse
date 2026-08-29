@@ -63,8 +63,7 @@ void validatePoolAlgosUsed(const std::vector<uint8_t> & algos_used, int error_co
     {
         /// A direct membership scan, not `blobHashAlgoName`: that throws `LOGICAL_ERROR`, which
         /// aborts at construction under a sanitizer/debug build before any catch can run, but a
-        /// persisted `algos_used` byte is exactly the unvalidated input this function must reject
-        /// cleanly instead.
+        /// this function validates a raw byte vector, so it must reject cleanly rather than abort.
         bool known = false;
         for (const auto & entry : kBlobHashAlgoWords.entries)
             if (static_cast<uint8_t>(entry.value) == algos_used[i])

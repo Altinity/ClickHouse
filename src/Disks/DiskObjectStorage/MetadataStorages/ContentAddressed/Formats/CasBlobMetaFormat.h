@@ -19,6 +19,8 @@ enum class MetaState : uint8_t
                      /// so a writer may republish it by replacing the body and updating this marker.
 };
 
+/// Convert a meta-state discriminator to its canonical wire word. Throws `LOGICAL_ERROR` for an
+/// out-of-range enum value.
 std::string_view metaStateToWireWord(MetaState state);
 
 /// The durable per-hash meta record. Its text representation consists of a format header followed by

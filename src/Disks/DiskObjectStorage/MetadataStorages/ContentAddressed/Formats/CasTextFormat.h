@@ -142,8 +142,9 @@ inline void writeIntText(uint64_t v, CasJsonWriter & out) { out.u64Number(v); }
 void writeHeaderLine(CasJsonWriter & out, FormatId id);
 void writeTrailerLine(CasJsonWriter & out, uint64_t n);
 
-/// A wire-key carrier. The explicit constructor keeps raw string literals out of writer call
-/// sites: a codec passes its named constant, and an inline `WireKey{"..."}` is deliberately loud.
+/// A wire-key carrier for migrated writer call sites. Its explicit constructor makes a codec pass a
+/// named constant, while an inline `WireKey{"..."}` is deliberately loud. `WireKey` borrows its
+/// `string_view`; the referenced text must outlive the key, as with string literals and static constants.
 struct WireKey
 {
     std::string_view text;

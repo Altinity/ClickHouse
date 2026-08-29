@@ -596,7 +596,7 @@ TEST(CASRefCatalogFormat, RegistryRowIsControlStrictWithRawStorage)
     EXPECT_EQ(traits.compression, CompressionPolicy::Never);
 }
 
-/// ---------- capacity admission: per-predicate boundary tests [codex r2/r3 finding 9] ----------
+/// ---------- capacity admission: per-predicate boundary tests ----------
 
 TEST(CASRefCatalogAdmission, Predicate1AcceptsEqualityRefusesCapPlusOne)
 {

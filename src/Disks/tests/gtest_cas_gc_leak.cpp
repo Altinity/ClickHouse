@@ -47,7 +47,7 @@ PoolPtr openTestPool(std::shared_ptr<InMemoryBackend> & out_backend)
 /// (condemn -> graduate -> delete) is in flight while this is true.
 bool anyRetiredPending(const PoolPtr & s)
 {
-    /// Retired-in-snapshot (T4): condemned state rides the adopted fold seal's RunMarker::Condemned rows, not a
+    /// Condemned state rides the adopted fold seal's RunMarker::Condemned rows, not a
     /// separate retired list — reconstruct the in-flight set from the seal.
     return DB::Cas::tests::anyCondemnedInSeal(s->backend(), s->layout());
 }
