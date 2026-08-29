@@ -388,7 +388,7 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
         .str();
 }
 
-/// The word vocabulary a row's marker byte renders as, matching the `cas_run` NDJSON's own `"m"` field
+/// The word vocabulary a row's marker byte renders as, matching the `cas_run` NDJSON's own `mark` field
 /// words (`runMarkerToWireWord`) so cas-inspect speaks the same vocabulary
 /// as the on-disk format rather than inventing a second one.
 String sourceEdgeRowKindName(RunMarker marker)

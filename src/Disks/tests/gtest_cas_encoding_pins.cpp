@@ -108,14 +108,14 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     writer.finish();
     out.finalize();
 
-    /// The exact "b" rendering (algo byte + digest hex) is pinned as a whole line; the point is
+    /// The exact `ref` rendering (algo byte + digest hex) is pinned as a whole line; the point is
     /// that the line-scratch rendering must reproduce it byte-for-byte.
     const String text = out.str();
     const String header = fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion());
     const String expected_record =
-        "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n";
+        "{\"ref\":\"0100000000000000000000000000000002\",\"src\":\"00000000000000000000000000000005\",\"mark\":\"edge\"}\n";
     const String expected_condemned =
-        "{\"b\":\"0100000000000000000000000000000003\",\"s\":\"00000000000000000000000000000000\",\"m\":\"condemned\",\"pend\":true,\"token_type\":\"etag\",\"token\":\"token\",\"sz\":9,\"cr\":\"7\",\"mc\":true}\n";
+        "{\"ref\":\"0100000000000000000000000000000003\",\"src\":\"00000000000000000000000000000000\",\"mark\":\"condemned\",\"pending\":true,\"token_type\":\"etag\",\"token\":\"token\",\"size\":9,\"condemn_round\":\"7\",\"confirmed\":true}\n";
     const String trailer = "{\"n\":2}\n";
     /// Both records must remain byte-identical to their canonical stored representation.
     const String expected_full = header + expected_record + expected_condemned + trailer;

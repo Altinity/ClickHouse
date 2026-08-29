@@ -22,13 +22,13 @@ namespace
 
 namespace RunWire
 {
-    constexpr WireKey ref{"b"};
-    constexpr WireKey src{"s"};
-    constexpr WireKey mark{"m"};
-    constexpr WireKey pending{"pend"};
-    constexpr WireKey size{"sz"};
-    constexpr WireKey condemn_round{"cr"};
-    constexpr WireKey confirmed{"mc"};
+    constexpr WireKey ref{"ref"};
+    constexpr WireKey src{"src"};
+    constexpr WireKey mark{"mark"};
+    constexpr WireKey pending{"pending"};
+    constexpr WireKey size{"size"};
+    constexpr WireKey condemn_round{"condemn_round"};
+    constexpr WireKey confirmed{"confirmed"};
 }
 
 constexpr EnumWireTable<RunMarker, 3> kRunMarkerWords{{{
@@ -66,8 +66,8 @@ BlobHashAlgo algoFromByte(uint8_t b, std::string_view what)
     }
 }
 
-/// `b` = the algo byte as two lowercase hex chars, then the digest hex at the algo's width. The algo
-/// byte leads so that string-sorting `b` reproduces the binary (algo, digest) byte order.
+/// `ref` = the algo byte as two lowercase hex chars, then the digest hex at the algo's width. The
+/// algo byte leads so that string-sorting `ref` reproduces the binary (algo, digest) byte order.
 String renderB(const BlobRef & ref)
 {
     static constexpr char H[] = "0123456789abcdef";
@@ -265,38 +265,38 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     SourceEdgeRecord out;
     String b;
     TokenFields token_fields;
-    bool have_b = false;
-    bool have_s = false;
-    bool have_m = false;
-    bool have_pend = false;
+    bool have_ref = false;
+    bool have_src = false;
+    bool have_mark = false;
+    bool have_pending = false;
     bool have_tt = false;
     bool have_tv = false;
-    bool have_sz = false;
-    bool have_cr = false;
-    bool have_mc = false;
+    bool have_size = false;
+    bool have_condemn_round = false;
+    bool have_confirmed = false;
     do
     {
-        if (key == RunWire::ref) { b = r.readString(); have_b = true; }
-        else if (key == RunWire::src) { out.source_id = r.readHex128(); have_s = true; }
-        else if (key == RunWire::mark) { out.marker = kRunMarkerWords.fromWord(r.readString(), "CAS cas_run"); have_m = true; }
-        else if (key == RunWire::pending) { out.delete_pending = r.readBool(); have_pend = true; }
+        if (key == RunWire::ref) { b = r.readString(); have_ref = true; }
+        else if (key == RunWire::src) { out.source_id = r.readHex128(); have_src = true; }
+        else if (key == RunWire::mark) { out.marker = kRunMarkerWords.fromWord(r.readString(), "CAS cas_run"); have_mark = true; }
+        else if (key == RunWire::pending) { out.delete_pending = r.readBool(); have_pending = true; }
         else if (matchTokenFields(key, r, token_fields)) { have_tt = token_fields.type_word.has_value(); have_tv = token_fields.value.has_value(); }
-        else if (key == RunWire::size) { out.size = r.readU64Number(); have_sz = true; }
-        else if (key == RunWire::condemn_round) { out.condemn_round = r.readU64String(); have_cr = true; }
-        else if (key == RunWire::confirmed) { out.marker_confirmed = r.readBool(); have_mc = true; }
+        else if (key == RunWire::size) { out.size = r.readU64Number(); have_size = true; }
+        else if (key == RunWire::condemn_round) { out.condemn_round = r.readU64String(); have_condemn_round = true; }
+        else if (key == RunWire::confirmed) { out.marker_confirmed = r.readBool(); have_confirmed = true; }
         else r.skipUnknown(key);   /// Strict => any unknown key is CORRUPTED_DATA
     } while (r.nextKey(key));
 
-    if (!have_b || !have_s || !have_m)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: record missing b/s/m");
+    if (!have_ref || !have_src || !have_mark)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: record missing ref/src/mark");
     out.ref = parseB(b);
     if (out.marker == RunMarker::Condemned)
     {
-        if (!have_pend || !have_tt || !have_tv || !have_sz || !have_cr || !have_mc)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pend/tt/tv/sz/cr/mc");
+        if (!have_pending || !have_tt || !have_tv || !have_size || !have_condemn_round || !have_confirmed)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pending/token_type/token/size/condemn_round/confirmed");
         out.token = Token{*token_fields.value, tokenTypeFromWord(*token_fields.type_word, "cas_run")};
     }
-    else if (have_pend || have_tt || have_tv || have_sz || have_cr || have_mc)
+    else if (have_pending || have_tt || have_tv || have_size || have_condemn_round || have_confirmed)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-condemned record carries condemned fields");
 
     if (!line_in.eof())

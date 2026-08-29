@@ -38,3 +38,35 @@ Gate:
 
 There was no `[  FAILED  ]` line. Deviation: `grep -aE` was needed for the requested gate extraction
 because the test log contains raw NUL output from a binary-payload test.
+
+## Task 11 — `cas_run`
+
+Status: complete.
+
+Inventory covered raw, escaped, and bare quoted forms for `b`, `s`, `m`, `pend`, `sz`, `cr`, and
+`mc`. The worklist entries were the `CasRecordStreamFormat` writer/reader/header, the run battery,
+and the two `SourceEdgeRunLines` encoding-pin rows. Context-overloaded hits in generic JSON tests,
+integration tests, and unrelated CAS codecs were classified and left unchanged; the bare-token
+integration/soak sweep contained no `cas_run` parser or assertion.
+
+Files: `CasRecordStreamFormat.{h,cpp}`, `gtest_cas_record_stream_format.cpp`,
+`gtest_cas_encoding_pins.cpp`, `CasInspect.cpp` comment, and `Formats/README.md`.
+
+Rows now use `ref`, `src`, `mark`, `pending`, `size`, `condemn_round`, and `confirmed`. The `ref`
+value is still the leading algorithm byte followed by digest hex, preserving lexical streaming-merge
+ordering. The `edge`/`zero`/`condemned` words, header `type`/`v`/`kind` with `source_edge`, in-degree
+marker bytes, and condemned requiredness/exclusivity checks are unchanged.
+
+Derived pins: edge and condemned `SourceEdgeRunLines` expectations were updated only for their key
+spelling. Their plaintext equality assertion independently pins the unchanged `ref` rendering,
+source id, marker word, token fields, number/string values, field order, and trailer. Reservation
+and budget tests measure through the real encoder and passed unchanged.
+
+Gate:
+
+```text
+[==========] 2212 tests from 284 test suites ran. (163203 ms total)
+[  PASSED  ] 2212 tests.
+```
+
+There was no `[  FAILED  ]` line. No deviations.

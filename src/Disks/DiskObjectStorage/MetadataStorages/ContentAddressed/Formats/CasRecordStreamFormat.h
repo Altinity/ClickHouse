@@ -63,17 +63,17 @@ inline RunMarker runMarkerFromByte(char byte, std::string_view what)
 ///
 /// File shape:
 ///   {"type":"cas_run","v":3,"kind":"source_edge"}                      header line (type + v + kind gate)
-///   {"b":"01<digest-hex>","s":"<32hex>","m":"edge"}                    an active-edge / zero-marker row
-///   {"b":"01<digest-hex>","s":"00000000000000000000000000000000","m":"condemned","pend":false,"token_type":"etag","token":"...","sz":123,"cr":"7","mc":false}
+///   {"ref":"01<digest-hex>","src":"<32hex>","mark":"edge"}                    an active-edge / zero-marker row
+///   {"ref":"01<digest-hex>","src":"00000000000000000000000000000000","mark":"condemned","pending":false,"token_type":"etag","token":"...","size":123,"condemn_round":"7","confirmed":false}
 ///   {"n":184267}                                                       trailer: record count
 ///
-/// The record key `b` is the algo BYTE as two lowercase hex chars followed by the digest hex at the
-/// algo's width; `s` is the 32-hex source id. String-sorting records by (b, s) reproduces the current
+/// The record key `ref` is the algo BYTE as two lowercase hex chars followed by the digest hex at the
+/// algo's width; `src` is the 32-hex source id. String-sorting records by (`ref`, `src`) reproduces the current
 /// `(algorithm, digest, source_id)` byte order (lowercase hex preserves unsigned byte order and the
 /// algorithm byte is emitted first) — the invariant the fold's two-cursor merge depends on. The row-tag word
-/// `m` maps to the `RunMarker` bytes; a `condemned` row additionally
-/// carries the retired incarnation (`pend`/`token_type`/`token`/`sz`/`cr`) and the durable condemn-marker
-/// confirmation bit (`mc`).
+/// `mark` maps to the `RunMarker` bytes; a `condemned` row additionally
+/// carries the retired incarnation (`pending`/`token_type`/`token`/`size`/`condemn_round`) and the durable condemn-marker
+/// confirmation bit (`confirmed`).
 
 /// One decoded source-edge row. All fields are identifier-layer types so the codec stays backend-free.
 /// The condemned-only fields (`delete_pending`/`token`/`size`/`condemn_round`/`marker_confirmed`) are

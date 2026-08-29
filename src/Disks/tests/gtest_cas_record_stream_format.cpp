@@ -76,7 +76,7 @@ TEST(CASFormatBattery, RunFile)
         [&] { return sealObject(FormatId::RunFile, encodeRun(records)); },
         [](std::string_view s) { decodeRun(std::string(openObject(FormatId::RunFile, s))); },
         fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion()) +
-        "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n"
+        "{\"ref\":\"0100000000000000000000000000000002\",\"src\":\"00000000000000000000000000000005\",\"mark\":\"edge\"}\n"
         "{\"n\":1}\n"});
 }
 
@@ -173,9 +173,9 @@ TEST(CASRecordStream, SourceIdRendersAs32Hex)
 {
     const String bytes = encodeRun({edge(chRef(1), 10)});
     /// The source id 10 is a 32-char lowercase hex string ending in 'a'.
-    EXPECT_NE(bytes.find("\"s\":\"0000000000000000000000000000000a\""), String::npos);
-    /// The record key `b` for a ch128 ref is the algo byte 01 + a 32-hex digest (34 chars total).
-    EXPECT_NE(bytes.find("\"b\":\"01"), String::npos);
+    EXPECT_NE(bytes.find("\"src\":\"0000000000000000000000000000000a\""), String::npos);
+    /// The record key `ref` for a ch128 ref is the algo byte 01 + a 32-hex digest (34 chars total).
+    EXPECT_NE(bytes.find("\"ref\":\"01"), String::npos);
 }
 
 TEST(CASRecordStream, SealChecksumMismatchFailsClosed)

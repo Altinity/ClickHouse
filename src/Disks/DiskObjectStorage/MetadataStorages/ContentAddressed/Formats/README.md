@@ -30,7 +30,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | `gc/maintenance_state` | leak-only namespace-janitor cursor (`janitor_cursor`) | `CasGcMaintenanceStateFormat` | future janitor |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log | `CasGcOutcomesFormat` (`.zst`) | GC |
 | `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic) | `CasFoldSealFormat` | GC |
-| `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs | `CasRecordStreamFormat` | GC |
+| `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs (`ref`, `src`, `mark`; condemned: `pending`, `size`, `condemn_round`, `confirmed`) | `CasRecordStreamFormat` | GC |
 | `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons (`server_uuid`, optional `retired_at_ms`; `next_writer_epoch`; `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`, `expires_at_ms`, `min_active_build_sequence`, `gc_fenced`, `write_attempt_id`) | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 
