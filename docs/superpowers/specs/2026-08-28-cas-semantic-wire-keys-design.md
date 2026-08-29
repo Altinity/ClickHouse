@@ -649,6 +649,9 @@ unchanged apart from the `class` word, which the `ref_life` row counts separatel
 
 | Repeated record | Increase |
 |---|---:|
+| `cas_ref_log` `owner_transition` op row | 50 bytes — the largest row cost of the change, both binding groups renamed at once |
+| `cas_ref_log` `set_published_at` op row | 18 bytes |
+| `cas_ref_log` body-less op rows (`namespace_birth`, `remove_namespace`, `epoch_seal`) | 0 bytes — the row is the `op` key alone, and `op` does not move |
 | active `cas_run` row | 7 bytes |
 | condemned `cas_run` row | 41 bytes |
 | blob `PartManifest` entry | 15 bytes |
@@ -662,6 +665,12 @@ unchanged apart from the `class` word, which the `ref_life` row counts separatel
 | cleanup-evidence `ref_life` additions | 16 bytes |
 | `blob_run` fold-seal row | 25 bytes |
 | `condemned` fold-seal summary row | 30 bytes |
+
+Every row above is pinned by a test that encodes the record through the real encoder and measures it
+against the pre-cut row held as a literal, so this table is checkable rather than merely asserted.
+The `cas_blob_meta` object grows 16 bytes; it is listed nowhere above because it is one object per
+blob rather than a repeated row, and the same is true of the other singletons, whose growth is paid
+once per object.
 
 These are accepted readability costs. Exact-member-name alternatives are rejected because they add
 another tens of bytes per row, particularly for `source_id`, `delete_pending`,

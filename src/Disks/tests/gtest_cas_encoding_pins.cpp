@@ -38,11 +38,15 @@ CasFoldSeal oneFoldSeal()
 }
 }
 
-/// These literals pin the CANONICAL BYTES of the CAS text encoders as of the commit that
-/// introduced this file. The CasJsonWriter migration (2026-07-20 spec) must keep every one of
-/// them green UNMODIFIED: canonical text is byte-compared on retries and deterministic adoption,
-/// and the incremental ref budget counters assume these exact sizes. Never edit an expected
-/// string here to make a test pass — that means the encoder's bytes drifted, which is the bug.
+/// The `CASEncodingPins` literals below pin the CANONICAL BYTES of the CAS text encoders: canonical
+/// text is byte-compared on retries and deterministic adoption, and the incremental ref budget
+/// counters assume these exact sizes. Never edit one of those expected strings to make a test pass —
+/// that means the encoder's bytes drifted, which is the bug.
+///
+/// The `CASWireCutDeltas` literals are the opposite kind: each is a HISTORICAL pre-cut row, kept so
+/// the cost of the semantic-key rename stays measurable against what it replaced. They are
+/// deliberately not the current bytes and must never be refreshed toward them — a delta measured
+/// against today's encoder on both sides would always be zero.
 
 TEST(CASEncodingPins, RefLogTxnAllOpKinds)
 {
@@ -212,6 +216,58 @@ TEST(CASWireCutDeltas, GcOutcomesRow)
     expectDelta(old_bytes, lineAt(encodeOutcomeLog(log), 1), 26);
 }
 
+/// The ref-log's own op rows: the highest-cardinality record of the format and, for
+/// `owner_transition`, the largest single-row cost of the whole cut -- both old-side groups and both
+/// new-side groups are renamed at once.
+TEST(CASWireCutDeltas, OwnerTransitionRefLogOpRow)
+{
+    RefLogTxn txn;
+    txn.ns = "root";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "r", ManifestRef{3, 4, 5}};
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "r", ManifestRef{3, 4, 5}};
+    txn.ops.push_back(op);
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"op\":\"owner_transition\",\"obk\":\"precommit\",\"orn\":\"r\",\"ome\":\"3\",\"omb\":\"4\",\"omo\":5,"
+                             "\"nbk\":\"committed\",\"nrn\":\"r\",\"nme\":\"3\",\"nmb\":\"4\",\"nmo\":5}\n";
+    expectDelta(old_bytes, lineAt(encodeRefLogTxn(txn), 2), 50);
+}
+
+TEST(CASWireCutDeltas, SetPublishedAtRefLogOpRow)
+{
+    RefLogTxn txn;
+    txn.ns = "root";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPublishedAt;
+    op.ref_name = "r";
+    op.expected_manifest_ref = ManifestRef{3, 4, 5};
+    op.published_at_ms = 6;
+    txn.ops.push_back(op);
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"op\":\"set_published_at\",\"rn\":\"r\",\"me\":\"3\",\"mb\":\"4\",\"mo\":5,\"ts\":6}\n";
+    expectDelta(old_bytes, lineAt(encodeRefLogTxn(txn), 2), 18);
+}
+
+/// The body-less ops are the cut's only free rows: the record is the `op` key alone, and `op` did not
+/// move. Pinned so "free" stays a measurement rather than an assumption.
+TEST(CASWireCutDeltas, BodylessRefLogOpRowsAreUnchanged)
+{
+    for (const RefOpKind kind : {RefOpKind::NamespaceBirth, RefOpKind::EpochSeal})
+    {
+        RefLogTxn txn;
+        txn.ns = "root";
+        txn.txn_id = RefTxnId{1, 1};
+        RefOp op;
+        op.kind = kind;
+        txn.ops.push_back(op);
+        const String old_bytes = fmt::format("{{\"op\":\"{}\"}}\n", refOpKindToWireWord(kind));
+        expectDelta(old_bytes, lineAt(encodeRefLogTxn(txn), 2), 0);
+    }
+}
+
 TEST(CASWireCutDeltas, CommittedRefSnapshotRow)
 {
     RefTableSnapshot snapshot;
@@ -242,16 +298,30 @@ TEST(CASWireCutDeltas, BaseRefCatalogRow)
     expectDelta(old_bytes, lineAt(encodeRefCatalog(catalog), 1), 9);
 }
 
+/// The base row's delta is 22 bytes of keys and tags plus the `class` word, which costs one byte more
+/// than its length (quotes, less the single numeric digit it replaces). Each word is measured
+/// separately: a range over all four would accept a key rename hiding inside the spread, and a single
+/// fixture would pin only one point of it. `clamped` cannot be a base row at all -- the grammar
+/// requires a hold on exactly those rows -- so it is measured whole and its base part recovered by
+/// subtracting the hold segment the next test pins.
 TEST(CASWireCutDeltas, BaseRefLifeFoldSealRow)
 {
-    CasFoldSeal seal = oneFoldSeal();
-    seal.ref_lives[UInt128(1)].coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{7, 11}};
-    /// This literal is the pre-cut baseline this delta is measured against.
-    const String old_bytes = "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\"}\n";
-    const String new_bytes = lineAt(encodeFoldSeal(seal), 2);
-    const size_t delta = new_bytes.size() - old_bytes.size();
-    EXPECT_GE(delta, 29u);
-    EXPECT_LE(delta, 32u);
+    const auto base_delta = [](CoverageClass classification, uint8_t old_wire_value)
+    {
+        CasFoldSeal seal = oneFoldSeal();
+        seal.ref_lives[UInt128(1)].coverage
+            = RefCoverage{.classification = classification, .last_folded_ref_id = RefTxnId{7, 11}};
+        /// This literal is the pre-cut baseline this delta is measured against.
+        const String old_bytes = fmt::format(
+            "{{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":{},\"lfe\":\"7\",\"lfs\":\"11\"}}\n",
+            old_wire_value);
+        return lineAt(encodeFoldSeal(seal), 2).size() - old_bytes.size();
+    };
+
+    /// The pre-cut wire numbered these 0/1/2, not the current enum's values.
+    EXPECT_EQ(base_delta(CoverageClass::Absent, 0), 29u);      /// 22 + "absent"
+    EXPECT_EQ(base_delta(CoverageClass::Unchanged, 1), 32u);   /// 22 + "unchanged"
+    EXPECT_EQ(base_delta(CoverageClass::Folded, 2), 29u);      /// 22 + "folded"
 }
 
 /// The ADDITIONS a hold contributes, isolated from the row it rides on. The with/without trick used
