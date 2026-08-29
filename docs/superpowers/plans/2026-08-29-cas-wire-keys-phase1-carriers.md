@@ -248,12 +248,51 @@ TEST(CASEnumWireTable, RoundTripsEveryEntryBothWays)
         EXPECT_EQ(grades.fromWord(grades.toWord(e.value, "grades"), "grades"), e.value);
 }
 
-TEST(CASEnumWireTable, FailsClosedBothWays)
+TEST(CASEnumWireTable, FromWordFailsClosed)
 {
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { fruits.fromWord("banana", "fruits"); });
+}
+
+/// `LOGICAL_ERROR` aborts the process in debug/sanitizer builds (`handle_error_code`), so the
+/// defensive toWord branch needs the death-test split this test directory already uses (see
+/// `gtest_cas_gc_state_format.cpp`'s `RejectsZeroGcShardsOnEncode` pair) — a bare EXPECT_THROW
+/// would SIGABRT the whole gate binary on those lanes.
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASEnumWireTableDeathTest, ToWordAbortsOnOutOfRangeValue)
+{
+    EXPECT_DEATH(fruits.toWord(static_cast<Fruit>(99), "fruits"), "outside the wire vocabulary");
+}
+#else
+TEST(CASEnumWireTable, ToWordThrowsLogicalErrorOnOutOfRangeValue)
+{
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { fruits.toWord(static_cast<Fruit>(99), "fruits"); });
+}
+#endif
+
+/// The compile-time proofs must also be exercised in the direction where they can fail — a
+/// predicate rewritten to `return true;` must break this file. All three are constexpr, so the
+/// negative cases are plain static_asserts over deliberately bad tables:
+namespace bad_tables
+{
+
+enum class Sparse : uint8_t { A = 0, B = 2 };
+constexpr EnumWireTable<Sparse, 2> sparse{{{{Sparse::A, "a"}, {Sparse::B, "b"}}}};
+static_assert(!sparse.denseAndOrdered());
+
+constexpr EnumWireTable<Fruit, 3> dup_words{{{
+    {Fruit::Apple, "apple"}, {Fruit::Pear, "apple"}, {Fruit::Plum, "plum"}}}};
+static_assert(!dup_words.wordsUnique());
+
+constexpr EnumWireTable<Fruit, 3> dup_value{{{
+    {Fruit::Apple, "apple"}, {Fruit::Apple, "pear"}, {Fruit::Plum, "plum"}}}};
+static_assert(!casEnumTableCoversEnum<dup_value, Fruit>());
+
+constexpr EnumWireTable<Fruit, 3> invalid_value{{{
+    {Fruit::Apple, "apple"}, {Fruit::Pear, "pear"}, {static_cast<Fruit>(99), "plum"}}}};
+static_assert(!casEnumTableCoversEnum<invalid_value, Fruit>());
+
 }
 ```
 
@@ -355,6 +394,10 @@ namespace DB::Cas
 template <const auto & Table, typename Enum>
 consteval bool casEnumTableCoversEnum()
 {
+    /// One assert per table carries all three obligations: a table author cannot forget density
+    /// or word uniqueness, because coverage subsumes them.
+    if (!Table.denseAndOrdered() || !Table.wordsUnique())
+        return false;
     constexpr auto declared = magic_enum::enum_values<Enum>();
     if (declared.size() != Table.entries.size())
         return false;
@@ -481,7 +524,7 @@ inline constexpr EnumWireTable<BlobHashAlgo, 3> kBlobHashAlgoWords{{{
 }}};
 ```
 
-Adjust enumerator spellings to the real declarations. In `CasWireVocab.cpp`, add `#include .../CasEnumWireTableAsserts.h` and the assert triples (`denseAndOrdered`, `wordsUnique`, `casEnumTableCoversEnum`) for `kTokenTypeWords`/`kObjectKindWords`; rewrite `tokenTypeToWord`/`tokenTypeFromWord`/`objectKindToWord`/`objectKindFromWord`/`blobHashAlgoFromWord` as one-line delegates preserving their exact signatures and `what`-style error context. In `CasBlobDigest.cpp`, add the `kBlobHashAlgoWords` assert triple and make `blobHashAlgoName` return `kBlobHashAlgoWords.toWord(algo, "blobHashAlgoName")` — apply Step 6 of Task 2 if a test pins its old `BAD_ARGUMENTS` defensive branch. Do NOT touch `blobHashAlgoFromConfigValue`-style config parsing (`cityhash128`/`xxh3-128` spellings): the configuration vocabulary is a separate contract and stays where it is.
+Adjust enumerator spellings to the real declarations. In `CasWireVocab.cpp`, add `#include .../CasEnumWireTableAsserts.h` and the coverage asserts (`denseAndOrdered`, `wordsUnique`, `casEnumTableCoversEnum`) for `kTokenTypeWords`/`kObjectKindWords`; rewrite `tokenTypeToWord`/`tokenTypeFromWord`/`objectKindToWord`/`objectKindFromWord`/`blobHashAlgoFromWord` as one-line delegates preserving their exact signatures and `what`-style error context. In `CasBlobDigest.cpp`, add the `kBlobHashAlgoWords` coverage assert and make `blobHashAlgoName` return `kBlobHashAlgoWords.toWord(algo, "blobHashAlgoName")` — apply Step 6 of Task 2 if a test pins its old `BAD_ARGUMENTS` defensive branch. Do NOT touch `blobHashAlgoFromConfigValue`-style config parsing (`cityhash128`/`xxh3-128` spellings): the configuration vocabulary is a separate contract and stays where it is.
 
 - [ ] **Step 3: Build + full gate green** — every golden byte-identical. Log `$BUILD/test_cas_task4.log`.
 
@@ -652,7 +695,7 @@ constexpr EnumWireTable<MetaState, 2> kMetaStateWords{{{
 }}};
 ```
 
-Copy the true `MetaState` enumerators from the file (`metaStateToWord` switch); add the assert triple with `CasEnumWireTableAsserts.h`; delete `metaStateToWord`/`metaStateFromWord` and route both directions through the table (preserving each direction's error message per the existing corruption tests). Because the old functions were file-local and Task 19 needs the word, declare ONE public narrow delegate in `CasBlobMetaFormat.h` — `std::string_view metaStateToWireWord(MetaState state);` — implemented as the table call; the table itself stays private to the `.cpp`. (Every codec task below whose vocabulary `CasInspect` renders adds the same kind of `<enum>ToWireWord` delegate; each task names its own.)
+Copy the true `MetaState` enumerators from the file (`metaStateToWord` switch); add the coverage assert with `CasEnumWireTableAsserts.h`; delete `metaStateToWord`/`metaStateFromWord` and route both directions through the table (preserving each direction's error message per the existing corruption tests). Because the old functions were file-local and Task 19 needs the word, declare ONE public narrow delegate in `CasBlobMetaFormat.h` — `std::string_view metaStateToWireWord(MetaState state);` — implemented as the table call; the table itself stays private to the `.cpp`. (Every codec task below whose vocabulary `CasInspect` renders adds the same kind of `<enum>ToWireWord` delegate; each task names its own.)
 
 - [ ] **Step 3: Migrate the writer** — the three `writeKey`+value pairs become:
 
@@ -821,7 +864,7 @@ constexpr EnumWireTable<ProvenanceOp, 6> kProvenanceOpWords{{{
 (Bundle member names already carry phase-2 semantics: `build` holds `"bld"`, `time_ms` holds `"ts"`, and so on.)
 
 - [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
-- [ ] **Step 2:** Add the table + assert triple; delete `opToWord`/`opFromWord`, routing encode through `kProvenanceOpWords.toWord(op, "CAS blob envelope")` and decode through `fromWord` — the decode message today is `CAS blob envelope: unknown operation '{}'` with `CORRUPTED_DATA`; keep code and check no test pins the exact text (apply Task 2 Step 6 if the encode branch is pinned). Declare the public narrow delegate `std::string_view provenanceOpToWireWord(ProvenanceOp op);` in `CasBlobEnvelopeFormat.h` (table stays private) — Task 19 consumes it.
+- [ ] **Step 2:** Add the table + coverage assert; delete `opToWord`/`opFromWord`, routing encode through `kProvenanceOpWords.toWord(op, "CAS blob envelope")` and decode through `fromWord` — the decode message today is `CAS blob envelope: unknown operation '{}'` with `CORRUPTED_DATA`; keep code and check no test pins the exact text (apply Task 2 Step 6 if the encode branch is pinned). Declare the public narrow delegate `std::string_view provenanceOpToWireWord(ProvenanceOp op);` in `CasBlobEnvelopeFormat.h` (table stays private) — Task 19 consumes it.
 - [ ] **Step 3:** Migrate `encodeEnvelopeHeader`'s field writes onto the constants (the `writeKey(buf, "...", first)` calls take `EnvelopeWire::…`). The truncated-`ref` writer (`writeEnvelopeRefField`, its escaper, and the `,\"ref\":` budget arithmetic) is CODEC-OWNED per the spec — do not convert it to field helpers; only its key spelling may read from `EnvelopeWire::ref.text`. Migrate `decodeEnvelopeHeader`'s key comparisons to the constants. The test-only `"!x"` literal stays a literal.
 - [ ] **Step 4: Build + full gate green.** Log `$BUILD/test_cas_task10.log`. **Commit:** `git commit -m "cas: blob envelope onto WireKey constants and the ProvenanceOp table"`.
 
@@ -1026,7 +1069,7 @@ inline RunMarker runMarkerFromByte(char byte, std::string_view what)
 }
 ```
 
-`SourceEdgeRecord::marker` becomes `RunMarker`; every site found by the grep uses `runMarkerByte` to store a raw byte and `runMarkerFromByte` to read one — only a value that passed `runMarkerFromByte` may reach `kRunMarkerWords`. Add a negative test: an in-degree payload with an unknown marker byte (e.g. `0x03`) is rejected with `CORRUPTED_DATA` (place it next to the existing decode-corruption tests of the payload it corrupts). `markerToWord`/`markerFromWord` → `kRunMarkerWords` delegates (+ assert triple; `magic_enum` handles a `char`-based enum), plus the public narrow delegate `runMarkerToWireWord` in `CasRecordStreamFormat.h` for Task 19.
+`SourceEdgeRecord::marker` becomes `RunMarker`; every site found by the grep uses `runMarkerByte` to store a raw byte and `runMarkerFromByte` to read one — only a value that passed `runMarkerFromByte` may reach `kRunMarkerWords`. Add a negative test: an in-degree payload with an unknown marker byte (e.g. `0x03`) is rejected with `CORRUPTED_DATA` (place it next to the existing decode-corruption tests of the payload it corrupts). `markerToWord`/`markerFromWord` → `kRunMarkerWords` delegates (+ coverage assert; `magic_enum` handles a `char`-based enum), plus the public narrow delegate `runMarkerToWireWord` in `CasRecordStreamFormat.h` for Task 19.
 - [ ] **Step 3: Member rename** `RunRef::generation` → `RunRef::key_generation` (declaration in `CasFoldSealFormat.h`; update every `.generation` use of `RunRef` — the wire key `"gen"` stays untouched, it is written in `CasFoldSealFormat.cpp` and migrates in Task 17).
 - [ ] **Step 4:** Writer/reader onto the constants; `matchTokenFields` adopted for `tt`/`tv` with the LOCAL condemned-row requiredness check kept exactly as is (`have_tt`, `have_tv` sextet logic — phase 2 owns any unification); the condemned/active variant exclusivity checks untouched. The header line writer keeps its literal `"type"`/`"v"`/`"kind"` framing (framing is `CasTextFormat`'s, not this plan's).
 - [ ] **Step 5: Build + full gate green** (`CASEncodingPins.SourceEdgeRunLines` byte-identical proves the enum swap changed nothing on the wire). Log `$BUILD/test_cas_task16.log`. **Commit:** `git commit -m "cas: run codec onto carriers; RunMarker typed enum; RunRef::key_generation"`.
@@ -1064,7 +1107,7 @@ namespace FoldSealWire
 }
 ```
 
-Record tags: `constexpr std::string_view kRefLifeTag = "rfl"; kBlobRunTag = "btr"; kCondemnedTag = "cnd";`. HoldReason table (words from `holdReasonToWord` — `gap_below_witness`, `unconsumed_seal_crossing`, `witness_disappeared`, `body_undecodable`, `manifest_body_missing`, `checkpoint_undecodable`; copy true enumerators, add assert triple). The numeric `cls` value stays a number in phase 1 (`CoverageClass` words are phase 2).
+Record tags: `constexpr std::string_view kRefLifeTag = "rfl"; kBlobRunTag = "btr"; kCondemnedTag = "cnd";`. HoldReason table (words from `holdReasonToWord` — `gap_below_witness`, `unconsumed_seal_crossing`, `witness_disappeared`, `body_undecodable`, `manifest_body_missing`, `checkpoint_undecodable`; copy true enumerators, add coverage assert). The numeric `cls` value stays a number in phase 1 (`CoverageClass` words are phase 2).
 
 - [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 - [ ] **Step 2:** Writers (`writeRun`, the `rfl` block, the `cnd` block, the meta line) onto constants/helpers (note `RunRef::key_generation` from Task 16 feeds the `"gen"` key here); Strict readers onto constants — the closed-set `cls` validation, hold grammar (iff classification 4), cleanup-evidence rules, shard totals, and every message untouched.
