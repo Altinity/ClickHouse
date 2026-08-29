@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnvelopeLimits.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
@@ -33,7 +34,6 @@ namespace DB::Cas
 /// that used to mask this is gone). We floor at 240 (a multiple of 8 comfortably above 225, leaving
 /// >= 15 bytes for the diagnostic ref even at type maxima, and well under the 256 default) so a
 /// misconfigured pool fails at CREATION with BAD_ARGUMENTS, not at first write with LOGICAL_ERROR.
-static constexpr uint64_t kMinBlobHeaderLen = 240;
 
 void validatePoolBlobHeaderLen(uint64_t blob_header_len, int error_code, std::string_view what)
 {
