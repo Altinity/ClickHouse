@@ -566,7 +566,7 @@ TEST(CASRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CASRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts)
 {
-    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "unknown ns state"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
+    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "outside the wire vocabulary"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
 }
 #endif
 

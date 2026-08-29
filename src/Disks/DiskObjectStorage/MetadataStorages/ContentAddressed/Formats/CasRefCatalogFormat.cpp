@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <limits>
@@ -20,30 +21,30 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-std::string_view nsStateToWord(NsState s)
-{
-    switch (s)
-    {
-        case NsState::Creating: return "creating";
-        case NsState::Live:     return "live";
-        case NsState::Removing: return "removing";
-    }
-    /// Every value reaching here came from a live `NsState` or from `nsStateFromWord`, which already
-    /// validated it on decode -- so this is a bug in THIS process, not corruption arriving from a
-    /// store.
-    throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS ref catalog: unknown ns state {}", static_cast<int>(s));
-}
-
-NsState nsStateFromWord(std::string_view w)
-{
-    if (w == "creating") return NsState::Creating;
-    if (w == "live")     return NsState::Live;
-    if (w == "removing") return NsState::Removing;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ns state '{}'", w);
-}
-
 namespace
 {
+
+namespace RefCatalogWire
+{
+    constexpr WireKey kind{"k"};
+    constexpr WireKey ns{"ns"};
+    constexpr WireKey state{"st"};
+    constexpr WireKey life{"inc"};
+    constexpr WireKey remove_round{"rsr"};
+    constexpr WireKey creator{"csr"};
+    constexpr WireKey creator_epoch{"cwe"};
+    constexpr WireKey creator_fence{"cfg"};
+}
+
+constexpr std::string_view kEntryTag = "ent";
+
+constexpr EnumWireTable<NsState, 3> kNsStateWords{{{
+    {NsState::Creating, "creating"},
+    {NsState::Live, "live"},
+    {NsState::Removing, "removing"},
+}}};
+
+static_assert(casEnumTableCoversEnum<kNsStateWords, NsState>());
 
 /// `creator` is required iff `state == Creating`, forbidden otherwise -- one predicate, used by both
 /// directions of the codec, so the writer's self-check and the reader's fail-close can never disagree.
@@ -68,6 +69,23 @@ bool isCanonicalCatalogOrder(const std::vector<CatalogEntry> & entries)
     return true;
 }
 
+}
+
+std::string_view nsStateToWord(NsState s)
+{
+    return kNsStateWords.toWord(s, "CAS ref catalog");
+}
+
+NsState nsStateFromWord(std::string_view w)
+{
+    try
+    {
+        return kNsStateWords.fromWord(w, "CAS ref catalog");
+    }
+    catch (const Exception &)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ns state '{}'", w);
+    }
 }
 
 String encodeRefCatalog(const RefCatalog & catalog)
@@ -136,19 +154,19 @@ String encodeRefCatalog(const RefCatalog & catalog)
                 e.ns.string(), nsStateToWord(e.state), e.removal_started_round ? "carries" : "lacks");
 
         bool first = true;
-        writeKey(out, "k", first);   writeStringValue(out, "ent");
-        writeKey(out, "ns", first);  writeStringValue(out, e.ns.string());
-        writeKey(out, "st", first);  writeStringValue(out, nsStateToWord(e.state));
-        writeKey(out, "inc", first); writeHex128Value(out, e.incarnation);
+        writeKey(out, RefCatalogWire::kind, first);  writeStringValue(out, kEntryTag);
+        writeKey(out, RefCatalogWire::ns, first);    writeStringValue(out, e.ns.string());
+        writeKey(out, RefCatalogWire::state, first); writeStringValue(out, nsStateToWord(e.state));
+        writeKey(out, RefCatalogWire::life, first);  writeHex128Value(out, e.incarnation);
         if (e.removal_started_round)
         {
-            writeKey(out, "rsr", first); writeU64StringValue(out, *e.removal_started_round);
+            writeKey(out, RefCatalogWire::remove_round, first); writeU64StringValue(out, *e.removal_started_round);
         }
         if (e.creator)
         {
-            writeKey(out, "csr", first); writeStringValue(out, e.creator->server_root_id);
-            writeKey(out, "cwe", first); writeU64StringValue(out, e.creator->writer_epoch);
-            writeKey(out, "cfg", first); writeU64StringValue(out, e.creator->fence_generation);
+            writeKey(out, RefCatalogWire::creator, first); writeStringValue(out, e.creator->server_root_id);
+            writeKey(out, RefCatalogWire::creator_epoch, first); writeU64StringValue(out, e.creator->writer_epoch);
+            writeKey(out, RefCatalogWire::creator_fence, first); writeU64StringValue(out, e.creator->fence_generation);
         }
         closeObject(out, first);
         closeLine("ent");
@@ -190,10 +208,10 @@ RefCatalog decodeRefCatalog(std::string_view data)
                     "CAS ref catalog: trailer count {} != {} records", n, seen);
             return catalog;
         }
-        if (key != "k")
+        if (key != RefCatalogWire::kind)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: record must start with \"k\"");
         const String kind = r.readString();
-        if (kind != "ent")
+        if (kind != kEntryTag)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown record kind '{}'", kind);
 
         String ns_str;
@@ -205,13 +223,13 @@ RefCatalog decodeRefCatalog(std::string_view data)
         std::optional<uint64_t> removal_started_round;
         while (r.nextKey(key))
         {
-            if (key == "ns") ns_str = r.readString();
-            else if (key == "st") st_word = r.readString();
-            else if (key == "inc") inc = r.readHex128();
-            else if (key == "csr") csr = r.readString();
-            else if (key == "cwe") cwe = r.readU64String();
-            else if (key == "cfg") cfg = r.readU64String();
-            else if (key == "rsr") removal_started_round = r.readU64String();
+            if (key == RefCatalogWire::ns) ns_str = r.readString();
+            else if (key == RefCatalogWire::state) st_word = r.readString();
+            else if (key == RefCatalogWire::life) inc = r.readHex128();
+            else if (key == RefCatalogWire::creator) csr = r.readString();
+            else if (key == RefCatalogWire::creator_epoch) cwe = r.readU64String();
+            else if (key == RefCatalogWire::creator_fence) cfg = r.readU64String();
+            else if (key == RefCatalogWire::remove_round) removal_started_round = r.readU64String();
             else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ent key '{}'", key);
         }
         if (!l.eof())

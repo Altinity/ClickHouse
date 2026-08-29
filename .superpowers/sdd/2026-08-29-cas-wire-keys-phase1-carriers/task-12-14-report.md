@@ -15,3 +15,11 @@
 - Gate: build PASS; `2199 tests from 284 test suites ran`; `2199 tests` passed, `0` failed.
 - Updated test expectations (old → new): none.
 - Deviations: none.
+
+## Task 14 — `cas_ref_catalog` + `NsState` table
+
+- Status: PASS
+- Files: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.cpp`; `src/Disks/tests/gtest_cas_ref_catalog.cpp`; this report.
+- Gate: build PASS; `2199 tests from 284 test suites ran`; `2199 tests` passed, `0` failed.
+- Updated test expectations (old → new): `CASRefCatalogFormatDeathTest.NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts`: `unknown ns state` → `outside the wire vocabulary` (sanctioned unreachable encoder branch).
+- Deviations: none.
