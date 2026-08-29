@@ -40,7 +40,7 @@ TEST(CASFormatBattery, BlobMeta)
         .encode = [&] { return sealObject(FormatId::BlobMeta, encodeBlobMeta(m)); },
         .decode = [](std::string_view s) { decodeBlobMeta(std::string(openObject(FormatId::BlobMeta, s))); },
         .golden = "{\"type\":\"cas_blob_meta\",\"v\":1}\n"
-                  "{\"st\":\"clean\",\"cr\":\"0\",\"sz\":\"12345\"}\n"});
+                  "{\"state\":\"clean\",\"condemn_round\":\"0\",\"size\":\"12345\"}\n"});
 }
 
 TEST(CASBlobMetaFormat, CondemnedRoundTripAllFields)
@@ -54,7 +54,7 @@ TEST(CASBlobMetaFormat, CondemnedRoundTripAllFields)
     EXPECT_EQ(back.condemn_round, 7u);
     EXPECT_EQ(back.size, 4096u);
     EXPECT_EQ(encodeBlobMeta(m),
-        "{\"type\":\"cas_blob_meta\",\"v\":1}\n{\"st\":\"condemned\",\"cr\":\"7\",\"sz\":\"4096\"}\n");
+        "{\"type\":\"cas_blob_meta\",\"v\":1}\n{\"state\":\"condemned\",\"condemn_round\":\"7\",\"size\":\"4096\"}\n");
 }
 
 TEST(CASBlobMetaFormat, FailsClosedOnUnknownStateAndTruncation)
@@ -62,10 +62,10 @@ TEST(CASBlobMetaFormat, FailsClosedOnUnknownStateAndTruncation)
     /// Unknown state word -> CORRUPTED_DATA (mirrors the old `state > Condemned` reject).
     /// `v:1` is the baseline generation, so it always passes the header gate -- the BODY is what has
     /// to fail here.
-    const String bad_state = "{\"type\":\"cas_blob_meta\",\"v\":1}\n{\"st\":\"zombie\",\"cr\":\"0\",\"sz\":\"0\"}\n";
+    const String bad_state = "{\"type\":\"cas_blob_meta\",\"v\":1}\n{\"state\":\"zombie\",\"condemn_round\":\"0\",\"size\":\"0\"}\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeBlobMeta(bad_state); });
     /// Missing state key -> CORRUPTED_DATA.
-    const String no_state = "{\"type\":\"cas_blob_meta\",\"v\":1}\n{\"cr\":\"0\",\"sz\":\"0\"}\n";
+    const String no_state = "{\"type\":\"cas_blob_meta\",\"v\":1}\n{\"condemn_round\":\"0\",\"size\":\"0\"}\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeBlobMeta(no_state); });
     /// Truncated (header only) -> CORRUPTED_DATA.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeBlobMeta("{\"type\":\"cas_blob_meta\",\"v\":1}\n"); });

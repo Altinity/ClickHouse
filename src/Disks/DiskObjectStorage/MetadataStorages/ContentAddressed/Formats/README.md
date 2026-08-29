@@ -25,7 +25,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | `cas/ns/state/<life_id>/_files/…​` | namespace-owned raw files | — | upper layers |
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest | `CasPartManifestFormat` | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat` | uploads |
-| blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar | `CasBlobMetaFormat` | dedup/GC |
+| blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |
 | `gc/state`, `gc/hb` | GC state / leader heartbeat | `CasGcStateFormat` | GC |
 | `gc/maintenance_state` | leak-only namespace-janitor cursor | `CasGcMaintenanceStateFormat` | future janitor |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log | `CasGcOutcomesFormat` (`.zst`) | GC |

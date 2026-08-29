@@ -20,9 +20,9 @@ namespace
 
 namespace BlobMetaWire
 {
-    constexpr WireKey state{"st"};
-    constexpr WireKey condemn_round{"cr"};
-    constexpr WireKey size{"sz"};
+    constexpr WireKey state{"state"};
+    constexpr WireKey condemn_round{"condemn_round"};
+    constexpr WireKey size{"size"};
 }
 
 constexpr EnumWireTable<MetaState, 2> kMetaStateWords{{{
@@ -82,7 +82,7 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
             r.skipUnknown(key);
     }
     if (!saw_state)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: missing st");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: missing state");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: trailing bytes");
     return m;
