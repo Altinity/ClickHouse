@@ -145,8 +145,8 @@ struct BlobRefFields
     BlobRef build(std::string_view what) const;
 };
 
-/// Collector for one `Token`'s two flat fields (`token_type`/`token`), filled in by `matchTokenFields`. Phase 1
-/// deliberately has no `build`: callers keep their own local requiredness checks until the unified
+/// Collector for one `Token`'s two flat fields (`token_type`/`token`), filled in by `matchTokenFields`. It
+/// deliberately has no `build` yet: callers keep their own local requiredness checks until the unified
 /// both-required build is introduced.
 struct TokenFields
 {

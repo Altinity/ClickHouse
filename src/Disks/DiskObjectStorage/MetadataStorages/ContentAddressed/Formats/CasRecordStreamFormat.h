@@ -72,7 +72,7 @@ inline RunMarker runMarkerFromByte(char byte, std::string_view what)
 /// `(algorithm, digest, source_id)` byte order (lowercase hex preserves unsigned byte order and the
 /// algorithm byte is emitted first) — the invariant the fold's two-cursor merge depends on. The row-tag word
 /// `m` maps to the `RunMarker` bytes; a `condemned` row additionally
-/// carries the retired incarnation (`pend`/`tt`/`tv`/`sz`/`cr`) and the durable condemn-marker
+/// carries the retired incarnation (`pend`/`token_type`/`token`/`sz`/`cr`) and the durable condemn-marker
 /// confirmation bit (`mc`).
 
 /// One decoded source-edge row. All fields are identifier-layer types so the codec stays backend-free.

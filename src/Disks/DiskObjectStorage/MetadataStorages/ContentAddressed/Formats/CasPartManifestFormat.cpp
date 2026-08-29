@@ -48,7 +48,7 @@ void writeEntryRecord(CasJsonWriter & out, const ManifestEntry & e)
     writeWordField(out, PartManifestWire::place, entryPlacementToWireWord(e.placement), first);
     if (e.placement == EntryPlacement::Blob)
     {
-        writeBlobRefFields(out, first, e.ref);   /// ha + h
+        writeBlobRefFields(out, first, e.ref);   /// algo + digest
         writeNumberField(out, PartManifestWire::size, e.blob_size, first);
     }
     else
@@ -99,7 +99,7 @@ String encodePartManifest(const PartManifest & m)
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::PartManifest);
 
-    /// descriptor meta line: ManifestRef (me/mb/mo, shared rendering with refsnaplog) + root
+    /// descriptor meta line: ManifestRef (epoch/build/ord, shared rendering with refsnaplog) + root
     /// namespace + payload digest.
     {
         bool first = true;

@@ -188,7 +188,7 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
     if (rec.marker == RunMarker::Condemned)
     {
         writeBoolField(scratch, RunWire::pending, rec.delete_pending, first);
-        writeTokenFields(scratch, first, rec.token);   /// tt + tv
+        writeTokenFields(scratch, first, rec.token);   /// token_type + token
         writeNumberField(scratch, RunWire::size, rec.size, first);
         writeU64StringField(scratch, RunWire::condemn_round, rec.condemn_round, first);
         writeBoolField(scratch, RunWire::confirmed, rec.marker_confirmed, first);

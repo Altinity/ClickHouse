@@ -54,8 +54,8 @@ String encodeOutcomeLog(const OutcomeLog & log)
     {
         bool first = true;
         writeStringField(out, GcOutcomesWire::kind, objectKindToWord(e.kind), first);
-        writeBlobRefFields(out, first, e.ref);   /// ha + h
-        writeTokenFields(out, first, e.token);   /// tt + tv
+        writeBlobRefFields(out, first, e.ref);   /// algo + digest
+        writeTokenFields(out, first, e.token);   /// token_type + token
         writeStringField(out, GcOutcomesWire::outcome, outcomeKindToWireWord(e.outcome), first);
         closeObject(out, first);
         writeChar('\n', out);
