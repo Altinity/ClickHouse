@@ -67,11 +67,11 @@ TEST(CASFormatBattery, PartManifest)
     /// stays self-consistent with whatever sample() produces, now that decode verifies payload_digest.
     const String golden =
         currentFormatHeader("cas_part_manifest") +
-        "{\"epoch\":\"5\",\"build\":\"15\",\"ord\":1,\"ns\":\"00/aa@cas@\",\"pd\":\"" + u128ToHex(m.payload_digest) + "\"}\n" // NOLINT(modernize-raw-string-literal): mixes '\"' quoting with '\n' line endings across this concatenated literal; a raw string can't hold the newline as-is.
-        "{\"p\":\"a/b.bin\",\"pm\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\",\"sz\":4096}\n"
-        "{\"p\":\"c/small.txt\",\"pm\":\"inline\",\"il\":12}\n"
+        "{\"epoch\":\"5\",\"build\":\"15\",\"ord\":1,\"root_namespace\":\"00/aa@cas@\",\"payload_digest\":\"" + u128ToHex(m.payload_digest) + "\"}\n" // NOLINT(modernize-raw-string-literal): mixes '\"' quoting with '\n' line endings across this concatenated literal; a raw string can't hold the newline as-is.
+        "{\"path\":\"a/b.bin\",\"place\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\",\"size\":4096}\n"
+        "{\"path\":\"c/small.txt\",\"place\":\"inline\",\"size\":12}\n"
         "{\"n\":2}\n"
-        "==> \"c/small.txt\" il=12 <==\n"
+        "==> \"c/small.txt\" size=12 <==\n"
         "hello world!\n";
     runFormatBattery({FormatId::PartManifest,
         [&] { return sealObject(FormatId::PartManifest, encodePartManifest(m)); },
@@ -115,15 +115,58 @@ TEST(CASPartManifestFormat, EmptyEntriesRoundTrips)
 TEST(CASPartManifestFormat, PlacementWordsRenderAndRejectUnknown)
 {
     const String text = encodePartManifest(sample());
-    EXPECT_NE(text.find("\"pm\":\"blob\""), String::npos);
-    EXPECT_NE(text.find("\"pm\":\"inline\""), String::npos);
+    EXPECT_NE(text.find("\"place\":\"blob\""), String::npos);
+    EXPECT_NE(text.find("\"place\":\"inline\""), String::npos);
 
     /// An unknown placement word fails closed.
     String bad = text;
-    const size_t pos = bad.find(R"("pm":"blob")");
+    const size_t pos = bad.find(R"("place":"blob")");
     ASSERT_NE(pos, String::npos);
-    bad.replace(pos, String(R"("pm":"blob")").size(), R"("pm":"bogus")");
+    bad.replace(pos, String(R"("place":"blob")").size(), R"("place":"bogus")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
+}
+
+TEST(CASPartManifestFormat, SizeBeforePlaceIsAcceptedForBothPlacements)
+{
+    String blob_first = encodePartManifest(sample());
+    const String blob_record = R"("place":"blob","algo":"ch128","digest":"00112233445566778899aabbccddeeff","size":4096)";
+    const size_t blob_pos = blob_first.find(blob_record);
+    ASSERT_NE(blob_pos, String::npos);
+    blob_first.replace(blob_pos, blob_record.size(),
+        R"("size":4096,"place":"blob","algo":"ch128","digest":"00112233445566778899aabbccddeeff")");
+    EXPECT_EQ(decodePartManifest(blob_first).entries[0].blob_size, 4096u);
+
+    String inline_first = encodePartManifest(sample());
+    const String inline_record = R"("place":"inline","size":12)";
+    const size_t inline_pos = inline_first.find(inline_record);
+    ASSERT_NE(inline_pos, String::npos);
+    inline_first.replace(inline_pos, inline_record.size(), R"("size":12,"place":"inline")");
+    EXPECT_EQ(decodePartManifest(inline_first).entries[1].inline_bytes, "hello world!");
+}
+
+TEST(CASPartManifestFormat, MissingSizeIsRejectedForBothPlacements)
+{
+    String blob_missing_size = encodePartManifest(sample());
+    const size_t blob_pos = blob_missing_size.find(",\"size\":4096");
+    ASSERT_NE(blob_pos, String::npos);
+    blob_missing_size.erase(blob_pos, String(",\"size\":4096").size());
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(blob_missing_size); });
+
+    String inline_missing_size = encodePartManifest(sample());
+    const size_t inline_pos = inline_missing_size.find(",\"size\":12");
+    ASSERT_NE(inline_pos, String::npos);
+    inline_missing_size.erase(inline_pos, String(",\"size\":12").size());
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(inline_missing_size); });
+}
+
+TEST(CASPartManifestFormat, DuplicateSizeIsRejected)
+{
+    String text = encodePartManifest(sample());
+    const String size = R"("size":4096)";
+    const size_t pos = text.find(size);
+    ASSERT_NE(pos, String::npos);
+    text.replace(pos, size.size(), R"("size":1,"size":4096)");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(text); });
 }
 
 /// Proves the payload zone, not JSON-string escaping: an Inline entry whose bytes contain an
@@ -198,7 +241,7 @@ TEST(CASPartManifestFormat, InlineBannerCarriesTheEscapedPath)
     m.entries = {e};
     m.payload_digest = computePayloadDigest(m);
 
-    EXPECT_NE(encodePartManifest(m).find("==> \"p\\nq.proj/c.txt\" il=1 <=="), String::npos);
+    EXPECT_NE(encodePartManifest(m).find("==> \"p\\nq.proj/c.txt\" size=1 <=="), String::npos);
 }
 
 TEST(CASPartManifestFormat, ByteDeterminism)
@@ -322,8 +365,8 @@ TEST(CASPartManifestFormat, DecodeRejectsOutOfOrderEntries)
     m.payload_digest = computePayloadDigest(m);
 
     const String text = encodePartManifest(m);
-    const size_t pos_a = text.find(R"("p":"a/one.bin")");
-    const size_t pos_b = text.find(R"("p":"b/two.bin")");
+    const size_t pos_a = text.find(R"("path":"a/one.bin")");
+    const size_t pos_b = text.find(R"("path":"b/two.bin")");
     ASSERT_NE(pos_a, String::npos);
     ASSERT_NE(pos_b, String::npos);
 
@@ -366,10 +409,10 @@ TEST(CASPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
     m.payload_digest = computePayloadDigest(m);
 
     String forged = encodePartManifest(m);
-    const String needle = R"("p":"ccc/three.bin")";
+    const String needle = R"("path":"ccc/three.bin")";
     const size_t pos = forged.find(needle);
     ASSERT_NE(pos, String::npos);
-    forged.replace(pos, needle.size(), R"("p":"aaa/one.bin")");
+    forged.replace(pos, needle.size(), R"("path":"aaa/one.bin")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(forged); });
 }
@@ -429,18 +472,18 @@ TEST(CASPartManifestFormat, TrailingByteAfterPayloadZoneFailsClosed)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 
-/// An Inline entry's record "il" disagrees with what the payload zone's banner+bytes actually
-/// declare (the banner and bytes are left as originally written; only the record line's "il" is
-/// edited). The record's declared `il` is what decode uses both to build the expected banner text
+/// An Inline entry's record `size` disagrees with what the payload zone's banner+bytes actually
+/// declare (the banner and bytes are left as originally written; only the record line's `size` is
+/// edited). The record's declared `size` is what decode uses both to build the expected banner text
 /// and to know how many bytes to read from the zone, so this must fail closed rather than silently
 /// reading the wrong byte count.
-TEST(CASPartManifestFormat, InlineRecordIlMismatchWithPayloadZoneBannerFailsClosed)
+TEST(CASPartManifestFormat, InlineRecordSizeMismatchWithPayloadZoneBannerFailsClosed)
 {
     String bad = encodePartManifest(sample());
-    const String needle = "\"il\":12";
+    const String needle = "\"size\":12";
     const size_t pos = bad.find(needle);
     ASSERT_NE(pos, String::npos);
-    bad.replace(pos, needle.size(), "\"il\":13");
+    bad.replace(pos, needle.size(), "\"size\":13");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 

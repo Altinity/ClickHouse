@@ -16,13 +16,13 @@ namespace DB::Cas
 ///
 ///   header line                 {"type":"cas_part_manifest","v":N}
 ///   descriptor meta line         {"epoch","build","ord"} (the ManifestRef, shared rendering with
-///                                refsnaplog, `CasWireVocab.h`) + "ns" (root namespace) + "pd"
+///                                refsnaplog, `CasWireVocab.h`) + `root_namespace` + `payload_digest`
 ///                                (payload digest, 32 lowercase hex)
-///   one entry-record line each   {"p":path,"pm":placement-word, then either the Blob's
-///                                {"algo","digest","sz"} or the Inline's {"il"}}, in canonical path order
+///   one entry-record line each   {"path":path,"place":placement-word, then either the Blob's
+///                                {"algo","digest","size"} or the Inline's {"size"}}, in canonical path order
 ///   trailer line                 {"n":entry-count}
 ///   PAYLOAD ZONE (raw, follows the trailer): for each Inline entry, in path order, a
-///                                `head -v`-style banner line `==> "<escaped path>" il=<n> <==\n`, then
+///                                `head -v`-style banner line `==> "<escaped path>" size=<n> <==\n`, then
 ///                                exactly `n` raw bytes, then `\n`. The path uses the same writer as
 ///                                the entry-record line, so decode can rebuild the banner byte-wise.
 ///                                Blob entries carry no

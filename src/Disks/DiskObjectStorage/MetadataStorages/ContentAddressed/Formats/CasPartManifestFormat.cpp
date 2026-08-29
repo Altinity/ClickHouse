@@ -25,12 +25,11 @@ namespace
 
 namespace PartManifestWire
 {
-    constexpr WireKey ns{"ns"};
-    constexpr WireKey payload_digest{"pd"};
-    constexpr WireKey path{"p"};
-    constexpr WireKey place{"pm"};
-    constexpr WireKey size{"sz"};
-    constexpr WireKey inline_size{"il"};
+    constexpr WireKey ns{"root_namespace"};
+    constexpr WireKey payload_digest{"payload_digest"};
+    constexpr WireKey path{"path"};
+    constexpr WireKey place{"place"};
+    constexpr WireKey size{"size"};
 }
 
 constexpr EnumWireTable<EntryPlacement, 2> kEntryPlacementWords{{{
@@ -40,7 +39,8 @@ constexpr EnumWireTable<EntryPlacement, 2> kEntryPlacementWords{{{
 
 static_assert(casEnumTableCoversEnum<kEntryPlacementWords, EntryPlacement>());
 
-/// One entry-record line: {"p","pm", then either the Blob's "algo"/"digest"/"sz" or the Inline's "il"}.
+/// One entry-record line: `path`/`place`, followed by either `algo`/`digest`/`size` for a Blob or
+/// `size` for Inline bytes.
 void writeEntryRecord(CasJsonWriter & out, const ManifestEntry & e)
 {
     bool first = true;
@@ -53,7 +53,7 @@ void writeEntryRecord(CasJsonWriter & out, const ManifestEntry & e)
     }
     else
     {
-        writeNumberField(out, PartManifestWire::inline_size, e.inline_bytes.size(), first);
+        writeNumberField(out, PartManifestWire::size, e.inline_bytes.size(), first);
     }
     closeObject(out, first);
     writeChar('\n', out);
@@ -69,7 +69,7 @@ String bannerFor(std::string_view path, uint64_t n)
     CasJsonWriter w(path.size() + 32);
     w.append("==> ");
     w.stringValue(path);
-    w.append(" il=");
+    w.append(" size=");
     w.u64Number(n);
     w.append(" <==");
     return std::move(w).take();
@@ -156,9 +156,9 @@ PartManifest decodePartManifest(std::string_view data)
             else r.skipUnknown(key);
         }
         if (!ns)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing ns");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing root_namespace");
         if (!pd)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing pd");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing payload_digest");
         m.ref = fields.buildRef("PartManifest", "descriptor");
         m.root_namespace_id = RootNamespace(*ns);
         m.payload_digest = *pd;
@@ -166,7 +166,7 @@ PartManifest decodePartManifest(std::string_view data)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: junk after descriptor line");
     }
 
-    /// entry record lines, until the trailer. Inline entries remember their declared `il` length so
+    /// entry record lines, until the trailer. Inline entries remember their declared `size` so
     /// the payload zone below can read exactly that many raw bytes back into `inline_bytes`.
     /// Index-aligned with `m.entries` (Blob entries push an unused 0 placeholder).
     std::vector<uint64_t> inline_lens;
@@ -194,7 +194,7 @@ PartManifest decodePartManifest(std::string_view data)
         }
 
         if (key != PartManifestWire::path)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"p\"");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"path\"");
         ManifestEntry e;
         e.path = r.readString();
 
@@ -214,38 +214,36 @@ PartManifest decodePartManifest(std::string_view data)
 
         std::optional<String> pm;
         BlobRefFields blob_ref;
-        std::optional<uint64_t> sz;
-        std::optional<uint64_t> il;
+        std::optional<uint64_t> size;
         while (r.nextKey(key))
         {
             if (key == PartManifestWire::place) pm = r.readString();
             else if (matchBlobRefFields(key, r, blob_ref)) {}
-            else if (key == PartManifestWire::size) sz = r.readU64Number();
-            else if (key == PartManifestWire::inline_size) il = r.readU64Number();
+            else if (key == PartManifestWire::size) size = r.readU64Number();
             else r.skipUnknown(key);
         }
         if (!l.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: junk after record");
         if (!pm)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: entry '{}' missing pm", e.path);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: entry '{}' missing place", e.path);
         e.placement = kEntryPlacementWords.fromWord(*pm, "PartManifest");
 
         if (e.placement == EntryPlacement::Blob)
         {
-            if (!sz)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: blob entry '{}' missing sz", e.path);
+            if (!size)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: blob entry '{}' missing size", e.path);
             blob_ref_what.assign("PartManifest entry '");
             blob_ref_what += e.path;
             blob_ref_what += '\'';
             e.ref = blob_ref.build(blob_ref_what);
-            e.blob_size = *sz;
+            e.blob_size = *size;
             inline_lens.push_back(0);   /// unused for Blob; keeps inline_lens index-aligned with entries
         }
         else
         {
-            if (!il)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: inline entry '{}' missing il", e.path);
-            inline_lens.push_back(*il);   /// bytes filled from the payload zone below
+            if (!size)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: inline entry '{}' missing size", e.path);
+            inline_lens.push_back(*size);   /// bytes filled from the payload zone below
         }
 
         /// Canonical ascending-order and no-duplicate-path enforcement: compare only against the
@@ -263,7 +261,7 @@ PartManifest decodePartManifest(std::string_view data)
     }
 
     /// payload zone: for each Inline entry, in the same order it appeared above, a banner line then
-    /// exactly `il` raw bytes then a terminating '\n'.
+    /// exactly `size` raw bytes then a terminating '\n'.
     for (size_t i = 0; i < m.entries.size(); ++i)
     {
         if (m.entries[i].placement != EntryPlacement::Inline)
