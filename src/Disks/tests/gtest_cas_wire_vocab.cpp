@@ -9,11 +9,12 @@ using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
 
-namespace DB::Cas::tests
+namespace
 {
 /// Same tiny inline copy as `gtest_cas_part_manifest_format.cpp`'s `expectThrowsCode`: stays clear
-/// of `Disks/tests/cas_test_helpers.h`, which would drag in the whole CAS backend/store machinery
-/// this file otherwise has no need for.
+/// of `Disks/tests/cas_test_helpers.h`'s `DB::Cas::tests::expectThrowsCode`, which would both drag
+/// in the whole CAS backend/store machinery this file otherwise has no need for AND collide (same
+/// namespace, same name and signature) if that header were ever included here too.
 template <typename F>
 void expectThrowsCode(int expected_code, F && fn)
 {
@@ -122,10 +123,70 @@ TEST(CASWireVocab, BlobRefBuildFailsClosedOnHalfAGroupAndOnBadWidth)
     using namespace DB::Cas;
     BlobRefFields only_algo;
     only_algo.algo_word = "ch128";
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { only_algo.build("t"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { only_algo.build("t"); });
 
     BlobRefFields short_digest;
     short_digest.algo_word = "ch128";
     short_digest.digest_hex = "00112233445566778899aabbccddee";   /// 30 hex chars, needs 32
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { short_digest.build("t"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { short_digest.build("t"); });
+}
+
+TEST(CASWireVocab, BlobRefBuildFailsClosedOnRightWidthNonHexDigest)
+{
+    using namespace DB::Cas;
+    BlobRefFields bad_hex;
+    bad_hex.algo_word = "ch128";
+    bad_hex.digest_hex = "gg112233445566778899aabbccddeeff";   /// 32 chars (right width), not hex
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { bad_hex.build("t"); });
+}
+
+TEST(CASWireVocab, MatchManifestRefFieldsAndBuildRefRoundTripInAnyKeyOrder)
+{
+    using namespace DB::Cas;
+    /// Fed out of writer order (mo, me, mb) to pin key-order independence. `me`/`mb` are quoted
+    /// decimal strings and `mo` is a bare number -- a swapped read primitive between the two shapes
+    /// would fail to parse this literal.
+    const String rendered = R"({"mo":3,"me":"7","mb":"9"})";
+    DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
+    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    ManifestRefFields fields;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (matchManifestRefFields(key, r, kBareManifestRefKeys, fields))
+            continue;
+        r.skipUnknown(key);
+    }
+    EXPECT_EQ(fields.buildRef("t", "ctx"), (ManifestRef{7, 9, 3}));
+}
+
+TEST(CASWireVocab, ManifestRefFieldsBuildRefFailsClosedOnHalfAGroup)
+{
+    using namespace DB::Cas;
+    ManifestRefFields fields;
+    fields.epoch = 7;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { fields.buildRef("t", "ctx"); });
+}
+
+TEST(CASWireVocab, MatchTokenFieldsConsumesTtTvAndLeavesUnrelatedKeyUnmatched)
+{
+    using namespace DB::Cas;
+    const String rendered = R"({"tt":"etag","tv":"abc","zz":1})";
+    DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
+    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    TokenFields fields;
+    String key;
+    bool saw_unmatched = false;
+    while (r.nextKey(key))
+    {
+        if (matchTokenFields(key, r, fields))
+            continue;
+        saw_unmatched = true;
+        r.skipUnknown(key);
+    }
+    ASSERT_TRUE(fields.type_word.has_value());
+    EXPECT_EQ(*fields.type_word, "etag");
+    ASSERT_TRUE(fields.value.has_value());
+    EXPECT_EQ(*fields.value, "abc");
+    EXPECT_TRUE(saw_unmatched);
 }

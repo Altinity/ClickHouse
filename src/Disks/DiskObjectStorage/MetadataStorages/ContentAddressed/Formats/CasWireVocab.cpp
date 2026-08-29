@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
+#include <base/hex.h>
+#include <algorithm>
 
 namespace DB
 {
@@ -45,17 +47,17 @@ ObjectKind objectKindFromWord(std::string_view w, std::string_view what)
 
 void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t)
 {
-    writeKey(out, "tt", first);
+    writeKey(out, SharedWire::token_type, first);
     writeStringValue(out, tokenTypeToWord(t.type));
-    writeKey(out, "tv", first);
+    writeKey(out, SharedWire::token, first);
     writeStringValue(out, t.value);
 }
 
 void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r)
 {
-    writeKey(out, "ha", first);
+    writeKey(out, SharedWire::algo, first);
     writeStringValue(out, blobHashAlgoName(r.algo));
-    writeKey(out, "h", first);
+    writeKey(out, SharedWire::digest, first);
     writeStringValue(out, codecFor(r.algo).toHex(r.digest));
 }
 
@@ -104,6 +106,12 @@ BlobRef BlobRefFields::build(std::string_view what) const
     if (digest_hex->size() != expected_hex_len)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS {}: digest hex width {} does not match algo width {}", what, digest_hex->size(), expected_hex_len);
+    /// Same fence, same reason as the width check above: a right-width but non-lowercase-hex digest
+    /// must also surface as CORRUPTED_DATA rather than `DigestCodec::fromHex`'s BAD_ARGUMENTS. Mirrors
+    /// `JsonObjectReader::readHex128`'s lowercase-hex predicate.
+    if (std::any_of(digest_hex->begin(), digest_hex->end(),
+            [](char c) { return unhex(c) == 0xff || (c >= 'A' && c <= 'F'); }))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: digest is not lowercase hex, got '{}'", what, *digest_hex);
     return BlobRef{algo, codecFor(algo).fromHex(*digest_hex)};
 }
 
