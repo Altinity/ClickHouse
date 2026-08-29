@@ -192,8 +192,7 @@ UInt128 JsonObjectReader::readHex128()
     return guarded([&]
     {
         const String hex = readString();
-        if (hex.size() != 32
-            || std::any_of(hex.begin(), hex.end(), [](char c) { return unhex(c) == 0xff || (c >= 'A' && c <= 'F'); }))
+        if (hex.size() != 32 || std::any_of(hex.begin(), hex.end(), [](char c) { return !isLowercaseHexChar(c); }))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: expected 32 lowercase hex chars, got '{}'", what, hex);
         return unhexUInt<UInt128>(hex.data());
     });

@@ -194,6 +194,13 @@ inline void writeBoolField(CasJsonWriter & out, WireKey key, bool value, bool & 
     writeBoolValue(out, value);
 }
 
+/// True iff `c` is one lowercase hexadecimal digit. Persisted CAS digests deliberately reject
+/// uppercase spellings so each digest has one canonical textual representation.
+constexpr bool isLowercaseHexChar(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+}
+
 /// Pull cursor over one canonical JSON object.
 ///
 /// The reader borrows the input buffer and records the object name for exception messages. It

@@ -42,6 +42,9 @@ enum class EntryPlacement : uint8_t
     Blob = 2,     /// bytes stored as a content-addressed blob at `blobKey`
 };
 
+/// Canonical wire word for one manifest entry placement.
+std::string_view entryPlacementToWireWord(EntryPlacement placement);
+
 /// One file entry inside a part manifest. `ref` is meaningful only for `Blob`; `inline_bytes` only
 /// for `Inline`. `blob_size` is the raw `Blob` byte count (0 for `Inline` — decode never fills it for
 /// an inline entry, since the wire format carries no redundant size for inline bytes). Use `size()`

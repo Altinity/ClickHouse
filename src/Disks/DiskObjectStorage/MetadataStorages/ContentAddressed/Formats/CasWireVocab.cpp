@@ -109,8 +109,7 @@ BlobRef BlobRefFields::build(std::string_view what) const
     /// Same fence, same reason as the width check above: a right-width but non-lowercase-hex digest
     /// must also surface as CORRUPTED_DATA rather than `DigestCodec::fromHex`'s BAD_ARGUMENTS. Mirrors
     /// `JsonObjectReader::readHex128`'s lowercase-hex predicate.
-    if (std::any_of(digest_hex->begin(), digest_hex->end(),
-            [](char c) { return unhex(c) == 0xff || (c >= 'A' && c <= 'F'); }))
+    if (std::any_of(digest_hex->begin(), digest_hex->end(), [](char c) { return !isLowercaseHexChar(c); }))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: digest is not lowercase hex, got '{}'", what, *digest_hex);
     return BlobRef{algo, codecFor(algo).fromHex(*digest_hex)};
 }
