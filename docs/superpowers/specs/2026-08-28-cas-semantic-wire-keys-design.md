@@ -669,7 +669,15 @@ Implementation verification records before/after encode and decode throughput an
 second for representative large `cas_run`, `RefSnapshot`, `PartManifest`, `FoldSeal` (with a
 realistic distribution of `ref_life` row variants), and `RefCatalog` inputs, together with the
 maximum record count under each object cap before and after, and — for `.zst` formats — the stored
-bytes alongside the decompressed bytes. These measurements are review evidence,
+bytes alongside the decompressed bytes. The throughput half has an existing harness:
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp`
+(Google Benchmark, built with `-DENABLE_BENCHMARKS=ON`) already measures the paths the longer keys
+touch — `BM_EncodeRefLogTxn`, `BM_SnapshotEncode`, `BM_ApplyRefLogTxn`, `BM_ReplayHistory`, and
+`BM_FlushInstall`. Both sides of the comparison are run back to back on one machine, the BEFORE side
+from a worktree at the commit preceding the cut, because the baseline table in that file's header
+predates this design and cannot serve as the before. Formats the harness does not cover
+(`PartManifest`, `FoldSeal`, `RefCatalog`, and raw `cas_run` streaming) are measured by extending it
+rather than by a second harness. These measurements are review evidence,
 not a timing assertion in CI. Exact encoded-byte deltas and boundary sizes are pinned in deterministic
 unit tests. The dominant performance risk of the whole change is the longer keys themselves — extra
 bytes written, compressed, decompressed, and key-compared — which these measurements cover; the enum
@@ -884,8 +892,9 @@ changes in one place.
    `min_active_build_sequence` together with its wire key — the fifth member rename tracks the cut,
    not the audit.
 3. **Proof and measurement.** Cross-check the constexpr worst case against the real encoder, run
-   the byte-delta and throughput measurements, and sweep the raw assertions in integration tests
-   and `utils/ca-soak`.
+   the byte-delta and throughput measurements — the throughput half through the existing
+   `benchmark_cas_ref_protocol` harness, both sides back to back on one machine — and sweep the raw
+   assertions in integration tests and `utils/ca-soak`.
 
 ## Test strategy {#test-strategy}
 
@@ -1074,7 +1083,9 @@ The change is complete when:
 - raw assertions in integration tests and `utils/ca-soak` use the new spellings;
 - `Formats/README.md`, codec comments, the `CasPoolMetaFormat.cpp` worst-case table, and the
   backlog no longer claim a universal 2–5-character or exact-full-member-name convention;
-- local before/after measurements report the decompressed and (for `.zst` formats) stored bytes,
+- local before/after measurements — the throughput half run through `benchmark_cas_ref_protocol`,
+  both sides back to back on one machine with the BEFORE side built from a pre-cut worktree —
+  report the decompressed and (for `.zst` formats) stored bytes,
   encode/decode throughput, records per second, and the maximum record count under each cap for
   `cas_run`, `RefSnapshot`, `PartManifest`, `FoldSeal` with realistic row-variant distributions,
   and `RefCatalog`; the generated assembly of the hot `toWord` instances and of the hot match

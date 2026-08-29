@@ -408,7 +408,8 @@ The dead-spelling vocabulary, used by every inventory below:
   Anything outside the legal classes is an unflipped spelling: fix and re-gate.
 - [ ] **Step 3: Golden vocabulary audit.** Per format (17): every key and tag in its goldens matches the spec tables; headers stamp `v:1`. One-line verdict per format in the report.
 - [ ] **Step 4: Canonical-example cross-check.** The spec's canonical examples (`cas_run` rows, three `ref_life` variants, catalog entry) match what the real encoders produce for those field sets (modulo illustrative `…` values). Discrepancies are defects in code or spec — surface them.
-- [ ] **Step 5:** Commit anything outstanding. Report wording: **"phase 2 complete; full revision-14 acceptance pending phase 3"** (measurements, hot `toWord`/match-helper assembly review, and integration + ca-soak EXECUTION are phase 3).
+- [ ] **Step 5: Throughput before/after (phase-3 evidence, produced here).** The measurements belong to phase 3, but the run is scheduled at THIS boundary because the BEFORE side must be built from a worktree at `65ec8688cdb` (the commit preceding Task 1) and both sides must run back to back on one machine. Build `benchmark_cas_ref_protocol` (`-DENABLE_BENCHMARKS=ON`) on both sides and run at least `BM_EncodeRefLogTxn`, `BM_SnapshotEncode`, `BM_ApplyRefLogTxn`, `BM_ReplayHistory`, `BM_FlushInstall`; keep both raw outputs plus a delta table under the workspace, and carry them into the phase-3 plan. The harness's in-file baseline table predates this design and is NOT the before. If the target fails to build on either side, that is a finding, not a skip.
+- [ ] **Step 6:** Commit anything outstanding. Report wording: **"phase 2 complete; full revision-14 acceptance pending phase 3"** (measurements, hot `toWord`/match-helper assembly review, and integration + ca-soak EXECUTION are phase 3).
 
 ---
 
