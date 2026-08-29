@@ -110,18 +110,14 @@ PoolMeta decodePoolMeta(std::string_view data)
     ReadBufferFromMemory in(data.data(), data.size());
     const TextHeader header = expectHeaderLine(in, FormatId::PoolMeta);
 
-    /// An older pool predates a breaking ref-layer change this build cannot reconcile, so
-    /// reject it before reading the metadata body. Writers always emit the current generation, while
-    /// `expectHeaderLine` separately rejects a future generation that this build cannot understand.
-    /// Generation 10 is the latest recreate-only authority floor and rejects old pools before any
-    /// mount lease body lacking its durable write-attempt identity can be interpreted.
-    if (header.v < kMountWriteAttemptIdGeneration)
+    /// The format-generation baseline is 1; a header below it cannot have been written by any build
+    /// this codec understands. `expectHeaderLine` above already rejects the symmetric FUTURE case
+    /// (`v > G_BUILD`); reject the backward case here, before the metadata body is read.
+    if (header.v < 1)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool format {} predates generation-10 mount-attempt-identity floor; recreate the pool. "
-            "This build requires the durable mount write attempt identity "
-            "in the generation-10 format "
-            "(generation {}+), and CAS is pre-release: there is no in-place migration.",
-            header.v, kMountWriteAttemptIdGeneration);
+            "CAS pool format {} predates the format-generation baseline; recreate the pool "
+            "(CAS is pre-release, so there is no in-place migration)",
+            header.v);
 
     const String body = readLine(in, traitsFor(FormatId::PoolMeta).line_cap, "pool meta");
     ReadBufferFromMemory body_in(body.data(), body.size());

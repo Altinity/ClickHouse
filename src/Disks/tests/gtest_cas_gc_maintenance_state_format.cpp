@@ -41,8 +41,8 @@ TEST(CASGCMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
     EXPECT_EQ(static_cast<uint16_t>(FormatId::GcMaintenanceState), 25);
     const auto points = changePoints(FormatId::GcMaintenanceState);
     ASSERT_EQ(points.size(), 1u);
-    EXPECT_EQ(points[0].generation, 7);
-    EXPECT_EQ(points[0].min_reader, 7);
+    EXPECT_EQ(points[0].generation, 1);
+    EXPECT_EQ(points[0].min_reader, 1);
     const FormatTraits & traits = traitsFor(FormatId::GcMaintenanceState);
     EXPECT_EQ(traits.type, "cas_gc_maintenance_state");
     EXPECT_EQ(traits.family, TextFamily::Control);
@@ -69,7 +69,7 @@ TEST(CASGCMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
 {
     const auto bad = [](std::string_view body)
     {
-        return "{\"type\":\"cas_gc_maintenance_state\",\"v\":7}\n" + String(body);
+        return "{\"type\":\"cas_gc_maintenance_state\",\"v\":1}\n" + String(body);
     };
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeGcMaintenanceState(bad("{}\n")); });
@@ -85,10 +85,10 @@ TEST(CASGCMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
     const GcMaintenanceState over_limit{.janitor_cursor = String(kMaxGcMaintenanceCursorBytes + 1, 'x')};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED,
         [&] { (void)encodeGcMaintenanceState(over_limit); });
-    const String raw = "{\"type\":\"cas_gc_maintenance_state\",\"v\":7}\n{\"cur\":\"" + over_limit.janitor_cursor + "\"}\n";
+    const String raw = "{\"type\":\"cas_gc_maintenance_state\",\"v\":1}\n{\"cur\":\"" + over_limit.janitor_cursor + "\"}\n";
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeGcMaintenanceState(raw); });
-    String oversized = R"({"type":"cas_gc_maintenance_state","v":7,"pad":")";
+    String oversized = R"({"type":"cas_gc_maintenance_state","v":1,"pad":")";
     oversized.append(448 * 1024, 'x');
     oversized += "\"}\n{\"cur\":\"";
     oversized.append(kMaxGcMaintenanceCursorBytes, 'y');

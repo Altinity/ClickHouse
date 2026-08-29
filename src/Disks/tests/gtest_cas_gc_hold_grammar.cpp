@@ -1398,7 +1398,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWithAnUndecodablePriorSeal)
 
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":4}\nthis is not a seal body\n",
+    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":1}\nthis is not a seal body\n",
                           backend->head(seal_key).token);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.rebuildBaseline(/*force=*/true); });
@@ -1470,7 +1470,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsL
 
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":4}\nthis is not a seal body\n",
+    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":1}\nthis is not a seal body\n",
                           backend->head(seal_key).token);
     const HeadResult sh = backend->head(layout.gcStateKey());
     ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);

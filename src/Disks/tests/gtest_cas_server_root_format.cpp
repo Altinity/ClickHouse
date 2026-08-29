@@ -138,7 +138,7 @@ TEST(CASMountLeaseFormat, UnknownFieldsRemainTolerated)
 
 TEST(CASMountLeaseFormat, RejectsMissingIdentityFields)
 {
-    const String header = "{\"type\":\"cas_mount_lease\",\"v\":3}\n";
+    const String header = "{\"type\":\"cas_mount_lease\",\"v\":1}\n";
     const String fields = "\"hn\":\"host-1\",\"pid\":4242,\"sat\":1752537600000,"
                           "\"seq\":\"5\",\"eat\":1752537630000,\"ma\":\"9\",\"fen\":false}";
 

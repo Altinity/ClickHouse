@@ -680,22 +680,15 @@ TEST(CASPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 }
 
 /// ============================================================================================
-/// CAS reader-generation gate (`Core/Formats/CasFormat.h`'s `G_BUILD`) was raised to 4 for
-/// per-namespace contiguous ref-log ids (INV-1) and has since moved again, to 5, for Stage B's
-/// namespace-life-keyed ref layer ("format bump B", `kNamespaceLifeKeyedGeneration`) -- this test's
-/// assertions read `G_BUILD` itself rather than a hardcoded generation number for exactly that reason,
-/// so a THIRD bump does not silently make them false. `PoolMeta::createOrValidate`'s open-time
-/// CAS-raise targets `G_BUILD`, and `decodePoolMeta` fail-closes BOTH on a FUTURE
-/// `min_reader_generation` AND on a BACKWARD pool whose header `compatibility_version` is below
-/// `kNamespaceLifeKeyedGeneration` (which, being the LATER of the two historical breaking-change
-/// floors, subsumes `kContiguousRefStreamsGeneration` -- see `CasPoolMetaFormat.cpp`).
+/// CAS reader-generation gate (`CasFormat.h`'s `G_BUILD`). This test's assertions read `G_BUILD`
+/// itself rather than a hardcoded generation number, so a future bump does not silently make them
+/// false. `PoolMeta::createOrValidate`'s open-time CAS-raise targets `G_BUILD`, and `decodePoolMeta`
+/// fail-closes BOTH on a FUTURE `min_reader_generation` AND on a BACKWARD pool whose header
+/// `compatibility_version` is below the format-generation baseline (see `CasPoolMetaFormat.cpp`).
 /// ============================================================================================
 
 TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
 {
-    EXPECT_GE(G_BUILD, kNamespaceLifeKeyedGeneration)
-        << "the reader-generation gate must be at least the namespace-life-keyed floor it enforces";
-
     /// A freshly opened/created pool records `min_reader_generation == G_BUILD` (the open-time
     /// CAS-raise, `PoolMeta::createOrValidate`, always targets this build's own floor).
     {
@@ -709,8 +702,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
     }
 
     /// FORWARD gate: a pool-meta carrying `min_reader_generation == G_BUILD + 1` (one generation past
-    /// THIS build's floor) still fails closed at open -- the startup gate (`decodePoolMeta`) rejects it
-    /// even though generation 4 is now understood.
+    /// THIS build's floor) fails closed at open -- the startup gate (`decodePoolMeta`) rejects it.
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
@@ -722,12 +714,9 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
         { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
     }
 
-    /// BACKWARD floor: a pool whose header `v` (compatibility_version) is BELOW `G_BUILD` was written
-    /// by an older build this reader can no longer trust -- today that is one generation short of
-    /// `kNamespaceLifeKeyedGeneration`, a pool whose ref-object keys carry no incarnation segment,
-    /// which this build's parsers refuse as corruption rather than read. Craft it at the text layer:
-    /// take a fresh pool-meta and rewrite its line-1 version gate down to `G_BUILD - 1` (an older
-    /// build would have stamped exactly that).
+    /// BACKWARD floor: a pool whose header `v` (compatibility_version) is below the format-generation
+    /// baseline predates every build this reader can trust. Craft it at the text layer: take a fresh
+    /// pool-meta and rewrite its line-1 version gate down to `G_BUILD - 1`.
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");

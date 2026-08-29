@@ -62,18 +62,9 @@ a bare hex would be ambiguous; unbounded u64 = decimal strings; bounded counts/l
   enforcement. In practice the mismatch never arises: `Always` objects are read via a constructed
   `.zst`-suffixed key, so a raw body is not GETtable at that key.
 
-## Generation 10 mount-attempt identity {#generation-10-mount-attempt-identity}
+## Generation history {#generation-history}
 
-Generation 10 is a breaking, recreate-only change for the unreleased CAS format:
-
-- `MountLease` adds the required full-word key `write_attempt_id`, encoded as a nonzero 32-character
-  lowercase `UInt128` hex value. It identifies one holder-originated logical write; all physical
-  retries reuse the exact body and ID. A GC fence preserves the observed ID, while reclaim and
-  successor bodies mint a new one. The decoder rejects a missing or zero value.
-- `FormatId::MountLease` has a breaking generation-10 change point because its canonical body gained
-  that required field.
-- `FormatId::PoolMeta` has the matching generation-10 change point and reader floor. `decodePoolMeta`
-  rejects a generation-9 pool before any old mount body can be interpreted without attempt identity.
-
-There is no generation-9 decoder, compatibility alias, or migration. CAS is pre-release; recreate a
-generation-9 pool with a generation-10 writer.
+The format's generation history was reset to a flat `{1, 1}` baseline (`G_BUILD == 1`): CAS is
+pre-release, carries no persisted data, and pays no compatibility cost for starting the count over.
+Every class's `changePoints` begins at generation 1; a future breaking change appends a real entry to
+that class's own array and bumps `G_BUILD`, the same way it always has.

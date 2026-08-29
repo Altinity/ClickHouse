@@ -248,12 +248,13 @@ TEST(CASRecordStream, HeaderGates)
 {
     /// Wrong type.
     {
-        const String s = "{\"type\":\"cas_pool_meta\",\"v\":3,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
+        const String s = "{\"type\":\"cas_pool_meta\",\"v\":1,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
         EXPECT_THROW(decodeRun(s), DB::Exception);
     }
-    /// Wrong kind.
+    /// Wrong kind. `v:1` is the baseline generation, so it always passes the header gate before the
+    /// kind check runs.
     {
-        const String s = "{\"type\":\"cas_run\",\"v\":3,\"kind\":\"blob_delta\"}\n{\"n\":0}\n";
+        const String s = "{\"type\":\"cas_run\",\"v\":1,\"kind\":\"blob_delta\"}\n{\"n\":0}\n";
         EXPECT_THROW(decodeRun(s), DB::Exception);
     }
     /// Future version -> UNKNOWN_FORMAT_VERSION.

@@ -118,12 +118,12 @@ TEST(CASGCOutcomesFormat, GarbageAndUnknownWordsFailClosed)
     EXPECT_THROW(decodeOutcomeLog(String("")), DB::Exception);
     EXPECT_THROW(decodeOutcomeLog(String("not a cas object\n")), DB::Exception);
     /// A record with an unknown outcome word fails closed.
-    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n"
+    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
                        "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\","
                        "\"tt\":\"etag\",\"tv\":\"x\",\"oc\":\"bogus\"}\n{\"n\":1}\n";
     EXPECT_THROW(decodeOutcomeLog(bad), DB::Exception);
     /// A trailer count mismatch fails closed.
-    const String miscount = "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n{\"n\":5}\n";
+    const String miscount = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n{\"n\":5}\n";
     EXPECT_THROW(decodeOutcomeLog(miscount), DB::Exception);
 }
 
@@ -132,7 +132,7 @@ TEST(CASGCOutcomesFormat, DigestWidthMismatchFailsClosedWithCorruptedData)
     /// `ch128` (CityHash128) digests are 16 bytes = 32 hex chars; here the "h" field is truncated
     /// to 30 hex chars. Must surface as CORRUPTED_DATA (malformed serialized input), not
     /// `fromHex`'s BAD_ARGUMENTS.
-    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n"
+    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
                        "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddee\","
                        "\"tt\":\"etag\",\"tv\":\"x\",\"oc\":\"deleted\"}\n{\"n\":1}\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bad); });

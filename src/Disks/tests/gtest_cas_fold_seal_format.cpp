@@ -303,24 +303,24 @@ TEST(CASFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
     EXPECT_EQ(decodeFoldSeal(expected), seal);
 }
 
-/// Mutation caught: accepting the generation-6 split coverage collection would leave a second
-/// namespace-keyed source of lifecycle work in a generation-7 process.
+/// Mutation caught: accepting the retired split coverage-collection kind would revive a second
+/// namespace-keyed source of lifecycle work alongside the unified per-life row.
 TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyCoverageRecord)
 {
     const String old =
-        "{\"type\":\"cas_fold_seal\",\"v\":7}\n"
+        "{\"type\":\"cas_fold_seal\",\"v\":1}\n"
         "{\"g\":\"8\",\"pg\":\"7\"}\n"
         "{\"k\":\"cov\",\"key\":\"name/0\",\"cls\":2,\"lfe\":\"3\",\"lfs\":\"4\"}\n"
         "{\"n\":1}\n";
     cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(old); }, "legacy coverage");
 }
 
-/// Mutation caught: accepting the generation-6 cleanup-item state would restore the independent
-/// marker-driven `Pending`/`Completed` handshake.
+/// Mutation caught: accepting the retired cleanup-item kind would restore the independent
+/// marker-driven `Pending`/`Completed` handshake the unified row replaced.
 TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyNamespaceCleanupRecord)
 {
     const String old =
-        "{\"type\":\"cas_fold_seal\",\"v\":7}\n"
+        "{\"type\":\"cas_fold_seal\",\"v\":1}\n"
         "{\"g\":\"8\",\"pg\":\"7\"}\n"
         "{\"k\":\"nsc\",\"ns\":\"name\",\"rte\":\"3\",\"rts\":\"4\",\"st\":\"completed\"}\n"
         "{\"n\":1}\n";
