@@ -1050,15 +1050,15 @@ inline uint64_t foldCursorOf(
 
 /// Set a server root's durable floor (so orphan-sweep eligibility can be driven). After the ack-floor
 /// merge the floor rides the mount lease body (`mountKey`), so this seeds a MountLease carrying
-/// `{writer_epoch, min_active}` — exactly what `prefixEligible` reads.
+/// `{writer_epoch, min_active_build_sequence}` — exactly what `prefixEligible` reads.
 inline void setWatermarkMinActive(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & server_root_id,
-    uint64_t writer_epoch, uint64_t min_active)
+    uint64_t writer_epoch, uint64_t min_active_build_sequence)
 {
     DB::Cas::MountLease m;
     m.server_uuid = DB::UInt128(0);
     m.writer_epoch = writer_epoch;
-    m.min_active = min_active;
+    m.min_active_build_sequence = min_active_build_sequence;
     m.seq = 1;
     m.write_attempt_id = DB::UInt128{1};
     const String key = layout.mountKey(server_root_id);

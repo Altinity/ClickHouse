@@ -16,26 +16,26 @@ namespace DB::Cas
 
 namespace OwnerWire
 {
-    constexpr WireKey server_uuid{"su"};
-    constexpr WireKey retired_at_ms{"rt"};
+    constexpr WireKey server_uuid{"server_uuid"};
+    constexpr WireKey retired_at_ms{"retired_at_ms"};
 }
 
 namespace ServerEpochWire
 {
-    constexpr WireKey next_writer_epoch{"nwe"};
+    constexpr WireKey next_writer_epoch{"next_writer_epoch"};
 }
 
 namespace MountLeaseWire
 {
-    constexpr WireKey server_uuid{"su"};
-    constexpr WireKey writer_epoch{"we"};
-    constexpr WireKey hostname{"hn"};
+    constexpr WireKey server_uuid{"server_uuid"};
+    constexpr WireKey writer_epoch{"writer_epoch"};
+    constexpr WireKey hostname{"hostname"};
     constexpr WireKey pid{"pid"};
-    constexpr WireKey started_at_ms{"sat"};
+    constexpr WireKey started_at_ms{"started_at_ms"};
     constexpr WireKey seq{"seq"};
-    constexpr WireKey expires_at_ms{"eat"};
-    constexpr WireKey min_active{"ma"};
-    constexpr WireKey gc_fenced{"fen"};
+    constexpr WireKey expires_at_ms{"expires_at_ms"};
+    constexpr WireKey min_active_build_sequence{"min_active_build_sequence"};
+    constexpr WireKey gc_fenced{"gc_fenced"};
     constexpr WireKey write_attempt_id{"write_attempt_id"};
 }
 
@@ -91,7 +91,7 @@ OwnerObject decodeOwner(std::string_view data)
     }
     o.retired_at_ms = rt;
     if (!saw)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: missing su");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: missing server_uuid");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: trailing bytes");
     return o;
@@ -130,7 +130,7 @@ ServerEpoch decodeServerEpoch(std::string_view data)
             r.skipUnknown(key);
     }
     if (!saw)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: missing nwe");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: missing next_writer_epoch");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: trailing bytes");
     return e;
@@ -148,7 +148,7 @@ String encodeMountLease(const MountLease & m)
     writeNumberField(out, MountLeaseWire::started_at_ms, m.started_at_ms, first);
     writeU64StringField(out, MountLeaseWire::seq, m.seq, first);
     writeNumberField(out, MountLeaseWire::expires_at_ms, m.expires_at_ms, first);
-    writeU64StringField(out, MountLeaseWire::min_active, m.min_active, first);
+    writeU64StringField(out, MountLeaseWire::min_active_build_sequence, m.min_active_build_sequence, first);
     writeBoolField(out, MountLeaseWire::gc_fenced, m.gc_fenced, first);
     writeHex128Field(out, MountLeaseWire::write_attempt_id, m.write_attempt_id, first);
     closeObject(out, first);
@@ -191,8 +191,8 @@ MountLease decodeMountLease(std::string_view data)
             m.seq = r.readU64String();
         else if (key == MountLeaseWire::expires_at_ms)
             m.expires_at_ms = r.readU64Number();
-        else if (key == MountLeaseWire::min_active)
-            m.min_active = r.readU64String();
+        else if (key == MountLeaseWire::min_active_build_sequence)
+            m.min_active_build_sequence = r.readU64String();
         else if (key == MountLeaseWire::gc_fenced)
             m.gc_fenced = r.readBool();
         else if (key == MountLeaseWire::write_attempt_id)

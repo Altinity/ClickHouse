@@ -166,7 +166,7 @@ public:
         if (armed && key == mount_key && result.outcome == PutOutcome::Done)
         {
             const MountLease mount = decodeMountLease(bytes);
-            if (mount.min_active == std::numeric_limits<uint64_t>::max())
+            if (mount.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
                 farewell_seen = true;
         }
         return result;
@@ -201,7 +201,7 @@ private:
         ++mount_value.seq;
         ++mount_value.started_at_ms;
         mount_value.expires_at_ms = mount_value.started_at_ms + 30'000;
-        mount_value.min_active = 0;
+        mount_value.min_active_build_sequence = 0;
         mount_value.gc_fenced = false;
         successor_mount_bytes = encodeMountLease(mount_value);
         const PutResult mount_put = InMemoryBackend::putOverwrite(
@@ -277,7 +277,7 @@ private:
             .started_at_ms = 1'000,
             .seq = 1,
             .expires_at_ms = 31'000,
-            .min_active = 0,
+            .min_active_build_sequence = 0,
         });
         const PutResult mount_put = InMemoryBackend::putIfAbsent(mount_key, successor_mount_bytes, {});
         if (mount_put.outcome != PutOutcome::Done)

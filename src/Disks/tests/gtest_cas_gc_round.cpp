@@ -1808,7 +1808,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     const ManifestRef r2 = ref(5, 0xCA02);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_epoch, /*min_active*/6);
+    setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_epoch, /*min_active_build_sequence*/6);
 
     /// The §6 deletion premise is a second precondition on every sweep deletion: a manifest of an
     /// epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an epoch
@@ -1823,7 +1823,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     /// injected cursor would prove only that the premise reads a number, not that the number can be
     /// produced.
     ///
-    /// The live publications use build sequences ABOVE the watermark's `min_active`, so the only
+    /// The live publications use build sequences ABOVE the watermark's `min_active_build_sequence`, so the only
     /// sweep-ELIGIBLE manifests in the namespace remain the two debris bodies -- the premise, not the
     /// watermark, is what this test varies.
     publishAt(*backend, store->layout(), ns, RefTxnId{1, 1}, "tbl", /*build_sequence=*/7,
@@ -1900,7 +1900,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     foreign_config.server_root_id = "test";
     auto invalid_store = openTestPoolWithConfig(foreign_backend, std::move(foreign_config));
     const String foreign_mount_key = invalid_store->layout().mountKey("test");
-    setWatermarkMinActive(*foreign_backend, invalid_store->layout(), "test", r1.writer_epoch, /*min_active*/6);
+    setWatermarkMinActive(*foreign_backend, invalid_store->layout(), "test", r1.writer_epoch, /*min_active_build_sequence*/6);
     const auto occupant_before = foreign_backend->get(foreign_mount_key);
     ASSERT_TRUE(occupant_before.has_value());
     const uint64_t violations_before

@@ -535,7 +535,7 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
 }
 
 /// Trimmed-but-live (design delta 2): the precommit's journal evidence is gone (trim), the build
-/// is NOT provably dead (a live build holds min_active down) — the unowned-alive sweep must
+/// is NOT provably dead (a live build holds min_active_build_sequence down) — the unowned-alive sweep must
 /// over-protect the manifest's edges.
 TEST(CASGCRebuild, UnownedAliveManifestOverProtected)
 {
@@ -543,7 +543,7 @@ TEST(CASGCRebuild, UnownedAliveManifestOverProtected)
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
-    /// A LIVE build pins min_active at its build_seq, so higher build sequences are not provably dead.
+    /// A LIVE build pins min_active_build_sequence at its build_seq, so higher build sequences are not provably dead.
     auto live_build = store->beginPartWrite({});
     store->renewWatermarkOnce();
 

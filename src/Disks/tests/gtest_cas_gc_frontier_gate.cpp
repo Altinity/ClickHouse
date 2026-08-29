@@ -1480,7 +1480,7 @@ TEST(CASGCFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
     const ManifestRef r2{.writer_epoch = 5, .build_sequence = 0xCA02, .manifest_ordinal = 1};
     writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(0xa1))});
     writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(0xb2))});
-    setWatermarkMinActive(*backend, layout, "test", r1.writer_epoch, /*min_active*/ 0xCA03);
+    setWatermarkMinActive(*backend, layout, "test", r1.writer_epoch, /*min_active_build_sequence*/ 0xCA03);
     /// The §6 deletion premise is a second precondition on the CONTROL arm below: a manifest of an
     /// epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an epoch
     /// strictly above `E`. Sealing that cursor here is what keeps this test about the GATE — without it

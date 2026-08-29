@@ -755,7 +755,7 @@ uint64_t allocateWriterEpoch(
                         const MountLease surviving = decodeMountLease(*mount_probe.body);
                         /// Deliberately weaker than claimMount's reclaim gate (this file, ~:370-380),
                         /// which never trusts a bare wall-clock comparison alone (only gc_fenced /
-                        /// the clean-farewell min_active==UINT64_MAX marker / a caller-proven-dead
+                        /// the clean-farewell min_active_build_sequence==UINT64_MAX marker / a caller-proven-dead
                         /// token justify a reclaim there, because clock skew can misjudge liveness).
                         /// This is still safe: (a) the mint below is DISTINCT from the survivor's
                         /// epoch by construction, so no same-(uuid, epoch) pair is ever representable
@@ -965,7 +965,7 @@ MountClaimResult claimMount(
     ///     every renewal fails the token guard forever, so it can never write again) — there is no
     ///     liveness left to wait for. This is what makes self-remount (and a fast restart after a
     ///     fence-out) instant instead of an observation wait.
-    ///   - the clean marker (`min_active == UINT64_MAX`) → the predecessor's OWN graceful farewell
+    ///   - the clean marker (`min_active_build_sequence == UINT64_MAX`) → the predecessor's OWN graceful farewell
     ///     (`MountLeaseKeeper::terminate`) — no observation needed either.
     ///   - `proven_dead_token` matches the token we just read → the CALLER (`claimMountAwaitingExpiry`)
     ///     already watched this exact token hold stable for the full observation threshold on its own
@@ -974,7 +974,7 @@ MountClaimResult claimMount(
     /// Anything else → `LiveDoubleStart` (do NOT write): a same-uuid, different-epoch, not fenced, not
     /// clean-marked, not (yet) proven-dead lease may simply be a live twin, and `expires_at_ms` alone
     /// can never distinguish that from a dead predecessor across two different clocks.
-    const bool clean_marker = existing.min_active == std::numeric_limits<uint64_t>::max();
+    const bool clean_marker = existing.min_active_build_sequence == std::numeric_limits<uint64_t>::max();
     const bool proven_dead = proven_dead_token && *proven_dead_token == got->token;
     if (existing.gc_fenced || clean_marker || proven_dead)
     {
@@ -1176,7 +1176,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                     obs.erase(srid);   /// terminal — no further observation needed
                     break;
                 }
-                if (m.min_active == std::numeric_limits<uint64_t>::max())
+                if (m.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
                 {
                     ++floor.terminated;
                     obs.erase(srid);   /// terminal — no further observation needed
@@ -1283,7 +1283,7 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(Backend & b, const 
                 continue;
             }
 
-            if (m.gc_fenced || m.min_active == std::numeric_limits<uint64_t>::max())
+            if (m.gc_fenced || m.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
                 continue;   /// terminal: fenced out by GC, or the holder's own graceful farewell.
 
             slots.push_back(NonTerminalMountSlot{srid, fmt::format(
@@ -1333,7 +1333,7 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
             }
             if (info.lease.gc_fenced)
                 info.state = "fenced";
-            else if (info.lease.min_active == std::numeric_limits<uint64_t>::max())
+            else if (info.lease.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
                 info.state = "terminated";
             else if (now_ms <= info.lease.expires_at_ms + skew_margin_ms)
                 info.state = "live";
@@ -1366,7 +1366,7 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 {
     if (lease.gc_fenced)
         return FenceCertificate::GcFenced;
-    if (lease.min_active == std::numeric_limits<uint64_t>::max())
+    if (lease.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
         return FenceCertificate::CleanFarewell;
     if (lease.writer_epoch != fence_writer_epoch)
         return FenceCertificate::SupersededEpoch;
@@ -1419,7 +1419,7 @@ bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const Stri
 MountLeaseKeeper::MountLeaseKeeper(
     BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-    std::function<uint64_t()> min_active_fn_,
+    std::function<uint64_t()> min_active_build_sequence_fn_,
     CasEventSink event_sink_,
     std::chrono::milliseconds lease_safety_margin_,
     std::function<uint64_t()> boot_ms_fn_)
@@ -1430,7 +1430,7 @@ MountLeaseKeeper::MountLeaseKeeper(
     , writer_epoch(writer_epoch_)
     , ttl(ttl_)
     , now_ms_fn(std::move(now_ms_fn_))
-    , min_active_fn(std::move(min_active_fn_))
+    , min_active_build_sequence_fn(std::move(min_active_build_sequence_fn_))
     , event_sink(std::move(event_sink_))
     , lease_safety_margin(lease_safety_margin_)
     , boot_ms_fn(boot_ms_fn_ ? std::move(boot_ms_fn_) : defaultBootMs)
@@ -1438,7 +1438,7 @@ MountLeaseKeeper::MountLeaseKeeper(
 }
 
 String MountLeaseKeeper::encodeBody(
-    uint64_t seq_, uint64_t wall_ms, uint64_t min_active, UInt128 write_attempt_id) const
+    uint64_t seq_, uint64_t wall_ms, uint64_t min_active_build_sequence, UInt128 write_attempt_id) const
 {
     const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
     const uint64_t expires_at_ms = wall_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
@@ -1452,7 +1452,7 @@ String MountLeaseKeeper::encodeBody(
         .started_at_ms = wall_ms,
         .seq = seq_,
         .expires_at_ms = expires_at_ms,
-        .min_active = min_active,
+        .min_active_build_sequence = min_active_build_sequence,
         .write_attempt_id = write_attempt_id,
     });
 }
@@ -1544,7 +1544,7 @@ uint64_t MountLeaseKeeper::start()
 
     const uint64_t wall_ms = now_ms_fn();
     const uint64_t attempt_start_boot_ms = boot_ms_fn();
-    const String body = encodeBody(/*seq_=*/1, wall_ms, min_active_fn(), newMountWriteAttemptId());
+    const String body = encodeBody(/*seq_=*/1, wall_ms, min_active_build_sequence_fn(), newMountWriteAttemptId());
     const Token token = claim(body);
 
     seq = 1;
@@ -1691,7 +1691,7 @@ MountRenewResult MountLeaseKeeper::renew(
     const uint64_t attempt_start_boot_ms = boot_clock();
     const uint64_t next_seq = seq + 1;
     const UInt128 write_attempt_id = newMountWriteAttemptId();
-    const String body = encodeBody(next_seq, wall_ms, min_active_fn(), write_attempt_id);
+    const String body = encodeBody(next_seq, wall_ms, min_active_build_sequence_fn(), write_attempt_id);
     const Token expected = last_token;
 
     const uint64_t safety_ms = static_cast<uint64_t>(lease_safety_margin.count());
@@ -1829,7 +1829,7 @@ void MountLeaseKeeper::terminate()
         .started_at_ms = wall_ms,
         .seq = seq + 1,
         .expires_at_ms = wall_ms,
-        .min_active = std::numeric_limits<uint64_t>::max(),
+        .min_active_build_sequence = std::numeric_limits<uint64_t>::max(),
         .write_attempt_id = newMountWriteAttemptId(),
     });
     const PutResult result = backend->putOverwrite(key, body, last_token);

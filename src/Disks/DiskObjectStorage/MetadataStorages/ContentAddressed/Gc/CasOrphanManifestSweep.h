@@ -153,7 +153,7 @@ struct ManifestSweepResult
 /// manifest bodies written before `PrecommitAdd` and never named by any live owner, scoped to ONE
 /// namespace + ONE build prefix. Rules:
 ///   - eligibility from the durable watermark fact only: the retired sentinel
-///     (`min_active == UINT64_MAX`), or `min_active > build_sequence`, or a replaced incarnation —
+///     (`min_active_build_sequence == UINT64_MAX`), or `min_active_build_sequence > build_sequence`, or a replaced incarnation —
 ///     NEVER a frozen-seq / judged-dead heuristic alone (a missing watermark => not eligible);
 ///   - the active `ManifestId` set comes from the namespace's committed + live-precommit owner view;
 ///   - delete only bodies whose `ManifestId` is ABSENT from the active set, by exact token;

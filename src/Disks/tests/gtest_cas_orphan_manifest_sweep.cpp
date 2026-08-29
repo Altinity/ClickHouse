@@ -166,7 +166,7 @@ TEST(CASOrphanManifestSweep, EligibleAndUnownedIsDeleted)
     registerNamespaceRaw(*backend, store->layout(), ns);
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active*/6);   // 6 > 5 => eligible
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active_build_sequence*/6);   // 6 > 5 => eligible
     seedConsumedSealCursor(*backend, store->layout(), ns);
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
 
@@ -214,7 +214,7 @@ TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
     const ManifestRef candidate = ref(5, 0xAC);
     const String candidate_key = layout.manifestKey(ManifestId{ns, candidate});
     writeManifestRaw(*backend, layout, ns, candidate, {blobEntryFor("a", DB::UInt128(1))});
-    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active=*/6);
+    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active_build_sequence=*/6);
     seedConsumedSealCursor(*backend, layout, ns);
 
     std::vector<String> warnings;
@@ -299,7 +299,7 @@ TEST(CASOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
     const ManifestRef r2 = ref(5, 0xE2);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active*/6);
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active_build_sequence*/6);
 
     const ManifestSweepResult first = sweepManifestCursorPageForTest(*store, "", /*list_budget*/1, /*delete_budget*/0);
     EXPECT_EQ(first.listed, 1u);

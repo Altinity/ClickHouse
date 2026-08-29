@@ -304,7 +304,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         }
 
         /// Graceful close stamps an already-expired lease and the watermark farewell
-        /// (`min_active = UINT64_MAX`), making the slot `terminated` before its mutable control objects
+        /// (`min_active_build_sequence = UINT64_MAX`), making the slot `terminated` before its mutable control objects
         /// are removed and its owner anchor is tombstoned.
         admin.reset();
 
@@ -334,7 +334,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                 const MountLease mount_value = decodeMountLease(farewell_mount->bytes);
                 captures_match = epoch_value.next_writer_epoch != 0
                     && mount_value.writer_epoch == epoch_value.next_writer_epoch - 1
-                    && mount_value.min_active == std::numeric_limits<uint64_t>::max()
+                    && mount_value.min_active_build_sequence == std::numeric_limits<uint64_t>::max()
                     && !mount_value.gc_fenced;
                 if (!captures_match)
                 {

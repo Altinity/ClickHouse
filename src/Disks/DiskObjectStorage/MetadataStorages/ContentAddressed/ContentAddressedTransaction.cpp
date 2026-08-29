@@ -113,7 +113,7 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
     /// backstop for aborted/exception-unwound transactions whose publishStaging never ran.
     cleanupPendingTempFiles();
 
-    /// An uncommitted transaction's uploads become min_active-spared debris: abandon every
+    /// An uncommitted transaction's uploads become min_active_build_sequence-spared debris: abandon every
     /// still-open PartWriteTxn so its build_seq is retired. This replaces the former pin machinery.
     if (committed)
         return;

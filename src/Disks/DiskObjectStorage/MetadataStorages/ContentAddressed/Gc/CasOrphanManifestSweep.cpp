@@ -40,7 +40,7 @@ void onGcEnumerationPage()
 /// namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain slashes.
 /// Try namespace prefixes from longest to shortest and accept the first durable mount body. Without a
 /// mount there is no deletion authority, so the caller must leave the prefix untouched. The mount's
-/// `writer_epoch` and `min_active` are the single durable epoch/floor pair used for eligibility, including
+/// `writer_epoch` and `min_active_build_sequence` are the single durable epoch/floor pair used for eligibility, including
 /// across process replacement and the retired sentinel.
 std::optional<MountLease> floorForNamespace(Pool & store, const RootNamespace & ns)
 {
@@ -478,7 +478,7 @@ bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & 
     /// Eligibility comes only from the durable mount-lease floor. A missing floor means NOT eligible;
     /// do not replace that authority check with a frozen-sequence or judged-dead guess. Compare
     /// `writer_epoch` first, then `build_sequence`, so old-epoch
-    /// debris drains after a process restart even when its build_sequence is above the current min_active.
+    /// debris drains after a process restart even when its build_sequence is above the current min_active_build_sequence.
     const auto floor = floorForNamespace(store, ns);
     if (!floor)
         return false;
@@ -488,9 +488,9 @@ bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & 
         return true;
     if (prefix.writer_epoch > w.writer_epoch)
         return false;
-    if (w.min_active == std::numeric_limits<uint64_t>::max())
+    if (w.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
         return true;   /// farewell/retired sentinel: every seq is retired
-    return w.min_active > prefix.build_sequence;
+    return w.min_active_build_sequence > prefix.build_sequence;
 }
 
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,

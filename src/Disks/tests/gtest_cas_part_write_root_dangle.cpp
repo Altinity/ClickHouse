@@ -62,7 +62,7 @@ ManifestEntry blobEntry(const String & name, const String & payload)
 /// public PartWriteTxn/Pool/Gc API (no snap injection):
 ///
 ///   PartWriteTxn A uploads blob P and publishes refA -> t1 -> { data.bin: P }. A is then RELEASED (dtor),
-///   retiring its build_seq so the GC watermark `min_active` advances PAST A. P now carries A's
+///   retiring its build_seq so the GC watermark `min_active_build_sequence` advances PAST A. P now carries A's
 ///   `cas_owner` and is no longer protected by any in-flight build.
 ///
 ///   PartWriteTxn B starts and ADOPTS the same blob P via tokenless evidence (adoptEvidence — the cross-node
@@ -83,7 +83,7 @@ TEST(CASPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
     const String P = "shared-blob-payload-P";
 
     /// PartWriteTxn A: upload P, publish refA -> manifest -> { data.bin: P }, then release A so its build_seq
-    /// retires and min_active advances past it.
+    /// retires and min_active_build_sequence advances past it.
     {
         PartWriteInfo info;
         info.intended_ref = ns.string() + "/refA";
@@ -93,7 +93,7 @@ TEST(CASPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
         a->putBlob(idOf(P), BlobSource::fromString(P));
         a->promote(ns, "refA", a->buildId(), id);
     }
-    s->renewWatermarkOnce();   /// A is gone; min_active now advances past A's build_seq
+    s->renewWatermarkOnce();   /// A is gone; min_active_build_sequence now advances past A's build_seq
 
     /// PartWriteTxn B: adopt the SAME blob P (cross-node adopt — tokenless evidence via adoptEvidence), assemble
     /// its manifest, and precommitAdd it. The precommit pins P's closure (fold +1 edge) for the build.
@@ -145,7 +145,7 @@ TEST(CASPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
     const RootNamespace ns{"test/tbl"};
     const String P = "shared-blob-payload-P-reclaim";
 
-    /// PartWriteTxn A: upload P, publish refA -> manifest, retire A so min_active advances past it.
+    /// PartWriteTxn A: upload P, publish refA -> manifest, retire A so min_active_build_sequence advances past it.
     {
         PartWriteInfo info;
         info.intended_ref = ns.string() + "/refA";
@@ -232,7 +232,7 @@ TEST(CASPartWriteTxnRoot, LivePrecommitNotReclaimed)
     const String Q = "live-build-blob-payload-Q";
 
     /// PartWriteTxn B stays ALIVE: upload Q, assemble, precommitAdd — and we DO NOT retire its seq. So
-    /// `min_active <= build_seq` (B is in-flight) and the watermark keeps a live, advancing seq.
+    /// `min_active_build_sequence <= build_seq` (B is in-flight) and the watermark keeps a live, advancing seq.
     PartWriteInfo binfo;
     binfo.intended_ref = ns.string() + "/refLive";
     auto b = s->beginPartWrite(binfo);
@@ -240,7 +240,7 @@ TEST(CASPartWriteTxnRoot, LivePrecommitNotReclaimed)
     b->precommitAdd(ns, "refLive", t);
     b->putBlob(idOf(Q), BlobSource::fromString(Q));
     s->renewWatermarkOnce();
-    ASSERT_LE(s->minActive(), b->buildSeq()) << "precondition: B must be in-flight (min_active <= seq)";
+    ASSERT_LE(s->minActive(), b->buildSeq()) << "precondition: B must be in-flight (min_active_build_sequence <= seq)";
 
     /// GC to fixpoint while B is live.
     Gc gc(s, u128Of("gc-b8-live"));

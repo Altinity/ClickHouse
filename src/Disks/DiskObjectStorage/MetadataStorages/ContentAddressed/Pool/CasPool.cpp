@@ -1458,7 +1458,7 @@ void Pool::enqueueWriterCleanupDuty(
     }
     catch (...)
     {
-        /// The build deliberately remains active. Advancing `min_active` after losing the only cleanup
+        /// The build deliberately remains active. Advancing `min_active_build_sequence` after losing the only cleanup
         /// duty would make an uncertain owner grant look dead; pinning the floor until process exit is
         /// the safe failure direction, and successor recovery handles the durable remnant.
         writer_cleanup_queue_failed.store(true, std::memory_order_release);

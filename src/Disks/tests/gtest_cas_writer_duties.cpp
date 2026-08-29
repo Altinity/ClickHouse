@@ -354,7 +354,7 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
 
     const auto mount = backend->get(mount_key);
     ASSERT_TRUE(mount.has_value());
-    EXPECT_NE(decodeMountLease(mount->bytes).min_active, std::numeric_limits<uint64_t>::max())
+    EXPECT_NE(decodeMountLease(mount->bytes).min_active_build_sequence, std::numeric_limits<uint64_t>::max())
         << "a live writer-cleanup duty forbids the clean-release certificate";
 
     uint64_t fake_boot = 0;

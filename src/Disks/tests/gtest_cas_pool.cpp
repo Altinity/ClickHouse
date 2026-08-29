@@ -2010,7 +2010,7 @@ TEST(CASPoolShutdown, CleanStopDrainsAndWritesFarewell)
     const auto got = backend->get(mount_key);
     ASSERT_TRUE(got.has_value());
     const MountLease lease = decodeMountLease(got->bytes);
-    EXPECT_EQ(lease.min_active, std::numeric_limits<uint64_t>::max())
+    EXPECT_EQ(lease.min_active_build_sequence, std::numeric_limits<uint64_t>::max())
         << "a clean drain (no in-flight ref-log PUT) must write the farewell marker";
 }
 
@@ -2047,7 +2047,7 @@ TEST(CASPoolShutdown, UnresolvedWedgeSkipsFarewell)
     const auto got = backend->get(mount_key);
     ASSERT_TRUE(got.has_value());
     const MountLease lease = decodeMountLease(got->bytes);
-    EXPECT_NE(lease.min_active, std::numeric_limits<uint64_t>::max())
+    EXPECT_NE(lease.min_active_build_sequence, std::numeric_limits<uint64_t>::max())
         << "an unresolved ref-log PUT must skip the clean-release farewell marker";
     EXPECT_FALSE(lease.gc_fenced);
 
@@ -2075,7 +2075,7 @@ TEST(CASMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
     Layout l{"p"};
     DB::Cas::tests::seedPoolMetaForRestart(*b);
     /// Predecessor: claim epoch 7, no farewell (simulate crash: just drop the keeper) -- a bare
-    /// `claimMount` plants the lease directly, with no clean-farewell `min_active` marker and no
+    /// `claimMount` plants the lease directly, with no clean-farewell `min_active_build_sequence` marker and no
     /// `gc_fenced`, so the successor below has no certificate of death until it observes one itself.
     ASSERT_EQ(claimMount(*b, l, "test", UInt128(1), /*epoch*/ 7, /*now_ms*/ 1000, /*ttl_ms*/ 500).kind,
               MountClaimResult::Claimed);
@@ -2122,7 +2122,7 @@ TEST(CASMountOpenWaits, CleanOpenSkipsAllWaits)
 {
     auto b = std::make_shared<InMemoryBackend>();
     /// Predecessor released cleanly (drain + farewell from Task 5): open, then reset() drives ~Pool(),
-    /// which -- with nothing in flight -- writes the farewell marker (min_active == UINT64_MAX).
+    /// which -- with nothing in flight -- writes the farewell marker (min_active_build_sequence == UINT64_MAX).
     auto predecessor = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test"});
     predecessor.reset();
@@ -2678,7 +2678,7 @@ TEST(CASPoolRemount, TeardownJoinsBothWorkersBeforeRelease)
     runtime.stopBackgroundWorkers();
     EXPECT_EQ(worker_exits.load(), 2u);
     runtime.finishTeardown(true);
-    EXPECT_EQ(decodeMountLease(backend->get(layout.mountKey("test"))->bytes).min_active,
+    EXPECT_EQ(decodeMountLease(backend->get(layout.mountKey("test"))->bytes).min_active_build_sequence,
               std::numeric_limits<uint64_t>::max());
 }
 
@@ -3373,7 +3373,7 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
             runtime.stopBackgroundWorkers();
         }
         runtime.finishTeardown(true);
-        return decodeMountLease(backend->get(layout.mountKey("test"))->bytes).min_active;
+        return decodeMountLease(backend->get(layout.mountKey("test"))->bytes).min_active_build_sequence;
     };
 
     EXPECT_EQ(run(false), std::numeric_limits<uint64_t>::max());
