@@ -17,3 +17,12 @@
 - Updated expectations: `pid` → `pool_id`; `hln` → `blob_header_len`; `gcs` → `gc_shards`; `mrg` → `min_reader_generation`; `alg` string → `algos_used` JSON word array. The direct byte-shape assertion is `{"algos_used":["ch128","sha256"]}`. The six negative pool fixtures (old joined string, non-string element, empty array, unsorted array, duplicate array, and unknown word) each require `CORRUPTED_DATA`; direct reader non-array and non-string-element negatives do too.
 - Gate: `[==========] 2207 tests from 284 test suites ran. (162963 ms total)`; no `[  FAILED  ]` line (zero failures).
 - Deviations: none. The initial gate exposed only two test setup/assertion mistakes caused by the new encoder validation and an unclosed test object; the final gate above is green.
+
+## Task 5 — GC state, heartbeat, and maintenance state
+
+- Status: complete.
+- Inventory before the flip (scoped to the owning GC fixtures and codec comments): escaped `rnd` (3), `gcs` (2), `sg` (3), `spt` (3), `sa` (3), `msc` (3), `lo` (3), `ls` (3), `by` (2), and heartbeat `seq` (2) in `gtest_cas_gc_state_format.cpp`; escaped `cur` (9) in `gtest_cas_gc_maintenance_state_format.cpp`. Raw hits outside those files belonged to the blob-envelope, pool-meta, or server-root formats and were not changed. Codec worklist: both local wire-constant blocks and their missing-key comments/diagnostics.
+- Files: `CasGcStateFormat.cpp`, `CasGcMaintenanceStateFormat.cpp`, `gtest_cas_gc_state_format.cpp`, `gtest_cas_gc_maintenance_state_format.cpp`, `Formats/README.md`.
+- Updated expectations: GC state `rnd`/`gcs`/`sg`/`spt`/`sa`/`msc`/`lo`/`ls` → `round`/`gc_shards`/`snap_generation`/`snap_pruned_through`/`snap_attempt`/`manifest_sweep_cursor`/`lease_owner`/`lease_seq`; heartbeat `by`/`seq` → `owner`/`hb_seq`; maintenance `cur` → `janitor_cursor`.
+- Gate: `[==========] 2207 tests from 284 test suites ran. (162898 ms total)`; no `[  FAILED  ]` line (zero failures).
+- Deviations: none.

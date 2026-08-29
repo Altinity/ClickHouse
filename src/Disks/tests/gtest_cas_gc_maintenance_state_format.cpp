@@ -33,7 +33,7 @@ TEST(CASFormatBattery, GcMaintenanceState)
     runFormatBattery({FormatId::GcMaintenanceState,
         [&] { return sealObject(FormatId::GcMaintenanceState, encodeGcMaintenanceState(state)); },
         [](std::string_view s) { decodeGcMaintenanceState(std::string(openObject(FormatId::GcMaintenanceState, s))); },
-        currentFormatHeader("cas_gc_maintenance_state") + "{\"cur\":\"cas/ns/a\"}\n"});
+        currentFormatHeader("cas_gc_maintenance_state") + "{\"janitor_cursor\":\"cas/ns/a\"}\n"});
 }
 
 TEST(CASGCMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
@@ -60,7 +60,7 @@ TEST(CASGCMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
 
     const GcMaintenanceState empty;
     EXPECT_EQ(encodeGcMaintenanceState(empty), fmt::format(
-        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"cur\":\"\"}}\n", currentCompatibilityVersion()));
+        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"janitor_cursor\":\"\"}}\n", currentCompatibilityVersion()));
     const GcMaintenanceState state{.janitor_cursor = R"(cas/ns/a/"quoted"\\next)"};
     EXPECT_EQ(decodeGcMaintenanceState(encodeGcMaintenanceState(state)), state);
 }
@@ -74,23 +74,23 @@ TEST(CASGCMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeGcMaintenanceState(bad("{}\n")); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { (void)decodeGcMaintenanceState(bad("{\"cur\":\"a\",\"cur\":\"b\"}\n")); });
+        [&] { (void)decodeGcMaintenanceState(bad("{\"janitor_cursor\":\"a\",\"janitor_cursor\":\"b\"}\n")); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { (void)decodeGcMaintenanceState(bad("{\"cur\":\"a\",\"extra\":1}\n")); });
+        [&] { (void)decodeGcMaintenanceState(bad("{\"janitor_cursor\":\"a\",\"extra\":1}\n")); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { (void)decodeGcMaintenanceState(bad("{\"cur\":\"a\"}\nx")); });
+        [&] { (void)decodeGcMaintenanceState(bad("{\"janitor_cursor\":\"a\"}\nx")); });
 
     const GcMaintenanceState at_limit{.janitor_cursor = String(kMaxGcMaintenanceCursorBytes, 'x')};
     EXPECT_EQ(decodeGcMaintenanceState(encodeGcMaintenanceState(at_limit)), at_limit);
     const GcMaintenanceState over_limit{.janitor_cursor = String(kMaxGcMaintenanceCursorBytes + 1, 'x')};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED,
         [&] { (void)encodeGcMaintenanceState(over_limit); });
-    const String raw = "{\"type\":\"cas_gc_maintenance_state\",\"v\":1}\n{\"cur\":\"" + over_limit.janitor_cursor + "\"}\n";
+    const String raw = "{\"type\":\"cas_gc_maintenance_state\",\"v\":1}\n{\"janitor_cursor\":\"" + over_limit.janitor_cursor + "\"}\n";
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeGcMaintenanceState(raw); });
     String oversized = R"({"type":"cas_gc_maintenance_state","v":1,"pad":")";
     oversized.append(448 * 1024, 'x');
-    oversized += "\"}\n{\"cur\":\"";
+    oversized += "\"}\n{\"janitor_cursor\":\"";
     oversized.append(kMaxGcMaintenanceCursorBytes, 'y');
     oversized += "\"}\n";
     ASSERT_GT(oversized.size(), traitsFor(FormatId::GcMaintenanceState).object_cap);
@@ -184,7 +184,7 @@ TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
     ASSERT_EQ(backend.putIfAbsent(key, fmt::format(
-        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"cur\":\"\"}}\n", currentCompatibilityVersion() + 1)).outcome,
+        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"janitor_cursor\":\"\"}}\n", currentCompatibilityVersion() + 1)).outcome,
         PutOutcome::Done);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { (void)readGcMaintenanceState(backend, layout); });

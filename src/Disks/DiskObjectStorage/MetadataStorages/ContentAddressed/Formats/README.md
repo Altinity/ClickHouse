@@ -26,8 +26,8 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest | `CasPartManifestFormat` | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |
-| `gc/state`, `gc/hb` | GC state / leader heartbeat | `CasGcStateFormat` | GC |
-| `gc/maintenance_state` | leak-only namespace-janitor cursor | `CasGcMaintenanceStateFormat` | future janitor |
+| `gc/state`, `gc/hb` | GC state (`round`, `gc_shards`, `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, `lease_owner`, `lease_seq`) / heartbeat (`owner`, `hb_seq`) | `CasGcStateFormat` | GC |
+| `gc/maintenance_state` | leak-only namespace-janitor cursor (`janitor_cursor`) | `CasGcMaintenanceStateFormat` | future janitor |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log | `CasGcOutcomesFormat` (`.zst`) | GC |
 | `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic) | `CasFoldSealFormat` | GC |
 | `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs | `CasRecordStreamFormat` | GC |
