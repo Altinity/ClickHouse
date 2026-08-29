@@ -106,10 +106,8 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
             else r.skipUnknown(key);
         } while (r.nextKey(key));
 
-        if (!blob_ref_fields.algo_word || !blob_ref_fields.digest_hex || !token_fields.type_word)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: record missing algo/digest/token_type");
         e.ref = blob_ref_fields.build("outcome log");
-        e.token = Token{token_fields.value.value_or(""), tokenTypeFromWord(*token_fields.type_word, "outcome log")};
+        e.token = token_fields.build("outcome log");
         if (!line_in.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: junk after record");
         log.entries.push_back(std::move(e));

@@ -114,4 +114,11 @@ BlobRef BlobRefFields::build(std::string_view what) const
     return BlobRef{algo, codecFor(algo).fromHex(*digest_hex)};
 }
 
+Token TokenFields::build(std::string_view what) const
+{
+    if (!type_word || !value)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: token missing token_type/token", what);
+    return Token{*value, tokenTypeFromWord(*type_word, what)};
+}
+
 }

@@ -269,8 +269,6 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     bool have_src = false;
     bool have_mark = false;
     bool have_pending = false;
-    bool have_tt = false;
-    bool have_tv = false;
     bool have_size = false;
     bool have_condemn_round = false;
     bool have_confirmed = false;
@@ -280,7 +278,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
         else if (key == RunWire::src) { out.source_id = r.readHex128(); have_src = true; }
         else if (key == RunWire::mark) { out.marker = kRunMarkerWords.fromWord(r.readString(), "CAS cas_run"); have_mark = true; }
         else if (key == RunWire::pending) { out.delete_pending = r.readBool(); have_pending = true; }
-        else if (matchTokenFields(key, r, token_fields)) { have_tt = token_fields.type_word.has_value(); have_tv = token_fields.value.has_value(); }
+        else if (matchTokenFields(key, r, token_fields)) {}
         else if (key == RunWire::size) { out.size = r.readU64Number(); have_size = true; }
         else if (key == RunWire::condemn_round) { out.condemn_round = r.readU64String(); have_condemn_round = true; }
         else if (key == RunWire::confirmed) { out.marker_confirmed = r.readBool(); have_confirmed = true; }
@@ -292,11 +290,11 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     out.ref = parseB(b);
     if (out.marker == RunMarker::Condemned)
     {
-        if (!have_pending || !have_tt || !have_tv || !have_size || !have_condemn_round || !have_confirmed)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pending/token_type/token/size/condemn_round/confirmed");
-        out.token = Token{*token_fields.value, tokenTypeFromWord(*token_fields.type_word, "cas_run")};
+        if (!have_pending || !have_size || !have_condemn_round || !have_confirmed)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pending/size/condemn_round/confirmed");
+        out.token = token_fields.build("cas_run");
     }
-    else if (have_pending || have_tt || have_tv || have_size || have_condemn_round || have_confirmed)
+    else if (have_pending || token_fields.type_word || token_fields.value || have_size || have_condemn_round || have_confirmed)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-condemned record carries condemned fields");
 
     if (!line_in.eof())

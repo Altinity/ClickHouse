@@ -147,8 +147,10 @@ TEST(CASRecordStream, CondemnedRowMissingOneOfItsSixFieldsFailsClosed)
         catch (const DB::Exception & e)
         {
             EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-            EXPECT_EQ(e.message(),
-                "CAS cas_run: condemned record missing pending/token_type/token/size/condemn_round/confirmed");
+            const String expected_message = field == R"(,"token_type":"etag")" || field == R"(,"token":"e-1")"
+                ? "CAS cas_run: token missing token_type/token"
+                : "CAS cas_run: condemned record missing pending/size/condemn_round/confirmed";
+            EXPECT_EQ(e.message(), expected_message);
         }
     }
 }

@@ -77,7 +77,7 @@ TEST(CASGCOutcomesFormat, MultiEntryRoundTripAllOutcomes)
     EXPECT_EQ(encodeOutcomeLog(d), text);
 }
 
-TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
+TEST(CASGCOutcomesFormat, RecordRequiresCompleteBlobRefAndTokenGroups)
 {
     OutcomeLog log;
     log.entries.push_back({ObjectKind::Blob,
@@ -85,16 +85,12 @@ TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
         Token{"e-1", TokenType::ETag}, OutcomeKind::Deleted});
     const String bytes = encodeOutcomeLog(log);
 
-    const String token_value = R"(,"token":"e-1")";
-    const auto token_value_pos = bytes.find(token_value);
-    ASSERT_NE(token_value_pos, String::npos);
-    String missing_token_value = bytes;
-    missing_token_value.erase(token_value_pos, token_value.size());
-    const OutcomeLog decoded = decodeOutcomeLog(missing_token_value);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].token.value, "");
-
-    for (const String & field : {String(R"(,"algo":"ch128")"), String(R"(,"digest":"00112233445566778899aabbccddeeff")"), String(R"(,"token_type":"etag")")})
+    for (const auto & [field, expected_message] : {
+        std::pair{String(R"(,"algo":"ch128")"), "CAS outcome log: blob ref missing ha/h"},
+        std::pair{String(R"(,"digest":"00112233445566778899aabbccddeeff")"), "CAS outcome log: blob ref missing ha/h"},
+        std::pair{String(R"(,"token_type":"etag")"), "CAS outcome log: token missing token_type/token"},
+        std::pair{String(R"(,"token":"e-1")"), "CAS outcome log: token missing token_type/token"},
+    })
     {
         const auto pos = bytes.find(field);
         ASSERT_NE(pos, String::npos);
@@ -108,7 +104,7 @@ TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
         catch (const DB::Exception & e)
         {
             EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-            EXPECT_EQ(e.message(), "CAS outcome log: record missing algo/digest/token_type");
+            EXPECT_EQ(e.message(), expected_message);
         }
     }
 }

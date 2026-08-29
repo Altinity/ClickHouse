@@ -191,6 +191,26 @@ TEST(CASWireVocab, MatchTokenFieldsConsumesSemanticKeysAndLeavesUnrelatedKeyUnma
     EXPECT_TRUE(saw_unmatched);
 }
 
+TEST(CASWireVocab, TokenFieldsBuildsInAnyKeyOrderAndRequiresBothFields)
+{
+    const String rendered = R"({"token":"abc","token_type":"etag"})";
+    DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
+    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    TokenFields fields;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (matchTokenFields(key, r, fields))
+            continue;
+        r.skipUnknown(key);
+    }
+    EXPECT_EQ(fields.build("t"), (Token{"abc", TokenType::ETag}));
+
+    TokenFields only_type;
+    only_type.type_word = "etag";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { only_type.build("t"); });
+}
+
 TEST(CASWireVocab, OldManifestEpochKeyDoesNotAliasTheSemanticKey)
 {
     const String rendered = R"({"me":"1","build":"2","ord":3})";
