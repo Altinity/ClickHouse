@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 
@@ -32,14 +33,7 @@ std::string_view refOwnerKindToWord(RefOwnerKind k)
 
 RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what)
 {
-    try
-    {
-        return kRefOwnerKindWords.fromWord(w, what);
-    }
-    catch (const Exception &)
-    {
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown owner kind '{}'", what, w);
-    }
+    return kRefOwnerKindWords.fromWord(w, what);
 }
 
 void checkRefTxnIdNonzero(const RefTxnId & id, std::string_view format, std::string_view field)
@@ -55,6 +49,15 @@ void writeRefTxnIdFields(CasJsonWriter & out, bool & first, std::string_view epo
     writeU64StringValue(out, id.writer_epoch);
     writeKey(out, seq_key, first);
     writeU64StringValue(out, id.ref_sequence);
+}
+
+void writeBindingFields(CasJsonWriter & out, bool & first, const BindingWireKeys & keys, const RefOwnerBinding & binding)
+{
+    checkCanonicalRefName(binding.ref_name, "RefLogTxn", "owner binding ref_name");
+    checkManifestRef(binding.manifest_ref, "RefLogTxn", "owner binding manifest_ref");
+    writeWordField(out, keys.kind, refOwnerKindToWord(binding.kind), first);
+    writeStringField(out, keys.ref, binding.ref_name, first);
+    writeManifestRefFields(out, first, keys.manifest, binding.manifest_ref);
 }
 
 }

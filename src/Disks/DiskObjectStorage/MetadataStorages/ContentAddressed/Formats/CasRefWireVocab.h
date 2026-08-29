@@ -52,6 +52,10 @@ RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what);
 /// formats can never disagree on the representation.
 void writeRefTxnIdFields(CasJsonWriter & out, bool & first, std::string_view epoch_key, std::string_view seq_key, const RefTxnId & id);
 
+/// Append one owner binding's flat fields named by `keys` to a ref-log `owner_transition` object.
+/// The binding's ref name and manifest reference are validated before writing.
+void writeBindingFields(CasJsonWriter & out, bool & first, const BindingWireKeys & keys, const RefOwnerBinding & binding);
+
 /// `RefTxnId`'s validity rule applied to ONE field of a decoded or about-to-be-encoded record: both
 /// components nonzero. `renderRefTxnId` refuses to build a key from anything else, so a half-zero id
 /// here would name an object that cannot exist -- `CORRUPTED_DATA`, in both directions.

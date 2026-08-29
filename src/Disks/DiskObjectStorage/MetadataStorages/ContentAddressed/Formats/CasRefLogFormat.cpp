@@ -45,14 +45,7 @@ static_assert(casEnumTableCoversEnum<kRefOpWords, RefOpKind>());
 
 RefOpKind opKindFromWord(std::string_view w)
 {
-    try
-    {
-        return kRefOpWords.fromWord(w, "RefLogTxn");
-    }
-    catch (const Exception &)
-    {
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind '{}'", w);
-    }
+    return kRefOpWords.fromWord(w, "RefLogTxn");
 }
 
 /// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
@@ -169,7 +162,8 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
         if (key == RefLogWire::ref)
             sp_rn = r.readString();
         else if (matchManifestRefFields(key, r, kBareManifestRefKeys, sp_manifest_fields))
-            continue;
+        {
+        }
         else if (key == RefLogWire::published_ms)
             sp_ts = r.readU64Number();
         else if (key == kOldBindingKeys.kind)
@@ -177,13 +171,15 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
         else if (key == kOldBindingKeys.ref)
             ob.ref = r.readString();
         else if (matchManifestRefFields(key, r, kOldBindingKeys.manifest, ob.manifest_fields))
-            continue;
+        {
+        }
         else if (key == kNewBindingKeys.kind)
             nb.kind = r.readString();
         else if (key == kNewBindingKeys.ref)
             nb.ref = r.readString();
         else if (matchManifestRefFields(key, r, kNewBindingKeys.manifest, nb.manifest_fields))
-            continue;
+        {
+        }
         else if (key == "pl")
             /// `"pl"` (payload) was removed from the op wire in stage-1 T12 (the `set_payload` op became
             /// `set_published_at`). The retired op WORD is already rejected by `opKindFromWord`, but this
