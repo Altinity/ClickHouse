@@ -117,7 +117,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     SourceEdgeRecord condemned_rec;
     condemned_rec.ref = bh(1);
     condemned_rec.source_id = UInt128{0};
-    condemned_rec.marker = kCondemned;
+    condemned_rec.marker = RunMarker::Condemned;
     condemned_rec.delete_pending = true;
     condemned_rec.token = Token{.value = "etag-1", .type = TokenType::Emulated};
     condemned_rec.size = 123;
@@ -127,7 +127,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     SourceEdgeRecord edge_rec;
     edge_rec.ref = bh(2);
     edge_rec.source_id = UInt128(9);
-    edge_rec.marker = kEdgeActive;
+    edge_rec.marker = RunMarker::Edge;
 
     DB::WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);

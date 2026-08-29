@@ -92,7 +92,7 @@ void writeRun(CasJsonWriter & out, std::string_view kind, const RunRef & r)
     writeKey(out, "key", first);   writeStringValue(out, r.key);
     writeKey(out, "ck", first);    writeHex128Value(out, r.checksum);
     writeKey(out, "shard", first); writeIntText(r.shard, out);
-    writeKey(out, "gen", first);   writeU64StringValue(out, r.generation);
+    writeKey(out, "gen", first);   writeU64StringValue(out, r.key_generation);
     closeObject(out, first);
 }
 
@@ -106,7 +106,7 @@ void validateFoldSealStructure(
     std::vector<bool> run_seen(gc_shards, false);
     for (const RunRef & run : seal.blob_target_runs)
     {
-        if (run.key.empty() || run.generation == 0)
+        if (run.key.empty() || run.key_generation == 0)
             throw Exception(error_code,
                 "CAS fold seal {}: blob-target run requires a nonempty key and nonzero physical generation",
                 source);
@@ -121,10 +121,10 @@ void validateFoldSealStructure(
         run_seen[run.shard] = true;
 
         const auto parsed = layout.parseBlobTargetRunKey(run.key);
-        if (!parsed || parsed->generation != run.generation || parsed->shard != run.shard || parsed->seq != 0)
+        if (!parsed || parsed->generation != run.key_generation || parsed->shard != run.shard || parsed->seq != 0)
             throw Exception(error_code,
                 "CAS fold seal {}: blob-target run key '{}' is not canonical for generation {}, shard {}, sequence 0",
-                source, run.key, run.generation, run.shard);
+                source, run.key, run.key_generation, run.shard);
     }
 
     if (seal.condemned_summary.size() != gc_shards)
@@ -496,7 +496,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS fold seal: btr requires key, ck, shard, and gen");
             seal.blob_target_runs.push_back(RunRef{
-                .key = std::move(*run_key), .checksum = *checksum, .shard = *shard, .generation = *generation});
+                .key = std::move(*run_key), .checksum = *checksum, .shard = *shard, .key_generation = *generation});
         }
         else if (kind == "cnd")
         {

@@ -101,7 +101,7 @@ bool blobPresent(Backend & backend, const Layout & layout, const DB::UInt128 & h
     return backend.head(layout.blobKey(blobRefOf(hash))).exists;
 }
 
-/// Whether ANY run the newest fold seal references carries a `kCondemned` row for `hash`. This is where
+/// Whether ANY run the newest fold seal references carries a `RunMarker::Condemned` row for `hash`. This is where
 /// a rebuild used to put its zero-edge condemnations, so "nothing was condemned" is checked HERE rather
 /// than by watching for a deletion several rounds later.
 bool condemnedInSealedRuns(Backend & backend, const Layout & layout, const DB::UInt128 & hash)
@@ -121,7 +121,7 @@ bool condemnedInSealedRuns(Backend & backend, const Layout & layout, const DB::U
             BlobRef ref;
             UInt128 sid;
             SourceEdgeKeyCodec::parse(k, ref, sid);
-            if (p.empty() || p[0] != kCondemned)
+            if (p.empty() || runMarkerFromByte(p[0], "CAS test source-edge run") != RunMarker::Condemned)
                 continue;
             if (ref.digest.toU128() == hash)
                 return true;

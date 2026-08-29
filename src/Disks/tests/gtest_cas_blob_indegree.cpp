@@ -144,27 +144,27 @@ TEST(CASBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
 
 /// ==== two-cursor settlement merge (retired-in-snapshot T3, spec §2.1/§3) ====
 ///
-/// The retired input is no longer a separate `prior_retired` vector — the prior generation's `kCondemned`
+/// The retired input is no longer a separate `prior_retired` vector — the prior generation's `RunMarker::Condemned`
 /// rows RIDE the source-edge run at the zero-sentinel key. These helpers build such a prior run directly
 /// (via the sorted-NDJSON `SourceEdgeRunWriter`, codecs-v3 phase 5) and decode a run for assertions.
 
 namespace
 {
 
-/// A `kCondemned` sentinel record for `h` at the zero source_id, carrying the condemned incarnation.
+/// A `RunMarker::Condemned` sentinel record for `h` at the zero source_id, carrying the condemned incarnation.
 SourceEdgeRecord condemnedRec(UInt128 h, const CondemnedRow & row)
 {
     return SourceEdgeRecord{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)},
-                            .source_id = UInt128{0}, .marker = kCondemned,
+                            .source_id = UInt128{0}, .marker = RunMarker::Condemned,
                             .delete_pending = row.delete_pending, .token = row.token,
                             .size = row.size, .condemn_round = row.condemn_round};
 }
 
-/// An active-edge record (`kEdgeActive`) for `h` at source `sid`.
+/// An active-edge record (`RunMarker::Edge`) for `h` at source `sid`.
 SourceEdgeRecord edgeRec(UInt128 h, UInt128 sid)
 {
     return SourceEdgeRecord{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)},
-                            .source_id = sid, .marker = kEdgeActive};
+                            .source_id = sid, .marker = RunMarker::Edge};
 }
 
 /// head_blob / peek_head stub: present with a fixed token/size.
@@ -189,7 +189,7 @@ CondemnedRow condemnedRowFor(uint64_t condemn_round, const String & tok = "t",
                         .size = size, .condemn_round = condemn_round};
 }
 
-/// Build a source-edge run (`kSourceEdgeKeySchema128`) carrying the given `kCondemned` sentinel rows
+/// Build a source-edge run (`kSourceEdgeKeySchema128`) carrying the given `RunMarker::Condemned` sentinel rows
 /// and surviving edges, write it under `blobTargetRunKey(gen, attempt, shard, 0)`, and return its
 /// `RunRef`. Rows are emitted in (blob_hash, source_id) order (sentinels at source_id 0 sort first
 /// per blob).
@@ -224,7 +224,7 @@ RunRef writeSourceEdgeRun(InMemoryBackend & backend, const Layout & layout,
     const String bytes = out.str();
     const String key = layout.blobTargetRunKey(gen, attempt, shard, 0);
     backend.putIfAbsent(key, bytes);
-    return RunRef{.key = key, .checksum = sourceEdgeRunChecksum(bytes), .shard = shard, .generation = gen};
+    return RunRef{.key = key, .checksum = sourceEdgeRunChecksum(bytes), .shard = shard, .key_generation = gen};
 }
 
 struct DecodedRun
@@ -251,11 +251,11 @@ DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
         EXPECT_FALSE(p.empty());
         if (p.empty())
             continue;
-        if (p[0] == kCondemned)
+        if (runMarkerFromByte(p[0], "CAS test source-edge run") == RunMarker::Condemned)
             d.condemned.emplace_back(bh, decodeCondemnedRow(p));
-        else if (p[0] == kZeroMarker)
+        else if (runMarkerFromByte(p[0], "CAS test source-edge run") == RunMarker::Zero)
             d.zero_markers.push_back(bh);
-        else if (p[0] == kEdgeActive)
+        else if (runMarkerFromByte(p[0], "CAS test source-edge run") == RunMarker::Edge)
             d.edges.emplace_back(bh, sid);
         else
             ADD_FAILURE() << "unknown run row type";
@@ -304,7 +304,7 @@ TEST(CASThreeCursorMerge, FloorBoundary)
     InMemoryBackend backend;
     Layout layout{"pool"};
 
-    /// Gen 1's run holds one unrelated surviving edge (b9) plus the carried kCondemned rows for A=b1
+    /// Gen 1's run holds one unrelated surviving edge (b9) plus the carried RunMarker::Condemned rows for A=b1
     /// (condemned round 2) and B=b2 (round 3); neither A nor B has any edge (in-degree 0 by definition).
     /// current_round = 3: strictly-below graduates, at-the-current-round stays.
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0,
@@ -329,7 +329,7 @@ TEST(CASThreeCursorMerge, FloorBoundary)
     EXPECT_TRUE(rmr.spared.empty());
     EXPECT_TRUE(rmr.redelete.empty());
 
-    /// still_retired mirrors exactly the kCondemned rows written into the output run, in order.
+    /// still_retired mirrors exactly the RunMarker::Condemned rows written into the output run, in order.
     const DecodedRun out = decodeRun(backend, runs2[0]);
     ASSERT_EQ(out.condemned.size(), 2u);
     EXPECT_EQ(out.condemned[0].first, b(1));
@@ -415,7 +415,7 @@ TEST(CASThreeCursorMerge, NewCandidateCondemned)
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
 
-    /// The fresh condemn is emitted as a kCondemned row (not a zero marker) into the output run.
+    /// The fresh condemn is emitted as a RunMarker::Condemned row (not a zero marker) into the output run.
     const DecodedRun out = decodeRun(backend, runs2[0]);
     ASSERT_EQ(out.condemned.size(), 1u);
     EXPECT_EQ(out.condemned[0].first, b(3));
@@ -451,7 +451,7 @@ TEST(CASThreeCursorMerge, AbsentBlobNotCondemned)
 
 TEST(CASThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
 {
-    /// Retired-in-snapshot changes the byte-invariant: the retired machinery now WRITES kCondemned
+    /// Retired-in-snapshot changes the byte-invariant: the retired machinery now WRITES RunMarker::Condemned
     /// sentinel rows into the run, so a retired-engaged run is no longer byte-identical to a plain one.
     /// The preserved invariant (spec §2.1) is narrower: the retired machinery touches ONLY the sentinel
     /// namespace — the surviving EDGE rows are byte-identical to a plain fold of the same deltas.
@@ -485,7 +485,7 @@ TEST(CASThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
 
 TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
 {
-    /// Gen 1 condemns b (a real +edge/-edge net-to-zero with head_blob present) -> a kCondemned row. Gen 2
+    /// Gen 1 condemns b (a real +edge/-edge net-to-zero with head_blob present) -> a RunMarker::Condemned row. Gen 2
     /// has NO deltas at all: the carried row must (a) survive byte-identically, (b) emit no zero marker,
     /// (c) never call peek_head (a carried sentinel is not a touch).
     InMemoryBackend backend;
@@ -502,7 +502,7 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
         const DecodedRun g1 = decodeRun(backend, runs1[0]);
         ASSERT_EQ(g1.condemned.size(), 1u);
         EXPECT_EQ(g1.condemned[0].first, b(2));
-        EXPECT_TRUE(g1.zero_markers.empty());   /// a condemned blob emits kCondemned, never a zero marker
+        EXPECT_TRUE(g1.zero_markers.empty());   /// a condemned blob emits RunMarker::Condemned, never a zero marker
     }
 
     /// Gen 2: empty deltas, current_round 1 (< 5 => b carries, does not graduate). peek_head must NOT fire.
@@ -541,7 +541,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
         out.finalize();
         const String bytes = out.str();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0),
-                         .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .generation = 1};
+                         .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .key_generation = 1};
         backend.putIfAbsent(bad.key, bytes);
 
         std::vector<RunRef> runs2;
@@ -561,7 +561,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
         out.finalize();
         const String bytes = out.str();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0),
-                         .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .generation = 1};
+                         .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .key_generation = 1};
         backend.putIfAbsent(bad.key, bytes);
 
         std::vector<RunRef> runs2;
@@ -698,7 +698,7 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     EXPECT_LE(backend.getCount(gen2_run_key), 2u);
 }
 
-/// ==== kCondemned row codec + typed source-edge open (retired-in-snapshot T2, spec §2.1) ====
+/// ==== RunMarker::Condemned row codec + typed source-edge open (retired-in-snapshot T2, spec §2.1) ====
 
 TEST(CASCondemnedRow, RoundTripAllTokenTypes)
 {
@@ -711,8 +711,26 @@ TEST(CASCondemnedRow, RoundTripAllTokenTypes)
         row.size = 4096;
         row.condemn_round = 7;
         const auto bytes = DB::Cas::encodeCondemnedRow(row);
-        ASSERT_EQ(bytes[0], DB::Cas::kCondemned);
+        ASSERT_EQ(bytes[0], DB::Cas::runMarkerByte(DB::Cas::RunMarker::Condemned));
         EXPECT_EQ(DB::Cas::decodeCondemnedRow(bytes), row);
+    }
+}
+
+TEST(CASCondemnedRow, UnknownMarkerByteFailsClosedWithCorruptedData)
+{
+    DB::Cas::CondemnedRow row;
+    row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
+    auto bytes = DB::Cas::encodeCondemnedRow(row);
+    bytes[0] = 0x03;
+
+    try
+    {
+        static_cast<void>(DB::Cas::decodeCondemnedRow(bytes));
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
     }
 }
 

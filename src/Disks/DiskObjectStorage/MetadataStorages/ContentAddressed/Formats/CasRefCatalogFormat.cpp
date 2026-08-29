@@ -351,7 +351,7 @@ uint64_t widestBlobTargetRunReservationBytes(const Layout & layout, uint64_t gc_
         .key = layout.blobTargetRunKey(max, max, gc_shards - 1, 0),
         .checksum = std::numeric_limits<UInt128>::max(),
         .shard = gc_shards - 1,
-        .generation = max});
+        .key_generation = max});
     return encodeFoldSeal(seal).size() - encodeFoldSeal(CasFoldSeal{}).size();
 }
 

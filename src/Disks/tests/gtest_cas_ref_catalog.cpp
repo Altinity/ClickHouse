@@ -704,7 +704,7 @@ TEST(CASRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimal
                 .key = layout.blobTargetRunKey(max, max, shard, 0),
                 .checksum = std::numeric_limits<UInt128>::max(),
                 .shard = shard,
-                .generation = max});
+                .key_generation = max});
             seal.condemned_summary.emplace(shard, CondemnedSummary{
                 .condemned_total = max,
                 .pending_total = max,

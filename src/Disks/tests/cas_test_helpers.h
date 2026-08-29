@@ -475,9 +475,9 @@ inline String encodeMinimalGcState(uint64_t round)
 
 /// Inject condemned bookkeeping + gc/state directly (bypassing a real GC round) so a test can seed the
 /// GC ledger's condemned state at an arbitrary round. Retired-in-snapshot: the condemned entries are
-/// seeded the way a real round leaves them — as `kCondemned` sentinel rows inside an adopted fold seal's
+/// seeded the way a real round leaves them — as `RunMarker::Condemned` sentinel rows inside an adopted fold seal's
 /// shard run (there is no separate retired-list object). A synthetic +edge/-edge pair nets each blob to
-/// in-degree 0 and a `seed_head` replays the captured token/size so the fold mints the `kCondemned` row.
+/// in-degree 0 and a `seed_head` replays the captured token/size so the fold mints the `RunMarker::Condemned` row.
 /// Also sets {round} on gc/state. Entries carry a `condemn_round` (default 0 → uses `round`); callers
 /// pass fresh (non-pending) condemns. An empty `entries` set just advances {round}.
 inline void injectRetire(
@@ -621,7 +621,7 @@ inline bool runRoundsUntilAbsent(
 
 /// The CURRENT condemned entries for `shard`, read from the adopted fold seal's `blob_target_runs`
 /// (retired-in-snapshot T4): the round no longer writes a separate retired-list object — condemned
-/// entries RIDE the source-edge run as `kCondemned` sentinel rows at the zero-sentinel key. This reads
+/// entries RIDE the source-edge run as `RunMarker::Condemned` sentinel rows at the zero-sentinel key. This reads
 /// the seal at (snap_generation, snap_attempt), opens every run for `shard`, and reconstructs the
 /// `RetiredEntry` shape (hash from the run key, the rest from the decoded `CondemnedRow`). Empty when
 /// gc/state / the seal / the runs are absent. Used by ack-floor tests to assert pending/condemn state.
@@ -649,7 +649,7 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
         String p;
         while (r.next(k, p))
         {
-            if (p.empty() || p[0] != DB::Cas::kCondemned)
+            if (p.empty() || DB::Cas::runMarkerFromByte(p[0], "CAS test source-edge run") != DB::Cas::RunMarker::Condemned)
                 continue;
             DB::Cas::BlobRef ref;
             DB::UInt128 source_id{};
@@ -668,7 +668,7 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
     return out;
 }
 
-/// True iff ANY gc-shard's adopted-seal run still holds a `kCondemned` row — the ack-floor deletion
+/// True iff ANY gc-shard's adopted-seal run still holds a `RunMarker::Condemned` row — the ack-floor deletion
 /// pipeline is in flight while this is true (retired-in-snapshot T4 replacement for the old
 /// "iterate gc/state.retired_refs" probe). `gc_shards` is read from gc/state when 0 is passed.
 inline bool anyCondemnedInSeal(
@@ -861,7 +861,7 @@ inline std::vector<DB::Cas::RunRef> runsForShard(
     }
 }
 
-/// Stream the sealed in-degree run segments `runs` and count the active source edges (`kEdgeActive`
+/// Stream the sealed in-degree run segments `runs` and count the active source edges (`RunMarker::Edge`
 /// rows) for `ref`. Test-side replacement for the deleted per-blob point query `inDegreeInGeneration`
 /// (codecs-v3 phase 5: a `cas_run` is a sequential NDJSON stream with no random access, so a blob's
 /// in-degree is recomputed by a full stream-and-count rather than a seek). A condemned / zero-marker
@@ -877,7 +877,7 @@ inline int64_t inDegreeInRuns(
         String p;
         while (r.next(k, p))
         {
-            if (p.empty() || p[0] != DB::Cas::kEdgeActive)
+            if (p.empty() || DB::Cas::runMarkerFromByte(p[0], "CAS test source-edge run") != DB::Cas::RunMarker::Edge)
                 continue;
             DB::Cas::BlobRef row_ref;
             DB::UInt128 source_id{};

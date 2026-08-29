@@ -35,7 +35,7 @@ TEST(CASFormatBattery, FoldSeal)
     seal.generation = 5;
     seal.parent_generation = 4;
     seal.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{7, 11}};
-    seal.blob_target_runs.push_back(RunRef{.key = "r0", .checksum = UInt128(0x0f), .shard = 0, .generation = 5});
+    seal.blob_target_runs.push_back(RunRef{.key = "r0", .checksum = UInt128(0x0f), .shard = 0, .key_generation = 5});
     seal.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1,
                                                  .oldest_nonpending_condemn_round = 4};
     runFormatBattery({FormatId::FoldSeal,
@@ -72,8 +72,8 @@ TEST(CASFoldSealFormat, AuthoritativeDecodeRejectsTwoBlobTargetRunsForOneShard)
     seal.generation = 7;
     seal.parent_generation = 6;
     seal.blob_target_runs = {
-        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .generation = 7},
-        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .generation = 7},
+        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .key_generation = 7},
+        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .key_generation = 7},
     };
     seal.condemned_summary[0] = CondemnedSummary{};
 
@@ -88,8 +88,8 @@ TEST(CASFoldSealFormatDeathTest, ProducerValidationRejectsMalformedSealBeforePut
     const Layout layout("p");
     CasFoldSeal seal;
     seal.blob_target_runs = {
-        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .generation = 7},
-        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .generation = 7}};
+        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .key_generation = 7},
+        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .key_generation = 7}};
     seal.condemned_summary[0] = CondemnedSummary{};
     EXPECT_DEATH({ validateFoldSealForWrite(seal, layout, 1); }, "duplicate blob-target shard");
 }
@@ -99,8 +99,8 @@ TEST(CASFoldSealFormat, ProducerValidationRejectsMalformedSealBeforePut)
     const Layout layout("p");
     CasFoldSeal seal;
     seal.blob_target_runs = {
-        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .generation = 7},
-        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .generation = 7}};
+        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .key_generation = 7},
+        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .key_generation = 7}};
     seal.condemned_summary[0] = CondemnedSummary{};
     cas_battery_detail::expectCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { validateFoldSealForWrite(seal, layout, 1); }, "duplicate blob-target shard");
@@ -117,7 +117,7 @@ TEST(CASFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryFiel
         .key = layout.blobTargetRunKey(7, 1, 0, 0),
         .checksum = UInt128{1},
         .shard = 0,
-        .generation = 7});
+        .key_generation = 7});
     seal.condemned_summary[0] = CondemnedSummary{};
     const String valid = encodeFoldSeal(seal);
 
@@ -161,7 +161,7 @@ TEST(CASFoldSealFormat, AuthoritativeDecodeRejectsNoncanonicalRowsAndIncompleteS
         .key = layout.blobTargetRunKey(7, 1, 1, 0),
         .checksum = UInt128{1},
         .shard = 1,
-        .generation = 7});
+        .key_generation = 7});
     seal.condemned_summary[0] = CondemnedSummary{};
 
     cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
@@ -254,7 +254,7 @@ TEST(CASFoldSeal, FoldSealCondemnedSummaryRoundTrips)
     s.parent_generation = 8;
     s.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = 2};
     s.blob_target_runs.push_back(RunRef{.key = "gc/gen/9/blob_target/0/0", .checksum = UInt128(0x77),
-                                        .shard = 0, .generation = 9});
+                                        .shard = 0, .key_generation = 9});
     s.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1,
                                               .oldest_nonpending_condemn_round = 5};
     s.condemned_summary[1] = CondemnedSummary{};   /// explicit zero entry (totality over gc_shards)

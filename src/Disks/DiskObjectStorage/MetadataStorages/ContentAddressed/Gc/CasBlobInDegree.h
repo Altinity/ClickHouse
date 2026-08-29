@@ -20,7 +20,7 @@ namespace DB::Cas
 
 /// In-memory description of a blob incarnation condemned by the in-degree merge. The exact token and
 /// size are captured from the blob HEAD so the GC caller can issue an exact-token deletion later;
-/// `condemn_round` controls round-paced graduation. Entries are decoded from `kCondemned` rows and are
+/// `condemn_round` controls round-paced graduation. Entries are decoded from `RunMarker::Condemned` rows and are
 /// returned through `RetiredMergeResult`; the type itself has no serialized representation.
 struct RetiredEntry
 {
@@ -324,10 +324,10 @@ struct GcRoundWorkBudget
     bool outcomeEntryAvailable() const { return max_outcome_entries == 0 || outcome_entries_used < max_outcome_entries; }
 };
 
-/// Merge the prior generation's source-edge run with new deltas. The prior run's `kCondemned` rows RIDE
+/// Merge the prior generation's source-edge run with new deltas. The prior run's `RunMarker::Condemned` rows RIDE
 /// the source-edge run itself at the zero-sentinel key (`source_id = 0`), so there is no separate
 /// `prior_retired` cursor — the prior run IS the retired input. `PriorEdgeCursor` decodes each sentinel
-/// `kCondemned` row and hands it to the per-blob close-out (in ascending hash order, exactly the order
+/// `RunMarker::Condemned` row and hands it to the per-blob close-out (in ascending hash order, exactly the order
 /// the old sorted vector had). Settlement rules, in order, per condemned row for blob `h` with post-merge
 /// in-degree `d`:
 ///   delete_pending (prior pass)                -> redelete if d = 0 (the caller executes the exact-token
@@ -342,9 +342,9 @@ struct GcRoundWorkBudget
 ///                                                 `confirm_condemned_marker` below): an unconfirmed
 ///                                                 entry is carried unchanged instead;
 ///   d = 0 otherwise                             -> still_retired, carried byte-unchanged.
-/// A carried `kCondemned` row is SETTLEMENT-ONLY: it never sets the blob's `cur_touched` bit, so a
+/// A carried `RunMarker::Condemned` row is SETTLEMENT-ONLY: it never sets the blob's `cur_touched` bit, so a
 /// generation that only carries the row emits no zero-marker and pays no `peek_head` HEAD. The surviving
-/// `still_retired` entries are re-emitted as `kCondemned` sentinel rows into the OUTPUT run (one sentinel
+/// `still_retired` entries are re-emitted as `RunMarker::Condemned` sentinel rows into the OUTPUT run (one sentinel
 /// per blob, emitted before the blob's edges since the sentinel key sorts first), so the next generation
 /// reads them back — `still_retired` mirrors exactly those rows, in the same order.
 /// When the pass is clamped on any shard, landed-before-cut events may remain unfolded behind the clamp,

@@ -26,17 +26,17 @@ BlobRef chRef(uint64_t n)
 
 SourceEdgeRecord edge(const BlobRef & ref, uint64_t source_id)
 {
-    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(source_id), .marker = kEdgeActive};
+    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(source_id), .marker = RunMarker::Edge};
 }
 
 SourceEdgeRecord zero(const BlobRef & ref)
 {
-    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = kZeroMarker};
+    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = RunMarker::Zero};
 }
 
 SourceEdgeRecord condemned(const BlobRef & ref, const Token & token, uint64_t size, uint64_t round, bool pend)
 {
-    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = kCondemned,
+    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = RunMarker::Condemned,
                             .delete_pending = pend, .token = token, .size = size, .condemn_round = round};
 }
 
@@ -98,18 +98,18 @@ TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
 
     EXPECT_EQ(back[0].ref, a);
     EXPECT_EQ(back[0].source_id, UInt128(10));
-    EXPECT_EQ(back[0].marker, kEdgeActive);
+    EXPECT_EQ(back[0].marker, RunMarker::Edge);
 
     EXPECT_EQ(back[1].ref, b);
     EXPECT_EQ(back[1].source_id, UInt128(0));
-    EXPECT_EQ(back[1].marker, kCondemned);
+    EXPECT_EQ(back[1].marker, RunMarker::Condemned);
     EXPECT_TRUE(back[1].delete_pending);
     EXPECT_EQ(back[1].token, (Token{"e-1", TokenType::ETag}));
     EXPECT_EQ(back[1].size, 4242u);
     EXPECT_EQ(back[1].condemn_round, 7u);
 
     EXPECT_EQ(back[2].ref, c);
-    EXPECT_EQ(back[2].marker, kZeroMarker);
+    EXPECT_EQ(back[2].marker, RunMarker::Zero);
 }
 
 TEST(CASRecordStream, WriterIsByteDeterministic)

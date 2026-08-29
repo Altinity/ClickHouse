@@ -54,7 +54,7 @@ bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash
 /// is in flight while this is true.
 bool anyRetiredPending(const PoolPtr & s)
 {
-    /// Retired-in-snapshot (T4): condemned state rides the adopted fold seal's kCondemned rows, not a
+    /// Retired-in-snapshot (T4): condemned state rides the adopted fold seal's RunMarker::Condemned rows, not a
     /// separate retired list — reconstruct the in-flight set from the seal.
     return anyCondemnedInSeal(s->backend(), s->layout());
 }

@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
 
@@ -18,6 +19,25 @@ namespace DB::Cas
 
 namespace
 {
+
+namespace RunWire
+{
+    constexpr WireKey ref{"b"};
+    constexpr WireKey src{"s"};
+    constexpr WireKey mark{"m"};
+    constexpr WireKey pending{"pend"};
+    constexpr WireKey size{"sz"};
+    constexpr WireKey condemn_round{"cr"};
+    constexpr WireKey confirmed{"mc"};
+}
+
+constexpr EnumWireTable<RunMarker, 3> kRunMarkerWords{{{
+    {RunMarker::Zero, "zero"},
+    {RunMarker::Edge, "edge"},
+    {RunMarker::Condemned, "condemned"},
+}}};
+
+static_assert(casEnumTableCoversEnum<kRunMarkerWords, RunMarker>());
 
 UInt128 toWideChecksum(CityHash_v1_0_2::uint128 h)
 {
@@ -78,26 +98,11 @@ BlobRef parseB(std::string_view b)
     return ref;
 }
 
-std::string_view markerToWord(char m)
-{
-    switch (m)
-    {
-        case kEdgeActive: return "edge";
-        case kZeroMarker: return "zero";
-        case kCondemned:  return "condemned";
-        default:
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: unknown row marker 0x{:02x}", static_cast<uint8_t>(m));
-    }
 }
 
-char markerFromWord(std::string_view w)
+std::string_view runMarkerToWireWord(RunMarker marker)
 {
-    if (w == "edge")      return kEdgeActive;
-    if (w == "zero")      return kZeroMarker;
-    if (w == "condemned") return kCondemned;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: unknown row marker '{}'", w);
-}
-
+    return kRunMarkerWords.toWord(marker, "CAS cas_run: RunMarker");
 }
 
 void writeRunHeaderLine(WriteBuffer & out, std::string_view kind)
@@ -174,23 +179,16 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
 
     scratch.clear();
     bool first = true;
-    writeKey(scratch, "b", first);
-    writeStringValue(scratch, renderB(rec.ref));
-    writeKey(scratch, "s", first);
-    writeHex128Value(scratch, rec.source_id);
-    writeKey(scratch, "m", first);
-    writeStringValue(scratch, markerToWord(rec.marker));
-    if (rec.marker == kCondemned)
+    writeStringField(scratch, RunWire::ref, renderB(rec.ref), first);
+    writeHex128Field(scratch, RunWire::src, rec.source_id, first);
+    writeWordField(scratch, RunWire::mark, runMarkerToWireWord(rec.marker), first);
+    if (rec.marker == RunMarker::Condemned)
     {
-        writeKey(scratch, "pend", first);
-        writeBoolValue(scratch, rec.delete_pending);
+        writeBoolField(scratch, RunWire::pending, rec.delete_pending, first);
         writeTokenFields(scratch, first, rec.token);   /// tt + tv
-        writeKey(scratch, "sz", first);
-        writeIntText(rec.size, scratch);
-        writeKey(scratch, "cr", first);
-        writeU64StringValue(scratch, rec.condemn_round);
-        writeKey(scratch, "mc", first);
-        writeBoolValue(scratch, rec.marker_confirmed);
+        writeNumberField(scratch, RunWire::size, rec.size, first);
+        writeU64StringField(scratch, RunWire::condemn_round, rec.condemn_round, first);
+        writeBoolField(scratch, RunWire::confirmed, rec.marker_confirmed, first);
     }
     closeObject(scratch, first);
     writeChar('\n', scratch);
@@ -263,7 +261,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
 
     SourceEdgeRecord out;
     String b;
-    String tv;
+    TokenFields token_fields;
     bool have_b = false;
     bool have_s = false;
     bool have_m = false;
@@ -273,29 +271,27 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     bool have_sz = false;
     bool have_cr = false;
     bool have_mc = false;
-    TokenType tt{};
     do
     {
-        if (key == "b") { b = r.readString(); have_b = true; }
-        else if (key == "s") { out.source_id = r.readHex128(); have_s = true; }
-        else if (key == "m") { out.marker = markerFromWord(r.readString()); have_m = true; }
-        else if (key == "pend") { out.delete_pending = r.readBool(); have_pend = true; }
-        else if (key == "tt") { tt = tokenTypeFromWord(r.readString(), "cas_run"); have_tt = true; }
-        else if (key == "tv") { tv = r.readString(); have_tv = true; }
-        else if (key == "sz") { out.size = r.readU64Number(); have_sz = true; }
-        else if (key == "cr") { out.condemn_round = r.readU64String(); have_cr = true; }
-        else if (key == "mc") { out.marker_confirmed = r.readBool(); have_mc = true; }
+        if (key == RunWire::ref) { b = r.readString(); have_b = true; }
+        else if (key == RunWire::src) { out.source_id = r.readHex128(); have_s = true; }
+        else if (key == RunWire::mark) { out.marker = kRunMarkerWords.fromWord(r.readString(), "CAS cas_run"); have_m = true; }
+        else if (key == RunWire::pending) { out.delete_pending = r.readBool(); have_pend = true; }
+        else if (matchTokenFields(key, r, token_fields)) { have_tt = token_fields.type_word.has_value(); have_tv = token_fields.value.has_value(); }
+        else if (key == RunWire::size) { out.size = r.readU64Number(); have_sz = true; }
+        else if (key == RunWire::condemn_round) { out.condemn_round = r.readU64String(); have_cr = true; }
+        else if (key == RunWire::confirmed) { out.marker_confirmed = r.readBool(); have_mc = true; }
         else r.skipUnknown(key);   /// Strict => any unknown key is CORRUPTED_DATA
     } while (r.nextKey(key));
 
     if (!have_b || !have_s || !have_m)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: record missing b/s/m");
     out.ref = parseB(b);
-    if (out.marker == kCondemned)
+    if (out.marker == RunMarker::Condemned)
     {
         if (!have_pend || !have_tt || !have_tv || !have_sz || !have_cr || !have_mc)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pend/tt/tv/sz/cr/mc");
-        out.token = Token{tv, tt};
+        out.token = Token{*token_fields.value, tokenTypeFromWord(*token_fields.type_word, "cas_run")};
     }
     else if (have_pend || have_tt || have_tv || have_sz || have_cr || have_mc)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-condemned record carries condemned fields");

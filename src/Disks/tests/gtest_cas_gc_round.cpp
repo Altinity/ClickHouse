@@ -129,7 +129,7 @@ GcState readState(InMemoryBackend & b, const Pool & s)
     return decodeGcState(got->bytes);
 }
 
-/// Whether ANY gc-shard's adopted-seal run still holds a `kCondemned` row (retired-in-snapshot T4: the
+/// Whether ANY gc-shard's adopted-seal run still holds a `RunMarker::Condemned` row (retired-in-snapshot T4: the
 /// retired state rides the snapshot run, not a separate retired-list object) — the ack-floor deletion
 /// pipeline is still in flight while this is true.
 bool anyRetiredPending(InMemoryBackend & b, const Pool & s)
@@ -542,7 +542,7 @@ TEST(CASGCRound, PublishDropReclaimsBlobAndManifestToFixpoint)
 
 /// retired-in-snapshot T4: after a round condemns one blob, the ADOPTED fold seal's per-shard
 /// condemned_summary reflects it (condemned_total == 1, pending_total == 0) — distilled zero-I/O from the
-/// kCondemned rows the fold sealed into the snapshot run.
+/// RunMarker::Condemned rows the fold sealed into the snapshot run.
 TEST(CASGCRound, CondemnRoundSealSummaryCountsCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -582,7 +582,7 @@ TEST(CASGCRound, CondemnRoundSealSummaryCountsCondemned)
         << "a non-pending condemned entry records its condemn round";
 }
 
-/// retired-in-snapshot T5: `previewDeletes` streams the adopted seal's `kCondemned` rows and reports each
+/// retired-in-snapshot T5: `previewDeletes` streams the adopted seal's `RunMarker::Condemned` rows and reports each
 /// with the STORED condemn-time token — `awaiting_graduation` while newly condemned, then `delete_pending`
 /// once graduated, and NOTHING once the exact-token redelete has removed the blob. The preview performs no
 /// HEAD on the condemned rows (the token is durable in-run) and is WRITE-FREE throughout (spec §5 req 1).
@@ -602,7 +602,7 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     EXPECT_TRUE(gc.previewDeletes().empty()) << "a live-referenced blob is never previewed for deletion";
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    runRegularRoundReclaiming(gc);                 /// condemning round: -1 => in-degree 0 => kCondemned row (not pending)
+    runRegularRoundReclaiming(gc);                 /// condemning round: -1 => in-degree 0 => RunMarker::Condemned row (not pending)
 
     /// Write-free contract: a full key->token snapshot must be identical across the previewDeletes call.
     const auto before = snapshotKeyTokens(*backend);
@@ -689,7 +689,7 @@ TEST(CASGCRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
         const auto parsed = store->layout().parseBlobTargetRunKey(run.key);
         ASSERT_TRUE(parsed.has_value());
         EXPECT_EQ(parsed->shard, run.shard);
-        EXPECT_EQ(parsed->generation, run.generation);
+        EXPECT_EQ(parsed->generation, run.key_generation);
         EXPECT_EQ(parsed->seq, 0u);
     }
     EXPECT_TRUE(run_seen[0]);
@@ -1468,7 +1468,7 @@ TEST(CASGCRetention, PruneRetainsLiveReferencedRun)
         backend->get(store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
     ASSERT_EQ(seal1.blob_target_runs.size(), 1u);
     const String referenced_run_key = seal1.blob_target_runs.front().key;
-    ASSERT_EQ(seal1.blob_target_runs.front().generation, ref_gen);
+    ASSERT_EQ(seal1.blob_target_runs.front().key_generation, ref_gen);
     ASSERT_TRUE(backend->head(referenced_run_key).exists);
 
     /// Several idle rounds: no delta, no retired => pure ref-carry. Each round advances the generation
@@ -1493,7 +1493,7 @@ TEST(CASGCRetention, PruneRetainsLiveReferencedRun)
         backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
     ASSERT_EQ(seal_now.blob_target_runs.size(), 1u);
     EXPECT_EQ(seal_now.blob_target_runs.front().key, referenced_run_key);
-    EXPECT_EQ(seal_now.blob_target_runs.front().generation, ref_gen);
+    EXPECT_EQ(seal_now.blob_target_runs.front().key_generation, ref_gen);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
         << "folding still resolves in-degree through the retained, carried parent ref";
 
@@ -1548,7 +1548,7 @@ TEST(CASGCRetention, HandOffDeletesSupersededRef)
     const auto seal_after = decodeFoldSeal(
         backend->get(store->layout().foldSealKey(st_after.snap_generation, st_after.snap_attempt))->bytes);
     for (const RunRef & rr : seal_after.blob_target_runs)
-        EXPECT_NE(rr.generation, old_gen) << "the live seal must have moved its ref off gen-1";
+        EXPECT_NE(rr.key_generation, old_gen) << "the live seal must have moved its ref off gen-1";
 
     /// ... and the post-CAS hand-off delete reclaimed gen-1's WHOLE prefix (not just the single run
     /// object): seal, attempt subtree, run — all gone. The ordinary prune would have leaked it because its

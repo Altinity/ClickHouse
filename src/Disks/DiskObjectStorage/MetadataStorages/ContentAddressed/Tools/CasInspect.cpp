@@ -351,7 +351,7 @@ String renderRunRef(const RunRef & r)
         .add("key", jsonEscape(r.key))
         .add("checksum", jsonHex(r.checksum))
         .add("shard", jsonUInt(r.shard))
-        .add("generation", jsonUInt(r.generation))
+        .add("generation", jsonUInt(r.key_generation))
         .str();
 }
 
@@ -379,7 +379,7 @@ String renderFoldSeal(const CasFoldSeal & seal)
     for (const auto & r : seal.blob_target_runs)
         blob_target_runs.push_back(renderRunRef(r));
 
-    /// A fold seal carries per-GC-shard totals for `kCondemned` rows in its source runs. Render the
+    /// A fold seal carries per-GC-shard totals for `RunMarker::Condemned` rows in its source runs. Render the
     /// summary from the seal itself; the older separate retired-reference object is no longer part
     /// of the current layout.
     JsonObj condemned_summary;
@@ -463,17 +463,11 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
 }
 
 /// The word vocabulary a row's marker byte renders as, matching the `cas_run` NDJSON's own `"m"` field
-/// words (`CasRecordStreamFormat.cpp`'s private `markerToWord`) so cas-inspect speaks the same vocabulary
+/// words (`runMarkerToWireWord`) so cas-inspect speaks the same vocabulary
 /// as the on-disk format rather than inventing a second one.
-String sourceEdgeRowKindName(char marker)
+String sourceEdgeRowKindName(RunMarker marker)
 {
-    switch (marker)
-    {
-        case kEdgeActive: return "edge";
-        case kZeroMarker: return "zero";
-        case kCondemned:  return "condemned";
-        default: return "unknown";
-    }
+    return String(runMarkerToWireWord(marker));
 }
 
 String renderCondemnedRow(const CondemnedRow & r)
@@ -514,7 +508,7 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
         if (payload.empty())
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
                 "cas-inspect: source-edge run row for blob {} has an empty payload", blobIdOf(ref));
-        const char marker = payload[0];
+        const RunMarker marker = runMarkerFromByte(payload[0], "cas-inspect: source-edge run row");
 
         distinct_blobs.insert(ref);
         JsonObj row;
@@ -527,20 +521,16 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
 
         switch (marker)
         {
-            case kEdgeActive:
+            case RunMarker::Edge:
                 ++edge_count;
                 break;
-            case kZeroMarker:
+            case RunMarker::Zero:
                 ++zero_marker_count;
                 break;
-            case kCondemned:
+            case RunMarker::Condemned:
                 ++condemned_count;
                 row.add("condemned", renderCondemnedRow(decodeCondemnedRow(payload)));   // CORRUPTED_DATA on malformed (fail-closed)
                 break;
-            default:
-                throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                    "cas-inspect: source-edge run row for blob {} has an unknown marker 0x{:02x}",
-                    blobIdOf(ref), static_cast<uint8_t>(marker));
         }
         rows.push_back(row.str());
     }

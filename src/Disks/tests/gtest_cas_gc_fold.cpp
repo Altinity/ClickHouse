@@ -249,7 +249,7 @@ TEST(CASGCFold, EmptyDeltaShardCarriesParentRunRef)
     EXPECT_EQ(carried.key, parent_ref.key) << "carried ref points at the PARENT generation's run key";
     EXPECT_EQ(carried.checksum, parent_ref.checksum);
     EXPECT_EQ(carried.shard, 0u);
-    EXPECT_EQ(carried.generation, st1.snap_generation)
+    EXPECT_EQ(carried.key_generation, st1.snap_generation)
         << "the carried ref names the generation whose key namespace physically holds the object";
 }
 
@@ -314,7 +314,7 @@ TEST(CASGCFold, PreviewResolvesCarriedRef)
     const auto seal2 = decodeFoldSeal(
         backend->get(store->layout().foldSealKey(st2.snap_generation, st2.snap_attempt))->bytes);
     ASSERT_EQ(seal2.blob_target_runs.size(), 1u);
-    ASSERT_EQ(seal2.blob_target_runs.front().generation, st1.snap_generation)
+    ASSERT_EQ(seal2.blob_target_runs.front().key_generation, st1.snap_generation)
         << "the current seal's ref physically lives at the parent generation (carried, not reconstructed)";
 
     // The preview resolves the carried ref (a gen-1 physical key) and computes in-degree 1 => blob 1 is

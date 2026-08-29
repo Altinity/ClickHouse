@@ -800,7 +800,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// The NON-SENTINEL source edges the snapshot still holds on each unreferenced blob, collected in
     /// `detail` mode only. `in_run_hashes` alone answers "does GC still see this blob at all"; the
     /// stale-edge cross-check below needs the edge IDENTITIES so it can ask whether their source
-    /// manifests still exist. Sentinel rows (`source_id == 0` — `kZeroMarker`/`kCondemned`) are not
+    /// manifests still exist. Sentinel rows (`source_id == 0` — `RunMarker::Zero`/`RunMarker::Condemned`) are not
     /// edges and are excluded.
     std::unordered_map<BlobRef, std::vector<UInt128>, BlobRefHash> unref_edge_sources;
     bool have_gc_state = false;
@@ -821,8 +821,8 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
             /// construction. Every row whose hash is in our candidate set marks "known to GC" —
             /// edges still counted (drop unfolded), an explicit zero-marker mid-pipeline, or a
-            /// `kCondemned` sentinel row that carries the condemned state (retired-in-snapshot):
-            /// the `kCondemned` rows feed `retired_by_hash` (the `PendingGc` classification) in the
+            /// `RunMarker::Condemned` sentinel row that carries the condemned state (retired-in-snapshot):
+            /// the `RunMarker::Condemned` rows feed `retired_by_hash` (the `PendingGc` classification) in the
             /// SAME pass, replacing the removed `retired_refs`/`decodeRetiredSet` loop.
             ///
             /// These sets are keyed by the full `BlobRef`, not a narrowed digest. The run's own
@@ -852,7 +852,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                             in_run_hashes.insert(ref);
                             if (detail && source_id != UInt128{0})
                                 unref_edge_sources[ref].push_back(source_id);
-                            if (!payload.empty() && payload[0] == kCondemned)
+                            if (!payload.empty() && runMarkerFromByte(payload[0], "CAS source-edge run") == RunMarker::Condemned)
                             {
                                 const CondemnedRow row = decodeCondemnedRow(payload);
                                 RetiredEntry e;

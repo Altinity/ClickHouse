@@ -91,7 +91,7 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     SourceEdgeRecord active;
     active.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(2))};
     active.source_id = UInt128(5);
-    active.marker = kEdgeActive;
+    active.marker = RunMarker::Edge;
     writer.append(active);
 
     writer.finish();
