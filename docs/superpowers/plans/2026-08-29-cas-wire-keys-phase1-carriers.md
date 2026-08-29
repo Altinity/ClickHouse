@@ -1,8 +1,17 @@
-# CAS Wire Keys — Phase 1 (Carriers) Implementation Plan
+---
+description: 'Phase-1 implementation plan for the CAS semantic wire-keys design: move every codec onto single carriers with the old spellings, persisted wire bytes frozen'
+sidebar_label: 'CAS wire keys phase 1'
+sidebar_position: 20
+slug: /superpowers/plans/cas-wire-keys-phase1-carriers
+title: 'CAS wire keys — phase 1 (carriers)'
+doc_type: 'guide'
+---
+
+# CAS Wire Keys — Phase 1 (Carriers) Implementation Plan {#cas-wire-keys-phase1-plan}
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Behavior-preserving preparation for the CAS semantic wire-keys cut: every codec's keys and enum words move onto single production carriers (`WireKey` constants, key bundles, `EnumWireTable`) with the OLD spellings, so that phase 2 flips the vocabulary in one place.
+**Goal:** Persisted-wire-preserving preparation for the CAS semantic wire-keys cut: every codec's keys and enum words move onto single production carriers (`WireKey` constants, key bundles, `EnumWireTable`) with the OLD spellings, so that phase 2 flips the vocabulary in one place. "Persisted-wire-preserving", not "behavior-preserving": persisted bytes are frozen absolutely; two narrow non-wire surfaces may change where a task says so (a defensive encode-branch error code, and `CasInspect` word normalization).
 
 **Architecture:** Three infrastructure pieces land first (`WireKey` + field write helpers in `CasTextFormat.h`; `EnumWireTable` in a new header with `magic_enum`-backed asserts confined to `.cpp`/tests; the shared envelope-limits header owning `kMinBlobHeaderLen`). Then each of the codecs migrates its writer and reader onto the carriers, codec by codec, with the wire bytes proven unchanged by the existing goldens. Four audit-driven member renames and the test-battery closure ride along. NOTHING in this plan changes a single persisted byte.
 
@@ -12,14 +21,29 @@
 
 **Follow-up plans (deferred with placement, not dropped):** phase 2 (atomic wire cut: new spellings, generation reset, goldens, tightenings, `static_assert` budget, `writeWordArrayField`+`algos_used` array, `class` words, `min_active_build_sequence`) will be written as `docs/superpowers/plans/<date>-cas-wire-keys-phase2-cut.md` after this plan's Task 21 gate passes; phase 3 (proof and measurement) as `...-phase3-proof.md` after phase 2. The `writeWordArrayField` primitive deliberately does NOT appear in this plan — it lands in phase 2 with its only consumer.
 
-## Global Constraints
+## Global Constraints {#global-constraints}
 
-- **Wire bytes are frozen for this entire plan.** Every existing golden stays byte-identical. If any `CAS*` test wants a changed expected string, the change is wrong — with exactly one sanctioned exception, stated in Task 3 Step 6 (a *defensive, unreachable-by-input* encode-branch error code may change; never a decode behavior).
-- Branch: work on `cas-gc-rebuild` (where the spec lives) or a worktree branched from it. Never rebase or amend; new commits only. Never push.
+- **Persisted wire bytes are frozen for this entire plan.** Every existing wire golden stays
+  byte-identical. If any `CAS*` test wants a changed expected string, the change is wrong — with
+  exactly two sanctioned, per-commit-documented exceptions: (a) Task 2 Step 6 — a *defensive,
+  unreachable-by-input* encode-branch error code may change (never a decode behavior); (b) Task 19 —
+  `CasInspect` introspection output is normalized onto the wire words, with every changed word
+  pinned by a new exact assertion.
+- Branch: work directly on `cas-gc-rebuild` (where the spec lives) — no worktrees, no branch
+  switches. Never rebase or amend; new commits only. Never push.
 - C++ style: Allman braces everywhere. Comments state constraints, not provenance — never cite this plan, the spec, or reviews in code comments.
-- Test gate: `$BUILD/src/unit_tests_dbms --gtest_filter='CAS*'` — the filter is EXACTLY `CAS*`, never widened and never narrowed. `$BUILD` is your build directory (e.g. `build`). If the binary is not at `$BUILD/src/unit_tests_dbms`, find it once with `find $BUILD -name unit_tests_dbms` and use that path throughout.
-- Build command (always redirect, per project rules): `ninja -C $BUILD unit_tests_dbms > $BUILD/build_wirekeys.log 2>&1; echo EXIT=$?` — no `-j`, no `nproc`. On failure, have a subagent summarize the log.
-- Run the gate GREEN before starting each task (proves you start from a good tree) and GREEN after (proves the task preserved behavior). Log to a unique file per run: `$BUILD/test_cas_task<N>.log`.
+- The mandatory FULL GATE is `$BUILD/src/unit_tests_dbms --gtest_filter='CAS*'` — as the gate, the
+  filter is EXACTLY `CAS*`. Focused filters (e.g. one suite) are fine as fast development runs
+  inside a step, but never substitute for the task's closing full gate. `$BUILD` is your build
+  directory (e.g. `build`). If the binary is not at `$BUILD/src/unit_tests_dbms`, find it once with
+  `find $BUILD -name unit_tests_dbms` and use that path throughout.
+- Build command (always redirect, per project rules; the exit status must propagate — do not append
+  `echo`): `ninja -C $BUILD unit_tests_dbms > $BUILD/build_wirekeys_task<N>.log 2>&1` — no `-j`, no
+  `nproc`. Have a subagent summarize every build and test log (not only failures); logs get unique
+  per-task names.
+- Run the full gate GREEN once before Task 1 (the plan's baseline); after that, each task ends with
+  its own GREEN full gate, which is the next task's baseline. Log to a unique file per run:
+  `$BUILD/test_cas_task<N>.log`.
 - `magic_enum` may be included ONLY from `.cpp` files and test files, never from headers under `Formats/`.
 - No `std::map`/`std::unordered_map`, no heap allocation, no stored callables anywhere in the carriers. `EnumWireTable::toWord` is a direct indexed lookup; `fromWord` is a linear scan.
 - Reader grammar stays hand-written and explicit: match helpers never own the read loop, never decide unknown-key policy, never track requiredness (spec: "helper-versus-framework boundary").
@@ -27,7 +51,7 @@
 
 ---
 
-### Task 1: `WireKey` and the per-encoding field write helpers
+### Task 1: `WireKey` and the per-encoding field write helpers {#task-1}
 
 **Files:**
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h`
@@ -152,11 +176,11 @@ git commit -m "cas: add WireKey and per-encoding field write helpers"
 
 ---
 
-### Task 2: `EnumWireTable` with compile-time proofs
+### Task 2: `EnumWireTable` with compile-time proofs {#task-2}
 
 **Files:**
-- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnumWireTable.h`
-- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnumWireTableAsserts.h`
+- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h` — the header lives in `Primitives/`, NOT `Formats/`: `Primitives` has zero outward dependencies (its README states the layering) and both `Primitives/CasBlobDigest` and every `Formats/` codec must be able to include the table in the allowed direction
+- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h`
 - Test: Create `src/Disks/tests/gtest_cas_enum_wire_table.cpp` (register it the same way sibling `gtest_cas_*.cpp` files are registered — check `src/Disks/tests/CMakeLists.txt` or the glob the directory uses; if sibling tests need no registration, neither does this one)
 
 **Interfaces:**
@@ -167,8 +191,8 @@ git commit -m "cas: add WireKey and per-encoding field write helpers"
 - [ ] **Step 1: Write the failing test** — `gtest_cas_enum_wire_table.cpp`:
 
 ```cpp
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnumWireTable.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnumWireTableAsserts.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <gtest/gtest.h>
 
@@ -323,7 +347,7 @@ struct EnumWireTable
 
 #include <magic_enum.hpp>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnumWireTable.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h>
 
 namespace DB::Cas
 {
@@ -358,15 +382,15 @@ If `magic_enum.hpp`'s include path differs in this tree, find it with `grep -rn 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnumWireTable.h \
-        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnumWireTableAsserts.h \
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h \
         src/Disks/tests/gtest_cas_enum_wire_table.cpp
 git commit -m "cas: add EnumWireTable with set-equality coverage proofs"
 ```
 
 ---
 
-### Task 3: One compile-time owner for `kMinBlobHeaderLen`
+### Task 3: One compile-time owner for `kMinBlobHeaderLen` {#task-3}
 
 **Files:**
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnvelopeLimits.h`
@@ -395,9 +419,7 @@ inline constexpr uint64_t kMinBlobHeaderLen = 240;
 }
 ```
 
-- [ ] **Step 2: In `CasPoolMetaFormat.cpp`** delete the line `static constexpr uint64_t kMinBlobHeaderLen = 240;` (keeping the derivation comment above it in place), add `#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnvelopeLimits.h>`. In `CasBlobEnvelopeFormat.cpp` add the same include (unused for now — it marks the second reader of the constant; phase 2 anchors the `static_assert` there).
-
-If the style check rejects an unused include, add it in phase 2 instead and note that in the commit message.
+- [ ] **Step 2: In `CasPoolMetaFormat.cpp`** delete the line `static constexpr uint64_t kMinBlobHeaderLen = 240;` (keeping the derivation comment above it in place), add `#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnvelopeLimits.h>`. Do NOT touch `CasBlobEnvelopeFormat.cpp` in this task — an unused include is dead scaffolding; phase 2 adds the include together with the `static_assert` it exists for.
 
 - [ ] **Step 3: Build + full gate green** (the boundary tests in `gtest_cas_pool.cpp` — floor 240, multiple-of-8, 16 KiB ceiling — pass unchanged). Log `$BUILD/test_cas_task3.log`.
 
@@ -405,22 +427,22 @@ If the style check rejects an unused include, add it in phase 2 instead and note
 
 ---
 
-### Task 4: Shared vocabulary — enum tables for `TokenType`, `ObjectKind`, `BlobHashAlgo`
+### Task 4: Shared vocabulary — enum tables for `TokenType`, `ObjectKind`, `BlobHashAlgo` {#task-4}
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h` (tables live here — no `magic_enum`; asserts go in the `.cpp`)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h` (the `TokenType`/`ObjectKind` tables live here — no `magic_enum`; asserts go in the `.cpp`)
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.cpp`
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.cpp` (`blobHashAlgoName` delegates to the shared table — today its words are duplicated here, split from `blobHashAlgoFromWord` in `CasWireVocab.cpp`; this is the live drift instance the spec names)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h` and `.cpp` — `kBlobHashAlgoWords` is defined HERE, next to `BlobHashAlgo` in `Primitives/` (layering: `Primitives` must not include `Formats/`; `Formats/CasWireVocab` then reads the table in the allowed `Formats → Primitives` direction). Today the words are split between `blobHashAlgoName` here and `blobHashAlgoFromWord` in `CasWireVocab.cpp` — the live drift instance the spec names. The pre-existing violation in `CasTypes.h` is not a precedent.
 - Test: `src/Disks/tests/gtest_cas_wire_vocab.cpp`
 
 **Interfaces:**
 - Consumes: Task 2's `EnumWireTable`, `casEnumTableCoversEnum`.
-- Produces: `inline constexpr EnumWireTable<TokenType, 3> kTokenTypeWords`, `inline constexpr EnumWireTable<ObjectKind, 1> kObjectKindWords`, `inline constexpr EnumWireTable<BlobHashAlgo, 3> kBlobHashAlgoWords` in `CasWireVocab.h`. The existing public word functions (`tokenTypeToWord`/`tokenTypeFromWord`, `objectKindToWord`/`objectKindFromWord`, `blobHashAlgoName`/`blobHashAlgoFromWord`) keep their exact signatures and become one-line delegates — every existing caller, `CasInspect` included, is unified for free.
+- Produces: `inline constexpr EnumWireTable<TokenType, 3> kTokenTypeWords` and `inline constexpr EnumWireTable<ObjectKind, 1> kObjectKindWords` in `CasWireVocab.h`; `inline constexpr EnumWireTable<BlobHashAlgo, 3> kBlobHashAlgoWords` in `Primitives/CasBlobDigest.h`. The existing public word functions (`tokenTypeToWord`/`tokenTypeFromWord`, `objectKindToWord`/`objectKindFromWord`, `blobHashAlgoName`/`blobHashAlgoFromWord`) keep their exact signatures and become one-line delegates — every existing caller, `CasInspect` included, is unified for free.
 
 - [ ] **Step 1: Add a coverage test** in `gtest_cas_wire_vocab.cpp` (fails to compile until the tables exist):
 
 ```cpp
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnumWireTableAsserts.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 
 static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kTokenTypeWords, DB::Cas::TokenType>());
 static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kObjectKindWords, DB::Cas::ObjectKind>());
@@ -439,7 +461,7 @@ TEST(CASWireVocab, EnumTablesPinTheCurrentWords)
 
 Before writing the table entries, open the current sources and copy the EXACT enumerators and words: `tokenTypeToWord`/`tokenTypeFromWord` (`CasWireVocab.cpp`, words `etag`, `generation`, `emulated`), `objectKindToWord` (`CasWireVocab.cpp:44`, sole word `blob`), `blobHashAlgoName` (`CasBlobDigest.cpp:6`, words `ch128`, `xxh3`, `sha256`) and the enum declarations they switch over. If `TokenType`/`BlobHashAlgo` enumerators are not dense from their first value, STOP and report — the spec's density premise would be wrong and the table needs the offset the enums actually have.
 
-- [ ] **Step 2: Define the tables in `CasWireVocab.h`** (entries copied from the switches; shown here with the audited spellings):
+- [ ] **Step 2: Define the tables** — `kTokenTypeWords`/`kObjectKindWords` in `CasWireVocab.h`, `kBlobHashAlgoWords` in `Primitives/CasBlobDigest.h` (entries copied from the switches; shown here with the audited spellings):
 
 ```cpp
 inline constexpr EnumWireTable<TokenType, 3> kTokenTypeWords{{{
@@ -459,7 +481,7 @@ inline constexpr EnumWireTable<BlobHashAlgo, 3> kBlobHashAlgoWords{{{
 }}};
 ```
 
-Adjust enumerator spellings to the real declarations. In `CasWireVocab.cpp`, add `#include .../CasEnumWireTableAsserts.h` and the three assert triples (`denseAndOrdered`, `wordsUnique`, `casEnumTableCoversEnum`); rewrite `tokenTypeToWord`/`tokenTypeFromWord`/`objectKindToWord`/`objectKindFromWord`/`blobHashAlgoFromWord` as one-line delegates preserving their exact signatures and `what`-style error context. In `CasBlobDigest.cpp`, `blobHashAlgoName` returns `kBlobHashAlgoWords.toWord(algo, "blobHashAlgoName")` — apply Step 6 of Task 2 if a test pins its old `BAD_ARGUMENTS` defensive branch. Do NOT touch `blobHashAlgoFromConfigValue`-style config parsing (`cityhash128`/`xxh3-128` spellings): the configuration vocabulary is a separate contract and stays where it is.
+Adjust enumerator spellings to the real declarations. In `CasWireVocab.cpp`, add `#include .../CasEnumWireTableAsserts.h` and the assert triples (`denseAndOrdered`, `wordsUnique`, `casEnumTableCoversEnum`) for `kTokenTypeWords`/`kObjectKindWords`; rewrite `tokenTypeToWord`/`tokenTypeFromWord`/`objectKindToWord`/`objectKindFromWord`/`blobHashAlgoFromWord` as one-line delegates preserving their exact signatures and `what`-style error context. In `CasBlobDigest.cpp`, add the `kBlobHashAlgoWords` assert triple and make `blobHashAlgoName` return `kBlobHashAlgoWords.toWord(algo, "blobHashAlgoName")` — apply Step 6 of Task 2 if a test pins its old `BAD_ARGUMENTS` defensive branch. Do NOT touch `blobHashAlgoFromConfigValue`-style config parsing (`cityhash128`/`xxh3-128` spellings): the configuration vocabulary is a separate contract and stays where it is.
 
 - [ ] **Step 3: Build + full gate green** — every golden byte-identical. Log `$BUILD/test_cas_task4.log`.
 
@@ -467,7 +489,7 @@ Adjust enumerator spellings to the real declarations. In `CasWireVocab.cpp`, add
 
 ---
 
-### Task 5: Shared vocabulary — key constants, bundles, and match/build collectors
+### Task 5: Shared vocabulary — key constants, bundles, and match/build collectors {#task-5}
 
 **Files:**
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h`
@@ -603,7 +625,7 @@ Adapt the exact error-message expectations to what the moved validation code alr
 
 ---
 
-### Task 6: Codec `cas_blob_meta` onto carriers (+ `MetaState` table)
+### Task 6: Codec `cas_blob_meta` onto carriers (+ `MetaState` table) {#task-6}
 
 **Files:**
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.cpp`
@@ -612,7 +634,7 @@ Adapt the exact error-message expectations to what the moved validation code alr
 **Interfaces:**
 - Consumes: Tasks 1, 2. Produces nothing new — this is the template every following codec task copies in spirit (each with its own constants, spelled out per task).
 
-- [ ] **Step 1: Gate green before.** `--gtest_filter='CAS*'` → PASS.
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 
 - [ ] **Step 2: Add the carriers** at the top of `CasBlobMetaFormat.cpp` (anonymous namespace):
 
@@ -630,7 +652,7 @@ constexpr EnumWireTable<MetaState, 2> kMetaStateWords{{{
 }}};
 ```
 
-Copy the true `MetaState` enumerators from the file (`metaStateToWord` switch); add the assert triple with `CasEnumWireTableAsserts.h`; delete `metaStateToWord`/`metaStateFromWord` and route both directions through the table (preserving each direction's error message per the existing corruption tests).
+Copy the true `MetaState` enumerators from the file (`metaStateToWord` switch); add the assert triple with `CasEnumWireTableAsserts.h`; delete `metaStateToWord`/`metaStateFromWord` and route both directions through the table (preserving each direction's error message per the existing corruption tests). Because the old functions were file-local and Task 19 needs the word, declare ONE public narrow delegate in `CasBlobMetaFormat.h` — `std::string_view metaStateToWireWord(MetaState state);` — implemented as the table call; the table itself stays private to the `.cpp`. (Every codec task below whose vocabulary `CasInspect` renders adds the same kind of `<enum>ToWireWord` delegate; each task names its own.)
 
 - [ ] **Step 3: Migrate the writer** — the three `writeKey`+value pairs become:
 
@@ -662,7 +684,7 @@ Note: `fromWord`'s message differs from the old `metaStateFromWord` text — che
 
 ---
 
-### Task 7: Codec `cas_pool_meta` onto carriers
+### Task 7: Codec `cas_pool_meta` onto carriers {#task-7}
 
 **Files:** Modify `Formats/CasPoolMetaFormat.cpp`. Tests: existing (`gtest_cas_format_battery.cpp`, `gtest_cas_pool.cpp`).
 
@@ -679,14 +701,14 @@ namespace PoolMetaWire
 }
 ```
 
-- [ ] **Step 1: Gate green before.**
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 - [ ] **Step 2: Writer** — `writeHex128Field(out, PoolMetaWire::pool_id, pm.pool_id, first)`, `writeNumberField` for `blob_header_len`/`gc_shards`/`min_reader_generation`; `algos_used` keeps its current hand-written join, only its `writeKey` call switching to `writeKey(out, PoolMetaWire::algos_used, first)`.
 - [ ] **Step 3: Reader** — replace the five key literals with the constants; grammar, CSV split loop, and all error messages untouched.
 - [ ] **Step 4: Build + full gate green.** Log `$BUILD/test_cas_task7.log`. **Commit:** `git commit -m "cas: pool-meta codec onto WireKey constants"`.
 
 ---
 
-### Task 8: Codecs `cas_gc_state`, `cas_gc_hb`, `cas_gc_maintenance_state` onto carriers
+### Task 8: Codecs `cas_gc_state`, `cas_gc_hb`, `cas_gc_maintenance_state` onto carriers {#task-8}
 
 **Files:** Modify `Formats/CasGcStateFormat.cpp`, `Formats/CasGcMaintenanceStateFormat.cpp`. Tests: existing (`gtest_cas_gc_state_format.cpp`, `gtest_cas_gc_maintenance_state_format.cpp`).
 
@@ -717,14 +739,14 @@ namespace GcMaintenanceWire
 }
 ```
 
-- [ ] **Step 1: Gate green before.**
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 - [ ] **Step 2: Writers** — `writeU64StringField` for `round`/`snap_*`/`lease_seq`/`hb_seq`, `writeNumberField` for `gc_shards`, `writeStringField` for the two cursors, `writeHex128Field` for `lease_owner`/`owner`.
 - [ ] **Step 3: Readers** — literals → constants; the `saw_gcs` fail-closed check and every message untouched. `GcMaintenanceState` is `Strict` — behavior identical since only spellings of comparisons moved.
 - [ ] **Step 4: Build + full gate green.** Log `$BUILD/test_cas_task8.log`. **Commit:** `git commit -m "cas: gc state/heartbeat/maintenance codecs onto WireKey constants"`.
 
 ---
 
-### Task 9: Codec `CasServerRootFormats` (`cas_owner`, `cas_epoch`, `cas_mount_lease`) onto carriers
+### Task 9: Codec `CasServerRootFormats` (`cas_owner`, `cas_epoch`, `cas_mount_lease`) onto carriers {#task-9}
 
 **Files:** Modify `Formats/CasServerRootFormats.cpp`. Tests: existing (`gtest_cas_server_root_format.cpp`).
 
@@ -759,14 +781,14 @@ namespace MountLeaseWire
 
 (`MountLease::min_active` the MEMBER is NOT renamed here — `min_active_build_sequence` tracks the wire cut in phase 2.)
 
-- [ ] **Step 1: Gate green before.**
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 - [ ] **Step 2: Writers** — owner: `writeHex128Field` + conditional `writeNumberField(…, retired_at_ms, …)` keeping the `if (o.retired_at_ms)` guard; epoch: `writeU64StringField`; mount lease: `writeHex128Field`×2 (`server_uuid`, `write_attempt_id`), `writeU64StringField`×3 (`writer_epoch`, `seq`, `min_active`), `writeStringField` (`hostname`), `writeNumberField`×3 (`pid`, `started_at_ms`, `expires_at_ms`), `writeBoolField` (`gc_fenced`).
 - [ ] **Step 3: Readers** — literals → constants; required-field checks (`su`, `we`, nonzero `write_attempt_id`) untouched.
 - [ ] **Step 4: Build + full gate green.** Log `$BUILD/test_cas_task9.log`. **Commit:** `git commit -m "cas: server-root codecs onto WireKey constants"`.
 
 ---
 
-### Task 10: Codec `cas_blob` envelope onto carriers (+ `ProvenanceOp` table)
+### Task 10: Codec `cas_blob` envelope onto carriers (+ `ProvenanceOp` table) {#task-10}
 
 **Files:** Modify `Formats/CasBlobEnvelopeFormat.cpp`. Tests: existing (`gtest_cas_blob_envelope_format.cpp`, `gtest_cas_envelope.cpp`).
 
@@ -798,14 +820,14 @@ constexpr EnumWireTable<ProvenanceOp, 6> kProvenanceOpWords{{{
 
 (Bundle member names already carry phase-2 semantics: `build` holds `"bld"`, `time_ms` holds `"ts"`, and so on.)
 
-- [ ] **Step 1: Gate green before.**
-- [ ] **Step 2:** Add the table + assert triple; delete `opToWord`/`opFromWord`, routing encode through `kProvenanceOpWords.toWord(op, "CAS blob envelope")` and decode through `fromWord` — the decode message today is `CAS blob envelope: unknown operation '{}'` with `CORRUPTED_DATA`; keep code and check no test pins the exact text (apply Task 2 Step 6 if the encode branch is pinned).
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
+- [ ] **Step 2:** Add the table + assert triple; delete `opToWord`/`opFromWord`, routing encode through `kProvenanceOpWords.toWord(op, "CAS blob envelope")` and decode through `fromWord` — the decode message today is `CAS blob envelope: unknown operation '{}'` with `CORRUPTED_DATA`; keep code and check no test pins the exact text (apply Task 2 Step 6 if the encode branch is pinned). Declare the public narrow delegate `std::string_view provenanceOpToWireWord(ProvenanceOp op);` in `CasBlobEnvelopeFormat.h` (table stays private) — Task 19 consumes it.
 - [ ] **Step 3:** Migrate `encodeEnvelopeHeader`'s field writes onto the constants (the `writeKey(buf, "...", first)` calls take `EnvelopeWire::…`). The truncated-`ref` writer (`writeEnvelopeRefField`, its escaper, and the `,\"ref\":` budget arithmetic) is CODEC-OWNED per the spec — do not convert it to field helpers; only its key spelling may read from `EnvelopeWire::ref.text`. Migrate `decodeEnvelopeHeader`'s key comparisons to the constants. The test-only `"!x"` literal stays a literal.
 - [ ] **Step 4: Build + full gate green.** Log `$BUILD/test_cas_task10.log`. **Commit:** `git commit -m "cas: blob envelope onto WireKey constants and the ProvenanceOp table"`.
 
 ---
 
-### Task 11: Codec `cas_ref_log` onto carriers (+ `RefOpKind`/`RefOwnerKind` tables, `BindingFields` renames)
+### Task 11: Codec `cas_ref_log` onto carriers (+ `RefOpKind`/`RefOwnerKind` tables, `BindingFields` renames) {#task-11}
 
 **Files:** Modify `Formats/CasRefLogFormat.cpp`. Tests: existing (`gtest_cas_ref_log_format.cpp`, `gtest_cas_ref_epoch_seal_format.cpp`, `gtest_cas_encoding_pins.cpp`).
 
@@ -840,14 +862,14 @@ constexpr EnumWireTable<RefOwnerKind, 2> kRefOwnerKindWords{{{
 
 Copy true enumerator spellings from `RefOpKind`/`RefOwnerKind` declarations; check density (if `RefOwnerKind` starts at a nonzero value the table still works — `denseAndOrdered` is offset-based). `kRefOwnerKindWords` may belong in `CasRefWireVocab` if `refOwnerKindToWord` lives there — put the table where the function it replaces lives.
 
-- [ ] **Step 1: Gate green before.**
-- [ ] **Step 2:** Replace `opKindToWord`/`opKindFromWord` and `refOwnerKindToWord`/`refOwnerKindFromWord` with table delegates (decode messages preserved; Task 2 Step 6 for the encode branch, whose current text is `RefLogTxn: unknown operation kind {}` with `CORRUPTED_DATA`).
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
+- [ ] **Step 2:** Replace `opKindToWord`/`opKindFromWord` and `refOwnerKindToWord`/`refOwnerKindFromWord` with table delegates (decode messages preserved; Task 2 Step 6 for the encode branch, whose current text is `RefLogTxn: unknown operation kind {}` with `CORRUPTED_DATA`). Where the replaced `toWord` was file-local, declare public narrow delegates in the owning header — `refOpKindToWireWord` in `CasRefLogFormat.h`; `refOwnerKindToWord` keeps whatever public home it has today (`CasRefWireVocab`).
 - [ ] **Step 3:** Rename the collector members — `ManifestFields` local struct is REPLACED by the shared `ManifestRefFields` from Task 5 (members `epoch`/`build`/`ord`, method `buildRef`); `BindingFields` members `bk`/`rn`/`mf` become `kind`/`ref`/`manifest_fields` (type of `manifest_fields` = shared `ManifestRefFields`). Update `readOpRecord`: the fifteen key comparisons read the constants and bundles (`kOldBindingKeys.kind`, `kOldBindingKeys.manifest.epoch`, `kBareManifestRefKeys.epoch`, `RefLogWire::published_ms`, …); adopt `matchManifestRefFields` for the three bare-triple keys. The `"pl"`-sentinel branch keeps its literal `"pl"` — sentinels are not live vocabulary and get no constant. `writeLogMeta`/`writeOp` writes go through the constants and Task 5's bundle-taking writers.
 - [ ] **Step 4: Build + full gate green** — `CASEncodingPins.RefLogTxnAllOpKinds` byte-identical is the hard proof. Log `$BUILD/test_cas_task11.log`. **Commit:** `git commit -m "cas: ref-log codec onto carriers; shared ManifestRefFields; BindingFields renamed"`.
 
 ---
 
-### Task 12: Codec `cas_ref_snap` onto carriers
+### Task 12: Codec `cas_ref_snap` onto carriers {#task-12}
 
 **Files:** Modify `Formats/CasRefSnapshotFormat.cpp`. Tests: existing (`gtest_cas_ref_snapshot_format.cpp`, `gtest_cas_encoding_pins.cpp`).
 
@@ -866,13 +888,13 @@ namespace RefSnapWire
 }
 ```
 
-- [ ] **Step 1: Gate green before.**
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 - [ ] **Step 2:** Writers (`writeCommittedRow`, `writePrecommitRow`, `writeSnapshotMeta`) onto constants/field helpers; row tags `"c"`/`"p"` become local `constexpr std::string_view kCommittedTag = "c"; kPrecommitTag = "p";` (tag VALUES are words, not keys — they stay `string_view`, and phase 2 flips these two strings). Reader: local `ManifestFields` replaced by shared `ManifestRefFields` + `matchManifestRefFields(key, r, kBareManifestRefKeys, fields)`; the `lc == "live"` hard check, the `rte`/`rts`/`pl` sentinel literals, and both row-variant requiredness checks stay exactly as written.
 - [ ] **Step 3: Build + full gate green** (`CASEncodingPins.RefSnapshotLive` byte-identical). Log `$BUILD/test_cas_task12.log`. **Commit:** `git commit -m "cas: ref-snapshot codec onto carriers"`.
 
 ---
 
-### Task 13: Codec `cas_ref_ckpt` onto carriers
+### Task 13: Codec `cas_ref_ckpt` onto carriers {#task-13}
 
 **Files:** Modify `Formats/CasRefCkptFormat.cpp`. Tests: existing (`gtest_cas_ref_ckpt.cpp`).
 
@@ -889,13 +911,13 @@ namespace RefCkptWire
 }
 ```
 
-- [ ] **Step 1: Gate green before.**
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 - [ ] **Step 2:** The `writeRefTxnIdFields(out, first, "cte", "cts", …)` calls pass `RefCkptWire::committed_epoch.text, RefCkptWire::committed_seq.text` (or overload `writeRefTxnIdFields` for `WireKey` pairs — prefer the overload, matching Task 1's pattern). Reader comparisons onto the constants; every both-or-neither check and message untouched. This is a Strict, trailer-less codec — nothing else moves.
 - [ ] **Step 3: Build + full gate green** (`CommittedThroughHasCanonicalExactWireEncoding` byte-identical). Log `$BUILD/test_cas_task13.log`. **Commit:** `git commit -m "cas: ref-ckpt codec onto carriers"`.
 
 ---
 
-### Task 14: Codec `cas_ref_catalog` onto carriers (+ `NsState` table)
+### Task 14: Codec `cas_ref_catalog` onto carriers (+ `NsState` table) {#task-14}
 
 **Files:** Modify `Formats/CasRefCatalogFormat.cpp`. Tests: existing (`gtest_cas_ref_catalog.cpp`).
 
@@ -921,13 +943,13 @@ constexpr EnumWireTable<NsState, 3> kNsStateWords{{{
 
 Record tag: local `constexpr std::string_view kEntryTag = "ent";`.
 
-- [ ] **Step 1: Gate green before.**
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 - [ ] **Step 2:** `nsStateToWord`/`nsStateFromWord` → table delegates (decode message preserved); writer and Strict reader onto constants; the creator/state and removal/state pairing rules, the empty-namespace rejection, and the zero-`inc` rejection untouched.
 - [ ] **Step 3: Build + full gate green.** Log `$BUILD/test_cas_task14.log`. **Commit:** `git commit -m "cas: ref-catalog codec onto carriers and the NsState table"`.
 
 ---
 
-### Task 15: Codec `cas_part_manifest` onto carriers (+ `EntryPlacement` table, `BlobRefFields` adoption)
+### Task 15: Codec `cas_part_manifest` onto carriers (+ `EntryPlacement` table, `BlobRefFields` adoption) {#task-15}
 
 **Files:** Modify `Formats/CasPartManifestFormat.cpp`. Tests: existing (`gtest_cas_part_manifest_format.cpp`).
 
@@ -950,13 +972,13 @@ constexpr EnumWireTable<EntryPlacement, 2> kEntryPlacementWords{{{
 
 (`size` and `inline_size` remain two constants in phase 1 because the OLD wire has two spellings; phase 2 collapses both to `"size"` — two constants, same flip discipline.)
 
-- [ ] **Step 1: Gate green before.**
-- [ ] **Step 2:** `placementToWord`/`placementFromWord` → table delegates; writer onto constants/helpers (blob entries: `writeBlobRefFields` then `writeNumberField(out, PartManifestWire::size, e.blob_size, first)`; inline: `writeNumberField(out, PartManifestWire::inline_size, …)`). Reader: adopt `matchBlobRefFields` + `BlobRefFields::build` — the digest-width-before-`fromHex` code MOVES into `build` (Task 5 defined it); the placement-vs-fields cross-checks (`blob` requires the group + `sz`, `inline` requires `il`) stay in the codec grammar. Banner code (`bannerFor`, `il=` literal) untouched — payload zones are codec-owned.
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
+- [ ] **Step 2:** `placementToWord`/`placementFromWord` → table delegates, plus the public narrow delegate `entryPlacementToWireWord` in `CasPartManifestFormat.h` (table private; Task 19 consumes it); writer onto constants/helpers (blob entries: `writeBlobRefFields` then `writeNumberField(out, PartManifestWire::size, e.blob_size, first)`; inline: `writeNumberField(out, PartManifestWire::inline_size, …)`). Reader: adopt `matchBlobRefFields` + `BlobRefFields::build` — the digest-width-before-`fromHex` code MOVES into `build` (Task 5 defined it); the placement-vs-fields cross-checks (`blob` requires the group + `sz`, `inline` requires `il`) stay in the codec grammar. Banner code (`bannerFor`, `il=` literal) untouched — payload zones are codec-owned.
 - [ ] **Step 3: Build + full gate green.** Log `$BUILD/test_cas_task15.log`. **Commit:** `git commit -m "cas: part-manifest codec onto carriers; digest-width check centralized"`.
 
 ---
 
-### Task 16: Codec `cas_run` onto carriers (+ `RunMarker` typed enum, `RunRef::key_generation` rename)
+### Task 16: Codec `cas_run` onto carriers (+ `RunMarker` typed enum, `RunRef::key_generation` rename) {#task-16}
 
 **Files:** Modify `Formats/CasRecordStreamFormat.h`, `Formats/CasRecordStreamFormat.cpp`, `Formats/CasFoldSealFormat.h` (the `RunRef` member), `Gc/CasBlobInDegree.h`/`.cpp` and `Gc/CasGc.cpp` (marker-byte and `generation` call sites — find them all with `grep -rn "kEdgeActive\|kZeroMarker\|kCondemned\|\.generation" src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ | grep -v Formats/CasFormat`). Tests: existing (`gtest_cas_record_stream_format.cpp`, `gtest_cas_encoding_pins.cpp`, fold-seal/GC suites for the rename fallout).
 
@@ -986,15 +1008,32 @@ constexpr EnumWireTable<RunMarker, 3> kRunMarkerWords{{{
 }}};
 ```
 
-- [ ] **Step 1: Gate green before.**
-- [ ] **Step 2: `RunMarker` enum.** Replace the three `constexpr char` markers with the enum above (same header position, byte values pinned — they persist in the in-degree payload representation). `SourceEdgeRecord::marker` becomes `RunMarker`; every comparison/assignment site found by the grep gets an explicit `static_cast<char>(…)` where a raw byte is genuinely stored (in-degree payload) and a typed use everywhere else. `markerToWord`/`markerFromWord` → `kRunMarkerWords` delegates (+ assert triple; `magic_enum` handles a `char`-based enum).
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
+- [ ] **Step 2: `RunMarker` enum with a checked byte boundary.** Replace the three `constexpr char` markers with the enum above (same header position, byte values pinned — they persist in the in-degree payload representation). The raw-byte boundary gets exactly two functions in `CasRecordStreamFormat.h`; a bare `static_cast<RunMarker>(byte)` is forbidden, because it lets a corrupted persisted payload byte become an invalid enum value whose later `toWord` throws `LOGICAL_ERROR` where the input deserves `CORRUPTED_DATA`:
+
+```cpp
+constexpr char runMarkerByte(RunMarker marker)
+{
+    return static_cast<char>(marker);
+}
+
+inline RunMarker runMarkerFromByte(char byte, std::string_view what)
+{
+    if (byte != runMarkerByte(RunMarker::Zero) && byte != runMarkerByte(RunMarker::Edge)
+        && byte != runMarkerByte(RunMarker::Condemned))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}: unknown marker byte {}", what, static_cast<int>(byte));
+    return static_cast<RunMarker>(byte);
+}
+```
+
+`SourceEdgeRecord::marker` becomes `RunMarker`; every site found by the grep uses `runMarkerByte` to store a raw byte and `runMarkerFromByte` to read one — only a value that passed `runMarkerFromByte` may reach `kRunMarkerWords`. Add a negative test: an in-degree payload with an unknown marker byte (e.g. `0x03`) is rejected with `CORRUPTED_DATA` (place it next to the existing decode-corruption tests of the payload it corrupts). `markerToWord`/`markerFromWord` → `kRunMarkerWords` delegates (+ assert triple; `magic_enum` handles a `char`-based enum), plus the public narrow delegate `runMarkerToWireWord` in `CasRecordStreamFormat.h` for Task 19.
 - [ ] **Step 3: Member rename** `RunRef::generation` → `RunRef::key_generation` (declaration in `CasFoldSealFormat.h`; update every `.generation` use of `RunRef` — the wire key `"gen"` stays untouched, it is written in `CasFoldSealFormat.cpp` and migrates in Task 17).
 - [ ] **Step 4:** Writer/reader onto the constants; `matchTokenFields` adopted for `tt`/`tv` with the LOCAL condemned-row requiredness check kept exactly as is (`have_tt`, `have_tv` sextet logic — phase 2 owns any unification); the condemned/active variant exclusivity checks untouched. The header line writer keeps its literal `"type"`/`"v"`/`"kind"` framing (framing is `CasTextFormat`'s, not this plan's).
 - [ ] **Step 5: Build + full gate green** (`CASEncodingPins.SourceEdgeRunLines` byte-identical proves the enum swap changed nothing on the wire). Log `$BUILD/test_cas_task16.log`. **Commit:** `git commit -m "cas: run codec onto carriers; RunMarker typed enum; RunRef::key_generation"`.
 
 ---
 
-### Task 17: Codec `cas_fold_seal` onto carriers (+ `HoldReason` table)
+### Task 17: Codec `cas_fold_seal` onto carriers (+ `HoldReason` table) {#task-17}
 
 **Files:** Modify `Formats/CasFoldSealFormat.cpp`. Tests: existing (`gtest_cas_fold_seal_format.cpp`, `gtest_cas_gc_hold_grammar.cpp`).
 
@@ -1027,13 +1066,13 @@ namespace FoldSealWire
 
 Record tags: `constexpr std::string_view kRefLifeTag = "rfl"; kBlobRunTag = "btr"; kCondemnedTag = "cnd";`. HoldReason table (words from `holdReasonToWord` — `gap_below_witness`, `unconsumed_seal_crossing`, `witness_disappeared`, `body_undecodable`, `manifest_body_missing`, `checkpoint_undecodable`; copy true enumerators, add assert triple). The numeric `cls` value stays a number in phase 1 (`CoverageClass` words are phase 2).
 
-- [ ] **Step 1: Gate green before.**
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
 - [ ] **Step 2:** Writers (`writeRun`, the `rfl` block, the `cnd` block, the meta line) onto constants/helpers (note `RunRef::key_generation` from Task 16 feeds the `"gen"` key here); Strict readers onto constants — the closed-set `cls` validation, hold grammar (iff classification 4), cleanup-evidence rules, shard totals, and every message untouched.
 - [ ] **Step 3: Build + full gate green** (hold-grammar suite is the sharpest watchdog here). Log `$BUILD/test_cas_task17.log`. **Commit:** `git commit -m "cas: fold-seal codec onto carriers and the HoldReason table"`.
 
 ---
 
-### Task 18: Codec `cas_gc_outcomes` onto carriers (+ `OutcomeKind` table)
+### Task 18: Codec `cas_gc_outcomes` onto carriers (+ `OutcomeKind` table) {#task-18}
 
 **Files:** Modify `Formats/CasGcOutcomesFormat.cpp`. Tests: existing (`gtest_cas_gc_outcomes_format.cpp`).
 
@@ -1052,22 +1091,26 @@ constexpr EnumWireTable<OutcomeKind, 4> kOutcomeKindWords{{{
 }}};
 ```
 
-- [ ] **Step 1: Gate green before.**
-- [ ] **Step 2:** `outcomeKindToWord`/`outcomeKindFromWord` → table delegates; writer onto constants (`writeBlobRefFields`/`writeTokenFields` calls unchanged); reader adopts `matchBlobRefFields` + `BlobRefFields::build` and `matchTokenFields` — **requiredness stays EXACTLY today's**: `ha`/`h`/`tt` required, missing `tv` reads as an empty token value (the both-required tightening is phase 2's own change with its own negative test; do not sneak it in here). The `have_ha || have_h || have_tt` check text stays.
+- [ ] **Step 1: Baseline.** The previous task's post-gate is this task's baseline — do not re-run the full gate here; run it only if the tree changed outside this plan.
+- [ ] **Step 2:** `outcomeKindToWord`/`outcomeKindFromWord` → table delegates, plus the public narrow delegate `outcomeKindToWireWord` in `CasGcOutcomesFormat.h` if the old function was file-local (table private; Task 19 consumes it); writer onto constants (`writeBlobRefFields`/`writeTokenFields` calls unchanged); reader adopts `matchBlobRefFields` + `BlobRefFields::build` and `matchTokenFields` — **requiredness stays EXACTLY today's**: `ha`/`h`/`tt` required, missing `tv` reads as an empty token value (the both-required tightening is phase 2's own change with its own negative test; do not sneak it in here). The `have_ha || have_h || have_tt` check text stays.
 - [ ] **Step 3: Build + full gate green.** Log `$BUILD/test_cas_task18.log`. **Commit:** `git commit -m "cas: gc-outcomes codec onto carriers; requiredness unchanged"`.
 
 ---
 
-### Task 19: `CasInspect` renders enum words through the tables
+### Task 19: `CasInspect` renders enum words through the tables {#task-19}
 
-**Files:** Modify `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp`. Tests: existing (whichever `CAS*` tests cover inspect output; also `05010`/`05012` stateless tests exist but are NOT run here — unit gate only).
+**Files:** Modify `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.cpp`; modify whichever `CAS*` unit tests pin inspect output — find them ALL with `grep -rln "renderMountLease\|CasInspect\|inspect" src/Disks/tests/gtest_cas_*.cpp` and by grepping the tests for the old non-wire words the sweep below uncovers (candidates to check explicitly: `gtest_cas_inspect.cpp`, `gtest_cas_observability.cpp`, `gtest_cas_blob_meta_format.cpp` — whichever of these exist in the tree). The `05010`/`05012` stateless tests are NOT run here — unit gate only; if this task changes a word they assert, note it in the commit message for the phase-2 stateless sweep.
 
-- [ ] **Step 1:** `grep -n "switch\|case " Tools/CasInspect.cpp` — list every place it renders a persisted enum with its own words. For each: if a public `*ToWord` delegate exists (they all do after Tasks 4–18), call it; delete the parallel switch. If any site printed a DIFFERENT word than the wire (e.g. `Merge` for `merge`), fixing it changes inspect output — that is introspection, not wire; note each such change in the commit message explicitly.
-- [ ] **Step 2: Build + full gate green.** Log `$BUILD/test_cas_task19.log`. **Commit:** `git commit -m "cas: CasInspect renders enum values through the wire tables"`.
+This task is the second sanctioned non-wire change (Global Constraints): inspect output is
+introspection, not persisted wire, and it is NORMALIZED here onto the wire words.
+
+- [ ] **Step 1:** `grep -n "switch\|case \|\"" Tools/CasInspect.cpp` — list every place it renders a persisted enum with its own words. For each: call the public `*ToWireWord`/`*ToWord` delegate the owning codec task declared (Tasks 4–18); delete the parallel switch.
+- [ ] **Step 2:** For every site whose printed word CHANGES (e.g. `Merge` → `merge`, `Inline` → `inline`): update the pinned assertions in the test files found above, and where no assertion pinned that word before, ADD one exact assertion pinning the new word — every normalized word ends this task pinned. List each old → new word in the commit message.
+- [ ] **Step 3: Build + full gate green.** Log `$BUILD/test_cas_task19.log`. **Commit:** `git commit -m "cas: CasInspect renders enum values through the wire tables"`.
 
 ---
 
-### Task 20: Battery closure and registry set-equality
+### Task 20: Battery closure and registry set-equality {#task-20}
 
 **Files:**
 - Modify: `Formats/CasFormat.h`/`CasFormat.cpp` (export a registry enumeration accessor — `TRAITS` is in an anonymous namespace today, so nothing outside the TU can iterate it)
@@ -1075,7 +1118,38 @@ constexpr EnumWireTable<OutcomeKind, 4> kOutcomeKindWords{{{
 - Modify: `src/Disks/tests/gtest_cas_text_format.cpp` (set-equality assertion)
 
 **Interfaces:**
-- Produces: `std::span<const FormatId> allRegisteredFormatIds()` in `CasFormat.h` (implemented over a static array in `CasFormat.cpp` built from `TRAITS`), and a battery-coverage registry in `cas_format_test_battery.h`: `runFormatBattery` records each exercised `FormatId` into a function-local static `std::set<FormatId> & batteryCoveredIds()` accessor (test-only code — the set is fine here).
+- Produces: `std::span<const FormatId> allRegisteredFormatIds()` declared in `CasFormat.h` and implemented in `CasFormat.cpp` as a PROJECTION of `TRAITS` — never a hand-maintained second list:
+
+```cpp
+std::span<const FormatId> allRegisteredFormatIds()
+{
+    static const auto ids = []
+    {
+        std::array<FormatId, std::size(TRAITS)> out{};
+        for (size_t i = 0; i < std::size(TRAITS); ++i)
+            out[i] = TRAITS[i].id;
+        return out;
+    }();
+    return ids;
+}
+```
+
+- Produces: a battery-coverage registrar in `cas_format_test_battery.h` — coverage is declared statically NEXT TO each battery test, never recorded dynamically inside `runFormatBattery` (dynamic recording would make the set-equality test depend on test execution order):
+
+```cpp
+namespace DB::Cas::tests
+{
+std::set<FormatId> & batteryCoveredIds();   /// function-local static; test-only, std::set is fine here
+
+struct BatteryCoverageRegistrar
+{
+    explicit BatteryCoverageRegistrar(FormatId id) { batteryCoveredIds().insert(id); }
+};
+}
+
+#define CAS_BATTERY_COVERS(format_id) \
+    static const DB::Cas::tests::BatteryCoverageRegistrar battery_covers_##format_id{DB::Cas::FormatId::format_id}
+```
 
 - [ ] **Step 1: Add the three missing battery rows.** Each needs `{id, encode, decode, golden}` with a LITERAL golden (never built from the constants — spec rule). RefCkpt (reuse the exact bytes already pinned by `CommittedThroughHasCanonicalExactWireEncoding`):
 
@@ -1109,24 +1183,72 @@ TEST(CASFormatBattery, EveryRegisteredFormatIsBatteryCovered)
 }
 ```
 
-gtest runs tests within a binary in declaration order across files non-deterministically relative to this one — make coverage collection order-independent: run this test LAST via `--gtest_filter` in the gate? No — simpler and deterministic: name it so it sorts last alphabetically within its suite AND, more robustly, have `batteryCoveredIds()` populated at static-registration time by making each battery call site register its id through a small `struct BatteryCoverageRegistrar { BatteryCoverageRegistrar(FormatId id) { batteryCoveredIds().insert(id); } };` static object next to each `TEST` — coverage then exists before ANY test runs. Use the registrar approach.
+Coverage exists before ANY test runs because every registrar is a namespace-scope static. Place one
+`CAS_BATTERY_COVERS(<FormatId>)` line immediately next to EVERY `runFormatBattery` call — the
+complete list of files (15 existing calls across 12 files, plus the 3 rows this task adds):
+
+| File | Registrar lines |
+|---|---|
+| `gtest_cas_blob_envelope_format.cpp` | `Blob` |
+| `gtest_cas_blob_meta_format.cpp` | `BlobMeta` |
+| `gtest_cas_format_battery.cpp` | `PoolMeta` |
+| `gtest_cas_ref_log_format.cpp` | `RefLog` |
+| `gtest_cas_ref_epoch_seal_format.cpp` | `RefLog` (second call site — `std::set` dedups; give the registrar variable a distinct name, e.g. suffix `_seal`) |
+| `gtest_cas_ref_snapshot_format.cpp` | `RefSnapshot` |
+| `gtest_cas_ref_catalog.cpp` | `RefCatalog` |
+| `gtest_cas_part_manifest_format.cpp` | `PartManifest` |
+| `gtest_cas_fold_seal_format.cpp` | `FoldSeal` |
+| `gtest_cas_gc_state_format.cpp` | `GcState`, `GcHeartbeat` |
+| `gtest_cas_gc_outcomes_format.cpp` | `GcOutcomes` |
+| `gtest_cas_server_root_format.cpp` | `Owner`, `ServerEpoch`, `MountLease` |
+| `gtest_cas_ref_ckpt.cpp` (new row, Step 1) | `RefCkpt` |
+| `gtest_cas_gc_maintenance_state_format.cpp` (new row, Step 1) | `GcMaintenanceState` |
+| `gtest_cas_record_stream_format.cpp` (new row, Step 1) | `RunFile` |
+
+If the grep `grep -rn runFormatBattery src/Disks/tests/` finds a call site this table misses, add
+its registrar too — the set-equality test is the backstop either way.
 
 - [ ] **Step 3: Build + full gate green.** Log `$BUILD/test_cas_task20.log`. **Commit:** `git commit -m "cas: close the format battery and assert registry set-equality"`.
 
 ---
 
-### Task 21: Phase-1 gate
+### Task 21: Phase-1 gate {#task-21}
 
 **Files:** none created; this task is verification + the phase boundary record.
 
 - [ ] **Step 1: Full gate** — `--gtest_filter='CAS*'` green, logged to `$BUILD/test_cas_phase1_gate.log`.
-- [ ] **Step 2: Golden immutability audit** — `git diff <base>..HEAD -- src/Disks/tests/ | grep '^[-+].*\\\"'` where `<base>` is the commit before Task 1: the ONLY changed expected-string lines allowed are (a) the three NEW battery goldens and new infra tests, (b) any Task-2-Step-6 defensive-code expectation, each named in its commit message. Anything else = a wire regression; stop and fix.
-- [ ] **Step 3: Carrier-completeness sweep** — `grep -rn 'writeKey(out, "' src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/*.cpp` must return ONLY `CasTextFormat.cpp` framing (`type`/`v`/`n`) and the test-only `"!x"` envelope line. Any other hit is an unmigrated writer.
+- [ ] **Step 2: Golden immutability audit** (a per-file review, not a one-liner). With `<base>` = the
+  commit before Task 1:
+  1. `git diff --name-only <base>..HEAD -- src/Disks/tests/` — the changed-file set must be a
+     subset of: new files (`gtest_cas_enum_wire_table.cpp`), the battery/registrar files Task 20
+     names, the inspect-assertion files Task 19 names, and any file named in a Task-2-Step-6
+     commit message.
+  2. For each changed EXISTING file, open `git diff <base>..HEAD -- <file>` and verify hunk by hunk
+     that no expected wire literal changed: additions of NEW assertions and registrar lines are
+     fine; any modified byte inside a pre-existing expected string is a wire regression unless its
+     commit message sanctioned it (Task 2 Step 6 defensive code, Task 19 inspect word). Record a
+     one-line verdict per file in the task report — the audit is only done when every file has one.
+- [ ] **Step 3: Carrier-completeness sweeps** (writer AND reader; run each, expect empty output
+  outside the allowlist):
+  1. Writer keys, any buffer variable, line breaks tolerated:
+     `rg -Un 'writeKey\(\s*\w+,\s*"' src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/`
+     — allowlist: `CasTextFormat.{h,cpp}` framing (`type`/`v`/`n`), the run-header framing
+     (`type`/`v`/`kind`) in `CasRecordStreamFormat.cpp`, and the test-only `"!x"` envelope line.
+  2. The deleted two-part writer must not have crept back:
+     `rg -n '\.key\(' src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/` —
+     allowlist: `CasTextFormat.{h,cpp}` internals only.
+  3. Reader keys compared against literals:
+     `rg -n 'key == "' src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/` —
+     allowlist: the known-field sentinels (`"pl"`, `"rte"`, `"rts"`), framing in
+     `CasTextFormat.cpp`/`CasRecordStreamFormat.cpp`, and the test-only `"!x"`. Record-TAG value
+     comparisons (`kind == "rfl"`-style, where the variable is a decoded VALUE, not the key) are
+     out of scope — but eyeball every hit before allowlisting it.
+  4. Any other hit in sweeps 1–3 is an unmigrated call site: migrate it and re-run the gate.
 - [ ] **Step 4: Commit anything outstanding**, then report: phase 1 complete; the phase-2 plan (`...-cas-wire-keys-phase2-cut.md`) can now be written against the landed carrier names.
 
 ---
 
-## Self-Review (performed at write time)
+## Self-Review (performed at write time) {#self-review}
 
 - **Spec coverage (phase-1 scope):** WireKey+helpers (T1), EnumWireTable+proofs (T2), envelope-limits owner (T3), shared tables incl. the `BlobHashAlgo` split unification (T4), bundles + prefix-API removal + match/build with the phase-2 boundary respected (T5), all 17 registered formats' codecs onto carriers (T6–T18 cover the 14 codec files behind them), introspection unification (T19), battery closure + set-equality with the anonymous-namespace export the spec flags (T20), gate + golden-immutability + completeness sweeps (T21). Deliberately OUT (phase 2, recorded in header): every new spelling, generation reset, sentinel/test churn, `static_assert` budget, `writeWordArrayField`/array, `class` words, tightenings, `min_active_build_sequence`. Deliberately OUT (phase 3): measurements, assembly review, ca-soak sweep.
 - **Placeholder scan:** no TBDs; every codec task carries its own verbatim constants; the two "copy from the file" instructions are verification directives (spellings must come from the tree), not gaps.
