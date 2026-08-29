@@ -34,7 +34,7 @@ namespace FoldSealWire
     constexpr WireKey shard{"shard"};
     constexpr WireKey key_generation{"key_generation"};
     constexpr WireKey life{"life"};
-    constexpr WireKey classification{"cls"};
+    constexpr WireKey classification{"class"};
     constexpr WireKey fold_epoch{"fold_epoch"};
     constexpr WireKey fold_seq{"fold_seq"};
     constexpr WireKey hold_reason{"hold_reason"};
@@ -69,15 +69,14 @@ HoldReason holdReasonFromWord(std::string_view w)
     return kHoldReasonWords.fromWord(w, "CAS fold seal hold reason");
 }
 
-/// The classification set is CLOSED. Every consumer of a coverage row branches on exact values — the
-/// sweep's §6 deletion premise refuses a row by testing `== 4` and then `== 0` — so a value outside the
-/// set is not an unknown variant to be tolerated forward: it is a row that passes every refusal written
-/// in terms of the set and reaches the irreversible delete. One predicate, used by both directions, so
-/// the writer's self-check and the reader's fail-close can never name different sets.
-bool isKnownClassification(uint64_t classification)
-{
-    return classification == 0 || classification == 1 || classification == 2 || classification == 4;
-}
+constexpr EnumWireTable<CoverageClass, 4> kCoverageClassWords{{{
+    {CoverageClass::Absent, "absent"},
+    {CoverageClass::Unchanged, "unchanged"},
+    {CoverageClass::Folded, "folded"},
+    {CoverageClass::Clamped, "clamped"},
+}}};
+
+static_assert(casEnumTableCoversEnum<kCoverageClassWords, CoverageClass>());
 
 /// A hold names a position the fold must resolve, and both components of that id are nonzero (the
 /// canonical `RefTxnId` rule `renderRefTxnId` enforces for every id that becomes a key). A zero
@@ -180,6 +179,16 @@ std::string_view holdReasonToWord(HoldReason r)
     return kHoldReasonWords.toWord(r, "CAS fold seal hold reason");
 }
 
+std::string_view coverageClassToWord(CoverageClass c)
+{
+    return kCoverageClassWords.toWord(c, "CAS fold seal classification");
+}
+
+CoverageClass coverageClassFromWord(std::string_view w)
+{
+    return kCoverageClassWords.fromWord(w, "CAS fold seal classification");
+}
+
 FoldSealCaps foldSealCaps()
 {
     const FormatTraits & t = traitsFor(FormatId::FoldSeal);
@@ -253,22 +262,19 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         /// process, not corruption arriving from a store — and none of these shapes is repairable once
         /// durable, so none is ever written.
         ///
-        /// A classification outside the closed set first, because the two checks after it are stated in
-        /// terms of the set and a row they cannot classify makes their answers meaningless.
-        if (!isKnownClassification(cov.classification))
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CAS fold seal: coverage '{}' has classification {}, which is not one of the four the "
-                "fold grammar defines (0 absent, 1 unchanged, 2 folded, 4 clamped) — every consumer "
-                "branches on those exact values, so this row would pass refusals meant to stop it",
-                life_hex, cov.classification);
-        /// A classification-4 row whose hold was dropped is indistinguishable, once durable, from a
-        /// namespace that stopped for no reason — and a hold on any other classification claims a stop
-        /// that did not happen.
-        if ((cov.classification == 4) != cov.hold.has_value())
+        /// A classification outside the four named values first, because the two checks after it are
+        /// stated in terms of those names and a row they cannot classify makes their answers meaningless.
+        /// `coverageClassToWord` IS that range check (it throws `LOGICAL_ERROR` for a value the table
+        /// does not index), so capturing its result here also gives the record its wire value below.
+        const std::string_view classification_word = coverageClassToWord(cov.classification);
+        /// A clamped row whose hold was dropped is indistinguishable, once durable, from a namespace that
+        /// stopped for no reason — and a hold on any other classification claims a stop that did not
+        /// happen.
+        if ((cov.classification == CoverageClass::Clamped) != cov.hold.has_value())
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS fold seal: coverage '{}' has classification {} and {} hold — the hold fields are "
-                "required for classification 4 and forbidden otherwise",
-                life_hex, cov.classification, cov.hold ? "a" : "no");
+                "required for classification clamped and forbidden otherwise",
+                life_hex, classification_word, cov.hold ? "a" : "no");
         /// A hold that names no position resolves itself on the next round (nothing sorts below
         /// `{0, 0}`) and cannot be rendered where the sweep reports why it retained a manifest.
         if (cov.hold && !isCanonicalHoldPosition(cov.hold->offending_position))
@@ -291,7 +297,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         bool first = true;
         writeStringField(out, FoldSealWire::kind, kRefLifeTag, first);
         writeHex128Field(out, FoldSealWire::life, life_id, first);
-        writeNumberField(out, FoldSealWire::classification, static_cast<uint32_t>(cov.classification), first);
+        writeStringField(out, FoldSealWire::classification, classification_word, first);
         writeU64StringField(out, FoldSealWire::fold_epoch, cov.last_folded_ref_id.writer_epoch, first);
         writeU64StringField(out, FoldSealWire::fold_seq, cov.last_folded_ref_id.ref_sequence, first);
         if (cov.hold)
@@ -402,11 +408,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
         {
             std::optional<UInt128> life_id;
             RefCoverage cov;
-            /// Read WIDE and validated before it is narrowed to the persisted byte. `cls` is the field
-            /// every consumer branches on, and a plain `static_cast<uint8_t>` maps 258 onto 2 ("all
-            /// records through the cursor were folded") and 256 onto 0 — a forged or damaged seal would
-            /// buy full coverage with an integer no reader ever sees.
-            std::optional<uint64_t> classification;
+            std::optional<CoverageClass> classification;
             /// The hold fields are read individually so the grammar can be checked on WHICH of them
             /// arrived, not merely on how many. `JsonObjectReader` already rejects a duplicate key, so
             /// a second `hold_reason` can never quietly rewrite the reason.
@@ -420,7 +422,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             while (r.nextKey(key))
             {
                 if (key == FoldSealWire::life) life_id = r.readHex128();
-                else if (key == FoldSealWire::classification) classification = r.readU64Number();
+                else if (key == FoldSealWire::classification) classification = coverageClassFromWord(r.readString());
                 else if (key == FoldSealWire::fold_epoch) cov.last_folded_ref_id.writer_epoch = r.readU64String();
                 else if (key == FoldSealWire::fold_seq) cov.last_folded_ref_id.ref_sequence = r.readU64String();
                 else if (key == FoldSealWire::hold_reason) hold_reason = holdReasonFromWord(r.readString());
@@ -438,16 +440,12 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                     "CAS fold seal: a ref-life row is missing a nonzero opaque life id");
             const String life_hex = u128ToHex(*life_id);
 
-            /// `cls` is required, not defaulted: an absent one would read as 0 ("no round folded this
-            /// namespace"), which is a claim about a fold, not the absence of one.
+            /// `class` is required, not defaulted: an absent one would read as `absent` ("no round
+            /// folded this namespace"), which is a claim about a fold, not the absence of one.
+            /// `coverageClassFromWord` above already refused any word outside the four names.
             if (!classification)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: ref_life '{}' missing cls", life_hex);
-            if (!isKnownClassification(*classification))
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS fold seal: coverage '{}' has classification {}, which is not one of the four "
-                    "the fold grammar defines (0 absent, 1 unchanged, 2 folded, 4 clamped)",
-                    life_hex, *classification);
-            cov.classification = static_cast<uint8_t>(*classification);   /// in range, so narrowing is exact
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: ref_life '{}' missing class", life_hex);
+            cov.classification = *classification;
 
             /// The same strict grammar the encoder enforces, applied to bytes we did not write. A
             /// PARTIAL hold is corruption, never a hold with defaults: a hold whose offending position
@@ -456,11 +454,11 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 || hold_retry_count || hold_next_retry_round;
             const bool every_hold_field = hold_reason && hold_epoch && hold_sequence
                 && hold_retry_count && hold_next_retry_round;
-            if (cov.classification == 4)
+            if (cov.classification == CoverageClass::Clamped)
             {
                 if (!every_hold_field)
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
-                        "CAS fold seal: coverage '{}' is held (classification 4) but its hold is "
+                        "CAS fold seal: coverage '{}' is held (classification clamped) but its hold is "
                         "incomplete — reason, offending position, retry count and next retry round are "
                         "all required", life_hex);
                 /// PRESENT is not enough: the position must be one a fold can actually retry. `{0, 0}`
@@ -480,8 +478,8 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             else if (any_hold_field)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS fold seal: coverage '{}' carries hold fields at classification {} — they are "
-                    "forbidden on anything but a held (classification 4) row",
-                    life_hex, cov.classification);
+                    "forbidden on anything but a held (classification clamped) row",
+                    life_hex, coverageClassToWord(cov.classification));
 
             const bool any_cleanup_field = remove_txn_epoch || remove_txn_sequence;
             const bool every_cleanup_field = remove_txn_epoch && remove_txn_sequence;

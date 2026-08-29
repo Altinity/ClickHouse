@@ -308,7 +308,7 @@ String renderRunRef(const RunRef & r)
 String renderRefCoverage(const RefCoverage & c)
 {
     return JsonObj()
-        .add("classification", jsonUInt(c.classification))
+        .add("classification", jsonEscape(coverageClassToWord(c.classification)))
         .add("last_folded_ref_id", renderRefTxnIdObj(c.last_folded_ref_id))
         .str();
 }

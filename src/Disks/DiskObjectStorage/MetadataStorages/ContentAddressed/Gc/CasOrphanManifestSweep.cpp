@@ -420,21 +420,21 @@ bool manifestDeletionPremise(const NamespaceFoldView & view, const ManifestKey &
 
     /// UNCERTAINTY, hold arm. A hold names the exact position the fold could not resolve, and everything
     /// at or above it is unaccounted -- including, for all this predicate can tell, the record that
-    /// grants or removes this very manifest. `classification == 4` is tested separately from the hold
-    /// even though the seal's strict grammar pairs them: the thing standing between a clamped namespace
-    /// and an irreversible delete must not be a codec invariant enforced somewhere else.
+    /// grants or removes this very manifest. `classification == Clamped` is tested separately from the
+    /// hold even though the seal's strict grammar pairs them: the thing standing between a clamped
+    /// namespace and an irreversible delete must not be a codec invariant enforced somewhere else.
     if (cov.hold)
         return retain(SweepRetainClass::Hold, "namespace held at " + renderRefTxnId(cov.hold->offending_position) + " ("
                       + String{holdReasonToWord(cov.hold->reason)} + ", retried "
                       + std::to_string(cov.hold->retry_count) + " round(s)): every record at or above "
                       "that position is unaccounted for");
-    if (cov.classification == 4)
+    if (cov.classification == CoverageClass::Clamped)
         return retain(SweepRetainClass::Hold,
-                      "namespace coverage is classified clamped (4) with no hold recorded: whatever "
+                      "namespace coverage is classified clamped with no hold recorded: whatever "
                       "stopped the fold was not carried, so nothing above its cursor is accounted for");
-    if (cov.classification == 0)
+    if (cov.classification == CoverageClass::Absent)
         return retain(SweepRetainClass::NoCoverage,
-                      "namespace coverage is classified absent (0): no round folded it, so its cursor "
+                      "namespace coverage is classified absent: no round folded it, so its cursor "
                       "is not the result of any walk");
 
     /// RULE 1 (spec §6). Grants do not cross epochs, so every `+1` that could name an epoch-`E` build

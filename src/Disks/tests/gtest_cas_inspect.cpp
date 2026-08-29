@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
@@ -286,6 +287,32 @@ TEST(CASInspect, RendersRefCkptAbsencesAsExplicitNulls)
     EXPECT_NE(json.find(R"("life_epoch":null)"), String::npos) << json;
     EXPECT_NE(json.find(R"("checkpoint_snapshot_id":null)"), String::npos) << json;
     EXPECT_NE(json.find(R"("last_epoch_seal":null)"), String::npos) << json;
+}
+
+/// `CoverageClass` renders as its full wire word, not the enumerator's numeric value: `cas-inspect` is
+/// exactly the tool an operator reaches for to read a fold seal directly, so a coverage row that still
+/// printed a bare integer would send them back to this file's comment to decode it.
+TEST(CASInspect, RendersCoverageClassificationWireWords)
+{
+    const Layout layout("p");
+    CasFoldSeal seal;
+    seal.generation = 3;
+    seal.parent_generation = 2;
+    seal.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = CoverageClass::Absent};
+    seal.ref_lives[UInt128{2}].coverage = RefCoverage{.classification = CoverageClass::Unchanged};
+    seal.ref_lives[UInt128{3}].coverage
+        = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}};
+    seal.ref_lives[UInt128{4}].coverage = RefCoverage{
+        .classification = CoverageClass::Clamped,
+        .hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
+                        .retry_count = 0, .next_retry_round = 1}};
+
+    const String key = layout.foldSealKey(/*generation*/3, /*attempt*/0);
+    const String json = caInspectToJson(layout, key, encodeFoldSeal(seal));
+    EXPECT_NE(json.find(R"("classification":"absent")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("classification":"unchanged")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("classification":"folded")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("classification":"clamped")"), String::npos) << json;
 }
 
 /// A listed physical id cannot supply a namespace. Inspect must receive the unique catalog join, and

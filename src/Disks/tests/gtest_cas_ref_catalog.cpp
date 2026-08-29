@@ -688,7 +688,7 @@ TEST(CASRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimal
         {
             seal.ref_lives.emplace(std::numeric_limits<UInt128>::max() - i, RefLifeFoldState{
                 .coverage = RefCoverage{
-                    .classification = 4,
+                    .classification = CoverageClass::Clamped,
                     .last_folded_ref_id = RefTxnId{max, max},
                     .hold = RefHold{
                         .reason = HoldReason::UnconsumedSealCrossing,
@@ -1113,7 +1113,7 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
     CasFoldSeal held_parent;
     held_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
         .coverage = RefCoverage{
-            .classification = 4,
+            .classification = CoverageClass::Clamped,
             .last_folded_ref_id = RefTxnId{1, 2},
             .hold = RefHold{.offending_position = RefTxnId{1, 3}}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
@@ -1124,7 +1124,7 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
 
     CasFoldSeal mismatched_parent;
     mismatched_parent.ref_lives.emplace(UInt128{8}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
         backend, layout, removing, mismatched_parent, 5,
@@ -1133,7 +1133,7 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
 
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
     CatalogEntry live = removing;
@@ -1196,7 +1196,7 @@ TEST(CASRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
 
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
         backend, layout, removing, ready_parent, 5,
@@ -1243,7 +1243,7 @@ TEST(CASRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrRepl
 
         CasFoldSeal ready_parent;
         ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-            .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+            .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
             .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
         std::optional<CatalogEntry> replacement;
         if (replace)
@@ -1290,7 +1290,7 @@ TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
         PutOutcome::Done);
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
@@ -1322,7 +1322,7 @@ TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolut
         PutOutcome::Done);
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
     size_t authority_checks = 0;
@@ -1359,7 +1359,7 @@ TEST(CASRefCatalogRemoval, CasPutExceptionPropagatesAfterMandatoryResolution)
         PutOutcome::Done);
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
     backend.armCasPutThrow(layout.refCatalogKey());
@@ -1432,12 +1432,12 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
 
     RefScanSummary ordinary_scan;
     ordinary_scan.parent_ref_lives.emplace(UInt128{1}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}}});
     ordinary_scan.parent_ref_lives.emplace(UInt128{3}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{3, 3}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{3, 3}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{3, 3}}});
     ordinary_scan.parent_ref_lives.emplace(UInt128{4}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{4, 4}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{4, 4}}});
     ordinary_scan.listed_lives = {UInt128{1}, UInt128{2}, UInt128{4}};
     ordinary_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 2}});
     ordinary_scan.holds.emplace(UInt128{2}, RefHold{.offending_position = RefTxnId{2, 2}});
@@ -1449,7 +1449,7 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     RefScanSummary rebuild_scan;
     rebuild_scan.parent_ref_lives.emplace(UInt128{1}, ordinary_scan.parent_ref_lives.at(UInt128{1}));
     rebuild_scan.parent_ref_lives.emplace(UInt128{5}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{5, 5}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{5, 5}}});
     rebuild_scan.listed_lives = {UInt128{1}, UInt128{3}, UInt128{5}};
     rebuild_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 3}});
     rebuild_scan.holds.emplace(UInt128{3}, RefHold{.offending_position = RefTxnId{3, 4}});
@@ -1541,7 +1541,7 @@ TEST(CASGCStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
     EXPECT_NE(absent->find("terminal has not folded"), String::npos);
     EXPECT_EQ(absent->find("/_log/"), String::npos) << "an absent terminal has no exact id to name";
 
-    row.fold_state.coverage.classification = 4;
+    row.fold_state.coverage.classification = CoverageClass::Clamped;
     row.fold_state.coverage.hold = RefHold{
         .reason = HoldReason::BodyUndecodable,
         .offending_position = RefTxnId{5, 6}};
@@ -1601,7 +1601,7 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     seal.generation = 1;
     seal.ref_lives.emplace(life_id, RefLifeFoldState{
         .coverage = RefCoverage{
-            .classification = 4,
+            .classification = CoverageClass::Clamped,
             .hold = RefHold{
                 .reason = HoldReason::BodyUndecodable,
                 .offending_position = RefTxnId{5, 6},
@@ -1659,9 +1659,9 @@ TEST(CASGCRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
         .catalog = catalog, .token = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
     RefScanSummary scan;
     scan.parent_ref_lives.emplace(current_life, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{2, 3}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{2, 3}}});
     scan.parent_ref_lives.emplace(unmatched_life, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{9, 9}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{9, 9}}});
 
     const uint64_t events_before =
         ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load();
@@ -1697,7 +1697,7 @@ TEST(CASGCRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
     RefScanSummary observations;
     observations.max_log_by_life.emplace(UInt128{2}, RefTxnId{2, 7});
     observations.parent_ref_lives.emplace(UInt128{2}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{2, 3}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{2, 3}}});
 
     const RefPlan plan = tests::buildRefWalkPlanForTest(observations, cut);
 

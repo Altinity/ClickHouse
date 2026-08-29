@@ -104,7 +104,7 @@ void deleteCatalogLife(
 
     CasFoldSeal parent;
     parent.ref_lives.emplace(life1.incarnation, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
     if (CasRefCatalog::deleteCompletedRemoving(
             backend, layout, *it, parent, 1,

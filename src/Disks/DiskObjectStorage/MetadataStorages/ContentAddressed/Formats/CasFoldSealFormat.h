@@ -55,6 +55,30 @@ enum class HoldReason : uint8_t
 /// namespace — and a second rendering of these words elsewhere would be a second place for them to drift.
 std::string_view holdReasonToWord(HoldReason r);
 
+/// What the current round did for one life-keyed `CasFoldSeal::ref_lives` row. A BOUNDED enum: the type
+/// itself is the closed set, so a producer cannot construct a fifth shape without an explicit cast, and
+/// the decoder's wire-word lookup refuses anything else as `CORRUPTED_DATA` rather than silently
+/// reinterpreting an integer.
+///
+/// THESE ARE WIRE VALUES, AND THEY ARE APPEND-ONLY, for the same reason `HoldReason` is: a durable seal
+/// written by one build is read by another. `Clamped` sits at 3, not the 4 an older byte-valued wire
+/// used for it — that old numeric wire is retired by this same cut and nothing outside it persists the
+/// raw byte, so nothing durable depends on the old number, and a dense range is what makes the wire
+/// table's lookup a direct index rather than a search.
+enum class CoverageClass : uint8_t
+{
+    Absent = 0,      /// no round has folded a ref cursor for this namespace
+    Unchanged = 1,   /// folded, but nothing moved this round
+    Folded = 2,      /// every record through the observed cursor was folded
+    Clamped = 3,     /// folding stopped below the ref-log cursor; must be read again next round
+};
+
+/// The wire word one `CoverageClass` is persisted as; `fromWord` rejects anything else as
+/// `CORRUPTED_DATA`. Exported for the same reason `holdReasonToWord` is: the classification is rendered
+/// outside the codec too (`cas-inspect`, the sweep's retention messages).
+std::string_view coverageClassToWord(CoverageClass c);
+CoverageClass coverageClassFromWord(std::string_view w);
+
 /// The durable hold on one namespace. It rides `RefCoverage` across rounds and across `REBUILD`, and
 /// clears ONLY by folding through `offending_position` and adopting the result in `gc/state` — never by
 /// observing another absent, because an absent is exactly the observation a lying store produces.
@@ -87,21 +111,17 @@ struct RefHold
     bool operator==(const RefHold &) const = default;
 };
 
-/// Records what the current round did for one life-keyed `CasFoldSeal::ref_lives` row.
-/// `classification` is a persisted byte:
-/// 0 means absent, 1 means unchanged, 2 means all records through the observed cursor were folded, and 4
-/// means folding was clamped below the ref-log cursor. A clamped entry must be read again in the next
-/// round, because an unfolded event may become foldable by then.
+/// Records what the current round did for one life-keyed `CasFoldSeal::ref_lives` row. See
+/// `CoverageClass` for what each value means.
 ///
-/// THE SET {0, 1, 2, 4} IS CLOSED, and both codecs enforce it (decode `CORRUPTED_DATA`, encode
-/// `LOGICAL_ERROR`). Every consumer branches on exact values — the sweep's §6 deletion premise refuses a
-/// row by testing `== 4` and `== 0` — so an unrecognized byte is not a variant to tolerate: it passes
-/// every refusal stated in terms of the set and reaches the delete. The decoder also validates BEFORE
-/// narrowing to the byte, because a wide integer on the wire (258, say) truncates into the set and would
-/// otherwise claim a coverage the fold never proved.
+/// Every consumer branches on exact values — the sweep's §6 deletion premise refuses a row by testing
+/// `== Clamped` and `== Absent` — so the CLOSED set matters beyond the codec, and it is now the type
+/// itself: `CoverageClass` names exactly the four shapes, both codecs go through the shared wire table
+/// (decode `CORRUPTED_DATA`, encode `LOGICAL_ERROR` on the one path that still reaches an out-of-range
+/// value, an explicit cast), and an unrecognized wire word is refused before it ever reaches a consumer.
 struct RefCoverage
 {
-    uint8_t classification = 0;
+    CoverageClass classification = CoverageClass::Absent;
 
     /// The greatest `RefTxnId` whose owner changes have contributed their manifest-edge deltas. There is
     /// one ref-log stream per namespace life, so this cursor is stored in that life-keyed row.
@@ -109,11 +129,11 @@ struct RefCoverage
     /// offending transaction so the complete transaction is retried rather than partially applied.
     RefTxnId last_folded_ref_id{};
 
-    /// STRICT GRAMMAR: present if and only if `classification == 4`. Both directions enforce it — the
-    /// encoder refuses to write a classification-4 row without a hold (a clamp whose reason was lost is
-    /// indistinguishable from a clean cursor once it is durable) and refuses to write a hold on any
-    /// other classification (`LOGICAL_ERROR`); the decoder rejects both shapes as `CORRUPTED_DATA`. The
-    /// pairing lives in the type, not only in the codec, so no producer can construct the forbidden
+    /// STRICT GRAMMAR: present if and only if `classification == CoverageClass::Clamped`. Both directions
+    /// enforce it — the encoder refuses to write a clamped row without a hold (a clamp whose reason was
+    /// lost is indistinguishable from a clean cursor once it is durable) and refuses to write a hold on
+    /// any other classification (`LOGICAL_ERROR`); the decoder rejects both shapes as `CORRUPTED_DATA`.
+    /// The pairing lives in the type, not only in the codec, so no producer can construct the forbidden
     /// combination by forgetting a field.
     std::optional<RefHold> hold = std::nullopt;
 
@@ -192,7 +212,7 @@ void checkFoldSealObjectBytes(uint64_t encoded_bytes);
 /// tagged records in the fixed `ref_life`/`blob_run`/`condemned` order and a record-count trailer. Map iteration and
 /// run references are sorted so retries produce byte-identical output for write-once adoption.
 ///
-/// Enforces the whole coverage grammar — the closed classification set, the classification-4 hold
+/// Enforces the whole coverage grammar — the closed classification set, the clamped-classification hold
 /// pairing, and the hold's canonical offending position — and BOTH byte caps: every emitted line against
 /// `line_cap` — header, meta, records and trailer alike, with no exception — and the whole object
 /// against `object_cap`. Both PUT sites go through this function, so the gate cannot be bypassed by

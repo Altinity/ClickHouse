@@ -326,7 +326,7 @@ uint64_t worstCaseEntryFoldReservationBytes()
         /// coverage record plus terminal cleanup evidence, all numeric fields at maximum width.
         seal.ref_lives[std::numeric_limits<UInt128>::max()] = RefLifeFoldState{
             .coverage = RefCoverage{
-                .classification = 4,
+                .classification = CoverageClass::Clamped,
                 .last_folded_ref_id = RefTxnId{kU64Max, kU64Max},
                 .hold = RefHold{.reason = HoldReason::UnconsumedSealCrossing,
                                  .offending_position = RefTxnId{kU64Max, kU64Max},

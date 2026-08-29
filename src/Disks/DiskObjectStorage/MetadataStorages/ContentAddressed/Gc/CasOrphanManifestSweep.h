@@ -39,7 +39,7 @@ struct ManifestKey
 enum class SweepRetainClass : uint8_t
 {
     None = 0,          /// the premise admitted the deletion; no retention happened
-    NoCoverage,        /// no sealed coverage row for the namespace (a classification-0 row counts here)
+    NoCoverage,        /// no sealed coverage row for the namespace (a classification-`Absent` row counts here)
     Hold,              /// the namespace is held, or is classified clamped
     UnconsumedSeal,    /// rule (1): the cursor has not consumed the build epoch's closing seal
     TailRemoval,       /// rule (2): an unconsumed tail record names this manifest as a removal target

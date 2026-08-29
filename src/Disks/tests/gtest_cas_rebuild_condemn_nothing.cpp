@@ -431,7 +431,7 @@ TEST(CASRebuildCondemnNothing, CarriesHoldsVerbatimWhileCondemningNothing)
     const CasFoldSeal seal = decodeFoldSeal(backend->get(layout.foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
     const auto it = seal.ref_lives.find(catalogLifeIdForTest(*backend, layout, kNsA));
     ASSERT_NE(it, seal.ref_lives.end());
-    EXPECT_EQ(it->second.coverage.classification, 4);
+    EXPECT_EQ(it->second.coverage.classification, CoverageClass::Clamped);
     ASSERT_TRUE(it->second.coverage.hold.has_value());
     EXPECT_EQ(*it->second.coverage.hold, planted)
         << "a rebuild retried nothing, so it rewrites nothing about the hold";

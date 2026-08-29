@@ -15,8 +15,8 @@ CasFoldSeal sampleFoldSeal()
     CasFoldSeal seal;
     seal.generation = 7;
     seal.parent_generation = 6;
-    seal.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{3, 4}};
-    seal.ref_lives[UInt128{2}].coverage = RefCoverage{.classification = 1};
+    seal.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{3, 4}};
+    seal.ref_lives[UInt128{2}].coverage = RefCoverage{.classification = CoverageClass::Unchanged};
     seal.blob_target_runs.push_back(RunRef{.key = "gc/gen/7/blob_target/0/0", .checksum = UInt128(0xABCDEF)});
     return seal;
 }
@@ -36,7 +36,7 @@ TEST(CASFormatBattery, FoldSeal)
     CasFoldSeal seal;
     seal.generation = 5;
     seal.parent_generation = 4;
-    seal.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{7, 11}};
+    seal.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{7, 11}};
     seal.blob_target_runs.push_back(RunRef{.key = "r0", .checksum = UInt128(0x0f), .shard = 0, .key_generation = 5});
     seal.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1,
                                                  .oldest_nonpending_condemn_round = 4};
@@ -45,7 +45,7 @@ TEST(CASFormatBattery, FoldSeal)
         [](std::string_view s) { decodeFoldSeal(std::string(openObject(FormatId::FoldSeal, s))); },
         currentFormatHeader("cas_fold_seal") +
         "{\"generation\":\"5\",\"parent_generation\":\"4\"}\n"
-        "{\"kind\":\"ref_life\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"fold_epoch\":\"7\",\"fold_seq\":\"11\"}\n"
+        "{\"kind\":\"ref_life\",\"life\":\"00000000000000000000000000000001\",\"class\":\"folded\",\"fold_epoch\":\"7\",\"fold_seq\":\"11\"}\n"
         "{\"kind\":\"blob_run\",\"key\":\"r0\",\"checksum\":\"0000000000000000000000000000000f\",\"shard\":0,\"key_generation\":\"5\"}\n"
         "{\"kind\":\"condemned\",\"shard\":0,\"condemned\":3,\"pending\":1,\"oldest_round\":\"4\"}\n"
         "{\"n\":3}\n"});
@@ -59,7 +59,7 @@ TEST(CASFoldSealFormat, RoundTripsAllFields)
     EXPECT_EQ(out.generation, in.generation);
     EXPECT_EQ(out.parent_generation, in.parent_generation);
     ASSERT_EQ(out.ref_lives.size(), in.ref_lives.size());
-    EXPECT_EQ(out.ref_lives.at(UInt128{1}).coverage.classification, 2);
+    EXPECT_EQ(out.ref_lives.at(UInt128{1}).coverage.classification, CoverageClass::Folded);
     EXPECT_EQ(out.ref_lives.at(UInt128{1}).coverage.last_folded_ref_id, (RefTxnId{3, 4}));
     ASSERT_EQ(out.blob_target_runs.size(), 1u);
     EXPECT_EQ(out.blob_target_runs[0].key, "gc/gen/7/blob_target/0/0");
@@ -241,7 +241,7 @@ TEST(CASFoldSeal, RejectsEmptyAndBadMagic)
 TEST(CASFoldSeal, CoverageRecordsEveryCatalogLife)
 {
     CasFoldSeal in = sampleFoldSeal();
-    in.ref_lives[UInt128{3}].coverage = RefCoverage{.classification = 0};
+    in.ref_lives[UInt128{3}].coverage = RefCoverage{.classification = CoverageClass::Absent};
     const CasFoldSeal out = decodeFoldSeal(encodeFoldSeal(in));
     EXPECT_TRUE(out.ref_lives.contains(UInt128{3}));
     EXPECT_EQ(out.ref_lives.size(), 3u);
@@ -254,7 +254,7 @@ TEST(CASFoldSeal, FoldSealCondemnedSummaryRoundTrips)
     CasFoldSeal s;
     s.generation = 9;
     s.parent_generation = 8;
-    s.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = 2};
+    s.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = CoverageClass::Folded};
     s.blob_target_runs.push_back(RunRef{.key = "gc/gen/9/blob_target/0/0", .checksum = UInt128(0x77),
                                         .shard = 0, .key_generation = 9});
     s.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1,
@@ -283,7 +283,7 @@ TEST(CASFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
     const UInt128 life_id{0x1234};
     seal.ref_lives.emplace(life_id, RefLifeFoldState{
         .coverage = RefCoverage{
-            .classification = 4,
+            .classification = CoverageClass::Clamped,
             .last_folded_ref_id = RefTxnId{3, 4},
             .hold = RefHold{
                 .reason = HoldReason::ManifestBodyMissing,
@@ -294,7 +294,7 @@ TEST(CASFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
 
     const String expected = currentFormatHeader("cas_fold_seal") +
         "{\"generation\":\"8\",\"parent_generation\":\"7\"}\n"
-        "{\"kind\":\"ref_life\",\"life\":\"00000000000000000000000000001234\",\"cls\":4,"
+        "{\"kind\":\"ref_life\",\"life\":\"00000000000000000000000000001234\",\"class\":\"clamped\","
         "\"fold_epoch\":\"3\",\"fold_seq\":\"4\",\"hold_reason\":\"manifest_body_missing\",\"hold_epoch\":\"5\","
         "\"hold_seq\":\"6\",\"retries\":7,\"retry_round\":\"8\",\"remove_epoch\":\"9\",\"remove_seq\":\"10\"}\n"
         "{\"n\":1}\n";
@@ -310,7 +310,7 @@ TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyCoverageRecord)
     const String old =
         "{\"type\":\"cas_fold_seal\",\"v\":1}\n"
         "{\"generation\":\"8\",\"parent_generation\":\"7\"}\n"
-        "{\"kind\":\"cov\",\"key\":\"name/0\",\"cls\":2,\"fold_epoch\":\"3\",\"fold_seq\":\"4\"}\n"
+        "{\"kind\":\"cov\",\"key\":\"name/0\",\"class\":\"folded\",\"fold_epoch\":\"3\",\"fold_seq\":\"4\"}\n"
         "{\"n\":1}\n";
     cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(old); }, "legacy coverage");
 }

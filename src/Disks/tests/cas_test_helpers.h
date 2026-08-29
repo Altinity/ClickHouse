@@ -940,8 +940,8 @@ inline UInt128 catalogLifeIdForTest(
 /// real round. This is the durable fact the sweep's §6 deletion premise reads
 /// (`CasOrphanManifestSweep.cpp`): `cursor` is the namespace's `last_folded_ref_id`, and a manifest of
 /// an epoch-`E` build is deletable only once that cursor sits in an epoch STRICTLY above `E`.
-/// `hold`, when set, makes the row classification 4 — the strict grammar `encodeFoldSeal` enforces in
-/// both directions, so a hold and a non-4 classification cannot be seeded together.
+/// `hold`, when set, makes the row classification `Clamped` — the strict grammar `encodeFoldSeal`
+/// enforces in both directions, so a hold and a non-clamped classification cannot be seeded together.
 ///
 /// SHARP EDGE, HANDLED HERE SO NO CALLER HAS TO KNOW IT: a fold seal must carry a `condemned_summary`
 /// entry for EVERY shard in `0..gc_shards-1`. A later real round adopts this object as its PARENT and
@@ -988,7 +988,7 @@ inline void seedFoldCursorForTest(
     seal.generation = generation;
 
     DB::Cas::RefCoverage cov;
-    cov.classification = hold ? 4 : 2;
+    cov.classification = hold ? DB::Cas::CoverageClass::Clamped : DB::Cas::CoverageClass::Folded;
     cov.last_folded_ref_id = cursor;
     cov.hold = hold;
     seal.ref_lives[life.incarnation].coverage = cov;

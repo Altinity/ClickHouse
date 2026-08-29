@@ -321,7 +321,7 @@ CompletedRemovingFixture seedCompletedRemoving(
     CasFoldSeal parent;
     parent.generation = 1;
     parent.ref_lives.emplace(fixture.life_id, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
     for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
         parent.condemned_summary.emplace(shard, CondemnedSummary{});
@@ -368,7 +368,7 @@ void seedCompletedRemovingBatch(
     parent.generation = 1;
     for (const CatalogEntry & entry : entries)
         parent.ref_lives.emplace(entry.incarnation, RefLifeFoldState{
-            .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+            .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
             .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
     for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
         parent.condemned_summary.emplace(shard, CondemnedSummary{});
@@ -2814,7 +2814,7 @@ TEST(CASGCFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDe
     const UInt128 unmatched_life = hexToU128("fedcba98765432100123456789abcdef");
     ASSERT_FALSE(parent.ref_lives.contains(unmatched_life));
     parent.ref_lives.emplace(unmatched_life, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{9, 9}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{9, 9}}});
     ASSERT_EQ(
         backend->putOverwrite(parent_seal_key, encodeFoldSeal(parent), parent_object->token).outcome,
         PutOutcome::Done);
@@ -3137,7 +3137,7 @@ TEST(CASGCFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
     CasFoldSeal parent;
     parent.generation = 1;
     parent.ref_lives.emplace(life_id, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
     for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
         parent.condemned_summary.emplace(shard, CondemnedSummary{});

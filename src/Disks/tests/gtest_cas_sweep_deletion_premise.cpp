@@ -179,7 +179,7 @@ TEST(CASSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
 
     NamespaceFoldView view;
     RefCoverage cov;
-    cov.classification = 2;
+    cov.classification = CoverageClass::Folded;
     cov.last_folded_ref_id = RefTxnId{kBuildEpoch + 1, 1};   /// rule (1) satisfied
     view.coverage = cov;
     view.tail_removal_targets.insert(key);
