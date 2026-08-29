@@ -10,6 +10,11 @@ SharedResourcesExt::Limits SharedResourcesExt::getLimitsPerReader(const FormatPa
 {
     const SharedResourcesExt & ext = *static_cast<const SharedResourcesExt *>(parser_shared_resources.opaque.get());
     size_t n = parser_shared_resources.num_streams.load(std::memory_order_relaxed);
+    /// Up to `max_concurrent_readers_per_stream` readers can be alive per stream at once (e.g.
+    /// `object_storage_max_files_to_prefetch` priming several files ahead). Without this factor,
+    /// each of them would compute its budget as if it alone owned its stream's whole share,
+    /// oversubscribing memory/parsing-thread budget by that factor once more than one is primed.
+    n *= std::max<size_t>(parser_shared_resources.max_concurrent_readers_per_stream, 1);
     fraction /= static_cast<double>(std::max(n, size_t(1)));
     return Limits {
         .memory_low_watermark = size_t(ext.total_memory_low_watermark * fraction),
