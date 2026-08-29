@@ -59,15 +59,13 @@ void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r)
     writeStringValue(out, codecFor(r.algo).toHex(r.digest));
 }
 
-void writeManifestRefFields(CasJsonWriter & out, bool & first, std::string_view prefix, const ManifestRef & r)
+void writeManifestRefFields(CasJsonWriter & out, bool & first, const ManifestRefWireKeys & keys, const ManifestRef & r)
 {
-    /// Unlike the WriteBuffer overload, the two-part key() form appends the prefix and name back
-    /// to back with no composed String(prefix) + "..." temporary.
-    out.key(prefix, "me", first);
+    writeKey(out, keys.epoch, first);
     out.u64StringValue(r.writer_epoch);
-    out.key(prefix, "mb", first);
+    writeKey(out, keys.build, first);
     out.u64StringValue(r.build_sequence);
-    out.key(prefix, "mo", first);
+    writeKey(out, keys.ord, first);
     out.u64Number(r.manifest_ordinal);
 }
 
@@ -85,6 +83,28 @@ ManifestRef manifestRefFromFields(uint64_t writer_epoch, uint64_t build_sequence
     r.manifest_ordinal = static_cast<uint32_t>(manifest_ordinal);
     checkManifestRef(r, caller, what);
     return r;
+}
+
+ManifestRef ManifestRefFields::buildRef(std::string_view what, std::string_view context) const
+{
+    if (!epoch || !build || !ord)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: {} manifest_ref missing epoch/build/ord", what, context);
+    return manifestRefFromFields(*epoch, *build, *ord, what, context);
+}
+
+BlobRef BlobRefFields::build(std::string_view what) const
+{
+    if (!algo_word || !digest_hex)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: blob ref missing ha/h", what);
+    const BlobHashAlgo algo = blobHashAlgoFromWord(*algo_word, what);
+    /// Validate the digest width before calling `fromHex`. A width mismatch otherwise produces
+    /// `BAD_ARGUMENTS` instead of the `CORRUPTED_DATA` required for malformed serialized input,
+    /// allowing an invalid record to escape the decoder's fail-closed error contract.
+    const uint64_t expected_hex_len = blobHashLenFor(algo) * 2;
+    if (digest_hex->size() != expected_hex_len)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: digest hex width {} does not match algo width {}", what, digest_hex->size(), expected_hex_len);
+    return BlobRef{algo, codecFor(algo).fromHex(*digest_hex)};
 }
 
 }

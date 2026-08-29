@@ -63,7 +63,7 @@ void writeCommittedRow(CasJsonWriter & out, const RefCommittedRow & row)
     writeStringValue(out, "c");
     writeKey(out, "rn", first);
     writeStringValue(out, row.ref_name);
-    writeManifestRefFields(out, first, "", row.manifest_ref);
+    writeManifestRefFields(out, first, kBareManifestRefKeys, row.manifest_ref);
     writeKey(out, "ts", first);
     writeIntText(row.published_at_ms, out);
     closeObject(out, first);
@@ -83,7 +83,7 @@ void writePrecommitRow(CasJsonWriter & out, const RefOwnerBinding & row)
     writeStringValue(out, "p");
     writeKey(out, "rn", first);
     writeStringValue(out, row.ref_name);
-    writeManifestRefFields(out, first, "", row.manifest_ref);
+    writeManifestRefFields(out, first, kBareManifestRefKeys, row.manifest_ref);
     closeObject(out, first);
     writeChar('\n', out);
 }

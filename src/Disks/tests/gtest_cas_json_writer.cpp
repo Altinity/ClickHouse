@@ -21,7 +21,7 @@ TEST(CASJsonWriter, KeyValueSequenceMatchesCanonicalShape)
     w.u64Number(3);
     w.key("ok", first);
     w.boolValue(true);
-    w.key("o", "me", first);
+    w.key("ome", first);
     w.u64StringValue(1);
     w.closeObject(first);
     w.newline();

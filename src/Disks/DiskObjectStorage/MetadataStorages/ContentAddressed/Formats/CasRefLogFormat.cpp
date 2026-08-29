@@ -69,15 +69,15 @@ void checkBudget(const std::vector<RefOp> & ops, size_t encoded_bytes)
     }
 }
 
-void writeBindingFields(CasJsonWriter & out, bool & first, std::string_view prefix, const RefOwnerBinding & b)
+void writeBindingFields(CasJsonWriter & out, bool & first, const BindingWireKeys & keys, const RefOwnerBinding & b)
 {
     checkCanonicalRefName(b.ref_name, "RefLogTxn", "owner binding ref_name");
     checkManifestRef(b.manifest_ref, "RefLogTxn", "owner binding manifest_ref");
-    out.key(prefix, "bk", first);
+    writeKey(out, keys.kind, first);
     writeStringValue(out, refOwnerKindToWord(b.kind));
-    out.key(prefix, "rn", first);
+    writeKey(out, keys.ref, first);
     writeStringValue(out, b.ref_name);
-    writeManifestRefFields(out, first, prefix, b.manifest_ref);
+    writeManifestRefFields(out, first, keys.manifest, b.manifest_ref);
 }
 
 void writeOp(CasJsonWriter & out, const RefOp & op)
@@ -93,16 +93,16 @@ void writeOp(CasJsonWriter & out, const RefOp & op)
             break;
         case RefOpKind::OwnerTransition:
             if (op.old_binding)
-                writeBindingFields(out, first, "o", *op.old_binding);
+                writeBindingFields(out, first, kOldBindingKeys, *op.old_binding);
             if (op.new_binding)
-                writeBindingFields(out, first, "n", *op.new_binding);
+                writeBindingFields(out, first, kNewBindingKeys, *op.new_binding);
             break;
         case RefOpKind::SetPublishedAt:
             checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_published_at ref_name");
             checkManifestRef(op.expected_manifest_ref, "RefLogTxn", "set_published_at manifest_ref");
             writeKey(out, "rn", first);
             writeStringValue(out, op.ref_name);
-            writeManifestRefFields(out, first, "", op.expected_manifest_ref);
+            writeManifestRefFields(out, first, kBareManifestRefKeys, op.expected_manifest_ref);
             writeKey(out, "ts", first);
             writeIntText(op.published_at_ms, out);
             break;

@@ -59,18 +59,6 @@ public:
         append("\":");
     }
 
-    /// Same, for the prefixed key vocabulary ("o"/"n" + "me"/"mb"/"mo"/"bk"/"rn") — the
-    /// prefix and name are appended back to back, no composed temporary.
-    void key(std::string_view prefix, std::string_view name, bool & first)
-    {
-        appendChar(first ? '{' : ',');
-        first = false;
-        appendChar('"');
-        append(prefix);
-        append(name);
-        append("\":");
-    }
-
     /// Quoted JSON string with full escaping (bulk-run scan). Defined in CasTextFormat.cpp.
     void stringValue(std::string_view s);
 

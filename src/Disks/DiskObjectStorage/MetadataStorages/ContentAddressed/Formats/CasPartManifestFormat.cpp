@@ -101,7 +101,7 @@ String encodePartManifest(const PartManifest & m)
     /// namespace + payload digest.
     {
         bool first = true;
-        writeManifestRefFields(out, first, "", m.ref);
+        writeManifestRefFields(out, first, kBareManifestRefKeys, m.ref);
         writeKey(out, "ns", first);
         writeStringValue(out, m.root_namespace_id.string());
         writeKey(out, "pd", first);

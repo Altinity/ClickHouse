@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace DB::Cas
@@ -57,12 +58,53 @@ void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t);
 /// lowercase digest are canonical, and the digest is rendered at the width required by `r.algo`.
 void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r);
 
-/// Append the three flat `ManifestRef` fields `me`, `mb`, and `mo` to an in-progress JSON object.
-/// `prefix` is prepended to each key, allowing the ref codecs to distinguish old and new owner
-/// bindings (`ome`/`omb`/`omo` and `nme`/`nmb`/`nmo`) while part manifests and ordinary rows use an
-/// empty prefix. The two unbounded `uint64_t` values are decimal JSON strings; the bounded ordinal
-/// is a JSON number. All consumers use this exact spelling and representation.
-void writeManifestRefFields(CasJsonWriter & out, bool & first, std::string_view prefix, const ManifestRef & r);
+/// The `ha`/`h` and `tt`/`tv` key spellings, named once so `writeBlobRefFields`/`writeTokenFields`
+/// and the `match*Fields` collectors below can never drift apart on the literal.
+namespace SharedWire
+{
+    inline constexpr WireKey algo{"ha"};
+    inline constexpr WireKey digest{"h"};
+    inline constexpr WireKey token_type{"tt"};
+    inline constexpr WireKey token{"tv"};
+}
+
+/// One `ManifestRef`'s three flat key names. Every bundle spells the SAME wire representation
+/// (two decimal-string `uint64_t`s and one JSON-number ordinal); only the key names vary per
+/// binding role. Member names carry the semantic role the ref plays (`epoch`/`build`/`ord`); the
+/// bundle constants below carry the CURRENT wire spelling for each role.
+struct ManifestRefWireKeys
+{
+    WireKey epoch;
+    WireKey build;
+    WireKey ord;
+};
+
+/// The unprefixed `me`/`mb`/`mo` spelling used by part manifests, snapshot rows, and the
+/// `set_published_at` ref-log op.
+inline constexpr ManifestRefWireKeys kBareManifestRefKeys{WireKey{"me"}, WireKey{"mb"}, WireKey{"mo"}};
+/// The `ome`/`omb`/`omo` spelling for a ref-log owner_transition's OLD binding.
+inline constexpr ManifestRefWireKeys kOldManifestRefKeys{WireKey{"ome"}, WireKey{"omb"}, WireKey{"omo"}};
+/// The `nme`/`nmb`/`nmo` spelling for a ref-log owner_transition's NEW binding.
+inline constexpr ManifestRefWireKeys kNewManifestRefKeys{WireKey{"nme"}, WireKey{"nmb"}, WireKey{"nmo"}};
+
+/// One owner binding's key names: the owner-kind word, the ref name, and its nested `ManifestRef`
+/// bundle. Only the ref-log owner_transition op uses this bundle (old/new binding sides).
+struct BindingWireKeys
+{
+    WireKey kind;
+    WireKey ref;
+    ManifestRefWireKeys manifest;
+};
+
+/// The `obk`/`orn`/`ome`/`omb`/`omo` spelling for the OLD binding side.
+inline constexpr BindingWireKeys kOldBindingKeys{WireKey{"obk"}, WireKey{"orn"}, kOldManifestRefKeys};
+/// The `nbk`/`nrn`/`nme`/`nmb`/`nmo` spelling for the NEW binding side.
+inline constexpr BindingWireKeys kNewBindingKeys{WireKey{"nbk"}, WireKey{"nrn"}, kNewManifestRefKeys};
+
+/// Append the three flat `ManifestRef` fields named by `keys` to an in-progress JSON object. The
+/// two unbounded `uint64_t` values are decimal JSON strings; the bounded ordinal is a JSON number.
+/// All consumers use this exact representation; only the key spelling varies by `keys`.
+void writeManifestRefFields(CasJsonWriter & out, bool & first, const ManifestRefWireKeys & keys, const ManifestRef & r);
 
 /// Construct a `ManifestRef` from decoded field values and validate the complete domain range:
 /// nonzero `writer_epoch` and `build_sequence`, and `manifest_ordinal` in
@@ -71,5 +113,71 @@ void writeManifestRefFields(CasJsonWriter & out, bool & first, std::string_view 
 /// exceptions.
 ManifestRef manifestRefFromFields(uint64_t writer_epoch, uint64_t build_sequence, uint64_t manifest_ordinal,
                                   std::string_view caller, std::string_view what);
+
+/// Collector for one `ManifestRef`'s three flat fields, filled in by repeated calls to
+/// `matchManifestRefFields` as a tolerant reader walks an object's keys. `buildRef` delegates the
+/// completed group to `manifestRefFromFields`, which performs the required-ness and range checks;
+/// this collector never validates on its own.
+struct ManifestRefFields
+{
+    std::optional<uint64_t> epoch;
+    std::optional<uint64_t> build;
+    std::optional<uint64_t> ord;
+
+    /// `what` names the codec (passed through to `manifestRefFromFields` as its `caller`); `context`
+    /// names the field being reconstructed (e.g. "descriptor", "committed"). Throws `CORRUPTED_DATA`
+    /// if the group is not all-or-nothing complete.
+    ManifestRef buildRef(std::string_view what, std::string_view context) const;
+};
+
+/// Collector for one `BlobRef`'s two flat fields (`ha`/`h`), filled in by `matchBlobRefFields`.
+struct BlobRefFields
+{
+    std::optional<String> algo_word;
+    std::optional<String> digest_hex;
+
+    /// Requires both fields, parses the algorithm word, and checks the digest hex width against the
+    /// algorithm's width BEFORE calling `fromHex` -- a width mismatch must surface as `CORRUPTED_DATA`
+    /// (malformed persisted input), not `DigestCodec::fromHex`'s `BAD_ARGUMENTS` (a caller-contract
+    /// violation). `what` identifies the field in the exception.
+    BlobRef build(std::string_view what) const;
+};
+
+/// Collector for one `Token`'s two flat fields (`tt`/`tv`), filled in by `matchTokenFields`. Phase 1
+/// deliberately has no `build`: callers keep their own local requiredness checks until the unified
+/// both-required build is introduced.
+struct TokenFields
+{
+    std::optional<String> type_word;
+    std::optional<String> value;
+};
+
+/// Each `match*Fields` helper tests `key` against the one or two field names it owns, consumes the
+/// value on a match via `r`, and reports whether it recognized the key. None of them loop over an
+/// object's keys or validate a completed group -- that is the caller's (tolerant-reader loop) and
+/// the collector's `build`/`buildRef` job respectively. Defined inline: a decoder's per-key dispatch
+/// is a hot path and must not gain a function-call boundary here.
+
+inline bool matchManifestRefFields(std::string_view key, JsonObjectReader & r, const ManifestRefWireKeys & keys, ManifestRefFields & fields)
+{
+    if (key == keys.epoch) { fields.epoch = r.readU64String(); return true; }
+    if (key == keys.build) { fields.build = r.readU64String(); return true; }
+    if (key == keys.ord)   { fields.ord = r.readU64Number(); return true; }
+    return false;
+}
+
+inline bool matchBlobRefFields(std::string_view key, JsonObjectReader & r, BlobRefFields & fields)
+{
+    if (key == SharedWire::algo)   { fields.algo_word = r.readString(); return true; }
+    if (key == SharedWire::digest) { fields.digest_hex = r.readString(); return true; }
+    return false;
+}
+
+inline bool matchTokenFields(std::string_view key, JsonObjectReader & r, TokenFields & fields)
+{
+    if (key == SharedWire::token_type) { fields.type_word = r.readString(); return true; }
+    if (key == SharedWire::token)      { fields.value = r.readString(); return true; }
+    return false;
+}
 
 }
