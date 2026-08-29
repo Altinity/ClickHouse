@@ -154,6 +154,58 @@ inline void writeIntText(uint64_t v, CasJsonWriter & out) { out.u64Number(v); }
 void writeHeaderLine(CasJsonWriter & out, FormatId id);
 void writeTrailerLine(CasJsonWriter & out, uint64_t n);
 
+/// A wire-key carrier. The explicit constructor keeps raw string literals out of writer call
+/// sites: a codec passes its named constant, and an inline `WireKey{"..."}` is deliberately loud.
+struct WireKey
+{
+    std::string_view text;
+
+    explicit constexpr WireKey(std::string_view text_) : text(text_) {}
+
+    friend constexpr bool operator==(std::string_view s, const WireKey & k) { return s == k.text; }
+};
+
+inline void writeKey(CasJsonWriter & out, WireKey key, bool & first)
+{
+    writeKey(out, key.text, first);
+}
+
+inline void writeWordField(CasJsonWriter & out, WireKey key, std::string_view word, bool & first)
+{
+    writeKey(out, key, first);
+    writeStringValue(out, word);
+}
+
+inline void writeStringField(CasJsonWriter & out, WireKey key, std::string_view value, bool & first)
+{
+    writeKey(out, key, first);
+    writeStringValue(out, value);
+}
+
+inline void writeU64StringField(CasJsonWriter & out, WireKey key, uint64_t value, bool & first)
+{
+    writeKey(out, key, first);
+    writeU64StringValue(out, value);
+}
+
+inline void writeNumberField(CasJsonWriter & out, WireKey key, uint64_t value, bool & first)
+{
+    writeKey(out, key, first);
+    out.u64Number(value);
+}
+
+inline void writeHex128Field(CasJsonWriter & out, WireKey key, const UInt128 & value, bool & first)
+{
+    writeKey(out, key, first);
+    writeHex128Value(out, value);
+}
+
+inline void writeBoolField(CasJsonWriter & out, WireKey key, bool value, bool & first)
+{
+    writeKey(out, key, first);
+    writeBoolValue(out, value);
+}
+
 /// Pull cursor over one canonical JSON object.
 ///
 /// The reader borrows the input buffer and records the object name for exception messages. It
