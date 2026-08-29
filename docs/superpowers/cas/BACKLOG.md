@@ -60,6 +60,13 @@ as a confirmation note rather than inserted separately. Full triage record:
 Append new items here — quick adds and concurrent-agent findings land in this section, unformatted
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
+
+- PROSE (wire-keys phase-1, gtest_cas_enum_wire_table.cpp `bad_tables`): comment "The two cases
+  above fail the folded density check" has a stale referent count after round-3 asserts — name the
+  cases: "`dup_value` and `invalid_value` fail the folded density check…" (plan copy already fixed).
+- PROSE (wire-keys phase-1, task-2-report.md fix-round-3 self-review): "size comparison … both
+  directions now have a witness" overstates `missing_enumerator` (reaches, doesn't discriminate;
+  only `extra_entry` guards the size line) — keep so nobody deletes `extra_entry` as a duplicate.
 isn't referenced elsewhere first.
 
 The eleven items below are untouched since the 2026-08-04 consolidation-audit findings that produced

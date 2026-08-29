@@ -299,8 +299,8 @@ constexpr EnumWireTable<Fruit, 3> invalid_value{{{
     {Fruit::Apple, "apple"}, {Fruit::Pear, "pear"}, {static_cast<Fruit>(99), "plum"}}}};
 static_assert(!casEnumTableCoversEnum<invalid_value, Fruit>());
 
-/// The two cases above fail the folded density check before the set-equality core runs, so the
-/// core needs its own failing witnesses — both dense and word-unique, so they reach it.
+/// `dup_value` and `invalid_value` fail the folded density check before the set-equality core
+/// runs, so the core needs its own failing witnesses — dense and word-unique, so they reach it.
 /// Reaches the size comparison: one enumerator short.
 constexpr EnumWireTable<Fruit, 2> missing_enumerator{{{
     {Fruit::Apple, "apple"}, {Fruit::Pear, "pear"}}}};
