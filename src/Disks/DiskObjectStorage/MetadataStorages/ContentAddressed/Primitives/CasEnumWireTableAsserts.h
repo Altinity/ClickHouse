@@ -15,6 +15,10 @@ namespace DB::Cas
 template <const auto & Table, typename Enum>
 consteval bool casEnumTableCoversEnum()
 {
+    /// One assert per table carries all three obligations: a table author cannot forget density
+    /// or word uniqueness, because coverage subsumes them.
+    if (!Table.denseAndOrdered() || !Table.wordsUnique())
+        return false;
     constexpr auto declared = magic_enum::enum_values<Enum>();
     if (declared.size() != Table.entries.size())
         return false;
