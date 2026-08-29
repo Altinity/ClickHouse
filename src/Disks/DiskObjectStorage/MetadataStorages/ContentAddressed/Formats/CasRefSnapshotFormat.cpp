@@ -20,6 +20,20 @@ namespace DB::Cas
 namespace
 {
 
+namespace RefSnapWire
+{
+    constexpr WireKey ns{"ns"};
+    constexpr WireKey snapshot_epoch{"we"};
+    constexpr WireKey snapshot_seq{"rs"};
+    constexpr WireKey lifecycle{"lc"};
+    constexpr WireKey kind{"k"};
+    constexpr WireKey ref{"rn"};
+    constexpr WireKey published_ms{"ts"};
+}
+
+constexpr std::string_view kCommittedTag = "c";
+constexpr std::string_view kPrecommitTag = "p";
+
 void checkCommittedSorted(const std::vector<RefCommittedRow> & rows)
 {
     for (size_t i = 1; i < rows.size(); ++i)
@@ -59,13 +73,10 @@ void writeCommittedRow(CasJsonWriter & out, const RefCommittedRow & row)
     checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
     checkManifestRef(row.manifest_ref, "RefTableSnapshot", "committed");
     bool first = true;
-    writeKey(out, "k", first);
-    writeStringValue(out, "c");
-    writeKey(out, "rn", first);
-    writeStringValue(out, row.ref_name);
+    writeWordField(out, RefSnapWire::kind, kCommittedTag, first);
+    writeStringField(out, RefSnapWire::ref, row.ref_name, first);
     writeManifestRefFields(out, first, kBareManifestRefKeys, row.manifest_ref);
-    writeKey(out, "ts", first);
-    writeIntText(row.published_at_ms, out);
+    writeNumberField(out, RefSnapWire::published_ms, row.published_at_ms, first);
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -79,10 +90,8 @@ void writePrecommitRow(CasJsonWriter & out, const RefOwnerBinding & row)
     checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "precommit ref_name");
     checkManifestRef(row.manifest_ref, "RefTableSnapshot", "precommit");
     bool first = true;
-    writeKey(out, "k", first);
-    writeStringValue(out, "p");
-    writeKey(out, "rn", first);
-    writeStringValue(out, row.ref_name);
+    writeWordField(out, RefSnapWire::kind, kPrecommitTag, first);
+    writeStringField(out, RefSnapWire::ref, row.ref_name, first);
     writeManifestRefFields(out, first, kBareManifestRefKeys, row.manifest_ref);
     closeObject(out, first);
     writeChar('\n', out);
@@ -95,32 +104,12 @@ void writePrecommitRow(CasJsonWriter & out, const RefOwnerBinding & row)
 void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
 {
     bool first = true;
-    writeKey(out, "ns", first);
-    writeStringValue(out, snapshot.ns);
-    writeRefTxnIdFields(out, first, "we", "rs", snapshot.snapshot_id);
-    writeKey(out, "lc", first);
-    writeStringValue(out, "live");
+    writeStringField(out, RefSnapWire::ns, snapshot.ns, first);
+    writeRefTxnIdFields(out, first, RefSnapWire::snapshot_epoch.text, RefSnapWire::snapshot_seq.text, snapshot.snapshot_id);
+    writeStringField(out, RefSnapWire::lifecycle, "live", first);
     closeObject(out, first);
     writeChar('\n', out);
 }
-
-/// Collector for a ManifestRef's three flat fields (bare "me"/"mb"/"mo").
-struct ManifestFields
-{
-    std::optional<uint64_t> me;
-    std::optional<uint64_t> mb;
-    std::optional<uint64_t> mo;
-
-    /// Reconstruct a manifest reference after the tolerant reader has collected all three flat
-    /// fields. Missing fields are malformed input; `manifestRefFromFields` performs the remaining
-    /// range checks and reports the same corruption context as the row decoder.
-    ManifestRef build(std::string_view what) const
-    {
-        if (!me || !mb || !mo)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: {} manifest_ref missing me/mb/mo", what);
-        return manifestRefFromFields(*me, *mb, *mo, "RefTableSnapshot", what);
-    }
-};
 
 }
 
@@ -166,10 +155,10 @@ RefTableSnapshot decodeRefTableSnapshot(
         String key;
         while (r.nextKey(key))
         {
-            if (key == "ns") { snapshot.ns = r.readString(); saw_ns = true; }
-            else if (key == "we") { snapshot.snapshot_id.writer_epoch = r.readU64String(); saw_we = true; }
-            else if (key == "rs") { snapshot.snapshot_id.ref_sequence = r.readU64String(); saw_rs = true; }
-            else if (key == "lc")
+            if (key == RefSnapWire::ns) { snapshot.ns = r.readString(); saw_ns = true; }
+            else if (key == RefSnapWire::snapshot_epoch) { snapshot.snapshot_id.writer_epoch = r.readU64String(); saw_we = true; }
+            else if (key == RefSnapWire::snapshot_seq) { snapshot.snapshot_id.ref_sequence = r.readU64String(); saw_rs = true; }
+            else if (key == RefSnapWire::lifecycle)
             {
                 const String lifecycle = r.readString();
                 if (lifecycle != "live")
@@ -210,20 +199,20 @@ RefTableSnapshot decodeRefTableSnapshot(
                     "RefTableSnapshot: trailer count {} != {} rows", n, snapshot.committed.size() + snapshot.precommits.size());
             break;
         }
-        if (key != "k")
+        if (key != RefSnapWire::kind)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: record must start with \"k\"");
         const String k = r.readString();
 
         std::optional<String> rn;
-        ManifestFields mf;
+        ManifestRefFields mf;
         std::optional<uint64_t> ts;
         while (r.nextKey(key))
         {
-            if (key == "rn") rn = r.readString();
-            else if (key == "me") mf.me = r.readU64String();
-            else if (key == "mb") mf.mb = r.readU64String();
-            else if (key == "mo") mf.mo = r.readU64Number();
-            else if (key == "ts") ts = r.readU64Number();
+            if (key == RefSnapWire::ref) rn = r.readString();
+            else if (matchManifestRefFields(key, r, kBareManifestRefKeys, mf))
+            {
+            }
+            else if (key == RefSnapWire::published_ms) ts = r.readU64Number();
             else if (key == "pl")
                 /// `"pl"` (payload) was removed from the row wire in stage-1 T12. It is a KNOWN-removed
                 /// field, not a genuinely-unknown future one the tolerant reader may skip -- silently
@@ -235,18 +224,18 @@ RefTableSnapshot decodeRefTableSnapshot(
         if (!l.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: junk after record");
 
-        if (k == "c")
+        if (k == kCommittedTag)
         {
             if (!rn || !ts)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: committed row missing rn/ts");
             RefCommittedRow row;
             row.ref_name = *rn;
             checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
-            row.manifest_ref = mf.build("committed");
+            row.manifest_ref = mf.buildRef("RefTableSnapshot", "committed");
             row.published_at_ms = *ts;
             snapshot.committed.push_back(std::move(row));
         }
-        else if (k == "p")
+        else if (k == kPrecommitTag)
         {
             if (!rn)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: precommit row missing rn");
@@ -254,7 +243,7 @@ RefTableSnapshot decodeRefTableSnapshot(
             row.kind = RefOwnerKind::Precommit;
             row.ref_name = *rn;
             checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "precommit ref_name");
-            row.manifest_ref = mf.build("precommit");
+            row.manifest_ref = mf.buildRef("RefTableSnapshot", "precommit");
             snapshot.precommits.push_back(std::move(row));
         }
         else
