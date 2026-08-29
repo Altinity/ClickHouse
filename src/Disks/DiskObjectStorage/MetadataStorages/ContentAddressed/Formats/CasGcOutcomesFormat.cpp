@@ -36,7 +36,7 @@ static_assert(casEnumTableCoversEnum<kOutcomeKindWords, OutcomeKind>());
 
 OutcomeKind outcomeKindFromWord(std::string_view w)
 {
-    return kOutcomeKindWords.fromWord(w, "CAS outcome log: unknown outcome");
+    return kOutcomeKindWords.fromWord(w, "CAS outcome log outcome kind");
 }
 
 }

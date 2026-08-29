@@ -49,8 +49,7 @@ RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what);
 /// consumer has to care how large a `ref_sequence` can get. `epoch_key`/`seq_key` name the two fields,
 /// letting each format distinguish its primary id from any secondary id it embeds (for example,
 /// `cas_ref_log`'s `we`/`rs` versus its `prev_epoch_seal` pair) while sharing one writer so the
-/// formats can never disagree on the representation. The `WireKey` overload keeps migrated codecs
-/// on named key carriers and is the shared internal writer.
+/// formats can never disagree on the representation.
 void writeRefTxnIdFields(CasJsonWriter & out, bool & first, WireKey epoch_key, WireKey seq_key, const RefTxnId & id);
 
 /// Append one owner binding's flat fields named by `keys` to a ref-log `owner_transition` object.

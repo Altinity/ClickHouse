@@ -66,7 +66,7 @@ static_assert(casEnumTableCoversEnum<kHoldReasonWords, HoldReason>());
 
 HoldReason holdReasonFromWord(std::string_view w)
 {
-    return kHoldReasonWords.fromWord(w, "CAS fold seal: unknown hold reason");
+    return kHoldReasonWords.fromWord(w, "CAS fold seal hold reason");
 }
 
 /// The classification set is CLOSED. Every consumer of a coverage row branches on exact values — the
@@ -177,7 +177,7 @@ void validateFoldSealStructure(
 
 std::string_view holdReasonToWord(HoldReason r)
 {
-    return kHoldReasonWords.toWord(r, "CAS fold seal: unknown hold reason");
+    return kHoldReasonWords.toWord(r, "CAS fold seal hold reason");
 }
 
 FoldSealCaps foldSealCaps()
