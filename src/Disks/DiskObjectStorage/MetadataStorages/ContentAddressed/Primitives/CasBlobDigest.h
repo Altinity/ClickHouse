@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
 #include <base/extended_types.h>
@@ -42,8 +43,16 @@ enum class BlobHashAlgo : uint8_t
     Sha256 = 3,
 };
 
+/// The `BlobHashAlgo` wire vocabulary (also the blob PATH SEGMENT, e.g.
+/// `<pool>/blobs/<algo>/<shard>/<hex>`); coverage is proven in `CasBlobDigest.cpp`.
+inline constexpr EnumWireTable<BlobHashAlgo, 3> kBlobHashAlgoWords{{{
+    {BlobHashAlgo::CityHash128, "ch128"},
+    {BlobHashAlgo::XXH3_128, "xxh3"},
+    {BlobHashAlgo::Sha256, "sha256"},
+}}};
+
 /// The blob PATH SEGMENT for `algo`, e.g. `<pool>/blobs/<algo>/<shard>/<hex>`: `"ch128"` | `"xxh3"` |
-/// `"sha256"`. Throws `BAD_ARGUMENTS` for an out-of-range enum value.
+/// `"sha256"`. Throws `LOGICAL_ERROR` for an out-of-range enum value.
 std::string_view blobHashAlgoName(BlobHashAlgo algo);
 
 /// Returns the digest byte width for `algo`: 16 for `CityHash128` and `XXH3_128`, or 32 for

@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 
 namespace DB
@@ -14,46 +15,32 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+static_assert(casEnumTableCoversEnum<kTokenTypeWords, TokenType>());
+static_assert(casEnumTableCoversEnum<kObjectKindWords, ObjectKind>());
+
 std::string_view tokenTypeToWord(TokenType t)
 {
-    switch (t)
-    {
-        case TokenType::ETag:       return "etag";
-        case TokenType::Generation: return "generation";
-        case TokenType::Emulated:   return "emulated";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS wire: unknown TokenType {}", static_cast<int>(t));
+    return kTokenTypeWords.toWord(t, "CAS wire: TokenType");
 }
 
 TokenType tokenTypeFromWord(std::string_view w, std::string_view what)
 {
-    if (w == "etag")       return TokenType::ETag;
-    if (w == "generation") return TokenType::Generation;
-    if (w == "emulated")   return TokenType::Emulated;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown token type '{}'", what, w);
+    return kTokenTypeWords.fromWord(w, what);
 }
 
 BlobHashAlgo blobHashAlgoFromWord(std::string_view w, std::string_view what)
 {
-    if (w == "ch128")  return BlobHashAlgo::CityHash128;
-    if (w == "xxh3")   return BlobHashAlgo::XXH3_128;
-    if (w == "sha256") return BlobHashAlgo::Sha256;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown blob hash algo '{}'", what, w);
+    return kBlobHashAlgoWords.fromWord(w, what);
 }
 
 std::string_view objectKindToWord(ObjectKind k)
 {
-    switch (k)
-    {
-        case ObjectKind::Blob: return "blob";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS wire: unknown ObjectKind {}", static_cast<int>(k));
+    return kObjectKindWords.toWord(k, "CAS wire: ObjectKind");
 }
 
 ObjectKind objectKindFromWord(std::string_view w, std::string_view what)
 {
-    if (w == "blob") return ObjectKind::Blob;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown object kind '{}'", what, w);
+    return kObjectKindWords.fromWord(w, what);
 }
 
 void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t)

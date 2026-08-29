@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -14,6 +15,18 @@ namespace DB::Cas
 /// ref logs, ref snapshots, part manifests, and blob envelopes. Every reverse map rejects an
 /// unrecognized value with `CORRUPTED_DATA`; silently choosing a default would turn malformed
 /// persisted data into a different valid-looking record.
+
+/// The `TokenType` wire vocabulary; coverage is proven in `CasWireVocab.cpp`.
+inline constexpr EnumWireTable<TokenType, 3> kTokenTypeWords{{{
+    {TokenType::ETag, "etag"},
+    {TokenType::Generation, "generation"},
+    {TokenType::Emulated, "emulated"},
+}}};
+
+/// The `ObjectKind` wire vocabulary; coverage is proven in `CasWireVocab.cpp`.
+inline constexpr EnumWireTable<ObjectKind, 1> kObjectKindWords{{{
+    {ObjectKind::Blob, "blob"},
+}}};
 
 /// Convert a token discriminator to its canonical wire word. Throws `CORRUPTED_DATA` if `t` is not
 /// one of the token types understood by this build.

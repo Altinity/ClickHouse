@@ -1,12 +1,27 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromMemory.h>
 
 using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
+
+static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kTokenTypeWords, DB::Cas::TokenType>());
+static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kObjectKindWords, DB::Cas::ObjectKind>());
+static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kBlobHashAlgoWords, DB::Cas::BlobHashAlgo>());
+
+TEST(CASWireVocab, EnumTablesPinTheCurrentWords)
+{
+    using namespace DB::Cas;
+    EXPECT_EQ(kTokenTypeWords.toWord(TokenType::ETag, "t"), "etag");
+    EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::CityHash128, "t"), "ch128");
+    EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::XXH3_128, "t"), "xxh3");
+    EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::Sha256, "t"), "sha256");
+    EXPECT_EQ(kObjectKindWords.toWord(ObjectKind::Blob, "t"), "blob");
+}
 
 TEST(CASWireVocab, EnumWordsRoundTrip)
 {
