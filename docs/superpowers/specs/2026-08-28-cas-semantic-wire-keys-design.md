@@ -241,8 +241,13 @@ change.) The four renames add exactly 15 bytes: `bld` to `build` adds 2, `ts` to
 Consequences:
 
 - the existing minimum `blob_header_len = 240` remains valid, with a one-byte diagnostic `ref`
-  budget at maximum field widths;
-- the default `blob_header_len = 256` leaves 17 escaped bytes for the diagnostic `ref`;
+  budget at TYPE maxima;
+- the default `blob_header_len = 256` leaves 17 escaped bytes for the diagnostic `ref` at those same
+  type maxima. Both figures are type-level bounds, not what a run of the encoder produces: the
+  worst case charges `v` its `uint32` width (10 digits) while the encoder always stamps
+  `currentCompatibilityVersion()`, so at a single-digit generation the reachable `ref` budget is nine
+  bytes wider (10 at the floor, 26 at the default). The bound is what must hold; the reachable
+  budget is what a test can observe, and the two must not be conflated when writing either;
 - the encoded descriptor remains exactly `blob_header_len` bytes after space padding;
 - the payload offset and every existing range-read calculation remain unchanged;
 - `validatePoolBlobHeaderLen` keeps its numeric bounds, but its rationale and boundary tests change
@@ -262,9 +267,12 @@ static_assert(mandatory_descriptor_worst_case <= kMinBlobHeaderLen - 1);
 
 A future longer provenance word then fails to compile instead of overflowing minimum-configured
 pools. The boundary test stays as the independent half of the proof: it feeds maximum-width values
-through the real encoder and checks that the formula matches the bytes — 239 mandatory bytes, a
-240-byte header encodes, a 256-byte header leaves 17 escaped `ref` bytes, and the payload offset is
-exact. The compiler proves the formula; the test proves the formula describes the encoder.
+through the real encoder and checks that the encoder never exceeds the formula — a 240-byte header
+encodes, the header is exactly the configured length, and the payload offset is exact. The test
+pins the budget the encoder can actually reach at the current generation and derives the default
+header's budget from it, rather than restating the type-level 1 and 17: no public API can widen the
+version field to its type maximum, so a test asserting the type-level figures would be asserting an
+unreachable state. The compiler proves the bound; the test proves the encoder stays under it.
 
 For the `static_assert` to be possible at all, `kMinBlobHeaderLen` needs one compile-time owner:
 today it is a file-local constant inside `CasPoolMetaFormat.cpp`, while the formula, the key
@@ -938,9 +946,11 @@ Fourth, blob-envelope boundary tests construct maximum-width mandatory values �
 longest `op` word from the shared constexpr `ProvenanceOp` wire-word table that replaces the two
 switches in `CasBlobEnvelopeFormat.cpp` — and assert:
 
-- `blob_header_len = 240` succeeds with a one-byte truncated `ref` budget;
-- `blob_header_len = 256` succeeds and permits exactly 17 escaped `ref` bytes at the mandatory
-  maximum;
+- `blob_header_len = 240` succeeds, and the `ref` budget it yields is pinned exactly — at a
+  single-digit generation that is 10 escaped bytes, the type-level bound of 1 plus the nine digits
+  the version field does not use;
+- `blob_header_len = 256` succeeds and yields exactly sixteen more than the floor's budget, derived
+  from it rather than restated as a second literal;
 - the returned header is exactly the configured length and the payload offset is unchanged;
 - the 256-byte test-only unknown-critical descriptor still fits and fails decode as
   `UNKNOWN_FORMAT_VERSION`.
