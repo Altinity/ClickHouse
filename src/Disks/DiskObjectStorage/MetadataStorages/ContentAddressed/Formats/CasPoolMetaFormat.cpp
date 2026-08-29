@@ -52,14 +52,16 @@ void validatePoolAlgosUsed(const std::vector<uint8_t> & algos_used, int error_co
         throw Exception(error_code, "CAS {}: algos_used must be non-empty", what);
     for (size_t i = 0; i < algos_used.size(); ++i)
     {
-        try
-        {
-            blobHashAlgoName(static_cast<BlobHashAlgo>(algos_used[i]));
-        }
-        catch (const Exception &)
-        {
+        /// A direct membership scan, not `blobHashAlgoName`: that throws `LOGICAL_ERROR`, which
+        /// aborts at construction under a sanitizer/debug build before any catch can run, but a
+        /// persisted `algos_used` byte is exactly the unvalidated input this function must reject
+        /// cleanly instead.
+        bool known = false;
+        for (const auto & entry : kBlobHashAlgoWords.entries)
+            if (static_cast<uint8_t>(entry.value) == algos_used[i])
+                known = true;
+        if (!known)
             throw Exception(error_code, "CAS {}: algos_used contains an unknown algo {}", what, algos_used[i]);
-        }
         if (i > 0 && algos_used[i] <= algos_used[i - 1])
             throw Exception(error_code,
                 "CAS {}: algos_used must be strictly sorted with no duplicates, got {} at index {} not after {}",

@@ -17,6 +17,8 @@ TEST(CASWireVocab, EnumTablesPinTheCurrentWords)
 {
     using namespace DB::Cas;
     EXPECT_EQ(kTokenTypeWords.toWord(TokenType::ETag, "t"), "etag");
+    EXPECT_EQ(kTokenTypeWords.toWord(TokenType::Generation, "t"), "generation");
+    EXPECT_EQ(kTokenTypeWords.toWord(TokenType::Emulated, "t"), "emulated");
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::CityHash128, "t"), "ch128");
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::XXH3_128, "t"), "xxh3");
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::Sha256, "t"), "sha256");
