@@ -61,6 +61,9 @@ Append new items here — quick adds and concurrent-agent findings land in this 
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 
+- PROSE (wire-keys phase-1, CasEnvelopeLimits.h): doc comment claims "read by BOTH validatePoolBlobHeaderLen and the blob-envelope codec" — false until the phase-2 static_assert lands (one reader today); self-heals in phase 2, else reword as purpose.
+- PROSE (wire-keys phase-2 TODO, CasPoolMetaFormat.{h,cpp}): the floor derivation comment is split from the value it derives (and its 214/225 numbers carry the known off-by-one — spec mandates 213/224); phase 2 should move the derivation into CasEnvelopeLimits.h beside the constant and erase the duplicated "240" prose in CasPoolMetaFormat.h.
+
 - PROSE (wire-keys phase-1, gtest_cas_enum_wire_table.cpp `bad_tables`): comment "The two cases
   above fail the folded density check" has a stale referent count after round-3 asserts — name the
   cases: "`dup_value` and `invalid_value` fail the folded density check…" (plan copy already fixed).
