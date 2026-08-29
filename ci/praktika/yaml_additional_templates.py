@@ -67,7 +67,6 @@ class AltinityWorkflowTemplates:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-regression-tester
       commit: {REGRESSION_HASH}
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -79,7 +78,6 @@ class AltinityWorkflowTemplates:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-regression-tester-aarch64
       commit: {REGRESSION_HASH}
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
