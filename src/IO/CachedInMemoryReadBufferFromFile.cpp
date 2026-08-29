@@ -397,6 +397,29 @@ VectorWithMemoryTracking<SeekableReadBuffer::CachedRegion> CachedInMemoryReadBuf
     return regions;
 }
 
+bool CachedInMemoryReadBufferFromFile::isBigRangeCached(size_t offset, size_t n) const
+{
+    if (n == 0)
+        return true;
+    if (!file_size.has_value() || offset >= file_size.value())
+        return false;
+
+    const size_t block_size = settings.block_size;
+    const size_t end_offset = offset + std::min(n, file_size.value() - offset);
+    const size_t first_block_start = offset / block_size * block_size;
+    const size_t num_blocks = (end_offset - first_block_start + block_size - 1) / block_size;
+
+    PageCacheByteRange block_range;
+    for (size_t i = 0; i < num_blocks; ++i)
+    {
+        block_range.offset = first_block_start + i * block_size;
+        block_range.size = std::min(block_size, file_size.value() - block_range.offset);
+        if (!cache->contains(block_range.hash(cache_key_base_hash), settings.random_eviction_for_tests))
+            return false;
+    }
+    return true;
+}
+
 bool CachedInMemoryReadBufferFromFile::isContentCached(size_t offset, size_t /*size*/)
 {
     /// Usually this is called immediately after seek()ing to `offset`.

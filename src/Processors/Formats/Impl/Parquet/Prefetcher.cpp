@@ -1,4 +1,5 @@
 #include <Processors/Formats/Impl/Parquet/Prefetcher.h>
+#include <IO/CachedInMemoryReadBufferFromFile.h>
 
 #include <Formats/FormatParserSharedResources.h>
 #include <IO/copyData.h>
@@ -48,6 +49,9 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
     read_amplification_floor_bytes = options.read_amplification_floor_bytes;
     parser_shared_resources = parser_shared_resources_;
     determineReadModeAndFileSize(reader_, options);
+    /// Only the page-cache buffer can say whether a range is already in memory; every other source
+    /// leaves `cache_probe` null and the coalescer behaves as before.
+    cache_probe = dynamic_cast<CachedInMemoryReadBufferFromFile *>(reader);
     range_sets.resize(1);
 }
 
@@ -399,15 +403,25 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     size_t start_idx = range_idx;
     size_t end_idx = range_idx + 1;
     size_t total_length_of_covered_ranges = end_offset - start_offset;
+    /// Bytes inside the task's span that are gaps the source can serve from its in-memory cache.
+    /// Reading through them costs a memcpy, not a request, so they are excluded from the read
+    /// amplification the cap bounds -- otherwise a cached block sitting between two needed ranges
+    /// splits the read in two and each half pays a full round trip for the uncached parts.
+    size_t cached_gap_bytes = 0;
 
     /// Go left.
     size_t initial_offset = start_offset;
     for (size_t idx = range_idx; idx > 0; --idx)
     {
         const RangeState & r = ranges[idx - 1];
-        if (r.end + gap_bytes <= start_offset || // gap too long to read through
+        /// The gap this merge would read through, and whether the cache already holds it.
+        const size_t gap = r.end < start_offset ? start_offset - r.end : 0;
+        const bool gap_cached = gap != 0 && gapIsCached(r.end, gap);
+        const size_t free_bytes = cached_gap_bytes + (gap_cached ? gap : 0);
+        const size_t span = std::max(end_offset, r.end) - std::min(start_offset, r.start);
+        if ((r.end + gap_bytes <= start_offset && !gap_cached) || // gap too long to read through
             r.start + bytes_per_read_task <= initial_offset || // task not too big
-            exceedsAmplification(std::max(end_offset, r.end) - std::min(start_offset, r.start), total_length_of_covered_ranges + r.length()) ||
+            exceedsAmplification(span - std::min(span, free_bytes), total_length_of_covered_ranges + r.length()) ||
             !r.request->allow_incidental_read.load(std::memory_order_relaxed)) // range wants to be coalesced
             break;
 
@@ -415,6 +429,7 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         if (s == RequestState::State::HasRange)
         {
             /// Include this range in the task.
+            cached_gap_bytes = free_bytes;
             start_idx = idx - 1;
             total_length_of_covered_ranges += r.length();
             start_offset = std::min(start_offset, r.start);
@@ -441,15 +456,20 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     for (size_t idx = range_idx + 1; idx < ranges.size(); ++idx)
     {
         const RangeState & r = ranges[end_idx];
-        if (end_offset + gap_bytes <= r.start ||
+        const size_t gap = end_offset < r.start ? r.start - end_offset : 0;
+        const bool gap_cached = gap != 0 && gapIsCached(end_offset, gap);
+        const size_t free_bytes = cached_gap_bytes + (gap_cached ? gap : 0);
+        const size_t span = std::max(end_offset, r.end) - std::min(start_offset, r.start);
+        if ((end_offset + gap_bytes <= r.start && !gap_cached) ||
             initial_offset + bytes_per_read_task <= r.end ||
-            exceedsAmplification(std::max(end_offset, r.end) - std::min(start_offset, r.start), total_length_of_covered_ranges + r.length()) ||
+            exceedsAmplification(span - std::min(span, free_bytes), total_length_of_covered_ranges + r.length()) ||
             !r.request->allow_incidental_read.load(std::memory_order_relaxed))
             break;
 
         const auto s = r.request->state.load(std::memory_order_relaxed);
         if (s == RequestState::State::HasRange)
         {
+            cached_gap_bytes = free_bytes;
             end_idx = idx + 1;
             total_length_of_covered_ranges += r.length();
             end_offset = std::max(end_offset, r.end);
@@ -575,6 +595,16 @@ Prefetcher::Task::State Prefetcher::waitForBytes(Task * task, size_t need)
     }
     task->waiters.fetch_sub(1, std::memory_order_seq_cst);
     return s;
+}
+
+bool Prefetcher::gapIsCached(size_t offset, size_t length) const
+{
+    /// `readBigAt`-family only, and only worth probing for gaps a task could actually absorb: the
+    /// probe is a hash lookup per cache block, so bounding it by `bytes_per_read_task` keeps the cost
+    /// proportional to the read it may enable.
+    if (!cache_probe || read_mode != ReadMode::RandomRead || length == 0 || length > bytes_per_read_task)
+        return false;
+    return cache_probe->isBigRangeCached(offset, length);
 }
 
 void Prefetcher::scheduleTask(Task * task)

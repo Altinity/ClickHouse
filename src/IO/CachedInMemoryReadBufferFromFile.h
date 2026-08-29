@@ -38,6 +38,11 @@ public:
 
     VectorWithMemoryTracking<CachedRegion> readBigAtRetainCells(size_t n, size_t offset) const override;
     bool supportsReadAtRetainCells() const override { return innerSupportsReadAt(); }
+    /// Whether every cache block covering [offset, offset + n) is present in the cache right now.
+    /// Unlike `isContentCached`, this touches no buffer state (no seek, no `chunk` population), so it
+    /// follows the same thread-safety rules as `readBigAt`: concurrent calls are allowed. Advisory
+    /// only -- a block can be evicted between this call and the read that follows it.
+    bool isBigRangeCached(size_t offset, size_t n) const;
 
     PageCache::MappedPtr getPageCacheCell() const { return chunk; }
     PageCachePtr getPageCache() const { return cache; }

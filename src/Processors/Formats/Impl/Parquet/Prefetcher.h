@@ -15,6 +15,11 @@ class ReadBuffer;
 class SeekableReadBuffer;
 }
 
+namespace DB
+{
+class CachedInMemoryReadBufferFromFile;
+}
+
 namespace DB::Parquet
 {
 
@@ -246,6 +251,9 @@ private:
     std::mutex read_mutex;
     ReadMode read_mode{};
     SeekableReadBuffer * reader = nullptr;
+    /// Non-null only when `reader` is the userspace page cache buffer, which can answer "is this range
+    /// cached" without touching its own read position. Owned by `reader`, valid for its lifetime.
+    CachedInMemoryReadBufferFromFile * cache_probe = nullptr;
     PaddedPODArray<char> entire_file;
 
     size_t file_size{};
@@ -310,6 +318,11 @@ private:
     /// If splitting, the request is being cancelled and replaced by a smaller range
     /// (splitAndPrefetchRange), and only subrange [subrange_start, subrange_end) needs to be read.
     void pickRangesAndCreateTaskIfNotExists(RequestState *, const PrefetchHandle &, bool splitting, size_t start_offset, size_t end_offset, std::unique_lock<std::mutex> lock);
+    /// Whether [offset, offset + length) is fully present in the source's in-memory cache. False
+    /// unless the source is the userspace page cache (`CachedInMemoryReadBufferFromFile`). Advisory:
+    /// used only to decide whether a gap is cheap to read through, never for correctness.
+    bool gapIsCached(size_t offset, size_t length) const;
+
     /// True if a task spanning `span` bytes to serve `useful` bytes would exceed max_read_amplification.
     ///
     /// The bound is a ratio, which says nothing about how much is actually wasted: on a file whose
