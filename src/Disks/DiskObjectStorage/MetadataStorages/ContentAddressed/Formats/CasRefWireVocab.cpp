@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 
 namespace DB
@@ -12,21 +13,33 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+namespace
+{
+
+constexpr EnumWireTable<RefOwnerKind, 2> kRefOwnerKindWords{{{
+    {RefOwnerKind::Committed, "committed"},
+    {RefOwnerKind::Precommit, "precommit"},
+}}};
+
+static_assert(casEnumTableCoversEnum<kRefOwnerKindWords, RefOwnerKind>());
+
+}
+
 std::string_view refOwnerKindToWord(RefOwnerKind k)
 {
-    switch (k)
-    {
-        case RefOwnerKind::Committed: return "committed";
-        case RefOwnerKind::Precommit: return "precommit";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref wire: unknown RefOwnerKind {}", static_cast<int>(k));
+    return kRefOwnerKindWords.toWord(k, "CAS ref wire: RefOwnerKind");
 }
 
 RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what)
 {
-    if (w == "committed") return RefOwnerKind::Committed;
-    if (w == "precommit") return RefOwnerKind::Precommit;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown owner kind '{}'", what, w);
+    try
+    {
+        return kRefOwnerKindWords.fromWord(w, what);
+    }
+    catch (const Exception &)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown owner kind '{}'", what, w);
+    }
 }
 
 void checkRefTxnIdNonzero(const RefTxnId & id, std::string_view format, std::string_view field)

@@ -11,6 +11,8 @@
 namespace DB::Cas
 {
 
+struct RefOwnerBinding;
+
 /// Shared JSON vocabulary for the value sub-types embedded by the CAS text codecs. These helpers
 /// keep the same sub-object key names and full-word enum values across outcome logs, record streams,
 /// ref logs, ref snapshots, part manifests, and blob envelopes. Every reverse map rejects an
@@ -106,6 +108,11 @@ inline constexpr BindingWireKeys kNewBindingKeys{WireKey{"nbk"}, WireKey{"nrn"},
 /// All consumers use this exact representation; only the key spelling varies by `keys`.
 void writeManifestRefFields(CasJsonWriter & out, bool & first, const ManifestRefWireKeys & keys, const ManifestRef & r);
 
+/// Append one owner binding's flat fields named by `keys` to an in-progress JSON object. The
+/// binding's ref name and manifest reference are validated before writing so every carrier of this
+/// shared shape enforces the same persisted-data contract.
+void writeBindingFields(CasJsonWriter & out, bool & first, const BindingWireKeys & keys, const RefOwnerBinding & binding);
+
 /// Construct a `ManifestRef` from decoded field values and validate the complete domain range:
 /// nonzero `writer_epoch` and `build_sequence`, and `manifest_ordinal` in
 /// `[1, kMaxManifestOrdinal]`. The upper bound is checked before narrowing to the in-memory
@@ -123,6 +130,8 @@ struct ManifestRefFields
     std::optional<uint64_t> epoch;
     std::optional<uint64_t> build;
     std::optional<uint64_t> ord;
+
+    bool any() const { return epoch || build || ord; }
 
     /// `what` names the codec (passed through to `manifestRefFromFields` as its `caller`); `context`
     /// names the field being reconstructed (e.g. "descriptor", "committed"). Throws `CORRUPTED_DATA`

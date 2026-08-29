@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
@@ -69,6 +70,15 @@ void writeManifestRefFields(CasJsonWriter & out, bool & first, const ManifestRef
     out.u64StringValue(r.build_sequence);
     writeKey(out, keys.ord, first);
     out.u64Number(r.manifest_ordinal);
+}
+
+void writeBindingFields(CasJsonWriter & out, bool & first, const BindingWireKeys & keys, const RefOwnerBinding & binding)
+{
+    checkCanonicalRefName(binding.ref_name, "RefLogTxn", "owner binding ref_name");
+    checkManifestRef(binding.manifest_ref, "RefLogTxn", "owner binding manifest_ref");
+    writeWordField(out, keys.kind, refOwnerKindToWord(binding.kind), first);
+    writeStringField(out, keys.ref, binding.ref_name, first);
+    writeManifestRefFields(out, first, keys.manifest, binding.manifest_ref);
 }
 
 ManifestRef manifestRefFromFields(uint64_t writer_epoch, uint64_t build_sequence, uint64_t manifest_ordinal,
