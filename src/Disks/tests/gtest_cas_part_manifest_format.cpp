@@ -146,17 +146,34 @@ TEST(CASPartManifestFormat, SizeBeforePlaceIsAcceptedForBothPlacements)
 
 TEST(CASPartManifestFormat, MissingSizeIsRejectedForBothPlacements)
 {
+    /// The MESSAGE is asserted, not just the code: a manifest whose entry lost its size also fails
+    /// the payload-digest check (blob) and the banner rebuild (inline), both of which raise the same
+    /// code, so a code-only assertion would still pass with the per-placement fences deleted.
+    const auto expect_message = [](const String & text, std::string_view expected)
+    {
+        try
+        {
+            static_cast<void>(decodePartManifest(text));
+            FAIL() << "expected CORRUPTED_DATA";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+            EXPECT_EQ(e.message(), expected);
+        }
+    };
+
     String blob_missing_size = encodePartManifest(sample());
     const size_t blob_pos = blob_missing_size.find(",\"size\":4096");
     ASSERT_NE(blob_pos, String::npos);
     blob_missing_size.erase(blob_pos, String(",\"size\":4096").size());
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(blob_missing_size); });
+    expect_message(blob_missing_size, "PartManifest: blob entry 'a/b.bin' missing size");
 
     String inline_missing_size = encodePartManifest(sample());
     const size_t inline_pos = inline_missing_size.find(",\"size\":12");
     ASSERT_NE(inline_pos, String::npos);
     inline_missing_size.erase(inline_pos, String(",\"size\":12").size());
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(inline_missing_size); });
+    expect_message(inline_missing_size, "PartManifest: inline entry 'c/small.txt' missing size");
 }
 
 TEST(CASPartManifestFormat, DuplicateSizeIsRejected)

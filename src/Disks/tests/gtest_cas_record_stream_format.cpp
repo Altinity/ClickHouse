@@ -126,6 +126,55 @@ TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
     EXPECT_EQ(back[2].marker, RunMarker::Zero);
 }
 
+/// The condemned row's six fields are all-or-nothing: a row that says `condemned` but drops one of
+/// them would decode with a silently defaulted value (a zero size, an empty token, `pending` false),
+/// which is a different retention decision than the writer recorded.
+TEST(CASRecordStream, CondemnedRowMissingOneOfItsSixFieldsFailsClosed)
+{
+    const String good = encodeRun({condemned(chRef(2), Token{"e-1", TokenType::ETag}, 4242, 7, /*pend*/ true)});
+    for (const std::string_view field : {R"(,"pending":true)", R"(,"token_type":"etag")", R"(,"token":"e-1")",
+                                         R"(,"size":4242)", R"(,"condemn_round":"7")", R"(,"confirmed":false)"})
+    {
+        String bytes = good;
+        const size_t at = bytes.find(field);
+        ASSERT_NE(at, String::npos) << "fixture does not carry " << field;
+        bytes.erase(at, field.size());
+        try
+        {
+            static_cast<void>(decodeRun(bytes));
+            FAIL() << "expected CORRUPTED_DATA after dropping " << field;
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+            EXPECT_EQ(e.message(),
+                "CAS cas_run: condemned record missing pending/token_type/token/size/condemn_round/confirmed");
+        }
+    }
+}
+
+/// The mirror fence: an active row carrying any condemned field is a row whose two halves disagree
+/// about what it is, and the reader must not pick one half.
+TEST(CASRecordStream, ActiveRowCarryingACondemnedFieldFailsClosed)
+{
+    String bytes = encodeRun({edge(chRef(1), 10)});
+    const String needle = R"(,"mark":"edge")";
+    const size_t at = bytes.find(needle);
+    ASSERT_NE(at, String::npos);
+    bytes.insert(at + needle.size(), R"(,"size":4242)");
+
+    try
+    {
+        static_cast<void>(decodeRun(bytes));
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_EQ(e.message(), "CAS cas_run: non-condemned record carries condemned fields");
+    }
+}
+
 TEST(CASRecordStream, WriterIsByteDeterministic)
 {
     std::vector<SourceEdgeRecord> recs = {

@@ -108,7 +108,7 @@ TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
         catch (const DB::Exception & e)
         {
             EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-            EXPECT_EQ(e.message(), "CAS outcome log: record missing ha/h/tt");
+            EXPECT_EQ(e.message(), "CAS outcome log: record missing algo/digest/token_type");
         }
     }
 }
