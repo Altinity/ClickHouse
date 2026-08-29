@@ -36,10 +36,12 @@ struct RunRef
 /// correlating logs. Persisted as a word, so an unknown word is `CORRUPTED_DATA` rather than a silently
 /// reinterpreted integer.
 ///
-/// THESE ARE WIRE VALUES, AND THEY ARE APPEND-ONLY. A durable seal written by one build is read by
-/// another, so a renumbered value or a reused word makes an older seal describe a hold that is not the
-/// one it recorded — and a hold's whole job is to say truthfully what stopped a namespace and where.
-/// Add new reasons at the end; never renumber, never repurpose a retired word.
+/// THE WORDS ARE THE WIRE, AND THE WORD VOCABULARY IS APPEND-ONLY. A durable seal written by one build
+/// is read by another, so a reused or repurposed word makes an older seal describe a hold that is not
+/// the one it recorded — and a hold's whole job is to say truthfully what stopped a namespace and
+/// where. The enumerator NUMBERS never leave memory; they are constrained only by the wire table's
+/// density-and-order proof, so inserting a value in the middle is a compile-time question, not a
+/// durability one. Add new reasons freely; never reuse or repurpose a retired word.
 enum class HoldReason : uint8_t
 {
     GapBelowWitness = 1,        /// 404 at the expected id with a durable witness above it, same epoch
@@ -55,16 +57,20 @@ enum class HoldReason : uint8_t
 /// namespace — and a second rendering of these words elsewhere would be a second place for them to drift.
 std::string_view holdReasonToWord(HoldReason r);
 
+/// Its fail-closed inverse: an unknown word is `CORRUPTED_DATA`. Paired with the renderer so a caller
+/// that needs to prove the vocabulary round-trips does not have to reach for the table itself.
+HoldReason holdReasonFromWord(std::string_view w);
+
 /// What the current round did for one life-keyed `CasFoldSeal::ref_lives` row. A BOUNDED enum: the type
 /// itself is the closed set, so a producer cannot construct a fifth shape without an explicit cast, and
 /// the decoder's wire-word lookup refuses anything else as `CORRUPTED_DATA` rather than silently
 /// reinterpreting an integer.
 ///
-/// THESE ARE WIRE VALUES, AND THEY ARE APPEND-ONLY, for the same reason `HoldReason` is: a durable seal
-/// written by one build is read by another. `Clamped` sits at 3, not the 4 an older byte-valued wire
-/// used for it — that old numeric wire is retired by this same cut and nothing outside it persists the
-/// raw byte, so nothing durable depends on the old number, and a dense range is what makes the wire
-/// table's lookup a direct index rather than a search.
+/// THE WORDS ARE THE WIRE, AND THE WORD VOCABULARY IS APPEND-ONLY, for the same reason `HoldReason`'s
+/// is: a durable seal written by one build is read by another. The enumerator numbers never leave
+/// memory. `Clamped` sits at 3, not the 4 a retired byte-valued wire used for it: nothing outside this
+/// JSON ever persisted the raw byte, and a dense range is what makes the wire table's lookup a direct
+/// index rather than a search.
 enum class CoverageClass : uint8_t
 {
     Absent = 0,      /// no round has folded a ref cursor for this namespace

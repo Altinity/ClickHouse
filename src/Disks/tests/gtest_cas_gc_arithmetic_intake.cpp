@@ -303,7 +303,7 @@ TEST(CASGCArithmeticIntake, CursorRestingOnSealCrossesInALaterRound)
 ///
 /// Listing-driven intake folded `{1,4}` and sealed the cursor at it -- permanently, since a record below
 /// the cursor is never re-read.
-TEST(CASGCArithmeticIntake, GapBelowWitnessHoldsNamespaceAtClassificationFour)
+TEST(CASGCArithmeticIntake, GapBelowWitnessHoldsNamespaceAtClampedClassification)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);

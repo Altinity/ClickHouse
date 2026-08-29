@@ -67,6 +67,7 @@ isn't referenced elsewhere first.
 
 - LATER PHASE (wire-keys, Formats/CasLayout.cpp blobRefFromKey): hand-rolled reimplementation of kBlobHashAlgoWords.fromWord ("one name authority" comment now stale) — replacing is a nullopt→throw posture flip needing a wedge audit of every caller; do not do casually.
 
+- PROSE tree-wide comment sweep (wire-keys phase 2): `rg -o 'this task|this same cut|pre-cut' src/Disks/` returns ~32 hits — comments that cite the change that made them true instead of stating the durable reason. Established idiom, so sweep once tree-wide rather than per task.
 - PROSE provenance (pre-existing, `gtest_cas_part_manifest_format.cpp`): the `sample()` comment cites "the plan's §text-shape illustration verbatim (codecs-v3 phase 6)" and the migrated-tests banner cites "(deleted in the phase-6 binary->text cutover, Task 3)" — drop the citations, keep the meaning.
 - PROSE provenance (pre-existing, ref codecs): "stage-1 T12" in both `pl` sentinel comments, "task-1 review finding M4" in `writeLogMeta`, and "review finding M4" / "codex round-2, finding 3" in the ref-log and ref-snapshot test files — drop the citations, keep the reasons.
 - PROSE provenance (pre-existing, wire-keys phase-2 sweep): "spec §2 [C4][D2]"-style citations in `CasPoolMetaFormat.h` and `Pool/CasPoolMeta.cpp`, and a plan-path citation in `utils/ca-soak/scenarios/cards/s28_s33_corner.py` — drop the citations, keep the meaning. Also `CasPoolMetaFormat.h`'s body example renders `] }` where the encoder emits `]}`.

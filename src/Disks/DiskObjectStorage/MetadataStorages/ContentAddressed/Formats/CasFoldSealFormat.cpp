@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <fmt/format.h>
 #include <algorithm>
 #include <utility>
 
@@ -63,11 +64,6 @@ constexpr EnumWireTable<HoldReason, 6> kHoldReasonWords{{{
 }}};
 
 static_assert(casEnumTableCoversEnum<kHoldReasonWords, HoldReason>());
-
-HoldReason holdReasonFromWord(std::string_view w)
-{
-    return kHoldReasonWords.fromWord(w, "CAS fold seal hold reason");
-}
 
 constexpr EnumWireTable<CoverageClass, 4> kCoverageClassWords{{{
     {CoverageClass::Absent, "absent"},
@@ -179,6 +175,11 @@ std::string_view holdReasonToWord(HoldReason r)
     return kHoldReasonWords.toWord(r, "CAS fold seal hold reason");
 }
 
+HoldReason holdReasonFromWord(std::string_view w)
+{
+    return kHoldReasonWords.fromWord(w, "CAS fold seal hold reason");
+}
+
 std::string_view coverageClassToWord(CoverageClass c)
 {
     return kCoverageClassWords.toWord(c, "CAS fold seal classification");
@@ -187,6 +188,21 @@ std::string_view coverageClassToWord(CoverageClass c)
 CoverageClass coverageClassFromWord(std::string_view w)
 {
     return kCoverageClassWords.fromWord(w, "CAS fold seal classification");
+}
+
+namespace
+{
+/// A seal can carry thousands of `ref_life` rows, so a rejected word names the row that carries it --
+/// "unknown word" alone leaves an operator scanning the object by hand.
+CoverageClass coverageClassInRow(std::string_view w, std::string_view life_hex)
+{
+    return kCoverageClassWords.fromWord(w, fmt::format("CAS fold seal: ref_life '{}' classification", life_hex));
+}
+
+HoldReason holdReasonInRow(std::string_view w, std::string_view life_hex)
+{
+    return kHoldReasonWords.fromWord(w, fmt::format("CAS fold seal: ref_life '{}' hold_reason", life_hex));
+}
 }
 
 FoldSealCaps foldSealCaps()
@@ -408,10 +424,11 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
         {
             std::optional<UInt128> life_id;
             RefCoverage cov;
-            std::optional<CoverageClass> classification;
             /// The hold fields are read individually so the grammar can be checked on WHICH of them
             /// arrived, not merely on how many. `JsonObjectReader` already rejects a duplicate key, so
             /// a second `hold_reason` can never quietly rewrite the reason.
+            std::optional<String> classification_word;
+            std::optional<String> hold_reason_word;
             std::optional<HoldReason> hold_reason;
             std::optional<uint64_t> hold_epoch;
             std::optional<uint64_t> hold_sequence;
@@ -422,10 +439,13 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             while (r.nextKey(key))
             {
                 if (key == FoldSealWire::life) life_id = r.readHex128();
-                else if (key == FoldSealWire::classification) classification = coverageClassFromWord(r.readString());
+                /// The two word-valued fields are collected as words and converted BELOW, once the row's
+                /// life id is known: a seal can carry thousands of rows, so an unknown word has to say
+                /// WHICH row carries it.
+                else if (key == FoldSealWire::classification) classification_word = r.readString();
                 else if (key == FoldSealWire::fold_epoch) cov.last_folded_ref_id.writer_epoch = r.readU64String();
                 else if (key == FoldSealWire::fold_seq) cov.last_folded_ref_id.ref_sequence = r.readU64String();
-                else if (key == FoldSealWire::hold_reason) hold_reason = holdReasonFromWord(r.readString());
+                else if (key == FoldSealWire::hold_reason) hold_reason_word = r.readString();
                 else if (key == FoldSealWire::hold_epoch) hold_epoch = r.readU64String();
                 else if (key == FoldSealWire::hold_seq) hold_sequence = r.readU64String();
                 else if (key == FoldSealWire::retries) hold_retry_count = r.readU32Number();
@@ -442,9 +462,11 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
 
             /// `class` is required, not defaulted: an absent one would read as `absent` ("no round
             /// folded this namespace"), which is a claim about a fold, not the absence of one.
-            /// `coverageClassFromWord` above already refused any word outside the four names.
-            if (!classification)
+            if (!classification_word)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: ref_life '{}' missing class", life_hex);
+            const std::optional<CoverageClass> classification = coverageClassInRow(*classification_word, life_hex);
+            if (hold_reason_word)
+                hold_reason = holdReasonInRow(*hold_reason_word, life_hex);
             cov.classification = *classification;
 
             /// The same strict grammar the encoder enforces, applied to bytes we did not write. A

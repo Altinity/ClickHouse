@@ -360,7 +360,7 @@ TEST(CASGCHoldGrammarBudget, SumsSaturateInsteadOfWrapping)
     EXPECT_FALSE(fitsObjectCap(kMax, 2, 256 * 1024 * 1024));
 }
 
-/// ===================== THE STRICT CLASSIFICATION-4 GRAMMAR =====================
+/// ===================== THE STRICT CLAMPED-CLASSIFICATION GRAMMAR =====================
 
 TEST(CASGCHoldGrammar, EveryHoldReasonRoundTrips)
 {
@@ -429,7 +429,7 @@ TEST(CASGCHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedByTheDecoder)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(text); });
 }
 
-TEST(CASGCHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
+TEST(CASGCHoldGrammar, ClampedWithoutAHoldIsRefusedByTheDecoder)
 {
     CasFoldSeal seal;
     seal.generation = 1;
