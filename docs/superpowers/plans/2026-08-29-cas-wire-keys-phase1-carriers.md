@@ -464,8 +464,7 @@ git commit -m "cas: add EnumWireTable with set-equality coverage proofs"
 
 **Files:**
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnvelopeLimits.h`
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.cpp` (delete the file-local `kMinBlobHeaderLen`, include the new header)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.cpp` (include the new header; no behavior change yet — the budget `static_assert` is phase 2)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.cpp` (delete the file-local `kMinBlobHeaderLen`, include the new header). `CasBlobEnvelopeFormat.cpp` is NOT touched in this task — it gains the include together with the `static_assert` in phase 2.
 
 **Interfaces:**
 - Produces: `namespace DB::Cas { inline constexpr uint64_t kMinBlobHeaderLen = 240; }` in `CasEnvelopeLimits.h`, read by `validatePoolBlobHeaderLen` and (from phase 2 on) by the envelope worst-case formula.
