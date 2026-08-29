@@ -293,6 +293,19 @@ constexpr EnumWireTable<Fruit, 3> invalid_value{{{
     {Fruit::Apple, "apple"}, {Fruit::Pear, "pear"}, {static_cast<Fruit>(99), "plum"}}}};
 static_assert(!casEnumTableCoversEnum<invalid_value, Fruit>());
 
+/// The two cases above fail the folded density check before the set-equality core runs, so the
+/// core needs its own failing witnesses — both dense and word-unique, so they reach it.
+/// Reaches the size comparison: one enumerator short.
+constexpr EnumWireTable<Fruit, 2> missing_enumerator{{{
+    {Fruit::Apple, "apple"}, {Fruit::Pear, "pear"}}}};
+static_assert(!casEnumTableCoversEnum<missing_enumerator, Fruit>());
+
+/// Reaches the declared-values scan: right size, dense from Pear, an out-of-enum value present
+/// and `Apple` missing — the asserts header's own motivating scenario.
+constexpr EnumWireTable<Fruit, 3> enumerator_missing{{{
+    {Fruit::Pear, "pear"}, {Fruit::Plum, "plum"}, {static_cast<Fruit>(3), "quince"}}}};
+static_assert(!casEnumTableCoversEnum<enumerator_missing, Fruit>());
+
 }
 ```
 
@@ -524,7 +537,7 @@ inline constexpr EnumWireTable<BlobHashAlgo, 3> kBlobHashAlgoWords{{{
 }}};
 ```
 
-Adjust enumerator spellings to the real declarations. In `CasWireVocab.cpp`, add `#include .../CasEnumWireTableAsserts.h` and the coverage asserts (`denseAndOrdered`, `wordsUnique`, `casEnumTableCoversEnum`) for `kTokenTypeWords`/`kObjectKindWords`; rewrite `tokenTypeToWord`/`tokenTypeFromWord`/`objectKindToWord`/`objectKindFromWord`/`blobHashAlgoFromWord` as one-line delegates preserving their exact signatures and `what`-style error context. In `CasBlobDigest.cpp`, add the `kBlobHashAlgoWords` coverage assert and make `blobHashAlgoName` return `kBlobHashAlgoWords.toWord(algo, "blobHashAlgoName")` — apply Step 6 of Task 2 if a test pins its old `BAD_ARGUMENTS` defensive branch. Do NOT touch `blobHashAlgoFromConfigValue`-style config parsing (`cityhash128`/`xxh3-128` spellings): the configuration vocabulary is a separate contract and stays where it is.
+Adjust enumerator spellings to the real declarations. In `CasWireVocab.cpp`, add `#include .../CasEnumWireTableAsserts.h` and one coverage assert per table (`casEnumTableCoversEnum` subsumes density and word uniqueness) for `kTokenTypeWords`/`kObjectKindWords`; rewrite `tokenTypeToWord`/`tokenTypeFromWord`/`objectKindToWord`/`objectKindFromWord`/`blobHashAlgoFromWord` as one-line delegates preserving their exact signatures and `what`-style error context. In `CasBlobDigest.cpp`, add the `kBlobHashAlgoWords` coverage assert and make `blobHashAlgoName` return `kBlobHashAlgoWords.toWord(algo, "blobHashAlgoName")` — apply Step 6 of Task 2 if a test pins its old `BAD_ARGUMENTS` defensive branch. Do NOT touch `blobHashAlgoFromConfigValue`-style config parsing (`cityhash128`/`xxh3-128` spellings): the configuration vocabulary is a separate contract and stays where it is.
 
 - [ ] **Step 3: Build + full gate green** — every golden byte-identical. Log `$BUILD/test_cas_task4.log`.
 
