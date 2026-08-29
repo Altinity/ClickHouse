@@ -303,6 +303,7 @@ TEST(CASRefCodec, OwnerTransitionBindingGroupsAreAbsentOrComplete)
     String old_absent = bytes;
     old_absent.erase(old_group_pos, old_group.size());
     const RefLogTxn without_old = decodeRefLogTxn(old_absent, txn.ns, txn.txn_id);
+    ASSERT_EQ(without_old.ops.size(), 1u);
     EXPECT_FALSE(without_old.ops[0].old_binding.has_value());
     EXPECT_TRUE(without_old.ops[0].new_binding.has_value());
 
@@ -319,6 +320,7 @@ TEST(CASRefCodec, OwnerTransitionBindingGroupsAreAbsentOrComplete)
     String new_absent = bytes;
     new_absent.erase(new_group_pos, new_group.size());
     const RefLogTxn without_new = decodeRefLogTxn(new_absent, txn.ns, txn.txn_id);
+    ASSERT_EQ(without_new.ops.size(), 1u);
     EXPECT_TRUE(without_new.ops[0].old_binding.has_value());
     EXPECT_FALSE(without_new.ops[0].new_binding.has_value());
 
