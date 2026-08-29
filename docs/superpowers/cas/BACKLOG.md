@@ -67,6 +67,7 @@ isn't referenced elsewhere first.
 
 - LATER PHASE (wire-keys, Formats/CasLayout.cpp blobRefFromKey): hand-rolled reimplementation of kBlobHashAlgoWords.fromWord ("one name authority" comment now stale) — replacing is a nullopt→throw posture flip needing a wedge audit of every caller; do not do casually.
 
+- PROSE stale-generation narrative (post-reset): `gtest_cas_namespace_life_id.cpp:208,315` comments still cite "Generation-5/6" parser history — reword to the timeless opaque-life-layout vocabulary (same class as the fixed `CasLayout.cpp` message).
 - PROSE (wire-keys phase-1, CasEnvelopeLimits.h): doc comment claims "read by BOTH validatePoolBlobHeaderLen and the blob-envelope codec" — false until the phase-2 static_assert lands (one reader today); self-heals in phase 2, else reword as purpose.
 - PROSE (wire-keys phase-2 TODO, CasPoolMetaFormat.{h,cpp}): the floor derivation comment is split from the value it derives (and its 214/225 numbers carry the known off-by-one — spec mandates 213/224); phase 2 should move the derivation into CasEnvelopeLimits.h beside the constant and erase the duplicated "240" prose in CasPoolMetaFormat.h.
 
