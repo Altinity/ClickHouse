@@ -115,9 +115,9 @@ ManifestRef manifestRefFromFields(uint64_t writer_epoch, uint64_t build_sequence
                                   std::string_view caller, std::string_view what);
 
 /// Collector for one `ManifestRef`'s three flat fields, filled in by repeated calls to
-/// `matchManifestRefFields` as a tolerant reader walks an object's keys. `buildRef` delegates the
-/// completed group to `manifestRefFromFields`, which performs the required-ness and range checks;
-/// this collector never validates on its own.
+/// `matchManifestRefFields` as a tolerant reader walks an object's keys. `buildRef` checks that the
+/// group is all-or-nothing complete, then delegates the completed group to `manifestRefFromFields`,
+/// which performs the nonzero and range checks.
 struct ManifestRefFields
 {
     std::optional<uint64_t> epoch;
