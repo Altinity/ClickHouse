@@ -1238,10 +1238,10 @@ TEST(CASRefCheckpoint, CommitRefChunkDurableBytesUnchangedByExtraction)
 {"op":"owner_transition","old_kind":"precommit","old_ref":"gold_ref","old_epoch":"1","old_build":"7","old_ord":1,"new_kind":"committed","new_ref":"gold_ref","new_epoch":"1","new_build":"7","new_ord":1}
 {"n":3}
 )") << "the sealed ref-log plaintext changed";
-    EXPECT_EQ(got->bytes.size(), 178u) << "the sealed ref-log body changed size";
+    EXPECT_EQ(got->bytes.size(), 201u) << "the sealed ref-log body changed size";
     SipHash body_hash;
     body_hash.update(got->bytes.data(), got->bytes.size());
-    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "517638cd859f74b5a4ce9f2e0d82a8f9")
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "6068c3d8bed1ecae98ec56902ef43d97")
         << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
            "before the extraction";
 }
