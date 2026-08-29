@@ -12,6 +12,11 @@
 #include <memory>
 #include <string_view>
 
+namespace DB::ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+
 namespace DB::Cas
 {
 

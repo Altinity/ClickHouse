@@ -92,6 +92,9 @@ BlobRef parseB(std::string_view b)
     if (digest_hex.size() != static_cast<size_t>(blobHashLenFor(algo)) * 2)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS cas_run: digest hex width {} does not match algo width {}", digest_hex.size(), blobHashLenFor(algo) * 2);
+    for (const char c : digest_hex)
+        if (!isLowercaseHexChar(c))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-lowercase-hex digest in record key");
     BlobRef ref;
     ref.algo = algo;
     ref.digest = codecFor(algo).fromHex(String(digest_hex));

@@ -718,6 +718,7 @@ TEST(CASCondemnedRow, RoundTripAllTokenTypes)
 
 TEST(CASCondemnedRow, UnknownMarkerByteFailsClosedWithCorruptedData)
 {
+    /// This pins the condemned-row decoder's own marker validation.
     DB::Cas::CondemnedRow row;
     row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
@@ -726,6 +727,23 @@ TEST(CASCondemnedRow, UnknownMarkerByteFailsClosedWithCorruptedData)
     try
     {
         static_cast<void>(DB::Cas::decodeCondemnedRow(bytes));
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+}
+
+TEST(CASRecordStream, RunMarkerByteContractFailsClosed)
+{
+    /// This helper is defense-in-depth; upstream word validation means no input path reaches it.
+    for (const auto marker : {DB::Cas::RunMarker::Zero, DB::Cas::RunMarker::Edge, DB::Cas::RunMarker::Condemned})
+        EXPECT_EQ(DB::Cas::runMarkerFromByte(DB::Cas::runMarkerByte(marker), "CAS test"), marker);
+
+    try
+    {
+        static_cast<void>(DB::Cas::runMarkerFromByte(0x03, "CAS test"));
         FAIL() << "expected CORRUPTED_DATA";
     }
     catch (const DB::Exception & e)

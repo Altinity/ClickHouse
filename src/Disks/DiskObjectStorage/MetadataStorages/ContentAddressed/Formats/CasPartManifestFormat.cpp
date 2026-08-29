@@ -144,28 +144,22 @@ PartManifest decodePartManifest(std::string_view data)
         const String meta = readLine(in, line_cap, "cas_part_manifest");
         ReadBufferFromMemory mm(meta.data(), meta.size());
         JsonObjectReader r(mm, KeyStrictness::Tolerant, "cas_part_manifest");
-        std::optional<uint64_t> me;
-        std::optional<uint64_t> mb;
-        std::optional<uint64_t> mo;
+        ManifestRefFields fields;
         std::optional<String> ns;
         std::optional<UInt128> pd;
         String key;
         while (r.nextKey(key))
         {
-            if (key == "me") me = r.readU64String();
-            else if (key == "mb") mb = r.readU64String();
-            else if (key == "mo") mo = r.readU64Number();
+            if (matchManifestRefFields(key, r, kBareManifestRefKeys, fields)) {}
             else if (key == PartManifestWire::ns) ns = r.readString();
             else if (key == PartManifestWire::payload_digest) pd = r.readHex128();
             else r.skipUnknown(key);
         }
-        if (!me || !mb || !mo)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing me/mb/mo");
         if (!ns)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing ns");
         if (!pd)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing pd");
-        m.ref = manifestRefFromFields(*me, *mb, *mo, "PartManifest", "descriptor");
+        m.ref = fields.buildRef("PartManifest", "descriptor");
         m.root_namespace_id = RootNamespace(*ns);
         m.payload_digest = *pd;
         if (!mm.eof())

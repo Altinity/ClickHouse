@@ -203,6 +203,24 @@ TEST(CASRecordStream, TrailerCountMismatchIsCorruptData)
     EXPECT_THROW(decodeRun(bytes), DB::Exception);
 }
 
+TEST(CASRecordStream, UppercaseDigestInRecordKeyIsCorruptedData)
+{
+    String bytes = encodeRun({edge(chRef(10), 1)});
+    const size_t digest = bytes.find("0000000000000000000000000000000a");
+    ASSERT_NE(digest, String::npos);
+    bytes[digest + 31] = 'A';
+
+    try
+    {
+        static_cast<void>(decodeRun(bytes));
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+}
+
 TEST(CASRecordStream, TruncationAtLineBoundaryFailsClosed)
 {
     const String bytes = encodeRun({edge(chRef(1), 10), edge(chRef(1), 20)});

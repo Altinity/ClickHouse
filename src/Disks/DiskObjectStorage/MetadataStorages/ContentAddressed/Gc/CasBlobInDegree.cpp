@@ -96,9 +96,6 @@ public:
                         if (v == RunMarker::Edge)
                             throw Exception(ErrorCodes::CORRUPTED_DATA,
                                 "CAS source-edge run: active edge at the reserved sentinel source_id 0");
-                        if (v != RunMarker::Zero && v != RunMarker::Condemned)
-                            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                                "CAS source-edge run: unknown sentinel row type 0x{:02x}", static_cast<uint8_t>(v));
                         if (have_sentinel_blob && sentinel_blob == bh)
                             throw Exception(ErrorCodes::CORRUPTED_DATA,
                                 "CAS source-edge run: duplicate sentinel row for one blob");
