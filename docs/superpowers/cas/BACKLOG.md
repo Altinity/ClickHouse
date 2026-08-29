@@ -61,6 +61,9 @@ Append new items here — quick adds and concurrent-agent findings land in this 
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 
+- PROSE FALSE sweep (wire-keys phase-1): three toWord delegates still documented as "Throws CORRUPTED_DATA" — `refOwnerKindToWord` (CasRefWireVocab.h, falsified by task 11), `tokenTypeToWord`/`objectKindToWord` (CasWireVocab.h, earlier task) — all throw LOGICAL_ERROR via the table now; sweep the three together.
+- WORDING pass (phase 2): `BindingFields::build`'s message "binding missing bk/rn" names deleted members; group-message texts unify with the cut.
+
 - PROSE (wire-keys phase-1, CasBlobMetaFormat.h): public delegate `metaStateToWireWord` undocumented — sibling `blobHashAlgoName` documents its LOGICAL_ERROR contract; add the same one-liner (surfaces for the CasInspect task's call site).
 
 - PROSE IMPRECISE (wire-keys phase-1, CasWireVocab.h match helpers): "must not gain a function-call boundary" overstates — `inline` is linkage, not an inlining guarantee; intent (header-defined, inlinable at per-key dispatch) is right.
