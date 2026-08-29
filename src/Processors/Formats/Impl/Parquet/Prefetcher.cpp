@@ -1,5 +1,6 @@
 #include <Processors/Formats/Impl/Parquet/Prefetcher.h>
 #include <IO/CachedInMemoryReadBufferFromFile.h>
+#include <algorithm>
 
 #include <Formats/FormatParserSharedResources.h>
 #include <IO/copyData.h>
@@ -75,7 +76,11 @@ Prefetcher::~Prefetcher()
 Prefetcher::ReadStats Prefetcher::readStats() const
 {
     std::lock_guard lock(stats_mutex);
-    return ReadStats{.rtt_us = stat_rtt_us, .bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us, .samples = stat_samples};
+    return ReadStats{
+        .rtt_us = stat_rtt_us,
+        .bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us,
+        .bandwidth_peak_bytes_per_us = stat_bandwidth_peak_bytes_per_us,
+        .samples = stat_samples};
 }
 
 size_t Prefetcher::requestLength(const PrefetchHandle & handle) const
@@ -113,15 +118,20 @@ void Prefetcher::updateReadStats(const Task * task, uint64_t total_us, bool tran
     ProfileEvents::increment(ProfileEvents::ParquetReadTransferMicroseconds, transfer_us);
 
     constexpr double alpha = 0.2;
-    std::lock_guard lock(stats_mutex);
-    stat_rtt_us = stat_rtt_us * (1 - alpha) + static_cast<double>(rtt_sample_us) * alpha;
-    if (transport_progress && transfer_us > 0)
     {
-        double bandwidth_sample = static_cast<double>(task->length) / static_cast<double>(transfer_us);
-        stat_bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us * (1 - alpha) + bandwidth_sample * alpha;
+        std::lock_guard lock(stats_mutex);
+        stat_rtt_us = stat_rtt_us * (1 - alpha) + static_cast<double>(rtt_sample_us) * alpha;
+        if (transport_progress && transfer_us > 0)
+        {
+            double bandwidth_sample = static_cast<double>(task->length) / static_cast<double>(transfer_us);
+            stat_bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us * (1 - alpha) + bandwidth_sample * alpha;
+            stat_bandwidth_peak_bytes_per_us = std::max(stat_bandwidth_peak_bytes_per_us, stat_bandwidth_bytes_per_us);
+        }
+        ++stat_samples;
     }
-    ++stat_samples;
+
 }
+
 
 void Prefetcher::determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOptions & options)
 {
@@ -597,6 +607,29 @@ Prefetcher::Task::State Prefetcher::waitForBytes(Task * task, size_t need)
     return s;
 }
 
+void Prefetcher::publishCacheReadThroughPolicy() const
+{
+    if (!cache_probe)
+        return;
+
+    /// Reading through an island of cached blocks buys one fewer round trip and costs the island's
+    /// bytes. Which side wins is not a property of the storage but of how this reader is using it:
+    /// with few reads in flight the pipe is idle and round trips are the wall clock, so bytes are
+    /// nearly free; with many reads in flight the link is the constraint, latency is already hidden by
+    /// the concurrency, and every extra byte displaces a useful one. The IO pool size is the reader's
+    /// own measure of that, and the cache cannot see it -- hence this hand-off.
+    ///
+    /// The measured shape on S3 (see the read-path report): read-through is a large win at 4 and 16
+    /// concurrent reads and a loss at 64, which `4 / concurrency` tracks -- full allowance up to 4,
+    /// a quarter at 16, a sixteenth at 64. Clamped to a floor so a very deep pool still merges an
+    /// island that is trivially small next to the request.
+    const size_t concurrency = std::max<size_t>(1, parser_shared_resources
+        ? parser_shared_resources->io_threads.load(std::memory_order_relaxed) : 1);
+    constexpr double latency_bound_concurrency = 4.0;
+    const double share = std::clamp(latency_bound_concurrency / static_cast<double>(concurrency), 0.05, 1.0);
+    cache_probe->setReadThroughWastePermille(static_cast<size_t>(share * 1000));
+}
+
 bool Prefetcher::gapIsCached(size_t offset, size_t length) const
 {
     /// `readBigAt`-family only, and only worth probing for gaps a task could actually absorb: the
@@ -609,6 +642,8 @@ bool Prefetcher::gapIsCached(size_t offset, size_t length) const
 
 void Prefetcher::scheduleTask(Task * task)
 {
+    publishCacheReadThroughPolicy();
+
     /// The calling thread (pickRangesAndCreateTaskIfNotExists) still holds, via the `PrefetchHandle`
     /// it was passed, a reference that keeps `refcount` >= 1 until that handle is later reset by its
     /// owner -- which can't happen before this call returns, since the owner is the caller further

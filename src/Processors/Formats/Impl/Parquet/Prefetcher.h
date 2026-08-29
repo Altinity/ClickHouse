@@ -86,6 +86,8 @@ public:
     {
         double rtt_us = 50'000;            // prior: 50 ms
         double bandwidth_bytes_per_us = 64; // prior: ~64 MB/s per stream
+        /// Highest per-stream bandwidth seen so far; 0 before any sample.
+        double bandwidth_peak_bytes_per_us = 0;
         size_t samples = 0;
     };
     /// Snapshot of the fitted stats; takes `stats_mutex` (shared with the rare per-task update).
@@ -293,6 +295,10 @@ private:
     mutable std::mutex stats_mutex;
     double stat_rtt_us = 50'000;
     double stat_bandwidth_bytes_per_us = 64;
+    /// Highest per-stream bandwidth this reader has seen. Together with the current value it estimates
+    /// how saturated the link is: when many streams share a saturated pipe, each one's measured
+    /// bandwidth falls, and bytes added to one stream are taken from the others.
+    double stat_bandwidth_peak_bytes_per_us = 0;
     size_t stat_samples = 0;
     /// Folds one task's timing into the EWMAs above and into the profile events. Called at the end
     /// of `runTask` for tasks read from the source (see call site for the exact conditions).
@@ -318,6 +324,10 @@ private:
     /// If splitting, the request is being cancelled and replaced by a smaller range
     /// (splitAndPrefetchRange), and only subrange [subrange_start, subrange_end) needs to be read.
     void pickRangesAndCreateTaskIfNotExists(RequestState *, const PrefetchHandle &, bool splitting, size_t start_offset, size_t end_offset, std::unique_lock<std::mutex> lock);
+    /// Tell the source's cache how much of a read it may waste on already-cached bytes, from this
+    /// reader's IO concurrency. Cheap (one atomic store); called as tasks are scheduled.
+    void publishCacheReadThroughPolicy() const;
+
     /// Whether [offset, offset + length) is fully present in the source's in-memory cache. False
     /// unless the source is the userspace page cache (`CachedInMemoryReadBufferFromFile`). Advisory:
     /// used only to decide whether a gap is cheap to read through, never for correctness.
@@ -327,10 +337,14 @@ private:
     ///
     /// The bound is a ratio, which says nothing about how much is actually wasted: on a file whose
     /// column chunks are a few KB, five needed columns sit inside ~25 KB and the ratio looks terrible
-    /// while the waste is a rounding error next to one request. So a read whose absolute waste is below
-    /// `input_format_parquet_read_amplification_floor_bytes` is never split, whatever its ratio; above
-    /// that the ratio governs, which is what keeps a row group's worth of unrelated data out of a read
-    /// that needs 50 KiB of it. `0` applies the ratio to every read.
+    /// while the waste is a rounding error next to one request. Measured on a 17.5k-file Iceberg table:
+    /// the ratio bound alone split each file's read three to four ways, trading 74 MiB (13% of the
+    /// bytes) for 6.5k extra requests and 40% more wall time, and turning it off matched the base
+    /// reader exactly. So a read whose absolute waste is below one round trip's worth of bytes is never
+    /// worth splitting, whatever its ratio; above that the ratio still governs, which is what keeps a
+    /// row group's worth of unrelated data out of a read that needs 50 KiB of it.
+    /// The floor is `input_format_parquet_read_amplification_floor_bytes`; `0` applies the ratio to
+    /// every read, which is what happens without the setting.
     bool exceedsAmplification(size_t span, size_t useful) const
     {
         if (max_read_amplification <= 0 || span <= useful)

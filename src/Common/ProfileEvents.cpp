@@ -78,6 +78,9 @@
     M(PageCacheResized, "Number of times the userspace page cache was auto-resized (typically happens a few times per second, controlled by memory_worker_period_ms).", ValueType::Number) \
     M(PageCacheOvercommitResize, "Number of times the userspace page cache was auto-resized to free memory during a memory allocation.", ValueType::Number) \
     M(PageCacheReadBytes, "Number of bytes read from userspace page cache.", ValueType::Bytes) \
+    M(PageCacheReadThroughBudgetSamples, "Times the userspace page cache recomputed its read-through budget from its own fitted bandwidth and round-trip time (once per source read)", ValueType::Number) \
+    M(PageCacheReadThroughBudgetBytesSum, "Sum of the read-through budgets the page cache computed; divide by `PageCacheReadThroughBudgetSamples` for the mean budget in bytes", ValueType::Bytes) \
+    M(PageCacheReadThroughBytes, "Number of bytes fetched from the source but thrown away because they cover cache blocks that were already present: the page cache read through a short island of cached blocks in order to serve two runs of missing blocks with one request", ValueType::Bytes) \
     M(MMappedFileCacheHits, "Number of times a file has been found in the MMap cache (for the 'mmap' read_method), so we didn't have to mmap it again.", ValueType::Number) \
     M(MMappedFileCacheMisses, "Number of times a file has not been found in the MMap cache (for the 'mmap' read_method), so we had to mmap it again.", ValueType::Number) \
     M(OpenedFileCacheHits, "Number of times a file has been found in the opened file cache, so we didn't have to open it again.", ValueType::Number) \
