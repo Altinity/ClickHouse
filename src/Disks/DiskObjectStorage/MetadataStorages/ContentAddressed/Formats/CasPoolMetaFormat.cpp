@@ -27,23 +27,14 @@ namespace PoolMetaWire
     constexpr WireKey algos_used{"algos_used"};
 }
 
-/// Minimum `blob_header_len` that provably fits the v3 `cas_blob` JSON envelope's mandatory (always-
-/// written) non-ref fields, computed at type maxima from `encodeEnvelopeHeader` (CasBlobEnvelopeFormat.cpp):
-///   {"type":"cas_blob"                                        18
-///   ,"v":<u32>          5 + 10 (currentCompatibilityVersion)  15
-///   ,"tag":"<32 hex>"   7 + 34                                41
-///   ,"bld":"<32 hex>"   7 + 34                                41
-///   ,"ts":<u64>         6 + 20 (created_at_ms)                26
-///   ,"by":"<32 hex>"    7 + 34                                41
-///   ,"op":"<word>"      6 + 10 (longest op word "mutation")   16
-///   ,"ch":<u32>         6 + 10 (VERSION_INTEGER)              16
-///                                            non-ref JSON  = 214 bytes
-/// The encoder then always frames the ref: `,"ref":` (7) + `""` (2) + `}` (1), and reserves byte
-/// blob_header_len-1 for '\n' (1) = 11 bytes. So the mandatory content needs 214 + 11 = 225 bytes;
-/// below that, encodeEnvelopeHeader throws LOGICAL_ERROR on the FIRST blob write (the old drop-and-retry
-/// that used to mask this is gone). We floor at 240 (a multiple of 8 comfortably above 225, leaving
-/// >= 15 bytes for the diagnostic ref even at type maxima, and well under the 256 default) so a
-/// misconfigured pool fails at CREATION with BAD_ARGUMENTS, not at first write with LOGICAL_ERROR.
+/// Minimum `blob_header_len` that provably fits the v3 `cas_blob` JSON envelope's mandatory-descriptor
+/// worst case. The byte-for-byte derivation (`kMandatoryDescriptorWorstCase`, currently 239 bytes) lives
+/// beside the envelope key constants in `CasBlobEnvelopeFormat.cpp`, next to the compile-time proof that
+/// it fits under this floor; below that bound, `encodeEnvelopeHeader` throws `LOGICAL_ERROR` on the
+/// FIRST blob write (the old drop-and-retry that used to mask this is gone). We floor at 240 (a
+/// multiple of 8 comfortably above the worst case, leaving at least one byte for the diagnostic `ref`
+/// even at type maxima, and well under the 256 default) so a misconfigured pool fails at CREATION with
+/// `BAD_ARGUMENTS`, not at first write with `LOGICAL_ERROR`.
 
 void validatePoolBlobHeaderLen(uint64_t blob_header_len, int error_code, std::string_view what)
 {
