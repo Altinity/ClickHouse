@@ -76,9 +76,9 @@ TEST(CASEncodingPins, RefSnapshotLive)
     snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "20260102_0_2_2_2", ManifestRef{4, 5, 6}});
 
     const String expected = fmt::format("{{\"type\":\"cas_ref_snap\",\"v\":{}}}\n", currentCompatibilityVersion()) +
-        "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\",\"lc\":\"live\"}\n"
-        "{\"k\":\"c\",\"rn\":\"20260101_0_1_1_1\",\"epoch\":\"1\",\"build\":\"2\",\"ord\":3,\"ts\":5}\n"
-        "{\"k\":\"p\",\"rn\":\"20260102_0_2_2_2\",\"epoch\":\"4\",\"build\":\"5\",\"ord\":6}\n"
+        "{\"namespace\":\"roots/pin\",\"snapshot_epoch\":\"7\",\"snapshot_seq\":\"9\",\"lifecycle\":\"live\"}\n"
+        "{\"kind\":\"committed\",\"ref\":\"20260101_0_1_1_1\",\"epoch\":\"1\",\"build\":\"2\",\"ord\":3,\"published_ms\":5}\n"
+        "{\"kind\":\"precommit\",\"ref\":\"20260102_0_2_2_2\",\"epoch\":\"4\",\"build\":\"5\",\"ord\":6}\n"
         "{\"n\":2}\n";
     EXPECT_EQ(encodeRefTableSnapshot(snap), expected);
 }
