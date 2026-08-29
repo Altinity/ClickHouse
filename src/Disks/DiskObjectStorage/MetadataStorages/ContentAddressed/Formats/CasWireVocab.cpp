@@ -97,7 +97,7 @@ ManifestRef ManifestRefFields::buildRef(std::string_view what, std::string_view 
 BlobRef BlobRefFields::build(std::string_view what) const
 {
     if (!algo_word || !digest_hex)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: blob ref missing ha/h", what);
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: blob ref missing algo/digest", what);
     const BlobHashAlgo algo = blobHashAlgoFromWord(*algo_word, what);
     /// Validate the digest width before calling `fromHex`. A width mismatch otherwise produces
     /// `BAD_ARGUMENTS` instead of the `CORRUPTED_DATA` required for malformed serialized input,

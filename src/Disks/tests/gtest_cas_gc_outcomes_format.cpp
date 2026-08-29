@@ -86,8 +86,8 @@ TEST(CASGCOutcomesFormat, RecordRequiresCompleteBlobRefAndTokenGroups)
     const String bytes = encodeOutcomeLog(log);
 
     for (const auto & [field, expected_message] : {
-        std::pair{String(R"(,"algo":"ch128")"), "CAS outcome log: blob ref missing ha/h"},
-        std::pair{String(R"(,"digest":"00112233445566778899aabbccddeeff")"), "CAS outcome log: blob ref missing ha/h"},
+        std::pair{String(R"(,"algo":"ch128")"), "CAS outcome log: blob ref missing algo/digest"},
+        std::pair{String(R"(,"digest":"00112233445566778899aabbccddeeff")"), "CAS outcome log: blob ref missing algo/digest"},
         std::pair{String(R"(,"token_type":"etag")"), "CAS outcome log: token missing token_type/token"},
         std::pair{String(R"(,"token":"e-1")"), "CAS outcome log: token missing token_type/token"},
     })

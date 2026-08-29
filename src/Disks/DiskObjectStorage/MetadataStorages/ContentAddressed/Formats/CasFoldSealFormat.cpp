@@ -308,7 +308,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
             writeU64StringField(out, FoldSealWire::remove_seq, life_state.cleanup_evidence->remove_txn_id.ref_sequence, first);
         }
         closeObject(out, first);
-        closeLine("ref_life");
+        closeLine(kRefLifeTag);
         ++n;
     }
 
@@ -318,7 +318,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         for (const RunRef & r : runs)
         {
             writeRun(out, kBlobRunTag, r);
-            closeLine("blob_run");
+            closeLine(kBlobRunTag);
         }
     }
     n += seal.blob_target_runs.size();
@@ -333,7 +333,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         writeNumberField(out, FoldSealWire::pending_total, s.pending_total, first);
         writeU64StringField(out, FoldSealWire::oldest_round, s.oldest_nonpending_condemn_round, first);
         closeObject(out, first);
-        closeLine("condemned");
+        closeLine(kCondemnedTag);
         ++n;
     }
 
