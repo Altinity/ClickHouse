@@ -280,10 +280,16 @@ namespace bad_tables
 enum class Sparse : uint8_t { A = 0, B = 2 };
 constexpr EnumWireTable<Sparse, 2> sparse{{{{Sparse::A, "a"}, {Sparse::B, "b"}}}};
 static_assert(!sparse.denseAndOrdered());
+/// ...and through the folded coverage proof, so deleting its density disjunct breaks the file
+/// (this table is set-equal and word-unique — only density rejects it):
+static_assert(!casEnumTableCoversEnum<sparse, Sparse>());
 
 constexpr EnumWireTable<Fruit, 3> dup_words{{{
     {Fruit::Apple, "apple"}, {Fruit::Pear, "apple"}, {Fruit::Plum, "plum"}}}};
 static_assert(!dup_words.wordsUnique());
+/// ...and through the folded proof (dense, right-sized, set-equal — only word uniqueness rejects
+/// it), so deleting the uniqueness disjunct breaks the file:
+static_assert(!casEnumTableCoversEnum<dup_words, Fruit>());
 
 constexpr EnumWireTable<Fruit, 3> dup_value{{{
     {Fruit::Apple, "apple"}, {Fruit::Apple, "pear"}, {Fruit::Plum, "plum"}}}};
@@ -305,6 +311,14 @@ static_assert(!casEnumTableCoversEnum<missing_enumerator, Fruit>());
 constexpr EnumWireTable<Fruit, 3> enumerator_missing{{{
     {Fruit::Pear, "pear"}, {Fruit::Plum, "plum"}, {static_cast<Fruit>(3), "quince"}}}};
 static_assert(!casEnumTableCoversEnum<enumerator_missing, Fruit>());
+
+/// Guards the size comparison itself: every declared value present PLUS one out-of-enum entry —
+/// the only miscoverage the declared-values scan cannot see (an enumerator deleted from the enum
+/// while its table row survived).
+constexpr EnumWireTable<Fruit, 4> extra_entry{{{
+    {Fruit::Apple, "apple"}, {Fruit::Pear, "pear"}, {Fruit::Plum, "plum"},
+    {static_cast<Fruit>(3), "quince"}}}};
+static_assert(!casEnumTableCoversEnum<extra_entry, Fruit>());
 
 }
 ```
