@@ -61,6 +61,10 @@ Append new items here — quick adds and concurrent-agent findings land in this 
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 
+- PROSE (wire-keys phase-1, CasPoolMetaFormat.cpp fence comment): "is exactly the unvalidated input this function must reject cleanly" overstates — no unvalidated byte reaches it today (decoder fromWord-gates first); reword as "validates a raw byte vector, so it must reject cleanly rather than abort".
+- PROSE FALSE (wire-keys phase-1, Pool/CasPoolMeta.cpp createOrValidate): comment claims blobHashAlgoName throws BAD_ARGUMENTS as garbage-cast defense — it throws LOGICAL_ERROR now (aborts debug/sanitizer); same unkeepable-fence shape as the fixed validatePoolAlgosUsed; comment must state programming-error semantics.
+- LATER PHASE (wire-keys, Formats/CasLayout.cpp blobRefFromKey): hand-rolled reimplementation of kBlobHashAlgoWords.fromWord ("one name authority" comment now stale) — replacing is a nullopt→throw posture flip needing a wedge audit of every caller; do not do casually.
+
 - PROSE (wire-keys phase-1, CasWireVocab.h): `tokenTypeToWord`/`objectKindToWord` doc comments still say "Throws CORRUPTED_DATA" — both now throw LOGICAL_ERROR via the table.
 - PROSE (wire-keys phase-1, CasBlobDigest.h): `blobHashLenFor` comment claims it preserves "the fail-closed contract of blobHashAlgoName" — no longer true (BAD_ARGUMENTS vs LOGICAL_ERROR); note 4 functions over BlobHashAlgo now intentionally diverge on the defensive code.
 - PROSE (wire-keys phase-1, CasGc.cpp fold comment): names the wrong function AND code — decoder fail-close is `blobHashAlgoFromWord` → CORRUPTED_DATA, not `blobHashAlgoName` (pre-existing, widened by the taxonomy change).
