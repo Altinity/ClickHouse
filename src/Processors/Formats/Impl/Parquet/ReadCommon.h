@@ -36,6 +36,8 @@ struct ReadOptions
     size_t coalesce_gap_bytes = 0;
     /// Bound on bytes read / bytes needed per coalesced read; 0 means no bound.
     double max_read_amplification = 0;
+    /// A read wasting no more than this many bytes is exempt from `max_read_amplification`.
+    size_t read_amplification_floor_bytes = 0;
 
     /// Don't use bloom filter for `x IN (...)` if the set `(...)` is has more than this many
     /// elements. There's no point using bloom filter for big sets because false positive

@@ -254,6 +254,8 @@ private:
     /// min(min_bytes_for_seek, options.coalesce_gap_bytes), or min_bytes_for_seek if the setting is 0.
     size_t gap_bytes{};
     double max_read_amplification = 0;
+    /// See `exceedsAmplification`.
+    size_t read_amplification_floor_bytes = 0;
 
     std::shared_ptr<ShutdownHelper> shutdown = std::make_shared<ShutdownHelper>();
 
@@ -309,9 +311,20 @@ private:
     /// (splitAndPrefetchRange), and only subrange [subrange_start, subrange_end) needs to be read.
     void pickRangesAndCreateTaskIfNotExists(RequestState *, const PrefetchHandle &, bool splitting, size_t start_offset, size_t end_offset, std::unique_lock<std::mutex> lock);
     /// True if a task spanning `span` bytes to serve `useful` bytes would exceed max_read_amplification.
+    ///
+    /// The bound is a ratio, which says nothing about how much is actually wasted: on a file whose
+    /// column chunks are a few KB, five needed columns sit inside ~25 KB and the ratio looks terrible
+    /// while the waste is a rounding error next to one request. So a read whose absolute waste is below
+    /// `input_format_parquet_read_amplification_floor_bytes` is never split, whatever its ratio; above
+    /// that the ratio governs, which is what keeps a row group's worth of unrelated data out of a read
+    /// that needs 50 KiB of it. `0` applies the ratio to every read.
     bool exceedsAmplification(size_t span, size_t useful) const
     {
-        return max_read_amplification > 0 && static_cast<double>(span) > max_read_amplification * static_cast<double>(useful);
+        if (max_read_amplification <= 0 || span <= useful)
+            return false;
+        if (span - useful <= read_amplification_floor_bytes)
+            return false;
+        return static_cast<double>(span) > max_read_amplification * static_cast<double>(useful);
     }
     static void decreaseTaskRefcount(Task * task, size_t amount);
     void scheduleTask(Task * task);

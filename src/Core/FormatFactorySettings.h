@@ -273,11 +273,34 @@ serve both with one request. Applied on top of the storage's min-bytes-for-seek 
 `0` uses the storage value only. On object storage the useful gap is about one round trip's worth of
 bandwidth, ~2 MiB; reading through larger gaps costs bytes without saving time.
 )", 0) \
-    DECLARE(Double, input_format_parquet_max_read_amplification, 4, R"(
+    DECLARE(Double, input_format_parquet_max_read_amplification, 8, R"(
 Upper bound on `bytes read / bytes needed` for one coalesced Parquet read. Coalescing stops extending a
 read when the span would exceed this multiple of the useful bytes it covers, so a few small column chunks
 cannot drag megabytes of unrelated data through the cache or the network. `0` disables the bound. Any other
 value must be `>= 1` (a read always spans at least the bytes it serves); values in `(0, 1)` are rejected.
+
+The bound is checked while a read is being grown one neighbouring range at a time, so it also rejects merges
+whose *intermediate* ratio is too high even when the finished read would be well within the bound. Tight
+values therefore cost round trips: on a query reading six narrow columns of a wide table, `4` split the reads
+of a row group into 1.6x as many requests as no bound at all and made the decoding threads wait 3.6x longer,
+while `8` and up reached the same bytes-read as no bound with the same request count. Values from 6 to 16
+measured the same on that dataset; below 6 the request count climbs.
+
+See also `input_format_parquet_read_amplification_floor_bytes`, which exempts reads that waste little in
+absolute terms from this bound.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_read_amplification_floor_bytes, 262144, R"(
+A coalesced Parquet read that wastes no more than this many bytes -- reads at most this much beyond the bytes
+it was asked for -- is never split by `input_format_parquet_max_read_amplification`, whatever its ratio.
+
+A ratio alone says nothing about how much is actually wasted, and on small files it reads as alarming when the
+waste is trivial: five columns of a 25 KiB file lie a few KB apart, so reading the file in one request wastes
+about 20 KB, which the ratio scores as a bad read. Measured on a 17,554-file Iceberg table, the ratio bound
+alone split each file's read three to four ways, buying 13% fewer bytes for 65% more requests and 45% more
+wall time; with this floor the same query matched the reader without any bound at all, while a query whose
+reads waste megabytes per useful range kept the bound's full effect (330 MiB read down to 11 MiB).
+
+`0` applies the amplification bound to every read regardless of how little it wastes.
 )", 0) \
     DECLARE(UInt64, input_format_parquet_min_bytes_in_flight, 67108864, R"(
 Lower bound for the Parquet reader's bytes-in-flight target: the reader issues the index and data-page

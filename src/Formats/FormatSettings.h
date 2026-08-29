@@ -367,7 +367,9 @@ struct FormatSettings
         /// this and the storage's min-bytes-for-seek wins); 0 = use the storage's value only.
         size_t coalesce_gap_bytes = 2097152;
         /// Bound on bytes read / bytes needed per coalesced read; 0 = no bound, otherwise >= 1.
-        double max_read_amplification = 4;
+        double max_read_amplification = 8;
+        /// A read wasting no more than this many bytes is exempt from `max_read_amplification`.
+        size_t read_amplification_floor_bytes = 256 * 1024;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
         /// Reader scheduler knob: share of the parsing thread pool given to column decoding.

@@ -45,6 +45,7 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "input_format_parquet_max_read_amplification must be 0 (disabled) or >= 1, got {}", options.max_read_amplification);
     max_read_amplification = options.max_read_amplification;
+    read_amplification_floor_bytes = options.read_amplification_floor_bytes;
     parser_shared_resources = parser_shared_resources_;
     determineReadModeAndFileSize(reader_, options);
     range_sets.resize(1);

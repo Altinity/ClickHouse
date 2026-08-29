@@ -62,6 +62,7 @@ ParquetV3BlockInputFormat::ParquetV3BlockInputFormat(
         : min_bytes_for_seek * 4;
     read_options.coalesce_gap_bytes = format_settings.parquet.coalesce_gap_bytes;
     read_options.max_read_amplification = format_settings.parquet.max_read_amplification;
+    read_options.read_amplification_floor_bytes = format_settings.parquet.read_amplification_floor_bytes;
 
     if (!format_filter_info)
         format_filter_info = std::make_shared<FormatFilterInfo>();

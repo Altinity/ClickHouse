@@ -253,6 +253,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.bytes_per_read_task = settings[Setting::input_format_parquet_bytes_per_read_task];
     format_settings.parquet.coalesce_gap_bytes = settings[Setting::input_format_parquet_coalesce_gap_bytes];
     format_settings.parquet.max_read_amplification = settings[Setting::input_format_parquet_max_read_amplification];
+    format_settings.parquet.read_amplification_floor_bytes = settings[Setting::input_format_parquet_read_amplification_floor_bytes];
     format_settings.parquet.enable_row_group_prefetch = settings[Setting::input_format_parquet_enable_row_group_prefetch];
     format_settings.parquet.verify_checksums = settings[Setting::input_format_parquet_verify_checksums];
     format_settings.parquet.local_time_as_utc = settings[Setting::input_format_parquet_local_time_as_utc];
