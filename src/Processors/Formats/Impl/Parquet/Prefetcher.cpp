@@ -64,6 +64,7 @@ Prefetcher::~Prefetcher()
     /// time all PrefetchHandle-s are gone (checked above) and `shutdown->shutdown()` has waited out
     /// any still-running tasks, none should be left in flight.
     chassert(bytes_in_flight.load(std::memory_order_relaxed) == 0);
+    chassert(bytes_executing.load(std::memory_order_relaxed) == 0);
 }
 
 Prefetcher::ReadStats Prefetcher::readStats() const
@@ -654,6 +655,12 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
     if (!task->state.compare_exchange_strong(s, Task::State::Running))
         return s;
 
+    /// From here on this task occupies a reader thread, so its bytes are what the storage is actually
+    /// working on -- the quantity the read-ahead target is about. Matched by the `fetch_sub` at the
+    /// end of this function; the CAS above succeeds for exactly one caller, so the pair is exact, and
+    /// a task dropped while still `Scheduled` never touches this counter.
+    bytes_executing.fetch_add(task->length, std::memory_order_relaxed);
+
     task->stopwatch.restart();
 
     auto final_state = Task::State::Done;
@@ -747,6 +754,8 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
     /// subtracts this task's bytes, since we only get here once (the CAS above succeeds for exactly
     /// one caller) and the early return above (CAS failed) skips this.
     bytes_in_flight.fetch_sub(task->length, std::memory_order_relaxed);
+    /// Matches the `fetch_add` after the `Scheduled` -> `Running` CAS above.
+    bytes_executing.fetch_sub(task->length, std::memory_order_relaxed);
 
     /// Fold this task's timing into the fitted round-trip-time/bandwidth stats, but only for reads
     /// that actually went over the wire and can be timed meaningfully: not on exception, only for

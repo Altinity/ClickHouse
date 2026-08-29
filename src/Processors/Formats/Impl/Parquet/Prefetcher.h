@@ -85,10 +85,16 @@ public:
     };
     /// Snapshot of the fitted stats; takes `stats_mutex` (shared with the rare per-task update).
     ReadStats readStats() const;
-    /// Sum of `length` of tasks that have started (`scheduleTask`) but not yet finished reading:
-    /// counts from scheduling until `runTask` finishes the read, i.e. up to (but not including) the
-    /// final state CAS to `Done`/`Exception` there.
-    size_t bytesInFlight() const { return bytes_in_flight.load(std::memory_order_relaxed); }
+    /// Sum of `length` of tasks a thread is actually reading right now: counts from the
+    /// `Scheduled` -> `Running` CAS in `runTask` until that call finishes the read. Tasks handed to
+    /// the IO pool but not yet picked up by one of its threads are *not* counted -- they occupy queue
+    /// space, not the storage's pipe, and counting them made the read-ahead target a limit on queue
+    /// length rather than on read depth (the pool executes `io_threads` reads at a time no matter how
+    /// many are queued behind them).
+    size_t bytesInFlight() const { return bytes_executing.load(std::memory_order_relaxed); }
+    /// Sum of `length` of tasks that are `Scheduled` or `Running`, i.e. including the ones still
+    /// waiting for an IO thread. Diagnostics only: no budget is derived from it.
+    size_t bytesQueued() const { return bytes_in_flight.load(std::memory_order_relaxed); }
     /// Length of the range a handle pins, 0 for an empty handle. Doesn't touch the handle's task or
     /// any other shared state, so the read-path planner can use it to size reads it hasn't started.
     size_t requestLength(const PrefetchHandle & handle) const;
@@ -265,6 +271,12 @@ private:
     /// decremented exactly once per task, either at the end of `runTask` (success or exception) or,
     /// if the task is dropped before any thread runs it, in `decreaseTaskRefcount`.
     std::atomic<size_t> bytes_in_flight {0};
+
+    /// Sum of `length` of tasks between the `Scheduled` -> `Running` CAS in `runTask` and the end of
+    /// the read there. Always <= `bytes_in_flight`; this is what `bytesInFlight` reports and what the
+    /// read-ahead target is compared against. A task dropped while still `Scheduled` never enters
+    /// this counter, so `decreaseTaskRefcount` has nothing to undo here.
+    std::atomic<size_t> bytes_executing {0};
 
     /// Protects the ReadStats accumulators below. Updated at most once per completed task (rare),
     /// so a mutex is simpler than lock-free fixed-point atomics.

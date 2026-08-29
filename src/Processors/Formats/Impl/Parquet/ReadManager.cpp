@@ -1434,7 +1434,8 @@ std::string ReadManager::collectDeadlockDiagnostics()
         result += " issue_queue: " + std::to_string(issue_queue.size()) + " reads, " + std::to_string(queued_bytes) + " bytes";
     }
     result += " bytes_in_flight: " + std::to_string(reader.prefetcher.bytesInFlight()) +
-        "/" + std::to_string(bytesInFlightTarget());
+        "/" + std::to_string(bytesInFlightTarget()) +
+        " (queued " + std::to_string(reader.prefetcher.bytesQueued()) + ")";
 
     result += " stages: ";
     for (size_t i = 0; i < size_t(ReadStage::Deallocated); ++i)
