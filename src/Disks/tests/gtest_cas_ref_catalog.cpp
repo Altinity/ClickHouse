@@ -56,27 +56,27 @@ namespace DB::ErrorCodes
 namespace
 {
 
-/// Hand-builds one raw "ent" line, bypassing `encodeRefCatalog` entirely -- used by the decode-side
+/// Hand-builds one raw `entry` line, bypassing `encodeRefCatalog` entirely -- used by the decode-side
 /// rejection tests, which must exercise bytes the encoder itself would refuse to produce.
-String rawEntLine(const String & ns, const String & state, const String & inc_hex,
+String rawEntryLine(const String & ns, const String & state, const String & inc_hex,
                    std::optional<std::tuple<String, uint64_t, uint64_t>> creator = std::nullopt)
 {
     if (!creator)
-        return fmt::format(R"({{"k":"ent","ns":"{}","st":"{}","inc":"{}"}})", ns, state, inc_hex);
+        return fmt::format(R"({{"kind":"entry","ns":"{}","state":"{}","life":"{}"}})", ns, state, inc_hex);
     const auto & [srid, we, fg] = *creator;
-    return fmt::format(R"({{"k":"ent","ns":"{}","st":"{}","inc":"{}","csr":"{}","cwe":"{}","cfg":"{}"}})",
+    return fmt::format(R"({{"kind":"entry","ns":"{}","state":"{}","life":"{}","creator":"{}","creator_epoch":"{}","creator_fence":"{}"}})",
                         ns, state, inc_hex, srid, we, fg);
 }
 
-/// Wraps `ent_lines` in the header/trailer a real `cas_ref_catalog` object carries. `v:1` always
+/// Wraps `entry_lines` in the header/trailer a real `cas_ref_catalog` object carries. `v:1` always
 /// passes the header gate (any version <= the build's `G_BUILD` does), matching the convention
 /// `gtest_cas_fold_seal_format.cpp`'s `RejectsOutOfRangeNsCleanupState` uses for the same reason.
-String rawCatalog(const std::vector<String> & ent_lines)
+String rawCatalog(const std::vector<String> & entry_lines)
 {
     String out = R"({"type":"cas_ref_catalog","v":1})" "\n";
-    for (const String & l : ent_lines)
+    for (const String & l : entry_lines)
         out += l + "\n";
-    out += fmt::format("{{\"n\":{}}}\n", ent_lines.size());
+    out += fmt::format("{{\"n\":{}}}\n", entry_lines.size());
     return out;
 }
 
@@ -84,7 +84,7 @@ String withRemovalStartedRound(String line, uint64_t round)
 {
     const size_t close = line.rfind('}');
     EXPECT_NE(close, String::npos);
-    line.insert(close, fmt::format(R"(,"rsr":"{}")", round));
+    line.insert(close, fmt::format(R"(,"remove_round":"{}")", round));
     return line;
 }
 
@@ -223,9 +223,9 @@ TEST(CASFormatBattery, RefCatalog)
         [&] { return sealObject(FormatId::RefCatalog, encodeRefCatalog(c)); },
         [](std::string_view s) { decodeRefCatalog(std::string(openObject(FormatId::RefCatalog, s))); },
         currentFormatHeader("cas_ref_catalog") +
-        "{\"k\":\"ent\",\"ns\":\"a\",\"st\":\"creating\",\"inc\":\"00000000000000000000000000000001\","
-        "\"csr\":\"srv1\",\"cwe\":\"5\",\"cfg\":\"2\"}\n"
-        "{\"k\":\"ent\",\"ns\":\"b\",\"st\":\"live\",\"inc\":\"00000000000000000000000000000002\"}\n"
+        "{\"kind\":\"entry\",\"ns\":\"a\",\"state\":\"creating\",\"life\":\"00000000000000000000000000000001\","
+        "\"creator\":\"srv1\",\"creator_epoch\":\"5\",\"creator_fence\":\"2\"}\n"
+        "{\"kind\":\"entry\",\"ns\":\"b\",\"state\":\"live\",\"life\":\"00000000000000000000000000000002\"}\n"
         "{\"n\":2}\n"});
 }
 
@@ -262,16 +262,16 @@ TEST(CASRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
         .removal_started_round = 19};
     const RefCatalog catalog{.entries = {removing}};
     const String encoded = encodeRefCatalog(catalog);
-    EXPECT_NE(encoded.find("\"rsr\":\"19\""), String::npos);
-    EXPECT_NE(encoded.find("\"st\":\"removing\""), String::npos);
+    EXPECT_NE(encoded.find("\"remove_round\":\"19\""), String::npos);
+    EXPECT_NE(encoded.find("\"state\":\"removing\""), String::npos);
     EXPECT_EQ(decodeRefCatalog(encoded), catalog);
 
     const String inc = "00000000000000000000000000000009";
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { (void)decodeRefCatalog(rawCatalog({rawEntLine("missing", "removing", inc)})); });
+        [&] { (void)decodeRefCatalog(rawCatalog({rawEntryLine("missing", "removing", inc)})); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        (void)decodeRefCatalog(rawCatalog({withRemovalStartedRound(rawEntLine("forbidden", "live", inc), 21)}));
+        (void)decodeRefCatalog(rawCatalog({withRemovalStartedRound(rawEntryLine("forbidden", "live", inc), 21)}));
     });
 }
 
@@ -477,7 +477,7 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAbort
 #endif
 
 /// A namespace + creator server_root_id that both max out at their respective byte bounds (512 +
-/// 255), escaped worst-case, land one "ent" line over the 4 KiB line cap (~4.7 KiB) -- reachable
+/// 255), escaped worst-case, land one `entry` line over the 4 KiB line cap (~4.7 KiB) -- reachable
 /// because neither this codec nor `validateServerRootId` restricts the charset, only the length.
 /// The refusal must be `LIMIT_EXCEEDED` (a capacity refusal), not `LOGICAL_ERROR` (a bug report) --
 /// `encodeFoldSeal`'s own `checkLineBytes` raises `LIMIT_EXCEEDED` for the identical shape of gate.
@@ -496,60 +496,76 @@ TEST(CASRefCatalogFormat, EncodeLineOverCapRaisesLimitExceeded)
 
 TEST(CASRefCatalogFormat, DecodeRejectsDuplicateNamespace)
 {
-    const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(1))),
-                                    rawEntLine("a", "live", u128ToHex(UInt128(2)))});
+    const String bad = rawCatalog({rawEntryLine("a", "live", u128ToHex(UInt128(1))),
+                                    rawEntryLine("a", "live", u128ToHex(UInt128(2)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsNonCanonicalOrder)
 {
-    const String bad = rawCatalog({rawEntLine("b", "live", u128ToHex(UInt128(1))),
-                                    rawEntLine("a", "live", u128ToHex(UInt128(2)))});
+    const String bad = rawCatalog({rawEntryLine("b", "live", u128ToHex(UInt128(1))),
+                                    rawEntryLine("a", "live", u128ToHex(UInt128(2)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsCreatorPresentOnLive)
 {
-    const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(1)),
+    const String bad = rawCatalog({rawEntryLine("a", "live", u128ToHex(UInt128(1)),
                                                std::make_tuple(String("srv"), uint64_t(1), uint64_t(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsCreatorAbsentOnCreating)
 {
-    const String bad = rawCatalog({rawEntLine("a", "creating", u128ToHex(UInt128(1)))});
+    const String bad = rawCatalog({rawEntryLine("a", "creating", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsZeroIncarnation)
 {
-    const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(0)))});
+    const String bad = rawCatalog({rawEntryLine("a", "live", u128ToHex(UInt128(0)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsNameOverByteBound)
 {
     const String too_long_ns(kMaxNamespaceBytes + 1, 'a');
-    const String bad = rawCatalog({rawEntLine(too_long_ns, "live", u128ToHex(UInt128(1)))});
+    const String bad = rawCatalog({rawEntryLine(too_long_ns, "live", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsUnknownState)
 {
-    const String bad = rawCatalog({rawEntLine("a", "bogus", u128ToHex(UInt128(1)))});
+    const String bad = rawCatalog({rawEntryLine("a", "bogus", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
+}
+
+TEST(CASRefCatalogFormat, DecodeRejectsUnknownEntryKey)
+{
+    const String bad = rawCatalog(
+        {R"({"kind":"entry","ns":"a","state":"live","life":"00000000000000000000000000000001","unknown":"x"})"});
+    try
+    {
+        (void)decodeRefCatalog(bad);
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(e.message().find("unknown entry key"), String::npos) << e.message();
+    }
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsEmptyNamespace)
 {
-    const String bad = rawCatalog({rawEntLine("", "live", u128ToHex(UInt128(1)))});
+    const String bad = rawCatalog({rawEntryLine("", "live", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsMissingNamespaceKey)
 {
     /// No "ns" key at all -- must be refused exactly like an explicit empty one, not read as "".
-    const String bad = rawCatalog({R"({"k":"ent","st":"live","inc":")" + u128ToHex(UInt128(1)) + "\"}"});
+    const String bad = rawCatalog({R"({"kind":"entry","state":"live","life":")" + u128ToHex(UInt128(1)) + "\"}"});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 

@@ -23,6 +23,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | `cas/ns/stream/<life_id>/_snap/…​.zst` | complete live ref table (`namespace`, `snapshot_epoch`/`snapshot_seq`, `lifecycle:"live"`; `kind` is `committed`/`precommit`, with `ref` and committed-only `published_ms`) | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
 | `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint (`life_epoch`, `committed_epoch`/`committed_seq`, `snapshot_epoch`/`snapshot_seq`, `seal_epoch`/`seal_seq`) | `CasRefCkptFormat` | writer/GC fold |
 | `cas/ns/state/<life_id>/_files/…​` | namespace-owned raw files | — | upper layers |
+| `cas/ref_catalog` | namespace lifecycle catalog (`kind:"entry"`, `ns`, `state`, `life`, `remove_round`, `creator`, `creator_epoch`, `creator_fence`) | `CasRefCatalogFormat` | namespace admission/removal |
 | `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` | part manifest (`root_namespace`, `payload_digest`; entry `path`, `place`, `size`) | `CasPartManifestFormat` | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope (`type`, `v`, `tag`, `build`, `time_ms`, `creator`, `op`, `chver`, `ref`) + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar (`state`, `condemn_round`, `size`) | `CasBlobMetaFormat` | dedup/GC |

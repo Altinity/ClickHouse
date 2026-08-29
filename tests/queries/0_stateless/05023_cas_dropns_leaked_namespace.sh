@@ -11,7 +11,7 @@
 # SQL-level drop completed normally while the CAS catalog row leaked, one per create/drop cycle.
 #
 # The primary oracle is the pool's OWN plain-text `cas/ref_catalog` object, read directly off disk: the
-# exact `st` (lifecycle) field recorded for the table's logical namespace. `SYSTEM CAS FSCK`'s
+# exact `state` (lifecycle) field recorded for the table's logical namespace. `SYSTEM CAS FSCK`'s
 # unreachable/dangling counts are a secondary check only -- fsck correctly regards a `live` leak as
 # CONSISTENT (nothing is unreachable; the row simply never dies), so it cannot detect this defect on its
 # own; `04290_cas_no_leftovers.sh`'s fsck-only oracle is exactly why FINDING #2 shipped unnoticed.
@@ -34,7 +34,7 @@ catalog_line() {
     grep -F "\"ns\":\"$1\"" "${CATALOG_FILE}" 2>/dev/null || true
 }
 
-# The `st` (lifecycle) word recorded for namespace $1: "live"/"creating"/"removing", or "absent" if the
+# The `state` (lifecycle) word recorded for namespace $1: "live"/"creating"/"removing", or "absent" if the
 # namespace has no catalog row (matches `04290`'s field-by-name discipline: never assume a position).
 catalog_state() {
     local line
@@ -43,7 +43,16 @@ catalog_state() {
         echo "absent"
         return
     fi
-    echo "${line}" | grep -o '"st":"[a-z]*"' | head -1 | sed -E 's/"st":"([a-z]*)"/\1/'
+    local state
+    if ! state=$(echo "${line}" | grep -o '"state":"[a-z]*"' | head -1 | sed -E 's/"state":"([a-z]*)"/\1/'); then
+        echo "catalog row for namespace $1 has no readable state field" >&2
+        return 1
+    fi
+    if [ -z "${state}" ]; then
+        echo "catalog row for namespace $1 has no readable state field" >&2
+        return 1
+    fi
+    echo "${state}"
 }
 
 # ClickHouse's own store/<u3>/<uuid> fanout with the CAS archive boundary marker, exactly as
@@ -91,7 +100,7 @@ echo "empty_table_has_no_ref_stream_before_drop $([ "${STREAM_HITS_BEFORE}" -eq 
 
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_dropns_empty SYNC"
 
-# The current branch fails here by leaving st:"live"; the fix must show "removing" (a terminal stream
+# The current branch fails here by leaving state:"live"; the fix must show "removing" (a terminal stream
 # record now exists but the catalog row itself is not deleted until GC folds and reclaims it).
 echo "empty_table_state_after_sync_drop $(catalog_state "${EMPTY_NS}")"
 STREAM_HITS_AFTER=$(find "${POOL_DIR}/ca/cas/ns/stream" -type f 2>/dev/null | wc -l)

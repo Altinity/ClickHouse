@@ -34,7 +34,7 @@ from soak.cluster import Cluster
 from soak.fsck import run_fsck
 
 _CATALOG_S3_URL = "http://rustfs1:11121/test/soak_pool/cas/ref_catalog"
-_ENTRY_RE = re.compile(r'\{"k":"ent","ns":"([^"]*)","st":"([^"]*)","inc":"([0-9a-f]+)"')
+_ENTRY_RE = re.compile(r'\{"kind":"entry","ns":"([^"]*)","state":"([^"]*)","life":"([0-9a-f]+)"')
 
 
 def dead_incarnation_ids():
