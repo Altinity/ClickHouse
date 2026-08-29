@@ -20,13 +20,13 @@ namespace
 
 namespace RefCkptWire
 {
-    constexpr WireKey life_epoch{"le"};
-    constexpr WireKey committed_epoch{"cte"};
-    constexpr WireKey committed_seq{"cts"};
-    constexpr WireKey snapshot_epoch{"cse"};
-    constexpr WireKey snapshot_seq{"css"};
-    constexpr WireKey seal_epoch{"lse"};
-    constexpr WireKey seal_seq{"lss"};
+    constexpr WireKey life_epoch{"life_epoch"};
+    constexpr WireKey committed_epoch{"committed_epoch"};
+    constexpr WireKey committed_seq{"committed_seq"};
+    constexpr WireKey snapshot_epoch{"snapshot_epoch"};
+    constexpr WireKey snapshot_seq{"snapshot_seq"};
+    constexpr WireKey seal_epoch{"seal_epoch"};
+    constexpr WireKey seal_seq{"seal_seq"};
 }
 
 }
@@ -143,22 +143,22 @@ RefCkpt decodeRefCkpt(std::string_view data)
     JsonObjectReader r(body_in, KeyStrictness::Strict, "cas_ref_ckpt");
 
     RefCkpt ckpt;
-    std::optional<uint64_t> cse;
-    std::optional<uint64_t> css;
-    std::optional<uint64_t> lse;
-    std::optional<uint64_t> lss;
-    std::optional<uint64_t> cte;
-    std::optional<uint64_t> cts;
+    std::optional<uint64_t> snapshot_epoch;
+    std::optional<uint64_t> snapshot_seq;
+    std::optional<uint64_t> seal_epoch;
+    std::optional<uint64_t> seal_seq;
+    std::optional<uint64_t> committed_epoch;
+    std::optional<uint64_t> committed_seq;
     String key;
     while (r.nextKey(key))
     {
         if (key == RefCkptWire::life_epoch) ckpt.life_epoch = r.readU64String();
-        else if (key == RefCkptWire::committed_epoch) cte = r.readU64String();
-        else if (key == RefCkptWire::committed_seq) cts = r.readU64String();
-        else if (key == RefCkptWire::snapshot_epoch) cse = r.readU64String();
-        else if (key == RefCkptWire::snapshot_seq) css = r.readU64String();
-        else if (key == RefCkptWire::seal_epoch) lse = r.readU64String();
-        else if (key == RefCkptWire::seal_seq) lss = r.readU64String();
+        else if (key == RefCkptWire::committed_epoch) committed_epoch = r.readU64String();
+        else if (key == RefCkptWire::committed_seq) committed_seq = r.readU64String();
+        else if (key == RefCkptWire::snapshot_epoch) snapshot_epoch = r.readU64String();
+        else if (key == RefCkptWire::snapshot_seq) snapshot_seq = r.readU64String();
+        else if (key == RefCkptWire::seal_epoch) seal_epoch = r.readU64String();
+        else if (key == RefCkptWire::seal_seq) seal_seq = r.readU64String();
         else r.skipUnknown(key);
     }
 
@@ -167,23 +167,23 @@ RefCkpt decodeRefCkpt(std::string_view data)
     /// deletable" today and as "recovery has no base" tomorrow -- both of which a reader would trust.
     /// Fail closed instead. (A missing whole field is a legitimate absence, not truncation: every field
     /// of this object is optional, so there is nothing to miss.)
-    if (cse || css)
+    if (snapshot_epoch || snapshot_seq)
     {
-        if (!cse || !css)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: checkpoint_snapshot_id needs both cse and css");
-        ckpt.checkpoint_snapshot_id = RefTxnId{*cse, *css};
+        if (!snapshot_epoch || !snapshot_seq)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: checkpoint_snapshot_id needs both snapshot_epoch and snapshot_seq");
+        ckpt.checkpoint_snapshot_id = RefTxnId{*snapshot_epoch, *snapshot_seq};
     }
-    if (cte || cts)
+    if (committed_epoch || committed_seq)
     {
-        if (!cte || !cts)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: committed_through needs both cte and cts");
-        ckpt.committed_through = RefTxnId{*cte, *cts};
+        if (!committed_epoch || !committed_seq)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: committed_through needs both committed_epoch and committed_seq");
+        ckpt.committed_through = RefTxnId{*committed_epoch, *committed_seq};
     }
-    if (lse || lss)
+    if (seal_epoch || seal_seq)
     {
-        if (!lse || !lss)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: last_epoch_seal needs both lse and lss");
-        ckpt.last_epoch_seal = RefTxnId{*lse, *lss};
+        if (!seal_epoch || !seal_seq)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: last_epoch_seal needs both seal_epoch and seal_seq");
+        ckpt.last_epoch_seal = RefTxnId{*seal_epoch, *seal_seq};
     }
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: trailing bytes");

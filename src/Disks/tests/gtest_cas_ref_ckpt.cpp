@@ -277,7 +277,7 @@ TEST(CASRefCheckpoint, CommittedThroughHasCanonicalExactWireEncoding)
                        .checkpoint_snapshot_id = RefTxnId{9, 10},
                        .last_epoch_seal = RefTxnId{8, 12}};
     const String expected = R"({"type":"cas_ref_ckpt","v":1}
-{"le":"7","cte":"9","cts":"11","cse":"9","css":"10","lse":"8","lss":"12"}
+{"life_epoch":"7","committed_epoch":"9","committed_seq":"11","snapshot_epoch":"9","snapshot_seq":"10","seal_epoch":"8","seal_seq":"12"}
 )";
 
     EXPECT_EQ(encodeRefCkpt(ckpt), expected);
@@ -296,7 +296,7 @@ TEST(CASFormatBattery, RefCkpt)
         [&] { return sealObject(FormatId::RefCkpt, encodeRefCkpt(ckpt)); },
         [](std::string_view s) { decodeRefCkpt(std::string(openObject(FormatId::RefCkpt, s))); },
         currentFormatHeader("cas_ref_ckpt") +
-        "{\"le\":\"7\",\"cte\":\"9\",\"cts\":\"11\",\"cse\":\"9\",\"css\":\"10\",\"lse\":\"8\",\"lss\":\"12\"}\n"});
+        "{\"life_epoch\":\"7\",\"committed_epoch\":\"9\",\"committed_seq\":\"11\",\"snapshot_epoch\":\"9\",\"snapshot_seq\":\"10\",\"seal_epoch\":\"8\",\"seal_seq\":\"12\"}\n"});
 }
 
 /// `last_epoch_seal` is chain evidence, not an arbitrary lower bound. It either names the frontier
@@ -323,9 +323,9 @@ TEST(CASRefCheckpoint, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefCkpt(unsealed_non_genesis); });
 
     String malformed = encodeRefCkpt(valid);
-    const size_t cte = malformed.find(R"("cte":"8")");
-    ASSERT_NE(cte, String::npos);
-    malformed.replace(cte, String{R"("cte":"8")"}.size(), R"("cte":"10")");
+    const size_t committed_epoch = malformed.find(R"("committed_epoch":"8")");
+    ASSERT_NE(committed_epoch, String::npos);
+    malformed.replace(committed_epoch, String{R"("committed_epoch":"8")"}.size(), R"("committed_epoch":"10")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(malformed); });
 }
 
@@ -347,13 +347,25 @@ TEST(CASRefCheckpoint, RejectsAnUnknownKey)
     expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRefCkpt(with_critical); });
 }
 
+/// Replacing the abbreviated key is a format cut, not an alias. Treating it as an optional partial
+/// pair would make an old writer's checkpoint appear to have no committed frontier.
+TEST(CASRefCheckpoint, RejectsOldCommittedEpochKeyRatherThanAliasingIt)
+{
+    String with_old_key = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
+                                                .committed_through = ID_1_1,
+                                                .checkpoint_snapshot_id = ID_1_1,
+                                                .last_epoch_seal = std::nullopt});
+    with_old_key.replace(with_old_key.rfind('}'), 1, R"(,"cte":"9"})");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(with_old_key); });
+}
+
 /// A duplicate key has no single meaning, so it can never be resolved by a reader's preference.
 TEST(CASRefCheckpoint, RejectsADuplicateKey)
 {
     const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt,
                                               .last_epoch_seal = std::nullopt});
     String duplicated = good;
-    duplicated.replace(duplicated.rfind('}'), 1, R"(,"le":"9"})");
+    duplicated.replace(duplicated.rfind('}'), 1, R"(,"life_epoch":"9"})");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(duplicated); });
 }
 
@@ -377,13 +389,13 @@ TEST(CASRefCheckpoint, RejectsTruncation)
     const String empty_body = good.substr(0, good.find('\n') + 1) + "{}\n";
     EXPECT_EQ(decodeRefCkpt(empty_body), RefCkpt{});
 
-    const String half_pair = good.substr(0, good.find('\n') + 1) + R"({"le":"7","cse":"1"})" + "\n";
+    const String half_pair = good.substr(0, good.find('\n') + 1) + R"({"life_epoch":"7","snapshot_epoch":"1"})" + "\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(half_pair); });
 
-    const String other_half = good.substr(0, good.find('\n') + 1) + R"({"le":"7","lss":"2"})" + "\n";
+    const String other_half = good.substr(0, good.find('\n') + 1) + R"({"life_epoch":"7","seal_seq":"2"})" + "\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(other_half); });
 
-    const String frontier_half = good.substr(0, good.find('\n') + 1) + R"({"le":"7","cte":"1"})" + "\n";
+    const String frontier_half = good.substr(0, good.find('\n') + 1) + R"({"life_epoch":"7","committed_epoch":"1"})" + "\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(frontier_half); });
 }
 
@@ -414,9 +426,9 @@ TEST(CASRefCheckpoint, RejectsInvalidFieldsOnEncodeAndOnDecode)
     const String header = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt,
                                                 .last_epoch_seal = std::nullopt});
     const String prefix = header.substr(0, header.find('\n') + 1);
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(prefix + R"({"le":"0"})" + "\n"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(prefix + R"({"life_epoch":"0"})" + "\n"); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decodeRefCkpt(prefix + R"({"le":"7","cse":"1","css":"0"})" + "\n"); });
+        [&] { decodeRefCkpt(prefix + R"({"life_epoch":"7","snapshot_epoch":"1","snapshot_seq":"0"})" + "\n"); });
 }
 
 /// The registry row is part of the contract: Control/Strict decides how the decoder treats unknown
