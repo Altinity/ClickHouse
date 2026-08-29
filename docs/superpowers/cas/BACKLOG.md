@@ -61,6 +61,10 @@ Append new items here — quick adds and concurrent-agent findings land in this 
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 
+- PROSE (wire-keys phase-1, CasWireVocab.h): `tokenTypeToWord`/`objectKindToWord` doc comments still say "Throws CORRUPTED_DATA" — both now throw LOGICAL_ERROR via the table.
+- PROSE (wire-keys phase-1, CasBlobDigest.h): `blobHashLenFor` comment claims it preserves "the fail-closed contract of blobHashAlgoName" — no longer true (BAD_ARGUMENTS vs LOGICAL_ERROR); note 4 functions over BlobHashAlgo now intentionally diverge on the defensive code.
+- PROSE (wire-keys phase-1, CasGc.cpp fold comment): names the wrong function AND code — decoder fail-close is `blobHashAlgoFromWord` → CORRUPTED_DATA, not `blobHashAlgoName` (pre-existing, widened by the taxonomy change).
+
 - PROSE (wire-keys phase-1, CasEnvelopeLimits.h): doc comment claims "read by BOTH validatePoolBlobHeaderLen and the blob-envelope codec" — false until the phase-2 static_assert lands (one reader today); self-heals in phase 2, else reword as purpose.
 - PROSE (wire-keys phase-2 TODO, CasPoolMetaFormat.{h,cpp}): the floor derivation comment is split from the value it derives (and its 214/225 numbers carry the known off-by-one — spec mandates 213/224); phase 2 should move the derivation into CasEnvelopeLimits.h beside the constant and erase the duplicated "240" prose in CasPoolMetaFormat.h.
 
