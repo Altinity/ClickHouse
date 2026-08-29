@@ -23,3 +23,15 @@ Message-text decision: reader error messages and strictness are unchanged; only 
 Gate results: `ninja -C build unit_tests_dbms` succeeded; `CAS*` passed 2199 tests with 0 failures.
 
 Deviation: none.
+
+## Task 9 {#task-9}
+
+Status: complete.
+
+Files changed: `CasServerRootFormats.cpp`.
+
+Message-text decision: reader error messages and required-field checks are unchanged; only the compared key literals became named `WireKey` constants.
+
+Gate results: `ninja -C build unit_tests_dbms` succeeded; `CAS*` passed 2199 tests with 0 failures.
+
+Deviation: none.
