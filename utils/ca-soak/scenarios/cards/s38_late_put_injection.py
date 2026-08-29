@@ -115,7 +115,8 @@ def _restamp_ref_log_txn(body: bytes, ref_sequence: int, writer_epoch: int | Non
     """Rewrite a real ref-log object's id and strip its ops.
 
     The format is line-oriented JSON (`CasTextFormat.cpp`): a header line, a meta line carrying
-    `ns`/`we`/`rs` (u64 as decimal STRINGS, `readU64String`), then one line per op, then a trailer
+    `namespace`/`txn_epoch`/`txn_seq` (u64 as decimal STRINGS, `readU64String`), then one line per op,
+    then a trailer
     `{"n": <op count>}`. Only the id fields and the op list change here, so the header (with its
     compatibility version) and the namespace come from a body the server wrote — this card does not
     encode the format, it edits two fields of it. `writer_epoch` defaults to the donor's own.
@@ -124,15 +125,17 @@ def _restamp_ref_log_txn(body: bytes, ref_sequence: int, writer_epoch: int | Non
     if len(lines) < 3:
         raise ValueError(f"ref-log body has {len(lines)} lines, expected at least 3 (header/meta/trailer)")
     meta = json.loads(lines[1])
-    if "rs" not in meta or "ns" not in meta or "we" not in meta:
-        raise ValueError(f"ref-log meta line lacks ns/we/rs: {lines[1][:200]}")
-    meta["rs"] = str(ref_sequence)
+    if "txn_seq" not in meta or "namespace" not in meta or "txn_epoch" not in meta:
+        raise ValueError(
+            f"ref-log meta line lacks namespace/txn_epoch/txn_seq: {lines[1][:200]}"
+        )
+    meta["txn_seq"] = str(ref_sequence)
     if writer_epoch is not None:
-        meta["we"] = str(writer_epoch)
-    # `!pse` is a chain link, legal only at sequence 1; the restamped id is not sequence 1, so a
-    # copied link would be rejected by the seal grammar for a reason unrelated to this card.
-    meta.pop("!pse", None)
-    meta.pop("!pss", None)
+        meta["txn_epoch"] = str(writer_epoch)
+    # `!prev_epoch` is a chain link, legal only at sequence 1; the restamped id is not sequence 1, so
+    # a copied link would be rejected by the seal grammar for a reason unrelated to this card.
+    meta.pop("!prev_epoch", None)
+    meta.pop("!prev_seq", None)
     # `keep_ops=False` is the S38 shape: an op-count of zero can never poison a real later fold, which
     # is what you want when the point is that the object is never READ. S43 needs the opposite — an
     # object whose absorption would be OBSERVABLE — so it keeps the donor's ops and the trailer that

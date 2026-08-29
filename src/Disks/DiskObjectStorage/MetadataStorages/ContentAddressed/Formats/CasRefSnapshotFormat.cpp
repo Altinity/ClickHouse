@@ -105,9 +105,10 @@ void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
     bool first = true;
     writeStringField(out, RefSnapWire::ns, snapshot.ns, first);
     writeRefTxnIdFields(out, first, RefSnapWire::snapshot_epoch, RefSnapWire::snapshot_seq, snapshot.snapshot_id);
-    const RefLifecycle lifecycle = RefLifecycle::Live;
-    if (lifecycle == RefLifecycle::Live)
-        writeStringField(out, RefSnapWire::lifecycle, kLiveLifecycleWord, first);
+    /// A snapshot object exists only for a live namespace -- `RefLifecycle::Removed` has no snapshot
+    /// representation -- so the wire carries exactly one lifecycle word. The reader keeps the
+    /// fail-closed half: any other word, or none, is rejected there.
+    writeStringField(out, RefSnapWire::lifecycle, kLiveLifecycleWord, first);
     closeObject(out, first);
     writeChar('\n', out);
 }

@@ -152,6 +152,30 @@ TEST(CASRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)
         [&] { decodeRefTableSnapshot(tampered, s.ns, s.snapshot_id); });
 }
 
+/// Row kinds are the owner-kind vocabulary, so an unknown kind word must fail closed at the word
+/// table rather than being silently skipped as an unrecognized row -- a skipped row would lose a ref
+/// from a snapshot the reader still reports as complete.
+TEST(CASRefSnapshotCodec, DecodeRejectsUnknownRowKindWord)
+{
+    RefTableSnapshot s;
+    s.ns = "ns";
+    s.snapshot_id = RefTxnId{1, 1};
+    RefCommittedRow c;
+    c.ref_name = "all_1_1_0";
+    c.manifest_ref = manifestRef(5, 10, 1);
+    c.published_at_ms = 1717000000000ULL;
+    s.committed.push_back(c);
+
+    const String bytes = encodeRefTableSnapshot(s);
+    const String needle = "\"kind\":\"committed\"";
+    const auto pos = bytes.find(needle);
+    ASSERT_NE(pos, String::npos);
+    const String tampered = bytes.substr(0, pos) + "\"kind\":\"archived\"" + bytes.substr(pos + needle.size());
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeRefTableSnapshot(tampered, s.ns, s.snapshot_id); });
+}
+
 TEST(CASRefSnapshotCodec, RoundTripLiveEmpty)
 {
     RefTableSnapshot s;

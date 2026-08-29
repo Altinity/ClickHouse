@@ -113,7 +113,7 @@ struct BindingFields
     RefOwnerBinding build(std::string_view what) const
     {
         if (!kind || !ref)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: {} binding missing bk/rn", what);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: {} binding missing kind/ref", what);
         RefOwnerBinding b;
         b.kind = refOwnerKindFromWord(*kind, "RefLogTxn owner binding");
         b.ref_name = *ref;
