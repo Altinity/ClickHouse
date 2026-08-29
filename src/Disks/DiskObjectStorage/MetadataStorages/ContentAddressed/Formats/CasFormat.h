@@ -74,20 +74,20 @@ void checkCompatibility(uint32_t compatibility_version, std::string_view what);
 /// One append-only entry in a class's format history. At `generation`, the class's ENCODING or the
 /// MEANING of what it encodes changed, and a reader must understand at least `min_reader` to read an
 /// object written at that generation. Additive changes retain the previous reader floor; breaking
-/// changes set the floor to the change generation itself. Generation 4's ref-stream entry is the
-/// worked example of the second kind: not one byte of `cas_ref_log` moved, but its ids became dense,
-/// so an older stream is unreadable to this build and the floor is the change generation.
+/// changes set the floor to the change generation itself — even when not one byte of the encoding
+/// moves: a change that makes ids dense, for example, leaves the bytes readable but their MEANING
+/// unreadable to an older build, so the floor is the change generation.
 struct FormatChangePoint
 {
     uint16_t generation;
     uint16_t min_reader;
 };
 
-/// Returns the append-only change-point history for `id`, oldest first. A class's history begins at
-/// the generation it was BORN in, not at 1: the classes that existed from the start carry the frozen
-/// `{1, 1}` baseline, while `RefCkpt` — introduced at generation 4 — begins at `{4, 4}`, because there
-/// is no such thing as a generation-1 `_ckpt` and claiming one would say a generation-1 reader could
-/// read it. Future changes append entries without editing old ones.
+/// Returns the append-only change-point history for `id`, oldest first. After the pre-release
+/// generation reset every class carries the shared `{1, 1}` baseline. A class born LATER than the
+/// current baseline must begin its history at its birth generation, not at 1 — claiming an earlier
+/// entry would say an older reader could read an object kind that did not yet exist. Future changes
+/// append entries without editing old ones.
 std::span<const FormatChangePoint> changePoints(FormatId id);
 
 /// The text-format registry has one row per decodable persisted object. Each row is the single source
