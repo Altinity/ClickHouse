@@ -17,6 +17,15 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+namespace PoolMetaWire
+{
+    constexpr WireKey pool_id{"pid"};
+    constexpr WireKey blob_header_len{"hln"};
+    constexpr WireKey gc_shards{"gcs"};
+    constexpr WireKey min_reader_generation{"mrg"};
+    constexpr WireKey algos_used{"alg"};
+}
+
 /// Minimum `blob_header_len` that provably fits the v3 `cas_blob` JSON envelope's mandatory (always-
 /// written) non-ref fields, computed at type maxima from `encodeEnvelopeHeader` (CasBlobEnvelopeFormat.cpp):
 ///   {"type":"cas_blob"                                        18
@@ -75,15 +84,11 @@ String encodePoolMeta(const PoolMeta & pm)
     writeHeaderLine(out, FormatId::PoolMeta);
 
     bool first = true;
-    writeKey(out, "pid", first);
-    writeHex128Value(out, pm.pool_id);
-    writeKey(out, "hln", first);
-    writeIntText(pm.blob_header_len, out);
-    writeKey(out, "gcs", first);
-    writeIntText(pm.gc_shards, out);
-    writeKey(out, "mrg", first);
-    writeIntText(pm.min_reader_generation, out);
-    writeKey(out, "alg", first);
+    writeHex128Field(out, PoolMetaWire::pool_id, pm.pool_id, first);
+    writeNumberField(out, PoolMetaWire::blob_header_len, pm.blob_header_len, first);
+    writeNumberField(out, PoolMetaWire::gc_shards, pm.gc_shards, first);
+    writeNumberField(out, PoolMetaWire::min_reader_generation, pm.min_reader_generation, first);
+    writeKey(out, PoolMetaWire::algos_used, first);
     {
         /// Comma-joined algo words (tiny list, <=3): "ch128" or "ch128,sha256".
         String joined;
@@ -129,21 +134,21 @@ PoolMeta decodePoolMeta(std::string_view data)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "pid")
+        if (key == PoolMetaWire::pool_id)
         {
             pm.pool_id = r.readHex128();
             saw_pid = true;
         }
-        else if (key == "hln")
+        else if (key == PoolMetaWire::blob_header_len)
             pm.blob_header_len = r.readU64Number();
-        else if (key == "gcs")
+        else if (key == PoolMetaWire::gc_shards)
         {
             pm.gc_shards = r.readU64Number();
             saw_gc_shards = true;
         }
-        else if (key == "mrg")
+        else if (key == PoolMetaWire::min_reader_generation)
             pm.min_reader_generation = r.readU64Number();
-        else if (key == "alg")
+        else if (key == PoolMetaWire::algos_used)
         {
             const String joined = r.readString();
             size_t start = 0;
