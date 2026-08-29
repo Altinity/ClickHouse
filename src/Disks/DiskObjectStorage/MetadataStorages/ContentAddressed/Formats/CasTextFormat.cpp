@@ -109,6 +109,20 @@ void CasJsonWriter::stringValue(std::string_view s)
     appendChar('"');
 }
 
+void CasJsonWriter::wordArray(std::span<const std::string_view> words)
+{
+    appendChar('[');
+    bool first = true;
+    for (const std::string_view word : words)
+    {
+        if (!first)
+            appendChar(',');
+        first = false;
+        stringValue(word);
+    }
+    appendChar(']');
+}
+
 /// ---- read-side pull cursor ----
 
 /// A canonical-text parse failure is CORRUPTED_DATA regardless of which ReadHelpers primitive
@@ -184,6 +198,27 @@ String JsonObjectReader::readString()
         String s;
         readJSONString(s, in, jsonReadSettings());
         return s;
+    });
+}
+
+std::vector<String> JsonObjectReader::readStringArray()
+{
+    return guarded([&]
+    {
+        std::vector<String> words;
+        assertChar('[', in);
+        if (checkChar(']', in))
+            return words;
+
+        while (true)
+        {
+            String word;
+            readJSONString(word, in, jsonReadSettings());
+            words.push_back(std::move(word));
+            if (checkChar(']', in))
+                return words;
+            assertChar(',', in);
+        }
     });
 }
 

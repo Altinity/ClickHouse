@@ -511,6 +511,7 @@ TEST(CASPoolMeta, RejectsBadConstantsOnDecode)
     PoolMeta bad_pm;
     bad_pm.pool_id = hexToU128("00000000000000000000000000000001");
     bad_pm.blob_header_len = 100;   /// violates 8-alignment invariant
+    bad_pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
     b->putIfAbsent(layout.poolMetaKey(), encodePoolMeta(bad_pm));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { PoolMeta::createOrValidate(*b, layout, 256); });

@@ -6,6 +6,7 @@
 #include <base/hex.h>
 #include <base/itoa.h>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -61,6 +62,9 @@ public:
 
     /// Quoted JSON string with full escaping (bulk-run scan). Defined in CasTextFormat.cpp.
     void stringValue(std::string_view s);
+
+    /// JSON array of canonical word strings, emitted without intermediate storage.
+    void wordArray(std::span<const std::string_view> words);
 
     void u64Number(uint64_t v)
     {
@@ -165,6 +169,12 @@ inline void writeWordField(CasJsonWriter & out, WireKey key, std::string_view wo
     writeStringValue(out, word);
 }
 
+inline void writeWordArrayField(CasJsonWriter & out, WireKey key, std::span<const std::string_view> words, bool & first)
+{
+    writeKey(out, key, first);
+    out.wordArray(words);
+}
+
 inline void writeStringField(CasJsonWriter & out, WireKey key, std::string_view value, bool & first)
 {
     writeKey(out, key, first);
@@ -221,6 +231,8 @@ public:
     bool nextKey(String & key);
     /// Reads the value for the key returned by `nextKey` as a JSON string.
     String readString();
+    /// Reads the value for the key returned by `nextKey` as an array of JSON strings.
+    std::vector<String> readStringArray();
     /// Reads a quoted 32-character lowercase hexadecimal string as a `UInt128`.
     UInt128 readHex128();
     /// Reads a quoted decimal u64 string and rejects empty, trailing, or non-decimal text.

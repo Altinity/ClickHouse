@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <array>
 
 namespace DB
 {
@@ -19,11 +20,11 @@ namespace DB::Cas
 
 namespace PoolMetaWire
 {
-    constexpr WireKey pool_id{"pid"};
-    constexpr WireKey blob_header_len{"hln"};
-    constexpr WireKey gc_shards{"gcs"};
-    constexpr WireKey min_reader_generation{"mrg"};
-    constexpr WireKey algos_used{"alg"};
+    constexpr WireKey pool_id{"pool_id"};
+    constexpr WireKey blob_header_len{"blob_header_len"};
+    constexpr WireKey gc_shards{"gc_shards"};
+    constexpr WireKey min_reader_generation{"min_reader_generation"};
+    constexpr WireKey algos_used{"algos_used"};
 }
 
 /// Minimum `blob_header_len` that provably fits the v3 `cas_blob` JSON envelope's mandatory (always-
@@ -79,6 +80,8 @@ void validatePoolAlgosUsed(const std::vector<uint8_t> & algos_used, int error_co
 
 String encodePoolMeta(const PoolMeta & pm)
 {
+    validatePoolAlgosUsed(pm.algos_used, ErrorCodes::CORRUPTED_DATA, "pool meta");
+
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::PoolMeta);
 
@@ -87,18 +90,10 @@ String encodePoolMeta(const PoolMeta & pm)
     writeNumberField(out, PoolMetaWire::blob_header_len, pm.blob_header_len, first);
     writeNumberField(out, PoolMetaWire::gc_shards, pm.gc_shards, first);
     writeNumberField(out, PoolMetaWire::min_reader_generation, pm.min_reader_generation, first);
-    writeKey(out, PoolMetaWire::algos_used, first);
-    {
-        /// Comma-joined algo words (tiny list, <=3): "ch128" or "ch128,sha256".
-        String joined;
-        for (size_t i = 0; i < pm.algos_used.size(); ++i)
-        {
-            if (i != 0)
-                joined += ',';
-            joined += blobHashAlgoName(static_cast<BlobHashAlgo>(pm.algos_used[i]));
-        }
-        writeStringValue(out, joined);
-    }
+    std::array<std::string_view, kBlobHashAlgoWords.entries.size()> algo_words;
+    for (size_t i = 0; i < pm.algos_used.size(); ++i)
+        algo_words[i] = kBlobHashAlgoWords.toWord(static_cast<BlobHashAlgo>(pm.algos_used[i]), "CAS pool meta");
+    writeWordArrayField(out, PoolMetaWire::algos_used, std::span{algo_words}.first(pm.algos_used.size()), first);
     closeObject(out, first);
     writeChar('\n', out);
 
@@ -145,27 +140,16 @@ PoolMeta decodePoolMeta(std::string_view data)
             pm.min_reader_generation = r.readU64Number();
         else if (key == PoolMetaWire::algos_used)
         {
-            const String joined = r.readString();
-            size_t start = 0;
-            while (start <= joined.size())
-            {
-                const size_t comma = joined.find(',', start);
-                const String word = joined.substr(start, comma == String::npos ? String::npos : comma - start);
-                if (word.empty())
-                    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: empty algo word in '{}'", joined);
+            for (const String & word : r.readStringArray())
                 pm.algos_used.push_back(static_cast<uint8_t>(blobHashAlgoFromWord(word, "pool meta algo")));
-                if (comma == String::npos)
-                    break;
-                start = comma + 1;
-            }
         }
         else
             r.skipUnknown(key);
     }
     if (!saw_pid)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing pid");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing pool_id");
     if (!saw_gc_shards || pm.gc_shards == 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing or zero gcs");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing or zero gc_shards");
     if (!body_in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: junk after body object");
     if (!in.eof())

@@ -18,7 +18,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
-| `_pool_meta` | pool identity + floors | `CasPoolMetaFormat` | pool create/admit |
+| `_pool_meta` | pool identity + floors (`pool_id`, `blob_header_len`, `gc_shards`, `min_reader_generation`, `algos_used` array) | `CasPoolMetaFormat` | pool create/admit |
 | `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log | `CasRefLogFormat` (`.zst`) | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/…​.zst` | complete ref table | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
 | `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint | `CasRefCkptFormat` | writer/GC fold |

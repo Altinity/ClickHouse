@@ -15,7 +15,8 @@ class Layout;
 
 /// `_pool_meta` — the pool identity and the pool-wide constants that every reader and writer must
 /// agree on. The v3 text representation is a header line followed by one JSON body object:
-/// {"pid":"<32hex>","hln":<blob_header_len>,"mrg":<min_reader_generation>,"alg":"<algo-words>"}.
+/// {"pool_id":"<32hex>","blob_header_len":<blob_header_len>,"gc_shards":<gc_shards>,
+///  "min_reader_generation":<min_reader_generation>,"algos_used":["<algo-word>",...] }.
 ///
 /// The persisted object is authoritative after creation. On reopen, `createOrValidate` uses its
 /// `blob_header_len` and reader-generation floor rather than replacing them with local configuration;
@@ -67,7 +68,7 @@ struct PoolMeta
 
 /// Serializes valid pool metadata as the versioned `_pool_meta` text object. The output includes the
 /// format header, one JSON body line, and its terminating newline; it is suitable for a conditional
-/// backend write and preserves the sorted algorithm set as comma-separated vocabulary words.
+/// backend write and preserves the sorted algorithm set as a JSON array of vocabulary words.
 String encodePoolMeta(const PoolMeta &);
 
 /// Parses and validates a persisted `_pool_meta` object. Unknown JSON keys are tolerated for additive

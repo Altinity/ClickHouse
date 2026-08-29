@@ -38,7 +38,19 @@ TEST(CASFormatBattery, PoolMeta)
         .encode = [&] { return sealObject(FormatId::PoolMeta, encodePoolMeta(pm)); },
         .decode = [](std::string_view s) { decodePoolMeta(std::string(openObject(FormatId::PoolMeta, s))); },
         .golden = currentFormatHeader("cas_pool_meta") +
-                  "{\"pid\":\"00112233445566778899aabbccddeeff\",\"hln\":256,\"gcs\":1,\"mrg\":1,\"alg\":\"ch128\"}\n"});
+                  "{\"pool_id\":\"00112233445566778899aabbccddeeff\",\"blob_header_len\":256,\"gc_shards\":1,\"min_reader_generation\":1,\"algos_used\":[\"ch128\"]}\n"});
+}
+
+TEST(CASPoolMeta, RejectsInvalidAlgoArrays)
+{
+    const auto decode = [](std::string_view algos_used)
+    {
+        return decodePoolMeta("{\"type\":\"cas_pool_meta\",\"v\":1}\n"
+            "{\"pool_id\":\"00112233445566778899aabbccddeeff\",\"blob_header_len\":256,\"gc_shards\":1,\"min_reader_generation\":1,\"algos_used\":" + String(algos_used) + "}\n");
+    };
+
+    for (const std::string_view bad : {"\"ch128,sha256\"", "[\"ch128\",1]", "[]", "[\"sha256\",\"ch128\"]", "[\"ch128\",\"ch128\"]", "[\"unknown\"]"})
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decode(bad); });
 }
 
 TEST(CASPoolMeta, ValidateAlgosUsedRejectsUnknownByte)

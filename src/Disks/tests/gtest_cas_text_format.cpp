@@ -7,6 +7,7 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <array>
 #include <set>
 
 using namespace DB::Cas;
@@ -138,6 +139,28 @@ TEST(CASJsonVocab, WriteAndReadBack)
     ASSERT_TRUE(r.nextKey(key)); EXPECT_EQ(key, "ref");
     EXPECT_EQ(r.readString(), "t-1/all_1_2_0\n\"quoted\"");
     EXPECT_FALSE(r.nextKey(key));
+}
+
+TEST(CASJsonVocab, WordArrayFieldAndReaderRejectInvalidValues)
+{
+    CasJsonWriter out;
+    bool first = true;
+    const std::array<std::string_view, 2> words{"ch128", "sha256"};
+    writeWordArrayField(out, WireKey{"algos_used"}, words, first);
+    closeObject(out, first);
+    EXPECT_EQ(std::move(out).take(), "{\"algos_used\":[\"ch128\",\"sha256\"]}");
+
+    const auto read = [](std::string_view text)
+    {
+        DB::ReadBufferFromMemory in(text.data(), text.size());
+        JsonObjectReader r(in, KeyStrictness::Tolerant, "test");
+        String key;
+        EXPECT_TRUE(r.nextKey(key));
+        return r.readStringArray();
+    };
+    EXPECT_EQ(read(R"({"algos_used":["ch128","sha256"]})"), (std::vector<String>{"ch128", "sha256"}));
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { read(R"({"algos_used":"ch128"})"); });
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { read(R"({"algos_used":["ch128",1]})"); });
 }
 
 TEST(CASJsonVocab, FailClosedRules)
