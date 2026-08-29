@@ -43,17 +43,10 @@ void checkRefTxnIdNonzero(const RefTxnId & id, std::string_view format, std::str
             "{}: {} fields must both be nonzero, got {}-{}", format, field, id.writer_epoch, id.ref_sequence);
 }
 
-void writeRefTxnIdFields(CasJsonWriter & out, bool & first, std::string_view epoch_key, std::string_view seq_key, const RefTxnId & id)
-{
-    writeKey(out, epoch_key, first);
-    writeU64StringValue(out, id.writer_epoch);
-    writeKey(out, seq_key, first);
-    writeU64StringValue(out, id.ref_sequence);
-}
-
 void writeRefTxnIdFields(CasJsonWriter & out, bool & first, WireKey epoch_key, WireKey seq_key, const RefTxnId & id)
 {
-    writeRefTxnIdFields(out, first, epoch_key.text, seq_key.text, id);
+    writeU64StringField(out, epoch_key, id.writer_epoch, first);
+    writeU64StringField(out, seq_key, id.ref_sequence, first);
 }
 
 void writeBindingFields(CasJsonWriter & out, bool & first, const BindingWireKeys & keys, const RefOwnerBinding & binding)
