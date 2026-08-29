@@ -2,12 +2,41 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/WriteBufferFromString.h>
 #include <fmt/format.h>
 
 using namespace DB;
 using namespace DB::Cas;
+
+namespace
+{
+String lineAt(const String & text, size_t index)
+{
+    size_t begin = 0;
+    for (size_t i = 0; i < index; ++i)
+        begin = text.find('\n', begin) + 1;
+    const size_t end = text.find('\n', begin);
+    return text.substr(begin, end - begin + 1);
+}
+
+void expectDelta(const String & old_bytes, const String & new_bytes, size_t expected)
+{
+    EXPECT_EQ(new_bytes.size() - old_bytes.size(), expected) << "old: " << old_bytes << "new: " << new_bytes;
+}
+
+CasFoldSeal oneFoldSeal()
+{
+    CasFoldSeal seal;
+    seal.generation = 5;
+    seal.parent_generation = 4;
+    return seal;
+}
+}
 
 /// These literals pin the CANONICAL BYTES of the CAS text encoders as of the commit that
 /// introduced this file. The CasJsonWriter migration (2026-07-20 spec) must keep every one of
@@ -120,4 +149,169 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     /// Both records must remain byte-identical to their canonical stored representation.
     const String expected_full = header + expected_record + expected_condemned + trailer;
     EXPECT_EQ(text, expected_full) << text;
+}
+
+TEST(CASWireCutDeltas, ActiveCasRunRow)
+{
+    SourceEdgeRecord record{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(2))}, .source_id = UInt128(5), .marker = RunMarker::Edge};
+    WriteBufferFromOwnString out;
+    SourceEdgeRunWriter writer(out);
+    writer.append(record);
+    writer.finish();
+    out.finalize();
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n";
+    expectDelta(old_bytes, lineAt(out.str(), 1), 7);
+}
+
+TEST(CASWireCutDeltas, CondemnedCasRunRow)
+{
+    SourceEdgeRecord record{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(3))}, .source_id = UInt128(0), .marker = RunMarker::Condemned, .delete_pending = true, .token = Token{"token", TokenType::ETag}, .size = 9, .condemn_round = 7, .marker_confirmed = true};
+    WriteBufferFromOwnString out;
+    SourceEdgeRunWriter writer(out);
+    writer.append(record);
+    writer.finish();
+    out.finalize();
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"b\":\"0100000000000000000000000000000003\",\"s\":\"00000000000000000000000000000000\",\"m\":\"condemned\",\"pend\":true,\"tt\":\"etag\",\"tv\":\"token\",\"sz\":9,\"cr\":\"7\",\"mc\":true}\n";
+    expectDelta(old_bytes, lineAt(out.str(), 1), 41);
+}
+
+TEST(CASWireCutDeltas, BlobPartManifestEntry)
+{
+    PartManifest manifest;
+    manifest.ref = ManifestRef{1, 2, 3};
+    manifest.root_namespace_id = RootNamespace{"root"};
+    manifest.entries = {ManifestEntry{"a", EntryPlacement::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, 9, {}}};
+    const String text = encodePartManifest(manifest);
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"p\":\"a\",\"pm\":\"blob\",\"ha\":\"ch128\",\"h\":\"00000000000000000000000000000004\",\"sz\":9}\n";
+    expectDelta(old_bytes, lineAt(text, 2), 15);
+}
+
+TEST(CASWireCutDeltas, InlinePartManifestEntry)
+{
+    PartManifest manifest;
+    manifest.ref = ManifestRef{1, 2, 3};
+    manifest.root_namespace_id = RootNamespace{"root"};
+    manifest.entries = {ManifestEntry{"a", EntryPlacement::Inline, {}, 0, "x"}};
+    const String text = encodePartManifest(manifest);
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"p\":\"a\",\"pm\":\"inline\",\"il\":1}\n";
+    expectDelta(old_bytes, lineAt(text, 2), 8);
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_banner = "==> \"a\" il=1 <==\n";
+    expectDelta(old_banner, lineAt(text, 4), 2);
+}
+
+TEST(CASWireCutDeltas, GcOutcomesRow)
+{
+    OutcomeLog log{{OutcomeEntry{ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, Token{"t", TokenType::ETag}, OutcomeKind::Deleted}}};
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00000000000000000000000000000004\",\"tt\":\"etag\",\"tv\":\"t\",\"oc\":\"deleted\"}\n";
+    expectDelta(old_bytes, lineAt(encodeOutcomeLog(log), 1), 26);
+}
+
+TEST(CASWireCutDeltas, CommittedRefSnapshotRow)
+{
+    RefTableSnapshot snapshot;
+    snapshot.ns = "root";
+    snapshot.snapshot_id = RefTxnId{1, 2};
+    snapshot.committed.push_back(RefCommittedRow{"r", ManifestRef{3, 4, 5}, 6});
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"k\":\"c\",\"rn\":\"r\",\"me\":\"3\",\"mb\":\"4\",\"mo\":5,\"ts\":6}\n";
+    expectDelta(old_bytes, lineAt(encodeRefTableSnapshot(snapshot), 2), 29);
+}
+
+TEST(CASWireCutDeltas, PrecommitRefSnapshotRow)
+{
+    RefTableSnapshot snapshot;
+    snapshot.ns = "root";
+    snapshot.snapshot_id = RefTxnId{1, 2};
+    snapshot.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "r", ManifestRef{3, 4, 5}});
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"k\":\"p\",\"rn\":\"r\",\"me\":\"3\",\"mb\":\"4\",\"mo\":5}\n";
+    expectDelta(old_bytes, lineAt(encodeRefTableSnapshot(snapshot), 2), 19);
+}
+
+TEST(CASWireCutDeltas, BaseRefCatalogRow)
+{
+    RefCatalog catalog{{CatalogEntry{.ns = RootNamespace{"root"}, .state = NsState::Live, .incarnation = UInt128(7)}}};
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"k\":\"ent\",\"ns\":\"root\",\"st\":\"live\",\"inc\":\"00000000000000000000000000000007\"}\n";
+    expectDelta(old_bytes, lineAt(encodeRefCatalog(catalog), 1), 9);
+}
+
+TEST(CASWireCutDeltas, BaseRefLifeFoldSealRow)
+{
+    CasFoldSeal seal = oneFoldSeal();
+    seal.ref_lives[UInt128(1)].coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{7, 11}};
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\"}\n";
+    const String new_bytes = lineAt(encodeFoldSeal(seal), 2);
+    const size_t delta = new_bytes.size() - old_bytes.size();
+    EXPECT_GE(delta, 29u);
+    EXPECT_LE(delta, 32u);
+}
+
+/// The ADDITIONS a hold contributes, isolated from the row it rides on. The with/without trick used
+/// for cleanup evidence is unavailable here: the grammar requires a hold on exactly the clamped rows,
+/// so a clamped row WITHOUT one cannot be encoded at all. Instead both sides are cut down to the hold
+/// segment itself -- from its first key to the closing brace -- so the tag, the `class` word and the
+/// fold pair are outside the comparison by construction rather than by cancellation.
+TEST(CASWireCutDeltas, HoldBearingRefLifeAdditions)
+{
+    CasFoldSeal seal = oneFoldSeal();
+    seal.ref_lives[UInt128(1)].coverage = RefCoverage{.classification = CoverageClass::Clamped, .last_folded_ref_id = RefTxnId{7, 11}, .hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{12, 13}, .retry_count = 14, .next_retry_round = 15}};
+
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_row = "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":4,\"lfe\":\"7\",\"lfs\":\"11\",\"hr\":\"gap_below_witness\",\"hpe\":\"12\",\"hps\":\"13\",\"hrc\":14,\"hnr\":\"15\"}\n";
+    const String new_row = lineAt(encodeFoldSeal(seal), 2);
+
+    const auto hold_segment = [](const String & row, std::string_view first_hold_key)
+    {
+        const size_t from = row.find(first_hold_key);
+        const size_t to = row.rfind('}');
+        EXPECT_NE(from, String::npos) << "row does not carry " << first_hold_key << ": " << row;
+        EXPECT_NE(to, String::npos);
+        return to > from ? to - from : 0;
+    };
+
+    EXPECT_EQ(hold_segment(new_row, ",\"hold_reason\"") - hold_segment(old_row, ",\"hr\""), 33u);
+}
+
+/// The cleanup-evidence pair isolated the same way: with and without, on both sides, so only the
+/// two added keys remain in the difference.
+TEST(CASWireCutDeltas, CleanupEvidenceRefLifeAdditions)
+{
+    CasFoldSeal without_evidence = oneFoldSeal();
+    without_evidence.ref_lives[UInt128(1)] = RefLifeFoldState{.coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{7, 11}}};
+    CasFoldSeal with_evidence = oneFoldSeal();
+    with_evidence.ref_lives[UInt128(1)] = RefLifeFoldState{.coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{7, 11}}, .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{12, 13}}};
+
+    /// These literals are the pre-cut baselines these deltas are measured against.
+    const String old_without = "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\"}\n";
+    const String old_with = "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\",\"rte\":\"12\",\"rts\":\"13\"}\n";
+
+    const size_t base_delta = lineAt(encodeFoldSeal(without_evidence), 2).size() - old_without.size();
+    const size_t whole_delta = lineAt(encodeFoldSeal(with_evidence), 2).size() - old_with.size();
+    EXPECT_EQ(whole_delta - base_delta, 16u);
+}
+
+TEST(CASWireCutDeltas, BlobRunFoldSealRow)
+{
+    CasFoldSeal seal = oneFoldSeal();
+    seal.blob_target_runs.push_back(RunRef{.key = "r0", .checksum = UInt128(15), .shard = 0, .key_generation = 5});
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"k\":\"btr\",\"key\":\"r0\",\"ck\":\"0000000000000000000000000000000f\",\"shard\":0,\"gen\":\"5\"}\n";
+    expectDelta(old_bytes, lineAt(encodeFoldSeal(seal), 2), 25);
+}
+
+TEST(CASWireCutDeltas, CondemnedFoldSealSummaryRow)
+{
+    CasFoldSeal seal = oneFoldSeal();
+    seal.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1, .oldest_nonpending_condemn_round = 4};
+    /// This literal is the pre-cut baseline this delta is measured against.
+    const String old_bytes = "{\"k\":\"cnd\",\"shard\":0,\"ct\":3,\"pt\":1,\"ocr\":\"4\"}\n";
+    expectDelta(old_bytes, lineAt(encodeFoldSeal(seal), 2), 30);
 }
