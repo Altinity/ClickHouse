@@ -19,7 +19,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
 | `_pool_meta` | pool identity + floors (`pool_id`, `blob_header_len`, `gc_shards`, `min_reader_generation`, `algos_used` array) | `CasPoolMetaFormat` | pool create/admit |
-| `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log | `CasRefLogFormat` (`.zst`) | writer commit path |
+| `cas/ns/stream/<life_id>/_log/…​.zst` | ref transaction log (`namespace`, `txn_epoch`/`txn_seq`, optional critical `!prev_epoch`/`!prev_seq`; `set_published_at` uses `ref`/`published_ms`) | `CasRefLogFormat` (`.zst`) | writer commit path |
 | `cas/ns/stream/<life_id>/_snap/…​.zst` | complete ref table | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
 | `cas/ns/state/<life_id>/_ckpt` | mutable life checkpoint (`life_epoch`, `committed_epoch`/`committed_seq`, `snapshot_epoch`/`snapshot_seq`, `seal_epoch`/`seal_seq`) | `CasRefCkptFormat` | writer/GC fold |
 | `cas/ns/state/<life_id>/_files/…​` | namespace-owned raw files | — | upper layers |

@@ -49,13 +49,13 @@ TEST(CASEncodingPins, RefLogTxnAllOpKinds)
     txn.ops.push_back(removal);
 
     const String expected = fmt::format("{{\"type\":\"cas_ref_log\",\"v\":{}}}\n", currentCompatibilityVersion()) +
-        "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\"}\n"
+        "{\"namespace\":\"roots/pin\",\"txn_epoch\":\"7\",\"txn_seq\":\"9\"}\n"
         "{\"op\":\"namespace_birth\"}\n"
         "{\"op\":\"owner_transition\",\"old_kind\":\"precommit\",\"old_ref\":\"20260101_0_1_1_1\","
         "\"old_epoch\":\"1\",\"old_build\":\"2\",\"old_ord\":3,\"new_kind\":\"committed\",\"new_ref\":\"20260101_0_1_1_1\","
         "\"new_epoch\":\"1\",\"new_build\":\"2\",\"new_ord\":3}\n"
-        "{\"op\":\"set_published_at\",\"rn\":\"20260101_0_1_1_1\\\"c\\nd\\u0001e\\u2028f\","
-        "\"epoch\":\"1\",\"build\":\"2\",\"ord\":3,\"ts\":1234}\n"
+        "{\"op\":\"set_published_at\",\"ref\":\"20260101_0_1_1_1\\\"c\\nd\\u0001e\\u2028f\","
+        "\"epoch\":\"1\",\"build\":\"2\",\"ord\":3,\"published_ms\":1234}\n"
         "{\"op\":\"remove_namespace\"}\n"
         "{\"n\":4}\n";
     EXPECT_EQ(encodeRefLogTxn(txn), expected);

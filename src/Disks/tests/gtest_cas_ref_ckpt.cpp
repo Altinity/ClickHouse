@@ -1249,16 +1249,16 @@ TEST(CASRefCheckpoint, CommitRefChunkDurableBytesUnchangedByExtraction)
     ASSERT_TRUE(got.has_value()) << "the birth chunk must be durable at its canonical key";
     const String plaintext = openObject(FormatId::RefLog, got->bytes);
     EXPECT_EQ(plaintext, R"({"type":"cas_ref_log","v":1}
-{"ns":"test/golden@cas@","we":"1","rs":"1"}
+{"namespace":"test/golden@cas@","txn_epoch":"1","txn_seq":"1"}
 {"op":"namespace_birth"}
 {"op":"owner_transition","new_kind":"precommit","new_ref":"gold_ref","new_epoch":"1","new_build":"7","new_ord":1}
 {"op":"owner_transition","old_kind":"precommit","old_ref":"gold_ref","old_epoch":"1","old_build":"7","old_ord":1,"new_kind":"committed","new_ref":"gold_ref","new_epoch":"1","new_build":"7","new_ord":1}
 {"n":3}
 )") << "the sealed ref-log plaintext changed";
-    EXPECT_EQ(got->bytes.size(), 201u) << "the sealed ref-log body changed size";
+    EXPECT_EQ(got->bytes.size(), 206u) << "the sealed ref-log body changed size";
     SipHash body_hash;
     body_hash.update(got->bytes.data(), got->bytes.size());
-    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "6068c3d8bed1ecae98ec56902ef43d97")
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "21c275ad44a6b47a4d6c389c0d71bb34")
         << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
            "before the extraction";
 }

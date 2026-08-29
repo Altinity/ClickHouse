@@ -23,14 +23,14 @@ namespace
 
 namespace RefLogWire
 {
-    constexpr WireKey ns{"ns"};
-    constexpr WireKey txn_epoch{"we"};
-    constexpr WireKey txn_seq{"rs"};
-    constexpr WireKey prev_epoch{"!pse"};
-    constexpr WireKey prev_seq{"!pss"};
+    constexpr WireKey ns{"namespace"};
+    constexpr WireKey txn_epoch{"txn_epoch"};
+    constexpr WireKey txn_seq{"txn_seq"};
+    constexpr WireKey prev_epoch{"!prev_epoch"};
+    constexpr WireKey prev_seq{"!prev_seq"};
     constexpr WireKey op{"op"};
-    constexpr WireKey ref{"rn"};
-    constexpr WireKey published_ms{"ts"};
+    constexpr WireKey ref{"ref"};
+    constexpr WireKey published_ms{"published_ms"};
 }
 
 constexpr EnumWireTable<RefOpKind, 5> kRefOpWords{{{
@@ -123,10 +123,10 @@ struct BindingFields
     }
 };
 
-/// The log transaction's header-object meta line (ns + txn_id + the optional `prev_epoch_seal`
+/// The log transaction's header-object meta line (`namespace` + txn_id + the optional `prev_epoch_seal`
 /// chain). Shared by `encodeRefLogTxn` and `removalFramingSize` so the two never disagree by a byte;
 /// `removalFramingSize` always passes `std::nullopt` -- a removal transaction is never a sequence-1
-/// epoch-transition record. Additive: the `"!pse"`/`"!pss"` pair is emitted only when
+/// epoch-transition record. Additive: the `"!prev_epoch"`/`"!prev_seq"` pair is emitted only when
 /// `prev_epoch_seal` is set, so a body without it is byte-identical to the pre-EpochSeal wire shape.
 /// `!`-prefixed: `prev_epoch_seal` is INV-2 chain evidence, not cosmetic metadata -- a decoder that
 /// doesn't understand it must refuse the object rather than silently drop the chain link while
@@ -149,9 +149,9 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
     op.kind = kind;
 
     /// set_published_at fields
-    std::optional<String> sp_rn;
+    std::optional<String> sp_ref;
     ManifestRefFields sp_manifest_fields;
-    std::optional<uint64_t> sp_ts;
+    std::optional<uint64_t> sp_published_ms;
     /// owner_transition bindings
     BindingFields ob;
     BindingFields nb;
@@ -160,12 +160,12 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
     while (r.nextKey(key))
     {
         if (key == RefLogWire::ref)
-            sp_rn = r.readString();
+            sp_ref = r.readString();
         else if (matchManifestRefFields(key, r, kBareManifestRefKeys, sp_manifest_fields))
         {
         }
         else if (key == RefLogWire::published_ms)
-            sp_ts = r.readU64Number();
+            sp_published_ms = r.readU64Number();
         else if (key == kOldBindingKeys.kind)
             ob.kind = r.readString();
         else if (key == kOldBindingKeys.ref)
@@ -204,12 +204,12 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
                 op.new_binding = nb.build("new");
             break;
         case RefOpKind::SetPublishedAt:
-            if (!sp_rn || !sp_ts)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: set_published_at missing rn/ts");
-            op.ref_name = *sp_rn;
+            if (!sp_ref || !sp_published_ms)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: set_published_at missing ref/published_ms");
+            op.ref_name = *sp_ref;
             checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_published_at ref_name");
             op.expected_manifest_ref = sp_manifest_fields.buildRef("RefLogTxn", "set_published_at");
-            op.published_at_ms = *sp_ts;
+            op.published_at_ms = *sp_published_ms;
             break;
     }
     return op;
@@ -310,10 +310,10 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
         ReadBufferFromMemory m(line.data(), line.size());
         JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_log");
         bool saw_ns = false;
-        bool saw_we = false;
-        bool saw_rs = false;
-        std::optional<uint64_t> pse;
-        std::optional<uint64_t> pss;
+        bool saw_txn_epoch = false;
+        bool saw_txn_seq = false;
+        std::optional<uint64_t> prev_epoch;
+        std::optional<uint64_t> prev_seq;
         String key;
         while (r.nextKey(key))
         {
@@ -325,29 +325,29 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
             else if (key == RefLogWire::txn_epoch)
             {
                 txn.txn_id.writer_epoch = r.readU64String();
-                saw_we = true;
+                saw_txn_epoch = true;
             }
             else if (key == RefLogWire::txn_seq)
             {
                 txn.txn_id.ref_sequence = r.readU64String();
-                saw_rs = true;
+                saw_txn_seq = true;
             }
             else if (key == RefLogWire::prev_epoch)
-                pse = r.readU64String();
+                prev_epoch = r.readU64String();
             else if (key == RefLogWire::prev_seq)
-                pss = r.readU64String();
+                prev_seq = r.readU64String();
             else
                 r.skipUnknown(key);
         }
-        if (!saw_ns || !saw_we || !saw_rs)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: meta line missing ns/we/rs");
-        /// Both-or-neither: `nextKey` already rejects a repeated "!pse"/"!pss" (duplicate-key check), so
+        if (!saw_ns || !saw_txn_epoch || !saw_txn_seq)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: meta line missing namespace/txn_epoch/txn_seq");
+        /// Both-or-neither: `nextKey` already rejects a repeated "!prev_epoch"/"!prev_seq" (duplicate-key check), so
         /// this only guards against a body carrying exactly one of the pair.
-        if (pse || pss)
+        if (prev_epoch || prev_seq)
         {
-            if (!pse || !pss)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: prev_epoch_seal needs both !pse and !pss");
-            txn.prev_epoch_seal = RefTxnId{*pse, *pss};
+            if (!prev_epoch || !prev_seq)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: prev_epoch_seal needs both !prev_epoch and !prev_seq");
+            txn.prev_epoch_seal = RefTxnId{*prev_epoch, *prev_seq};
         }
         if (!m.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after meta line");

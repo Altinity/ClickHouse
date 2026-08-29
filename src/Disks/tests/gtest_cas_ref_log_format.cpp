@@ -204,8 +204,8 @@ TEST(CASRefCodec, DecodeRejectsRemovedPayloadFieldInOpRecord)
     txn.ops.push_back(op);
 
     const String bytes = encodeRefLogTxn(txn);
-    /// Splice the retired `"pl"` field back into the op record, just before its `"ts"` field.
-    const String needle = ",\"ts\":";
+    /// Splice the retired `"pl"` field back into the op record, just before its `"published_ms"` field.
+    const String needle = ",\"published_ms\":";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     const String tampered = bytes.substr(0, pos) + R"(,"pl":"deadbeef")" + bytes.substr(pos);
@@ -833,7 +833,7 @@ TEST(CASFormatBattery, RefLog)
         [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
         currentFormatHeader("cas_ref_log") +
-        "{\"ns\":\"ns\",\"we\":\"1\",\"rs\":\"1\"}\n"
-        "{\"op\":\"set_published_at\",\"rn\":\"all_1_1_0\",\"epoch\":\"1\",\"build\":\"1\",\"ord\":1,\"ts\":42}\n"
+        "{\"namespace\":\"ns\",\"txn_epoch\":\"1\",\"txn_seq\":\"1\"}\n"
+        "{\"op\":\"set_published_at\",\"ref\":\"all_1_1_0\",\"epoch\":\"1\",\"build\":\"1\",\"ord\":1,\"published_ms\":42}\n"
         "{\"n\":1}\n"});
 }
