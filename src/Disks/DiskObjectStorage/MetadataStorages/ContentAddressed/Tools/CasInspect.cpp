@@ -378,7 +378,7 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
     return JsonObj()
         .add("kind", jsonEscape(objectKindToWord(h.kind)))
         /// The blob identity is carried by the object key, so the envelope keeps only the provenance
-        /// fields needed for forensics (`ch` and `bld`) together with its compatibility version.
+        /// fields needed for forensics (`chver` and `build`) together with its compatibility version.
         .add("compatibility_version", jsonUInt(h.compatibility_version))
         .add("incarnation_tag", jsonHex(h.incarnation_tag))
         .add("build_id", jsonHex(h.build_id))

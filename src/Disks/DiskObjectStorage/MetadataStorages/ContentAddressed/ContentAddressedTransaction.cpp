@@ -759,8 +759,8 @@ std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
     header.kind = Cas::ObjectKind::Blob;
     header.incarnation_tag = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
     header.build_id = 0;   /// not known at stream time; diagnostic-only (not read by GC/read paths)
-    /// ch = the real ClickHouse VERSION_INTEGER (diagnostic-only; consistent with `PartWriteTxn::buildHeader`).
-    /// The v3 envelope drops hash_algo/domain_id/writer_version, so forensics ride on ch + bld.
+    /// `chver` = the real ClickHouse VERSION_INTEGER (diagnostic-only; consistent with `PartWriteTxn::buildHeader`).
+    /// The envelope drops hash_algo/domain_id/writer_version, so forensics ride on `chver` + `build`.
     header.provenance = Cas::Provenance{
         /*created_at_ms*/ 0, cfg.server_id, VERSION_INTEGER, Cas::ProvenanceOp::Other};
     header.intended_ref = route.ns.string() + "/" + route.ref;

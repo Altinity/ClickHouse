@@ -98,7 +98,8 @@ constexpr size_t kMandatoryDescriptorWorstCase = kMandatoryNonRefWorstCase + kRe
 
 static_assert(kMandatoryDescriptorWorstCase <= kMinBlobHeaderLen - 1,
     "the mandatory blob-envelope fields plus the empty-ref framing must fit under kMinBlobHeaderLen "
-    "(byte kMinBlobHeaderLen - 1 is reserved for '\\n'); if a field grew, either shrink it back or "
+    "(the trailing '\\n' is already counted above, so the spare byte is the diagnostic ref's floor "
+    "budget, not the newline); if a field grew, either shrink it back or "
     "raise kMinBlobHeaderLen (CasEnvelopeLimits.h) to match");
 
 /// The escaped byte-length of one raw ref char under the frozen envelope alphabet (see writeEnvelopeRefField).

@@ -27,7 +27,7 @@ namespace PoolMetaWire
     constexpr WireKey algos_used{"algos_used"};
 }
 
-/// Minimum `blob_header_len` that provably fits the v3 `cas_blob` JSON envelope's mandatory-descriptor
+/// Minimum `blob_header_len` that provably fits the `cas_blob` JSON envelope's mandatory-descriptor
 /// worst case. The byte-for-byte derivation (`kMandatoryDescriptorWorstCase`, currently 239 bytes) lives
 /// beside the envelope key constants in `CasBlobEnvelopeFormat.cpp`, next to the compile-time proof that
 /// it fits under this floor; below that bound, `encodeEnvelopeHeader` throws `LOGICAL_ERROR` on the
@@ -39,7 +39,7 @@ namespace PoolMetaWire
 void validatePoolBlobHeaderLen(uint64_t blob_header_len, int error_code, std::string_view what)
 {
     if (blob_header_len < kMinBlobHeaderLen)
-        throw Exception(error_code, "CAS {}: blob_header_len must be >= {} (v3 envelope minimum), got {}",
+        throw Exception(error_code, "CAS {}: blob_header_len must be >= {} (blob envelope minimum), got {}",
             what, kMinBlobHeaderLen, blob_header_len);
     if (blob_header_len % 8 != 0)
         throw Exception(error_code, "CAS {}: blob_header_len must be a multiple of 8, got {}", what, blob_header_len);

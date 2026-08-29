@@ -146,8 +146,10 @@ TEST(CASBlobEnvelopeFormat, MandatoryWorstCaseBoundary)
     /// `encodeEnvelopeHeader` always stamps the CURRENT `currentCompatibilityVersion()`, one digit at
     /// this generation -- so the worst case reachable through the real encoder right now is 9 bytes
     /// smaller: a 10-byte `ref` budget at the floor, not 1. That 9-byte gap is exactly
-    /// `kMaxU32DecimalLen - digit count of the current compatibility version` and will shrink on its
-    /// own as `v` grows in a future generation, without anyone touching this test.
+    /// `kMaxU32DecimalLen - digit count of the current compatibility version`, so a generation that
+    /// reaches two digits narrows it and this expectation must be re-derived then -- the literal below
+    /// is deliberate, since deriving it from the version width here would restate the formula the
+    /// compile-time bound already owns and prove nothing about the encoder.
     EnvelopeHeader h_floor = maxReachableHeader("");
     const String head_floor = encodeEnvelopeHeader(h_floor, static_cast<uint32_t>(kMinBlobHeaderLen));
     ASSERT_EQ(head_floor.size(), kMinBlobHeaderLen);

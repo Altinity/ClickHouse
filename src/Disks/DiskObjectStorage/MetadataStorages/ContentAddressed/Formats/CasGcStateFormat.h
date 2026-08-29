@@ -53,7 +53,7 @@ GcState decodeGcState(std::string_view data);
 /// independently of round progress, because its lease renewal counter can remain unchanged during a
 /// long fold. A follower that observes the heartbeat advance backs off from stealing the lease; this
 /// prevents mistaking an alive, mid-round leader for a stalled one. The value is persisted as the
-/// versioned `cas_gc_hb` text object, whose body contains `by` and `seq` string values, replacing the
+/// versioned `cas_gc_hb` text object, whose body contains `owner` and `hb_seq` string values, replacing the
 /// former unversioned 24-byte record.
 struct GcHeartbeat
 {
