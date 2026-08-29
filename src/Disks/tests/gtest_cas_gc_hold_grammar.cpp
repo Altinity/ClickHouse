@@ -456,8 +456,8 @@ TEST(CASGCHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
                        .retry_count = 3, .next_retry_round = 4};
     fixtureCoverage(seal, "ns/0") = cov;
     const String whole = encodeFoldSeal(seal);
-    for (const String & field : {String(R"("hr":"body_undecodable")"), String(R"("hpe":"1")"),
-                                 String(R"("hps":"2")"), String(R"("hrc":3)"), String(R"("hnr":"4")")})
+    for (const String & field : {String(R"("hold_reason":"body_undecodable")"), String(R"("hold_epoch":"1")"),
+                                 String(R"("hold_seq":"2")"), String(R"("retries":3)"), String(R"("retry_round":"4")")})
     {
         SCOPED_TRACE("without " + field);
         const size_t at = whole.find(field);
@@ -479,12 +479,12 @@ TEST(CASGCHoldGrammar, DuplicateHoldKeyIsCorruptedData)
     fixtureCoverage(seal, "ns/0") = cov;
 
     const String whole = encodeFoldSeal(seal);
-    const String field = R"("hr":"gap_below_witness")";
+    const String field = R"("hold_reason":"gap_below_witness")";
     const size_t at = whole.find(field);
     ASSERT_NE(at, String::npos);
     /// The same key twice, with a DIFFERENT value: last-wins would silently rewrite the reason.
     String doubled = whole;
-    doubled.insert(at, R"("hr":"witness_disappeared",)");
+    doubled.insert(at, R"("hold_reason":"witness_disappeared",)");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(doubled); });
 }
 
@@ -567,13 +567,13 @@ TEST(CASGCHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedDa
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        decodeFoldSeal(withField(withField(held, R"("hpe":"4")", R"("hpe":"0")"),
-                                 R"("hps":"6")", R"("hps":"0")"));
+        decodeFoldSeal(withField(withField(held, R"("hold_epoch":"4")", R"("hold_epoch":"0")"),
+                                 R"("hold_seq":"6")", R"("hold_seq":"0")"));
     });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(held, R"("hpe":"4")", R"("hpe":"0")")); });
+                     [&] { decodeFoldSeal(withField(held, R"("hold_epoch":"4")", R"("hold_epoch":"0")")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(held, R"("hps":"6")", R"("hps":"0")")); });
+                     [&] { decodeFoldSeal(withField(held, R"("hold_seq":"6")", R"("hold_seq":"0")")); });
 }
 
 /// (3) The duplicate row. Two `cov` records for the same (namespace, shard) — held first, clean second —
@@ -608,7 +608,7 @@ TEST(CASGCHoldGrammar, ASecondCoverageRowForTheSameKeyIsCorruptedData)
     EXPECT_EQ(seal.ref_lives.size(), 1u);
 }
 
-/// The same one-record-per-key rule applies to `cnd`: a repeated row rewrites a shard's condemned
+/// The same one-record-per-key rule applies to `condemned`: a repeated row rewrites a shard's condemned
 /// totals, which graduation paces on.
 TEST(CASGCHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
 {
@@ -617,7 +617,7 @@ TEST(CASGCHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
                                                  .oldest_nonpending_condemn_round = 3};
     const String encoded = encodeFoldSeal(seal);
 
-    /// Lines 3..4 are `rfl`, `cnd` in the encoder's fixed order.
+    /// Lines 3..4 are `ref_life`, `condemned` in the encoder's fixed order.
     std::vector<String> lines;
     for (size_t begin = headerAndMetaOf(encoded).size(); begin < encoded.size();)
     {
@@ -626,14 +626,14 @@ TEST(CASGCHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
         lines.push_back(encoded.substr(begin, end - begin));
         begin = end + 1;
     }
-    ASSERT_EQ(lines.size(), 3u) << "rfl, cnd and the trailer";
+    ASSERT_EQ(lines.size(), 3u) << "ref_life, condemned and the trailer";
     const String ref_life_line = lines[0];
-    const String cnd_line = lines[1];
+    const String condemned_line = lines[1];
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(sealTextWith(encoded, {ref_life_line, cnd_line, cnd_line})); });
+                     [&] { decodeFoldSeal(sealTextWith(encoded, {ref_life_line, condemned_line, condemned_line})); });
     /// The unduplicated assembly is the control.
-    const std::vector<String> one_of_each{ref_life_line, cnd_line};
+    const std::vector<String> one_of_each{ref_life_line, condemned_line};
     EXPECT_NO_THROW(decodeFoldSeal(sealTextWith(encoded, one_of_each)));
 }
 
@@ -647,12 +647,12 @@ TEST(CASGCHoldGrammar, CleanupEvidenceWithAZeroRemovalIdIsCorruptedData)
     const String encoded = encodeFoldSeal(seal);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rte":"2")", R"("rte":"0")")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_epoch":"2")", R"("remove_epoch":"0")")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rts":"3")", R"("rts":"0")")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_seq":"3")", R"("remove_seq":"0")")); });
     /// Omitted entirely is the same thing: the fields default to zero.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rte":"2",)", "")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_epoch":"2",)", "")); });
 }
 
 /// The OBJECT cap bounds the whole seal. Nothing on the fold-seal READ path enforces it (the seal

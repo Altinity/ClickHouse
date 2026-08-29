@@ -26,32 +26,32 @@ namespace
 
 namespace FoldSealWire
 {
-    constexpr WireKey generation{"g"};
-    constexpr WireKey parent_generation{"pg"};
-    constexpr WireKey kind{"k"};
+    constexpr WireKey generation{"generation"};
+    constexpr WireKey parent_generation{"parent_generation"};
+    constexpr WireKey kind{"kind"};
     constexpr WireKey run_key{"key"};
-    constexpr WireKey checksum{"ck"};
+    constexpr WireKey checksum{"checksum"};
     constexpr WireKey shard{"shard"};
-    constexpr WireKey key_generation{"gen"};
+    constexpr WireKey key_generation{"key_generation"};
     constexpr WireKey life{"life"};
     constexpr WireKey classification{"cls"};
-    constexpr WireKey fold_epoch{"lfe"};
-    constexpr WireKey fold_seq{"lfs"};
-    constexpr WireKey hold_reason{"hr"};
-    constexpr WireKey hold_epoch{"hpe"};
-    constexpr WireKey hold_seq{"hps"};
-    constexpr WireKey retries{"hrc"};
-    constexpr WireKey retry_round{"hnr"};
-    constexpr WireKey remove_epoch{"rte"};
-    constexpr WireKey remove_seq{"rts"};
-    constexpr WireKey condemned_total{"ct"};
-    constexpr WireKey pending_total{"pt"};
-    constexpr WireKey oldest_round{"ocr"};
+    constexpr WireKey fold_epoch{"fold_epoch"};
+    constexpr WireKey fold_seq{"fold_seq"};
+    constexpr WireKey hold_reason{"hold_reason"};
+    constexpr WireKey hold_epoch{"hold_epoch"};
+    constexpr WireKey hold_seq{"hold_seq"};
+    constexpr WireKey retries{"retries"};
+    constexpr WireKey retry_round{"retry_round"};
+    constexpr WireKey remove_epoch{"remove_epoch"};
+    constexpr WireKey remove_seq{"remove_seq"};
+    constexpr WireKey condemned_total{"condemned"};
+    constexpr WireKey pending_total{"pending"};
+    constexpr WireKey oldest_round{"oldest_round"};
 }
 
-constexpr std::string_view kRefLifeTag = "rfl";
-constexpr std::string_view kBlobRunTag = "btr";
-constexpr std::string_view kCondemnedTag = "cnd";
+constexpr std::string_view kRefLifeTag = "ref_life";
+constexpr std::string_view kBlobRunTag = "blob_run";
+constexpr std::string_view kCondemnedTag = "condemned";
 
 constexpr EnumWireTable<HoldReason, 6> kHoldReasonWords{{{
     {HoldReason::GapBelowWitness, "gap_below_witness"},
@@ -104,7 +104,7 @@ void insertRecordOnce(Map & map, const Key & key, Value && value, std::string_vi
             what, key);
 }
 
-/// Emit one run record (`k` = "btr") WITHOUT its line terminator; the caller closes (and measures) the
+/// Emit one run record (`kind` = `blob_run`) WITHOUT its line terminator; the caller closes (and measures) the
 /// line, and sorts the vector by key first.
 void writeRun(CasJsonWriter & out, std::string_view kind, const RunRef & r)
 {
@@ -308,7 +308,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
             writeU64StringField(out, FoldSealWire::remove_seq, life_state.cleanup_evidence->remove_txn_id.ref_sequence, first);
         }
         closeObject(out, first);
-        closeLine("rfl");
+        closeLine("ref_life");
         ++n;
     }
 
@@ -318,7 +318,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         for (const RunRef & r : runs)
         {
             writeRun(out, kBlobRunTag, r);
-            closeLine("btr");
+            closeLine("blob_run");
         }
     }
     n += seal.blob_target_runs.size();
@@ -333,7 +333,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         writeNumberField(out, FoldSealWire::pending_total, s.pending_total, first);
         writeU64StringField(out, FoldSealWire::oldest_round, s.oldest_nonpending_condemn_round, first);
         closeObject(out, first);
-        closeLine("cnd");
+        closeLine("condemned");
         ++n;
     }
 
@@ -395,7 +395,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             return seal;
         }
         if (key != FoldSealWire::kind)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: record must start with \"k\"");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: record must start with \"kind\"");
         const String kind = r.readString();
 
         if (kind == kRefLifeTag)
@@ -409,7 +409,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             std::optional<uint64_t> classification;
             /// The hold fields are read individually so the grammar can be checked on WHICH of them
             /// arrived, not merely on how many. `JsonObjectReader` already rejects a duplicate key, so
-            /// a second `hr` can never quietly rewrite the reason.
+            /// a second `hold_reason` can never quietly rewrite the reason.
             std::optional<HoldReason> hold_reason;
             std::optional<uint64_t> hold_epoch;
             std::optional<uint64_t> hold_sequence;
@@ -430,7 +430,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else if (key == FoldSealWire::retry_round) hold_next_retry_round = r.readU64String();
                 else if (key == FoldSealWire::remove_epoch) remove_txn_epoch = r.readU64String();
                 else if (key == FoldSealWire::remove_seq) remove_txn_sequence = r.readU64String();
-                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown rfl key '{}'", key);
+                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown ref_life key '{}'", key);
             }
 
             if (!life_id || *life_id == 0)
@@ -441,7 +441,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             /// `cls` is required, not defaulted: an absent one would read as 0 ("no round folded this
             /// namespace"), which is a claim about a fold, not the absence of one.
             if (!classification)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: rfl '{}' missing cls", life_hex);
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: ref_life '{}' missing cls", life_hex);
             if (!isKnownClassification(*classification))
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS fold seal: coverage '{}' has classification {}, which is not one of the four "
@@ -518,7 +518,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             }
             if (!run_key || !checksum || !shard || !generation)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS fold seal: btr requires key, ck, shard, and gen");
+                    "CAS fold seal: blob_run requires key, checksum, shard, and key_generation");
             seal.blob_target_runs.push_back(RunRef{
                 .key = std::move(*run_key), .checksum = *checksum, .shard = *shard, .key_generation = *generation});
         }
@@ -534,11 +534,11 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else if (key == FoldSealWire::condemned_total) condemned_total = r.readU64Number();
                 else if (key == FoldSealWire::pending_total) pending_total = r.readU64Number();
                 else if (key == FoldSealWire::oldest_round) oldest_nonpending_condemn_round = r.readU64String();
-                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown cnd key '{}'", key);
+                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown condemned key '{}'", key);
             }
             if (!shard || !condemned_total || !pending_total || !oldest_nonpending_condemn_round)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS fold seal: cnd requires shard, ct, pt, and ocr");
+                    "CAS fold seal: condemned requires shard, condemned, pending, and oldest_round");
             insertRecordOnce(seal.condemned_summary, *shard, CondemnedSummary{
                 .condemned_total = *condemned_total,
                 .pending_total = *pending_total,

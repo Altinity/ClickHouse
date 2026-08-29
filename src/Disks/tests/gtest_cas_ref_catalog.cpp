@@ -699,7 +699,7 @@ TEST(CASRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimal
         }
         for (uint64_t shard = 0; shard < gc_shards; ++shard)
         {
-            /// Predicate 2 charges exactly `gc_shards` widest `btr` rows. This fixture is the maximum
+            /// Predicate 2 charges exactly `gc_shards` widest `blob_run` rows. This fixture is the maximum
             /// legal cardinality, not an optimistic producer convention: authoritative fold-seal
             /// grammar permits at most one run per shard and requires its canonical key to use seq 0.
             seal.blob_target_runs.push_back(RunRef{

@@ -44,10 +44,10 @@ TEST(CASFormatBattery, FoldSeal)
         [&] { return sealObject(FormatId::FoldSeal, encodeFoldSeal(seal)); },
         [](std::string_view s) { decodeFoldSeal(std::string(openObject(FormatId::FoldSeal, s))); },
         currentFormatHeader("cas_fold_seal") +
-        "{\"g\":\"5\",\"pg\":\"4\"}\n"
-        "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\"}\n"
-        "{\"k\":\"btr\",\"key\":\"r0\",\"ck\":\"0000000000000000000000000000000f\",\"shard\":0,\"gen\":\"5\"}\n"
-        "{\"k\":\"cnd\",\"shard\":0,\"ct\":3,\"pt\":1,\"ocr\":\"4\"}\n"
+        "{\"generation\":\"5\",\"parent_generation\":\"4\"}\n"
+        "{\"kind\":\"ref_life\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"fold_epoch\":\"7\",\"fold_seq\":\"11\"}\n"
+        "{\"kind\":\"blob_run\",\"key\":\"r0\",\"checksum\":\"0000000000000000000000000000000f\",\"shard\":0,\"key_generation\":\"5\"}\n"
+        "{\"kind\":\"condemned\",\"shard\":0,\"condemned\":3,\"pending\":1,\"oldest_round\":\"4\"}\n"
         "{\"n\":3}\n"});
 }
 
@@ -125,11 +125,11 @@ TEST(CASFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryFiel
 
     for (const std::string_view field : {
         R"(,"key":"p/gc/gen/7/attempt/1/blob_target/0/0")",
-        R"(,"ck":"00000000000000000000000000000001")",
-        R"(,"gen":"7")",
-        ",\"ct\":0",
-        ",\"pt\":0",
-        R"(,"ocr":"18446744073709551615")"})
+        R"(,"checksum":"00000000000000000000000000000001")",
+        R"(,"key_generation":"7")",
+        ",\"condemned\":0",
+        ",\"pending\":0",
+        R"(,"oldest_round":"18446744073709551615")"})
     {
         String malformed = valid;
         eraseRequiredField(malformed, field);
@@ -138,19 +138,19 @@ TEST(CASFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryFiel
     }
 
     /// `shard` occurs once on each row; remove each occurrence independently.
-    String missing_btr_shard = valid;
-    eraseRequiredField(missing_btr_shard, ",\"shard\":0");
+    String missing_blob_run_shard = valid;
+    eraseRequiredField(missing_blob_run_shard, ",\"shard\":0");
     cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decodeFoldSeal(missing_btr_shard, layout, 1); }, "missing");
+        [&] { decodeFoldSeal(missing_blob_run_shard, layout, 1); }, "missing");
 
-    String missing_cnd_shard = valid;
-    const size_t first_shard = missing_cnd_shard.find(",\"shard\":0");
+    String missing_condemned_shard = valid;
+    const size_t first_shard = missing_condemned_shard.find(",\"shard\":0");
     ASSERT_NE(first_shard, String::npos);
-    const size_t second_shard = missing_cnd_shard.find(",\"shard\":0", first_shard + 1);
+    const size_t second_shard = missing_condemned_shard.find(",\"shard\":0", first_shard + 1);
     ASSERT_NE(second_shard, String::npos);
-    missing_cnd_shard.erase(second_shard, std::string_view(",\"shard\":0").size());
+    missing_condemned_shard.erase(second_shard, std::string_view(",\"shard\":0").size());
     cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decodeFoldSeal(missing_cnd_shard, layout, 1); }, "missing");
+        [&] { decodeFoldSeal(missing_condemned_shard, layout, 1); }, "missing");
 }
 
 TEST(CASFoldSealFormat, AuthoritativeDecodeRejectsNoncanonicalRowsAndIncompleteSummaryDomain)
@@ -293,10 +293,10 @@ TEST(CASFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{9, 10}}});
 
     const String expected = currentFormatHeader("cas_fold_seal") +
-        "{\"g\":\"8\",\"pg\":\"7\"}\n"
-        "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000001234\",\"cls\":4,"
-        "\"lfe\":\"3\",\"lfs\":\"4\",\"hr\":\"manifest_body_missing\",\"hpe\":\"5\","
-        "\"hps\":\"6\",\"hrc\":7,\"hnr\":\"8\",\"rte\":\"9\",\"rts\":\"10\"}\n"
+        "{\"generation\":\"8\",\"parent_generation\":\"7\"}\n"
+        "{\"kind\":\"ref_life\",\"life\":\"00000000000000000000000000001234\",\"cls\":4,"
+        "\"fold_epoch\":\"3\",\"fold_seq\":\"4\",\"hold_reason\":\"manifest_body_missing\",\"hold_epoch\":\"5\","
+        "\"hold_seq\":\"6\",\"retries\":7,\"retry_round\":\"8\",\"remove_epoch\":\"9\",\"remove_seq\":\"10\"}\n"
         "{\"n\":1}\n";
 
     EXPECT_EQ(encodeFoldSeal(seal), expected);
@@ -309,8 +309,8 @@ TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyCoverageRecord)
 {
     const String old =
         "{\"type\":\"cas_fold_seal\",\"v\":1}\n"
-        "{\"g\":\"8\",\"pg\":\"7\"}\n"
-        "{\"k\":\"cov\",\"key\":\"name/0\",\"cls\":2,\"lfe\":\"3\",\"lfs\":\"4\"}\n"
+        "{\"generation\":\"8\",\"parent_generation\":\"7\"}\n"
+        "{\"kind\":\"cov\",\"key\":\"name/0\",\"cls\":2,\"fold_epoch\":\"3\",\"fold_seq\":\"4\"}\n"
         "{\"n\":1}\n";
     cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(old); }, "legacy coverage");
 }
@@ -321,8 +321,8 @@ TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyNamespaceCleanupRecord)
 {
     const String old =
         "{\"type\":\"cas_fold_seal\",\"v\":1}\n"
-        "{\"g\":\"8\",\"pg\":\"7\"}\n"
-        "{\"k\":\"nsc\",\"ns\":\"name\",\"rte\":\"3\",\"rts\":\"4\",\"st\":\"completed\"}\n"
+        "{\"generation\":\"8\",\"parent_generation\":\"7\"}\n"
+        "{\"kind\":\"nsc\",\"ns\":\"name\",\"remove_epoch\":\"3\",\"remove_seq\":\"4\",\"st\":\"completed\"}\n"
         "{\"n\":1}\n";
     cas_battery_detail::expectCode(
         DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(old); }, "legacy namespace cleanup");

@@ -52,4 +52,57 @@ returned no `[  FAILED  ]` line; 2215 ran equals 2215 passed.
 
 None.
 
-## Task 14 — pending
+## Task 14 — complete
+
+### Inventory
+
+The required three-form `hr` sweep covered `src/Disks/tests/`, the actual codec root
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`, `tests/integration/`,
+`utils/ca-soak/`, and `tests/queries/0_stateless/*cas*`.
+
+- Raw `"hr":`: 3 hits in `gtest_cas_gc_hold_grammar.cpp`, all fold-seal hold-grammar literals.
+- Escaped `\"hr\":`: 1 hit in `gtest_cas_fold_seal_format.cpp`, the fold-seal ref-life golden.
+- Bare `"hr"`: 3 hits in `gtest_cas_gc_hold_grammar.cpp`, the same fold-seal hold-grammar
+  literals; no Python soak-card key manipulation was present.
+
+The wider old-key worklist resolved to `CasFoldSealFormat.cpp`, its format/hold-grammar tests, and
+the real-encoder reservation helpers in `CasRefCatalogFormat.cpp` and its tests. `rte`/`rts` hits in
+the ref-snapshot codec and tests are its rejected sentinels, not fold-seal fields, and were retained.
+Unrelated `k` and `g` hits in catalog, backend, integration, and generic JSON tests were retained.
+
+### Files
+
+- `CasFoldSealFormat.{h,cpp}`: changed metadata, record, row, and summary keys to their semantic
+  names; changed record tags to `ref_life`, `blob_run`, and `condemned`; left `cls` unchanged.
+- `gtest_cas_fold_seal_format.cpp` and `gtest_cas_gc_hold_grammar.cpp`: updated all literal fold-seal
+  goldens and mutation fields, including every ref-life variant, blob-run, and condemned summary.
+- `CasRefCatalogFormat.cpp` and `gtest_cas_ref_catalog.cpp`: updated comments naming the record tag;
+  their real-encoder reservation tests need no manually maintained byte values.
+- `Formats/README.md`: documents the new fold-seal metadata keys and tags.
+
+### Expectations and derived pins
+
+All changed goldens remain literal. The battery golden now begins with
+`generation`/`parent_generation`, and its rows use `kind` with `ref_life`, `blob_run`, and
+`condemned`; the full ref-life golden also spells every renamed hold and cleanup-evidence key.
+There were no size or SipHash numeric pins to re-derive. The semantic assertion that makes the
+changed encoder bytes trustworthy is
+`CASRefCatalogAdmission.ReservationCoversActualWidestLegalRowsAcrossDecimalTransitions`; it passed
+with the helpers measuring through `encodeFoldSeal`. `Predicate2AcceptsEqualityRefusesOneEntryOver`
+also passed, confirming the derived admission boundary.
+
+### Gate
+
+Build: `ninja -C build unit_tests_dbms > build/build_wirekeys_p2_task14.log 2>&1` — green.
+
+```text
+[==========] 2215 tests from 284 test suites ran. (162716 ms total)
+[  PASSED  ] 2215 tests.
+```
+
+`grep -aE '^\\[  FAILED  \\]|tests from .* ran|^\\[  PASSED  \\]' build/test_cas_p2_task14.log`
+returned no `[  FAILED  ]` line; 2215 ran equals 2215 passed.
+
+### Deviations
+
+None.

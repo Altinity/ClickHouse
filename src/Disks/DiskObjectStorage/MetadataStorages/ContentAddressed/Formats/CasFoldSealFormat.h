@@ -189,7 +189,7 @@ FoldSealCaps foldSealCaps();
 void checkFoldSealObjectBytes(uint64_t encoded_bytes);
 
 /// Encodes a fold seal as a strict, raw text control object. The header and meta lines are followed by
-/// tagged records in the fixed `rfl`/`btr`/`cnd` order and a record-count trailer. Map iteration and
+/// tagged records in the fixed `ref_life`/`blob_run`/`condemned` order and a record-count trailer. Map iteration and
 /// run references are sorted so retries produce byte-identical output for write-once adoption.
 ///
 /// Enforces the whole coverage grammar — the closed classification set, the classification-4 hold
