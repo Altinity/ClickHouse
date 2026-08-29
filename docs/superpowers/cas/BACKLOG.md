@@ -61,6 +61,8 @@ Append new items here — quick adds and concurrent-agent findings land in this 
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 
+- PROSE IMPRECISE (wire-keys phase-1, CasWireVocab.h match helpers): "must not gain a function-call boundary" overstates — `inline` is linkage, not an inlining guarantee; intent (header-defined, inlinable at per-key dispatch) is right.
+
 - PROSE (wire-keys phase-1, CasPoolMetaFormat.cpp fence comment): "is exactly the unvalidated input this function must reject cleanly" overstates — no unvalidated byte reaches it today (decoder fromWord-gates first); reword as "validates a raw byte vector, so it must reject cleanly rather than abort".
 - PROSE FALSE (wire-keys phase-1, Pool/CasPoolMeta.cpp createOrValidate): comment claims blobHashAlgoName throws BAD_ARGUMENTS as garbage-cast defense — it throws LOGICAL_ERROR now (aborts debug/sanitizer); same unkeepable-fence shape as the fixed validatePoolAlgosUsed; comment must state programming-error semantics.
 - LATER PHASE (wire-keys, Formats/CasLayout.cpp blobRefFromKey): hand-rolled reimplementation of kBlobHashAlgoWords.fromWord ("one name authority" comment now stale) — replacing is a nullopt→throw posture flip needing a wedge audit of every caller; do not do casually.
