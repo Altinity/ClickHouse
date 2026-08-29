@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
 
@@ -20,30 +21,29 @@ namespace
 
 constexpr std::string_view kBlobType = "cas_blob";
 
-std::string_view opToWord(ProvenanceOp op)
+namespace EnvelopeWire
 {
-    switch (op)
-    {
-        case ProvenanceOp::Other:    return "other";
-        case ProvenanceOp::Insert:   return "insert";
-        case ProvenanceOp::Merge:    return "merge";
-        case ProvenanceOp::Mutation: return "mutation";
-        case ProvenanceOp::Attach:   return "attach";
-        case ProvenanceOp::Repack:   return "repack";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob envelope: unknown ProvenanceOp {}", static_cast<int>(op));
+    constexpr WireKey type{"type"};
+    constexpr WireKey version{"v"};
+    constexpr WireKey tag{"tag"};
+    constexpr WireKey build{"bld"};
+    constexpr WireKey time_ms{"ts"};
+    constexpr WireKey creator{"by"};
+    constexpr WireKey op{"op"};
+    constexpr WireKey chver{"ch"};
+    constexpr WireKey ref{"ref"};
 }
 
-ProvenanceOp opFromWord(std::string_view w)
-{
-    if (w == "other")    return ProvenanceOp::Other;
-    if (w == "insert")   return ProvenanceOp::Insert;
-    if (w == "merge")    return ProvenanceOp::Merge;
-    if (w == "mutation") return ProvenanceOp::Mutation;
-    if (w == "attach")   return ProvenanceOp::Attach;
-    if (w == "repack")   return ProvenanceOp::Repack;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob envelope: unknown op '{}'", w);
-}
+constexpr EnumWireTable<ProvenanceOp, 6> kProvenanceOpWords{{{
+    {ProvenanceOp::Other, "other"},
+    {ProvenanceOp::Insert, "insert"},
+    {ProvenanceOp::Merge, "merge"},
+    {ProvenanceOp::Mutation, "mutation"},
+    {ProvenanceOp::Attach, "attach"},
+    {ProvenanceOp::Repack, "repack"},
+}}};
+
+static_assert(casEnumTableCoversEnum<kProvenanceOpWords, ProvenanceOp>());
 
 /// The escaped byte-length of one raw ref char under the frozen envelope alphabet (see writeEnvelopeRefField).
 size_t escapedLen(char c)
@@ -96,6 +96,11 @@ void writeEnvelopeRefField(String & json, size_t budget, std::string_view raw_re
 
 }
 
+std::string_view provenanceOpToWireWord(ProvenanceOp op)
+{
+    return kProvenanceOpWords.toWord(op, "CAS blob envelope");
+}
+
 String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
 {
     if (header.kind != ObjectKind::Blob)
@@ -108,16 +113,16 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
     {
         CasJsonWriter buf(256);
         bool first = true;
-        writeKey(buf, "type", first); writeStringValue(buf, kBlobType);
-        writeKey(buf, "v", first);    writeIntText(currentCompatibilityVersion(), buf);
-        writeKey(buf, "tag", first);  writeHex128Value(buf, header.incarnation_tag);
-        writeKey(buf, "bld", first);  writeHex128Value(buf, header.build_id);
+        writeKey(buf, EnvelopeWire::type, first); writeStringValue(buf, kBlobType);
+        writeKey(buf, EnvelopeWire::version, first); writeIntText(currentCompatibilityVersion(), buf);
+        writeKey(buf, EnvelopeWire::tag, first); writeHex128Value(buf, header.incarnation_tag);
+        writeKey(buf, EnvelopeWire::build, first); writeHex128Value(buf, header.build_id);
         if (header.provenance)
         {
-            writeKey(buf, "ts", first); writeIntText(header.provenance->created_at_ms, buf);
-            writeKey(buf, "by", first); writeHex128Value(buf, header.provenance->creator_server_id);
-            writeKey(buf, "op", first); writeStringValue(buf, opToWord(header.provenance->op));
-            writeKey(buf, "ch", first); writeIntText(header.provenance->ch_version, buf);
+            writeKey(buf, EnvelopeWire::time_ms, first); writeIntText(header.provenance->created_at_ms, buf);
+            writeKey(buf, EnvelopeWire::creator, first); writeHex128Value(buf, header.provenance->creator_server_id);
+            writeKey(buf, EnvelopeWire::op, first); writeStringValue(buf, kProvenanceOpWords.toWord(header.provenance->op, "CAS blob envelope"));
+            writeKey(buf, EnvelopeWire::chver, first); writeIntText(header.provenance->ch_version, buf);
         }
         /// Test-only critical extension: an unknown `!`-key BEFORE `ref`.
         if (header.emit_unknown_critical_key)
@@ -132,15 +137,17 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
     /// (byte blob_header_len-1 is reserved for '\n'; the pad zone fills the gap with spaces).
     if (header.intended_ref)
     {
-        static constexpr std::string_view ref_key = ",\"ref\":";
+        constexpr size_t ref_key_size = 4 + EnvelopeWire::ref.text.size();
         /// +3 = opening quote + closing quote + closing brace.
-        const size_t fixed = json.size() + ref_key.size() + 3;
+        const size_t fixed = json.size() + ref_key_size + 3;
         if (blob_header_len < 1 || fixed > static_cast<size_t>(blob_header_len) - 1)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS blob envelope: non-ref fields ({} bytes) do not fit blob_header_len {} before the ref",
                 fixed, blob_header_len);
         const size_t budget = (static_cast<size_t>(blob_header_len) - 1) - fixed;
-        json += ref_key;
+        json += ",\"";
+        json += EnvelopeWire::ref.text;
+        json += "\":";
         writeEnvelopeRefField(json, budget, *header.intended_ref);
     }
     json += '}';
@@ -173,7 +180,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
     String key;
     while (r.nextKey(key))
     {
-        if (key == "type")
+        if (key == EnvelopeWire::type)
         {
             const String t = r.readString();
             if (t != kBlobType)
@@ -181,37 +188,37 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
                     "CAS blob envelope: object is a '{}', not a '{}'", t, kBlobType);
             saw_type = true;
         }
-        else if (key == "v")
+        else if (key == EnvelopeWire::version)
         {
             h.compatibility_version = r.readU32Number();
             checkCompatibility(h.compatibility_version, "blob envelope");
             saw_v = true;
         }
-        else if (key == "tag")
+        else if (key == EnvelopeWire::tag)
             h.incarnation_tag = r.readHex128();
-        else if (key == "bld")
+        else if (key == EnvelopeWire::build)
             h.build_id = r.readHex128();
-        else if (key == "ts")
+        else if (key == EnvelopeWire::time_ms)
         {
             prov.created_at_ms = r.readU64Number();
             have_prov = true;
         }
-        else if (key == "by")
+        else if (key == EnvelopeWire::creator)
         {
             prov.creator_server_id = r.readHex128();
             have_prov = true;
         }
-        else if (key == "op")
+        else if (key == EnvelopeWire::op)
         {
-            prov.op = opFromWord(r.readString());
+            prov.op = kProvenanceOpWords.fromWord(r.readString(), "CAS blob envelope");
             have_prov = true;
         }
-        else if (key == "ch")
+        else if (key == EnvelopeWire::chver)
         {
             prov.ch_version = static_cast<uint32_t>(r.readU64Number());
             have_prov = true;
         }
-        else if (key == "ref")
+        else if (key == EnvelopeWire::ref)
             h.intended_ref = r.readString();
         else
             r.skipUnknown(key);   /// `!`-key -> UNKNOWN_FORMAT_VERSION; unknown plain key -> skipped (tolerant)
