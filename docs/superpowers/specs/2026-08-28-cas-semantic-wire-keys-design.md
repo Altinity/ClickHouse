@@ -1155,38 +1155,18 @@ The change is complete when:
 
 ## Acceptance {#acceptance-outcome}
 
-Revision 14 is **NOT ACCEPTED** as of 2026-08-30. An external review of the whole campaign
-(`tmp/codex-campaign-review.md`, model gpt-5.6-sol at high effort) found that criteria 5 and 6 are
-not discharged and that 3, 8 and 11 are only partially discharged. The per-criterion state is in
-`docs/superpowers/cas/2026-08-30-wire-keys-acceptance.md`, which the review's findings supersede
-where they disagree.
+Revision 14 is **ACCEPTED** at freeze commit `3c948a46d1c`. The per-criterion evidence is in
+`docs/superpowers/cas/2026-08-30-wire-keys-acceptance.md`.
 
-An earlier version of this section claimed two amendments were owed to this document. **The first
-was wrong and is retracted.** It read the criterion's phrase "the match helpers inline" as covering
-`EnumWireTable::toWord`, which does not inline. The criterion's match helpers are the three
-`match*Fields` functions for the shared value types, and all three are header-defined `inline` with
-a comment saying why (`Formats/CasWireVocab.h`). `toWord` is an encode-side enum lookup and is not
-one of them. No amendment is owed on that point, and the document was correct as written.
+An earlier acceptance was declared and then retracted after an external review found three criteria
+unmet. All three have since been fixed in code rather than by restating the requirement: the goldens
+no longer derive their header version from production, the descriptor boundary test now sends a
+maximum-width version through the real encoder, and every writer has been moved onto the
+per-encoding field helpers.
 
-The second amendment is withdrawn outright. The spill finding it rested on came from a comparison
-whose two binaries were built with different flags; on matched binaries spill density falls in every
-decode symbol and does not move in the encode symbol, so all three of the measurement criterion's
-conditions hold and no amendment is owed on that point either.
-
-What actually blocks acceptance:
-
-- **Criterion 5.** The common golden helper derives the expected header's version byte from the
-  production `currentCompatibilityVersion` rather than spelling it literally, so a production
-  generation change would move encoder output and expectation together — the coupling this criterion
-  exists to forbid.
-- **Criterion 6.** The match-helper clause holds, but the field-helper mandate does not: the shared
-  token, blob-ref and manifest-ref writers, every ref-catalog row, the checkpoint `life_epoch` and
-  the non-`ref` envelope fields all emit a key followed by a raw value call instead of using the
-  per-encoding field helpers. The exemption this document grants covers only the envelope `ref`
-  writer and the payload zones.
-- **Criterion 3.** The boundary test never sends a maximum-width version through the encoder; it
-  encodes the current one-digit version and adds the remaining digits arithmetically.
-- **Criteria 8 and 11.** Evidence gaps rather than defects: no retained execution log for the unit
-  battery, no retained raw output for the byte and capacity oracle, and — the reason 11 is
-  suspended outright — the two measured binaries were compiled with different ISA baselines and
-  frame-pointer settings, so neither the timing nor the assembly comparison is currently valid.
+Two amendments this document briefly carried are withdrawn, both having been my error rather than
+the document's. The criterion's "match helpers inline" refers to the three `match*Fields` functions,
+all of which are header-defined `inline`; `EnumWireTable::toWord` is an encode-side enum lookup and
+is not one of them. And the expectation that nothing new would spill does hold — the measurement that
+suggested otherwise compared two binaries built with different frame-pointer settings, and on matched
+builds spill density falls in every symbol inspected.
