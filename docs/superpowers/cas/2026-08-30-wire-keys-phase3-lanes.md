@@ -86,6 +86,11 @@ containers successfully. It is a probe result, not a test outcome.
 
 ## What these lanes do not cover {#what-these-lanes-do-not-cover}
 
-They do not measure anything — no throughput, byte, or capacity claim is discharged here. They also
-do not reach every format: several formats have no stateless or integration test that parses their
-bytes directly, which is what the soak-card coverage table is for.
+They do not measure anything — no throughput, byte, or capacity claim is discharged here.
+
+They also reach far fewer formats byte-wise than the pass counts suggest. None of the seventeen
+registry type strings appears anywhere in either lane's test sources, and only the three suites
+named above assert on a persisted object's fields at all; every other test exercises the formats
+only through whatever the server happens to write and read back, which a symmetric rename cannot
+break. That is a real limit on what a green lane proves, and it is why the format coverage question
+is answered by the soak-card table rather than here.
