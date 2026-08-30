@@ -464,10 +464,9 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             /// folded this namespace"), which is a claim about a fold, not the absence of one.
             if (!classification_word)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: ref_life '{}' missing class", life_hex);
-            const std::optional<CoverageClass> classification = coverageClassInRow(*classification_word, life_hex);
             if (hold_reason_word)
                 hold_reason = holdReasonInRow(*hold_reason_word, life_hex);
-            cov.classification = *classification;
+            cov.classification = coverageClassInRow(*classification_word, life_hex);
 
             /// The same strict grammar the encoder enforces, applied to bytes we did not write. A
             /// PARTIAL hold is corruption, never a hold with defaults: a hold whose offending position

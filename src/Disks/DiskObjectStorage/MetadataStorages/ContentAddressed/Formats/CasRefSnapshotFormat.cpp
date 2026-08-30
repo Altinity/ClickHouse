@@ -226,7 +226,12 @@ RefTableSnapshot decodeRefTableSnapshot(
         if (!l.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: junk after record");
 
-        if (kind == RefOwnerKind::Committed)
+        /// A `switch` rather than an if/else-if chain: the row kinds partition the enum, and a future
+        /// enumerator must not be able to arrive here, pass the word lookup, and then fall out of the
+        /// chain as a silently dropped row. With no default arm, adding one is a build error.
+        switch (kind)
+        {
+        case RefOwnerKind::Committed:
         {
             if (!ref || !published_ms)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: committed row missing ref/published_ms");
@@ -236,8 +241,9 @@ RefTableSnapshot decodeRefTableSnapshot(
             row.manifest_ref = mf.buildRef("RefTableSnapshot", "committed");
             row.published_at_ms = *published_ms;
             snapshot.committed.push_back(std::move(row));
+            break;
         }
-        else if (kind == RefOwnerKind::Precommit)
+        case RefOwnerKind::Precommit:
         {
             if (!ref)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: precommit row missing ref");
@@ -247,6 +253,8 @@ RefTableSnapshot decodeRefTableSnapshot(
             checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "precommit ref_name");
             row.manifest_ref = mf.buildRef("RefTableSnapshot", "precommit");
             snapshot.precommits.push_back(std::move(row));
+            break;
+        }
         }
     }
 

@@ -177,7 +177,7 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
         }
         else if (key == "pl")
             /// `"pl"` (payload) was removed from the op wire when the `set_payload` op became
-            /// `set_published_at`). The retired op WORD is already rejected by `refOpKindFromWireWord`, but this
+            /// `set_published_at`. The retired op WORD is already rejected by `refOpKindFromWireWord`, but this
             /// generic reader reads field keys before switching on kind, so a `"pl"` field paired with a
             /// still-recognized op word would otherwise be `skipUnknown`'d. It is a KNOWN-removed field,
             /// not a genuinely-unknown one -- reject it explicitly rather than silently discard it.

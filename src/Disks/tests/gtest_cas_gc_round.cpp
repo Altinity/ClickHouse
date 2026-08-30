@@ -631,7 +631,7 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 
 /// A fully idle fold pure-carries every shard's authoritative rows verbatim. The parent is first made
 /// non-vacuous with one live blob in each of two shards; the forced no-delta successor must preserve
-/// both `btr` rows and the total `cnd` domain byte-for-byte.
+/// both `blob_run` rows and the total `condemned` domain byte-for-byte.
 TEST(CASGCRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -675,9 +675,9 @@ TEST(CASGCRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
     EXPECT_TRUE(seal1.condemned_summary.contains(0) && seal1.condemned_summary.contains(1));
     EXPECT_TRUE(seal2.condemned_summary.contains(0) && seal2.condemned_summary.contains(1));
 
-    /// Capacity reserves one widest `btr` row per shard. Pin the production pure-carry seal to the
+    /// Capacity reserves one widest `blob_run` row per shard. Pin the production pure-carry seal to the
     /// authoritative grammar that makes that bound sufficient: at most one in-range canonical seq-0
-    /// run per shard, beside exactly one `cnd` row for every shard.
+    /// run per shard, beside exactly one `condemned` row for every shard.
     bool run_seen[2] = {false, false};
     ASSERT_EQ(seal1.blob_target_runs.size(), 2u);
     ASSERT_EQ(seal2.blob_target_runs.size(), 2u);

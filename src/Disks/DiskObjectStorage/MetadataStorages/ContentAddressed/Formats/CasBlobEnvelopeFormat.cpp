@@ -191,7 +191,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
         {
             writeKey(buf, "!x", first); writeStringValue(buf, "1");
         }
-        json = std::move(buf).take();   /// e.g. {"type":"cas_blob","v":3,...,"chver":26006001   (no ref, no closing brace)
+        json = std::move(buf).take();   /// e.g. {"type":"cas_blob","v":1,...,"chver":26006001   (no ref, no closing brace)
     }
 
     /// Optional `ref`, truncated to the exact remaining budget. Layout after this block:

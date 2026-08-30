@@ -62,7 +62,7 @@ inline RunMarker runMarkerFromByte(char byte, std::string_view what)
 /// leaking into the format implementation.
 ///
 /// File shape:
-///   {"type":"cas_run","v":3,"kind":"source_edge"}                      header line (type + v + kind gate)
+///   {"type":"cas_run","v":1,"kind":"source_edge"}                      header line (type + v + kind gate)
 ///   {"ref":"01<digest-hex>","src":"<32hex>","mark":"edge"}                    an active-edge / zero-marker row
 ///   {"ref":"01<digest-hex>","src":"00000000000000000000000000000000","mark":"condemned","pending":false,"token_type":"etag","token":"...","size":123,"condemn_round":"7","confirmed":false}
 ///   {"n":184267}                                                       trailer: record count

@@ -16,7 +16,7 @@ class Layout;
 /// The byte bound every namespace name admitted into `ref_catalog` must satisfy (spec INV-3:
 /// "namespace names get a byte bound"). It keeps the catalog's operator-visible row and line grammar
 /// bounded, and both directions of the codec enforce it. Logical namespace bytes do NOT enter
-/// predicate (2): fold-seal `rfl` rows are keyed only by the fixed-width opaque life id.
+/// predicate (2): fold-seal `ref_life` rows are keyed only by the fixed-width opaque life id.
 constexpr size_t kMaxNamespaceBytes = 512;
 
 /// One namespace's catalog lifecycle state (spec INV-3, §3). `Creating` blocks publication and
@@ -144,7 +144,7 @@ uint64_t widestCondemnedSummaryReservationBytes(uint64_t gc_shards);
 
 /// PRE-PUT GATE, predicate (2) of INV-3's additive admission. Reserves the widest fixed frame, one
 /// widest ref-life row per candidate catalog entry, and one widest blob-target plus condemned-summary
-/// row per authoritative GC shard. The `btr` multiplier follows the authoritative fold-seal grammar:
+/// row per authoritative GC shard. The `blob_run` multiplier follows the authoritative fold-seal grammar:
 /// at most one canonical sequence-0 run is legal for each shard. Equality is accepted; refuses
 /// (`LIMIT_EXCEEDED`, naming `ns`) one entry over. Every multiplication and addition saturates, so an
 /// unreachable-in-practice count can never wrap into something that reads as "fits".

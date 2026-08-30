@@ -500,7 +500,7 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
     EXPECT_EQ(rep.committed_refs, blobs.size());
 
     /// Multiple rebuild flushes still converge to one authoritative row domain: no more than one
-    /// canonical seq-0 `btr` per shard and exactly one `cnd` per shard. These are the cardinalities the
+    /// canonical seq-0 `blob_run` per shard and exactly one `condemned` per shard. These are the cardinalities the
     /// catalog admission reservation over-covers independently of catalog-entry count.
     const GcState rebuilt_state = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     const CasFoldSeal rebuilt_seal = decodeFoldSeal(

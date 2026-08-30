@@ -138,11 +138,18 @@ TEST(CASMountLeaseFormat, UnknownFieldsRemainTolerated)
 
 TEST(CASMountLeaseFormat, RejectsMissingIdentityFields)
 {
+    /// Each arm drops exactly ONE identity and keeps the other two, and each asserts the message that
+    /// names the dropped one. A body missing two of them would satisfy whichever clause runs first, so
+    /// a shared fixture and a shared message together would let two of the three checks be deleted
+    /// with this test still green.
     const String header = "{\"type\":\"cas_mount_lease\",\"v\":1}\n";
-    const String fields = "\"hostname\":\"host-1\",\"pid\":4242,\"started_at_ms\":1752537600000,"
-                          "\"seq\":\"5\",\"expires_at_ms\":1752537630000,\"min_active_build_sequence\":\"9\",\"gc_fenced\":false}";
+    const String uuid = R"("server_uuid":"0123456789abcdeffedcba9876543210",)";
+    const String epoch = R"("writer_epoch":"7",)";
+    const String attempt = R"("write_attempt_id":"00112233445566778899aabbccddeeff",)";
+    const String rest = "\"hostname\":\"host-1\",\"pid\":4242,\"started_at_ms\":1752537600000,"
+                        "\"seq\":\"5\",\"expires_at_ms\":1752537630000,\"min_active_build_sequence\":\"9\",\"gc_fenced\":false}";
 
-    const auto expectCorrupted = [](const String & data)
+    const auto expectMessage = [](const String & data, std::string_view expected)
     {
         try
         {
@@ -152,9 +159,11 @@ TEST(CASMountLeaseFormat, RejectsMissingIdentityFields)
         catch (const DB::Exception & e)
         {
             EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+            EXPECT_EQ(e.message(), expected);
         }
     };
 
-    expectCorrupted(header + R"({"writer_epoch":"7",)" + fields + "\n");
-    expectCorrupted(header + R"({"server_uuid":"0123456789abcdeffedcba9876543210",)" + fields + "\n");
+    expectMessage(header + "{" + epoch + attempt + rest + "\n", "CAS mount-lease: missing server_uuid");
+    expectMessage(header + "{" + uuid + attempt + rest + "\n", "CAS mount-lease: missing writer_epoch");
+    expectMessage(header + "{" + uuid + epoch + rest + "\n", "CAS mount-lease: missing or zero write_attempt_id");
 }

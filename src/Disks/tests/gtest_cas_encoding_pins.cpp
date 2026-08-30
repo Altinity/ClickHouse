@@ -251,8 +251,10 @@ TEST(CASWireCutDeltas, SetPublishedAtRefLogOpRow)
     expectDelta(old_bytes, lineAt(encodeRefLogTxn(txn), 2), 18);
 }
 
-/// The body-less ops are the cut's only free rows: the record is the `op` key alone, and `op` did not
-/// move. Pinned so "free" stays a measurement rather than an assumption.
+/// The body-less ops are the cut's only free rows: the record is the `op` key alone. This measures
+/// that the ROW costs nothing extra, not that the word itself is unchanged -- it builds its old side
+/// from the current word, so it cannot see a word rename. The words are pinned literally by the
+/// closed-set tests; what this adds is that no framing crept in around them.
 TEST(CASWireCutDeltas, BodylessRefLogOpRowsAreUnchanged)
 {
     for (const RefOpKind kind : {RefOpKind::NamespaceBirth, RefOpKind::EpochSeal})

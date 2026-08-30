@@ -203,8 +203,15 @@ MountLease decodeMountLease(std::string_view data)
         else
             r.skipUnknown(key);
     }
-    if (!saw_su || !saw_we || !saw_write_attempt_id || m.write_attempt_id == UInt128{})
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: missing or zero identity field");
+    /// Named one by one rather than as a single condition: these are three separate identities, and a
+    /// shared message cannot tell an operator which of them the object is missing -- nor let a test
+    /// prove that each is actually required.
+    if (!saw_su)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: missing server_uuid");
+    if (!saw_we)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: missing writer_epoch");
+    if (!saw_write_attempt_id || m.write_attempt_id == UInt128{})
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: missing or zero write_attempt_id");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: trailing bytes");
     return m;

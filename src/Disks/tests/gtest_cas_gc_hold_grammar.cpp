@@ -517,8 +517,9 @@ TEST(CASGCHoldGrammar, AClassificationOutsideTheGrammarIsCorruptedData)
     });
 
     /// The bare number `4` is the classification's pre-cut wire representation — the old byte-valued
-    /// `cls` this task retired. This is the ONE place that spelling is allowed to survive in the tree, as
-    /// a marked negative fixture proving the decoder still refuses it now that `class` takes a word.
+    /// form. A retired spelling is legal here because this is a marked negative fixture proving the
+    /// decoder still refuses it now that `class` takes a word; the byte-delta pins hold the other such
+    /// fixtures, and both kinds are exempt from the vocabulary sweeps for the same reason.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
         decodeFoldSeal(withField(clean, R"("class":"folded")", R"("class":4)"));
