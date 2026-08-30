@@ -31,6 +31,13 @@ namespace RunWire
     constexpr WireKey confirmed{"confirmed"};
 }
 
+namespace RunHeaderWire
+{
+    constexpr WireKey type{"type"};
+    constexpr WireKey version{"v"};
+    constexpr WireKey kind{"kind"};
+}
+
 constexpr EnumWireTable<RunMarker, 3> kRunMarkerWords{{{
     {RunMarker::Zero, "zero"},
     {RunMarker::Edge, "edge"},
@@ -119,12 +126,9 @@ void writeRunHeaderLine(WriteBuffer & out, std::string_view kind)
     const FormatTraits & t = traitsFor(FormatId::RunFile);
     CasJsonWriter line(64);
     bool first = true;
-    writeKey(line, "type", first);
-    writeStringValue(line, t.type);
-    writeKey(line, "v", first);
-    writeIntText(currentCompatibilityVersion(), line);
-    writeKey(line, "kind", first);
-    writeStringValue(line, kind);
+    writeStringField(line, RunHeaderWire::type, t.type, first);
+    writeNumberField(line, RunHeaderWire::version, currentCompatibilityVersion(), first);
+    writeStringField(line, RunHeaderWire::kind, kind, first);
     closeObject(line, first);
     writeChar('\n', line);
     const std::string_view line_view = line.view();

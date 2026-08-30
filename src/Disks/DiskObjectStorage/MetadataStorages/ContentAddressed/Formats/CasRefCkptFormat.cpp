@@ -105,10 +105,7 @@ String encodeRefCkpt(const RefCkpt & ckpt)
     /// written by the one shared `RefTxnId` writer the `_log` and `_snap` formats also use, so the
     /// three ref formats cannot disagree on the encoding.
     if (ckpt.life_epoch)
-    {
-        writeKey(out, RefCkptWire::life_epoch, first);
-        writeU64StringValue(out, *ckpt.life_epoch);
-    }
+        writeU64StringField(out, RefCkptWire::life_epoch, *ckpt.life_epoch, first);
     if (ckpt.committed_through)
         writeRefTxnIdFields(out, first, RefCkptWire::committed_epoch, RefCkptWire::committed_seq, *ckpt.committed_through);
     if (ckpt.checkpoint_snapshot_id)

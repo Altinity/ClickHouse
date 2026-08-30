@@ -328,14 +328,22 @@ void JsonObjectReader::skipUnknown(const String & key)
 
 /// ---- header line / trailer line / raw line access ----
 
+namespace
+{
+namespace ContainerWire
+{
+    constexpr WireKey type{"type"};
+    constexpr WireKey version{"v"};
+    constexpr WireKey count{"n"};
+}
+}
+
 void writeHeaderLine(CasJsonWriter & out, FormatId id)
 {
     const FormatTraits & t = traitsFor(id);
     bool first = true;
-    writeKey(out, "type", first);
-    writeStringValue(out, t.type);
-    writeKey(out, "v", first);
-    writeIntText(currentCompatibilityVersion(), out);
+    writeStringField(out, ContainerWire::type, t.type, first);
+    writeNumberField(out, ContainerWire::version, currentCompatibilityVersion(), first);
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -343,8 +351,7 @@ void writeHeaderLine(CasJsonWriter & out, FormatId id)
 void writeTrailerLine(CasJsonWriter & out, uint64_t n)
 {
     bool first = true;
-    writeKey(out, "n", first);
-    writeIntText(n, out);
+    writeNumberField(out, ContainerWire::count, n, first);
     closeObject(out, first);
     writeChar('\n', out);
 }

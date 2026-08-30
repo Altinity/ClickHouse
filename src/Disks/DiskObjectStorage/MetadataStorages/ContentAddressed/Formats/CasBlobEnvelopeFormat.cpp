@@ -35,6 +35,8 @@ namespace EnvelopeWire
     constexpr WireKey op{"op"};
     constexpr WireKey chver{"chver"};
     constexpr WireKey ref{"ref"};
+    /// Not a field this build understands: written only to exercise the reader's `!`-key policy.
+    constexpr WireKey unknown_critical{"!x"};
 }
 
 constexpr EnumWireTable<ProvenanceOp, 6> kProvenanceOpWords{{{
@@ -178,22 +180,20 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len,
     {
         CasJsonWriter buf(256);
         bool first = true;
-        writeKey(buf, EnvelopeWire::type, first); writeStringValue(buf, kBlobType);
+        writeStringField(buf, EnvelopeWire::type, kBlobType, first);
         writeNumberField(buf, EnvelopeWire::version, version_override.value_or(currentCompatibilityVersion()), first);
-        writeKey(buf, EnvelopeWire::tag, first); writeHex128Value(buf, header.incarnation_tag);
-        writeKey(buf, EnvelopeWire::build, first); writeHex128Value(buf, header.build_id);
+        writeHex128Field(buf, EnvelopeWire::tag, header.incarnation_tag, first);
+        writeHex128Field(buf, EnvelopeWire::build, header.build_id, first);
         if (header.provenance)
         {
-            writeKey(buf, EnvelopeWire::time_ms, first); writeIntText(header.provenance->created_at_ms, buf);
-            writeKey(buf, EnvelopeWire::creator, first); writeHex128Value(buf, header.provenance->creator_server_id);
-            writeKey(buf, EnvelopeWire::op, first); writeStringValue(buf, provenanceOpToWireWord(header.provenance->op));
-            writeKey(buf, EnvelopeWire::chver, first); writeIntText(header.provenance->ch_version, buf);
+            writeNumberField(buf, EnvelopeWire::time_ms, header.provenance->created_at_ms, first);
+            writeHex128Field(buf, EnvelopeWire::creator, header.provenance->creator_server_id, first);
+            writeStringField(buf, EnvelopeWire::op, provenanceOpToWireWord(header.provenance->op), first);
+            writeNumberField(buf, EnvelopeWire::chver, header.provenance->ch_version, first);
         }
         /// Test-only critical extension: an unknown `!`-key BEFORE `ref`.
         if (header.emit_unknown_critical_key)
-        {
-            writeKey(buf, "!x", first); writeStringValue(buf, "1");
-        }
+            writeStringField(buf, EnvelopeWire::unknown_critical, "1", first);
         json = std::move(buf).take();   /// e.g. {"type":"cas_blob","v":1,...,"chver":26006001   (no ref, no closing brace)
     }
 
