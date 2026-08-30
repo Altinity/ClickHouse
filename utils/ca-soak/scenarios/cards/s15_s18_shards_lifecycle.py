@@ -358,22 +358,30 @@ class S16(Scenario):
         gc_all = _gc_log_since(ctx)
         result.observations["gc_summary"] = gc_all.get("summary", {})
 
-        # Resurrection audit: a hot content cycle (drop -> GC-condemn -> re-insert) must surface
-        # `blob_reuse_resurrect` events in system.cas_log — the CA event audit's
-        # equivalent of the removed `ContentAddressedGenerationResurrectionsTotal` /
-        # `ContentAddressedDuplicateGenerationBytes` ProfileEvents (both were zero-increment husks
-        # from the pre-incarnation-token "generation" GC design and were removed). Under the current
-        # architecture, `blob_reuse_resurrect` is the live event a writer emits when it observes a
-        # condemned token and must re-upload from source (see `Build::observeAndAdmit` in
-        # `CasBuild.cpp`); its count is already computed above in `reuse_events`.
-        resurrect_count = result.observations["reuse_events"].get("blob_reuse_resurrect", 0)
+        # Reuse audit: a hot content cycle (drop -> GC-condemn -> re-insert) must actually REUSE the
+        # blob rather than treat each cycle as new content, or the cycle proves nothing about
+        # condemned-token handling and the invariant proxy below has nothing to guard.
+        #
+        # This verdict used to require `blob_reuse_resurrect`, on the reading that a writer emits it
+        # when it observes a condemned token and must re-upload from source. That event no longer has
+        # an emitter: `907c3b5ce7d` ("Publish CAS blobs after mandatory HEAD") made publication
+        # unconditional after a mandatory HEAD, so a writer no longer splits reuse into adopt versus
+        # resurrect — it always re-uploads from source and records `blob_reuse_adopt`. The enum member
+        # and its string survive with nothing raising them, so the old assertion could not pass at any
+        # scale. What is LOST by this change is the only direct, positive check that a CONDEMNED token
+        # specifically forces a re-upload; the resurrect invariant itself is still covered, but only by
+        # the proxy immediately below (correct data every cycle plus no bad CA events).
+        reuse_events = result.observations["reuse_events"]
+        reuse_count = reuse_events.get("blob_reuse_adopt", 0) + reuse_events.get("blob_reuse_resurrect", 0)
         result.add(Verdict.check(
-            "resurrection events recorded (cas_log)",
-            "blob_reuse_resurrect fires for the drop/GC-condemn/re-insert cycle",
-            f"blob_reuse_resurrect={resurrect_count}", resurrect_count > 0,
-            "" if resurrect_count > 0 else
-            "no blob_reuse_resurrect events observed across the hot cycle — either GC did not condemn "
-            "before the re-insert or the resurrect event failed to fire"))
+            "content reuse recorded (cas_log)",
+            "the drop/GC-condemn/re-insert cycle reuses the blob rather than re-admitting new content",
+            f"blob_reuse_adopt={reuse_events.get('blob_reuse_adopt', 0)} "
+            f"blob_reuse_resurrect={reuse_events.get('blob_reuse_resurrect', 0)}",
+            reuse_count > 0,
+            "" if reuse_count > 0 else
+            "no blob reuse events at all across the hot cycle — the identical content was not "
+            "recognised as identical, so this run says nothing about condemned-token handling"))
 
         # --- INVARIANT proxy: reintroduced content is read from writer-owned source bytes, never
         # from a condemned object. We cannot directly observe the GET source, so assert the proxy:

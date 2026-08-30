@@ -71,6 +71,32 @@ unchanged, only relocated.
 
 ### From the 2026-08-04 destructive-baseline / soak audit {#inbox-audit-batch}
 
+## `[blob-reuse-resurrect-no-emitter]` `BlobReuseResurrect` has no emitter, and the condemned-token re-upload has no positive test {#blob-reuse-resurrect-no-emitter}
+
+**Found while triaging an S16 soak failure during the wire-keys proof phase (2026-08-30).**
+
+`CasEventType::BlobReuseResurrect` is still declared in `Primitives/CasEvent.h` and still maps to the
+string `blob_reuse_resurrect` in `CasEvent.cpp`, but nothing in `src/` raises it — only
+`BlobReuseAdopt` is emitted, from two sites in `Pool/CasPartWriteTxn.cpp`. `git log -S` puts the
+removal at `907c3b5ce7d` ("Publish CAS blobs after mandatory `HEAD`"): once publication became
+unconditional after a mandatory `HEAD`, a writer no longer splits reuse into adopt versus resurrect,
+because it always re-uploads from source.
+
+Two separate things are left over.
+
+**A dead enum member.** It costs nothing at runtime, but it makes the event vocabulary lie: a reader of
+`system.cas_log`'s event set will look for a value that can never appear, which is exactly the trap
+S16 fell into — its verdict required the event and so could not pass at any scale.
+
+**A real coverage gap, which is the part that matters.** S16 was the only positive check that a
+CONDEMNED token specifically forces a re-upload rather than a revival. Its assertion has been replaced
+with one that requires reuse to happen at all, so the resurrect invariant is now guarded only by S16's
+proxy — correct data on every cycle plus no bad CA events. That proxy is genuine but negative: it
+would catch a revival that corrupted data or raised a bad event, and would miss one that happened to
+return the right bytes. Restoring a direct check means finding an observable that distinguishes
+"re-uploaded from writer-owned source" from "revived from the condemned object" under the current
+architecture — a counter, an event, or a fault-injected condemned object that must not be readable.
+
 ## `[gc-mf-cleanup-durable-retry]` Manifest-cleanup GC phase needs durable retry, not a cap {#gc-mf-cleanup-durable-retry}
 
 **Found by a 24h soak (`soak-t6b-report.md`) after `gc_round_manifest_cleanup_budget` landed as one of
