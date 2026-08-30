@@ -1,5 +1,17 @@
 # Wire-keys phase 2 — throughput before/after
 
+> **VOID, marked 2026-08-30.** Do not quote these numbers. The two sides were not built with the
+> same flags, contrary to the sentence below. The before-side worktree was configured with a plain
+> `cmake` and took the repository defaults (`X86_ARCH_LEVEL=3`, frame pointers omitted), while the
+> master build tree carries deliberate non-default settings (`X86_ARCH_LEVEL=2`,
+> `DISABLE_OMIT_FRAME_POINTER=ON`). So the before side targeted a newer ISA baseline — v3 has AVX2,
+> BMI2 and FMA that v2 does not — and did not reserve a register for a frame pointer, both of which
+> flatter it and inflate the measured regression.
+>
+> The claim "the same compiler and flags" was checked by listing three settings that do match and
+> never diffing the two `CMakeCache.txt` files, which is what would have caught it. The same mistake
+> propagated into phase 3's measurement, where an external review found it.
+
 Both sides built with the same compiler and flags (`clang-21`, `SANITIZE=OFF`, `ENABLE_BENCHMARKS=ON`)
 and run back to back on one machine.
 
