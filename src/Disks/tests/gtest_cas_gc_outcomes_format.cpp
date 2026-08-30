@@ -126,16 +126,16 @@ TEST(CASGCOutcomesFormat, RecordRequiresCompleteBlobRefAndTokenGroups)
 
 TEST(CASGCOutcomesFormat, GarbageAndUnknownWordsFailClosed)
 {
-    EXPECT_THROW(decodeOutcomeLog(String("")), DB::Exception);
-    EXPECT_THROW(decodeOutcomeLog(String("not a cas object\n")), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("not a cas object\n")); });
     /// A record with an unknown outcome word fails closed.
     const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
                        "{\"kind\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
                        "\"token_type\":\"etag\",\"token\":\"x\",\"outcome\":\"bogus\"}\n{\"n\":1}\n";
-    EXPECT_THROW(decodeOutcomeLog(bad), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bad); });
     /// A trailer count mismatch fails closed.
     const String miscount = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n{\"n\":5}\n";
-    EXPECT_THROW(decodeOutcomeLog(miscount), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(miscount); });
 }
 
 TEST(CASGCOutcomesFormat, DigestWidthMismatchFailsClosedWithCorruptedData)

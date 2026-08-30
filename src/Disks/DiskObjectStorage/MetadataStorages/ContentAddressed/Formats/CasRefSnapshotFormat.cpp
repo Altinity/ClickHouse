@@ -216,7 +216,7 @@ RefTableSnapshot decodeRefTableSnapshot(
             }
             else if (key == RefSnapWire::published_ms) published_ms = r.readU64Number();
             else if (key == "pl")
-                /// `"pl"` (payload) was removed from the row wire in stage-1 T12. It is a KNOWN-removed
+                /// `"pl"` (payload) was removed from the row wire. It is a KNOWN-removed
                 /// field, not a genuinely-unknown future one the tolerant reader may skip -- silently
                 /// discarding a persisted payload would lose data -- so reject it explicitly.
                 throw Exception(ErrorCodes::CORRUPTED_DATA,

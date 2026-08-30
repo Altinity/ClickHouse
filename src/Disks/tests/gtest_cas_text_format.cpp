@@ -208,7 +208,7 @@ TEST(CASJsonVocab, FailClosedRules)
         String k;
         r.nextKey(k); r.readHex128();
     }); });
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"s":"12x"})", KeyStrictness::Tolerant, [](auto & r)
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"u64_string_field":"12x"})", KeyStrictness::Tolerant, [](auto & r)
     {
         String k;
         r.nextKey(k); r.readU64String();

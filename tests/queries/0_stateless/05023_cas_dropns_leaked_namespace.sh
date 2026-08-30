@@ -4,7 +4,7 @@
 #   own unique local-object-storage pool and a per-run CAS disk name, so unlike 04290_cas_no_leftovers
 #   it does not need no-parallel.
 
-# FINDING #2 regression test: `DROP TABLE ... SYNC` on a content-addressed MergeTree used to leave the
+# Regression test: `DROP TABLE ... SYNC` on a content-addressed MergeTree used to leave the
 # table's CAS ref-catalog row `live` forever whenever `DirShape::TableDir`'s `existsDirectory` observed
 # zero committed refs -- an empty table, or one whose last part was just removed. `dropAllData`'s own
 # `existsDirectory` precheck skipped `removeRecursive`/`dropNamespace` entirely in that shape, so the
@@ -14,7 +14,7 @@
 # exact `state` (lifecycle) field recorded for the table's logical namespace. `SYSTEM CAS FSCK`'s
 # unreachable/dangling counts are a secondary check only -- fsck correctly regards a `live` leak as
 # CONSISTENT (nothing is unreachable; the row simply never dies), so it cannot detect this defect on its
-# own; `04290_cas_no_leftovers.sh`'s fsck-only oracle is exactly why FINDING #2 shipped unnoticed.
+# own; `04290_cas_no_leftovers.sh`'s fsck-only oracle is exactly why that leak shipped unnoticed.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
