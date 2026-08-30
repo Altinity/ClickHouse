@@ -1,0 +1,26 @@
+--- a/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp
++++ b/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp
+@@ -657,15 +657,15 @@
+     return out.str();
+ }
+ 
+-/// The ONE call site whose TYPE differs across the wire-key-rename cut this benchmark spans: on this
+-/// (AFTER) side `RefCoverage::classification` is the closed `CoverageClass` enum; at the pre-cut
+-/// commit it is a raw `uint8_t` whose CLAMPED value is ALSO renumbered (4 there, 3 here -- see
+-/// `CasFoldSealFormat.h`'s own history comment on `CoverageClass`). A bare numeric literal at the call
+-/// site would therefore silently measure the WRONG row shape on the before-side build, so the Step-4
+-/// patch touches only this pair of one-line functions; every benchmark body in this file stays
++/// The ONE call site whose TYPE differs across the wire-key-rename cut this benchmark spans: at this
++/// pre-cut commit `RefCoverage::classification` is a raw `uint8_t` (0 absent, 1 unchanged, 2 folded, 4
++/// clamped -- see this build's `CasFoldSealFormat.h` comment on `RefCoverage`), where the AFTER side
++/// uses the closed `CoverageClass` enum with CLAMPED renumbered to 3. A bare numeric literal at the
++/// call site would therefore silently measure the WRONG row shape on one side or the other, so this
++/// Step-4 patch touches only this pair of one-line functions; every benchmark body in this file stays
+ /// byte-identical on both sides.
+-CoverageClass foldedClassification() { return CoverageClass::Folded; }
+-CoverageClass clampedClassification() { return CoverageClass::Clamped; }
++uint8_t foldedClassification() { return 2; }
++uint8_t clampedClassification() { return 4; }
+ 
+ /// Not the record axis under test (`n` below is `ref_lives` row count): fixed at a representative
+ /// multi-shard pool size. A single-shard fixture would fold `blob_target_runs`/`condemned_summary` to
