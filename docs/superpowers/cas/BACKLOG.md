@@ -71,6 +71,32 @@ unchanged, only relocated.
 
 ### From the 2026-08-04 destructive-baseline / soak audit {#inbox-audit-batch}
 
+## `[s45-drop-member-sweep-untested]` GC wins S45's race, so `cas-drop-member`'s own sweep path is never exercised {#s45-drop-member-sweep-untested}
+
+**Found while triaging an S45 soak failure during the wire-keys proof phase (2026-08-30).**
+
+S45 exists to prove that decommissioning a member does not leave its `Removing` catalog rows behind
+as permanent debris, and it asserted that `cas-drop-member` reported `namespaces_removed >= 3`. It
+reported zero, deterministically, including on the seed that passed on 2026-08-03.
+
+The card cannot win the race it depends on. `cas-drop-member` refuses to run while the victim's mount
+lease is alive, so the card must wait for the lease to lapse — and the SURVIVOR is the pool's GC
+leader, which retires `Removing` namespaces pool-wide during exactly that wait. Instrumenting the
+catalog on both sides of the wait showed it plainly: three victim and three survivor `removing` rows
+right after the kill, and none of the six by the time the tool returned. The survivor's own rows went
+too, and the tool never touches those, so GC — not the tool — did the sweeping. The tool then
+correctly reported nothing to remove, with `slot_removed=true`.
+
+The verdict has been rewritten to assert the invariant the scenario actually protects (no victim rows
+survive the decommission) plus a precondition check that the hidden rows existed at the kill. **What
+that loses is the only coverage of the tool's own sweep path.** When GC wins, that path never runs, so
+a regression in `cas-drop-member`'s namespace sweeping would not be caught by any scenario.
+
+**Fix direction:** give S45 a compose variant with `cas_gc_enabled` off on the survivor, so the
+`Removing` rows persist through the lease-lapse wait and the tool is the only thing that can sweep
+them. That makes the premise holdable by construction instead of by luck, and restores the assertion
+that `namespaces_removed` matches the table count.
+
 ## `[blob-reuse-resurrect-no-emitter]` `BlobReuseResurrect` has no emitter, and the condemned-token re-upload has no positive test {#blob-reuse-resurrect-no-emitter}
 
 **Found while triaging an S16 soak failure during the wire-keys proof phase (2026-08-30).**

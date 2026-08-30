@@ -61,6 +61,7 @@ unconditionally. Final `fsck` showed `dangling=0` (some `unreachable` residue, w
 pre-GC state the warnings describe, not corruption).
 """
 
+import re
 import subprocess
 import time
 
@@ -111,6 +112,32 @@ def _run_drop_member(container: str, srid: str, timeout_s: float = 300.0) -> dic
 # GC leader itself relies on to call a lease conclusively lapsed.
 _LEASE_WAIT_BOUND_S = 60.0
 _LEASE_POLL_INTERVAL_S = 5.0
+
+
+_CATALOG_S3_URL = "http://rustfs1:11121/test/soak_pool/cas/ref_catalog"
+_CATALOG_ENTRY_RE = re.compile(
+    r'\{"kind":"entry","ns":"([^"]*)","state":"([^"]*)","life":"([0-9a-f]+)"')
+
+
+def _catalog_states(node) -> dict:
+    """Count catalog entries per state, keyed by the server root each namespace belongs to.
+
+    Without this, a `namespaces_removed=0` report is undiagnosable: it looks identical whether the
+    victim's `Removing` rows were never created, were already retired by the SURVIVOR's GC during the
+    lease-lapse wait, or were present and missed by the tool. Those are three different findings and
+    only one of them is about the tool."""
+    text = node.query(
+        f"SELECT * FROM s3('{_CATALOG_S3_URL}', 'clickhouse', 'clickhouse', 'RawBLOB') FORMAT TSVRaw")
+    counts = {}
+    for m in _CATALOG_ENTRY_RE.finditer(text):
+        ns, state = m.group(1), m.group(2)
+        root = ns.split("/", 1)[0]
+        counts[f"{root}:{state}"] = counts.get(f"{root}:{state}", 0) + 1
+    if not counts and '"kind":"entry"' in text:
+        raise AssertionError(
+            "ref catalog has entry rows but none matched the reader's field pattern; the wire "
+            "vocabulary changed and this card is stale: " + text[:400])
+    return counts
 
 
 def _run_drop_member_after_lease_lapses(container: str, srid: str) -> dict:
@@ -172,7 +199,12 @@ class S45(Scenario):
         ctx.log(f"S45: killing victim {_VICTIM_CONTAINER} immediately after drop (before its own GC settles)")
         subprocess.run(["docker", "kill", _VICTIM_CONTAINER], capture_output=True, check=True)
 
+        # Sample the catalog on both sides of the lease-lapse wait. The tool cannot sweep rows that
+        # are already gone, so a report of zero only convicts the tool if the rows were still there
+        # when it ran.
+        result.observations["catalog_states_after_kill"] = _catalog_states(node)
         report = _run_drop_member_after_lease_lapses(_SURVIVOR_CONTAINER, _VICTIM_SRID)
+        result.observations["catalog_states_after_drop_member"] = _catalog_states(node)
         ctx.write_json("s45_drop_member_report.json", report)
 
         result.add(Verdict.check(
@@ -180,13 +212,42 @@ class S45(Scenario):
             f"exit_code={report.get('exit_code')}", report.get("exit_code") == 0,
             f"stderr: {report.get('stderr', '')[:500]}"))
 
+        # Two separate claims, because conflating them made a failure undiagnosable.
+        #
+        # First: the scenario actually built the shape it is named after. If the victim's `Removing`
+        # rows are not in the catalog right after the kill, nothing that follows means anything, and
+        # a later zero would be measuring the setup rather than the decommission.
+        after_kill = result.observations["catalog_states_after_kill"]
+        hidden_at_kill = after_kill.get(f"{_VICTIM_SRID}:removing", 0)
+        result.add(Verdict.check(
+            "the victim's hidden Removing rows exist at the kill", f">= {len(tables)}",
+            f"{_VICTIM_SRID}:removing={hidden_at_kill} (full: {after_kill})",
+            hidden_at_kill >= len(tables),
+            "the victim was dropped but its namespaces never reached Removing, so this run never "
+            "built the hidden-debris shape the card exists to decommission"))
+
+        # Second: the invariant. Decommissioning must not leave the victim's rows behind as permanent
+        # catalog debris. The card used to require that `cas-drop-member` be the component that swept
+        # them (`namespaces_removed >= len(tables)`), but it cannot control that: the tool refuses to
+        # run until the victim's mount lease has lapsed, and the SURVIVOR is the pool's GC leader and
+        # retires Removing namespaces pool-wide during exactly that wait. A live run showed the
+        # catalog holding 3 victim and 3 survivor `removing` rows at the kill and NONE of the six by
+        # the time the tool returned — the survivor's own rows went too, and the tool never touches
+        # those. So the old verdict asserted the outcome of a race the card has no way to win.
+        #
+        # What this LOSES is the only check that the tool's OWN sweep path works: when GC wins the
+        # race, that path is never exercised. Holding the premise needs background GC suspended on
+        # the survivor for the duration of the wait, which needs a compose variant with
+        # `cas_gc_enabled` off. Recorded in the backlog rather than bodged here.
+        after = result.observations["catalog_states_after_drop_member"]
+        victim_left = sum(n for k, n in after.items() if k.startswith(f"{_VICTIM_SRID}:"))
         namespaces_removed = report.get("namespaces_removed")
         result.add(Verdict.check(
-            "hidden Removing rows are accounted for", f">= {len(tables)}",
-            f"namespaces_removed={namespaces_removed}",
-            namespaces_removed is not None and namespaces_removed >= len(tables),
-            "the victim's Removing rows (dropped but never condemned before the kill) must be swept "
-            "by the tool, not left as permanent catalog debris"))
+            "the decommissioned member leaves no catalog debris", "0 victim rows after the tool runs",
+            f"victim_rows_after={victim_left} namespaces_removed={namespaces_removed} (full: {after})",
+            victim_left == 0,
+            "the victim's rows survived both the pool's GC and the decommission tool, which is "
+            "exactly the permanent catalog debris this scenario exists to rule out"))
 
         gc_mod.forced_gc_to_fixpoint(ctx.cluster, lambda: 0)
         try:
