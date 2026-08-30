@@ -1,5 +1,5 @@
 ---
-description: 'Phase-3 implementation plan for the CAS semantic wire-keys design: prove the cut — run the lanes the unit gate cannot see, measure what the design claims, and close revision 14'
+description: 'Phase-3 implementation plan for the CAS semantic wire-keys design: settle the vocabulary, run the lanes the unit gate cannot see, measure what the design claims, and close revision 14'
 sidebar_label: 'CAS wire keys phase 3'
 sidebar_position: 22
 slug: /superpowers/plans/cas-wire-keys-phase3-proof
@@ -11,158 +11,184 @@ doc_type: 'guide'
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Establish that the wire cut is correct where the unit gate cannot see, that it costs what the design says it costs, and that nothing in revision 14 remains merely asserted — so the design can be declared accepted rather than implemented.
+**Goal:** Establish that the wire cut is correct where the unit gate cannot see, that it costs what the design says it costs, and that nothing in revision 14 remains merely asserted — so the design can be declared accepted, or explicitly not accepted, on recorded evidence.
 
-**Architecture:** Phases 1 and 2 are landed. Phase 1 bound every codec to named carriers; phase 2 changed the vocabulary, reset the generation history, and pinned the byte deltas and closed sets. Everything phase 2 could prove with a unit gate is proven. What remains is of three kinds, and the tasks below are grouped by which: **execution** of the lanes that never run in the unit gate (integration, soak, stateless — phase 2 re-spelled their assertions but never ran them), **measurement** of the claims the design makes about cost, and **settlement** of the questions the phase-2 reviews raised but deliberately did not answer.
+**Architecture:** Phases 1 and 2 are landed. Everything the unit gate can prove is proven. What remains is of three kinds, and the ORDER between them is load-bearing: **settlement** of the open vocabulary questions must come FIRST, because any key it changes invalidates every measurement, lane run and disassembly taken before it; then **execution** of the integration, soak and stateless lanes that phase 2 re-spelled but never ran; then **measurement** of the design's cost claims against that final vocabulary. The plan ends with a durable acceptance matrix that fails closed.
 
-**Tech Stack:** C++ (ClickHouse tree), gtest, Google Benchmark (`benchmark_cas_ref_protocol`), pytest integration lanes, `utils/ca-soak` docker-compose scenarios, stateless `.sh`/`.sql` tests.
+**Tech Stack:** C++ (ClickHouse tree), gtest, Google Benchmark (`benchmark_cas_ref_protocol`), praktika-driven stateless and integration lanes, `utils/ca-soak` docker-compose scenarios.
 
-**Spec:** docs/superpowers/specs/2026-08-28-cas-semantic-wire-keys-design.md (revision 14). Its "Implementation shape" item 3, the "Decompressed-byte accounting" paragraph, and the acceptance-criteria list are what this plan discharges.
+**Spec:** docs/superpowers/specs/2026-08-28-cas-semantic-wire-keys-design.md (revision 14). Its "Implementation shape" item 3, the "Decompressed-byte accounting" paragraph, and the eleven acceptance criteria are what this plan discharges.
 
-**Prior work this plan builds on:**
-- Phase-1 plan: docs/superpowers/plans/2026-08-29-cas-wire-keys-phase1-carriers.md
-- Phase-2 plan: docs/superpowers/plans/2026-08-29-cas-wire-keys-phase2-cut.md
-- The throughput measurement already taken at the phase-2 boundary, with its raw data: docs/superpowers/cas/2026-08-30-wire-keys-phase2-throughput.md and docs/superpowers/cas/bench-wire-keys-phase2/
-- The deferred items, all in the `## Inbox` of docs/superpowers/cas/BACKLOG.md
+**Prior work:**
+- Phase-1 plan: docs/superpowers/plans/2026-08-29-cas-wire-keys-phase1-carriers.md; phase-2 plan: docs/superpowers/plans/2026-08-29-cas-wire-keys-phase2-cut.md
+- Phase-2 range in git: `65ec8688cdb..874ca4a491e`. **Cite commits, tests and docs — never SDD workspace paths: `874ca4a491e` deleted them.**
+- Boundary measurement already taken (narrow: `cas_ref_log` + `RefSnapshot` timings only): docs/superpowers/cas/2026-08-30-wire-keys-phase2-throughput.md with raw JSON in docs/superpowers/cas/bench-wire-keys-phase2/
+- Deferred items: the `## Inbox` of docs/superpowers/cas/BACKLOG.md
 
 ## Global Constraints {#global-constraints}
 
-- Branch `cas-gc-rebuild`, this checkout. Run `git branch --show-current` before AND after every work session; if not on `cas-gc-rebuild`, STOP. No rebase, no amend, NEVER push.
-- Unit gate after every task that touches `src/`: `ninja -C build unit_tests_dbms` then `build/src/unit_tests_dbms --gtest_filter='CAS*'`, both logged. **Green means the log's `[  FAILED  ]` count is ZERO and `X tests ran` equals `[  PASSED  ] X`** — a `[  PASSED  ] N` line alone is not proof; a phase-2 batch committed a red tree that way. Baseline entering this plan: 2249.
-- **Never edit any source while a build is running.** A stale object silently drops a newly added test and the gate still reads green with an unchanged count — this happened in phase 2. Build from a quiescent tree, and prove a new test exists with `--gtest_list_tests`, never by a moving count.
-- **A failing external lane is a finding, not an obstacle.** This plan's whole purpose is that these lanes have never run against the cut. When one fails, diagnose it: a stale assertion this plan must fix, a real defect the cut introduced, or a pre-existing failure unrelated to the cut. Record which, with evidence. Do not "fix" a lane by weakening what it asserts.
-- **Measurements are review evidence, never CI assertions.** No timing assertion enters CI. Every measured number is recorded with the conditions it was taken under, and any figure taken on a loaded machine is labelled as such — phase 2 shipped a measurement whose two sides ran under 16.09 and 3.04 load average, and only a reviewer's check caught it.
-- Comments state constraints, never provenance. Allman braces. No `EXPECT_THROW` on `LOGICAL_ERROR` (death-split rule).
-- Deletions, weakenings and skips of any existing test require an explicit ruling recorded in the report, naming what is lost.
+- Branch `cas-gc-rebuild`, this checkout. Check `git branch --show-current` before and after every session. No rebase, no amend, NEVER push.
+- Unit gate after every task touching `src/`: `ninja -C build unit_tests_dbms`, then `build/src/unit_tests_dbms --gtest_filter='CAS*'`, both logged, both analysed by a subagent. **Green means `[  FAILED  ]` is ZERO AND `X tests ran` equals `[  PASSED  ] X`.** Baseline entering this plan: 2249.
+- **Never edit a source while a build runs** — a stale object drops a new test and the gate still reads green. Prove a new test exists with `--gtest_list_tests`, never by a moving count.
+- **A failing external lane is a finding, not an obstacle**, and never fixed by weakening an assertion. Every failure gets one of SIX outcomes (Task 2 defines them); `unclassified` blocks closure.
+- **Measurements are review evidence, never CI assertions.** Every number carries the conditions it was taken under. A run whose two sides' 1-minute load averages differ by more than 1.0, or whose absolute loads exceed 2.0, is VOID — preserve it under `void/` with a manifest and take it again. Phase 2 shipped a pair taken at 16.09 versus 3.04 and only a reviewer caught it.
+- **Any evidence taken before the vocabulary is final must be retaken.** If Task 1 changes a key after a later task ran, that later task re-runs in full — not just "the external readers".
+- New files under `docs/` need frontmatter (`description`, `sidebar_label`, `sidebar_position`, `slug`, `title`, `doc_type`) and `{#anchor}` on every heading.
+- Comments state constraints, never provenance. Allman braces. No `EXPECT_THROW` on `LOGICAL_ERROR`. Weakening or skipping any existing test requires a ruling in the report naming what is lost.
 
 ---
 
-### Task 1: Run the CAS stateless lane {#task-1}
+### Task 1: Settle the vocabulary — FOUR separate rulings {#task-1}
 
-**Files:** none expected to change; whatever the run convicts.
+**Files:** the codecs each ruling touches; `docs/superpowers/specs/2026-08-28-cas-semantic-wire-keys-design.md` when a ruling changes or confirms a table.
 
-The 57 CAS stateless tests (`tests/queries/0_stateless/*cas*`, numbers 04278-04300 and 05000-05026) exercise the server end to end. Phase 2 updated the two that parse persisted objects by hand (`05023`'s catalog reader, and the `05010`/`05012` checks) but ran none of them.
+This is FIRST because it is the last task that may change a persisted key. Phase 2 already pinned literal goldens, sixteen byte deltas, closed sets, canonical examples, README rows and external parsers — so a change here is another small wire cut, not a prose ruling, and it must land before anything is measured or executed. Four rulings, each recorded separately even when the outcome is "keep what is there"; bundling them is how a multi-part item gets half-discharged.
 
-- [ ] **Step 1: Run the lane.** Use the repository's praktika runner (`python3 -m ci.praktika run` — see the project instructions for the exact invocation and the `--test` selector syntax), selecting the CAS tests. Log to a file; have a subagent summarise it rather than reading it whole.
-- [ ] **Step 2: Triage every failure into one of three classes**, with evidence for the classification: (a) an assertion still spelling a pre-cut key or word — fix it, it is this plan's work; (b) a real behaviour difference the cut introduced — that is a phase-2 defect and the most valuable thing this plan can find, so stop and report it before touching anything; (c) failing before the cut too — prove it by running the same test at `65ec8688cdb` (a worktree at that commit already exists at `/home/mfilimonov/workspace/ClickHouse/cas-p2-before`), then record it as pre-existing and out of scope.
-- [ ] **Step 3:** Fix the class (a) failures; re-run until the lane is green or every remaining failure is classified (b) or (c). **Commit:** `cas: follow the wire cut into the stateless lane` (body: every test touched and why).
+**Interfaces:**
+- Produces: the FINAL vocabulary and the commit that establishes it. Every later task cites that commit as its AFTER side.
 
----
-
-### Task 2: Run the CAS integration lane {#task-2}
-
-**Files:** none expected to change; whatever the run convicts.
-
-Twelve integration suites (`tests/integration/test_cas_*`). Three of them parse persisted objects directly and were re-spelled during phase 2 without ever being executed: `test_cas_gc_sharded` (reads `gc/state`'s `snap_generation`/`snap_attempt`), `test_cas_gcs` (rewrites and asserts `cas_blob_meta` bodies in its mock), `test_cas_mount_renewal_retry` (reads the lease's `seq` and `write_attempt_id`).
-
-- [ ] **Step 1: Run the lane** per `tests/integration/README.md` (`python -m ci.praktika run "integration" --test <selectors>` from the repository root), one selector per suite so a single stuck suite does not hide the others. Log per suite.
-- [ ] **Step 2: Triage** exactly as Task 1 Step 2, same three classes, same evidence rule. Pay particular attention to the three parser suites: a green run there is the first real proof that phase 2's re-spelling was correct rather than merely consistent.
-- [ ] **Step 3:** Fix class (a), re-run, classify the rest. **Commit:** `cas: follow the wire cut into the integration lane`.
+- [ ] **Step 1: Ruling A — the GC leader's spelling.** The same identity is `lease_owner` in `cas_gc_state` and `owner` in `cas_gc_hb`. Decision criteria, all four to be answered in the record: semantic precision when the object is read alone; redundancy against the containing object's own context; cross-format grep value for the operator question "which server holds GC"; repeated-row byte cost (nil here — both are singletons). Note the nuance before deciding: the heartbeat's owner may name a DEPOSED leader while `gc/state.lease_owner` names the current lease holder (`CasGc.cpp` compares them deliberately), so "same identity type" is not "same current value" — that may argue for or against one spelling, but it must be addressed.
+- [ ] **Step 2: Ruling B — the sequence context.** `cas_gc_hb` took `by`→`owner` but kept `seq`→`hb_seq`, while `cas_mount_lease` kept a bare `seq` under the same context rule. Decide the rule and apply it consistently. This is NOT part of Ruling A.
+- [ ] **Step 3: Ruling C — the namespace's three spellings**: `namespace` (ref log, ref snapshot), `ns` (catalog, deliberate and spec'd), `root_namespace` (part manifest, where the object carries exactly one namespace so `root_` is redundant by the spec's own context rule).
+- [ ] **Step 4: Ruling D — the C++ carrier identifiers.** `ns` names three different wire keys across three codecs, including `PartManifestWire::ns` holding `"root_namespace"`. Whatever C decides, an identifier should name what it holds.
+- [ ] **Step 5: If any ruling changes a key, treat it as a wire cut** — goldens, the affected byte-delta pins, closed-set pins, canonical examples, README row, spec table, external parsers, and a fresh dead-spelling sweep in ALL forms (raw, escaped `rg -F`, bare token, index form `meta["k"]`, and backticked prose — each of those forms caught something phase 2's other forms missed). Unit gate green.
+- [ ] **Step 6: Record all four rulings in the spec**, including the ones that changed nothing, so they are not reopened. **Commit** per ruling. **This task's final commit is the AFTER side for everything below; record its SHA in the report.**
 
 ---
 
-### Task 3: Run the ca-soak scenarios {#task-3}
+### Task 2: Define the lane-failure taxonomy, then run the CAS stateless lane {#task-2}
 
-**Files:** none expected to change; whatever the run convicts.
+**Files:** whatever the run convicts; the taxonomy lives in this task's report and binds Tasks 3 and 4.
 
-`utils/ca-soak` drives real servers against real object storage. Two of its cards manipulate persisted bodies directly and both were touched blind during phase 2: `cards/s38_late_put_injection.py` (restamps a ref-log meta line — it was found still using the pre-cut `ns`/`we`/`rs` because a colon-form grep could not see `meta["we"]`) and `scripts/t8_s44_stuck_removing_discrimination.py` (regex over catalog rows).
+**Interfaces:**
+- Produces: the six-outcome taxonomy Tasks 3 and 4 reuse.
 
-- [ ] **Step 1: Run the scenarios that touch persisted bodies first** — S38, S43 and the T8/S44 discrimination script — since those are the ones phase 2 changed. Follow the soak run conventions recorded in `utils/ca-soak/scenarios/RUN_HISTORY.md`; a fresh restart is required to get a clean mount (host logs survive teardown; `down -v` for a clean remount).
-- [ ] **Step 2: Then run a representative breadth pass** across the remaining cards, enough to exercise each format the cut touched at least once. Do not run all 21 if that costs hours you can spend better; state which you ran and why that set is representative.
-- [ ] **Step 3: Triage** per the three classes. A soak card that now hard-fails at its injection step is class (a) and this plan's work; a scenario whose *conclusion* changed is class (b) and stops the plan.
-- [ ] **Step 4:** Fix, re-run, record. Append the run to `RUN_HISTORY.md` in the project's scenario-results table format (№ / описание / результат / артефакты / фикс). **Commit:** `cas: follow the wire cut into the soak scenarios`.
+- [ ] **Step 1: Fix the taxonomy** (three classes are not enough — the soak history already contains inconclusive, connection-refused, missing-helper and resource failures):
+  - **stale-assertion** — the test spells a pre-cut key or word. This plan fixes it. A repair must name the exact discriminator it now asserts (message, code, field) and show the intended fence was reached, with a control proving no OTHER fence satisfies the assertion. That control is mandatory: a negative test another fence also satisfies is the defect class this campaign hit three times.
+  - **cut-defect** — a real behaviour difference the cut introduced. STOP and report before touching anything; this is the most valuable thing phase 3 can find.
+  - **pre-existing** — fails before the cut too. Proof requires the OLD test code, the OLD binary and the OLD config against a clean pool; running post-cut test code against pre-cut bytes manufactures a failure and proves nothing.
+  - **environment/harness** — docker cleanup, missing service, ports, disk, credentials, timeout. Retryable; record the retry.
+  - **inconclusive** — reproduced neither way. Retryable a bounded number of times, then escalated.
+  - **unclassified** — anything not yet in the five above. **Blocks closure.**
+- [ ] **Step 2: Run the CAS stateless lane.** 57 tests match `tests/queries/0_stateless/*cas*` (04278-04300, 05000-05026). Use the praktika runner per the project instructions (`python3 -m ci.praktika run` with the `--test` selector; note the flag is one space-separated argument and repeats collapse to the last). Log to a file; have a subagent summarise. Do not overlap with a soak run — praktika's post-hooks prune docker.
+- [ ] **Step 3: Classify every failure** per Step 1, fix the stale-assertion ones, re-run. **Commit:** `cas: follow the wire cut into the stateless lane` (body: every test touched and its outcome class).
 
 ---
 
-### Task 4: Extend the benchmark harness to the uncovered formats {#task-4}
+### Task 3: Run the CAS integration lane {#task-3}
+
+**Files:** whatever the run convicts.
+
+Twelve suites match `tests/integration/test_cas_*`. Three parse persisted bodies and were re-spelled in phase 2 without ever being executed: `test_cas_gc_sharded` (reads `gc/state`'s `snap_generation`/`snap_attempt` — phase 2 also made its reader raise on an unreadable-but-present object rather than returning the absent sentinel), `test_cas_gcs` (its mock rewrites and asserts `cas_blob_meta` bodies), `test_cas_mount_renewal_retry` (reads the lease's `seq` and `write_attempt_id`, both deliberately unchanged by the cut).
+
+- [ ] **Step 1: Run per suite**, `python -m ci.praktika run "integration" --test <selector>` from the repository root (see `tests/integration/README.md`), one selector at a time so a stuck suite does not mask the others. Log per suite.
+- [ ] **Step 2: Classify** with Task 2's six outcomes. The three parser suites are the point: a green run there is the first evidence that phase 2's re-spelling was correct rather than merely self-consistent.
+- [ ] **Step 3:** Fix stale assertions, re-run, record. **Commit:** `cas: follow the wire cut into the integration lane`.
+
+---
+
+### Task 4: Run the ca-soak scenarios {#task-4}
+
+**Files:** whatever the run convicts; append the run to `utils/ca-soak/scenarios/RUN_HISTORY.md`.
+
+Two cards manipulate persisted bodies and were edited blind in phase 2: `cards/s38_late_put_injection.py` (restamps a ref-log meta line; it was found still on the pre-cut `ns`/`we`/`rs` because a colon-form grep cannot see `meta["we"]`) and `scripts/t8_s44_stuck_removing_discrimination.py` (regex over catalog rows; phase 2 also made it raise instead of returning an empty catalog when the pattern no longer matches).
+
+- [ ] **Step 1: Read `RUN_HISTORY.md` first** for the run conventions, the status vocabulary and the compose file each scenario needs. Real soak runs use the duration-driven phase, not the quick `--ops` phase; a fresh `down -v` remount is required for a clean mount.
+- [ ] **Step 2: Run the body-touching scenarios first** — S38, S43, and the T8/S44 discrimination script with the sequence `RUN_HISTORY.md` records for it. If that sequence is not recorded there, reconstruct it from the script and WRITE IT DOWN before running, so the run is repeatable.
+- [ ] **Step 3: Then a breadth pass** chosen so every format the cut touched is exercised at least once. State the mapping from chosen scenarios to formats, and say which scenarios you did not run and why. "Representative" without that mapping is not a claim.
+- [ ] **Step 4: Classify** with Task 2's taxonomy. A card that hard-fails at its injection step is stale-assertion; a scenario whose CONCLUSION changed is cut-defect and stops the plan.
+- [ ] **Step 5:** Fix, re-run, append the run to `RUN_HISTORY.md` in its table format (№ / описание / результат / артефакты / фикс). **Commit:** `cas: follow the wire cut into the soak scenarios`.
+
+---
+
+### Task 5: Extend the benchmark harness to all five required formats, on both sides {#task-5}
 
 **Files:**
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp`
+- Create: a recorded patch file for the BEFORE side (see Step 4)
 
-The measurement taken at the phase-2 boundary covers `cas_ref_log` and `RefSnapshot` only, because that is all the harness measures. The design's measurement paragraph names five inputs; three have no coverage at all, and the spec says to reach them by EXTENDING this harness rather than adding a second one.
-
-- [ ] **Step 1: Add encode and decode benchmarks** for `PartManifest` (a realistic entry mix: blob entries plus inline entries with payload), `FoldSeal` (with a realistic distribution of `ref_life` row variants — base, hold-bearing, cleanup-evidence — since their per-row costs differ by 33 and 16 bytes), `RefCatalog`, and raw `cas_run` streaming (the format whose active row is the cheapest and whose volume is the highest). Follow the file's existing shape: `->RangeMultiplier(10)->Range(100, 100000)->Complexity()`.
-- [ ] **Step 2:** Build with `-DENABLE_BENCHMARKS=ON` and run once to confirm the new benchmarks produce sane numbers and complexity fits. Do not record results yet — Task 5 takes the measurement.
-- [ ] **Step 3:** Update the file's header comment: it carries a baseline table from 2026-07-21 that predates this design. Say plainly that those figures are pre-wire-keys, so nobody reads them as the before side. **Commit:** `cas: extend the ref-protocol benchmark to the formats the wire cut left unmeasured`.
-
----
-
-### Task 5: Take the full before/after measurement {#task-5}
-
-**Files:** Create `docs/superpowers/cas/2026-XX-XX-wire-keys-full-measurement.md` (date it the day it runs); add raw JSON beside the existing `docs/superpowers/cas/bench-wire-keys-phase2/`.
+The spec names five inputs and both directions. The harness today measures `cas_ref_log` and `RefSnapshot` encode plus some state-machine paths; `PartManifest`, `FoldSeal`, `RefCatalog` and raw `cas_run` streaming have no coverage at all, and DECODE is missing for most of what exists — while the design says decode throughput is the primary evidence.
 
 **Interfaces:**
-- Consumes: the extended harness from Task 4; the pre-cut worktree at `/home/mfilimonov/workspace/ClickHouse/cas-p2-before` (detached at `65ec8688cdb`, `contrib` symlinked to the main checkout — verified identical, since no submodule moved across the phase).
-- Produces: the measurement the spec's acceptance criteria require.
+- Produces: encode AND decode benchmarks for `cas_run`, `RefSnapshot`, `PartManifest`, `FoldSeal`, `RefCatalog`, plus the fixture layer Task 6 measures through.
 
-- [ ] **Step 1: Cherry-pick the harness extension onto the BEFORE side.** The new benchmarks must exist on both sides or there is nothing to compare. Apply Task 4's benchmark file to the pre-cut worktree WITHOUT any other phase-2 change — the point is to measure the old codecs through the new harness. Record exactly what you applied.
-- [ ] **Step 2: Run both sides back to back on a QUIET machine**, `--benchmark_repetitions=3 --benchmark_report_aggregates_only=true`, and record `load_avg` for each run from the JSON. If the two sides' loads differ materially, the run is void — take it again. This is not pedantry: the phase-2 measurement was taken at 16.09 versus 3.04 and only a reviewer's check caught it.
-- [ ] **Step 3: Byte accounting, which the throughput run does not give you.** For each of the five formats, at a realistic record count: decompressed bytes before and after, stored `.zst` bytes before and after, and the maximum record count that fits under each object cap before and after. The encoders are the oracle — measure, do not compute from the delta table.
-- [ ] **Step 4: Records per second** for encode and decode of each format, derived from the timings and record counts.
-- [ ] **Step 5: Write the document.** Lead with the conditions (both sides' loads, `cpu_scaling_enabled`, the commits), then the tables, then a reading that says what the numbers mean rather than restating them. State plainly what is NOT covered. **Commit:** `docs: the wire cut's full before/after measurement`.
+- [ ] **Step 1: Define the workloads explicitly in code comments**, because a measurement whose input shape is undocumented cannot be repeated: for each format, the record count range, the field-value widths, and — for `FoldSeal` — the proportion of base, hold-bearing and cleanup-evidence `ref_life` rows, since those three shapes differ by 33 and 16 bytes and a seal made only of base rows would understate the cost. Follow the file's existing `->RangeMultiplier(10)->Range(100, 100000)->Complexity()` shape.
+- [ ] **Step 2: Add encode and decode benchmarks** for all five. Decode must consume real encoder output, not a hand-built string.
+- [ ] **Step 3: The byte and cap oracle.** Add a small non-benchmark harness (or a gtest in the benchmark's own file guarded off the timing path) that, per format at a stated record count, reports: decompressed bytes, stored bytes after the format's real compression (and explicitly `n/a` for formats stored raw — say which those are rather than reporting a zero), and the maximum record count that fits under the format's object cap, found by the real encoder rather than computed from the delta table. State the search algorithm (binary search on record count against the cap, encoder as oracle).
+- [ ] **Step 4: Make the harness build on BOTH sides.** A straight copy will NOT compile at `65ec8688cdb`: `RefCoverage::classification` is `uint8_t` there and `CoverageClass` here, and the pre-cut worktree is not clean (its `contrib` is a symlink and tracked entries read as deleted, so `git cherry-pick` has no clean precondition). Choose one and record it: (a) keep the benchmark bodies identical and put the two public APIs behind a tiny side-local fixture adapter, applying the harness to the BEFORE side with `git apply` of a recorded patch; or (b) write the fixtures against only the API both sides share. Build BOTH sides before any measurement and record compiler, flags, patch hash and binary hashes.
+- [ ] **Step 5:** Correct the file's header: its baseline table is from 2026-07-21 and predates this design, so it is not the before side. **Commit:** `cas: extend the ref-protocol benchmark to every format and direction the design measures`.
 
 ---
 
-### Task 6: Cross-check the constexpr descriptor bound against the real encoder {#task-6}
+### Task 6: Take the full before/after measurement {#task-6}
 
-**Files:** Modify `src/Disks/tests/gtest_cas_blob_envelope_format.cpp` if the check is incomplete.
+**Files:** Create `docs/superpowers/cas/<date>-wire-keys-full-measurement.md` (frontmatter + anchored headings); raw data under `docs/superpowers/cas/bench-wire-keys-phase3/`.
 
-Phase 2 landed `static_assert(kMandatoryDescriptorWorstCase <= kMinBlobHeaderLen - 1)` and a boundary test. The spec asks for the two halves to meet: the compiler proves the formula, the test proves the formula describes the encoder.
+**Interfaces:**
+- Consumes: Task 5's harness on both sides; Task 1's final vocabulary commit as the AFTER side; `/home/mfilimonov/workspace/ClickHouse/cas-p2-before` (detached at `65ec8688cdb`) as the BEFORE side.
 
-- [ ] **Step 1: Establish what the existing test actually proves.** It pins the ENCODER-REACHABLE budget (10 bytes at the 240 floor), not the type-level bound (1 byte), because no public API can widen the version field to its `uint32` maximum. Confirm that reasoning still holds and that the gap is exactly the unused version digits.
-- [ ] **Step 2: Close the remaining half if it is open.** The `<=` assert cannot catch an UNDERSTATED formula — shrinking a component would drop the sum with both the assert and the test still green. Decide whether that matters: the case that matters operationally is growth, which is caught twice. If you conclude it needs closing, the cheapest honest closure is a test that reconstructs the worst case from the encoder's own maximum-width output and compares it to the constant. Record the ruling either way.
-- [ ] **Step 3:** Build + gate. **Commit** only if something changed.
+- [ ] **Step 1: Validity protocol, fixed before running.** Both sides: same compiler, same flags, same machine, back to back, `--benchmark_repetitions=3 --benchmark_report_aggregates_only=true`. Record `load_avg` and `cpu_scaling_enabled` from each JSON. VOID conditions (from the Global Constraints): sides' 1-minute loads differing by more than 1.0, or either above 2.0. A void run is preserved under `bench-wire-keys-phase3/void/` with a manifest saying why — never overwritten, so the record shows what was rejected.
+- [ ] **Step 2: Throughput**, encode and decode, all five formats, both sides.
+- [ ] **Step 3: Byte accounting** through Task 5's oracle: decompressed bytes, stored bytes (or explicit `n/a`), and maximum records under each cap, before and after.
+- [ ] **Step 4: Records per second** for encode and decode of each format.
+- [ ] **Step 5: Write the document**: conditions first (commits, loads, scaling, flags, binary hashes), then the tables, then a reading that says what the numbers mean. State what is not covered.
+- [ ] **Step 6: If a measurement CONTRADICTS a design claim** — a cost materially larger than the accepted single-digit percent, a cap maximum that falls further than the design's capacity note allows, a complexity class that changed — STOP. That is a finding for the spec, not a number to record and move past. Say so in the report and escalate. **Commit:** `docs: the wire cut's full before/after measurement`.
 
 ---
 
 ### Task 7: Review the generated assembly of the hot paths {#task-7}
 
-**Files:** none; the deliverable is the review, recorded in the measurement document from Task 5.
+**Files:** the verdict goes into Task 6's measurement document; raw tool output under `bench-wire-keys-phase3/asm/`.
 
-The design's stated dominant risk is the longer keys themselves. Its stated secondary risk is that the enum tables and match helpers might add to that cost — this task is what rules that out.
+The design's dominant risk is the longer keys themselves; its secondary risk is that the enum tables and match helpers add to that. This task rules the secondary risk in or out.
 
-- [ ] **Step 1: Disassemble and review** the hot `toWord` instances (the `cas_run` marker first — it renders a word on every row) and the hot match helpers (`cas_run` token matching, `PartManifest` blob matching). Use the repository's `.claude/tools/analyze-assembly.py` (it disassembles, builds a CFG and reports spill/branch/call density; prefer it to raw `llvm-objdump`). Compare against the pre-cut binary in the worktree with the tool's `--before`/`--after` diff mode.
-- [ ] **Step 2: State the verdict** in the measurement document: whether the tables compile to the indexed lookup the design assumes, whether the match helpers stayed inline with no added call or allocation, and whether anything spilled that did not before. A finding here is a design-level concern, not a nitpick.
-
----
-
-### Task 8: Settle the vocabulary questions phase 2 raised {#task-8}
-
-**Files:** the codecs named below; `docs/superpowers/specs/2026-08-28-cas-semantic-wire-keys-design.md` if a decision changes the spec.
-
-Three naming questions came out of the phase-2 final review. They are spec-level decisions, not implementation deviations, and phase 3 is the last cheap moment to settle them — after this the vocabulary is pinned by measurement documents and operator habit.
-
-- [ ] **Step 1: The GC leader's two spellings.** The same identity is `lease_owner` in `cas_gc_state` and `owner` in `cas_gc_hb`. The spec's own justification for unifying `condemn_round` applies verbatim: two spellings for one concept defeat cross-format grep, and "which server holds GC" is a real operator question. Decide: unify (and which way), or record why this pair is different from `condemn_round`. Related and part of the same decision: `cas_gc_hb` applied the context rule to `by`→`owner` but not to `seq`→`hb_seq`, while `cas_mount_lease` kept a bare `seq` under that same rule.
-- [ ] **Step 2: The namespace's three spellings** — `namespace` (ref log, ref snapshot), `ns` (catalog, deliberate and spec'd), `root_namespace` (part manifest). A part manifest carries exactly one namespace, so `root_` is redundant by the spec's own opening context rule. Decide and record.
-- [ ] **Step 3: The `ns` identifier names three different wire keys** across three codecs, including `PartManifestWire::ns` holding `"root_namespace"`. Whatever Step 2 decides, the C++ identifier should name what it holds.
-- [ ] **Step 4:** If any step changes a key, it is a wire change: update the goldens, the byte-delta pins, the closed-set pins, the README row, and the spec table in the same commit, and re-run the external lanes that read that format. If a step decides to keep what is there, record the reason in the spec so the question is not reopened. **Commit** per decision.
+- [ ] **Step 1: Locate the symbols.** The interesting helpers are `inline` and may not survive as standalone symbols — name the ENCLOSING symbols to disassemble (the `cas_run` row writer and its record reader, `PartManifest`'s entry writer/reader) rather than only the helper names, and say how you confirmed you are looking at the right code.
+- [ ] **Step 2: Compare both sides** with `.claude/tools/analyze-assembly.py` in `--before`/`--after` mode (it builds a CFG and reports spill/branch/call density; prefer it to raw `llvm-objdump`).
+- [ ] **Step 3: State the verdict against three explicit conditions**: the `toWord` instances compile to the indexed lookup the design assumes (not a scan); the match helpers added NO call, NO allocation and NO branch beyond the comparisons the pre-cut chains made; nothing spills that did not spill before. A failure of any one is a design-level finding.
+- [ ] **Step 4: Disposition.** If the verdict is negative, it blocks acceptance until either the code is fixed or the spec's claim is amended — record which. Do not record a negative verdict as a caveat and continue.
 
 ---
 
-### Task 9: Discharge the remaining backlog items this campaign created {#task-9}
+### Task 8: Close the descriptor proof {#task-8}
 
-**Files:** per item; all are named in the `## Inbox` of `docs/superpowers/cas/BACKLOG.md`.
+**Files:** `src/Disks/tests/gtest_cas_blob_envelope_format.cpp`, and whatever narrow seam Step 2 needs.
 
-- [ ] **Step 1: The three hand enumerations of `BlobHashAlgo`** against one proven table: `algoFromByte` in the record stream (its byte side is now round-trip tested but still hand-written) and the candidate loop in `CasLayout.cpp` (untested). Re-anchor both on the table, or record why one cannot be.
-- [ ] **Step 2: `writeWordField` and `writeStringField` have identical bodies**, and five wire-table words go through the string helper. Either give the word helper a contract the string helper does not have (it takes a table word, so it could assert that) or drop one of them. Whichever you choose, the five call sites should be consistent afterwards.
-- [ ] **Step 3: The prose sweeps** the campaign accumulated: the tree-wide `this task`/`this same cut` citations, the remaining internal-reference comments, and the stale-generation narrative in `gtest_cas_namespace_life_id.cpp`. These are one mechanical pass.
-- [ ] **Step 4:** Build + gate. **Commit** per group, not one commit for everything.
+The spec requires two independent halves: the compiler proves the formula, and a test proves the formula describes the ENCODER. Today the `static_assert` proves the bound, and the boundary test pins the encoder-REACHABLE budget (10 bytes at the floor) — which is a different quantity from the type-level 239-byte worst case, because no public API can widen the version field to its `uint32` maximum. The remaining gap is real and asymmetric: the `<=` assert cannot catch an UNDERSTATED formula, so a shrunken component would pass both halves.
 
----
-
-### Task 10: Close revision 14 {#task-10}
-
-**Files:** Modify `docs/superpowers/specs/2026-08-28-cas-semantic-wire-keys-design.md` (revision history and, if a Task-8 decision changed anything, the affected tables).
-
-- [ ] **Step 1: Walk the acceptance-criteria list item by item** and record, for each, the artifact that discharges it — a test name, a document, a commit. An item with no artifact is not accepted, however obviously true it looks.
-- [ ] **Step 2: Record the phase-3 outcome in the spec's revision history**: what was measured, what was executed, what was settled, and what — if anything — the measurements changed about the design's claims.
-- [ ] **Step 3: Report** the campaign's end state: the three phases, the gate count, the measured cost, the external lanes' status, and anything deliberately left open with its reason. **Commit:** `docs: record the wire-keys campaign's acceptance evidence`.
+- [ ] **Step 1: Build the independent oracle.** Reconstruct the mandatory worst case from the REAL encoder's maximum-width output — not by re-deriving the key-cost arithmetic, which would compare the formula to a copy of itself. That requires rendering a descriptor whose version field is at its type maximum; if the version stamp is file-local, add the narrowest possible test seam and say plainly in the comment that it exists for this proof.
+- [ ] **Step 2: Pin what the spec names**: the 239-byte mandatory shape, the one-byte `ref` budget at the 240 floor and the 17-byte budget at the 256 default, both at type maxima. Keep the existing reachable-budget test — the two measure different things and the file must say which is which.
+- [ ] **Step 3:** Build + gate. **Commit:** `cas: prove the descriptor formula against the encoder, not against itself`. A documentation-only outcome is NOT acceptable here; the spec's acceptance text requires the independent confirmation.
 
 ---
 
-## Self-Review (performed at write time) {#self-review}
+### Task 9: Discharge the backlog items this campaign created {#task-9}
 
-- **Spec coverage.** Implementation-shape item 3 has three clauses: the constexpr cross-check → Task 6; the byte-delta and throughput measurements → Tasks 4, 5 and 7 (throughput, byte accounting, records/sec, assembly); the sweep of raw assertions in integration tests and `utils/ca-soak` → phase 2 did the SPELLING, Tasks 1-3 do the EXECUTION, which is what the acceptance criterion actually requires. Acceptance criteria 1-8 and 10 were satisfied by phase 2 (verified in its gate audit); criterion 9 is Tasks 1-3; criterion 11 is Tasks 4, 5 and 7; Task 10 walks the whole list and records the evidence. Task 8 settles what the phase-2 reviews raised and deliberately deferred; Task 9 clears the campaign's own backlog residue.
-- **Placeholder scan.** No TBDs. Two tasks deliberately do not prescribe an outcome — Task 6 Step 2 and Task 8 — because they are rulings, and each says what must be recorded either way. The lane tasks name the specific tests known to parse persisted bodies, so a runner has a starting point rather than only a directory.
-- **Type consistency.** No new production interfaces. Task 4 extends an existing harness in its existing shape; Task 5 consumes it on both sides; Task 7 reads binaries the earlier tasks built. The pre-cut worktree is named once and reused by Tasks 1, 5 and 7.
-- **Ordering.** Tasks 1-3 are independent of 4-7 and can run in either order; 5 depends on 4, 7 depends on 5's binaries, 10 depends on everything. Task 8 should precede Task 5's final numbers if it changes a key, which is why it is placed before Task 10 but flagged as wire-affecting.
+**Files:** per item, all named in the `## Inbox` of `docs/superpowers/cas/BACKLOG.md`.
+
+Each item is discharged only when EVERY clause of its bullet is done — phase 2 struck a two-clause item having done one clause, and the surviving half was a wrong number in a production header that nothing then tracked. Re-read each bullet before striking it, and strike it in the same commit as the fix.
+
+- [ ] **Step 1: The three hand enumerations of `BlobHashAlgo`** against one proven table: `algoFromByte` in the record stream (byte side now round-trip tested but still hand-written) and the candidate loop in `CasLayout.cpp` (untested). Re-anchor both on the table, or record why one cannot be.
+- [ ] **Step 2: `writeWordField` and `writeStringField` have identical bodies** and five wire-table words go through the string helper. Give the word helper a contract the string helper lacks, or drop one; leave the five call sites consistent either way.
+- [ ] **Step 3: The prose sweeps**: the tree-wide `this task`/`this same cut` citations, the remaining internal-reference comments, and the stale-generation narrative in `gtest_cas_namespace_life_id.cpp`.
+- [ ] **Step 4:** Build + gate. **Commit** per group.
+
+---
+
+### Task 10: The acceptance matrix {#task-10}
+
+**Files:** Create `docs/superpowers/cas/<date>-wire-keys-acceptance.md` (frontmatter + anchored headings); modify the spec's revision history to link it.
+
+- [ ] **Step 1: Build the matrix — one row per acceptance criterion** (eleven), each with: the exact requirement, the artifact that discharges it (a commit SHA, a test name, a document path, a log path, a raw-data path — never a deleted workspace path), the result, any caveat, and the disposition. A criterion with no artifact is not discharged, however obviously true it looks.
+- [ ] **Step 2: Two supporting matrices** — one row per external lane with its outcome classes and counts, and one row per format per measured metric.
+- [ ] **Step 3: The closure rule, stated and applied.** ACCEPTED requires every criterion row to be PASS, or an explicit spec revision that changes the requirement. Any of the following leaves revision 14 NOT ACCEPTED: an OPEN row, an `unclassified` lane failure, a VOID measurement with no valid replacement, a negative assembly verdict, or a measurement that contradicts a design claim. Say which state the campaign is in and why.
+- [ ] **Step 4: Record the outcome in the spec's revision history** — a summary and a link to the matrix, not the matrix itself. **Commit:** `docs: the wire-keys campaign's acceptance evidence`.
+
+---
+
+## Self-Review (performed at write time; revision 2 after external review) {#self-review}
+
+- **Ordering is the substantive change in revision 2.** The vocabulary rulings were Task 8 and are now Task 1: a key changed after a measurement invalidates the measurement, the lane runs and the disassembly, and "rerun the external readers" does not cover that. Everything below Task 1 cites Task 1's final commit as its AFTER side.
+- **Spec coverage.** Implementation-shape item 3: the constexpr/encoder cross-check → Task 8, now mandatory with a named oracle (revision 1 allowed a documentation-only ruling, which the acceptance text does not); byte-delta and throughput → Tasks 5-6, now covering all five formats in BOTH directions with a defined workload, a stated byte/cap oracle, and quantitative void conditions; the raw-assertion sweep → phase 2 discharged the SPELLING (criterion 9's literal text) and Tasks 2-4 add execution as separate confidence evidence, which Task 10 records as two distinct rows. Assembly review → Task 7, now with three explicit conditions and a blocking disposition.
+- **Placeholder scan.** No TBDs. Dates in output paths are written as `<date>` deliberately — they are stamped when the task runs. Task 1 and Task 8 Step 1 leave OUTCOMES open by design; each states the criteria to decide on and requires the reasoning to be recorded either way.
+- **What could still be missed.** The lane tasks cannot prove absence of a defect in a format no lane exercises; Task 4 Step 3 requires the scenario-to-format mapping precisely so that gap is visible rather than assumed. The measurement cannot see costs outside encode/decode (object-store round trips, GC scan time); that is stated in Task 6 Step 5 as not covered rather than left to a reader's assumption.
+- **Type consistency.** No new production interfaces except the narrowest possible test seam Task 8 may need, which that task must justify in a comment. Task 5 produces the fixture layer and the byte/cap oracle; Task 6 consumes both; Task 7 reads the binaries Task 6 built.
