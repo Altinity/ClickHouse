@@ -4,6 +4,7 @@
 #include <Formats/FormatSettings.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
+#include <base/find_symbols.h>
 #include <base/hex.h>
 #include <base/scope_guard.h>
 #include <algorithm>
@@ -166,9 +167,29 @@ auto JsonObjectReader::guarded(F && f)
 }
 
 JsonObjectReader::JsonObjectReader(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_)
-    : in(in_), strictness(strictness_), what(what_)
+    : in(&in_), strictness(strictness_), what(what_)
 {
-    guarded([&] { assertChar('{', in); });
+    guarded([&] { assertChar('{', *in); });
+}
+
+void JsonObjectReader::reset(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_)
+{
+    in = &in_;
+    strictness = strictness_;
+    what = what_;
+    /// `clear` on both keeps their buffers: that is the whole point of reusing the reader.
+    seen_keys.clear();
+    scratch.clear();
+    first = true;
+    done = false;
+    guarded([&] { assertChar('{', *in); });
+}
+
+std::string_view JsonObjectReader::readStringIntoScratch()
+{
+    scratch.clear();
+    readJSONStringInto(scratch, *in, jsonReadSettings());
+    return scratch;
 }
 
 bool JsonObjectReader::nextKey(String & key)
@@ -180,7 +201,7 @@ bool JsonObjectReader::nextKey(String & key)
         if (first)
         {
             first = false;
-            if (checkChar('}', in))
+            if (checkChar('}', *in))
             {
                 done = true;
                 return false;
@@ -188,15 +209,15 @@ bool JsonObjectReader::nextKey(String & key)
         }
         else
         {
-            if (checkChar('}', in))
+            if (checkChar('}', *in))
             {
                 done = true;
                 return false;
             }
-            assertChar(',', in);
+            assertChar(',', *in);
         }
-        readJSONString(key, in, jsonReadSettings());
-        assertChar(':', in);
+        readJSONString(key, *in, jsonReadSettings());
+        assertChar(':', *in);
         if (std::find(seen_keys.begin(), seen_keys.end(), key) != seen_keys.end())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: duplicate key '{}'", what, key);
         seen_keys.push_back(key);
@@ -209,7 +230,7 @@ String JsonObjectReader::readString()
     return guarded([&]
     {
         String s;
-        readJSONString(s, in, jsonReadSettings());
+        readJSONString(s, *in, jsonReadSettings());
         return s;
     });
 }
@@ -219,18 +240,18 @@ std::vector<String> JsonObjectReader::readStringArray()
     return guarded([&]
     {
         std::vector<String> words;
-        assertChar('[', in);
-        if (checkChar(']', in))
+        assertChar('[', *in);
+        if (checkChar(']', *in))
             return words;
 
         while (true)
         {
             String word;
-            readJSONString(word, in, jsonReadSettings());
+            readJSONString(word, *in, jsonReadSettings());
             words.push_back(std::move(word));
-            if (checkChar(']', in))
+            if (checkChar(']', *in))
                 return words;
-            assertChar(',', in);
+            assertChar(',', *in);
         }
     });
 }
@@ -239,7 +260,7 @@ UInt128 JsonObjectReader::readHex128()
 {
     return guarded([&]
     {
-        const String hex = readString();
+        const std::string_view hex = readStringIntoScratch();
         if (hex.size() != 32 || std::any_of(hex.begin(), hex.end(), [](char c) { return !isLowercaseHexChar(c); }))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: expected 32 lowercase hex chars, got '{}'", what, hex);
         return unhexUInt<UInt128>(hex.data());
@@ -250,7 +271,7 @@ uint64_t JsonObjectReader::readU64String()
 {
     return guarded([&]
     {
-        const String s = readString();
+        const std::string_view s = readStringIntoScratch();
         ReadBufferFromMemory buf(s.data(), s.size());
         uint64_t v = 0;
         readIntText(v, buf);
@@ -265,7 +286,7 @@ uint64_t JsonObjectReader::readU64Number()
     return guarded([&]
     {
         uint64_t v = 0;
-        readIntText(v, in);
+        readIntText(v, *in);
         return v;
     });
 }
@@ -282,9 +303,9 @@ bool JsonObjectReader::readBool()
 {
     return guarded([&]
     {
-        if (checkString("true", in))
+        if (checkString("true", *in))
             return true;
-        assertString("false", in);
+        assertString("false", *in);
         return false;
     });
 }
@@ -298,7 +319,7 @@ void JsonObjectReader::skipUnknown(const String & key)
                 "CAS {}: critical key '{}' is not understood by this build", what, key);
         if (strictness == KeyStrictness::Strict)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown key '{}' in a strict format", what, key);
-        skipJSONField(in, key, jsonReadSettings());
+        skipJSONField(*in, key, jsonReadSettings());
     });
 }
 
@@ -325,21 +346,42 @@ void writeTrailerLine(CasJsonWriter & out, uint64_t n)
     writeChar('\n', out);
 }
 
-String readLine(ReadBuffer & in, uint64_t line_cap, std::string_view what)
+void readLineInto(ReadBuffer & in, String & line, uint64_t line_cap, std::string_view what)
 {
-    String line;
+    /// `clear` keeps the capacity, so a caller that reuses one scratch across a stream's rows stops
+    /// allocating after the longest line it has seen -- the same bound the writer's scratch has.
+    line.clear();
     while (true)
     {
         if (in.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: truncated object (line without terminator)", what);
-        const char c = *in.position();
-        ++in.position();
-        if (c == '\n')
-            return line;
-        line.push_back(c);
-        if (line.size() > line_cap)
+
+        /// Take the whole run up to the terminator in one append rather than a byte at a time: a
+        /// per-character `push_back` also re-checks the cap on every character, and a stream row is
+        /// hundreds of characters long.
+        const char * const from = in.position();
+        const char * const found = find_first_symbols<'\n'>(from, in.buffer().end());
+        const size_t taken = static_cast<size_t>(found - from);
+        if (line.size() + taken > line_cap)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: line exceeds the {}-byte cap", what, line_cap);
+        line.append(from, taken);
+        in.position() += taken;
+
+        /// `find_first_symbols` stops either at the terminator or at the end of the buffered window.
+        /// Only the first case ends the line; the second needs the next window.
+        if (found != in.buffer().end())
+        {
+            ++in.position();
+            return;
+        }
     }
+}
+
+String readLine(ReadBuffer & in, uint64_t line_cap, std::string_view what)
+{
+    String line;
+    readLineInto(in, line, line_cap, what);
+    return line;
 }
 
 namespace

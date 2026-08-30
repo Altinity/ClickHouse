@@ -242,9 +242,12 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     if (done)
         return false;
 
-    const String line = readLine(hashing, traitsFor(FormatId::RunFile).line_cap, "cas_run");
-    ReadBufferFromMemory line_in(line.data(), line.size());
-    JsonObjectReader r(line_in, KeyStrictness::Strict, "cas_run");
+    readLineInto(hashing, scratch, traitsFor(FormatId::RunFile).line_cap, "cas_run");
+    ReadBufferFromMemory line_in(scratch.data(), scratch.size());
+    /// Re-point the reader rather than building one per row: a fresh reader re-allocates its
+    /// seen-key store and value scratch every row, and this loop runs once per record.
+    reader.reset(line_in, KeyStrictness::Strict, "cas_run");
+    JsonObjectReader & r = reader;
 
     String key;
     if (!r.nextKey(key))
