@@ -7,6 +7,13 @@ title: 'CAS wire keys — the full before/after measurement'
 doc_type: 'reference'
 ---
 
+> **SUPERSEDED by `2026-08-30-wire-keys-final-measurement.md`.** The numbers here compare a pre-cut
+> build against a post-cut one at a time when neither carried the decode optimisation. That is still
+> a valid comparison of the two spellings *as they then stood*, but it is not the campaign's answer:
+> the optimisation has since landed, both sides have been rebuilt with it, and the cut's cost has
+> been re-measured on equal footing. The replacement also separates the cut, the optimisation and
+> their net effect, which this document does not.
+
 # CAS wire keys — the full before/after measurement {#cas-wire-keys-the-full-before-after-measurement}
 
 What renaming the wire keys of all seventeen CAS persisted formats cost in bytes and in time.
