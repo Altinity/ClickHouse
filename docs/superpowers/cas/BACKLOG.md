@@ -62,11 +62,7 @@ is fine. They get triaged into the topic files above during the next grooming pa
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 isn't referenced elsewhere first.
 
-- LATER PHASE (wire-keys, Formats/CasLayout.cpp blobRefFromKey): hand-rolled reimplementation of kBlobHashAlgoWords.fromWord ("one name authority" comment now stale) — replacing is a nullopt→throw posture flip needing a wedge audit of every caller; do not do casually.
 
-- PROSE key mentions in COMMENTS (wire-keys phase 2 lesson, sweep once at the end): every per-task sweep searched quoted key forms (`"ch":`, `\"ch\":`, `"ch"`) and therefore could not see keys named in prose with backticks or bare words — that is how `\`ch\`` / `\`bld\`` survived in `CasInspect.cpp` and `ContentAddressedTransaction.cpp` after the descriptor rename. A closing sweep must also grep backticked and bare mentions of every retired spelling in comments and messages.
-- CODE (wire-keys phase-2 leftover): `writeWordField` and `writeStringField` have IDENTICAL bodies, and five wire-table words are written through the string helper — mostly pre-existing, phase 2 added the `class` one. Either give the word helper a distinguishing contract or drop one.
-- CODE (wire-keys, three enumerations against one proven table): `BlobHashAlgo` is enumerated by hand in `algoFromByte` (record stream) and in `CasLayout.cpp`'s candidate loop, beside the one table that is proven exhaustive. The byte side is now round-trip tested; the layout loop is not. Re-anchor both on the table.
 
 The eleven items below are untouched since the 2026-08-04 consolidation-audit findings that produced
 them; the nine below those are the "found during the 2026-08 documentation consolidation" batch from
