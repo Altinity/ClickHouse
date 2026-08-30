@@ -9,6 +9,17 @@ doc_type: 'reference'
 
 # CAS wire keys — acceptance evidence {#cas-wire-keys-acceptance-evidence}
 
+> **SUPERSEDED, 2026-08-30.** An external review of the whole campaign found this matrix's verdict
+> wrong. Criteria 5 and 6 are **not** discharged, and 3, 8 and 11 only partially; the campaign is
+> **NOT ACCEPTED**. Two of this document's own claims are false as written: criterion 5's "the
+> battery's fifteen format test files carry literal byte strings" (the common golden helper derives
+> the version byte from production code), and criterion 6's `toWord` amendment, which reads the
+> criterion's "match helpers inline" as covering an encode-side enum lookup — the criterion's match
+> helpers are the three `match*Fields` functions and all three are inline. Criterion 11 is
+> additionally suspended because the two measured binaries were built with different ISA baselines
+> and frame-pointer settings. See the spec's Acceptance section for the current state; this document
+> is being re-issued after the re-measurement and the code fixes.
+
 One row per acceptance criterion in revision 14 of
 `docs/superpowers/specs/2026-08-28-cas-semantic-wire-keys-design.md`, with the artifact that
 discharges it. A criterion with no artifact is not discharged, however obviously true it looks —

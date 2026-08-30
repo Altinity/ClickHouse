@@ -1155,21 +1155,37 @@ The change is complete when:
 
 ## Acceptance {#acceptance-outcome}
 
-Revision 14 is **ACCEPTED** as of 2026-08-30. The per-criterion evidence is in
-`docs/superpowers/cas/2026-08-30-wire-keys-acceptance.md`, which cites a commit, a test name, a
-`static_assert` or a committed document for each of the eleven criteria, and states the closure rule
-it applies.
+Revision 14 is **NOT ACCEPTED** as of 2026-08-30. An external review of the whole campaign
+(`tmp/codex-campaign-review.md`, model gpt-5.6-sol at high effort) found that criteria 5 and 6 are
+not discharged and that 3, 8 and 11 are only partially discharged. The per-criterion state is in
+`docs/superpowers/cas/2026-08-30-wire-keys-acceptance.md`, which the review's findings supersede
+where they disagree.
 
-Two criteria pass with an amendment owed to this document rather than to the code:
+An earlier version of this section claimed two amendments were owed to this document. **The first
+was wrong and is retracted.** It read the criterion's phrase "the match helpers inline" as covering
+`EnumWireTable::toWord`, which does not inline. The criterion's match helpers are the three
+`match*Fields` functions for the shared value types, and all three are header-defined `inline` with
+a comment saying why (`Formats/CasWireVocab.h`). `toWord` is an encode-side enum lookup and is not
+one of them. No amendment is owed on that point, and the document was correct as written.
 
-- The match-helper criterion says the helpers are **inline**. `toWord` is not: it survives as
-  `call <EnumWireTable<RunMarker, 3>::toWord>` on the encode path. The behaviour the criterion
-  protects does hold — the hot decode path gained no call, allocation or branch, lost a
-  `std::string` copy constructor, and its branch count fell — but the word is wrong and should be
-  read as "adds no call on hot decode paths" rather than as a claim about inlining.
-- The measurement criterion carried an implicit expectation that nothing new would spill. Spills
-  rose on every symbol inspected, by 3.75 percentage points on the `cas_run` decode path, and that
-  is the most likely mechanism behind the only part of the decode cost that byte growth does not
-  account for. It does not contradict this document's actual claim — that the dominant cost is the
-  longer keys themselves, which five rows of byte-normalized data confirm — but the expectation was
-  unstated and unmet, and the follow-up is filed as `[cas-decode-register-pressure]`.
+The second amendment is also withdrawn pending re-measurement: the spill finding it rested on came
+from a comparison whose two binaries were built with different flags, so it is not yet known whether
+anything new spills at all.
+
+What actually blocks acceptance:
+
+- **Criterion 5.** The common golden helper derives the expected header's version byte from the
+  production `currentCompatibilityVersion` rather than spelling it literally, so a production
+  generation change would move encoder output and expectation together — the coupling this criterion
+  exists to forbid.
+- **Criterion 6.** The match-helper clause holds, but the field-helper mandate does not: the shared
+  token, blob-ref and manifest-ref writers, every ref-catalog row, the checkpoint `life_epoch` and
+  the non-`ref` envelope fields all emit a key followed by a raw value call instead of using the
+  per-encoding field helpers. The exemption this document grants covers only the envelope `ref`
+  writer and the payload zones.
+- **Criterion 3.** The boundary test never sends a maximum-width version through the encoder; it
+  encodes the current one-digit version and adds the remaining digits arithmetically.
+- **Criteria 8 and 11.** Evidence gaps rather than defects: no retained execution log for the unit
+  battery, no retained raw output for the byte and capacity oracle, and — the reason 11 is
+  suspended outright — the two measured binaries were compiled with different ISA baselines and
+  frame-pointer settings, so neither the timing nor the assembly comparison is currently valid.
