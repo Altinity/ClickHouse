@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <base/types.h>
@@ -33,6 +34,14 @@ enum class ProvenanceOp : uint8_t
 };
 
 /// Returns the persisted wire word for a validated provenance operation.
+/// The largest descriptor `encodeEnvelopeHeader` can ever produce before the diagnostic `ref` gets any
+/// budget: every mandatory field at its type maximum, the longest provenance word, the `ref` framing
+/// with empty quotes, the closing brace and the trailing newline. A `static_assert` beside its
+/// definition proves it fits under `kMinBlobHeaderLen`; this declaration exists so the boundary test
+/// can confirm the SAME number against bytes the encoder actually produced, which is the half a
+/// compile-time proof cannot do — an understated formula satisfies the assert quite happily.
+extern const size_t mandatory_descriptor_worst_case;
+
 std::string_view provenanceOpToWireWord(ProvenanceOp op);
 
 /// Its fail-closed inverse: an unknown word is `CORRUPTED_DATA`.
