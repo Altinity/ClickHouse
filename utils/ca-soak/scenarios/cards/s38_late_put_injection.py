@@ -56,6 +56,7 @@ minutes; ci/full scale up the storm.
 """
 
 import json
+import re
 import threading
 import time
 
@@ -73,6 +74,13 @@ _TABLE = "s38_handover"
 _S3_ENDPOINT = "http://localhost:18121"
 _S3_BUCKET = "test"
 _POOL_PREFIX = "soak_pool"   # matches observe.POOL_DIR / storage_conf.xml's endpoint sub-path
+
+# The catalog is read through the server rather than the host S3 client because the server already
+# holds the pool credentials, and it is the pool-wide authority on which namespaces exist and which
+# life each one is on.
+_CATALOG_S3_URL = f"http://rustfs1:11121/{_S3_BUCKET}/{_POOL_PREFIX}/cas/ref_catalog"
+_CATALOG_ENTRY_RE = re.compile(
+    r'\{"kind":"entry","ns":"([^"]*)","state":"([^"]*)","life":"([0-9a-f]+)"')
 
 # Far above anything a dev-scale storm could allocate as a real `ref_sequence`, so the injected object
 # is unambiguously INSIDE the region the seal closed and above every real transaction in it. One below
@@ -190,11 +198,16 @@ def _list_keys(s3, prefix: str) -> list:
         token = resp.get("NextContinuationToken")
 
 
-# S38 and S43 deliberately create one table in an otherwise empty pool. The current layout therefore
-# exposes exactly one DIRECT child under `cas/ns/stream/`: its opaque, canonical 32-hex life id. Do not
-# reconstruct a logical namespace from storage keys; the catalog is the only such mapping. Refuse zero,
-# multiple, malformed, uppercase, or nested children rather than guessing which life the card should
-# inject into.
+# The card injects into the KILLED node's namespace, so it must name that namespace exactly. One
+# logical table does not mean one namespace: a namespace is scoped to the table's UUID, and the two
+# replicas of `_TABLE` are created by separate `CREATE TABLE` statements in an Atomic database, so
+# each holds a different UUID and the pool carries one live namespace per replica. Listing storage
+# keys therefore cannot identify the target, and reconstructing a logical namespace from a key is
+# forbidden — the catalog is the only mapping from a namespace to its opaque life id. Refuse zero,
+# multiple, or malformed matches rather than guessing which life to inject into.
+# S43 keeps using this one: it drives a pool where a single namespace is the property under test, so
+# "exactly one child" is that card's assertion rather than an assumption it has outgrown. S38 cannot
+# use it, because S38's own compose carries two replicas and therefore two live namespaces.
 def _discover_single_life_id(s3):
     prefix = f"{_POOL_PREFIX}/cas/ns/stream/"
     children = _list_common_prefixes(s3, prefix)
@@ -204,6 +217,29 @@ def _discover_single_life_id(s3):
     if not child.startswith(prefix) or not child.endswith("/"):
         return None
     life_id = child[len(prefix):-1]
+    if len(life_id) != 32 or any(c not in "0123456789abcdef" for c in life_id):
+        return None
+    return life_id
+
+
+def _discover_life_id_for_uuid(node, table_uuid: str):
+    text = node.query(
+        f"SELECT * FROM s3('{_CATALOG_S3_URL}', 'clickhouse', 'clickhouse', 'RawBLOB') FORMAT TSVRaw")
+    matches = []
+    for m in _CATALOG_ENTRY_RE.finditer(text):
+        ns, state, life = m.group(1), m.group(2), m.group(3)
+        if table_uuid in ns and state == "live":
+            matches.append(life)
+    if not matches and '"kind":"entry"' in text:
+        # Entry rows are present but none matched the field pattern: the catalog's key spelling moved
+        # and this reader did not follow. Saying "no namespace" here would look identical to an empty
+        # pool and would silently retire the injection this card exists for.
+        raise AssertionError(
+            "ref catalog has entry rows but none matched the reader's field pattern; the wire "
+            "vocabulary changed and this card is stale: " + text[:400])
+    if len(matches) != 1:
+        return None
+    life_id = matches[0]
     if len(life_id) != 32 or any(c not in "0123456789abcdef" for c in life_id):
         return None
     return life_id
@@ -390,13 +426,20 @@ class S38(Scenario):
             return
 
         s3 = _s3_client()
-        life_id = _discover_single_life_id(s3)
+        # Inject into the KILLED replica's namespace: that is the one whose epoch the successor
+        # just sealed. Its identity is the table's UUID on that node, which the catalog maps to the
+        # opaque life id.
+        table_uuid = cl.node1.scalar(
+            f"SELECT toString(uuid) FROM system.tables "
+            f"WHERE database = currentDatabase() AND name = '{_TABLE}'")
+        result.observations["injection_table_uuid"] = table_uuid
+        life_id = _discover_life_id_for_uuid(cl.node1, table_uuid)
         result.observations["discovered_life_id"] = life_id
         if life_id is None:
             result.add(Verdict.inconclusive(
                 "opaque life id discovered for injection",
-                "exactly one canonical 32-hex child under cas/ns/stream/",
-                "the single-table pool did not expose one unambiguous life-id child"))
+                f"exactly one live catalog entry whose namespace carries table uuid {table_uuid}",
+                "the catalog did not map that table uuid to exactly one live life id"))
             _common.standard_end(ctx, result, [_TABLE])
             return
 
