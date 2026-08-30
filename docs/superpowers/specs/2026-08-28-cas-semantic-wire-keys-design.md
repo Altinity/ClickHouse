@@ -300,7 +300,12 @@ These fields occur once per small control object and use descriptive names:
 
 The mount lease keeps `pid` (an established fragment: the OS process id) and `seq` — the object
 *is* the lease, so a `lease_seq` spelling would restate its own container; both stay per the
-context rule. `ma` becomes `min_active_build_sequence`: the singleton descriptive rule outranks
+context rule. The same rule, applied in the other direction, is why `cas_gc_state`
+spells the lease's fields `lease_owner` and `lease_seq`: there the lease is a sub-structure of a
+larger object, so those are flattened member paths, while `cas_gc_hb`'s own `owner` needs no prefix
+because that object IS the heartbeat. The two owner fields are also not the same value at an
+observation — a deposed leader keeps pulsing under its own name, and the GC contender deliberately
+does not compare them — so one shared spelling would suggest an equivalence the code denies. `ma` becomes `min_active_build_sequence`: the singleton descriptive rule outranks
 brevity here, and a bare `min_active` under-names what is specifically a build-sequence floor. The
 member follows (`MountLease::min_active` becomes `min_active_build_sequence`), and its `UINT64_MAX`
 clean-farewell sentinel remains part of the field contract, documented at the codec.
