@@ -8,6 +8,13 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 > `deduplication_cache_bytes` describe the superseded conditional blob-publication cache experiment;
 > the scenario, cache, and setting are no longer active.
 
+> **2026-08-30 wire-keys proof phase:** the rows from `09:04` onward are that campaign's soak pass.
+> Three cards needed fixes and all three were stale assertions rather than defects; the classification
+> of every failure, with the evidence that attributed it, is in
+> `docs/superpowers/cas/2026-08-30-wire-keys-phase3-soak.md`. The two `S41` `cluster did not become
+> healthy` rows are an invocation error, not a scenario result: S41 needs its isolated `ca-s41` project
+> and `--no-reset`, as its own docstring says.
+
 | started (UTC) | scenario | seed | scale | duration | status | git sha | run_dir | note |
 |---|---|---|---|---|---|---|---|---|
 | 2026-06-27T20:35:36 | S01 | 7 | dev | 900s | pass | ae0cc27b1bf5 | 20260627T203522_S01_seed7 | S01 ran at a small dev blob size; the memory-materialization risk is best exposed at >= 256 MiB (use --scale ci/full) |
@@ -505,3 +512,19 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-08-03T11:31:03 | S45 | 4 | dev | 300s | pass | d7673bd9ede3 | 20260803T112949_S45_seed4 |  |
 | 2026-08-24T13:58:41 | S39 | 2244 | dev | 900s | pass | 80601d38ed03 | 20260824T135648_S39_seed2244 |  |
 | 2026-08-24T14:49:58 | S39 | 2244 | dev | 900s | pass | 9a17584246cb | 20260824T143451_S39_seed2244 |  |
+| 2026-08-30T09:06:17 | S38 | 20260830 | dev | 900s | inconclusive | ab93a7c90c02 | 20260830T090413_S38_seed20260830 |  |
+| 2026-08-30T09:08:20 | S43 | 20260830 | dev | 900s | pass | ab93a7c90c02 | 20260830T090617_S43_seed20260830 | quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table default.w3_recreated (3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b) is not replicated. (BAD_ARGUMENTS) (version 26.6.2.20000.altinityantalya) / sql=SYSTEM SYNC REPLICA w3_recreated |
+| 2026-08-30T09:08:54 | S44 | 1 | dev | 300s | pass | 8535c45280de | 20260830T090820_S44_seed1 |  |
+| 2026-08-30T09:10:30 | S38 | 20260830 | dev | 900s | inconclusive | 8535c45280de | 20260830T090918_S38_seed20260830 |  |
+| 2026-08-30T09:17:05 | S38 | 20260830 | dev | 900s | pass | 8535c45280de | 20260830T091540_S38_seed20260830 |  |
+| 2026-08-30T09:18:43 | S16 | 20260830 | dev | 900s | fail | 038cacc1559e | 20260830T091740_S16_seed20260830 |  |
+| 2026-08-30T09:33:52 | S39 | 20260830 | dev | 900s | pass | 585d0a73aa13 | 20260830T091843_S39_seed20260830 |  |
+| 2026-08-30T09:35:16 | S45 | 20260830 | dev | 900s | fail | 817ca63299c6 | 20260830T093352_S45_seed20260830 |  |
+| 2026-08-30T09:40:22 | S41 | 20260830 | dev | 900s | fail | 817ca63299c6 | 20260830T093516_S41_seed20260830 | cluster did not become healthy after reset |
+| 2026-08-30T09:48:01 | S41 | 20260830 | dev | 900s | fail | 817ca63299c6 | 20260830T094300_S41_seed20260830 | cluster did not become healthy after reset |
+| 2026-08-30T09:49:09 | S45 | 4 | dev | 900s | fail | 817ca63299c6 | 20260830T094802_S45_seed4 |  |
+| 2026-08-30T09:50:19 | S45 | 20260830 | dev | 900s | fail | 817ca63299c6 | 20260830T094909_S45_seed20260830 |  |
+| 2026-08-30T09:51:22 | S16 | 20260830 | dev | 900s | pass | 817ca63299c6 | 20260830T095020_S16_seed20260830 |  |
+| 2026-08-30T09:53:30 | S45 | 4 | dev | 900s | fail | 817ca63299c6 | 20260830T095217_S45_seed4 |  |
+| 2026-08-30T09:56:47 | S45 | 4 | dev | 900s | pass | 817ca63299c6 | 20260830T095537_S45_seed4 |  |
+| 2026-08-30T09:57:36 | S41 | 20260830 | dev | 900s | pass | 817ca63299c6 | 20260830T095648_S41_seed20260830 |  |
