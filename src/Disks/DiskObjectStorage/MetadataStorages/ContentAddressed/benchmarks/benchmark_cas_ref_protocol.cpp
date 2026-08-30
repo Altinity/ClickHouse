@@ -30,6 +30,7 @@ namespace DB::ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int LIMIT_EXCEEDED;
+    extern const int LOGICAL_ERROR;
 }
 
 /// Pure measurement, no pass/fail assertions -- see the cas-gc-rebuild BACKLOG.md entries
@@ -150,6 +151,15 @@ RefLogTxn makeSamplePromoteTxn()
 /// A synthetic snapshot of `n` committed rows plus one pending precommit ready to promote.
 /// Built as a RefTableSnapshot and materialized via the public `replay` entry point, so this
 /// helper keeps compiling unchanged when RefTableState's fields become private (Phase A).
+///
+/// Committed-row field widths (load-bearing for the `cas_ref_snap` wire-key-cut benchmarks and byte
+/// oracle, which measure the RELATIVE cost of a key rename against the encoded VALUE bytes as the
+/// denominator): `published_at_ms` is a real 13-digit epoch-ms rather than the default `0`, and
+/// `manifest_ref`'s `writer_epoch`/`build_sequence` are multi-digit (a pool old enough to have
+/// restarted its writer decades of times, and a build counter past its 89811th commit -- the same
+/// order of magnitude as the real ref-ledger key at the top of this file, `kSafeKeyLikeString`, and
+/// `makeSamplePromoteTxn`'s ref name). A minimal `0`/`1`/`1` shrinks the value-byte denominator a key
+/// rename is measured against and inflates the rename's apparent percentage cost.
 RefTableSnapshot makeSyntheticSnapshot(size_t n)
 {
     RefTableSnapshot snapshot;
@@ -159,7 +169,8 @@ RefTableSnapshot makeSyntheticSnapshot(size_t n)
     {
         RefCommittedRow row;
         row.ref_name = "part_" + std::to_string(i) + "_20260719_0_1000_1";
-        row.manifest_ref = ManifestRef{1, 1, static_cast<uint32_t>(i + 1)};
+        row.manifest_ref = ManifestRef{42, 89811 + static_cast<uint64_t>(i), static_cast<uint32_t>(i + 1)};
+        row.published_at_ms = 1752900000000ULL + i;
         snapshot.committed.push_back(row);
     }
     std::sort(snapshot.committed.begin(), snapshot.committed.end(),
@@ -653,8 +664,11 @@ String encodeSourceEdgeRun(const std::vector<SourceEdgeRecord> & records)
     for (const auto & r : records)
         writer.append(r);
     writer.finish();
-    out.finalize();
-    return out.str();
+    /// `str()` returns a `std::string &`, so returning it plainly would copy-construct the whole
+    /// encoded run on every call (no NRVO is available for a reference) -- `std::move` here moves it
+    /// instead, matching the four other encoders, which all end with `std::move(out).take()` and copy
+    /// nothing. `str()` finalizes `out` itself, so no separate `finalize()` call is needed first.
+    return std::move(out.str());
 }
 
 /// The ONE call site whose TYPE differs across the wire-key-rename cut this benchmark spans: on this
@@ -675,15 +689,22 @@ constexpr uint64_t kFoldSealGcShards = 4;
 
 /// `cas_fold_seal` fixture: `n` `ref_lives` rows keyed by ascending life id, split base/hold-bearing/
 /// cleanup-evidence 90%/5%/5%. Per the spec's byte table, a hold-bearing row adds 33 bytes and a
-/// cleanup-evidence row adds 16 bytes over a base row's 22-plus-class-word bytes, so a seal built only
-/// of base rows understates the per-row cost by up to a third. The 90/5/5 split models a healthy pool:
-/// most namespaces fold cleanly every round (base: `Folded`, no hold, no cleanup evidence); a minority
-/// sit behind a transient barrier (hold-bearing: `Clamped`, `ManifestBodyMissing`); a minority are
-/// mid-teardown (cleanup evidence: `Folded` plus a terminal `remove_namespace` fold). Neither minority
-/// shape is the common case, but neither is negligible either -- both recur every round in a live pool.
-/// Field values (epochs/sequences/rounds) are the exact ones the fold-seal spec's byte table uses for
-/// each of the three shapes, so this fixture's line lengths are traceable to that table by inspection.
-/// Record count ranges 100 to 100,000, matching every `Complexity()` benchmark in this file.
+/// cleanup-evidence row adds 16 bytes over a base row's 22-plus-class-word bytes; at this 90/5/5 mix
+/// the recovered uplift over an all-base fixture is 0.05*33 + 0.05*16 = 2.45 bytes/row, about 8% over
+/// a base row's own ~30 bytes (the full one-third the spec's deltas imply is the all-clamped extreme,
+/// not this mix) -- still enough that omitting the two minority shapes entirely would misstate the
+/// row-average cost in the wrong direction. The 90/5/5 split models a healthy pool: most namespaces
+/// fold cleanly every round (base: `Folded`, no hold, no cleanup evidence); a minority sit behind a
+/// transient barrier (hold-bearing: `Clamped`, `ManifestBodyMissing`); a minority are mid-teardown
+/// (cleanup evidence: `Folded` plus a terminal `remove_namespace` fold). Neither minority shape is the
+/// common case, but neither is negligible either -- both recur every round in a live pool.
+/// `RefTxnId` epoch/sequence pairs and the hold's `retry_count`/`next_retry_round` are multi-digit
+/// (a pool old enough to have restarted its writer dozens of times and folded past its 100,000th
+/// ref-log transaction; a hold retried past its first round but nowhere near abandoned) rather than
+/// the single-digit illustrative values the spec's byte table uses to name the three row SHAPES --
+/// matching the shapes, not the spec table's example digits, is what keeps the value-byte denominator
+/// realistic (see `makeSyntheticSnapshot`'s doc comment for why that denominator matters). Record
+/// count ranges 100 to 100,000, matching every `Complexity()` benchmark in this file.
 CasFoldSeal makeFoldSeal(size_t n)
 {
     CasFoldSeal seal;
@@ -696,21 +717,21 @@ CasFoldSeal makeFoldSeal(size_t n)
         {
             row.coverage = RefCoverage{
                 .classification = clampedClassification(),
-                .last_folded_ref_id = RefTxnId{3, 4},
+                .last_folded_ref_id = RefTxnId{42, 103482},
                 .hold = RefHold{
                     .reason = HoldReason::ManifestBodyMissing,
-                    .offending_position = RefTxnId{5, 6},
-                    .retry_count = 2,
-                    .next_retry_round = 8}};
+                    .offending_position = RefTxnId{42, 103500},
+                    .retry_count = 14,
+                    .next_retry_round = 1042}};
         }
         else if (i % 20 == 1)
         {
-            row.coverage = RefCoverage{.classification = foldedClassification(), .last_folded_ref_id = RefTxnId{9, 12}};
-            row.cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{9, 10}};
+            row.coverage = RefCoverage{.classification = foldedClassification(), .last_folded_ref_id = RefTxnId{42, 118203}};
+            row.cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{42, 118190}};
         }
         else
         {
-            row.coverage = RefCoverage{.classification = foldedClassification(), .last_folded_ref_id = RefTxnId{7, 11}};
+            row.coverage = RefCoverage{.classification = foldedClassification(), .last_folded_ref_id = RefTxnId{42, 100123}};
         }
         seal.ref_lives.emplace(UInt128(i + 1), std::move(row));
     }
@@ -952,10 +973,23 @@ uint64_t maxRecordCountUnderCap(FormatId id, uint64_t known_fits_n, uint64_t kno
         }
     };
 
+    /// The bisection below is correct only if `fits(lo) == true`. The caller's `known_fits_n` comes
+    /// from an encode IT ran itself -- never through `openObject`, which is what actually enforces
+    /// `object_cap` (the raw-size check, or the zstd frame's declared decompressed size) -- so this
+    /// verifies the bound directly rather than trusting that claim. If `known_fits_n` itself is
+    /// already over the cap (e.g. a future, much larger report size), halve downward until a verified
+    /// fit is found; if even `n == 1` does not fit, that is a fixture/format bug, not a capacity
+    /// signal, and is raised loudly rather than silently reported as a wrong maximum.
+    uint64_t lo = known_fits_n;
+    while (lo > 1 && !fits(lo))
+        lo /= 2;
+    if (!fits(lo))
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
+            "maxRecordCountUnderCap: format {} does not fit its object cap even at n=1", static_cast<uint16_t>(id));
+
     const FormatTraits & traits = traitsFor(id);
     const uint64_t per_record = std::max<uint64_t>(1, known_fits_bytes / std::max<uint64_t>(1, known_fits_n));
-    uint64_t lo = known_fits_n;   /// already confirmed to fit by the caller's own encode above
-    uint64_t hi = std::max<uint64_t>(known_fits_n * 2, traits.object_cap / per_record);
+    uint64_t hi = std::max<uint64_t>(lo * 2, traits.object_cap / per_record);
     while (fits(hi))
     {
         lo = hi;

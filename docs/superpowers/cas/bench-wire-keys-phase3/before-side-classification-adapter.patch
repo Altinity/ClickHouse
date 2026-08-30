@@ -1,7 +1,7 @@
 --- a/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp
 +++ b/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp
-@@ -657,15 +657,15 @@
-     return out.str();
+@@ -671,15 +671,15 @@
+     return std::move(out.str());
  }
  
 -/// The ONE call site whose TYPE differs across the wire-key-rename cut this benchmark spans: on this
