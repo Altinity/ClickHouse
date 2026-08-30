@@ -1,5 +1,5 @@
 ---
-description: 'Which ca-soak scenario cards exercise which CAS persisted formats, and which formats no card reaches.'
+description: 'Which ca-soak scenario cards exercise which CAS persisted formats, and how strongly each is exercised.'
 sidebar_label: 'ca-soak card format coverage'
 sidebar_position: 96
 slug: /superpowers/cas/ca-soak-card-format-coverage
@@ -11,7 +11,7 @@ doc_type: 'reference'
 
 Read-only analysis of `utils/ca-soak/scenarios/cards/*.py` (skipping `_common.py`/`__init__.py`)
 against the 17 registered CAS formats (`src/.../ContentAddressed/Formats/CasFormat.cpp` `TRAITS`).
-One row per card **file** (18 files map to scenario IDs S01–S45; S24 does not exist). Cross-checked
+One row per card **file** (19 files map to 44 scenario IDs, S01–S45; S24 does not exist). Cross-checked
 against the framework helpers (`checkpoint.py`, `gc.py`, `observe.py`, `lifecycle.py`, `cluster_boot.py`,
 `assertions.py`, `sql.py`, `base.py`) and, where format write triggers were unclear from Python alone,
 against the C++ ref-ledger/GC source (`CasRefLedger.cpp`, `CasGc.cpp`).
@@ -54,8 +54,8 @@ key via `layout.gcMaintenanceStateKey()`), not inferred from the README text.
 (same call sites — the checkpoint is updated on essentially every writer commit, not just at GC fold,
 contrary to a naive reading of the format README), `cas_part_manifest` (one manifest per part build),
 and `cas_blob` (upload). Marked **[write-path]**. The one card with **zero** tables and **zero** inserts
-is **S23** (deliberately idle empty pool) — it still gets the `[baseline]` six via mount, but none of
-`[write-path]`.
+is **S23** (deliberately idle empty pool) — it still gets the `[baseline]` seven via mount+GC rounds, but
+none of `[write-path]`.
 
 **`cas_fold_seal` / `cas_run` / `cas_gc_outcomes`** are written only when a GC round actually **folds**
 new work (a real condemn/delete/replace), not on an idle deferred round (confirmed by S03's own
@@ -93,7 +93,8 @@ runner's real compose variant (S22/S27 self-probe their fault-proxy's `/healthz`
 `Verdict.inconclusive` only if genuinely unreachable; S44/S45 have no such probe at all). This survey
 treats all four as **runnable now**, not skipped, and notes the stale docstrings inline.
 
-Legend: **[baseline]** = the six mount/GC-round formats reached by every card. **[write-path]** = the
+Legend: **[baseline]** = the seven mount/GC-round formats reached by every card (including
+`cas_gc_maintenance_state`, per the correction above). **[write-path]** = the
 five formats reached by any CREATE+INSERT. `*` = the card's own Python code parses/writes persisted CAS
 object **bytes** directly (`boto3` S3 GET/PUT + manual zstd/JSON decode of a `cas_*` object) — as
 opposed to using the server's SQL/system-table interface or shelling out to the real `cas-fsck` binary.
@@ -109,7 +110,7 @@ opposed to using the server's SQL/system-table interface or shelling out to the 
 | `s12_s14_faults.py` | S12, S13, S14 | **S12: `tenreplicas`** (`docker-compose-10replicas.yml`, 10 nodes); S13, S14: default | S12: [baseline] + [write-path] + `blob_meta`; S13: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes`, owner/epoch/mount_lease **transition** (plausible); S14: [baseline] + [write-path], owner/epoch/mount_lease **transition** (plausible) | S12: 10 replicas write a byte-identical shared block concurrently — asserts `CASBlobBodyPutAvoided>0` (confirmed `blob_meta` under real concurrency). S13: repeatedly hard-kills ch1 (writer) and the last GC-leader node while inserting/mutating; the interleaved `ALTER ... DELETE` mechanically obsoletes parts (confirmed reclaim), and every kill/restart forces the killed node's CA-disk to re-mount — a genuine owner/epoch/lease transition, though the card verifies it only via CA-log lease-event *counts*, not the object bytes. S14: a full clean restart of both servers after prefilling many tables/parts — per S38's finding, even a *clean* restart mints a fresh writer epoch/seal, so this is also a plausible epoch transition, though S14 asserts only startup-latency/counter behavior, not the transition itself. |
 | `s15_s18_shards_lifecycle.py` | S15, S16, S17, S18 | **S15 uniquely needs three composes**: default, `gc_shards2` (`docker-compose-gc_shards2.yml`), `gc_shards8` (`docker-compose-gc_shards8.yml`) — it resets the cluster itself, mid-run, across all three, then resets back to default at the end; S16–S18: default | S15: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes` (×3 shard variants); S16: same + `blob_meta`; S17: same; S18: same, `ref_catalog`/`part_manifest` **conditionally** on `ALTER TABLE FREEZE` succeeding (the card documents this as a known-risk B3 item that may simply fail) | S15 compares GC-shard fanout across gc_shards=1/2/8 after `DROP PARTITION`s — confirmed reclaim, and it does its own raw filesystem **directory-count** probe (`find .../gc/*/blob_target -type d`) which counts shard dirs but never decodes an object body (not `*`). S16: insert→`TRUNCATE`→condemn→re-insert cycles with deterministic content are the resurrect/dedup invariant itself — confirmed `blob_meta`, explicit `blob_reuse_resurrect` event check. S17: `DETACH`/`ATTACH`/`DROP DETACHED PARTITION` — confirmed reclaim of the dropped-detached content via `assert_reclaimable_drained`. S18: `FREEZE`/drop-live/`UNFREEZE` — if `FREEZE` fails (which the card explicitly anticipates and handles), only the ordinary live table's formats are touched; if it succeeds, the shadow's own manifest/ref-catalog exposure is asserted only via `fsck dangling`, not confirmed at the format level. |
 | `s19_s22_clone_fetch.py` | S19, S20, S21, S22 | S19, S20, S21: default; **S22: `s3faultproxy`** (`docker-compose-s3faultproxy.yml`) | S19: [baseline] + [write-path] (heavy `part_manifest`/`ref_log` republish, no reclaim confirmed); S20: same + `blob_meta`, mount_lease **transition** (plausible); S21: [baseline] + [write-path] only (read-heavy, no reclaim); S22: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes` | S19: `MOVE PARTITION`/`REPLACE PARTITION` republish manifests/refs without re-uploading bodies (checked directly: `CASBlobPut` stays small); a gated cross-disk `MOVE` is asserted to fail with zero blob writes. S20: stops/starts the follower (ch2) around a leader-only insert window, so the follower's later fetch/relink is the point — explicit `CASBlobPutDeduplicated`/`CASBlobBodyPutAvoided` check on the follower (`blob_meta`), and the stop/start is a real per-node mount cycle (plausible lease transition, not asserted at the object level). S21: pure read-path caching card, no `DROP`/mutation anywhere. S22: fault-injected `OPTIMIZE TABLE ... FINAL` under an armed S3 proxy forces real merges → confirmed reclaim as a side effect. |
-| `s23_s27_misc.py` | S23, S25, S26, S27 (no S24) | S23, S25, S26: default; **S27: `s3listproxy`** (same `docker-compose-s3faultproxy.yml`, LIST-anomaly mode) | S23: [baseline] **only** — zero tables, zero inserts, explicit `SELECT count() FROM system.tables` check that the pool stays empty; S25: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes`, plus a **non-Atomic (`Ordinary`) database** namespace-path variant (often inconclusive — `Ordinary` is deprecated and frequently refused by the build); S26: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes`; S27: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes` | S23 is the idle-pool baseline — dozens of explicit `gc_drive_round()` calls with nothing to reclaim, so it is the strongest single-card evidence for the `[baseline]` claim (`gc_state`/`gc_hb`/`pool_meta`/`owner`/`epoch`/`mount_lease` all reached with **zero** other formats). S25 attempts the full lifecycle (insert/detach/attach/freeze/mutate/drop-partition/drop-table/drop-database) under an `Ordinary` DB — confirmed reclaim on the final drop, *if* `CREATE DATABASE ... Ordinary` is accepted by the build (recorded honestly as inconclusive otherwise). S26 explicitly proves table-level verbatim `_files` (mutation/dedup-log entries — NOT one of the 17 formats, a raw passthrough per the format README) are cleaned by owner-path drop rather than `CASBlobDelete`, and separately confirms identical-insert dedup (`blob_meta`) and a real drop+GC at the end. S27 drops half of many tables under LIST-anomaly injection targeting `cas/refs/` and asserts the dropped content still fully reclaims — confirmed reclaim under fault. |
+| `s23_s27_misc.py` | S23, S25, S26, S27 (no S24) | S23, S25, S26: default; **S27: `s3listproxy`** (same `docker-compose-s3faultproxy.yml`, LIST-anomaly mode) | S23: [baseline] **only** — zero tables, zero inserts, explicit `SELECT count() FROM system.tables` check that the pool stays empty; S25: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes`, plus a **non-Atomic (`Ordinary`) database** namespace-path variant (often inconclusive — `Ordinary` is deprecated and frequently refused by the build); S26: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes`; S27: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes` | S23 is the idle-pool baseline — dozens of explicit `gc_drive_round()` calls with nothing to reclaim, so it is the strongest single-card evidence for the `[baseline]` claim (`gc_state`/`gc_hb`/`gc_maintenance_state`/`pool_meta`/`owner`/`epoch`/`mount_lease` all reached with **zero** other formats). S25 attempts the full lifecycle (insert/detach/attach/freeze/mutate/drop-partition/drop-table/drop-database) under an `Ordinary` DB — confirmed reclaim on the final drop, *if* `CREATE DATABASE ... Ordinary` is accepted by the build (recorded honestly as inconclusive otherwise). S26 explicitly proves table-level verbatim `_files` (mutation/dedup-log entries — NOT one of the 17 formats, a raw passthrough per the format README) are cleaned by owner-path drop rather than `CASBlobDelete`, and separately confirms identical-insert dedup (`blob_meta`) and a real drop+GC at the end. S27 drops half of many tables under LIST-anomaly injection targeting `cas/refs/` and asserts the dropped content still fully reclaims — confirmed reclaim under fault. |
 | `s28_s33_corner.py` | S28, S29, S30, S31, S32, S33 | S28, S29, S30, S32, S33: default; **S31: `gc_shards2`** | S28: [baseline] + [write-path]; S29: [baseline] + [write-path] (heavy inline-payload zone of `part_manifest` — the `PayloadHybrid` non-blob file path); S30: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes` + `ref_catalog` (incarnation/tombstone specifically); S31: same as S30 + `gc_shards2`; S32: same + TTL-driven reclaim; S33: same, deliberately adversarial | S28: concurrent wide inserts stressing scratch, no drop — no reclaim confirmed. S29: a data-skipping-index/statistics part is the one card explicitly designed to make the manifest's inline-payload banner zone (not `.bin`/marks/`primary.idx`) large — direct `part_manifest` PayloadHybrid-path exercise. S30: rapid create/insert/drop of many distinct table names is precisely the `ref_catalog` namespace-tombstone/monotone-fanout regression guard (D1), with per-batch explicit GC rounds and a raw **directory-count** probe (`find roots/ -maxdepth 1 -type d`, again a dir count, not a body decode — not `*`). S31: same churn pattern plus `cas-gc-dryrun` completeness under `gc_shards=2`. S32: `TTL ... DELETE` expiry + `MATERIALIZE TTL`/`OPTIMIZE FINAL`, explicit `assert_reclaimable_drained`. S33: deliberately fires `SYSTEM CAS GC RUN` concurrently on both replicas (the one place in the whole suite that manufactures the two-leader fold-seal collision) — the strongest single-card exercise of `fold_seal`'s attempt-scoped-generation mechanics. |
 | `s34_s35_d1_churn.py` | S34, S35 | default | S34: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes` + `ref_catalog` (D1 tombstone); S35: same, plus incarnation-monotonicity specifically | S34 is S30's identical pattern re-run as a regression-**win** guard (D1 fixed the fanout), same raw directory-count probe (not `*`). S35 hammers the SAME table name through hundreds of create/insert/DROP cycles — the single strongest card for `ref_catalog`'s per-`(ns,shard)` incarnation-monotonicity property specifically (a wrong-incarnation revival would surface as a bad CA-log event, which the card asserts stays at zero). |
 | `s36_s37_disk_move.py` | S36, S37 | **`multidisk`** (`docker-compose-multidisk.yml`) for both | S36: [baseline] + [write-path] + `fold_seal`/`run`/`gc_outcomes` + `blob_meta`, owner/epoch/mount_lease **transition** (chaos kill); S37: same, plus a clean full-cluster restart | S36: explicit `MOVE PART`/`MOVE PARTITION TO DISK 'ca'` (publishes via the normal build path — `part_manifest`/`blob`/`ref_log`) then back `TO DISK 'local1'` (drops the CAS refs, explicit "GC reclaims the vacated CA content" residual==0 check — confirmed reclaim), a dedicated dedup A/B differential (`blob_meta`, confirmed), and a chaos leg that hard-kills ch1 mid-`MOVE PART` (a genuine mount/epoch transition on ch1's restart, verified only via row-count/checksum atomicity, not the lease object itself). S37: policy-routed placement + `TTL ... TO VOLUME` moves (same TO-CA/OFF-CA reclaim pattern) plus both a clean full-cluster restart and a second chaos-kill leg mid-policy-move — two more transition events. |
@@ -168,9 +169,10 @@ that need a **specific** fault/lifecycle shape, not by the bulk of the matrix:
    `ref_catalog`'s ordinary admission/removal, not the decommission-specific state. Contributes: the
    `Removing`-state / decommission-specific facet of `ref_catalog`, plus `cas_owner` retirement.
 
-**{S16, S39, S45}** covers every format any card reaches except `cas_gc_maintenance_state` (unreached by
-construction) and `cas_ref_snap` (undetermined by construction — no card's assertions pin it down, so no
-card can be credited with "covering" it in a defensible way). A fourth card is arguably worth adding for
+**{S16, S39, S45}** covers all 16 confirmed-reached formats (`cas_gc_maintenance_state` included, via the
+`[baseline]` correction above) except `cas_ref_snap` (undetermined by construction — no card's assertions
+pin it down, so no card can be credited with "covering" it in a defensible way). A fourth card is
+arguably worth adding for
 completeness rather than strict minimality: **S41** is the only card that protocol-verifies `cas_blob_meta`'s
 full `CASMetaCreateClean`/`CASMetaCompareSwap`/`CASMetaAdoptBackfill`/`CASMetaResurrectClean` transition
 set (S16's dedup check is coarser — it only confirms `blob_reuse_resurrect` fires, not the metadata
@@ -203,16 +205,32 @@ refusal check is via a server-log grep, not a body decode). No card decodes `cas
 ProfileEvents-based, or (S15/S30/S34) a raw filesystem **directory listing** (`find ... -type d`) that
 never opens or interprets an object's body.
 
+
 ## How much of this was checked independently {#how-much-of-this-was-checked-independently}
 
 This survey was produced by reading every card, and its row count matches the nineteen card files on
-disk. Two of its load-bearing claims were then re-verified directly, because the rest of the campaign
-leans on them:
+disk. Its most load-bearing claims were then re-verified against the source.
 
-- **No card reaches `cas_gc_maintenance_state`.** A case-insensitive search of the whole
-  `utils/ca-soak/scenarios` tree for `maintenance_state` and `GcMaintenanceState` returns nothing.
-- **Only S38 and S43 decode persisted object bytes in their own code.** Searching every card for
-  `zstd` and `decompress` returns exactly those two files.
+The verification is worth describing, because the first attempt at it was wrong in an instructive
+way. An earlier draft of this document said `cas_gc_maintenance_state` was reached by no card, and
+that claim was "confirmed" by searching every card for `maintenance_state` and `GcMaintenanceState`
+and finding nothing. The search was accurate; the conclusion did not follow. A card does not have to
+NAME a format to reach it — the server reaches it while executing what the card asks for. Here
+`readGcMaintenanceState` is called unconditionally by `NamespaceJanitor::runOnePage`
+(`CasNamespaceJanitor.cpp:13`), and `Gc::runNamespaceJanitorPage` runs from BOTH branches of every GC
+round (`CasGc.cpp:579` on the defer path and `CasGc.cpp:1089` on the normal fold path). Since almost
+every card drives a real GC round in its end checkpoint, that format is part of the universal
+baseline rather than a gap. Naming and reaching are different questions, and a grep answers only the
+first.
 
-The remaining per-format attributions were not re-derived one by one. The `UNDETERMINED` entry for
-`cas_ref_snap` is a real gap and should be read as such rather than as coverage.
+What does hold after re-verification:
+
+- **Only S38 and S43 decode persisted object bytes in their own code**, both for `cas_ref_log` only.
+  Searching every card for `zstd` and `decompress` returns exactly those two files. That is the whole
+  surface on which a wire-key rename fails loudly instead of round-tripping silently.
+- **`cas_ref_snap` coverage is UNDETERMINED**, and should be read as a gap rather than as coverage.
+  Its publication is dispatched by a read-triggered latch in `CasRefLedger.cpp` that no card's SQL
+  controls, and no card checks its counters. Settling it needs a run with
+  `CASRefSnapshotPublishDispatched` read from `system.events`, not more code reading.
+
+The remaining per-format attributions were not re-derived one by one.
