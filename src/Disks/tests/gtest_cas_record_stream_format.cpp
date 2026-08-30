@@ -128,9 +128,9 @@ TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
     EXPECT_EQ(back[2].marker, RunMarker::Zero);
 }
 
-/// Closed-set pin: the three `RunMarker` words, walked through `magic_enum::enum_values` so a
-/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
-/// silently through an unspecified word.
+/// Closed-set pin: the three `RunMarker` words, walked through `magic_enum::enum_values`, which is what proves the
+/// renderer and the parser consult the SAME table: a table entry missing altogether is already a
+/// build error at the coverage assert, but two delegates drifting onto different tables is not.
 TEST(CASRecordStream, ClosedSetPinsRunMarkerWords)
 {
     EXPECT_EQ(runMarkerToWireWord(RunMarker::Zero), "zero");
@@ -199,6 +199,24 @@ TEST(CASRecordStream, WriterIsByteDeterministic)
         condemned(chRef(2), Token{"t/with/slashes", TokenType::ETag}, 1, 2, false),
     };
     EXPECT_EQ(encodeRun(recs), encodeRun(recs));   /// pure function of the sorted record set
+}
+
+/// The run `ref` carries the algorithm as a raw leading BYTE, a second representation of the same
+/// closed set the `algo` WORD spells elsewhere. The word side is proven exhaustive at compile time by
+/// its wire table; the byte side is a hand-written switch, so nothing but this walk stops a new
+/// algorithm from being written by `renderB` and rejected by the reader -- an asymmetry that would
+/// appear as unreadable runs rather than as a failing build.
+TEST(CASRecordStream, EveryBlobHashAlgoRoundTripsThroughTheRunRefByte)
+{
+    for (const BlobHashAlgo algo : magic_enum::enum_values<BlobHashAlgo>())
+    {
+        BlobDigest digest{};
+        digest.bytes[0] = 0x10;
+        const BlobRef ref{algo, digest};
+        const std::vector<SourceEdgeRecord> back = decodeRun(encodeRun({edge(ref, 1)}));
+        ASSERT_EQ(back.size(), 1u) << "algo " << magic_enum::enum_name(algo);
+        EXPECT_EQ(back[0].ref.algo, algo) << "the leading byte did not survive the round trip";
+    }
 }
 
 TEST(CASRecordStream, SortOrderAcrossAlgosFollowsAlgoByte)

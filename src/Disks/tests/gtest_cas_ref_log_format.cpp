@@ -142,9 +142,9 @@ TEST(CASRefCodec, OrderMatchesLexicalOrderOfRender)
 /// RefLogTxn: round trip
 /// ===================================================================================
 
-/// Closed-set pin: the five `RefOpKind` words, walked through `magic_enum::enum_values` so a
-/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
-/// silently through an unspecified word.
+/// Closed-set pin: the five `RefOpKind` words, walked through `magic_enum::enum_values`, which is
+/// what proves the renderer and the parser consult the SAME table: a table entry missing altogether is already a
+/// build error at the coverage assert, but two delegates drifting onto different tables is not.
 TEST(CASRefCodec, ClosedSetPinsRefOpKindWords)
 {
     EXPECT_EQ(refOpKindToWireWord(RefOpKind::NamespaceBirth), "namespace_birth");

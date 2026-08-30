@@ -186,9 +186,9 @@ TEST(CASBlobEnvelopeFormat, CriticalKeyDescriptorStillFitsAtDefaultLength)
         "critical-key blob envelope at max-reachable field values");
 }
 
-/// Closed-set pin: the six `ProvenanceOp` words, walked through `magic_enum::enum_values` so a
-/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
-/// silently through an unspecified word.
+/// Closed-set pin: the six `ProvenanceOp` words, walked through `magic_enum::enum_values`, which is what proves the
+/// renderer and the parser consult the SAME table: a table entry missing altogether is already a
+/// build error at the coverage assert, but two delegates drifting onto different tables is not.
 TEST(CASBlobEnvelopeFormat, ClosedSetPinsProvenanceOpWords)
 {
     EXPECT_EQ(provenanceOpToWireWord(ProvenanceOp::Other), "other");

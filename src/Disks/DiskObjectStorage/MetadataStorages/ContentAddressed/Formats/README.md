@@ -43,7 +43,7 @@ in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`.
 Key naming follows a deliberate split between metadata written once per object and fields repeated
 once per record, not a flat character-count budget:
 
-- metadata written once per object (`namespace`, `condemn_round`, `writer_epoch`, …) uses
+- metadata written once per object (`namespace`, `writer_epoch`, `blob_header_len`, …) uses
   descriptive names;
 - fields repeated once per record (`ref`, `mark`, `op`, `class`, `place`, …) use short, semantic
   words whose meaning is clear in the record rather than the C++ member name verbatim;

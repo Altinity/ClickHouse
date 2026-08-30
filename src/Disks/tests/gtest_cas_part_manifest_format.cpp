@@ -128,9 +128,9 @@ TEST(CASPartManifestFormat, PlacementWordsRenderAndRejectUnknown)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 
-/// Closed-set pin: the two `EntryPlacement` words, walked through `magic_enum::enum_values` so a
-/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
-/// silently through an unspecified word.
+/// Closed-set pin: the two `EntryPlacement` words, walked through `magic_enum::enum_values`, which is what proves the
+/// renderer and the parser consult the SAME table: a table entry missing altogether is already a
+/// build error at the coverage assert, but two delegates drifting onto different tables is not.
 TEST(CASPartManifestFormat, ClosedSetPinsEntryPlacementWords)
 {
     EXPECT_EQ(entryPlacementToWireWord(EntryPlacement::Inline), "inline");
