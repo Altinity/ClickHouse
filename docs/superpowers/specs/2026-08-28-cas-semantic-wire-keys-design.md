@@ -1152,3 +1152,24 @@ The change is complete when:
   `algos_used` array); the array gets its carrier API (`writeWordArrayField` /
   `readStringArray`, streaming, no joined string) and its negative-test set; the key-constant type
   reads `WireKey` everywhere; the bundle example moved to Allman style.
+
+## Acceptance {#acceptance-outcome}
+
+Revision 14 is **ACCEPTED** as of 2026-08-30. The per-criterion evidence is in
+`docs/superpowers/cas/2026-08-30-wire-keys-acceptance.md`, which cites a commit, a test name, a
+`static_assert` or a committed document for each of the eleven criteria, and states the closure rule
+it applies.
+
+Two criteria pass with an amendment owed to this document rather than to the code:
+
+- The match-helper criterion says the helpers are **inline**. `toWord` is not: it survives as
+  `call <EnumWireTable<RunMarker, 3>::toWord>` on the encode path. The behaviour the criterion
+  protects does hold — the hot decode path gained no call, allocation or branch, lost a
+  `std::string` copy constructor, and its branch count fell — but the word is wrong and should be
+  read as "adds no call on hot decode paths" rather than as a claim about inlining.
+- The measurement criterion carried an implicit expectation that nothing new would spill. Spills
+  rose on every symbol inspected, by 3.75 percentage points on the `cas_run` decode path, and that
+  is the most likely mechanism behind the only part of the decode cost that byte growth does not
+  account for. It does not contradict this document's actual claim — that the dominant cost is the
+  longer keys themselves, which five rows of byte-normalized data confirm — but the expectation was
+  unstated and unmet, and the follow-up is filed as `[cas-decode-register-pressure]`.
