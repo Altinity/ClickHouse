@@ -53,10 +53,10 @@ String encodeOutcomeLog(const OutcomeLog & log)
     for (const OutcomeEntry & e : log.entries)
     {
         bool first = true;
-        writeStringField(out, GcOutcomesWire::kind, objectKindToWord(e.kind), first);
+        writeWordField(out, GcOutcomesWire::kind, objectKindToWord(e.kind), first);
         writeBlobRefFields(out, first, e.ref);   /// algo + digest
         writeTokenFields(out, first, e.token);   /// token_type + token
-        writeStringField(out, GcOutcomesWire::outcome, outcomeKindToWireWord(e.outcome), first);
+        writeWordField(out, GcOutcomesWire::outcome, outcomeKindToWireWord(e.outcome), first);
         closeObject(out, first);
         writeChar('\n', out);
     }

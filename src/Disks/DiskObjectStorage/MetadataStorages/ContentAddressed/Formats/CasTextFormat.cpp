@@ -109,6 +109,19 @@ void CasJsonWriter::stringValue(std::string_view s)
     appendChar('"');
 }
 
+void CasJsonWriter::wordValue(std::string_view word)
+{
+    /// The contract, checked where it is cheap to check: a vocabulary word carries no byte the JSON
+    /// escaper would rewrite. Violating it would emit malformed JSON rather than a mis-escaped
+    /// string, so this is a programming error and belongs in the debug build, not a runtime branch on
+    /// the encode hot path.
+    chassert(std::none_of(word.begin(), word.end(),
+        [](char c) { return isSpecialJsonByte(static_cast<unsigned char>(c)); }));
+    appendChar('"');
+    buf.append(word.data(), word.size());
+    appendChar('"');
+}
+
 void CasJsonWriter::wordArray(std::span<const std::string_view> words)
 {
     appendChar('[');
@@ -118,7 +131,7 @@ void CasJsonWriter::wordArray(std::span<const std::string_view> words)
         if (!first)
             appendChar(',');
         first = false;
-        stringValue(word);
+        wordValue(word);
     }
     appendChar(']');
 }

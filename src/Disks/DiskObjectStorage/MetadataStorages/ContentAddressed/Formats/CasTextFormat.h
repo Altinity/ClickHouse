@@ -63,6 +63,13 @@ public:
     /// Quoted JSON string with full escaping (bulk-run scan). Defined in CasTextFormat.cpp.
     void stringValue(std::string_view s);
 
+    /// A value from a wire VOCABULARY -- an enum table's word or a record tag. Those are drawn from
+    /// `[a-z0-9_]` by construction, so this writes the bytes as they are instead of running them
+    /// through the escaper's byte scan and state machine. Output is identical to `stringValue` for
+    /// every input the contract admits; a caller that passes an arbitrary string is the bug this
+    /// asserts against, and `writeWordField` is the only intended way in.
+    void wordValue(std::string_view word);
+
     /// JSON array of canonical word strings, emitted without intermediate storage.
     void wordArray(std::span<const std::string_view> words);
 
@@ -163,10 +170,13 @@ inline void writeKey(CasJsonWriter & out, WireKey key, bool & first)
     writeKey(out, key.text, first);
 }
 
+/// For a value that comes from a wire vocabulary (an enum table's word, a record tag). It is NOT
+/// interchangeable with `writeStringField`: this one promises its value needs no JSON escaping and
+/// skips the escaper accordingly, which is why an open string must never be routed through it.
 inline void writeWordField(CasJsonWriter & out, WireKey key, std::string_view word, bool & first)
 {
     writeKey(out, key, first);
-    writeStringValue(out, word);
+    out.wordValue(word);
 }
 
 inline void writeWordArrayField(CasJsonWriter & out, WireKey key, std::span<const std::string_view> words, bool & first)
