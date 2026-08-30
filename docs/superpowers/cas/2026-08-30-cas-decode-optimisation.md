@@ -85,37 +85,38 @@ what would catch an incomplete reset.
 
 ## What it bought {#what-it-bought}
 
-Measured on a quiet machine (1-minute load 0.37) against the same freeze-commit binary the campaign's
-throughput tables came from, same flags, same fixtures.
+A/B on one machine: the same tree built twice, once with these changes reverted and once with them
+applied, each measured at a 1-minute load under 0.8 (0.49 and 0.76). Provenance was checked by
+content on both sides — the baseline binary does not contain `readLineInto`, the optimised one does.
 
-| benchmark | before | after | change |
-|---|---:|---:|---:|
-| **`cas_run` decode** | 34.31 ms | 19.66 ms | **−42.4%** |
-| `cas_ref_snap` decode | 42.08 ms | 41.91 ms | −0.6% |
-| `cas_part_manifest` decode | 53.71 ms | 52.32 ms | −2.2% |
-| `cas_fold_seal` decode | 57.46 ms | 56.75 ms | −1.6% |
-| `cas_ref_catalog` decode | 29.74 ms | 29.55 ms | −0.8% |
-| encode, all five | | | −0.7% to +1.6% |
+| format | before | after | change | records/s |
+|---|---:|---:|---:|---|
+| `cas_ref_catalog` | 55.95 ms | 10.68 ms | **−80.9%** | 1.79M → 9.36M |
+| `cas_run` | 63.98 ms | 19.71 ms | **−69.2%** | 1.56M → 5.07M |
+| `cas_ref_snap` | 73.95 ms | 22.66 ms | **−68.6%** | 1.35M → 4.41M |
+| `cas_fold_seal` | 86.52 ms | 34.75 ms | **−62.5%** | 1.16M → 2.88M |
+| `cas_part_manifest` | 81.21 ms | 34.25 ms | **−58.0%** | 1.23M → 2.92M |
 
-At 100,000 records, `cas_run` decode goes from **2.91 to 5.09 million records per second — a 75%
-increase in throughput**.
+**Decoding is 2.4 to 5.2 times the throughput it was**, on every format the harness covers. Two more
+row loops were given the same treatment — `cas_gc_outcomes` and `cas_ref_log` — and are not measured,
+because the harness does not cover them; the mechanism is identical but the number is not claimed.
 
-**The shape of the result is the evidence that the mechanism is understood, not the size of it.** The
-prediction written down before the run was: `cas_run` decode improves substantially, the other four
-formats do not, and encode does not move — because only `cas_run` streams through the reusable
-reader. That is exactly what came back. A number that large arriving on the wrong benchmarks would
-have meant something else was going on.
+### An earlier number in this document was wrong, and wrong in the flattering direction {#a-retracted-number}
 
-Two caveats on the size. The gain exceeds the 22% of instructions the profile attributes to
-allocation accounting, which is expected: instruction counts do not see cache misses, and allocation
-churn costs memory-system time that callgrind cannot charge to it. And the first run of this
-measurement was taken while the machine was still busy from the unit gate — it reported −43.2%, and
-the quiet re-run reports −42.4%, so the load was not what produced the number.
+A previous revision reported −42.4% for `cas_run` and zero for the `readLine` change. Both were
+measured against a baseline file that a **stale background script had silently overwritten** with a
+run of the already-optimised binary. The comparison was therefore partly against itself. The commit
+that introduced these changes carries the −42.4% figure in its message; it is superseded by the
+table above.
 
-**The other four formats are unimproved and that is not a failure — it is scope.** They decode whole
-objects through a reader built once per object, so there is no per-row rebuild to remove. The same
-treatment would only pay for a format that streams many objects through one call, and `cas_run` is
-the only one that does.
+Two things make the corrected figures trustworthy where the retracted ones were not. The baseline
+here reproduces the campaign's independently committed measurement to within 0.5% — 63.98 ms against
+64.30 ms for `cas_run` — despite being taken hours apart under different load. And the improvement
+appears on all five formats, which is what the mechanism predicts, rather than on one.
+
+The `readLine` change's real contribution is still not separated from the reader change's, because
+they were measured together after the contaminated comparison was discovered. It is not claimed to
+buy anything on its own.
 
 ## What this costs the campaign {#what-this-costs}
 

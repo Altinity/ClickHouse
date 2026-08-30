@@ -194,6 +194,9 @@ std::string_view JsonObjectReader::readStringIntoScratch()
 
 bool JsonObjectReader::nextKey(String & key)
 {
+    /// A default-constructed reader is unbound until `reset`; using one is a programming error, so
+    /// this belongs in the debug build rather than as a branch on the decode hot path.
+    chassert(in != nullptr);
     return guarded([&]() -> bool
     {
         if (done)

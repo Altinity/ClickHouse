@@ -176,11 +176,17 @@ PartManifest decodePartManifest(std::string_view data)
     /// Index-aligned with `m.entries` (Blob entries push an unused 0 placeholder).
     std::vector<uint64_t> inline_lens;
     String blob_ref_what;   /// reused across Blob entries so the error context does not allocate per row
+    /// One line scratch and one reader for the whole loop: a decoder that rebuilds them per
+    /// row pays an allocation per row for the seen-key store and the line, which profiling put
+    /// at about a fifth of the instructions executed inside a row.
+    String row_line;
+    JsonObjectReader row_reader;
     while (true)
     {
-        const String line = readLine(in, line_cap, "cas_part_manifest");
-        ReadBufferFromMemory l(line.data(), line.size());
-        JsonObjectReader r(l, KeyStrictness::Tolerant, "cas_part_manifest");
+        readLineInto(in, row_line, line_cap, "cas_part_manifest");
+        ReadBufferFromMemory l(row_line.data(), row_line.size());
+        row_reader.reset(l, KeyStrictness::Tolerant, "cas_part_manifest");
+        JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: empty line");

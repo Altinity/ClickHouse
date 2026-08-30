@@ -180,11 +180,17 @@ RefCatalog decodeRefCatalog(std::string_view data)
 
     RefCatalog catalog;
     uint64_t seen = 0;
+    /// One line scratch and one reader for the whole loop: a decoder that rebuilds them per
+    /// row pays an allocation per row for the seen-key store and the line, which profiling put
+    /// at about a fifth of the instructions executed inside a row.
+    String row_line;
+    JsonObjectReader row_reader;
     for (;;)
     {
-        const String line = readLine(in, line_cap, "ref catalog");
-        ReadBufferFromMemory l(line.data(), line.size());
-        JsonObjectReader r(l, KeyStrictness::Strict, "ref catalog");
+        readLineInto(in, row_line, line_cap, "ref catalog");
+        ReadBufferFromMemory l(row_line.data(), row_line.size());
+        row_reader.reset(l, KeyStrictness::Strict, "ref catalog");
+        JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: empty line");

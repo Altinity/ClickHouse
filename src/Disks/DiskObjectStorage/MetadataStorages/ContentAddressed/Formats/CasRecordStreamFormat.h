@@ -192,11 +192,8 @@ private:
     /// buffer, so a run of any length allocates only up to the longest line it has actually seen.
     String scratch;
     /// Reused object reader, for the same reason: its per-object buffers then cost one allocation
-    /// for the whole run rather than one per row. `placeholder` exists only so the reader has a
-    /// well-formed object to construct against; every row re-points it via `reset`. It is declared
-    /// FIRST because members initialise in declaration order and the reader binds to it.
-    ReadBufferFromMemory placeholder{"{}", 2};
-    JsonObjectReader reader{placeholder, KeyStrictness::Strict, "cas_run"};
+    /// for the whole run rather than one per row. It starts unbound and every row re-points it.
+    JsonObjectReader reader;
 };
 
 }

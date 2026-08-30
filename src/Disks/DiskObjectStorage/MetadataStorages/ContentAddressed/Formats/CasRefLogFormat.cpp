@@ -365,11 +365,16 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
             expected_ns, expected_txn_id.writer_epoch, expected_txn_id.ref_sequence);
 
     /// op record lines, until the trailer
+    /// One line scratch and one reader for the whole loop, as the other row decoders do:
+    /// rebuilding them per row costs an allocation per row for the seen-key store and the line.
+    String row_line;
+    JsonObjectReader row_reader;
     while (true)
     {
-        const String line = readLine(in, line_cap, "cas_ref_log");
-        ReadBufferFromMemory l(line.data(), line.size());
-        JsonObjectReader r(l, KeyStrictness::Tolerant, "cas_ref_log");
+        readLineInto(in, row_line, line_cap, "cas_ref_log");
+        ReadBufferFromMemory l(row_line.data(), row_line.size());
+        row_reader.reset(l, KeyStrictness::Tolerant, "cas_ref_log");
+        JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: empty line");

@@ -236,6 +236,10 @@ public:
     /// Consumes the opening `{`; throws `CORRUPTED_DATA` when the object does not start there.
     JsonObjectReader(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_);
 
+    /// An unbound reader, for a decoder that wants one reader outside its row loop and re-points it
+    /// per row. `reset` must be called before any read; nothing else is valid on it.
+    JsonObjectReader() = default;
+
     /// Re-point an existing reader at another object, as the constructor would, but WITHOUT
     /// releasing the buffers it has already grown. A stream decoder reads one object per row, and a
     /// reader built fresh each time re-allocates its seen-key store and its value scratch on every
@@ -277,8 +281,8 @@ private:
     /// grown. The view is valid until the next read on this reader.
     std::string_view readStringIntoScratch();
 
-    ReadBuffer * in;
-    KeyStrictness strictness;
+    ReadBuffer * in = nullptr;
+    KeyStrictness strictness = KeyStrictness::Strict;
     String what;
     std::vector<String> seen_keys;
     String scratch;
