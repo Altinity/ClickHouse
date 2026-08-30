@@ -71,28 +71,18 @@ unchanged, only relocated.
 
 ### From the 2026-08-04 destructive-baseline / soak audit {#inbox-audit-batch}
 
-## `[cas-decode-register-pressure]` `SourceEdgeRunReader::next` spills more after the wire-key cut {#cas-decode-register-pressure}
+## `[cas-decode-register-pressure]` WITHDRAWN — the finding was a build-flag artifact {#cas-decode-register-pressure}
 
-**Found by the wire-keys phase-3 assembly review (2026-08-30); evidence in
-`docs/superpowers/cas/2026-08-30-wire-keys-full-measurement.md` and `bench-wire-keys-phase3/asm/`.**
+**Raised 2026-08-30 on an assembly review, withdrawn the same day.**
 
-The semantic wire-key cut left `cas_run` decode costing about 5 percentage points more than its byte
-growth accounts for, and `cas_ref_catalog` about 4. The assembly says what the extra work is, and it
-is not what the design expected: calls did not increase, branches went **down** in every symbol
-inspected, and allocation calls are identical — but every symbol spills more. On
-`SourceEdgeRunReader::next` the spill density rose from 22.1% to 25.8%, with a new high-severity
-finding of spills inside the loop at `L78` where two of every five instructions are stack traffic.
-Ordering the formats by spill-density growth and by decode-time-minus-byte-growth gives the same
-order, which is what makes this the likely mechanism rather than a coincidence.
+The item claimed that the wire-key cut raised register pressure in `SourceEdgeRunReader::next`, on
+the evidence that spill density rose from 22.1% to 25.8% with new spills inside the hot loop. That
+comparison was taken across two binaries built with different frame-pointer settings: the after side
+reserved `rbp`, the before side did not. On correctly matched binaries spill density **falls** in
+every decode symbol inspected and does not move in the encode symbol. There is nothing here to fix.
 
-The function is flagged "very large" at 1041 instructions and 5166 bytes: it inlines error handling,
-the trailer branch and per-field decoding into one body, so the allocator has many live values across
-the hot region. **Fix direction:** move the cold paths (the `CORRUPTED_DATA` throw sites, the trailer
-branch) out of line and re-measure. The prediction is narrow enough to falsify — spill density should
-fall back toward 22.1% and `cas_run` decode should move toward its byte growth of 7.8%.
-
-Sequencing: must not land until the wire-keys campaign is accepted, since it is production code and
-would move the freeze the measurements are anchored to.
+Kept as a withdrawn entry rather than deleted, because the reasoning that produced it was published
+and someone may come looking for it.
 
 ## `[cas-decode-per-row-scratch]` The `cas_run` reader rebuilds its scratch every row; the writer does not {#cas-decode-per-row-scratch}
 

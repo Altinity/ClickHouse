@@ -1168,9 +1168,10 @@ was wrong and is retracted.** It read the criterion's phrase "the match helpers 
 a comment saying why (`Formats/CasWireVocab.h`). `toWord` is an encode-side enum lookup and is not
 one of them. No amendment is owed on that point, and the document was correct as written.
 
-The second amendment is also withdrawn pending re-measurement: the spill finding it rested on came
-from a comparison whose two binaries were built with different flags, so it is not yet known whether
-anything new spills at all.
+The second amendment is withdrawn outright. The spill finding it rested on came from a comparison
+whose two binaries were built with different flags; on matched binaries spill density falls in every
+decode symbol and does not move in the encode symbol, so all three of the measurement criterion's
+conditions hold and no amendment is owed on that point either.
 
 What actually blocks acceptance:
 

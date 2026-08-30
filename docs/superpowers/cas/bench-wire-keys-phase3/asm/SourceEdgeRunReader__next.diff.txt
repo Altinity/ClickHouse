@@ -1,0 +1,46 @@
+=== Diff Mode ===
+Match method: mangled_symbol
+
+--- Before ---
+Binary: ~/workspace/ClickHouse/cas-p2-before/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Function: DB::Cas::SourceEdgeRunReader::next(DB::Cas::SourceEdgeRecord&)
+Build ID: 58769b4ef09b1f1b...
+Instructions: 1037  Bytes: 5275
+Spill: 27.1%  Branch: 15.3%  Call: 8.7%
+Blocks: 207  Loops: 5
+
++++ After +++
+Binary: build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Function: DB::Cas::SourceEdgeRunReader::next(DB::Cas::SourceEdgeRecord&)
+Build ID: 8132ee5914cbf4d9...
+Instructions: 1041  Bytes: 5166
+Spill: 25.8%  Branch: 14.4%  Call: 8.6%
+Blocks: 193  Loops: 5
+
+=== Deltas ===
+  instruction_count: +4
+  byte_size: -109
+  branch_count: -9
+  call_count: -1
+  spill_store_count: -7
+  spill_load_count: -5
+  spill_density: -1.26%
+  branch_density: -0.92%
+  call_density: -0.13%
+  block_count: -14
+  loop_count: 0
+
+=== Finding Changes ===
+  + [high] Register spills in loop at L78 (40.0% of 5 insns)
+  - [high] Register spills in loop at L91 (40.0% of 5 insns)
+
+=== Timing ===
+  probe: 21ms
+  inspect_before: 7ms
+  resolve_before: 723ms
+  disassemble_before: 81ms
+  inspect_after: 7ms
+  resolve_after: 244ms
+  disassemble_after: 82ms
+  diff_total: 1146ms
+

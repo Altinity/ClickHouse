@@ -1,0 +1,554 @@
+=== Target ===
+Function: DB::Cas::SourceEdgeRunWriter::append(DB::Cas::SourceEdgeRecord const&)
+Binary: ~/workspace/ClickHouse/cas-p2-before/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Format: ELF
+Arch: x86_64
+Build ID: 58769b4ef09b1f1b...
+Address: 0x1609e40..0x160a6a1 (2145 bytes)
+Resolution confidence: high
+
+=== Metrics ===
+Instructions: 506
+Byte size: 2145
+Branch density: 9.9% (50 branches)
+Call density: 13.6% (69 calls)
+Spill density: 8.7% (25 stores + 19 loads)
+Basic blocks: 69
+Loops detected: 2
+Max block spill density: 100.0%
+Max block branch density: 100.0%
+
+=== Findings ===
+[high] Register spills in loop at L32 (16.7% of 6 insns)
+  0x160a642: mov rdi, qword ptr [rbp - 0x50]
+  Why: Spills inside loop bodies multiply memory traffic by iteration count
+
+[medium] High call density (13.6%)
+  0x1609e8d: call <_ZNSt3__1ssB9fqe220101IhLm32EEEDTclL_ZNS_17__synth_three_wayB9fqe220101EEclsr3stdE7declvalIRT_EEclsr3stdE7declvalIS2_EEEERKNS_5arrayIS1_XT0_EEES7_>
+  0x1609f70: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x1609f81: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x1609f8a: call <_ZN2DB3Cas14blobHashLenForENS0_12BlobHashAlgoE>
+  0x1609fef: call <_Znwm>
+  0x160a01f: call <memset@plt>
+  Why: Frequent function calls may inhibit inlining and optimization; check if callees are small enough to inline
+
+=== Disassembly (506 of 506 instructions) ===
+  0x1609e40: jmp <L0>
+  0x1609e42: nop word ptr [rax + rax + 0x200]
+  0x1609e4b: push rbp
+  0x1609e4c: mov rbp, rsp
+  0x1609e4f: push r15
+  0x1609e51: push r14
+  0x1609e53: push r13
+  0x1609e55: push r12
+  0x1609e57: push rbx
+  0x1609e58: sub rsp, 0xb8
+  0x1609e5f: cmp byte ptr [rdi + 0x48], 0x1
+  0x1609e63: je <L26>
+  0x1609e69: mov r14, rsi
+  0x1609e6c: mov rbx, rdi
+  0x1609e6f: cmp byte ptr [rdi + 0x10], 0x1
+  0x1609e73: jne <L4>
+  0x1609e79: movzx eax, byte ptr [rbx + 0x11]
+  0x1609e7d: nop dword ptr [rax]
+  0x1609e80: cmp byte ptr [r14], al
+  0x1609e83: jne <L1>
+  0x1609e85: lea rdi, [r14 + 0x1]
+  0x1609e89: lea rsi, [rbx + 0x12]
+  0x1609e8d: call <_ZNSt3__1ssB9fqe220101IhLm32EEEDTclL_ZNS_17__synth_three_wayB9fqe220101EEclsr3stdE7declvalIRT_EEclsr3stdE7declvalIS2_EEEERKNS_5arrayIS1_XT0_EEES7_>
+  0x1609e92: test al, al
+  0x1609e94: jns <L2>
+  0x1609e96: jmp <L28>
+  0x1609e9b: nop dword ptr [rax + rax]
+  0x1609ea0: jb <L28>
+  0x1609ea6: movzx eax, byte ptr [r14]
+  0x1609eaa: cmp al, byte ptr [rbx + 0x11]
+  0x1609ead: jne <L4>
+  0x1609eaf: movdqu xmm0, xmmword ptr [r14 + 0x1]
+  0x1609eb5: movdqu xmm1, xmmword ptr [r14 + 0x11]
+  0x1609ebb: movdqu xmm2, xmmword ptr [rbx + 0x12]
+  0x1609ec0: pxor xmm2, xmm0
+  0x1609ec4: movdqu xmm0, xmmword ptr [rbx + 0x22]
+  0x1609ec9: pxor xmm0, xmm1
+  0x1609ecd: por xmm0, xmm2
+  0x1609ed1: ptest xmm0, xmm0
+  0x1609ed6: jne <L4>
+  0x1609ed8: mov rax, qword ptr [rbx + 0x40]
+  0x1609edc: mov rcx, qword ptr [r14 + 0x30]
+  0x1609ee0: cmp rcx, rax
+  0x1609ee3: jne <L3>
+  0x1609ee5: mov rax, qword ptr [rbx + 0x38]
+  0x1609ee9: mov rcx, qword ptr [r14 + 0x28]
+  0x1609eed: cmp rcx, rax
+  0x1609ef0: je <L4>
+  0x1609ef2: cmp rcx, rax
+  0x1609ef5: jb <L28>
+  0x1609efb: mov byte ptr [rbx + 0x10], 0x1
+  0x1609eff: movups xmm0, xmmword ptr [r14]
+  0x1609f03: movups xmm1, xmmword ptr [r14 + 0x10]
+  0x1609f08: movups xmmword ptr [rbx + 0x11], xmm0
+  0x1609f0c: movups xmmword ptr [rbx + 0x21], xmm1
+  0x1609f10: movzx eax, byte ptr [r14 + 0x20]
+  0x1609f15: mov byte ptr [rbx + 0x31], al
+  0x1609f18: movups xmm0, xmmword ptr [r14 + 0x28]
+  0x1609f1d: movups xmmword ptr [rbx + 0x38], xmm0
+  0x1609f21: cmp byte ptr [rbx + 0x67], 0x0
+  0x1609f25: mov qword ptr [rbp - 0x78], rbx
+  0x1609f29: js <L5>
+  0x1609f2b: mov byte ptr [rbx + 0x50], 0x0
+  0x1609f2f: mov byte ptr [rbx + 0x67], 0x0
+  0x1609f33: jmp <L6>
+  0x1609f35: mov rax, qword ptr [rbx + 0x50]
+  0x1609f39: mov byte ptr [rax], 0x0
+  0x1609f3c: mov qword ptr [rbx + 0x58], 0x0
+  0x1609f44: mov byte ptr [rbp - 0x29], 0x1
+  0x1609f48: movzx ebx, byte ptr [r14]
+  0x1609f4c: xorps xmm0, xmm0
+  0x1609f4f: movaps xmmword ptr [rbp - 0x70], xmm0
+  0x1609f53: mov qword ptr [rbp - 0x60], 0x0
+  0x1609f5b: mov eax, ebx
+  0x1609f5d: shr eax, 0x4
+  0x1609f60: lea r15,  <ossl_to_lowerhex.hexdig>
+  0x1609f67: movsx esi, byte ptr [rax + r15]
+  0x1609f6c: lea rdi, [rbp - 0x70]
+  0x1609f70: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x1609f75: and ebx, 0xf
+  0x1609f78: movsx esi, byte ptr [rbx + r15]
+  0x1609f7d: lea rdi, [rbp - 0x70]
+  0x1609f81: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x1609f86: movzx edi, byte ptr [r14]
+  0x1609f8a: call <_ZN2DB3Cas14blobHashLenForENS0_12BlobHashAlgoE>
+  0x1609f8f: mov r15, rax
+  0x1609f92: movabs rcx, 0x7fffffffffffffff
+  0x1609f9c: lea r12, [rax + rax]
+  0x1609fa0: lea rax, [rcx - 0x9]
+  0x1609fa4: cmp r12, rax
+  0x1609fa7: ja <L27>
+  0x1609fad: cmp r12, 0x17
+  0x1609fb1: jae <L7>
+  0x1609fb3: mov byte ptr [rbp - 0x39], r12b
+  0x1609fb7: lea r13, [rbp - 0x50]
+  0x1609fbb: test r12, r12
+  0x1609fbe: mov rbx, qword ptr [rbp - 0x78]
+  0x1609fc2: jne <L8>
+  0x1609fc4: mov byte ptr [r13 + 2*r15], 0x0
+  0x1609fca: test r15, r15
+  0x1609fcd: jne <L9>
+  0x1609fcf: jmp <L17>
+  0x1609fd4: lea rax, [rcx - 0x7]
+  0x1609fd8: and rax, r12
+  0x1609fdb: add rax, 0x8
+  0x1609fdf: cmp rax, 0x18
+  0x1609fe3: mov ebx, 0x19
+  0x1609fe8: cmovne rbx, rax
+  0x1609fec: mov rdi, rbx
+  0x1609fef: call <_Znwm>
+  0x1609ff4: mov r13, rax
+  0x1609ff7: movabs rax, 0x7fffffffffffffff
+  0x160a001: add rax, rbx
+  0x160a004: inc rax
+  0x160a007: mov qword ptr [rbp - 0x50], r13
+  0x160a00b: mov qword ptr [rbp - 0x48], r12
+  0x160a00f: mov qword ptr [rbp - 0x40], rax
+  0x160a013: mov rbx, qword ptr [rbp - 0x78]
+  0x160a017: mov rdi, r13
+  0x160a01a: xor esi, esi
+  0x160a01c: mov rdx, r12
+  0x160a01f: call <memset@plt>
+  0x160a024: mov byte ptr [r13 + 2*r15], 0x0
+  0x160a02a: test r15, r15
+  0x160a02d: je <L17>
+  0x160a033: cmp r15, 0x1
+  0x160a037: jne <L11>
+  0x160a039: xor eax, eax
+  0x160a03b: nop dword ptr [rax + rax]
+  0x160a040: test r15b, 0x1
+  0x160a044: je <L17>
+  0x160a04a: movzx ecx, byte ptr [r14 + rax + 0x1]
+  0x160a050: cmp byte ptr [rbp - 0x39], 0x0
+  0x160a054: jns <L15>
+  0x160a056: mov rdx, qword ptr [rbp - 0x50]
+  0x160a05a: jmp <L16>
+  0x160a05c: mov rcx, r15
+  0x160a05f: and rcx, -0x2
+  0x160a063: xor eax, eax
+  0x160a065: lea rdx, [rbp - 0x50]
+  0x160a069: lea rsi,  <nilstr+0x5a72e>
+  0x160a070: jmp <L13>
+  0x160a072: nop word ptr cs:[rax + rax]
+  0x160a080: movzx r8d, byte ptr [r14 + rax + 0x2]
+  0x160a086: movzx r8d, word ptr [rsi + 2*r8]
+  0x160a08b: mov word ptr [rdi + 2*rax + 0x2], r8w
+  0x160a091: add rax, 0x2
+  0x160a095: cmp rcx, rax
+  0x160a098: je <L10>
+  0x160a09a: cmp byte ptr [rbp - 0x39], 0x0
+  0x160a09e: mov rdi, rdx
+  0x160a0a1: jns <L14>
+  0x160a0a3: mov rdi, qword ptr [rbp - 0x50]
+  0x160a0a7: movzx r8d, byte ptr [r14 + rax + 0x1]
+  0x160a0ad: movzx r8d, word ptr [rsi + 2*r8]
+  0x160a0b2: mov word ptr [rdi + 2*rax], r8w
+  0x160a0b7: cmp byte ptr [rbp - 0x39], 0x0
+  0x160a0bb: mov rdi, rdx
+  0x160a0be: nop 
+  0x160a0c0: jns <L12>
+  0x160a0c2: mov rdi, qword ptr [rbp - 0x50]
+  0x160a0c6: jmp <L12>
+  0x160a0c8: lea rdx, [rbp - 0x50]
+  0x160a0cc: lea rsi,  <nilstr+0x5a72e>
+  0x160a0d3: movzx ecx, word ptr [rsi + 2*rcx]
+  0x160a0d7: mov word ptr [rdx + 2*rax], cx
+  0x160a0db: movsx rdx, byte ptr [rbp - 0x39]
+  0x160a0e0: test rdx, rdx
+  0x160a0e3: jns <L18>
+  0x160a0e5: mov rsi, qword ptr [rbp - 0x50]
+  0x160a0e9: mov rdx, qword ptr [rbp - 0x48]
+  0x160a0ed: jmp <L19>
+  0x160a0ef: lea rsi, [rbp - 0x50]
+  0x160a0f3: lea r13, [rbp - 0x70]
+  0x160a0f7: mov rdi, r13
+  0x160a0fa: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a0ff: cmp byte ptr [rbp - 0x39], 0x0
+  0x160a103: js <L25>
+  0x160a109: lea r15, [rbx + 0x50]
+  0x160a10d: movsx r12, byte ptr [rbp - 0x59]
+  0x160a112: test r12, r12
+  0x160a115: jns <L21>
+  0x160a117: mov r13, qword ptr [rbp - 0x70]
+  0x160a11b: mov r12, qword ptr [rbp - 0x68]
+  0x160a11f: cmp byte ptr [rbp - 0x29], 0x0
+  0x160a123: mov eax, 0x7b
+  0x160a128: mov esi, 0x2c
+  0x160a12d: cmovne esi, eax
+  0x160a130: mov rdi, r15
+  0x160a133: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a138: mov rdi, r15
+  0x160a13b: mov esi, 0x22
+  0x160a140: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a145: lea rsi,  <_ZN9benchmark12_GLOBAL__N_111kBigSIUnitsE+0x2c0e2>
+  0x160a14c: mov edx, 0x1
+  0x160a151: mov rdi, r15
+  0x160a154: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a159: lea rsi,  <_ZN9benchmark12_GLOBAL__N_111kBigSIUnitsE+0x2c0df>
+  0x160a160: mov edx, 0x2
+  0x160a165: mov rdi, r15
+  0x160a168: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a16d: mov rdi, r15
+  0x160a170: mov rsi, r13
+  0x160a173: mov rdx, r12
+  0x160a176: call <_ZN2DB3Cas13CasJsonWriter11stringValueENSt3__117basic_string_viewIcNS2_11char_traitsIcEEEE>
+  0x160a17b: cmp byte ptr [rbp - 0x59], 0x0
+  0x160a17f: nop 
+  0x160a180: jns <L22>
+  0x160a182: mov rdi, qword ptr [rbp - 0x70]
+  0x160a186: movabs rsi, 0x7fffffffffffffff
+  0x160a190: and rsi, qword ptr [rbp - 0x60]
+  0x160a194: call <_ZdlPvm>
+  0x160a199: mov rdi, r15
+  0x160a19c: mov esi, 0x2c
+  0x160a1a1: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a1a6: mov rdi, r15
+  0x160a1a9: mov esi, 0x22
+  0x160a1ae: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a1b3: lea rsi,  <_ZN9benchmark12_GLOBAL__N_111kBigSIUnitsE+0x38af7>
+  0x160a1ba: mov edx, 0x1
+  0x160a1bf: mov rdi, r15
+  0x160a1c2: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a1c7: lea rsi,  <_ZN9benchmark12_GLOBAL__N_111kBigSIUnitsE+0x2c0df>
+  0x160a1ce: mov edx, 0x2
+  0x160a1d3: mov rdi, r15
+  0x160a1d6: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a1db: mov rdi, qword ptr [r14 + 0x28]
+  0x160a1df: mov rsi, qword ptr [r14 + 0x30]
+  0x160a1e3: lea rcx,  <nilstr+0x5a72e>
+  0x160a1ea: lea r12, [rbp - 0x50]
+  0x160a1ee: mov r8d, 0x200
+  0x160a1f4: mov rdx, r12
+  0x160a1f7: call <_ZN4impl17HexConversionUIntIN4wide7integerILm128EjEEvE3hexES3_PcNSt3__117basic_string_viewIcNS6_11char_traitsIcEEEE>
+  0x160a1fc: mov rdi, r15
+  0x160a1ff: mov esi, 0x22
+  0x160a204: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a209: mov edx, 0x20
+  0x160a20e: mov rdi, r15
+  0x160a211: mov rsi, r12
+  0x160a214: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a219: mov rdi, r15
+  0x160a21c: mov esi, 0x22
+  0x160a221: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a226: movsx esi, byte ptr [r14 + 0x38]
+  0x160a22b: lea rdi,  <_ZN2DB3Cas12_GLOBAL__N_115kRunMarkerWordsE>
+  0x160a232: lea rdx,  <nilstr+0x443e2>
+  0x160a239: mov ecx, 0x16
+  0x160a23e: call <_ZNK2DB3Cas13EnumWireTableINS0_9RunMarkerELm3EE6toWordES2_NSt3__117basic_string_viewIcNS4_11char_traitsIcEEEE>
+  0x160a243: mov r13, rax
+  0x160a246: mov r12, rdx
+  0x160a249: mov rdi, r15
+  0x160a24c: mov esi, 0x2c
+  0x160a251: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a256: mov rdi, r15
+  0x160a259: mov esi, 0x22
+  0x160a25e: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a263: lea rsi,  <_ZN9benchmark12_GLOBAL__N_111kBigSIUnitsE+0x2c0e4>
+  0x160a26a: mov edx, 0x1
+  0x160a26f: mov rdi, r15
+  0x160a272: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a277: mov edx, 0x2
+  0x160a27c: mov rdi, r15
+  0x160a27f: lea rsi,  <_ZN9benchmark12_GLOBAL__N_111kBigSIUnitsE+0x2c0df>
+  0x160a286: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a28b: mov rdi, r15
+  0x160a28e: mov rsi, r13
+  0x160a291: mov rdx, r12
+  0x160a294: call <_ZN2DB3Cas13CasJsonWriter11stringValueENSt3__117basic_string_viewIcNS2_11char_traitsIcEEEE>
+  0x160a299: cmp byte ptr [r14 + 0x38], 0x2
+  0x160a29e: nop 
+  0x160a2a0: jne <L23>
+  0x160a2a6: movzx ebx, byte ptr [r14 + 0x39]
+  0x160a2ab: mov rdi, r15
+  0x160a2ae: mov esi, 0x2c
+  0x160a2b3: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a2b8: mov byte ptr [rbp - 0x29], 0x0
+  0x160a2bc: mov rdi, r15
+  0x160a2bf: mov esi, 0x22
+  0x160a2c4: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a2c9: lea rsi,  <_ZN9benchmark12_GLOBAL__N_111kBigSIUnitsE+0x16f92>
+  0x160a2d0: mov edx, 0x4
+  0x160a2d5: mov rdi, r15
+  0x160a2d8: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a2dd: lea r12,  <_ZN9benchmark12_GLOBAL__N_111kBigSIUnitsE+0x2c0df>
+  0x160a2e4: mov edx, 0x2
+  0x160a2e9: mov rdi, r15
+  0x160a2ec: mov rsi, r12
+  0x160a2ef: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a2f4: mov rdx, rbx
+  0x160a2f7: xor rdx, 0x5
+  0x160a2fb: lea rax,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0xa80a>
+  0x160a302: lea rsi,  <ZSTD_splitBlock_byChunks.hashParams+0x2926>
+  0x160a309: test rbx, rbx
+  0x160a30c: cmovne rsi, rax
+  0x160a310: mov rdi, r15
+  0x160a313: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a318: lea rdx, [r14 + 0x40]
+  0x160a31c: lea rsi, [rbp - 0x29]
+  0x160a320: mov rdi, r15
+  0x160a323: call <_ZN2DB3Cas16writeTokenFieldsERNS0_13CasJsonWriterERbRKNS0_5TokenE>
+  0x160a328: mov r13, qword ptr [r14 + 0x60]
+  0x160a32c: cmp byte ptr [rbp - 0x29], 0x0
+  0x160a330: mov eax, 0x7b
+  0x160a335: mov esi, 0x2c
+  0x160a33a: cmovne esi, eax
+  0x160a33d: mov rdi, r15
+  0x160a340: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a345: mov byte ptr [rbp - 0x29], 0x0
+  0x160a349: mov rdi, r15
+  0x160a34c: mov esi, 0x22
+  0x160a351: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a356: lea rsi,  <_ZN9benchmark12_GLOBAL__N_113kSmallSIUnitsE+0xa307>
+  0x160a35d: mov edx, 0x2
+  0x160a362: mov rdi, r15
+  0x160a365: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a36a: mov edx, 0x2
+  0x160a36f: mov rdi, r15
+  0x160a372: mov rsi, r12
+  0x160a375: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a37a: mov rdi, r13
+  0x160a37d: lea rbx, [rbp - 0x50]
+  0x160a381: mov rsi, rbx
+  0x160a384: call <_Z4itoamPc>
+  0x160a389: sub rax, rbx
+  0x160a38c: mov rdi, r15
+  0x160a38f: mov rsi, rbx
+  0x160a392: mov rdx, rax
+  0x160a395: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a39a: cmp byte ptr [rbp - 0x29], 0x0
+  0x160a39e: mov r13, qword ptr [r14 + 0x68]
+  0x160a3a2: mov esi, 0x2c
+  0x160a3a7: mov eax, 0x7b
+  0x160a3ac: cmovne esi, eax
+  0x160a3af: mov rdi, r15
+  0x160a3b2: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a3b7: mov byte ptr [rbp - 0x29], 0x0
+  0x160a3bb: mov rdi, r15
+  0x160a3be: mov esi, 0x22
+  0x160a3c3: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a3c8: lea rsi,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0x14d7f>
+  0x160a3cf: mov edx, 0x2
+  0x160a3d4: mov rdi, r15
+  0x160a3d7: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a3dc: mov edx, 0x2
+  0x160a3e1: mov rdi, r15
+  0x160a3e4: mov rsi, r12
+  0x160a3e7: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a3ec: mov rdi, r15
+  0x160a3ef: mov esi, 0x22
+  0x160a3f4: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a3f9: mov rdi, r13
+  0x160a3fc: mov rsi, rbx
+  0x160a3ff: call <_Z4itoamPc>
+  0x160a404: sub rax, rbx
+  0x160a407: mov rdi, r15
+  0x160a40a: mov rsi, rbx
+  0x160a40d: mov rdx, rax
+  0x160a410: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a415: mov rdi, r15
+  0x160a418: mov esi, 0x22
+  0x160a41d: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a422: movzx r14d, byte ptr [r14 + 0x70]
+  0x160a427: cmp byte ptr [rbp - 0x29], 0x0
+  0x160a42b: mov esi, 0x2c
+  0x160a430: mov eax, 0x7b
+  0x160a435: cmovne esi, eax
+  0x160a438: mov rbx, qword ptr [rbp - 0x78]
+  0x160a43c: mov rdi, r15
+  0x160a43f: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a444: mov byte ptr [rbp - 0x29], 0x0
+  0x160a448: mov rdi, r15
+  0x160a44b: mov esi, 0x22
+  0x160a450: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a455: lea rsi,  <_ZN9benchmark12_GLOBAL__N_113kSmallSIUnitsE+0x3f080>
+  0x160a45c: mov edx, 0x2
+  0x160a461: mov rdi, r15
+  0x160a464: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a469: mov edx, 0x2
+  0x160a46e: mov rdi, r15
+  0x160a471: mov rsi, r12
+  0x160a474: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a479: mov rdx, r14
+  0x160a47c: xor rdx, 0x5
+  0x160a480: test r14, r14
+  0x160a483: lea rsi,  <ZSTD_splitBlock_byChunks.hashParams+0x2926>
+  0x160a48a: lea rax,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0xa80a>
+  0x160a491: cmovne rsi, rax
+  0x160a495: mov rdi, r15
+  0x160a498: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6appendEPKcm>
+  0x160a49d: cmp byte ptr [rbp - 0x29], 0x1
+  0x160a4a1: jne <L23>
+  0x160a4a3: mov rdi, r15
+  0x160a4a6: mov esi, 0x7b
+  0x160a4ab: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a4b0: mov byte ptr [rbp - 0x29], 0x0
+  0x160a4b4: mov rdi, r15
+  0x160a4b7: mov esi, 0x7d
+  0x160a4bc: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a4c1: mov rdi, r15
+  0x160a4c4: mov esi, 0xa
+  0x160a4c9: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9push_backEc>
+  0x160a4ce: movsx rdx, byte ptr [rbx + 0x67]
+  0x160a4d3: test rdx, rdx
+  0x160a4d6: jns <L24>
+  0x160a4d8: mov r15, qword ptr [rbx + 0x50]
+  0x160a4dc: mov rdx, qword ptr [rbx + 0x58]
+  0x160a4e0: mov rdi, qword ptr [rbx]
+  0x160a4e3: mov rsi, r15
+  0x160a4e6: call <_ZN2DB11WriteBuffer5writeEPKcm>
+  0x160a4eb: inc qword ptr [rbx + 0x8]
+  0x160a4ef: add rsp, 0xb8
+  0x160a4f6: pop rbx
+  0x160a4f7: pop r12
+  0x160a4f9: pop r13
+  0x160a4fb: pop r14
+  0x160a4fd: pop r15
+  0x160a4ff: pop rbp
+  0x160a500: ret 
+  0x160a501: nop word ptr cs:[rax + rax + 0x200]
+  0x160a50b: mov rdi, qword ptr [rbp - 0x50]
+  0x160a50f: mov rsi, qword ptr [rbp - 0x40]
+  0x160a513: movabs rax, 0x7fffffffffffffff
+  0x160a51d: and rsi, rax
+  0x160a520: call <_ZdlPvm>
+  0x160a525: lea r15, [rbx + 0x50]
+  0x160a529: movsx r12, byte ptr [rbp - 0x59]
+  0x160a52e: test r12, r12
+  0x160a531: js <L20>
+  0x160a537: jmp <L21>
+  0x160a53c: mov edi, 0x180
+  0x160a541: call <__cxa_allocate_exception>
+  0x160a546: mov r14, rax
+  0x160a549: lea rax,  <_ZN2DB10ErrorCodes13LOGICAL_ERRORE>
+  0x160a550: mov esi, dword ptr [rax]
+  0x160a552: lea rax,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0x14d3d>
+  0x160a559: mov qword ptr [rbp - 0xb8], rax
+  0x160a560: mov qword ptr [rbp - 0xb0], 0x20
+  0x160a56b: mov qword ptr [rbp - 0xa8], rax
+  0x160a572: mov qword ptr [rbp - 0xa0], 0x20
+  0x160a57d: movups xmm0, xmmword ptr [rbp - 0xb8]
+  0x160a584: movups xmm1, xmmword ptr [rbp - 0xa8]
+  0x160a58b: movups xmmword ptr [rsp + 0x10], xmm1
+  0x160a590: movups xmmword ptr [rsp], xmm0
+  0x160a594: mov rdi, r14
+  0x160a597: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x160a59c: jmp <L29>
+  0x160a59e: call <_ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE20__throw_length_errorB9fqe220101Ev>
+  0x160a5a3: mov edi, 0x180
+  0x160a5a8: call <__cxa_allocate_exception>
+  0x160a5ad: mov r14, rax
+  0x160a5b0: lea rax,  <_ZN2DB10ErrorCodes13LOGICAL_ERRORE>
+  0x160a5b7: mov esi, dword ptr [rax]
+  0x160a5b9: lea rax,  <ZSTD_splitBlock_byChunks.hashParams+0x26d1f>
+  0x160a5c0: mov qword ptr [rbp - 0x98], rax
+  0x160a5c7: mov qword ptr [rbp - 0x90], 0x3b
+  0x160a5d2: mov qword ptr [rbp - 0x88], rax
+  0x160a5d9: mov qword ptr [rbp - 0x80], 0x3b
+  0x160a5e1: movups xmm0, xmmword ptr [rbp - 0x98]
+  0x160a5e8: movups xmm1, xmmword ptr [rbp - 0x88]
+  0x160a5ef: movups xmmword ptr [rsp + 0x10], xmm1
+  0x160a5f4: movups xmmword ptr [rsp], xmm0
+  0x160a5f8: mov rdi, r14
+  0x160a5fb: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x160a600: lea rsi,  <_ZTIN2DB9ExceptionE>
+  0x160a607: lea rdx,  <_ZN2DB9ExceptionD2Ev>
+  0x160a60e: mov rdi, r14
+  0x160a611: call <__cxa_throw>
+  0x160a616: jmp <L30>
+  0x160a618: mov rbx, rax
+  0x160a61b: mov rdi, r14
+  0x160a61e: call <__cxa_free_exception>
+  0x160a623: mov rdi, rbx
+  0x160a626: call <_Unwind_Resume>
+  0x160a62b: mov rbx, rax
+  0x160a62e: cmp byte ptr [rbp - 0x39], 0x0
+  0x160a632: js <L32>
+  0x160a634: cmp byte ptr [rbp - 0x59], 0x0
+  0x160a638: js <L33>
+  0x160a63a: mov rdi, rbx
+  0x160a63d: call <_Unwind_Resume>
+  0x160a642: mov rdi, qword ptr [rbp - 0x50]
+  0x160a646: movabs rsi, 0x7fffffffffffffff
+  0x160a650: and rsi, qword ptr [rbp - 0x40]
+  0x160a654: call <_ZdlPvm>
+  0x160a659: cmp byte ptr [rbp - 0x59], 0x0
+  0x160a65d: jns <L31>
+  0x160a65f: nop 
+  0x160a660: jmp <L33>
+  0x160a662: mov rbx, rax
+  0x160a665: cmp byte ptr [rbp - 0x59], 0x0
+  0x160a669: jns <L31>
+  0x160a66b: jmp <L33>
+  0x160a66d: mov rbx, rax
+  0x160a670: cmp byte ptr [rbp - 0x59], 0x0
+  0x160a674: jns <L31>
+  0x160a676: jmp <L33>
+  0x160a678: mov rbx, rax
+  0x160a67b: cmp byte ptr [rbp - 0x59], 0x0
+  0x160a67f: nop 
+  0x160a680: jns <L31>
+  0x160a682: mov rdi, qword ptr [rbp - 0x70]
+  0x160a686: movabs rsi, 0x7fffffffffffffff
+  0x160a690: and rsi, qword ptr [rbp - 0x60]
+  0x160a694: call <_ZdlPvm>
+  0x160a699: mov rdi, rbx
+  0x160a69c: call <_Unwind_Resume>
+
+=== Notes ===
+  static-only ranking; runtime impact unknown
+
+=== Timing ===
+  probe: 17ms
+  inspect: 5ms
+  resolve: 220ms
+  disassemble: 82ms
+  cfg: 0ms
+  metrics: 0ms
+  findings: 0ms
+

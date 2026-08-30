@@ -1,11 +1,11 @@
 before_binary=/home/mfilimonov/workspace/ClickHouse/cas-p2-before/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
 after_binary=build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
-before_sha256=afa30fb8c8fb298d6a03692fdca6589ef852ba4842d3e27a662eb2d439d7b300
+before_sha256=cde34568041f462804ac04dfd08f9565626088d556b4513a425e0351b6b58e34
 after_sha256=070b777eadbaeeac93447128fbd738398a6cb311e49fd4fb8de73bf8bc66db49
 before_rc=0
 after_rc=0
-load1_before=0.49
-load1_after=1.00
+load1_before=1.13
+load1_after=1.24
 flags=--benchmark_repetitions=3 --benchmark_report_aggregates_only=true --benchmark_filter=BM_Cas(Run|RefSnap|PartManifest|FoldSeal|RefCatalog)(Encode|Decode)
 before_cpu_scaling_enabled=True
 before_num_cpus=32
