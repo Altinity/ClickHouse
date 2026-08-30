@@ -235,7 +235,9 @@ size_t max_tests = $BENCHMARK_TESTS;
 size_t max_steps = $BENCHMARK_STEPS;
 
 $GLOBAL
-int work(int thread_id = 0) {
+/// Internal linkage: the ClickHouse build enables -Werror,-Wmissing-prototypes, which rejects a
+/// definition of an external function that has no preceding declaration.
+static int work(int thread_id = 0) {
   (void)thread_id;
   try {
 EOF
