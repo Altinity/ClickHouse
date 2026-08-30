@@ -118,6 +118,44 @@ The `readLine` change's real contribution is still not separated from the reader
 they were measured together after the contaminated comparison was discovered. It is not claimed to
 buy anything on its own.
 
+## A third attempt, measured and reverted {#a-third-attempt-reverted}
+
+With the per-row allocations gone, a second profile showed the cost had moved where it should have:
+allocation accounting fell from about 22% of decode instructions to 5.6%, and what dominated instead
+was reading JSON strings by copying them — for `cas_ref_catalog`, `std::string::append`,
+`readJSONStringInto`, its symbol scan and `memcpy` together came to roughly 36% of the decode.
+
+So the next change read a JSON string **without copying it**: when the whole quoted run is already in
+the buffer and carries no escape — which is every value this format writes, and always true for a row
+decoder parsing from a buffer that holds the entire line — return a view instead of a copy, falling
+back to the copying path otherwise so that no input changes meaning. It was wired into `readHex128`
+and `readU64String`. The unit battery stayed green at 2250.
+
+**It was reverted, because it made `cas_ref_catalog` slower and the reason is not understood.**
+
+| format | run 1 | run 2 |
+|---|---:|---:|
+| `cas_ref_catalog` | **+7.5%** | **+6.0%** |
+| `cas_fold_seal` | −4.9% | −3.9% |
+
+Two independent runs, five repetitions each, on a quieter machine than the baseline they are compared
+against — so load does not explain a slowdown. The other three formats moved less than 1.5%, inside
+this harness's noise.
+
+Part of the outcome has an explanation and part does not. The absent *gain* does: the fast path was
+wired into two value readers, while most of the copying `cas_ref_catalog` does is in keys and string
+values, which go through `nextKey` and `readString` and were left untouched. The measurement
+therefore did not test the thing the profile pointed at. But nothing in that explains a *regression*
+from removing a copy, and shipping a change whose effect cannot be accounted for — negative, on the
+format the profile said would gain most — is worse than shipping nothing.
+
+**Four predictions, three refuted.** The duplicate-key scan (0.17% of instructions), the
+byte-at-a-time line reader (exactly zero), and the copy-free string read (a reproducible regression
+where the largest gain was expected). The one that held — reusing the reader — was the only one made
+*after* profiling rather than from reading the code. Reading code reliably shows what looks wasteful
+and unreliably shows what is expensive; cost comes from how often something runs and how it touches
+memory, neither of which is visible in the shape of the source.
+
 ## What this costs the campaign {#what-this-costs}
 
 This is production code, so it moves the wire-keys campaign's freeze commit. Every measurement, lane
