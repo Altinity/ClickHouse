@@ -94,7 +94,14 @@ struct EnvelopeHeader
 /// diagnostic `ref` is the only truncatable field and is shortened, never dropped, when necessary to
 /// preserve the fixed layout. The header is built without payload bytes, so an upload can stage the
 /// header before the payload is streamed.
-String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len);
+/// `version_override` exists for one caller: the boundary test that has to see what the descriptor
+/// costs at the WIDEST version the budget reserves room for. The budget is sized for a ten-digit
+/// version; production has only ever written a one-digit one, so a test that encodes at the current
+/// version and adds the missing digits arithmetically never sends the boundary through the encoder
+/// at all -- it re-derives the formula it is supposed to be checking. Production passes nothing and
+/// gets `currentCompatibilityVersion()`.
+String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len,
+                            std::optional<uint32_t> version_override = {});
 
 /// Parses and validates the JSON descriptor, its expected `type`, and its compatibility version.
 /// Derives `header_len` from the terminating '\n' and requires every preceding byte in the pad zone to

@@ -84,3 +84,18 @@ TEST(CASFormat, CheckCompatibilityFailsClosedOnFuture)
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
     }
 }
+
+/// The battery's goldens spell their header version as the literal 1 rather than asking production
+/// for it, so that a generation bump cannot move the expectation and the encoder output together.
+/// The cost of that is a golden set which goes stale silently if nobody notices the bump; this test
+/// is what notices. It fails FIRST and says what to do, so the failure that greets a generation bump
+/// is one explanatory test rather than every exact-encoding golden at once.
+TEST(CASFormat, HeaderVersionIsTheLiteralThisBatteryPins)
+{
+    EXPECT_EQ(currentCompatibilityVersion(), 1u)
+        << "The compatibility version has moved away from the literal 1 that "
+           "`currentFormatHeader` in cas_format_test_battery.h writes into every golden header. "
+           "That is a deliberate wire change: read the new bytes, agree to them, and update the "
+           "literal and the goldens together. Do NOT make the helper derive the version from "
+           "production again -- a golden that tracks the code it pins cannot fail.";
+}

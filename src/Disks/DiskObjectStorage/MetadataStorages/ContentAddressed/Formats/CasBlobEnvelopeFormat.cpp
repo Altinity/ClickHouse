@@ -165,7 +165,8 @@ ProvenanceOp provenanceOpFromWireWord(std::string_view w)
     return kProvenanceOpWords.fromWord(w, "CAS blob envelope");
 }
 
-String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
+String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len,
+                            std::optional<uint32_t> version_override)
 {
     if (header.kind != ObjectKind::Blob)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -178,7 +179,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
         CasJsonWriter buf(256);
         bool first = true;
         writeKey(buf, EnvelopeWire::type, first); writeStringValue(buf, kBlobType);
-        writeKey(buf, EnvelopeWire::version, first); writeIntText(currentCompatibilityVersion(), buf);
+        writeNumberField(buf, EnvelopeWire::version, version_override.value_or(currentCompatibilityVersion()), first);
         writeKey(buf, EnvelopeWire::tag, first); writeHex128Value(buf, header.incarnation_tag);
         writeKey(buf, EnvelopeWire::build, first); writeHex128Value(buf, header.build_id);
         if (header.provenance)
