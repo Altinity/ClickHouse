@@ -54,16 +54,17 @@ int hexNibble(char c)
     return -1;
 }
 
+/// The run `ref` carries the algorithm as a raw leading byte, so this is the byte-side counterpart of
+/// the word table -- and it walks that same table rather than listing the enumerators again. A second
+/// list is how the writer and the reader come to disagree about which algorithms exist: `renderB`
+/// writes whatever the enum holds, and a hand-written switch here would reject exactly what a new
+/// enumerator adds.
 BlobHashAlgo algoFromByte(uint8_t b, std::string_view what)
 {
-    switch (b)
-    {
-        case static_cast<uint8_t>(BlobHashAlgo::CityHash128): return BlobHashAlgo::CityHash128;
-        case static_cast<uint8_t>(BlobHashAlgo::XXH3_128):    return BlobHashAlgo::XXH3_128;
-        case static_cast<uint8_t>(BlobHashAlgo::Sha256):      return BlobHashAlgo::Sha256;
-        default:
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown algo byte {} in record key", what, b);
-    }
+    for (const auto & entry : kBlobHashAlgoWords.entries)
+        if (static_cast<uint8_t>(entry.value) == b)
+            return entry.value;
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown algo byte {} in record key", what, b);
 }
 
 /// `ref` = the algo byte as two lowercase hex chars, then the digest hex at the algo's width. The
