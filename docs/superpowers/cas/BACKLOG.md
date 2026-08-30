@@ -71,6 +71,33 @@ unchanged, only relocated.
 
 ### From the 2026-08-04 destructive-baseline / soak audit {#inbox-audit-batch}
 
+## `[ref-catalog-write-hotspot]` The pool-wide ref catalog is the only object that timed out under a full-suite workload {#ref-catalog-write-hotspot}
+
+**Found by the first full local run of the stateless suite on CAS storage (2026-08-30), 11,137 tests.**
+
+One test failed with `Code: 499 ... Timeout ... key cas_s3/cas/ref_catalog, object size 41454`. The
+S3 client retried twice more and both retries timed out at the same size, so this is one logical
+write, not three failures.
+
+What makes it worth recording is the negative half: across 11,137 tests, **`ref_catalog` was the
+only object class whose write ever timed out.** No blob, no manifest, no ref log. The catalog is
+pool-wide, mutable, and rewritten whenever a namespace is created or dropped — and a full stateless
+suite creates and drops tables continuously, so the catalog is both the hottest write in the pool and
+the one that grows with the number of namespaces that have ever existed in it.
+
+This is **not** established as a defect. The run had a load average above 20 with a saturated
+single-node object store, and a 41 KB write timing out under that is plausible on its own. What is
+established is where the pressure lands.
+
+**Worth measuring before deciding anything:** how catalog size and rewrite frequency scale with
+namespace churn, and whether the write is proportional to the whole catalog or to the change. If it
+is the whole catalog on every change, the cost is quadratic in namespace count over a workload's
+lifetime, and a busy pool reaches the timeout on merit rather than by luck.
+
+This finding is the argument for the full lane existing at all: the 41-test CAS selector that stood
+in for it could never have produced this, because it never creates enough namespaces to grow the
+catalog.
+
 ## `[cas-decode-register-pressure]` WITHDRAWN — the finding was a build-flag artifact {#cas-decode-register-pressure}
 
 **Raised 2026-08-30 on an assembly review, withdrawn the same day.**
