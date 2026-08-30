@@ -1,4 +1,13 @@
-# Wire-keys phase 3 — the external lanes
+---
+description: 'Stateless and integration lane results for the CAS semantic wire-key cut, taken at the freeze commit.'
+sidebar_label: 'Wire keys phase 3 lanes'
+sidebar_position: 95
+slug: /superpowers/cas/wire-keys-phase3-lanes
+title: 'CAS wire keys phase 3 — the external lanes'
+doc_type: 'reference'
+---
+
+# Wire-keys phase 3 — the external lanes {#wire-keys-phase-3-the-external-lanes}
 
 The unit battery proves the codecs agree with themselves. These two lanes prove the cut through a
 running server and a real object store, which is a different claim: the stateless lane exercises
@@ -7,7 +16,7 @@ their own readers, so a wrong key spelling fails them loudly rather than silentl
 
 Both lanes ran at the freeze commit `e9f1c3d867c` (gate 2250/2250).
 
-## Binary provenance
+## Binary provenance {#binary-provenance}
 
 The version banner is not a build marker. The stateless run's log reports the server as
 `26.6.2.20000.altinityantalya @ 164a356e367`, which is an earlier commit and reads exactly like a
@@ -18,7 +27,7 @@ string. Provenance was established by content instead —
 commit's part-manifest key change. Every later local lane that mounts `build/programs/clickhouse`
 inherits the same provenance as long as nothing rebuilds into `build/`.
 
-## Stateless lane
+## Stateless lane {#stateless-lane}
 
 Job `Stateless tests (amd_binary, cas s3 storage, parallel)`, selector built from the 41 CAS tests
 in `tests/queries/0_stateless` (36 parallel + 5 sequential, as the runner reported).
@@ -31,7 +40,7 @@ selector. Enumerating `.sh` and `.sql` files under both conventions yields the s
 nothing was missed — the `*content_addressed*` matches in the directory are orphaned `.stdout` and
 `.stderr` artifacts of renamed tests, not tests.
 
-## Integration lane
+## Integration lane {#integration-lane}
 
 Twelve suites match `tests/integration/test_cas_*`; the directory list was taken at run time so a
 suite added since the plan was written could not be silently skipped, and it matched the plan's
@@ -64,7 +73,7 @@ executed, so they are the point of the lane rather than incidental coverage:
 - `test_cas_mount_renewal_retry` reads the lease's `seq` and `write_attempt_id`, both deliberately
   left unchanged by the cut — so this suite would also catch an over-eager rename.
 
-## Triage
+## Triage {#triage}
 
 The plan's six outcome classes (stale-assertion, cut-defect, pre-existing, environment/harness,
 inconclusive, unclassified) were not needed for a test result: no test in either lane failed.
@@ -75,7 +84,7 @@ failure. Every integration log contains two lines reading
 `docker info > /dev/null 2>&1` probe, which it tolerates and proceeds past; the suites then start
 containers successfully. It is a probe result, not a test outcome.
 
-## What these lanes do not cover
+## What these lanes do not cover {#what-these-lanes-do-not-cover}
 
 They do not measure anything — no throughput, byte, or capacity claim is discharged here. They also
 do not reach every format: several formats have no stateless or integration test that parses their
