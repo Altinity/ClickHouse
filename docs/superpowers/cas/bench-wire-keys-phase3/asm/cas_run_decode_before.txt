@@ -1,0 +1,1087 @@
+=== Target ===
+Function: DB::Cas::SourceEdgeRunReader::next(DB::Cas::SourceEdgeRecord&)
+Binary: ~/workspace/ClickHouse/cas-p2-before/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Format: ELF
+Arch: x86_64
+Build ID: 7536cbc3b9c1926e...
+Address: 0x16df900..0x16e0e0b (5387 bytes)
+Resolution confidence: high
+
+=== Metrics ===
+Instructions: 1032
+Byte size: 5387
+Branch density: 15.5% (160 branches)
+Call density: 8.6% (89 calls)
+Spill density: 22.1% (147 stores + 81 loads)
+Basic blocks: 207
+Loops detected: 5
+Max block spill density: 100.0%
+Max block branch density: 100.0%
+
+=== Findings ===
+[high] High register spill density (22.1%)
+  0x16df971: mov rbx, qword ptr [rsp + 0x138]
+  0x16df979: mov rax, qword ptr [rsp + 0x140]
+  0x16df981: mov qword ptr [rsp + 0x188], r15
+  0x16df989: mov qword ptr [rsp + 0x198], rbx
+  0x16df991: mov qword ptr [rsp + 0x1a0], 0x0
+  0x16df9a0: mov qword ptr [rsp + 0x1a8], rbx
+  Why: Excessive stack spills indicate register pressure; may cause extra memory traffic in hot paths
+
+[high] Register spills in loop at L91 (25.0% of 4 insns)
+  0x16e0d9d: mov rdi, qword ptr [rsp + 0x70]
+  Why: Spills inside loop bodies multiply memory traffic by iteration count
+
+[medium] Branch-heavy loop at L5 (25.0%, 1 branches in 4 insns)
+  0x16dfb8f: jns <L6>
+  Why: Branch-heavy loops are candidates for vectorization or branchless rewriting
+
+[low] Very large function (1032 instructions, 5387 bytes)
+  Why: Large functions may exceed instruction cache capacity and are harder for the compiler to optimize globally
+
+=== Disassembly (1032 of 1032 instructions) ===
+  0x16df900: jmp <L0>
+  0x16df902: nop word ptr [rax + rax + 0x200]
+  0x16df90b: push rbp
+  0x16df90c: push r15
+  0x16df90e: push r14
+  0x16df910: push r13
+  0x16df912: push r12
+  0x16df914: push rbx
+  0x16df915: sub rsp, 0x388
+  0x16df91c: cmp byte ptr [rdi + 0xa8], 0x0
+  0x16df923: je <L1>
+  0x16df925: xor ebx, ebx
+  0x16df927: jmp <L59>
+  0x16df92c: mov r15, rsi
+  0x16df92f: mov r14, rdi
+  0x16df932: mov edi, 0xd
+  0x16df937: call <_ZN2DB3Cas9traitsForENS0_8FormatIdE>
+  0x16df93c: mov rdx, qword ptr [rax + 0x28]
+  0x16df940: lea r12,  <nilstr+0x2f0bf>
+  0x16df947: lea rbx, [rsp + 0x138]
+  0x16df94f: mov r8d, 0x7
+  0x16df955: mov rdi, rbx
+  0x16df958: mov rsi, r14
+  0x16df95b: mov rcx, r12
+  0x16df95e: call <_ZN2DB3Cas8readLineERNS_10ReadBufferEmNSt3__117basic_string_viewIcNS3_11char_traitsIcEEEE>
+  0x16df963: movsx rax, byte ptr [rsp + 0x14f]
+  0x16df96c: test rax, rax
+  0x16df96f: jns <L2>
+  0x16df971: mov rbx, qword ptr [rsp + 0x138]
+  0x16df979: mov rax, qword ptr [rsp + 0x140]
+  0x16df981: mov qword ptr [rsp + 0x188], r15
+  0x16df989: mov qword ptr [rsp + 0x198], rbx
+  0x16df991: mov qword ptr [rsp + 0x1a0], 0x0
+  0x16df99d: add rax, rbx
+  0x16df9a0: mov qword ptr [rsp + 0x1a8], rbx
+  0x16df9a8: mov qword ptr [rsp + 0x1b0], rax
+  0x16df9b0: mov qword ptr [rsp + 0x1b8], rbx
+  0x16df9b8: mov qword ptr [rsp + 0x1c0], rax
+  0x16df9c0: mov word ptr [rsp + 0x1c8], 0x0
+  0x16df9ca: mov qword ptr [rsp + 0x1d0], 0x0
+  0x16df9d6: lea rax,  <_ZTVN2DB20ReadBufferFromMemoryE>
+  0x16df9dd: add rax, 0x10
+  0x16df9e1: mov qword ptr [rsp + 0x190], rax
+  0x16df9e9: lea rdi, [rsp + 0x1d8]
+  0x16df9f1: lea rsi, [rsp + 0x190]
+  0x16df9f9: mov r8d, 0x7
+  0x16df9ff: mov edx, 0x2
+  0x16dfa04: mov rcx, r12
+  0x16dfa07: call <_ZN2DB3Cas16JsonObjectReaderC2ERNS_10ReadBufferENS0_13KeyStrictnessENSt3__117basic_string_viewIcNS5_11char_traitsIcEEEE>
+  0x16dfa0c: vpxor xmm0, xmm0, xmm0
+  0x16dfa10: vmovdqa xmmword ptr [rsp + 0x70], xmm0
+  0x16dfa16: mov qword ptr [rsp + 0x80], 0x0
+  0x16dfa22: lea rdi, [rsp + 0x1d8]
+  0x16dfa2a: lea r13, [rsp + 0x70]
+  0x16dfa2f: mov rsi, r13
+  0x16dfa32: call <_ZN2DB3Cas16JsonObjectReader7nextKeyERNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE>
+  0x16dfa37: test al, al
+  0x16dfa39: je <L67>
+  0x16dfa3f: movsx rax, byte ptr [rsp + 0x87]
+  0x16dfa48: mov rcx, rax
+  0x16dfa4b: test rax, rax
+  0x16dfa4e: jns <L3>
+  0x16dfa50: mov rcx, qword ptr [rsp + 0x78]
+  0x16dfa55: cmp rcx, 0x1
+  0x16dfa59: jne <L4>
+  0x16dfa5b: nop dword ptr [rax + rax]
+  0x16dfa60: test al, al
+  0x16dfa62: jns <L42>
+  0x16dfa68: mov rax, qword ptr [rsp + 0x70]
+  0x16dfa6d: cmp byte ptr [rax], 0x6e
+  0x16dfa70: je <L43>
+  0x16dfa76: vpxor xmm0, xmm0, xmm0
+  0x16dfa7a: vmovdqu ymmword ptr [rsp + 0x340], ymm0
+  0x16dfa83: vpxor xmm0, xmm0, xmm0
+  0x16dfa87: vmovdqa xmmword ptr [rsp + 0xd0], xmm0
+  0x16dfa90: mov qword ptr [rsp + 0xe0], 0x0
+  0x16dfa9c: mov byte ptr [rsp + 0x90], 0x0
+  0x16dfaa4: mov byte ptr [rsp + 0xa8], 0x0
+  0x16dfaac: mov byte ptr [rsp + 0xb0], 0x0
+  0x16dfab4: mov byte ptr [rsp + 0xc8], 0x0
+  0x16dfabc: mov byte ptr [rsp + 0x2f], 0x1
+  0x16dfac1: xor ebp, ebp
+  0x16dfac3: lea rbx, [rsp + 0x1d8]
+  0x16dfacb: lea r15, [rsp + 0x30]
+  0x16dfad0: mov qword ptr [rsp + 0x150], 0x0
+  0x16dfadc: mov qword ptr [rsp + 0x170], 0x0
+  0x16dfae8: mov qword ptr [rsp + 0x158], 0x0
+  0x16dfaf4: mov qword ptr [rsp + 0x168], 0x0
+  0x16dfb00: mov qword ptr [rsp + 0x160], 0x0
+  0x16dfb0c: mov qword ptr [rsp + 0x110], 0x0
+  0x16dfb18: mov qword ptr [rsp + 0x118], 0x0
+  0x16dfb24: mov qword ptr [rsp + 0x120], 0x0
+  0x16dfb30: mov qword ptr [rsp + 0x100], 0x0
+  0x16dfb3c: mov qword ptr [rsp + 0x130], 0x0
+  0x16dfb48: mov qword ptr [rsp + 0x128], 0x0
+  0x16dfb54: mov qword ptr [rsp + 0xf0], 0x0
+  0x16dfb60: mov qword ptr [rsp + 0xf8], 0x0
+  0x16dfb6c: xor r12d, r12d
+  0x16dfb6f: nop word ptr cs:[rax + rax]
+  0x16dfb7e: nop 
+  0x16dfb80: movsx rcx, byte ptr [rsp + 0x87]
+  0x16dfb89: mov rax, r13
+  0x16dfb8c: test rcx, rcx
+  0x16dfb8f: jns <L6>
+  0x16dfb91: mov rax, qword ptr [rsp + 0x70]
+  0x16dfb96: mov rcx, qword ptr [rsp + 0x78]
+  0x16dfb9b: nop dword ptr [rax + rax]
+  0x16dfba0: cmp rcx, 0x4
+  0x16dfba4: je <L9>
+  0x16dfbaa: cmp rcx, 0x2
+  0x16dfbae: je <L8>
+  0x16dfbb0: cmp rcx, 0x1
+  0x16dfbb4: jne <L10>
+  0x16dfbba: cmp byte ptr [rax], 0x62
+  0x16dfbbd: nop dword ptr [rax]
+  0x16dfbc0: jne <L11>
+  0x16dfbc6: mov rdi, r15
+  0x16dfbc9: mov rsi, rbx
+  0x16dfbcc: vzeroupper 
+  0x16dfbcf: call <_ZN2DB3Cas16JsonObjectReader10readStringEv>
+  0x16dfbd4: cmp byte ptr [rsp + 0xe7], 0x0
+  0x16dfbdc: jns <L7>
+  0x16dfbde: mov rdi, qword ptr [rsp + 0xd0]
+  0x16dfbe6: mov al, 0x3f
+  0x16dfbe8: bzhi rsi, qword ptr [rsp + 0xe0], rax
+  0x16dfbf2: call <_ZdlPvm>
+  0x16dfbf7: mov rax, qword ptr [rsp + 0x40]
+  0x16dfbfc: mov qword ptr [rsp + 0xe0], rax
+  0x16dfc04: vmovdqu xmm0, xmmword ptr [rsp + 0x30]
+  0x16dfc0a: vmovdqa xmmword ptr [rsp + 0xd0], xmm0
+  0x16dfc13: mov r12b, 0x1
+  0x16dfc16: jmp <L24>
+  0x16dfc1b: nop dword ptr [rax + rax]
+  0x16dfc20: cmp word ptr [rax], 0x7474
+  0x16dfc25: je <L12>
+  0x16dfc2b: cmp word ptr [rax], 0x7674
+  0x16dfc30: je <L18>
+  0x16dfc36: cmp word ptr [rax], 0x7a73
+  0x16dfc3b: nop dword ptr [rax + rax]
+  0x16dfc40: je <L21>
+  0x16dfc46: cmp word ptr [rax], 0x7263
+  0x16dfc4b: je <L25>
+  0x16dfc51: cmp word ptr [rax], 0x636d
+  0x16dfc56: jne <L10>
+  0x16dfc58: mov rdi, rbx
+  0x16dfc5b: vzeroupper 
+  0x16dfc5e: call <_ZN2DB3Cas16JsonObjectReader8readBoolEv>
+  0x16dfc63: mov ebp, eax
+  0x16dfc65: mov al, 0x1
+  0x16dfc67: mov qword ptr [rsp + 0x110], rax
+  0x16dfc6f: jmp <L24>
+  0x16dfc74: nop word ptr cs:[rax + rax]
+  0x16dfc80: cmp dword ptr [rax], 0x646e6570
+  0x16dfc86: je <L14>
+  0x16dfc8c: mov rdi, rbx
+  0x16dfc8f: mov rsi, r13
+  0x16dfc92: vzeroupper 
+  0x16dfc95: call <_ZN2DB3Cas16JsonObjectReader11skipUnknownERKNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE>
+  0x16dfc9a: jmp <L24>
+  0x16dfc9f: cmp byte ptr [rax], 0x73
+  0x16dfca2: jne <L15>
+  0x16dfca8: mov rdi, rbx
+  0x16dfcab: vzeroupper 
+  0x16dfcae: call <_ZN2DB3Cas16JsonObjectReader10readHex128Ev>
+  0x16dfcb3: mov qword ptr [rsp + 0x160], rax
+  0x16dfcbb: mov qword ptr [rsp + 0x168], rdx
+  0x16dfcc3: mov al, 0x1
+  0x16dfcc5: mov qword ptr [rsp + 0xf8], rax
+  0x16dfccd: jmp <L24>
+  0x16dfcd2: mov rdi, r15
+  0x16dfcd5: mov rsi, rbx
+  0x16dfcd8: vzeroupper 
+  0x16dfcdb: call <_ZN2DB3Cas16JsonObjectReader10readStringEv>
+  0x16dfce0: cmp byte ptr [rsp + 0xa8], 0x1
+  0x16dfce8: jne <L20>
+  0x16dfcee: cmp byte ptr [rsp + 0xa7], 0x0
+  0x16dfcf6: jns <L13>
+  0x16dfcf8: mov rdi, qword ptr [rsp + 0x90]
+  0x16dfd00: mov al, 0x3f
+  0x16dfd02: bzhi rsi, qword ptr [rsp + 0xa0], rax
+  0x16dfd0c: call <_ZdlPvm>
+  0x16dfd11: mov rax, qword ptr [rsp + 0x40]
+  0x16dfd16: mov qword ptr [rsp + 0xa0], rax
+  0x16dfd1e: vmovdqu xmm0, xmmword ptr [rsp + 0x30]
+  0x16dfd24: vmovdqa xmmword ptr [rsp + 0x90], xmm0
+  0x16dfd2d: jmp <L23>
+  0x16dfd32: mov rdi, rbx
+  0x16dfd35: vzeroupper 
+  0x16dfd38: call <_ZN2DB3Cas16JsonObjectReader8readBoolEv>
+  0x16dfd3d: mov qword ptr [rsp + 0x170], rax
+  0x16dfd45: mov al, 0x1
+  0x16dfd47: mov qword ptr [rsp + 0x128], rax
+  0x16dfd4f: jmp <L24>
+  0x16dfd54: cmp byte ptr [rax], 0x6d
+  0x16dfd57: jne <L10>
+  0x16dfd5d: mov rdi, r15
+  0x16dfd60: mov rsi, rbx
+  0x16dfd63: vzeroupper 
+  0x16dfd66: call <_ZN2DB3Cas16JsonObjectReader10readStringEv>
+  0x16dfd6b: movsx rdx, byte ptr [rsp + 0x47]
+  0x16dfd71: mov rsi, r15
+  0x16dfd74: test rdx, rdx
+  0x16dfd77: jns <L16>
+  0x16dfd79: mov rsi, qword ptr [rsp + 0x30]
+  0x16dfd7e: mov rdx, qword ptr [rsp + 0x38]
+  0x16dfd83: mov r8d, 0xb
+  0x16dfd89: lea rdi,  <_ZN2DB3Cas12_GLOBAL__N_115kRunMarkerWordsE>
+  0x16dfd90: lea rcx,  <_ZZN4absl12lts_202601079SymbolizeEPKvPciE9kEllipsis+0x1942f>
+  0x16dfd97: call <_ZNK2DB3Cas13EnumWireTableINS0_9RunMarkerELm3EE8fromWordENSt3__117basic_string_viewIcNS4_11char_traitsIcEEEES8_>
+  0x16dfd9c: mov byte ptr [rsp + 0x2f], al
+  0x16dfda0: cmp byte ptr [rsp + 0x47], 0x0
+  0x16dfda5: jns <L17>
+  0x16dfda7: mov rdi, qword ptr [rsp + 0x30]
+  0x16dfdac: mov al, 0x3f
+  0x16dfdae: bzhi rsi, qword ptr [rsp + 0x40], rax
+  0x16dfdb5: call <_ZdlPvm>
+  0x16dfdba: mov al, 0x1
+  0x16dfdbc: mov qword ptr [rsp + 0xf0], rax
+  0x16dfdc4: jmp <L24>
+  0x16dfdc9: mov rdi, r15
+  0x16dfdcc: mov rsi, rbx
+  0x16dfdcf: vzeroupper 
+  0x16dfdd2: call <_ZN2DB3Cas16JsonObjectReader10readStringEv>
+  0x16dfdd7: cmp byte ptr [rsp + 0xc8], 0x1
+  0x16dfddf: nop 
+  0x16dfde0: jne <L22>
+  0x16dfde6: cmp byte ptr [rsp + 0xc7], 0x0
+  0x16dfdee: jns <L19>
+  0x16dfdf0: mov rdi, qword ptr [rsp + 0xb0]
+  0x16dfdf8: mov al, 0x3f
+  0x16dfdfa: bzhi rsi, qword ptr [rsp + 0xc0], rax
+  0x16dfe04: call <_ZdlPvm>
+  0x16dfe09: mov rax, qword ptr [rsp + 0x40]
+  0x16dfe0e: lea rcx, [rsp + 0xb0]
+  0x16dfe16: mov qword ptr [rcx + 0x10], rax
+  0x16dfe1a: vmovdqu xmm0, xmmword ptr [rsp + 0x30]
+  0x16dfe20: vmovdqu xmmword ptr [rcx], xmm0
+  0x16dfe24: jmp <L23>
+  0x16dfe26: mov rax, qword ptr [rsp + 0x40]
+  0x16dfe2b: mov qword ptr [rsp + 0xa0], rax
+  0x16dfe33: vmovdqu xmm0, xmmword ptr [rsp + 0x30]
+  0x16dfe39: vmovdqa xmmword ptr [rsp + 0x90], xmm0
+  0x16dfe42: mov byte ptr [rsp + 0xa8], 0x1
+  0x16dfe4a: jmp <L23>
+  0x16dfe4c: mov rdi, rbx
+  0x16dfe4f: vzeroupper 
+  0x16dfe52: call <_ZN2DB3Cas16JsonObjectReader13readU64NumberEv>
+  0x16dfe57: mov qword ptr [rsp + 0x158], rax
+  0x16dfe5f: mov al, 0x1
+  0x16dfe61: mov qword ptr [rsp + 0x120], rax
+  0x16dfe69: jmp <L24>
+  0x16dfe6b: mov rax, qword ptr [rsp + 0x40]
+  0x16dfe70: lea rcx, [rsp + 0xb0]
+  0x16dfe78: mov qword ptr [rcx + 0x10], rax
+  0x16dfe7c: vmovdqu xmm0, xmmword ptr [rsp + 0x30]
+  0x16dfe82: vmovdqu xmmword ptr [rcx], xmm0
+  0x16dfe86: mov byte ptr [rsp + 0xc8], 0x1
+  0x16dfe8e: movzx eax, byte ptr [rsp + 0xa8]
+  0x16dfe96: mov qword ptr [rsp + 0x130], rax
+  0x16dfe9e: movzx eax, byte ptr [rsp + 0xc8]
+  0x16dfea6: mov qword ptr [rsp + 0x100], rax
+  0x16dfeae: nop word ptr cs:[rax + rax]
+  0x16dfebd: nop dword ptr [rax]
+  0x16dfec0: mov rdi, rbx
+  0x16dfec3: mov rsi, r13
+  0x16dfec6: call <_ZN2DB3Cas16JsonObjectReader7nextKeyERNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE>
+  0x16dfecb: test al, al
+  0x16dfecd: jne <L5>
+  0x16dfed3: jmp <L26>
+  0x16dfed5: mov rdi, rbx
+  0x16dfed8: vzeroupper 
+  0x16dfedb: call <_ZN2DB3Cas16JsonObjectReader13readU64StringEv>
+  0x16dfee0: mov qword ptr [rsp + 0x150], rax
+  0x16dfee8: mov al, 0x1
+  0x16dfeea: mov qword ptr [rsp + 0x118], rax
+  0x16dfef2: jmp <L24>
+  0x16dfef4: and r12b, byte ptr [rsp + 0xf8]
+  0x16dfefc: and r12b, byte ptr [rsp + 0xf0]
+  0x16dff04: test r12b, 0x1
+  0x16dff08: je <L68>
+  0x16dff0e: mov qword ptr [rsp + 0xf8], r14
+  0x16dff16: movsx rsi, byte ptr [rsp + 0xe7]
+  0x16dff1f: mov rdx, qword ptr [rsp + 0xd0]
+  0x16dff27: test rsi, rsi
+  0x16dff2a: jns <L27>
+  0x16dff2c: mov r14, qword ptr [rsp + 0xd8]
+  0x16dff34: mov r12, rdx
+  0x16dff37: jmp <L28>
+  0x16dff39: lea r12, [rsp + 0xd0]
+  0x16dff41: mov r14, rsi
+  0x16dff44: cmp r14, 0x1
+  0x16dff48: jbe <L69>
+  0x16dff4e: movsx eax, byte ptr [r12]
+  0x16dff53: lea ecx, [rax - 0x30]
+  0x16dff56: cmp cl, 0x9
+  0x16dff59: mov qword ptr [rsp + 0x180], rbp
+  0x16dff61: ja <L29>
+  0x16dff63: add eax, -0x30
+  0x16dff66: jmp <L30>
+  0x16dff68: lea ecx, [rax - 0x61]
+  0x16dff6b: add eax, -0x57
+  0x16dff6e: cmp cl, 0x6
+  0x16dff71: mov ecx, 0xffffffff
+  0x16dff76: cmovb ecx, eax
+  0x16dff79: mov eax, ecx
+  0x16dff7b: test sil, sil
+  0x16dff7e: lea r15, [rsp + 0xd0]
+  0x16dff86: mov rcx, r15
+  0x16dff89: cmovs rcx, rdx
+  0x16dff8d: movsx ebp, byte ptr [rcx + 0x1]
+  0x16dff91: lea ecx, [rbp - 0x30]
+  0x16dff94: cmp cl, 0x9
+  0x16dff97: ja <L31>
+  0x16dff99: add ebp, -0x30
+  0x16dff9c: jmp <L32>
+  0x16dff9e: lea ecx, [rbp - 0x61]
+  0x16dffa1: add ebp, -0x57
+  0x16dffa4: cmp cl, 0x6
+  0x16dffa7: mov ecx, 0xffffffff
+  0x16dffac: cmovb ecx, ebp
+  0x16dffaf: mov ebp, ecx
+  0x16dffb1: mov ecx, ebp
+  0x16dffb3: or ecx, eax
+  0x16dffb5: js <L70>
+  0x16dffbb: shl eax, 0x4
+  0x16dffbe: or ebp, eax
+  0x16dffc0: lea rax,  <nilstr+0x2f0bf>
+  0x16dffc7: mov qword ptr [rsp + 0x50], rax
+  0x16dffcc: mov qword ptr [rsp + 0x58], 0x7
+  0x16dffd5: mov byte ptr [rsp + 0x68], bpl
+  0x16dffda: lea eax, [rbp - 0x1]
+  0x16dffdd: nop dword ptr [rax]
+  0x16dffe0: cmp al, 0x3
+  0x16dffe2: jae <L71>
+  0x16dffe8: mov qword ptr [rsp + 0xf0], rsi
+  0x16dfff0: test sil, sil
+  0x16dfff3: mov qword ptr [rsp + 0x178], rdx
+  0x16dfffb: cmovs r15, rdx
+  0x16dffff: movzx ebx, bpl
+  0x16e0003: mov edi, ebx
+  0x16e0005: call <_ZN2DB3Cas14blobHashLenForENS0_12BlobHashAlgoE>
+  0x16e000a: lea r13, [r14 - 0x2]
+  0x16e000e: add rax, rax
+  0x16e0011: cmp r13, rax
+  0x16e0014: jne <L72>
+  0x16e001a: add r15, 0x2
+  0x16e001e: nop 
+  0x16e0020: cmp r14, 0x2
+  0x16e0024: je <L34>
+  0x16e0026: add r12, r14
+  0x16e0029: mov rax, r15
+  0x16e002c: nop word ptr cs:[rax + rax]
+  0x16e003b: nop dword ptr [rax + rax]
+  0x16e0040: movzx ecx, byte ptr [rax]
+  0x16e0043: lea edx, [rcx - 0x30]
+  0x16e0046: cmp dl, 0xa
+  0x16e0049: setb dl
+  0x16e004c: add cl, -0x61
+  0x16e004f: cmp cl, 0x6
+  0x16e0052: setb cl
+  0x16e0055: or cl, dl
+  0x16e0057: je <L64>
+  0x16e005d: inc rax
+  0x16e0060: cmp rax, r12
+  0x16e0063: jne <L33>
+  0x16e0065: mov edi, ebx
+  0x16e0067: call <_ZN2DB3Cas14blobHashLenForENS0_12BlobHashAlgoE>
+  0x16e006c: movabs r14, 0x7ffffffffffffff6
+  0x16e0076: mov qword ptr [rsp + 0x68], rax
+  0x16e007b: nop dword ptr [rax + rax]
+  0x16e0080: cmp r13, r14
+  0x16e0083: ja <L73>
+  0x16e0089: cmp r13, 0x16
+  0x16e008d: ja <L35>
+  0x16e008f: mov byte ptr [rsp + 0x67], r13b
+  0x16e0094: lea rbx, [rsp + 0x50]
+  0x16e0099: jmp <L36>
+  0x16e009b: lea rax, [r14 + 0x2]
+  0x16e009f: and rax, r13
+  0x16e00a2: add rax, 0x8
+  0x16e00a6: cmp rax, 0x18
+  0x16e00aa: mov r12d, 0x19
+  0x16e00b0: cmovne r12, rax
+  0x16e00b4: mov rdi, r12
+  0x16e00b7: call <_Znwm>
+  0x16e00bc: mov rbx, rax
+  0x16e00bf: lea rax, [r14 + r12]
+  0x16e00c3: add rax, 0xa
+  0x16e00c7: mov qword ptr [rsp + 0x50], rbx
+  0x16e00cc: mov qword ptr [rsp + 0x58], r13
+  0x16e00d1: mov qword ptr [rsp + 0x60], rax
+  0x16e00d6: mov rdi, rbx
+  0x16e00d9: mov rsi, r15
+  0x16e00dc: mov rdx, r13
+  0x16e00df: call <memcpy>
+  0x16e00e4: mov byte ptr [rbx + r13], 0x0
+  0x16e00e9: movsx rcx, byte ptr [rsp + 0x67]
+  0x16e00ef: test rcx, rcx
+  0x16e00f2: mov r14, qword ptr [rsp + 0xf8]
+  0x16e00fa: jns <L37>
+  0x16e00fc: mov rdx, qword ptr [rsp + 0x50]
+  0x16e0101: mov rcx, qword ptr [rsp + 0x58]
+  0x16e0106: jmp <L38>
+  0x16e0108: lea rdx, [rsp + 0x50]
+  0x16e010d: movzx ebx, byte ptr [rsp + 0x2f]
+  0x16e0112: lea rdi, [rsp + 0x30]
+  0x16e0117: lea rsi, [rsp + 0x68]
+  0x16e011c: call <_ZNK2DB3Cas11DigestCodec7fromHexENSt3__117basic_string_viewIcNS2_11char_traitsIcEEEE>
+  0x16e0121: vmovups ymm0, ymmword ptr [rsp + 0x30]
+  0x16e0127: vmovups ymmword ptr [rsp + 0x360], ymm0
+  0x16e0130: cmp byte ptr [rsp + 0x67], 0x0
+  0x16e0135: js <L40>
+  0x16e013b: vmovdqu ymm0, ymmword ptr [rsp + 0x360]
+  0x16e0144: vmovdqu ymmword ptr [rsp + 0x340], ymm0
+  0x16e014d: cmp bl, 0x2
+  0x16e0150: jne <L41>
+  0x16e0156: test byte ptr [rsp + 0x128], 0x1
+  0x16e015e: nop 
+  0x16e0160: je <L76>
+  0x16e0166: test byte ptr [rsp + 0x130], 0x1
+  0x16e016e: je <L76>
+  0x16e0174: test byte ptr [rsp + 0x100], 0x1
+  0x16e017c: nop dword ptr [rax]
+  0x16e0180: je <L76>
+  0x16e0186: test byte ptr [rsp + 0x120], 0x1
+  0x16e018e: je <L76>
+  0x16e0194: test byte ptr [rsp + 0x118], 0x1
+  0x16e019c: nop dword ptr [rax]
+  0x16e01a0: je <L76>
+  0x16e01a6: test byte ptr [rsp + 0x110], 0x1
+  0x16e01ae: je <L76>
+  0x16e01b4: cmp byte ptr [rsp + 0xc8], 0x0
+  0x16e01bc: nop dword ptr [rax]
+  0x16e01c0: je <L63>
+  0x16e01c6: cmp byte ptr [rsp + 0xc7], 0x0
+  0x16e01ce: js <L44>
+  0x16e01d4: lea rcx, [rsp + 0xb0]
+  0x16e01dc: mov rax, qword ptr [rcx + 0x10]
+  0x16e01e0: mov qword ptr [rsp + 0x40], rax
+  0x16e01e5: vmovdqu xmm0, xmmword ptr [rcx]
+  0x16e01e9: vmovdqa xmmword ptr [rsp + 0x30], xmm0
+  0x16e01ef: jmp <L45>
+  0x16e01f4: mov rdi, qword ptr [rsp + 0x50]
+  0x16e01f9: mov al, 0x3f
+  0x16e01fb: bzhi rsi, qword ptr [rsp + 0x60], rax
+  0x16e0202: vzeroupper 
+  0x16e0205: call <_ZdlPvm>
+  0x16e020a: vmovdqu ymm0, ymmword ptr [rsp + 0x360]
+  0x16e0213: vmovdqu ymmword ptr [rsp + 0x340], ymm0
+  0x16e021c: nop dword ptr [rax]
+  0x16e0220: cmp bl, 0x2
+  0x16e0223: je <L39>
+  0x16e0229: test byte ptr [rsp + 0x128], 0x1
+  0x16e0231: jne <L77>
+  0x16e0237: test byte ptr [rsp + 0x130], 0x1
+  0x16e023f: nop 
+  0x16e0240: jne <L77>
+  0x16e0246: test byte ptr [rsp + 0x100], 0x1
+  0x16e024e: jne <L77>
+  0x16e0254: test byte ptr [rsp + 0x120], 0x1
+  0x16e025c: nop dword ptr [rax]
+  0x16e0260: jne <L77>
+  0x16e0266: test byte ptr [rsp + 0x118], 0x1
+  0x16e026e: jne <L77>
+  0x16e0274: test byte ptr [rsp + 0x110], 0x1
+  0x16e027c: nop dword ptr [rax]
+  0x16e0280: jne <L77>
+  0x16e0286: vpxor xmm1, xmm1, xmm1
+  0x16e028a: mov r13b, 0x1
+  0x16e028d: xor r15d, r15d
+  0x16e0290: jmp <L48>
+  0x16e0295: lea rax, [rsp + 0x70]
+  0x16e029a: cmp byte ptr [rax], 0x6e
+  0x16e029d: nop dword ptr [rax]
+  0x16e02a0: jne <L4>
+  0x16e02a6: lea rdi, [rsp + 0x1d8]
+  0x16e02ae: call <_ZN2DB3Cas16JsonObjectReader13readU64NumberEv>
+  0x16e02b3: mov rbx, rax
+  0x16e02b6: mov qword ptr [rsp + 0x90], rax
+  0x16e02be: lea rdi, [rsp + 0x1d8]
+  0x16e02c6: lea rsi, [rsp + 0x70]
+  0x16e02cb: call <_ZN2DB3Cas16JsonObjectReader7nextKeyERNSt3__112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE>
+  0x16e02d0: test al, al
+  0x16e02d2: jne <L79>
+  0x16e02d8: mov rax, qword ptr [rsp + 0x1b0]
+  0x16e02e0: cmp rax, qword ptr [rsp + 0x198]
+  0x16e02e8: jne <L74>
+  0x16e02ee: lea rdi, [rsp + 0x190]
+  0x16e02f6: call <_ZN2DB10ReadBuffer4nextEv>
+  0x16e02fb: nop dword ptr [rax + rax]
+  0x16e0300: test al, al
+  0x16e0302: jne <L74>
+  0x16e0308: mov rax, qword ptr [r14 + 0x20]
+  0x16e030c: cmp rax, qword ptr [r14 + 0x8]
+  0x16e0310: jne <L75>
+  0x16e0316: mov rdi, r14
+  0x16e0319: call <_ZN2DB10ReadBuffer4nextEv>
+  0x16e031e: nop 
+  0x16e0320: test al, al
+  0x16e0322: jne <L75>
+  0x16e0328: cmp rbx, qword ptr [r14 + 0xa0]
+  0x16e032f: jne <L80>
+  0x16e0335: mov byte ptr [r14 + 0xa8], 0x1
+  0x16e033d: xor ebx, ebx
+  0x16e033f: cmp byte ptr [rsp + 0x87], 0x0
+  0x16e0347: jns <L53>
+  0x16e034d: jmp <L52>
+  0x16e0352: mov rsi, qword ptr [rsp + 0xb0]
+  0x16e035a: mov rdx, qword ptr [rsp + 0xb8]
+  0x16e0362: lea rdi, [rsp + 0x30]
+  0x16e0367: vzeroupper 
+  0x16e036a: call <_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE25__init_copy_ctor_externalEPKcm>
+  0x16e036f: cmp byte ptr [rsp + 0xa8], 0x0
+  0x16e0377: je <L63>
+  0x16e037d: movsx rsi, byte ptr [rsp + 0xa7]
+  0x16e0386: test rsi, rsi
+  0x16e0389: jns <L46>
+  0x16e038b: mov rdi, qword ptr [rsp + 0x90]
+  0x16e0393: mov rsi, qword ptr [rsp + 0x98]
+  0x16e039b: jmp <L47>
+  0x16e039d: lea rdi, [rsp + 0x90]
+  0x16e03a5: lea rdx,  <nilstr+0x2f0bf>
+  0x16e03ac: mov ecx, 0x7
+  0x16e03b1: vzeroupper 
+  0x16e03b4: call <_ZN2DB3Cas17tokenTypeFromWordENSt3__117basic_string_viewIcNS1_11char_traitsIcEEEES5_>
+  0x16e03b9: mov r13d, eax
+  0x16e03bc: mov r15, qword ptr [rsp + 0x30]
+  0x16e03c1: vmovdqu xmm1, xmmword ptr [rsp + 0x38]
+  0x16e03c7: mov rax, qword ptr [rsp + 0x1b0]
+  0x16e03cf: cmp rax, qword ptr [rsp + 0x198]
+  0x16e03d7: vmovdqa xmmword ptr [rsp + 0x100], xmm1
+  0x16e03e0: jne <L66>
+  0x16e03e6: vpextrq r12, xmm1, 0x1
+  0x16e03ec: lea rdi, [rsp + 0x190]
+  0x16e03f4: vzeroupper 
+  0x16e03f7: call <_ZN2DB10ReadBuffer4nextEv>
+  0x16e03fc: test al, al
+  0x16e03fe: vmovdqa xmm1, xmmword ptr [rsp + 0x100]
+  0x16e0407: jne <L66>
+  0x16e040d: mov r12, qword ptr [rsp + 0x188]
+  0x16e0415: mov byte ptr [r12], bpl
+  0x16e0419: vmovdqu ymm0, ymmword ptr [rsp + 0x340]
+  0x16e0422: vmovdqu ymmword ptr [r12 + 0x1], ymm0
+  0x16e0429: mov rax, qword ptr [rsp + 0x160]
+  0x16e0431: mov qword ptr [r12 + 0x28], rax
+  0x16e0436: mov rax, qword ptr [rsp + 0x168]
+  0x16e043e: mov qword ptr [r12 + 0x30], rax
+  0x16e0443: mov byte ptr [r12 + 0x38], bl
+  0x16e0448: mov rax, qword ptr [rsp + 0x170]
+  0x16e0450: mov byte ptr [r12 + 0x39], al
+  0x16e0455: cmp byte ptr [r12 + 0x57], 0x0
+  0x16e045b: jns <L49>
+  0x16e045d: lea rbx, [r12 + 0x40]
+  0x16e0462: mov rdi, qword ptr [r12 + 0x40]
+  0x16e0467: mov al, 0x3f
+  0x16e0469: bzhi rsi, qword ptr [r12 + 0x50], rax
+  0x16e0470: vzeroupper 
+  0x16e0473: call <_ZdlPvm>
+  0x16e0478: vmovdqa xmm1, xmmword ptr [rsp + 0x100]
+  0x16e0481: vpxor xmm0, xmm0, xmm0
+  0x16e0485: vmovdqu xmmword ptr [rbx], xmm0
+  0x16e0489: mov qword ptr [rbx + 0x10], 0x0
+  0x16e0491: mov qword ptr [r12 + 0x40], r15
+  0x16e0496: vmovdqu xmmword ptr [r12 + 0x48], xmm1
+  0x16e049d: mov byte ptr [r12 + 0x58], r13b
+  0x16e04a2: mov rax, qword ptr [rsp + 0x158]
+  0x16e04aa: mov qword ptr [r12 + 0x60], rax
+  0x16e04af: mov rax, qword ptr [rsp + 0x150]
+  0x16e04b7: mov qword ptr [r12 + 0x68], rax
+  0x16e04bc: mov rax, qword ptr [rsp + 0x180]
+  0x16e04c4: mov byte ptr [r12 + 0x70], al
+  0x16e04c9: inc qword ptr [r14 + 0xa0]
+  0x16e04d0: cmp byte ptr [rsp + 0xc8], 0x1
+  0x16e04d8: jne <L50>
+  0x16e04da: cmp byte ptr [rsp + 0xc7], 0x0
+  0x16e04e2: jns <L50>
+  0x16e04e4: mov rdi, qword ptr [rsp + 0xb0]
+  0x16e04ec: mov al, 0x3f
+  0x16e04ee: bzhi rsi, qword ptr [rsp + 0xc0], rax
+  0x16e04f8: vzeroupper 
+  0x16e04fb: call <_ZdlPvm>
+  0x16e0500: cmp byte ptr [rsp + 0xa8], 0x1
+  0x16e0508: mov rbx, qword ptr [rsp + 0xf0]
+  0x16e0510: jne <L51>
+  0x16e0512: cmp byte ptr [rsp + 0xa7], 0x0
+  0x16e051a: jns <L51>
+  0x16e051c: mov rdi, qword ptr [rsp + 0x90]
+  0x16e0524: mov al, 0x3f
+  0x16e0526: bzhi rsi, qword ptr [rsp + 0xa0], rax
+  0x16e0530: vzeroupper 
+  0x16e0533: call <_ZdlPvm>
+  0x16e0538: nop dword ptr [rax + rax]
+  0x16e0540: test bl, bl
+  0x16e0542: js <L62>
+  0x16e0548: mov bl, 0x1
+  0x16e054a: cmp byte ptr [rsp + 0x87], 0x0
+  0x16e0552: jns <L53>
+  0x16e0554: mov rdi, qword ptr [rsp + 0x70]
+  0x16e0559: mov al, 0x3f
+  0x16e055b: bzhi rsi, qword ptr [rsp + 0x80], rax
+  0x16e0565: vzeroupper 
+  0x16e0568: call <_ZdlPvm>
+  0x16e056d: mov r14, qword ptr [rsp + 0x200]
+  0x16e0575: test r14, r14
+  0x16e0578: je <L58>
+  0x16e057a: mov r15, qword ptr [rsp + 0x208]
+  0x16e0582: mov rdi, r14
+  0x16e0585: cmp r14, r15
+  0x16e0588: je <L57>
+  0x16e058a: mov r12b, 0x3f
+  0x16e058d: jmp <L55>
+  0x16e058f: nop word ptr cs:[rax + rax]
+  0x16e059e: nop 
+  0x16e05a0: add r15, -0x18
+  0x16e05a4: cmp r15, r14
+  0x16e05a7: je <L56>
+  0x16e05a9: cmp byte ptr [r15 - 0x1], 0x0
+  0x16e05ae: jns <L54>
+  0x16e05b0: mov rdi, qword ptr [r15 - 0x18]
+  0x16e05b4: bzhi rsi, qword ptr [r15 - 0x8], r12
+  0x16e05ba: vzeroupper 
+  0x16e05bd: call <_ZdlPvm>
+  0x16e05c2: jmp <L54>
+  0x16e05c4: mov rdi, qword ptr [rsp + 0x200]
+  0x16e05cc: mov qword ptr [rsp + 0x208], r14
+  0x16e05d4: mov rsi, qword ptr [rsp + 0x210]
+  0x16e05dc: sub rsi, rdi
+  0x16e05df: vzeroupper 
+  0x16e05e2: call <_ZdlPvm>
+  0x16e05e7: cmp byte ptr [rsp + 0x1ff], 0x0
+  0x16e05ef: js <L60>
+  0x16e05f1: cmp byte ptr [rsp + 0x14f], 0x0
+  0x16e05f9: js <L61>
+  0x16e05fb: mov eax, ebx
+  0x16e05fd: add rsp, 0x388
+  0x16e0604: pop rbx
+  0x16e0605: pop r12
+  0x16e0607: pop r13
+  0x16e0609: pop r14
+  0x16e060b: pop r15
+  0x16e060d: pop rbp
+  0x16e060e: vzeroupper 
+  0x16e0611: nop 
+  0x16e0612: ret 
+  0x16e0613: nop word ptr cs:[rax + rax + 0x200]
+  0x16e061d: mov rdi, qword ptr [rsp + 0x1e8]
+  0x16e0625: mov al, 0x3f
+  0x16e0627: bzhi rsi, qword ptr [rsp + 0x1f8], rax
+  0x16e0631: vzeroupper 
+  0x16e0634: call <_ZdlPvm>
+  0x16e0639: cmp byte ptr [rsp + 0x14f], 0x0
+  0x16e0641: jns <L59>
+  0x16e0643: mov rdi, qword ptr [rsp + 0x138]
+  0x16e064b: mov al, 0x3f
+  0x16e064d: bzhi rsi, qword ptr [rsp + 0x148], rax
+  0x16e0657: vzeroupper 
+  0x16e065a: call <_ZdlPvm>
+  0x16e065f: nop 
+  0x16e0660: jmp <L59>
+  0x16e0662: mov al, 0x3f
+  0x16e0664: bzhi rsi, qword ptr [rsp + 0xe0], rax
+  0x16e066e: mov rdi, qword ptr [rsp + 0x178]
+  0x16e0676: vzeroupper 
+  0x16e0679: call <_ZdlPvm>
+  0x16e067e: mov bl, 0x1
+  0x16e0680: cmp byte ptr [rsp + 0x87], 0x0
+  0x16e0688: jns <L53>
+  0x16e068e: jmp <L52>
+  0x16e0693: lea rdi,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0x1d5>
+  0x16e069a: lea rsi,  <ZSTD_splitBlock_byChunks.hashParams+0xc41f>
+  0x16e06a1: xor eax, eax
+  0x16e06a3: vzeroupper 
+  0x16e06a6: call <_ZNSt3__122__libcpp_verbose_abortEPKcz>
+  0x16e06ab: mov edi, 0x180
+  0x16e06b0: call <__cxa_allocate_exception>
+  0x16e06b5: mov r14, rax
+  0x16e06b8: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e06bf: mov esi, dword ptr [rax]
+  0x16e06c1: lea rax,  <_ZN9benchmark12_GLOBAL__N_113kSmallSIUnitsE+0x18348>
+  0x16e06c8: mov qword ptr [rsp + 0x30], rax
+  0x16e06cd: mov qword ptr [rsp + 0x38], 0x33
+  0x16e06d6: mov qword ptr [rsp + 0x40], rax
+  0x16e06db: mov qword ptr [rsp + 0x48], 0x33
+  0x16e06e4: vmovups ymm0, ymmword ptr [rsp + 0x30]
+  0x16e06ea: vmovups ymmword ptr [rsp], ymm0
+  0x16e06ef: mov rdi, r14
+  0x16e06f2: vzeroupper 
+  0x16e06f5: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e06fa: lea rsi,  <_ZTIN2DB9ExceptionE>
+  0x16e0701: lea rdx,  <_ZN2DB9ExceptionD2Ev>
+  0x16e0708: mov rdi, r14
+  0x16e070b: call <__cxa_throw>
+  0x16e0710: mov edi, 0x180
+  0x16e0715: vzeroupper 
+  0x16e0718: call <__cxa_allocate_exception>
+  0x16e071d: mov r14, rax
+  0x16e0720: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0727: mov esi, dword ptr [rax]
+  0x16e0729: lea rax,  <ZSTD_splitBlock_byChunks.hashParams+0x2f6e2>
+  0x16e0730: mov qword ptr [rsp + 0x220], rax
+  0x16e0738: mov qword ptr [rsp + 0x228], 0x25
+  0x16e0744: mov qword ptr [rsp + 0x230], rax
+  0x16e074c: mov qword ptr [rsp + 0x238], 0x25
+  0x16e0758: vmovups ymm0, ymmword ptr [rsp + 0x220]
+  0x16e0761: vmovups ymmword ptr [rsp], ymm0
+  0x16e0766: mov rdi, r14
+  0x16e0769: vzeroupper 
+  0x16e076c: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e0771: vmovdqa xmm0, xmmword ptr [rsp + 0x100]
+  0x16e077a: vpextrq r12, xmm0, 0x1
+  0x16e0780: lea rsi,  <_ZTIN2DB9ExceptionE>
+  0x16e0787: lea rdx,  <_ZN2DB9ExceptionD2Ev>
+  0x16e078e: mov rdi, r14
+  0x16e0791: call <__cxa_throw>
+  0x16e0796: jmp <L68>
+  0x16e0798: mov edi, 0x180
+  0x16e079d: call <__cxa_allocate_exception>
+  0x16e07a2: mov r14, rax
+  0x16e07a5: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e07ac: mov esi, dword ptr [rax]
+  0x16e07ae: lea rax,  <nilstr+0x5a95f>
+  0x16e07b5: mov qword ptr [rsp + 0x320], rax
+  0x16e07bd: mov qword ptr [rsp + 0x328], 0x17
+  0x16e07c9: mov qword ptr [rsp + 0x330], rax
+  0x16e07d1: mov qword ptr [rsp + 0x338], 0x17
+  0x16e07dd: vmovdqu ymm0, ymmword ptr [rsp + 0x320]
+  0x16e07e6: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e07eb: mov rdi, r14
+  0x16e07ee: vzeroupper 
+  0x16e07f1: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e07f6: lea rsi,  <_ZTIN2DB9ExceptionE>
+  0x16e07fd: lea rdx,  <_ZN2DB9ExceptionD2Ev>
+  0x16e0804: mov rdi, r14
+  0x16e0807: call <__cxa_throw>
+  0x16e080c: mov edi, 0x180
+  0x16e0811: call <__cxa_allocate_exception>
+  0x16e0816: mov r14, rax
+  0x16e0819: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0820: mov esi, dword ptr [rax]
+  0x16e0822: lea rax,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0x42ff7>
+  0x16e0829: mov qword ptr [rsp + 0x280], rax
+  0x16e0831: mov qword ptr [rsp + 0x288], 0x21
+  0x16e083d: mov qword ptr [rsp + 0x290], rax
+  0x16e0845: mov qword ptr [rsp + 0x298], 0x21
+  0x16e0851: vmovdqu ymm0, ymmword ptr [rsp + 0x280]
+  0x16e085a: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e085f: mov rdi, r14
+  0x16e0862: vzeroupper 
+  0x16e0865: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e086a: jmp <L78>
+  0x16e086f: mov edi, 0x180
+  0x16e0874: call <__cxa_allocate_exception>
+  0x16e0879: mov r14, rax
+  0x16e087c: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0883: mov esi, dword ptr [rax]
+  0x16e0885: lea rax,  <ZSTD_splitBlock_byChunks.hashParams+0xc3fd>
+  0x16e088c: mov qword ptr [rsp + 0x30], rax
+  0x16e0891: mov qword ptr [rsp + 0x38], 0x21
+  0x16e089a: mov qword ptr [rsp + 0x40], rax
+  0x16e089f: mov qword ptr [rsp + 0x48], 0x21
+  0x16e08a8: vmovdqu ymm0, ymmword ptr [rsp + 0x30]
+  0x16e08ae: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e08b3: mov rdi, r14
+  0x16e08b6: vzeroupper 
+  0x16e08b9: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e08be: nop 
+  0x16e08c0: jmp <L65>
+  0x16e08c5: mov edi, 0x180
+  0x16e08ca: call <__cxa_allocate_exception>
+  0x16e08cf: mov r14, rax
+  0x16e08d2: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e08d9: mov esi, dword ptr [rax]
+  0x16e08db: lea rax,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0x580>
+  0x16e08e2: mov qword ptr [rsp + 0x30], rax
+  0x16e08e7: mov qword ptr [rsp + 0x38], 0x2c
+  0x16e08f0: mov qword ptr [rsp + 0x40], rax
+  0x16e08f5: mov qword ptr [rsp + 0x48], 0x2c
+  0x16e08fe: vmovdqu ymm0, ymmword ptr [rsp + 0x30]
+  0x16e0904: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e0909: mov rdi, r14
+  0x16e090c: vzeroupper 
+  0x16e090f: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e0914: jmp <L65>
+  0x16e0919: mov edi, 0x180
+  0x16e091e: call <__cxa_allocate_exception>
+  0x16e0923: mov r14, rax
+  0x16e0926: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e092d: mov esi, dword ptr [rax]
+  0x16e092f: lea rax,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0x5ad>
+  0x16e0936: mov qword ptr [rsp + 0x30], rax
+  0x16e093b: mov qword ptr [rsp + 0x38], 0x2a
+  0x16e0944: mov qword ptr [rsp + 0x40], rax
+  0x16e0949: mov qword ptr [rsp + 0x48], 0x2a
+  0x16e0952: vmovdqu ymm0, ymmword ptr [rsp + 0x30]
+  0x16e0958: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e095d: lea rdx, [rsp + 0x50]
+  0x16e0962: lea rcx, [rsp + 0x68]
+  0x16e0967: mov rdi, r14
+  0x16e096a: vzeroupper 
+  0x16e096d: call <_ZN2DB9ExceptionC2IJRNSt3__117basic_string_viewIcNS2_11char_traitsIcEEEERhEEEi22FormatStringHelperImplIJDpNS2_13type_identityIT_E4typeEEEDpOSB_>
+  0x16e0972: jmp <L65>
+  0x16e0977: mov edi, 0x180
+  0x16e097c: call <__cxa_allocate_exception>
+  0x16e0981: mov r14, rax
+  0x16e0984: lea rax,  <_ZN9benchmark12_GLOBAL__N_113kSmallSIUnitsE+0xa30a>
+  0x16e098b: mov qword ptr [rsp + 0x30], rax
+  0x16e0990: mov qword ptr [rsp + 0x38], 0x3d
+  0x16e0999: mov qword ptr [rsp + 0x40], rax
+  0x16e099e: mov qword ptr [rsp + 0x48], 0x3d
+  0x16e09a7: mov qword ptr [rsp + 0x50], r13
+  0x16e09ac: mov edi, ebx
+  0x16e09ae: call <_ZN2DB3Cas14blobHashLenForENS0_12BlobHashAlgoE>
+  0x16e09b3: lea rcx,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e09ba: mov esi, dword ptr [rcx]
+  0x16e09bc: add rax, rax
+  0x16e09bf: mov qword ptr [rsp + 0x68], rax
+  0x16e09c4: vmovdqu ymm0, ymmword ptr [rsp + 0x30]
+  0x16e09ca: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e09cf: lea rdx, [rsp + 0x50]
+  0x16e09d4: lea rcx, [rsp + 0x68]
+  0x16e09d9: mov rdi, r14
+  0x16e09dc: vzeroupper 
+  0x16e09df: call <_ZN2DB9ExceptionC2IJmmEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e09e4: jmp <L65>
+  0x16e09e9: call <_ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE20__throw_length_errorB9fqe220101Ev>
+  0x16e09ee: mov edi, 0x180
+  0x16e09f3: call <__cxa_allocate_exception>
+  0x16e09f8: mov r14, rax
+  0x16e09fb: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0a02: mov esi, dword ptr [rax]
+  0x16e0a04: lea rax,  <nilstr+0x5a99b>
+  0x16e0a0b: mov qword ptr [rsp + 0x2e0], rax
+  0x16e0a13: mov qword ptr [rsp + 0x2e8], 0x26
+  0x16e0a1f: mov qword ptr [rsp + 0x2f0], rax
+  0x16e0a27: mov qword ptr [rsp + 0x2f8], 0x26
+  0x16e0a33: vmovdqu ymm0, ymmword ptr [rsp + 0x2e0]
+  0x16e0a3c: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e0a41: mov rdi, r14
+  0x16e0a44: vzeroupper 
+  0x16e0a47: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e0a4c: jmp <L81>
+  0x16e0a51: mov edi, 0x180
+  0x16e0a56: call <__cxa_allocate_exception>
+  0x16e0a5b: mov r14, rax
+  0x16e0a5e: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0a65: mov esi, dword ptr [rax]
+  0x16e0a67: lea rax,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0x14d5e>
+  0x16e0a6e: mov qword ptr [rsp + 0x2c0], rax
+  0x16e0a76: mov qword ptr [rsp + 0x2c8], 0x20
+  0x16e0a82: mov qword ptr [rsp + 0x2d0], rax
+  0x16e0a8a: mov qword ptr [rsp + 0x2d8], 0x20
+  0x16e0a96: vmovdqu ymm0, ymmword ptr [rsp + 0x2c0]
+  0x16e0a9f: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e0aa4: mov rdi, r14
+  0x16e0aa7: vzeroupper 
+  0x16e0aaa: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e0aaf: jmp <L81>
+  0x16e0ab4: mov edi, 0x180
+  0x16e0ab9: vzeroupper 
+  0x16e0abc: call <__cxa_allocate_exception>
+  0x16e0ac1: mov r14, rax
+  0x16e0ac4: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0acb: mov esi, dword ptr [rax]
+  0x16e0acd: lea rax,  <ZSTD_splitBlock_byChunks.hashParams+0x2f6a8>
+  0x16e0ad4: mov qword ptr [rsp + 0x260], rax
+  0x16e0adc: mov qword ptr [rsp + 0x268], 0x39
+  0x16e0ae8: mov qword ptr [rsp + 0x270], rax
+  0x16e0af0: mov qword ptr [rsp + 0x278], 0x39
+  0x16e0afc: vmovdqu ymm0, ymmword ptr [rsp + 0x260]
+  0x16e0b05: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e0b0a: mov rdi, r14
+  0x16e0b0d: vzeroupper 
+  0x16e0b10: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e0b15: jmp <L78>
+  0x16e0b17: mov edi, 0x180
+  0x16e0b1c: vzeroupper 
+  0x16e0b1f: call <__cxa_allocate_exception>
+  0x16e0b24: mov r14, rax
+  0x16e0b27: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0b2e: mov esi, dword ptr [rax]
+  0x16e0b30: lea rax,  <_ZN9benchmark12_GLOBAL__N_113kSmallSIUnitsE+0x3f034>
+  0x16e0b37: mov qword ptr [rsp + 0x240], rax
+  0x16e0b3f: mov qword ptr [rsp + 0x248], 0x3a
+  0x16e0b4b: mov qword ptr [rsp + 0x250], rax
+  0x16e0b53: mov qword ptr [rsp + 0x258], 0x3a
+  0x16e0b5f: vmovdqu ymm0, ymmword ptr [rsp + 0x240]
+  0x16e0b68: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e0b6d: mov rdi, r14
+  0x16e0b70: vzeroupper 
+  0x16e0b73: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e0b78: xor r12d, r12d
+  0x16e0b7b: lea rsi,  <_ZTIN2DB9ExceptionE>
+  0x16e0b82: lea rdx,  <_ZN2DB9ExceptionD2Ev>
+  0x16e0b89: xor r15d, r15d
+  0x16e0b8c: mov rdi, r14
+  0x16e0b8f: call <__cxa_throw>
+  0x16e0b94: mov edi, 0x180
+  0x16e0b99: call <__cxa_allocate_exception>
+  0x16e0b9e: mov r14, rax
+  0x16e0ba1: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0ba8: mov esi, dword ptr [rax]
+  0x16e0baa: lea rax,  <nilstr+0x5a977>
+  0x16e0bb1: mov qword ptr [rsp + 0x300], rax
+  0x16e0bb9: mov qword ptr [rsp + 0x308], 0x23
+  0x16e0bc5: mov qword ptr [rsp + 0x310], rax
+  0x16e0bcd: mov qword ptr [rsp + 0x318], 0x23
+  0x16e0bd9: vmovdqu ymm0, ymmword ptr [rsp + 0x300]
+  0x16e0be2: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e0be7: mov rdi, r14
+  0x16e0bea: vzeroupper 
+  0x16e0bed: call <_ZN2DB9ExceptionC2IJEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS5_>
+  0x16e0bf2: jmp <L81>
+  0x16e0bf4: add r14, 0xa0
+  0x16e0bfb: mov edi, 0x180
+  0x16e0c00: call <__cxa_allocate_exception>
+  0x16e0c05: mov rcx, r14
+  0x16e0c08: mov r14, rax
+  0x16e0c0b: lea rax,  <_ZN2DB10ErrorCodes14CORRUPTED_DATAE>
+  0x16e0c12: mov esi, dword ptr [rax]
+  0x16e0c14: lea rax,  <_ZZN4absl12lts_2026010718debugging_internalL30IdentifierIsAnonymousNamespaceEPNS1_5StateEmE11anon_prefix+0x42fb8>
+  0x16e0c1b: mov qword ptr [rsp + 0x2a0], rax
+  0x16e0c23: mov qword ptr [rsp + 0x2a8], 0x3e
+  0x16e0c2f: mov qword ptr [rsp + 0x2b0], rax
+  0x16e0c37: mov qword ptr [rsp + 0x2b8], 0x3e
+  0x16e0c43: vmovdqu ymm0, ymmword ptr [rsp + 0x2a0]
+  0x16e0c4c: vmovdqu ymmword ptr [rsp], ymm0
+  0x16e0c51: lea rdx, [rsp + 0x90]
+  0x16e0c59: mov rdi, r14
+  0x16e0c5c: vzeroupper 
+  0x16e0c5f: call <_ZN2DB9ExceptionC2IJRKmRmEEEi22FormatStringHelperImplIJDpNSt3__113type_identityIT_E4typeEEEDpOS8_>
+  0x16e0c64: lea rsi,  <_ZTIN2DB9ExceptionE>
+  0x16e0c6b: lea rdx,  <_ZN2DB9ExceptionD2Ev>
+  0x16e0c72: mov rdi, r14
+  0x16e0c75: call <__cxa_throw>
+  0x16e0c7a: jmp <L82>
+  0x16e0c7c: jmp <L82>
+  0x16e0c7e: nop 
+  0x16e0c80: jmp <L87>
+  0x16e0c85: jmp <L86>
+  0x16e0c8a: jmp <L86>
+  0x16e0c8f: jmp <L82>
+  0x16e0c91: jmp <L82>
+  0x16e0c93: jmp <L83>
+  0x16e0c95: jmp <L86>
+  0x16e0c9a: jmp <L86>
+  0x16e0c9f: nop 
+  0x16e0ca0: jmp <L86>
+  0x16e0ca5: jmp <L86>
+  0x16e0caa: mov rbx, rax
+  0x16e0cad: mov rdi, r14
+  0x16e0cb0: call <__cxa_free_exception>
+  0x16e0cb5: cmp byte ptr [rsp + 0x87], 0x0
+  0x16e0cbd: nop dword ptr [rax]
+  0x16e0cc0: js <L91>
+  0x16e0cc6: jmp <L92>
+  0x16e0ccb: jmp <L86>
+  0x16e0ccd: mov rbx, rax
+  0x16e0cd0: mov rdi, r14
+  0x16e0cd3: call <__cxa_free_exception>
+  0x16e0cd8: vmovdqa xmm0, xmmword ptr [rsp + 0x100]
+  0x16e0ce1: vpextrq r12, xmm0, 0x1
+  0x16e0ce7: jmp <L89>
+  0x16e0ce9: mov rbx, rax
+  0x16e0cec: cmp byte ptr [rsp + 0x67], 0x0
+  0x16e0cf1: jns <L88>
+  0x16e0cf3: mov rdi, qword ptr [rsp + 0x50]
+  0x16e0cf8: mov al, 0x3f
+  0x16e0cfa: bzhi rsi, qword ptr [rsp + 0x60], rax
+  0x16e0d01: jmp <L84>
+  0x16e0d03: mov rbx, rax
+  0x16e0d06: cmp byte ptr [rsp + 0x47], 0x0
+  0x16e0d0b: jns <L88>
+  0x16e0d0d: mov rdi, qword ptr [rsp + 0x30]
+  0x16e0d12: mov al, 0x3f
+  0x16e0d14: bzhi rsi, qword ptr [rsp + 0x40], rax
+  0x16e0d1b: call <_ZdlPvm>
+  0x16e0d20: jmp <L88>
+  0x16e0d22: jmp <L87>
+  0x16e0d24: mov rbx, rax
+  0x16e0d27: jmp <L93>
+  0x16e0d2c: jmp <L87>
+  0x16e0d2e: jmp <L85>
+  0x16e0d30: mov rbx, rax
+  0x16e0d33: cmp byte ptr [rsp + 0x87], 0x0
+  0x16e0d3b: js <L91>
+  0x16e0d3d: jmp <L92>
+  0x16e0d3f: mov rbx, rax
+  0x16e0d42: jmp <L89>
+  0x16e0d44: jmp <L87>
+  0x16e0d46: mov rbx, rax
+  0x16e0d49: mov rdi, r14
+  0x16e0d4c: call <__cxa_free_exception>
+  0x16e0d51: jmp <L88>
+  0x16e0d53: jmp <L87>
+  0x16e0d55: mov rbx, rax
+  0x16e0d58: xor r12d, r12d
+  0x16e0d5b: xor r15d, r15d
+  0x16e0d5e: lea rdi, [rsp + 0x90]
+  0x16e0d66: call <_ZN2DB3Cas13BlobRefFieldsD2Ev>
+  0x16e0d6b: cmp byte ptr [rsp + 0xe7], 0x0
+  0x16e0d73: jns <L95>
+  0x16e0d75: mov rdi, qword ptr [rsp + 0xd0]
+  0x16e0d7d: mov al, 0x3f
+  0x16e0d7f: bzhi rsi, qword ptr [rsp + 0xe0], rax
+  0x16e0d89: call <_ZdlPvm>
+  0x16e0d8e: test r12, r12
+  0x16e0d91: js <L96>
+  0x16e0d93: cmp byte ptr [rsp + 0x87], 0x0
+  0x16e0d9b: jns <L92>
+  0x16e0d9d: mov rdi, qword ptr [rsp + 0x70]
+  0x16e0da2: mov al, 0x3f
+  0x16e0da4: bzhi rsi, qword ptr [rsp + 0x80], rax
+  0x16e0dae: call <_ZdlPvm>
+  0x16e0db3: lea rdi, [rsp + 0x1d8]
+  0x16e0dbb: call <_ZN2DB3Cas16JsonObjectReaderD2Ev>
+  0x16e0dc0: cmp byte ptr [rsp + 0x14f], 0x0
+  0x16e0dc8: jns <L94>
+  0x16e0dca: mov rdi, qword ptr [rsp + 0x138]
+  0x16e0dd2: mov al, 0x3f
+  0x16e0dd4: bzhi rsi, qword ptr [rsp + 0x148], rax
+  0x16e0dde: call <_ZdlPvm>
+  0x16e0de3: mov rdi, rbx
+  0x16e0de6: call <_Unwind_Resume>
+  0x16e0deb: test r12, r12
+  0x16e0dee: jns <L90>
+  0x16e0df0: mov al, 0x3f
+  0x16e0df2: bzhi rsi, r12, rax
+  0x16e0df7: mov rdi, r15
+  0x16e0dfa: call <_ZdlPvm>
+  0x16e0dff: cmp byte ptr [rsp + 0x87], 0x0
+  0x16e0e07: js <L91>
+  0x16e0e09: jmp <L92>
+
+=== Notes ===
+  static-only ranking; runtime impact unknown
+
+=== Timing ===
+  probe: 18ms
+  inspect: 8ms
+  resolve: 234ms
+  disassemble: 80ms
+  cfg: 0ms
+  metrics: 0ms
+  findings: 0ms
+

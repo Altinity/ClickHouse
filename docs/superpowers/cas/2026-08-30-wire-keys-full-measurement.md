@@ -207,3 +207,129 @@ bytes while `cas_fold_seal` does not, which is what makes it a hypothesis rather
 - **No CI assertion.** By the design's own instruction, none of this becomes a timing test. It is
   review evidence, and it expires if production code changes — the freeze commit is named above for
   exactly that reason.
+
+## The generated assembly {#the-generated-assembly}
+
+The measurement leaves one thing unexplained — `cas_run` decode costs about 5 points more than its
+byte growth accounts for, and `cas_ref_catalog` about 4 — and the design anticipated exactly that
+question. Its claim is that the enum tables and the match helpers add nothing beyond the bytes. This
+section tests it.
+
+Both sides were disassembled with `.claude/tools/analyze-assembly.py` in before/after mode, on the
+same two benchmark binaries the throughput tables were taken from — so the code inspected here is
+the code that produced those numbers, not a similar build. Raw tool output is under
+`bench-wire-keys-phase3/asm/`.
+
+| symbol | instructions | calls | branches | spill stores | spill loads | spill density |
+|---|---:|---:|---:|---:|---:|---:|
+| `SourceEdgeRunReader::next` (`cas_run` decode) | +9 | 0 | −10 | +13 | +28 | +3.75% |
+| `SourceEdgeRunWriter::append` (`cas_run` encode) | −15 | 0 | −4 | +2 | +2 | +1.02% |
+| `decodeRefCatalog` | +42 | 0 | −2 | +17 | +37 | +3.30% |
+| `decodePartManifest` | +86 | 0 | −3 | +17 | +40 | +2.11% |
+
+**The plan's Task 9 named `SourceEdgeRunView::next` as the `cas_run` row reader. That is the wrong
+symbol** and the table above uses the right one. `SourceEdgeRunView::next` delegates to
+`SourceEdgeRunReader::next` and then re-packs the typed record back into raw key and payload strings
+for the legacy fold consumers; it parses no wire keys at all. The key matching lives in
+`SourceEdgeRunReader::next`.
+
+### Condition 1 — the enum tables are a lookup, not a scan {#condition-tables-not-a-scan}
+
+Holds in substance, with one thing worth recording. The branch count fell in **every** symbol
+inspected, which is the signature of a table replacing a comparison chain — a scan would have added
+branches, not removed them. The table itself is visible in the encode path:
+`lea rdi, <DB::Cas::(anonymous namespace)::kRunMarkerWords>` immediately before the marker is
+rendered.
+
+What the design did not predict is that `toWord` **did not inline**. It survives as its own symbol
+and is called out of line:
+`call <DB::Cas::EnumWireTable<DB::Cas::RunMarker, 3ul>::toWord(RunMarker, std::string_view) const>`.
+The spec's wording is "with the match helpers inline"; on this path they are not. It costs nothing
+measurable — `cas_run` encode grew about 6% against a byte growth of 7.8%, so encoding is cheaper
+per byte after the cut than before it — but the spec says inline and the compiler disagreed.
+
+### Condition 2 — no added call, allocation or branch on hot decode paths {#condition-no-added-work}
+
+Holds, and the decode path is better off than before. Comparing the full call sets of
+`SourceEdgeRunReader::next` on both sides: the post-cut version adds exactly one call,
+`TokenFields::build`, and loses three — the pre-cut match helper `tokenTypeFromWord` (which was
+itself out of line, so this is a swap and not a new call), a `std::string` copy constructor, and an
+abort path. Allocation calls are identical on both sides. Branches fell by ten.
+
+So the shared collectors did not add work to the hot decode path; they removed a string copy from it.
+
+### Condition 3 — nothing spills that did not spill before {#condition-no-new-spills}
+
+**This one fails, uniformly.** Every symbol inspected spills more after the cut than before it, and
+the `cas_run` decode path picks up a new high-severity finding: register spills inside the loop at
+`L78`, where two of every five instructions are spill traffic. Overall spill density on that path
+rose from 22.1% to 25.8%.
+
+The ranking is what makes this more than a curiosity. Order the formats by how much their spill
+density grew and by how much their decode time exceeded their byte growth, and the two orders agree:
+
+| format | spill density delta | decode minus bytes |
+|---|---:|---:|
+| `cas_run` | +3.75% | +5.0 points |
+| `cas_ref_catalog` | +3.30% | +3.8 points |
+| `cas_part_manifest` | +2.11% | −6.0 points |
+
+That is consistent with the extra time being register pressure rather than instruction count — the
+instruction counts barely moved, and where they rose most (`decodePartManifest`, +86) the decode is
+still comfortably cheaper than its bytes.
+
+### Verdict and disposition {#assembly-verdict}
+
+Two of the three conditions hold; the third does not. Longer keys mean more live values across the
+key-matching region, and the register allocator pays for it in stack traffic. The effect is small in
+absolute terms — a few points on two of five formats, against a change that grew encoded bytes by up
+to a third — but it is real, it is reproducible, and it is not what the design predicted.
+
+The disposition is that this does **not** block acceptance, and the reason is specific rather than
+lenient: the spec's own framing is that the dominant risk is the longer keys themselves and that the
+tables must not *add* to it. The tables demonstrably do not — they removed branches and a string
+copy. What spills is the surrounding decode code under the wider values the keys now carry, which is
+the byte cost expressing itself through the register allocator rather than a separate cost the
+design failed to anticipate. The honest amendment is to the spec's word "inline", which is wrong for
+`toWord`, and to the implicit assumption that no new spills would appear.
+
+Both are recorded in the acceptance matrix rather than waved through, and the spill finding has a
+concrete follow-up, described next.
+
+## Where the decode path could be made faster {#where-decode-could-be-faster}
+
+Three opportunities, ranked by how well the evidence above supports them. None may land before the
+campaign is accepted: each touches production code, which would move the freeze and invalidate every
+measurement and lane run recorded here.
+
+**1. Reduce register pressure in `SourceEdgeRunReader::next`.** This is the only one that targets the
+residue actually measured. The tool's own findings on that function are a spill density of 25.8%,
+spills inside the loop at `L78` where two of every five instructions are stack traffic, and a
+"very large function" flag at 1041 instructions. The function inlines its error handling, its trailer
+branch and its per-field decoding into one body; moving the cold paths out of line would give the
+allocator fewer live values to juggle across the hot region. The prediction to test is narrow: spill
+density falls back toward the pre-cut 22.1%, and `cas_run` decode moves toward its byte growth of
+7.8% rather than its current 12.8%.
+
+**2. Stop rebuilding the per-row scratch.** Each decoded row allocates a `String` for the line via
+`readLine`, constructs a `JsonObjectReader` — which owns a `std::vector<String>` that grows as keys
+are seen — and destroys both. The write side already solved exactly this: `SourceEdgeRunWriter`
+carries a reused `CasJsonWriter scratch` whose comment says memory stays bounded by the largest line
+ever assembled rather than by record count. The read side never got the same treatment. This is not
+the cut's doing — it costs the same on both sides — which is why it does not show up in any delta
+here.
+
+**3. Make duplicate-key detection a bitmask rather than a scan.** `JsonObjectReader::nextKey` rejects
+duplicates with `std::find` over a `std::vector<String>` of keys already seen, comparing whole
+strings, which is quadratic in the number of keys on a row. Every format's key set is fixed and
+already enumerated by the shared collectors, so the check could be a bit per known key: no
+allocation, no string comparison.
+
+**An honest correction on that third one.** Before measuring, this was the leading hypothesis for
+where the cut's cost would land — longer keys make each comparison longer, and the semantic names
+deliberately share prefixes (`snap_generation`, `snap_attempt`, `snap_pruned_through`), so each
+comparison runs further before it can differ. The data refutes it as an explanation. The hypothesis
+predicts that the format with the most keys per row suffers most; that format is `cas_fold_seal`, and
+its decode is 7 points **cheaper** than its byte growth — the best result of the five. The scan is
+real waste and worth removing, but it is not what the measurement found, and it is listed third for
+that reason rather than first.

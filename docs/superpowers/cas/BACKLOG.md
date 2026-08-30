@@ -71,6 +71,51 @@ unchanged, only relocated.
 
 ### From the 2026-08-04 destructive-baseline / soak audit {#inbox-audit-batch}
 
+## `[cas-decode-register-pressure]` `SourceEdgeRunReader::next` spills more after the wire-key cut {#cas-decode-register-pressure}
+
+**Found by the wire-keys phase-3 assembly review (2026-08-30); evidence in
+`docs/superpowers/cas/2026-08-30-wire-keys-full-measurement.md` and `bench-wire-keys-phase3/asm/`.**
+
+The semantic wire-key cut left `cas_run` decode costing about 5 percentage points more than its byte
+growth accounts for, and `cas_ref_catalog` about 4. The assembly says what the extra work is, and it
+is not what the design expected: calls did not increase, branches went **down** in every symbol
+inspected, and allocation calls are identical — but every symbol spills more. On
+`SourceEdgeRunReader::next` the spill density rose from 22.1% to 25.8%, with a new high-severity
+finding of spills inside the loop at `L78` where two of every five instructions are stack traffic.
+Ordering the formats by spill-density growth and by decode-time-minus-byte-growth gives the same
+order, which is what makes this the likely mechanism rather than a coincidence.
+
+The function is flagged "very large" at 1041 instructions and 5166 bytes: it inlines error handling,
+the trailer branch and per-field decoding into one body, so the allocator has many live values across
+the hot region. **Fix direction:** move the cold paths (the `CORRUPTED_DATA` throw sites, the trailer
+branch) out of line and re-measure. The prediction is narrow enough to falsify — spill density should
+fall back toward 22.1% and `cas_run` decode should move toward its byte growth of 7.8%.
+
+Sequencing: must not land until the wire-keys campaign is accepted, since it is production code and
+would move the freeze the measurements are anchored to.
+
+## `[cas-decode-per-row-scratch]` The `cas_run` reader rebuilds its scratch every row; the writer does not {#cas-decode-per-row-scratch}
+
+**Found while reading the decode path during the wire-keys phase-3 review (2026-08-30).**
+
+Every decoded `cas_run` row allocates a `String` for the line through `readLine`, constructs a
+`JsonObjectReader` — which owns a `std::vector<String> seen_keys` that grows as keys are read — and
+destroys both. The write side already solved this: `SourceEdgeRunWriter` holds a reused
+`CasJsonWriter scratch`, documented as keeping memory bounded by the largest line ever assembled
+rather than by record count. The read side never received the same treatment.
+
+Two related pieces of waste sit in the same place. `JsonObjectReader::nextKey` rejects duplicate keys
+with `std::find` over that vector, comparing whole strings, which is quadratic in the keys on a row;
+since every format's key set is fixed and already enumerated by the shared collectors, the check
+could be a bit per known key, with no allocation and no string comparison. And `readString` returns
+by value, so each wide field is a fresh allocation.
+
+**This is not a regression from the wire-key cut** — it costs the same on both sides and appears in
+no delta. It was in fact the leading pre-measurement hypothesis for where the cut's cost would land,
+and the measurement refuted it: the hypothesis predicts that the format with the most keys per row
+suffers most, and that format (`cas_fold_seal`) decodes 7 points cheaper than its byte growth, the
+best of the five. Worth doing as a straightforward win, not as a fix for anything the cut caused.
+
 ## `[s45-drop-member-sweep-untested]` GC wins S45's race, so `cas-drop-member`'s own sweep path is never exercised {#s45-drop-member-sweep-untested}
 
 **Found while triaging an S45 soak failure during the wire-keys proof phase (2026-08-30).**
