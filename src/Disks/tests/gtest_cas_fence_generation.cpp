@@ -327,7 +327,7 @@ TEST(CASFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAn
         store->removeNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "victim");
     });
 
-    /// The durable delete never ran -- the object survives (reads are not fence-gated by this task).
+    /// The durable delete never ran, so the object survives; reads are not fence-gated.
     const auto still_there = store->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "victim");
     ASSERT_TRUE(still_there.has_value());
     EXPECT_EQ(*still_there, "still here");

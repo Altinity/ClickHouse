@@ -30,8 +30,7 @@ void expectThrowsCode(int expected_code, F && fn)
     }
 }
 
-/// One Blob + one Inline entry, matching the plan's §text-shape illustration verbatim (codecs-v3
-/// phase 6): deliberately NOT path-sorted on input, so the round trip also exercises canonical
+/// One Blob + one Inline entry, deliberately NOT path-sorted on input, so the round trip also exercises canonical
 /// path-order encoding.
 PartManifest sample()
 {
@@ -517,8 +516,7 @@ TEST(CASPartManifestFormat, InlineRecordSizeMismatchWithPayloadZoneBannerFailsCl
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 
-/// ==== migrated from gtest_cas_manifest_codec.cpp (deleted in the phase-6 binary->text cutover,
-/// Task 3): these exercise refMatchesBody/manifestNamespaceMatches/findEntry/entryRange, pure
+/// ==== Migrated manifest helpers: these exercise `refMatchesBody`, `manifestNamespaceMatches`, `findEntry`, and `entryRange`, pure
 /// functions carried over verbatim from the retired binary codec (untouched by the wire-shape
 /// migration) — reusing this file's own sample() fixture instead of reintroducing a second one. ====
 

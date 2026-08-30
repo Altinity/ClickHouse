@@ -591,8 +591,8 @@ class S31(Scenario):
         result.observations["blobs_reclaimed_by_gc"] = blobs_reclaimed
 
         # --- dryrun completeness under gc_shards>1 ------------------------------------------
-        # previewDeletes is a SINGLE-ROUND, point-in-time preview (zero-in-degree + condemned rows
-        # in the currently-adopted fold seal, ALL shards — CasGc.cpp previewDeletes). Comparing it
+        # `previewDeletes` is a SINGLE-ROUND, point-in-time preview (zero-in-degree + condemned rows
+        # in the currently-adopted fold seal, ALL shards). Comparing it
         # against the CUMULATIVE multi-round deleted_total is unsound: right after a mass DROP most
         # blobs are still unreachable/awaiting-gc and only condemned by LATER folds, so
         # preview < cumulative is EXPECTED (2026-07-18 S31 RCA; the old "previews only shard 0"

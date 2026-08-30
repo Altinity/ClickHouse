@@ -71,8 +71,7 @@ String rawEntryLine(const String & ns, const String & state, const String & inc_
 }
 
 /// Wraps `entry_lines` in the header/trailer a real `cas_ref_catalog` object carries. `v:1` always
-/// passes the header gate (any version <= the build's `G_BUILD` does), matching the convention
-/// `gtest_cas_fold_seal_format.cpp`'s `RejectsOutOfRangeNsCleanupState` uses for the same reason.
+/// passes the header gate because any version <= the build's `G_BUILD` does.
 String rawCatalog(const std::vector<String> & entry_lines)
 {
     String out = R"({"type":"cas_ref_catalog","v":1})" "\n";
@@ -618,11 +617,11 @@ TEST(CASRefCatalogFormat, RegistryRowIsControlStrictWithRawStorage)
     EXPECT_EQ(traits.object_cap, 256u * 1024u * 1024u);
     EXPECT_EQ(traits.line_cap, 4u * 1024u);
     EXPECT_EQ(traitsForType("cas_ref_catalog"), &traits);
-    /// Raw, so the key has no suffix: `Pool/CasRefCatalog.cpp` hands bytes to/from the backend
-    /// directly, bypassing `sealObject`/`openObject` because both are the identity under
+    /// Raw, so the key has no suffix: the catalog hands bytes directly to/from the backend,
+    /// bypassing `sealObject`/`openObject` because both are the identity under
     /// `CompressionPolicy::Never`. This line is the TRIPWIRE for that shortcut -- a policy flip to
     /// `Always` would silently write uncompressed bodies under a `.zst` key, which this assertion
-    /// catches first (see `CasRefCatalogFormat.h`'s comment on `encodeRefCatalog`).
+    /// catches first.
     EXPECT_EQ(storedSuffix(FormatId::RefCatalog), "");
     EXPECT_EQ(traits.compression, CompressionPolicy::Never);
 }

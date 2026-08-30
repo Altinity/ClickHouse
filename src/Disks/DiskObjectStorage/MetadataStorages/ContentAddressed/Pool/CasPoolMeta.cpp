@@ -132,7 +132,7 @@ PoolMeta PoolMeta::createOrValidate(
     /// build at all), so the reader-generation floor is stamped at THIS build's `G_BUILD` at
     /// creation, not left at 0.
     ///
-    /// BOOTSTRAP GATE (spec §2 [C4][D2]): minting is permitted ONLY on the verified bootstrap path. A
+    /// BOOTSTRAP GATE: minting is permitted ONLY on the verified bootstrap path. A
     /// non-bootstrap caller (a read-only/observe open, `openForDecommission`) passes `allow_mint=false`
     /// and fails closed here — never minting a fresh identity outside that path (an observe scan that
     /// minted would poison the next writable mount's residual check). The residual EMPTINESS proof itself

@@ -439,15 +439,9 @@ TEST(CASPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
 }
 
 /// ============================================================================================
-/// CAS pluggable-blob-hash Phase 2 Task 6 -- end-to-end sha256 WRITE path (in-memory; the real
-/// wiring-level integration + soak is Task 7).
-///
-/// Before this task, `PartWriteTxn`'s OWN write-path internals stayed a fixed 128-bit representation
-/// downstream of the mint (`poolContentHash`/`PartWriteTxn::putBlob`'s `logical_hash`, the `deps` map key, the
-/// event-log `object_hash` render, and `objectKey`) -- safe only because the disk-config factory guard
-/// (`MetadataStorageFactory.cpp`) blocked any real sha256 pool from reaching `PartWriteTxn` at all (see the
-/// Task 5 report and the "Task 6+" comments this task removes). Task 6 finishes those sites AND lifts
-/// the guard in the SAME commit. This test drives a REAL `PartWriteTxn` (`putBlob` -> `stageManifest` ->
+/// End-to-end SHA-256 write path. Every `PartWriteTxn` representation downstream of digest creation
+/// must preserve the pool's variable-width digest; truncation would address a different blob. This
+/// test drives a REAL `PartWriteTxn` (`putBlob` -> `stageManifest` ->
 /// `precommitAdd` -> `promote`) on a `Sha256` pool and asserts:
 ///   1. the blob lands under `blobs/sha256/<64-hex>` and the manifest entry's `blob_hash`, read back via
 ///      `decodePartManifest`, is the FULL 32-byte digest (bytes beyond 16 are non-zero for a real sha256
@@ -510,7 +504,7 @@ TEST(CASPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
 
     /// THE CRUX (blob side): the blob body lands under the sha256-segmented path, addressed by the
     /// FULL 64-hex key -- `PartWriteTxn::putBlob`'s internal `logical_hash` must not have silently narrowed it
-    /// to a 32-hex (128-bit) key before this task.
+    /// to a 32-hex (128-bit) key.
     const String blob_key = store->layout().blobKey(id);
     EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
     ASSERT_TRUE(backend->head(blob_key).exists);
@@ -545,7 +539,7 @@ TEST(CASPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
 /// validation at `foldManifestEdges` with refresh-on-miss.
 /// ============================================================================================
 
-/// spec §9.8 -- THE race regression this task exists to close. Each `Pool`'s `admitted_algos` cache
+/// Each `Pool`'s `admitted_algos` cache
 /// is a MONOTONE snapshot seeded once at `Pool::open` and never re-read on its own; if node A admits
 /// a brand-new algo and publishes a manifest naming it, node B's stale cache must NOT fail the fold
 /// closed forever -- `foldManifestEdges` must refresh `_pool_meta` on the very first miss and accept

@@ -126,7 +126,7 @@ struct BindingFields
 /// `!`-prefixed: `prev_epoch_seal` is INV-2 chain evidence, not cosmetic metadata -- a decoder that
 /// doesn't understand it must refuse the object rather than silently drop the chain link while
 /// otherwise passing the structural grammar (`JsonObjectReader::skipUnknown` rejects any unrecognized
-/// `!`-key with `UNKNOWN_FORMAT_VERSION`, tolerant or not; see task-1 review finding M4).
+/// `!`-key with `UNKNOWN_FORMAT_VERSION`, tolerant or not).
 void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id, const std::optional<RefTxnId> & prev_epoch_seal)
 {
     bool first = true;

@@ -51,9 +51,8 @@ extern const Event CASRefSnapshotPublishDispatched;
 /// single item whose own op count, or whose one op's encoded size, exceeds its cap fails ALONE; a
 /// neighbor co-batched into the same flush still commits. `ref_txn_max_ops` is checked exactly (the
 /// `build_ops` result's size), and the per-op cap is checked by encoding exactly one op at a time --
-/// no accumulation, matching the admission machinery this replaces. T9 (removal-class detection by
-/// op inspection) and T10 (chunked flush across a whole-batch op-count overflow) extend this file;
-/// this task adds only the per-item / per-op isolation tests and the canonical round-trip leg of
+/// no accumulation, matching the admission machinery. The per-item / per-op isolation tests and
+/// the canonical round-trip leg cover
 /// test 12 (the maximum legally-admissible normal-class transaction).
 ///
 /// The suite name is prefixed `RefWriter` so it is covered by the `RefWriter*` unit-test gate filter.

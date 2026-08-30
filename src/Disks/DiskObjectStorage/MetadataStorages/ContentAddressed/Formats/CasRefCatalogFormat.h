@@ -103,8 +103,8 @@ struct RefCatalog
 /// instead) -- but deliberately does NOT enforce the whole-object cap itself: that predicate must
 /// name the namespace under admission, which only a caller of `checkCatalogAdmission` knows.
 ///
-/// These bytes go to and come from the backend DIRECTLY, exactly like `cas_ref_ckpt`: the Pool-side
-/// `CasRefCatalog::read`/`casUpdateImpl` (`Pool/CasRefCatalog.cpp`) bypass `sealObject`/`openObject`,
+/// These bytes go to and come from the backend DIRECTLY: the catalog read and update paths bypass
+/// `sealObject`/`openObject`,
 /// which are the identity under this class's `CompressionPolicy::Never` and would add nothing. A
 /// policy flip to `Always` therefore breaks this silently -- and is caught, because `storedSuffix`
 /// would stop being empty and the registry test asserting `storedSuffix(FormatId::RefCatalog) == ""`

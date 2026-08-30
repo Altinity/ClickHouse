@@ -153,7 +153,7 @@ TEST(CASRefEpochSealFormat, EncodeRejectsSealTxnWithSecondNonSealOp)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-/// Decode-side pin for the same op-count rule (review finding I1): `encodeRefLogTxn` can never
+/// Decode-side pin for the same op-count rule: `encodeRefLogTxn` can never
 /// produce a 2-op seal body, so only a decode-only splice proves `decodeRefLogTxn` independently
 /// re-derives the rule rather than trusting whatever the encoder produced -- deleting the structural
 /// validator's call site inside `decodeRefLogTxn` would leave this the only failing test.
@@ -213,7 +213,7 @@ TEST(CASRefEpochSealFormat, EncodeRejectsPrevEpochSealAtNonUnitSequence)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-/// Decode-side pin for the sequence-1-only rule (review finding I1). `prev_epoch_seal`'s
+/// Decode-side pin for the sequence-1-only rule. `prev_epoch_seal`'s
 /// writer_epoch (1) is strictly below the transaction's own (5), satisfying the I3 chain-direction
 /// rule, so this isolates the sequence-1 rule specifically rather than incidentally also tripping I3.
 TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealAtNonUnitSequenceSpliced)
@@ -233,7 +233,7 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealAtNonUnitSequenceSpliced)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
 
-/// Well-formedness (review finding M2): a zero component inside `prev_epoch_seal` is rejected the
+/// Well-formedness: a zero component inside `prev_epoch_seal` is rejected the
 /// same way a zero component in the primary `txn_id` is (`checkRefTxnIdNonzero`, shared code path).
 TEST(CASRefEpochSealFormat, EncodeRejectsPrevEpochSealWithZeroWriterEpoch)
 {
@@ -276,7 +276,7 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
 
-/// Chain direction (review finding I3): a seal closing epoch E always has id `{E, T+1}`, and the
+/// Chain direction: a seal closing epoch E always has id `{E, T+1}`, and the
 /// sequence-1 transaction in the next numeric epoch must name it. This remains context-free (a
 /// property of one transaction), so it belongs in the structural half; Tasks 2/6 walk this pointer
 /// backwards over untrusted decoded bodies and must not have to re-derive the rule themselves.
@@ -335,7 +335,7 @@ TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealSkippingImmediateEpochSpli
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
 
-/// Decode-side pin for the chain-direction rule (review finding I3): the encoder's own check would
+/// Decode-side pin for the chain-direction rule: the encoder's own check would
 /// refuse to produce this shape (the two Encode* tests above pin that direction), so a splice into an
 /// otherwise-valid sequence-1 body proves decode re-derives the rule independently.
 TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealPointingAtSameOrFutureEpochSpliced)
@@ -382,7 +382,7 @@ TEST(CASRefEpochSealFormat, ContextualRejectsPrevEpochSealWhenForbidden)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { validateEpochSealGrammarContextual(txn, /*life_epoch=*/5); });
 }
 
-/// codex r2 finding 2: "genesis" is per-namespace. A namespace first born at global epoch 5 (not
+/// "Genesis" is per-namespace. A namespace first born at global epoch 5 (not
 /// epoch 1) appends {5, 1} with NO prev_epoch_seal -- that IS its genesis, not a transition.
 TEST(CASRefEpochSealFormat, ContextualAllowsGenesisBirthAboveEpochOneWithoutPrevEpochSeal)
 {
@@ -393,7 +393,7 @@ TEST(CASRefEpochSealFormat, ContextualAllowsGenesisBirthAboveEpochOneWithoutPrev
     EXPECT_NO_THROW(validateEpochSealGrammarContextual(txn, /*life_epoch=*/5));
 }
 
-/// Review finding I2: the `ref_sequence != 1` early return is load-bearing for Task 4's encode call
+/// The `ref_sequence != 1` early return is load-bearing for the encode call
 /// site, which calls this on every txn it mints, including ordinary sequence->=2 transactions in a
 /// post-transition epoch that legitimately carry no `prev_epoch_seal`. Pinned on both sides of the
 /// life_epoch relation to prove the early return fires regardless of it.
@@ -418,7 +418,7 @@ TEST(CASRefEpochSealFormat, ContextualPassesThroughNonSequenceOneAtOrBelowLifeEp
 }
 
 /// ===================================================================================
-/// Criticality of the prev_epoch_seal wire fields (review finding M4)
+/// Criticality of the `prev_epoch_seal` wire fields
 /// ===================================================================================
 
 /// `!prev_epoch`/`!prev_seq` are `!`-prefixed CRITICAL keys: `prev_epoch_seal` is INV-2 chain evidence, and a

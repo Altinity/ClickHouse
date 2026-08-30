@@ -1711,8 +1711,7 @@ TEST(CASRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroug
 /// The reaction is now the mount's, not the table's [review I5]: a foreign object at a key that
 /// mount-lease exclusivity says is exclusively ours contradicts the exclusivity itself, so the append
 /// site routes through `reportImpossibleInterference` exactly as the wedge-resolve site does -- fence
-/// closed, remount scheduled. Before this task it failed closed and stayed closed, blocking the table
-/// until somebody remounted by hand. So there are two separate scopes to keep straight, and this test
+/// closed, remount scheduled. The fence is released only after remount, so there are two separate scopes to keep straight, and this test
 /// pins both:
 ///   the FENCE is mount-wide -- while it is closed EVERY lane is refused, including untouched ones;
 ///   the DAMAGE is per-namespace -- a real remount replaces both immutable runtimes, then recovery of
@@ -3947,7 +3946,7 @@ TEST(CASRefWriterNamespaceRemoval, RemovalPublishesTerminalLogWithoutTerminalSna
     EXPECT_EQ(terminal_logs, 1u);
 }
 
-/// Review fix (prerequisite to this task's dropNamespace rewiring): `flushRefBatch`'s per-item
+/// `flushRefBatch`'s per-item
 /// validation previously previewed each op as its OWN single-op trial transaction, so a
 /// whole-transaction-shape rule ("remove_namespace must be the FINAL op") trivially passed on every
 /// singleton slice regardless of an item's REAL combined shape -- a malformed item would only have

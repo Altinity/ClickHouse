@@ -107,7 +107,7 @@ PoolPtr openPoolSingleAttempt(const BackendPtr & backend)
 /// With `openPoolFenceControlled`'s budget below that margin is 100 + 100 = 200 ms, so a 100 ms
 /// remaining lease sits BETWEEN them: the flush is admitted and then its very first pre-attempt gate
 /// refuses. That is
-/// exactly the production shape this task is about (a lease too short to start a write, not a lost
+/// exactly the production shape of a lease too short to start a write, not a lost
 /// one), and it needs no fault injection at all -- which is the point: nothing is sent.
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
 constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 100;
@@ -330,8 +330,8 @@ TEST(CASRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
         << "the refused drop must not have taken effect";
 
     /// The availability half of the claim: the lane is usable the moment the lease is healthy again --
-    /// no remount, no wedge resolution, nothing to clear. Before this task the same sequence left a
-    /// wedge over a key that was never written, and this append would have failed forever.
+    /// no remount, no wedge resolution, nothing to clear. A refused pre-attempt never writes a key,
+    /// so it cannot leave a wedge to block this append.
     store->setMountDeadline(FENCE_DEADLINE_HEALTHY_MS);
     store->dropRef(ns, "part_a");
     EXPECT_FALSE(store->resolveRef(ns, "part_a", /*allow_stale=*/false).has_value())

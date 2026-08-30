@@ -242,9 +242,8 @@ TEST(CASRefContiguousAlloc, EpochChangeRestartsTheSequenceAtOne)
 }
 
 /// The read side is what makes INV-1 an invariant rather than a convention: a transaction whose id is
-/// not the successor of `greatest_applied` is CORRUPTED_DATA, naming both ids. Before this task the
-/// state machine checked strict increase only, so a stream with a hole applied cleanly and no reader
-/// could tell a complete chain from a truncated one.
+/// not the successor of `greatest_applied` is CORRUPTED_DATA, naming both ids. Strict increase alone
+/// admits holes, so it cannot distinguish a complete chain from a truncated one.
 TEST(CASRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
 {
     const String ns = "srv1/contig_density";
@@ -253,7 +252,7 @@ TEST(CASRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
     RefTableState state = replay(DB::Cas::tests::minimalLiveSnapshot(ns, RefTxnId{kEpoch, 1}), {});
     ASSERT_EQ(state.getGreatestApplied(), (RefTxnId{kEpoch, 1}));
 
-    /// Strictly greater, but skips {7,2}: admitted before this task, rejected now.
+    /// Strictly greater, but skips {7,2}: not the required successor.
     try
     {
         applyRefLogTxn(state, RefLogTxn{ns, RefTxnId{kEpoch, 3}, publishCommittedOps("r", ManifestRef{1, 1, 1}), std::nullopt});

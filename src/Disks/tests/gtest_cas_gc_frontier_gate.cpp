@@ -32,10 +32,9 @@ namespace DB::ErrorCodes
 ///
 /// Reachability is a property of the WHOLE POOL. A blob is unreferenced only if no namespace anywhere
 /// owns an edge to it, so a round that deletes one is asserting something about every namespace at
-/// once -- including the ones it never looked at. Task 7 made the per-namespace half of that assertion
-/// cheap and exact: one `GET` at the cursor's arithmetic successor, absent means end-of-stream. Task 8
-/// made a namespace that could NOT be walked say so durably. What neither can supply is the SET those
-/// proofs have to cover, and that is what this task is about.
+/// once -- including the ones it never looked at. A `GET` at the cursor's arithmetic successor makes
+/// the per-namespace proof cheap and exact, and a namespace that cannot be walked reports that fact
+/// durably. Neither supplies the SET those proofs have to cover.
 ///
 /// So the gate has three terms, and a round destroys only when all three are clear:
 ///
@@ -1423,7 +1422,7 @@ TEST(CASGCFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
     EXPECT_FALSE(backend->list(old_prefix, "", 1000).keys.empty())
         << "the superseded generation's prefix survives a suppressed round intact";
 
-    /// AND THE OPPORTUNITY IS CONSUMED, NOT DEFERRED -- the one place in this task where the gate
+    /// AND THE OPPORTUNITY IS CONSUMED, NOT DEFERRED -- the gate
     /// costs something permanent, so it is asserted here rather than left to be discovered later.
     ///
     /// The hand-off is a one-shot DIFFERENCE: it compares the PARENT seal's runs against the new

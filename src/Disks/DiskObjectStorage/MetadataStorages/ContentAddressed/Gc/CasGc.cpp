@@ -2674,7 +2674,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// It counts the CUT ARITHMETICALLY, not by listed ids. Under arithmetic intake a listed-id count is
     /// not even the right question: a hint hole means a round legitimately applies records the listing
     /// never mentioned, so the old recomputation would report fewer logs than folded and fail every
-    /// healthy round on a lying store -- it would have made this task's own fix unshippable.
+    /// healthy round on a lying store.
     ///
     /// BE HONEST ABOUT WHAT IS LEFT. The old formula could disagree with reality because it was derived
     /// from a different source (the listing) than the counter. This one is derived from the runs the

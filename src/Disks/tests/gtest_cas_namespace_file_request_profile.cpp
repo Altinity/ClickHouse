@@ -500,8 +500,8 @@ TEST(CASNamespaceFileDiskProfile, TheLifeResolutionIsPaidOncePerTableOpen)
 }
 
 
-/// THE REMOVAL PATHS MUST NOT CREATE A NAMESPACE — the case that regressed silently in this task's first
-/// round, so it is pinned on the catalog rather than on the file outcome.
+/// THE REMOVAL PATHS MUST NOT CREATE A NAMESPACE: the catalog, rather than the file outcome, proves
+/// that invariant.
 ///
 /// Why the file outcome cannot pin it: `unlinkFile`/`removeRecursive` against a never-opened table
 /// answer "absent" both before and after the defect, because a freshly minted namespace has no files

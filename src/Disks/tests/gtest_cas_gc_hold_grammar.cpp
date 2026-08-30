@@ -24,8 +24,8 @@
 /// DURABLE HOLDS (spec 2026-07-27 "ref chain complete cut" §5).
 ///
 /// A namespace whose ref-log walk meets an IMPOSSIBLE shape stops there, and that stop has to survive
-/// the round. Before this task the stop was a single bit — `classification == CoverageClass::Clamped` —
-/// and everything that explained it (what went wrong, and exactly WHERE) lived in a log line and an
+/// the round. A classification alone cannot preserve the cause and position of the stop; without
+/// durable hold evidence, that information lives only in a log line and an
 /// in-memory anomaly, both gone by the next round. That is not enough for three separate reasons:
 ///
 ///   * the next round could not RETRY the exact position, so a hold only survived while the round's
@@ -298,8 +298,7 @@ std::vector<std::pair<const char *, CasFoldSeal>> illFormedSealsTheEncoderMustRe
                      "durable", clamped_without_hold);
 
     /// The closed set is now the enum's declared values, so only an explicit cast reaches outside it.
-    /// 4 is the sharpest value to plant: it was the wire value for Clamped before this task's dense
-    /// renumbering, and under the new table it is simply out of range.
+    /// 4 is the sharpest value to plant: it is outside the closed wire vocabulary.
     CasFoldSeal classification_retired_wire_value = cleanSeal("ns/0");
     fixtureCoverage(classification_retired_wire_value, "ns/0").classification
         = static_cast<CoverageClass>(4);

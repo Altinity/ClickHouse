@@ -41,7 +41,7 @@ TEST(CASGCRoundDefer, PredicateTruthTable)
     EXPECT_FALSE(shouldDeferRound(2, false, 8, 3, 8));   // bound reached => force fold
 }
 
-/// graduationDue (retired-in-snapshot T4): read ZERO-I/O from the adopted seal's condemned_summary. An
+/// `graduationDue` reads ZERO-I/O from the adopted seal's `condemned_summary`. An
 /// entry whose oldest non-pending condemn round crosses current_round forces it true; a delete_pending
 /// entry forces it true regardless of the round; otherwise false.
 TEST(CASGCRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
@@ -584,9 +584,9 @@ TEST(CASGCRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 
     writeBlobBody(*backend, layout, blob);
 
-    /// Seed the adopted fold seal's condemned_summary with B already `delete_pending` (pending_total = 1),
-    /// mirroring `CASGCRoundDefer.GraduationDueDetectsDuePendingAndRoundCrossing`. Retired-in-snapshot
-    /// (T4): graduationDue reads this summary ZERO-I/O off the adopted seal — a delete_pending entry forces
+    /// Seed the adopted fold seal's condemned_summary with B already `delete_pending` (pending_total = 1).
+    /// `graduationDue`
+    /// reads this summary ZERO-I/O from the adopted seal — a `delete_pending` entry forces
     /// it true regardless of the round. At `gc_fold_threshold = 1000` a real condemn -> graduate pipeline of
     /// `runRegularRound` calls is not usable to set this up: every round before graduation would ITSELF
     /// defer (nothing due yet, and changed_shards never nears 1000), so the due-pending summary is injected

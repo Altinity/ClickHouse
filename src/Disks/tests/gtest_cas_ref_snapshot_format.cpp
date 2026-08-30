@@ -126,8 +126,7 @@ TEST(CASRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnFieldPair)
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
 }
 
-/// No-tolerance decode pin (codex round-2, finding 3): the `"pl"` (payload) field was removed from the
-/// committed-row wire in stage-1 T12. It is NOT a genuinely-unknown future field the tolerant reader may
+/// No-tolerance decode pin: the `"pl"` (payload) field is not a genuinely-unknown future field the tolerant reader may
 /// skip -- silently discarding a persisted payload would lose data -- so decoding a committed row that
 /// still carries `"pl"` must FAIL with `CORRUPTED_DATA` naming the removed field, not `skipUnknown` it.
 TEST(CASRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)

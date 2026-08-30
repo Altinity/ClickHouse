@@ -71,7 +71,7 @@ TEST(CASEncodingPins, RefLogTxnAllOpKinds)
     /// not quote/newline/control bytes/U+2028, so `ref_name` -- the only free-form string `RefOp`
     /// still carries now that `payload` is gone -- exercises quote, newline, a bare control byte,
     /// and the three-byte U+2028 sequence. Backslash escaping is pinned separately, over an
-    /// unrestricted string, by `gtest_cas_json_writer.cpp`'s `CASJsonWriterEscaping` suite.
+    /// unrestricted string, by the JSON-writer escaping suite.
     set_published_at.ref_name = String("20260101_0_1_1_1\"c\nd") + "\x01" "e" + "\xE2\x80\xA8" "f";
     set_published_at.expected_manifest_ref = ManifestRef{1, 2, 3};
     set_published_at.published_at_ms = 1234;
