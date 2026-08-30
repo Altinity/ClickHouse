@@ -82,6 +82,11 @@ std::string_view entryPlacementToWireWord(EntryPlacement placement)
     return kEntryPlacementWords.toWord(placement, "PartManifest: EntryPlacement");
 }
 
+EntryPlacement entryPlacementFromWireWord(std::string_view w)
+{
+    return kEntryPlacementWords.fromWord(w, "PartManifest: EntryPlacement");
+}
+
 String encodePartManifest(const PartManifest & m)
 {
     /// Canonical path order plus duplicate-path rejection makes the encoded record sequence
@@ -226,7 +231,7 @@ PartManifest decodePartManifest(std::string_view data)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: junk after record");
         if (!pm)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: entry '{}' missing place", e.path);
-        e.placement = kEntryPlacementWords.fromWord(*pm, "PartManifest");
+        e.placement = entryPlacementFromWireWord(*pm);
 
         if (e.placement == EntryPlacement::Blob)
         {

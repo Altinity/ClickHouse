@@ -35,6 +35,9 @@ enum class ProvenanceOp : uint8_t
 /// Returns the persisted wire word for a validated provenance operation.
 std::string_view provenanceOpToWireWord(ProvenanceOp op);
 
+/// Its fail-closed inverse: an unknown word is `CORRUPTED_DATA`.
+ProvenanceOp provenanceOpFromWireWord(std::string_view w);
+
 /// Optional diagnostic metadata recorded with an envelope. The fields identify when and where the
 /// incarnation was created, the ClickHouse build that wrote it, and the operation that produced it;
 /// none of them participates in object identity or a protocol decision.

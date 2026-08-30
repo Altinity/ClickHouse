@@ -43,11 +43,6 @@ constexpr EnumWireTable<RefOpKind, 5> kRefOpWords{{{
 
 static_assert(casEnumTableCoversEnum<kRefOpWords, RefOpKind>());
 
-RefOpKind opKindFromWord(std::string_view w)
-{
-    return kRefOpWords.fromWord(w, "RefLogTxn");
-}
-
 /// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
 /// budget and has neither an op-count nor a per-op cap; normal transactions are bounded by
 /// `ref_txn_max_ops` and, per op, by `ref_op_max_bytes` (checked via `encodedOpSize`, one op at a
@@ -182,7 +177,7 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
         }
         else if (key == "pl")
             /// `"pl"` (payload) was removed from the op wire in stage-1 T12 (the `set_payload` op became
-            /// `set_published_at`). The retired op WORD is already rejected by `opKindFromWord`, but this
+            /// `set_published_at`). The retired op WORD is already rejected by `refOpKindFromWireWord`, but this
             /// generic reader reads field keys before switching on kind, so a `"pl"` field paired with a
             /// still-recognized op word would otherwise be `skipUnknown`'d. It is a KNOWN-removed field,
             /// not a genuinely-unknown one -- reject it explicitly rather than silently discard it.
@@ -220,6 +215,11 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
 std::string_view refOpKindToWireWord(RefOpKind kind)
 {
     return kRefOpWords.toWord(kind, "RefLogTxn");
+}
+
+RefOpKind refOpKindFromWireWord(std::string_view w)
+{
+    return kRefOpWords.fromWord(w, "RefLogTxn");
 }
 
 bool refLogTxnIsEpochSeal(const RefLogTxn & txn)
@@ -387,7 +387,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
         }
         if (key != RefLogWire::op)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: record must start with \"op\"");
-        const RefOpKind kind = opKindFromWord(r.readString());
+        const RefOpKind kind = refOpKindFromWireWord(r.readString());
         txn.ops.push_back(readOpRecord(r, kind));
         if (!l.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: junk after op record");

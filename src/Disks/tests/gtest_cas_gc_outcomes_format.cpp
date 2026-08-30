@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
 
+#include <magic_enum.hpp>
+
 using namespace DB::Cas;
 
 namespace
@@ -75,6 +77,19 @@ TEST(CASGCOutcomesFormat, MultiEntryRoundTripAllOutcomes)
     EXPECT_EQ(d.entries[3].token.value, "9");
     /// Insertion order + byte-stable text (the encoder is a pure function of the log).
     EXPECT_EQ(encodeOutcomeLog(d), text);
+}
+
+/// Closed-set pin: the four `OutcomeKind` words, walked through `magic_enum::enum_values` so a
+/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
+/// silently through an unspecified word.
+TEST(CASGCOutcomesFormat, ClosedSetPinsOutcomeKindWords)
+{
+    EXPECT_EQ(outcomeKindToWireWord(OutcomeKind::Deleted), "deleted");
+    EXPECT_EQ(outcomeKindToWireWord(OutcomeKind::Absent), "absent");
+    EXPECT_EQ(outcomeKindToWireWord(OutcomeKind::Replaced), "replaced");
+    EXPECT_EQ(outcomeKindToWireWord(OutcomeKind::Spared), "spared");
+    for (const auto o : magic_enum::enum_values<OutcomeKind>())
+        EXPECT_EQ(outcomeKindFromWireWord(outcomeKindToWireWord(o)), o);
 }
 
 TEST(CASGCOutcomesFormat, RecordRequiresCompleteBlobRefAndTokenGroups)

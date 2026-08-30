@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <IO/ReadBufferFromMemory.h>
 
+#include <magic_enum.hpp>
+
 using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
@@ -55,6 +57,17 @@ TEST(CASBlobMetaFormat, CondemnedRoundTripAllFields)
     EXPECT_EQ(back.size, 4096u);
     EXPECT_EQ(encodeBlobMeta(m),
         "{\"type\":\"cas_blob_meta\",\"v\":1}\n{\"state\":\"condemned\",\"condemn_round\":\"7\",\"size\":\"4096\"}\n");
+}
+
+/// Closed-set pin: the two `MetaState` wire words, walked through `magic_enum::enum_values` so a
+/// future state a `MetaState` construction can reach but no table entry names would fail this
+/// exhaustive check rather than silently pass through unspecified.
+TEST(CASBlobMetaFormat, ClosedSetPinsMetaStateWords)
+{
+    EXPECT_EQ(metaStateToWireWord(MetaState::Clean), "clean");
+    EXPECT_EQ(metaStateToWireWord(MetaState::Condemned), "condemned");
+    for (const auto state : magic_enum::enum_values<MetaState>())
+        EXPECT_EQ(metaStateFromWireWord(metaStateToWireWord(state)), state);
 }
 
 TEST(CASBlobMetaFormat, FailsClosedOnUnknownStateAndTruncation)

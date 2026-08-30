@@ -34,16 +34,16 @@ constexpr EnumWireTable<OutcomeKind, 4> kOutcomeKindWords{{{
 
 static_assert(casEnumTableCoversEnum<kOutcomeKindWords, OutcomeKind>());
 
-OutcomeKind outcomeKindFromWord(std::string_view w)
-{
-    return kOutcomeKindWords.fromWord(w, "CAS outcome log outcome kind");
-}
-
 }
 
 std::string_view outcomeKindToWireWord(OutcomeKind outcome)
 {
     return kOutcomeKindWords.toWord(outcome, "CAS outcome log outcome kind");
+}
+
+OutcomeKind outcomeKindFromWireWord(std::string_view w)
+{
+    return kOutcomeKindWords.fromWord(w, "CAS outcome log outcome kind");
 }
 
 String encodeOutcomeLog(const OutcomeLog & log)
@@ -102,7 +102,7 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
             if (key == GcOutcomesWire::kind) e.kind = objectKindFromWord(r.readString(), "outcome log");
             else if (matchBlobRefFields(key, r, blob_ref_fields)) {}
             else if (matchTokenFields(key, r, token_fields)) {}
-            else if (key == GcOutcomesWire::outcome) e.outcome = outcomeKindFromWord(r.readString());
+            else if (key == GcOutcomesWire::outcome) e.outcome = outcomeKindFromWireWord(r.readString());
             else r.skipUnknown(key);
         } while (r.nextKey(key));
 

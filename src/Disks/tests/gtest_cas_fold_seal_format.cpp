@@ -4,6 +4,8 @@
 #include <limits>
 #include <algorithm>
 
+#include <magic_enum.hpp>
+
 using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; extern const int LOGICAL_ERROR; }
@@ -301,6 +303,28 @@ TEST(CASFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
 
     EXPECT_EQ(encodeFoldSeal(seal), expected);
     EXPECT_EQ(decodeFoldSeal(expected), seal);
+}
+
+/// Closed-set pin: `CoverageClass` and `HoldReason`, each walked through `magic_enum::enum_values`
+/// so a future enumerator no table entry names fails this exhaustive check instead of round-tripping
+/// silently through an unspecified word.
+TEST(CASFoldSealFormat, ClosedSetPinsCoverageClassAndHoldReasonWords)
+{
+    EXPECT_EQ(coverageClassToWord(CoverageClass::Absent), "absent");
+    EXPECT_EQ(coverageClassToWord(CoverageClass::Unchanged), "unchanged");
+    EXPECT_EQ(coverageClassToWord(CoverageClass::Folded), "folded");
+    EXPECT_EQ(coverageClassToWord(CoverageClass::Clamped), "clamped");
+    for (const auto c : magic_enum::enum_values<CoverageClass>())
+        EXPECT_EQ(coverageClassFromWord(coverageClassToWord(c)), c);
+
+    EXPECT_EQ(holdReasonToWord(HoldReason::GapBelowWitness), "gap_below_witness");
+    EXPECT_EQ(holdReasonToWord(HoldReason::UnconsumedSealCrossing), "unconsumed_seal_crossing");
+    EXPECT_EQ(holdReasonToWord(HoldReason::WitnessDisappeared), "witness_disappeared");
+    EXPECT_EQ(holdReasonToWord(HoldReason::BodyUndecodable), "body_undecodable");
+    EXPECT_EQ(holdReasonToWord(HoldReason::ManifestBodyMissing), "manifest_body_missing");
+    EXPECT_EQ(holdReasonToWord(HoldReason::CheckpointUndecodable), "checkpoint_undecodable");
+    for (const auto r : magic_enum::enum_values<HoldReason>())
+        EXPECT_EQ(holdReasonFromWord(holdReasonToWord(r)), r);
 }
 
 /// Mutation caught: accepting the retired split coverage-collection kind would revive a second

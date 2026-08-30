@@ -62,20 +62,15 @@ is fine. They get triaged into the topic files above during the next grooming pa
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 isn't referenced elsewhere first.
 
-- PHASE-2 PLAN INPUTS (wire-keys, from the phase-1 final review — fold into `...-cas-wire-keys-phase2-cut.md` when written): (a) constant for the snapshot `lc == "live"` word; (b) Wire-namespace placement rule for NEW codec files — wire namespaces + tables go inside the codec `.cpp`'s anonymous namespace, public delegates in headers; (c) optionally single-site the reader-side `key == "n"` trailer-detection literal (seven readers, one writer `writeTrailerLine` today — framing, not vocabulary); (d) negative fixture for an unknown envelope `op` word; (e) outcomes token-group requiredness flips to both-required WITH its own negative test; (f) phase-1 pins that phase 2 must flip are enumerated per-file in the phase-1 plan's task list.
-- WORDING pass (phase 2): `BindingFields::build`'s message "binding missing bk/rn" names deleted members; group-message texts unify with the cut.
-
 - LATER PHASE (wire-keys, Formats/CasLayout.cpp blobRefFromKey): hand-rolled reimplementation of kBlobHashAlgoWords.fromWord ("one name authority" comment now stale) — replacing is a nullopt→throw posture flip needing a wedge audit of every caller; do not do casually.
 
 - PROSE key mentions in COMMENTS (wire-keys phase 2 lesson, sweep once at the end): every per-task sweep searched quoted key forms (`"ch":`, `\"ch\":`, `"ch"`) and therefore could not see keys named in prose with backticks or bare words — that is how `\`ch\`` / `\`bld\`` survived in `CasInspect.cpp` and `ContentAddressedTransaction.cpp` after the descriptor rename. A closing sweep must also grep backticked and bare mentions of every retired spelling in comments and messages.
 - PROSE tree-wide comment sweep (wire-keys phase 2): `rg -o 'this task|this same cut|pre-cut' src/Disks/` returns ~32 hits — comments that cite the change that made them true instead of stating the durable reason. Established idiom, so sweep once tree-wide rather than per task.
 - PROSE provenance (pre-existing, `gtest_cas_part_manifest_format.cpp`): the `sample()` comment cites "the plan's §text-shape illustration verbatim (codecs-v3 phase 6)" and the migrated-tests banner cites "(deleted in the phase-6 binary->text cutover, Task 3)" — drop the citations, keep the meaning.
-- PROSE provenance (pre-existing, ref codecs): "stage-1 T12" in both `pl` sentinel comments, "task-1 review finding M4" in `writeLogMeta`, and "review finding M4" / "codex round-2, finding 3" in the ref-log and ref-snapshot test files — drop the citations, keep the reasons.
+- PROSE provenance (pre-existing, ref codecs): "stage-1 T12" in both `pl` sentinel comments and "task-1 review finding M4" in `writeLogMeta` — drop the citations, keep the reasons. (The ref-log test file's "codex round-2, finding 3" citation is already gone, dropped incidentally by the task-19 parse-delegate rename it sat beside; the ref-snapshot test file's own "review finding M4" citation is untouched.)
 - PROSE provenance (pre-existing, wire-keys phase-2 sweep): "spec §2 [C4][D2]"-style citations in `CasPoolMetaFormat.h` and `Pool/CasPoolMeta.cpp`, and a plan-path citation in `utils/ca-soak/scenarios/cards/s28_s33_corner.py` — drop the citations, keep the meaning. Also `CasPoolMetaFormat.h`'s body example renders `] }` where the encoder emits `]}`.
-- PROSE stale claim (Task 16, `Formats/README.md` line ~40): "Key naming: keys 2–5 chars" is already false from earlier phase-2 renames (`gc_shards`, `snap_generation`, `manifest_sweep_cursor`, etc. all exceed 5 chars) and more so after Task 16's `time_ms`/`creator` (7 chars each). It's a tree-wide claim, not one row's fix — sweep once when all phase-2 renames have landed rather than editing it per task.
 - PROSE provenance (pre-existing): `gtest_cas_ref_epoch_seal_format.cpp` carries a `/// codex r2 finding 2:` comment — drop the citation, keep the reason (comment policy: no internal references).
 - PROSE stale-generation narrative (post-reset): `gtest_cas_namespace_life_id.cpp:208,315` comments still cite "Generation-5/6" parser history — reword to the timeless opaque-life-layout vocabulary (same class as the fixed `CasLayout.cpp` message).
-- PROSE (wire-keys phase-2 TODO, CasPoolMetaFormat.{h,cpp}): the floor derivation comment is split from the value it derives (and its 214/225 numbers carry the known off-by-one — spec mandates 213/224); phase 2 should move the derivation into CasEnvelopeLimits.h beside the constant and erase the duplicated "240" prose in CasPoolMetaFormat.h.
 
 The eleven items below are untouched since the 2026-08-04 consolidation-audit findings that produced
 them; the nine below those are the "found during the 2026-08 documentation consolidation" batch from
@@ -752,29 +747,21 @@ first-class and visible:
 - docs `{#sql-gc-run}`: state the leadership model in one sentence.
 No-steal on manual `RUN` stays untouched.
 
-## Reviewer ask: full-word wire keys in all CAS persisted formats (2026-08-21) {#wire-keys-full-words}
+## Reviewer ask: full-word wire keys in all CAS persisted formats (2026-08-21, RESOLVED 2026-08-30) {#wire-keys-full-words}
 
 Reviewer feedback: after the move to JSON text formats, the 2-5-char field keys (`su`, `eat`, `fen`,
 `nwe`, ...) are illegible and force manual remapping when reading raw objects. Wanted: human-readable
 identifiers everywhere, matching the struct/enum names, no mapping table needed.
 
-Adjudication: the terse convention is deliberate (`Formats/README.md`: "Key naming: keys 2-5 chars")
-but its size rationale is weak — every can-grow-large object is `.zst`, where repeated long keys
-compress to almost nothing, and the raw objects are tiny singletons. Enum VALUES are already
-full words (`CasWireVocab`). Agreed with the reviewers.
-
-Fix (pre-release only-cheap-now: breaking change to every persisted format, zero compat scaffolding
-while nothing persisted exists — [[feedback_ca_no_compat_scaffolding_predev]]):
-- rename every field key to the exact struct-field name (`su`→`server_uuid`,
-  `eat`→`expires_at_ms`, `fen`→`gc_fenced`, ...; prefixed triples `ome/omb/omo`→
-  `old_manifest_epoch/...` via the existing prefix mechanism);
-- scope: 71 distinct keys across ~14 codecs in `Formats/*.cpp`, mirrored read-side key branches,
-  and every golden test pinning wire bytes; check ca-soak/scenario asserts that grep raw JSON;
-- decide at fix time: header/trailer structural keys (`type`, `v`, `n`→`count`?) and the `!`
-  critical-key prefix spelling;
-- rewrite the README key-naming convention line in the same commit (its own rule).
-Mechanical sweep → codex candidate per [[feedback_delegate_mechanical_to_codex_luna]], with the
-golden regeneration reviewed here.
+Resolved by `docs/superpowers/specs/2026-08-28-cas-semantic-wire-keys-design.md`, shipped as the
+semantic-wire-keys generation reset: every persisted key became a "sufficiently full" semantic word
+(metadata written once per object gets a descriptive name; fields repeated once per record get a
+short semantic word; enum values render as full words). Exact full C++ member names everywhere —
+the reviewer's literal ask — were deliberately REJECTED for repeated records and for the fixed
+`cas_blob` descriptor: the design's "Rejected alternatives" section records why, and points at the
+Altinity PR #2288 implementation of the rejected alternative as a worked illustration of the cost
+(the descriptor no longer fits the default payload offset, and the raw uncompressed formats grow
+materially). `Formats/README.md` carries the naming rule the reviewer originally quoted.
 
 ## Issue #2219: relink refusals logged at Error with stack trace (adjudicated 2026-08-21, fix queued) {#issue-2219-relink-refusal-log-level}
 

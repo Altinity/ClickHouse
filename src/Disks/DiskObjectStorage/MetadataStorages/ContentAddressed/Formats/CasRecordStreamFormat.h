@@ -96,6 +96,9 @@ inline constexpr std::string_view kSourceEdgeKindWord = "source_edge";
 /// Canonical wire word for one source-edge run marker.
 std::string_view runMarkerToWireWord(RunMarker marker);
 
+/// Its fail-closed inverse: an unknown word is `CORRUPTED_DATA`.
+RunMarker runMarkerFromWireWord(std::string_view w);
+
 /// Write the typed header line `{"type":"cas_run","v":G_BUILD,"kind":"<kind>"}\n` with a fixed key
 /// order for byte-determinism. The `kind` field distinguishes the record schema within the run
 /// family, so a reader can reject a valid run of the wrong kind before interpreting any records.

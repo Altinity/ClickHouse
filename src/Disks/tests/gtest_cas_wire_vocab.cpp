@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromMemory.h>
+
+#include <magic_enum.hpp>
 
 using namespace DB::Cas;
 
@@ -44,6 +47,23 @@ TEST(CASWireVocab, EnumTablesPinTheCurrentWords)
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::XXH3_128, "t"), "xxh3");
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::Sha256, "t"), "sha256");
     EXPECT_EQ(kObjectKindWords.toWord(ObjectKind::Blob, "t"), "blob");
+    EXPECT_EQ(refOwnerKindToWord(RefOwnerKind::Committed), "committed");
+    EXPECT_EQ(refOwnerKindToWord(RefOwnerKind::Precommit), "precommit");
+}
+
+/// Every enum wire table's closed set, walked through `magic_enum::enum_values` rather than a
+/// hand-copied list -- a future enumerator the encoder can construct but no table entry covers
+/// would otherwise round-trip silently through the untested value.
+TEST(CASWireVocab, ClosedSetsRoundTripEveryEnumeratorExhaustively)
+{
+    for (const auto t : magic_enum::enum_values<TokenType>())
+        EXPECT_EQ(tokenTypeFromWord(tokenTypeToWord(t), "t"), t);
+    for (const auto k : magic_enum::enum_values<ObjectKind>())
+        EXPECT_EQ(objectKindFromWord(objectKindToWord(k), "k"), k);
+    for (const auto a : magic_enum::enum_values<BlobHashAlgo>())
+        EXPECT_EQ(blobHashAlgoFromWord(blobHashAlgoName(a), "a"), a);
+    for (const auto k : magic_enum::enum_values<RefOwnerKind>())
+        EXPECT_EQ(refOwnerKindFromWord(refOwnerKindToWord(k), "k"), k);
 }
 
 TEST(CASWireVocab, EnumWordsRoundTrip)

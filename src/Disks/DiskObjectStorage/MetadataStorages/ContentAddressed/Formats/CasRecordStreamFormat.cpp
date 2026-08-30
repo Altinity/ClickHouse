@@ -108,6 +108,11 @@ std::string_view runMarkerToWireWord(RunMarker marker)
     return kRunMarkerWords.toWord(marker, "CAS cas_run: RunMarker");
 }
 
+RunMarker runMarkerFromWireWord(std::string_view w)
+{
+    return kRunMarkerWords.fromWord(w, "CAS cas_run: RunMarker");
+}
+
 void writeRunHeaderLine(WriteBuffer & out, std::string_view kind)
 {
     const FormatTraits & t = traitsFor(FormatId::RunFile);
@@ -276,7 +281,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     {
         if (key == RunWire::ref) { b = r.readString(); have_ref = true; }
         else if (key == RunWire::src) { out.source_id = r.readHex128(); have_src = true; }
-        else if (key == RunWire::mark) { out.marker = kRunMarkerWords.fromWord(r.readString(), "CAS cas_run"); have_mark = true; }
+        else if (key == RunWire::mark) { out.marker = runMarkerFromWireWord(r.readString()); have_mark = true; }
         else if (key == RunWire::pending) { out.delete_pending = r.readBool(); have_pending = true; }
         else if (matchTokenFields(key, r, token_fields)) {}
         else if (key == RunWire::size) { out.size = r.readU64Number(); have_size = true; }

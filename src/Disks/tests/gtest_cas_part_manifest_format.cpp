@@ -5,6 +5,8 @@
 #include <utility>
 #include <vector>
 
+#include <magic_enum.hpp>
+
 using namespace DB::Cas;
 
 namespace
@@ -124,6 +126,17 @@ TEST(CASPartManifestFormat, PlacementWordsRenderAndRejectUnknown)
     ASSERT_NE(pos, String::npos);
     bad.replace(pos, String(R"("place":"blob")").size(), R"("place":"bogus")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
+}
+
+/// Closed-set pin: the two `EntryPlacement` words, walked through `magic_enum::enum_values` so a
+/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
+/// silently through an unspecified word.
+TEST(CASPartManifestFormat, ClosedSetPinsEntryPlacementWords)
+{
+    EXPECT_EQ(entryPlacementToWireWord(EntryPlacement::Inline), "inline");
+    EXPECT_EQ(entryPlacementToWireWord(EntryPlacement::Blob), "blob");
+    for (const auto p : magic_enum::enum_values<EntryPlacement>())
+        EXPECT_EQ(entryPlacementFromWireWord(entryPlacementToWireWord(p)), p);
 }
 
 TEST(CASPartManifestFormat, SizeBeforePlaceIsAcceptedForBothPlacements)

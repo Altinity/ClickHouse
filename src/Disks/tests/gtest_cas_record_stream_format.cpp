@@ -7,6 +7,8 @@
 #include <fmt/format.h>
 #include <vector>
 
+#include <magic_enum.hpp>
+
 using namespace DB;
 using namespace DB::Cas;
 
@@ -124,6 +126,18 @@ TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
 
     EXPECT_EQ(back[2].ref, c);
     EXPECT_EQ(back[2].marker, RunMarker::Zero);
+}
+
+/// Closed-set pin: the three `RunMarker` words, walked through `magic_enum::enum_values` so a
+/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
+/// silently through an unspecified word.
+TEST(CASRecordStream, ClosedSetPinsRunMarkerWords)
+{
+    EXPECT_EQ(runMarkerToWireWord(RunMarker::Zero), "zero");
+    EXPECT_EQ(runMarkerToWireWord(RunMarker::Edge), "edge");
+    EXPECT_EQ(runMarkerToWireWord(RunMarker::Condemned), "condemned");
+    for (const auto m : magic_enum::enum_values<RunMarker>())
+        EXPECT_EQ(runMarkerFromWireWord(runMarkerToWireWord(m)), m);
 }
 
 /// The condemned row's six fields are all-or-nothing: a row that says `condemned` but drops one of

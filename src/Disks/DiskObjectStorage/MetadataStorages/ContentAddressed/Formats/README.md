@@ -38,11 +38,28 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 ## Codec table
 
 Authoritative per-format traits (type string, family, strictness, compression policy, caps) live
-in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`. Key naming: keys
-2–5 chars; fixed-width `UInt128` identities = 32-char lowercase hex strings; blob digests =
-algo-width hex (two chars per digest byte), rendered with their algo name (`sha256:ab12…`) wherever
-a bare hex would be ambiguous; unbounded u64 = decimal strings; bounded counts/lengths/ms-timestamps
-= numbers; units documented here per object as codecs land.
+in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`.
+
+Key naming follows a deliberate split between metadata written once per object and fields repeated
+once per record, not a flat character-count budget:
+
+- metadata written once per object (`namespace`, `condemn_round`, `writer_epoch`, …) uses
+  descriptive names;
+- fields repeated once per record (`ref`, `mark`, `op`, `class`, `place`, …) use short, semantic
+  words whose meaning is clear in the record rather than the C++ member name verbatim;
+- the fixed `cas_blob` descriptor uses its own separately budgeted compact vocabulary (`tag`,
+  `build`, `chver`, …), because it must fit before the pool-wide fixed payload offset;
+- common framing stays `type`, `v`, and `n`;
+- `!` stays the must-understand prefix for critical fields;
+- C++ member names obey an asymmetric rule: a member may be fuller than its wire key, never more
+  cryptic than it.
+
+Exact full C++ member names everywhere were deliberately rejected — see
+`docs/superpowers/specs/2026-08-28-cas-semantic-wire-keys-design.md` ("Rejected alternatives").
+Fixed-width `UInt128` identities render as 32-char lowercase hex strings; blob digests render as
+algo-width hex (two chars per digest byte), with their algo name (`sha256:ab12…`) wherever a bare
+hex would be ambiguous; unbounded u64 = decimal strings; bounded counts/lengths/ms-timestamps =
+numbers; units documented here per object as codecs land.
 
 `CasWireVocab.{h,cpp}` owns repeated value fields: `BlobRef` uses `algo`/`digest`, `Token` uses
 the jointly required `token_type`/`token`, `ManifestRef` uses `epoch`/`build`/`ord`, and owner-transition bindings use

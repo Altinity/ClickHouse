@@ -45,6 +45,9 @@ enum class EntryPlacement : uint8_t
 /// Canonical wire word for one manifest entry placement.
 std::string_view entryPlacementToWireWord(EntryPlacement placement);
 
+/// Its fail-closed inverse: an unknown word is `CORRUPTED_DATA`.
+EntryPlacement entryPlacementFromWireWord(std::string_view w);
+
 /// One file entry inside a part manifest. `ref` is meaningful only for `Blob`; `inline_bytes` only
 /// for `Inline`. `blob_size` is the raw `Blob` byte count (0 for `Inline` — decode never fills it for
 /// an inline entry, since the wire format carries no redundant size for inline bytes). Use `size()`

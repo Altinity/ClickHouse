@@ -6,6 +6,8 @@
 #include <random>
 #include <vector>
 
+#include <magic_enum.hpp>
+
 /// v3 text codec tests for `cas_ref_log` (codecs-v3 phase 3). Split out of the retired
 /// `gtest_cas_ref_codecs.cpp` and re-pointed at the TEXT codec: the encoder-side validation tests are
 /// format-agnostic (they only assert `encodeRefLogTxn` throws) and carry over verbatim; the old
@@ -140,6 +142,20 @@ TEST(CASRefCodec, OrderMatchesLexicalOrderOfRender)
 /// RefLogTxn: round trip
 /// ===================================================================================
 
+/// Closed-set pin: the five `RefOpKind` words, walked through `magic_enum::enum_values` so a
+/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
+/// silently through an unspecified word.
+TEST(CASRefCodec, ClosedSetPinsRefOpKindWords)
+{
+    EXPECT_EQ(refOpKindToWireWord(RefOpKind::NamespaceBirth), "namespace_birth");
+    EXPECT_EQ(refOpKindToWireWord(RefOpKind::OwnerTransition), "owner_transition");
+    EXPECT_EQ(refOpKindToWireWord(RefOpKind::SetPublishedAt), "set_published_at");
+    EXPECT_EQ(refOpKindToWireWord(RefOpKind::RemoveNamespace), "remove_namespace");
+    EXPECT_EQ(refOpKindToWireWord(RefOpKind::EpochSeal), "epoch_seal");
+    for (const auto k : magic_enum::enum_values<RefOpKind>())
+        EXPECT_EQ(refOpKindFromWireWord(refOpKindToWireWord(k)), k);
+}
+
 TEST(CASRefCodec, RoundTripNamespaceBirth)
 {
     RefLogTxn txn;
@@ -185,9 +201,9 @@ TEST(CASRefCodec, RoundTripSetPublishedAt)
     EXPECT_EQ(decoded, txn);
 }
 
-/// No-tolerance decode pin (codex round-2, finding 3): the `"pl"` (payload) field was removed from the
+/// No-tolerance decode pin: the `"pl"` (payload) field was removed from the
 /// ref-op wire in stage-1 T12. Although the retired `set_payload` op WORD is already rejected by
-/// `opKindFromWord`, the generic op-record reader reads all field keys before switching on kind, so a
+/// `refOpKindFromWireWord`, the generic op-record reader reads all field keys before switching on kind, so a
 /// `"pl"` field paired with a still-recognized op word would otherwise be `skipUnknown`'d. It is a
 /// removed field, not a genuinely-unknown one: decoding an op record that still carries `"pl"` must FAIL
 /// with `CORRUPTED_DATA` naming the removed field.

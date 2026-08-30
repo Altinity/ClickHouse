@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Common/Exception.h>
+#include <set>
+#include <string_view>
 
 namespace DB::ErrorCodes
 {
@@ -9,6 +11,33 @@ namespace DB::ErrorCodes
 }
 
 using namespace DB::Cas;
+
+/// Closed-set pin: the registry's complete set of object `type` strings. `allRegisteredFormatIds`
+/// is the registry's own enumeration accessor, so this walks the SAME set the codecs and the object
+/// header gate see -- a registered class with no test coverage here is a registered class this test
+/// cannot see either, which is the point: a 17th, 18th, ... entry the spec's closed set does not
+/// name would show up as a set-size mismatch instead of passing unnoticed.
+TEST(CASFormat, RegistryTypeStringsArePinnedClosedSet)
+{
+    const std::set<std::string_view> expected{
+        "cas_blob", "cas_blob_meta", "cas_pool_meta", "cas_ref_log", "cas_ref_snap",
+        "cas_ref_ckpt", "cas_ref_catalog", "cas_gc_maintenance_state", "cas_part_manifest",
+        "cas_run", "cas_fold_seal", "cas_gc_state", "cas_gc_hb", "cas_gc_outcomes",
+        "cas_owner", "cas_epoch", "cas_mount_lease"};
+    ASSERT_EQ(expected.size(), 17u);
+
+    std::set<std::string_view> actual;
+    for (const auto id : allRegisteredFormatIds())
+        actual.insert(traitsFor(id).type);
+    EXPECT_EQ(actual, expected);
+
+    for (const auto & type : expected)
+    {
+        const FormatTraits * t = traitsForType(type);
+        ASSERT_NE(t, nullptr) << type;
+        EXPECT_EQ(t->type, type);
+    }
+}
 
 /// The generation history is reset to a flat `{1, 1}` baseline for every class: CAS is pre-release and
 /// carries no persisted data, so there is no compatibility cost to starting the count over. Pinned

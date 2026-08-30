@@ -16,6 +16,8 @@
 #include <type_traits>
 #include <utility>
 
+#include <magic_enum.hpp>
+
 using namespace DB::Cas;
 
 namespace ProfileEvents
@@ -227,6 +229,18 @@ TEST(CASFormatBattery, RefCatalog)
         "\"creator\":\"srv1\",\"creator_epoch\":\"5\",\"creator_fence\":\"2\"}\n"
         "{\"kind\":\"entry\",\"ns\":\"b\",\"state\":\"live\",\"life\":\"00000000000000000000000000000002\"}\n"
         "{\"n\":2}\n"});
+}
+
+/// Closed-set pin: the three `NsState` words, walked through `magic_enum::enum_values` so a future
+/// enumerator no table entry names fails this exhaustive check instead of round-tripping silently
+/// through an unspecified word.
+TEST(CASRefCatalogFormat, ClosedSetPinsNsStateWords)
+{
+    EXPECT_EQ(nsStateToWord(NsState::Creating), "creating");
+    EXPECT_EQ(nsStateToWord(NsState::Live), "live");
+    EXPECT_EQ(nsStateToWord(NsState::Removing), "removing");
+    for (const auto s : magic_enum::enum_values<NsState>())
+        EXPECT_EQ(nsStateFromWord(nsStateToWord(s)), s);
 }
 
 /// ---------- codec round-trip ----------

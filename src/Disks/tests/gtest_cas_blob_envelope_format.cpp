@@ -186,6 +186,21 @@ TEST(CASBlobEnvelopeFormat, CriticalKeyDescriptorStillFitsAtDefaultLength)
         "critical-key blob envelope at max-reachable field values");
 }
 
+/// Closed-set pin: the six `ProvenanceOp` words, walked through `magic_enum::enum_values` so a
+/// future enumerator no table entry names fails this exhaustive check instead of round-tripping
+/// silently through an unspecified word.
+TEST(CASBlobEnvelopeFormat, ClosedSetPinsProvenanceOpWords)
+{
+    EXPECT_EQ(provenanceOpToWireWord(ProvenanceOp::Other), "other");
+    EXPECT_EQ(provenanceOpToWireWord(ProvenanceOp::Insert), "insert");
+    EXPECT_EQ(provenanceOpToWireWord(ProvenanceOp::Merge), "merge");
+    EXPECT_EQ(provenanceOpToWireWord(ProvenanceOp::Mutation), "mutation");
+    EXPECT_EQ(provenanceOpToWireWord(ProvenanceOp::Attach), "attach");
+    EXPECT_EQ(provenanceOpToWireWord(ProvenanceOp::Repack), "repack");
+    for (const auto op : magic_enum::enum_values<ProvenanceOp>())
+        EXPECT_EQ(provenanceOpFromWireWord(provenanceOpToWireWord(op)), op);
+}
+
 TEST(CASBlobEnvelopeFormat, UnknownOpWordFailsClosed)
 {
     /// `op` is written as a plain (non-critical) key, so an unrecognized word is a decode-time

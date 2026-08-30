@@ -158,6 +158,11 @@ std::string_view provenanceOpToWireWord(ProvenanceOp op)
     return kProvenanceOpWords.toWord(op, "CAS blob envelope");
 }
 
+ProvenanceOp provenanceOpFromWireWord(std::string_view w)
+{
+    return kProvenanceOpWords.fromWord(w, "CAS blob envelope");
+}
+
 String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
 {
     if (header.kind != ObjectKind::Blob)
@@ -268,7 +273,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
         }
         else if (key == EnvelopeWire::op)
         {
-            prov.op = kProvenanceOpWords.fromWord(r.readString(), "CAS blob envelope");
+            prov.op = provenanceOpFromWireWord(r.readString());
             have_prov = true;
         }
         else if (key == EnvelopeWire::chver)

@@ -39,6 +39,11 @@ std::string_view metaStateToWireWord(MetaState state)
     return kMetaStateWords.toWord(state, "CAS blob meta");
 }
 
+MetaState metaStateFromWireWord(std::string_view w)
+{
+    return kMetaStateWords.fromWord(w, "CAS blob meta");
+}
+
 String encodeBlobMeta(const BlobMeta & meta)
 {
     CasJsonWriter out(256);
@@ -71,7 +76,7 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
     {
         if (key == BlobMetaWire::state)
         {
-            m.state = kMetaStateWords.fromWord(r.readString(), "CAS blob meta");
+            m.state = metaStateFromWireWord(r.readString());
             saw_state = true;
         }
         else if (key == BlobMetaWire::condemn_round)
