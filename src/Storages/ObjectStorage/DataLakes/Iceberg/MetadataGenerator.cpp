@@ -458,32 +458,27 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
         summary->set(Iceberg::f_changed_partition_count, std::to_string(num_partitions));
     }
 
-    setSnapshotTotals(
-        summary,
-        parent_snapshot,
-        /*added_records=*/added_records,
-        /*added_files_size=*/added_files_size,
-        /*added_data_files=*/added_files,
-        /*added_delete_files=*/added_delete_files,
-        /*added_position_deletes=*/num_deleted_rows,
-        /*added_equality_deletes=*/0);
-    auto sum_with_parent_snapshot = [&](const char * field_name, Int64 snapshot_value)
+    if (is_truncate)
     {
-        if (is_truncate)
-        {
-            summary->set(field_name, std::to_string(0));
-            return;
-        }
-        Int64 prev_value = parent_snapshot && parent_snapshot->has(Iceberg::f_summary) && parent_snapshot->getObject(Iceberg::f_summary)->has(field_name) ? parse<Int64>(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(field_name)) : 0;
-        summary->set(field_name, std::to_string(prev_value + snapshot_value));
-    };
-
-    sum_with_parent_snapshot(Iceberg::f_total_records, added_records);
-    sum_with_parent_snapshot(Iceberg::f_total_files_size, added_files_size);
-    sum_with_parent_snapshot(Iceberg::f_total_data_files, added_files);
-    sum_with_parent_snapshot(Iceberg::f_total_delete_files, added_delete_files);
-    sum_with_parent_snapshot(Iceberg::f_total_position_deletes, num_deleted_rows);
-    sum_with_parent_snapshot(Iceberg::f_total_equality_deletes, 0);
+        summary->set(Iceberg::f_total_records, "0");
+        summary->set(Iceberg::f_total_files_size, "0");
+        summary->set(Iceberg::f_total_data_files, "0");
+        summary->set(Iceberg::f_total_delete_files, "0");
+        summary->set(Iceberg::f_total_position_deletes, "0");
+        summary->set(Iceberg::f_total_equality_deletes, "0");
+    }
+    else
+    {
+        setSnapshotTotals(
+            summary,
+            parent_snapshot,
+            /*added_records=*/added_records,
+            /*added_files_size=*/added_files_size,
+            /*added_data_files=*/added_files,
+            /*added_delete_files=*/added_delete_files,
+            /*added_position_deletes=*/num_deleted_rows,
+            /*added_equality_deletes=*/0);
+    }
     new_snapshot->set(Iceberg::f_summary, summary);
 
     new_snapshot->set(Iceberg::f_schema_id, metadata_object->getValue<Int32>(Iceberg::f_current_schema_id));
