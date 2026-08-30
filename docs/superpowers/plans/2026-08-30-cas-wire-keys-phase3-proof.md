@@ -53,14 +53,14 @@ The plan ends with a durable acceptance matrix that fails closed.
 This is FIRST because it is the last task that may change a persisted key. Phase 2 already pinned literal goldens, sixteen byte deltas, closed sets, canonical examples, README rows and external parsers — so a change here is another small wire cut, not a prose ruling, and it must land before anything is measured or executed. Four rulings, each recorded separately even when the outcome is "keep what is there"; bundling them is how a multi-part item gets half-discharged.
 
 **Interfaces:**
-- Produces: the FINAL vocabulary and the commit that establishes it. Every later task cites that commit as its AFTER side.
+- Produces: the FINAL vocabulary. Its commit is not itself the AFTER side — the freeze commit declared at the end of Task 3 is, since Tasks 2 and 3 also change production code.
 
 - [ ] **Step 1: Ruling A — the GC leader's spelling.** The same identity is `lease_owner` in `cas_gc_state` and `owner` in `cas_gc_hb`. Decision criteria, all four to be answered in the record: semantic precision when the object is read alone; redundancy against the containing object's own context; cross-format grep value for the operator question "which server holds GC"; repeated-row byte cost (nil here — both are singletons). Note the nuance before deciding: the heartbeat's owner may name a DEPOSED leader while `gc/state.lease_owner` names the current lease holder (`CasGc.cpp` compares them deliberately), so "same identity type" is not "same current value" — that may argue for or against one spelling, but it must be addressed.
 - [ ] **Step 2: Ruling B — the sequence context.** `cas_gc_hb` took `by`→`owner` but kept `seq`→`hb_seq`, while `cas_mount_lease` kept a bare `seq` under the same context rule. Answer the same four criteria (precision alone, redundancy against the container, cross-format grep value, repeated-row cost), decide the rule, and apply it consistently. This is NOT part of Ruling A: bundling them is how a two-clause item gets half-discharged.
 - [ ] **Step 3: Ruling C — the namespace's three spellings**: `namespace` (ref log, ref snapshot), `ns` (catalog, deliberate and spec'd), `root_namespace` (part manifest, where the object carries exactly one namespace so `root_` is redundant by the spec's own context rule). Same four criteria; note that `namespace` is a repeated-row key in neither format, so byte cost does not decide this one — say what does.
 - [ ] **Step 4: Ruling D — the C++ carrier identifiers.** `ns` names three different wire keys across three codecs, including `PartManifestWire::ns` holding `"root_namespace"`. This one is governed by the spec's asymmetric member rule (a member may be fuller than its key, never more cryptic) rather than by byte cost; whatever C decides, an identifier should name what it holds.
 - [ ] **Step 5: If any ruling changes a key, treat it as a wire cut** — goldens, the affected byte-delta pins, closed-set pins, canonical examples, README row, spec table, external parsers, and a fresh dead-spelling sweep in ALL forms (raw, escaped `rg -F`, bare token, index form `meta["k"]`, and backticked prose — each of those forms caught something phase 2's other forms missed). Unit gate green.
-- [ ] **Step 6: Record all four rulings in the spec**, including the ones that changed nothing, so they are not reopened. **Commit** per ruling. **This task's final commit is the AFTER side for everything below; record its SHA in the report.**
+- [ ] **Step 6: Record all four rulings in the spec**, including the ones that changed nothing, so they are not reopened. **Commit** per ruling. Record each SHA; Task 3 Step 4 folds them into the freeze point.
 
 ---
 
@@ -109,7 +109,14 @@ The spec requires two independent halves: the compiler proves the formula, and a
   - **inconclusive** — reproduced neither way. Retryable a bounded number of times, then escalated.
   - **unclassified** — anything not yet in the five above. **Blocks closure.**
 - [ ] **Step 2: Run the CAS stateless lane.** **41** tests, matched by `_cas[_.]` and NOT by a bare `cas` substring — that pattern also catches `case` and `cast` and inflates the set to 348, which is how an earlier draft of this plan claimed 57. Confirm the set before running: `ls tests/queries/0_stateless/ | grep -E "_cas[_.]" | grep -E "\.(sh|sql)$"`, numbers 04278-04300 and 05000-05026. Also check for CAS tests that do NOT carry `cas` in the name (grep the bodies for `content_addressed`) and say whether any exist.
-  Run with the praktika runner from the repository root, logging to `build/test_stateless_cas.log`, and have a subagent summarise the log rather than reading it whole. The `--test` flag is ONE space-separated argument and repeats collapse to the last, so pass the whole set in a single flag. Do not overlap with a soak run: praktika's post-hooks prune docker containers and volumes.
+  The repository has a DEDICATED CAS stateless lane — `ci/defs/altinity_jobs.py` parametrises "Stateless tests" with `cas s3 storage`, which runs the suite with a content-addressed disk as the default MergeTree storage. Run it from the repository root:
+
+```bash
+python3 -m ci.praktika run "Stateless tests (amd_binary, cas s3 storage, parallel)" \
+  --test "04278_cas_disk 04279_cas_gc ..." > build/test_stateless_cas.log 2>&1
+```
+
+  Pass the whole set in ONE `--test` argument (the flag is a single space-separated string and repeats collapse to the last). Confirm the exact job name against `ci/defs/altinity_jobs.py` before running — it is parametrised, so the string above must match the parametrisation in the tree at that moment. Note that this lane runs the WHOLE stateless suite over a CAS disk, which is stronger evidence than the 41 CAS-named tests alone; run the named set first for a fast signal, then the full lane. Have a subagent summarise the log rather than reading it whole. Do not overlap with a soak run: praktika's post-hooks prune docker containers and volumes.
 - [ ] **Step 3: Classify every failure** per Step 1, fix the stale-assertion ones, re-run. **Commit:** `cas: follow the wire cut into the stateless lane` (body: every test touched and its outcome class).
 
 ---
