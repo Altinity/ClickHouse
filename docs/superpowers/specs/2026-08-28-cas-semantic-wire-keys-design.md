@@ -396,7 +396,7 @@ The once-per-object descriptor line becomes:
 | Old | New |
 |---|---|
 | `me`, `mb`, `mo` | `epoch`, `build`, `ord` |
-| `ns` | `root_namespace` |
+| `ns` | `namespace` |
 | `pd` | `payload_digest` |
 
 Repeated entry rows become:

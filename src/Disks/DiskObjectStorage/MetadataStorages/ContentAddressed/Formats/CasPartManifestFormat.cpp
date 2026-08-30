@@ -25,7 +25,7 @@ namespace
 
 namespace PartManifestWire
 {
-    constexpr WireKey ns{"root_namespace"};
+    constexpr WireKey ns{"namespace"};
     constexpr WireKey payload_digest{"payload_digest"};
     constexpr WireKey path{"path"};
     constexpr WireKey place{"place"};
@@ -161,7 +161,7 @@ PartManifest decodePartManifest(std::string_view data)
             else r.skipUnknown(key);
         }
         if (!ns)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing root_namespace");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing namespace");
         if (!pd)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing payload_digest");
         m.ref = fields.buildRef("PartManifest", "descriptor");
