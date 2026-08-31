@@ -1311,7 +1311,30 @@ distinguish "retry until the transient clears" from "wait forever", and a persis
 deserves to surface as an error long before attempt 500. Both are wider than S21 — every scenario
 doing concurrent reads at scale is exposed.
 
-**What is NOT established:** whether RustFS's read-concurrency ceiling is configurable in
-`1.0.0-rc.3`. `configs/rustfs.env` already disables the scanner and heal for related 503 bursts
-("multi-minute `503 ServiceUnavailable` bursts in this single-disk ephemeral fixture"), so raising the
-ceiling may not be available and pacing the client may be the only lever.
+**The ceiling IS configurable, and raising it fixes the stall.** `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`
+is the knob — found by extracting `RUSTFS_*` names from the `1.0.0-rc.3` binary, alongside
+`RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT`, `RUSTFS_OBJECT_DISK_DEGRADED_READ_CAP`,
+`RUSTFS_OBJECT_DISK_READ_TIMEOUT` and `RUSTFS_OBJECT_DISK_WRITE_ABSOLUTE_CAP`. The binary also carries
+the write-side twin of the message, `foreground write concurrency limit reached`.
+
+Measured, not assumed:
+
+| ceiling | outcome for the same 1.1 GiB seven-part merge |
+|---|---|
+| default | never completes: 20 MiB read, 0 bytes written across a 40 s window, 3,884 503s in 12 min |
+| **256** | **completes**: `system.part_log` shows `MergeParts` at 1,211.7 s with `error = 0` |
+
+`configs/rustfs.env` is set to 256 for that reason. A trial at 1024 was botched — rustfs was restarted
+mid-merge, destroying the experiment — so 1024 carries no evidence and is not used.
+
+**Two things this does not settle.** 503s still occur at 256 (579 in three minutes) while the host is
+completely idle: load 0.82, iowait 0%, on NVMe. So the ceiling is reached for reasons other than
+physical disk saturation, and what those are is unknown. And the client still does not pace itself at
+all, so every refusal becomes a long wait rather than an error — `s3_max_get_rps` remains the other
+half of the fix.
+
+**A hypothesis I raised and then withdrew, recorded so nobody re-runs it:** I proposed a permit leak in
+rustfs, on the grounds that progress came in a burst after each restart and then appeared to stop.
+The merge's completion refutes it. What actually happened is that the merge was slow and *uneven*, and
+I sampled a single 90-second window that fell in a pause, then concluded throughput was zero. Read a
+curve, not one interval.
