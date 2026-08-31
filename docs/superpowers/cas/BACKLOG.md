@@ -71,6 +71,102 @@ unchanged, only relocated.
 
 ### From the 2026-08-04 destructive-baseline / soak audit {#inbox-audit-batch}
 
+## `[s27-list-anomaly-aimed-at-a-retired-path]` S27 perturbs a prefix nothing lists any more {#s27-list-anomaly-aimed-at-a-retired-path}
+
+**Found by the full scenario sweep (2026-08-31). S27 FAILED, and it failed for the right reason.**
+
+The card injects LIST anomalies — pagination ambiguity, duplicate and missing pages — on
+`cas/refs/` and checks that discovery survives them. Its verdict was:
+
+> LIST anomalies were injected on cas/refs/ (test not vacuous): expected > 0 perturbed LISTs,
+> observed 0 — proxy perturbed 0 LISTs — discovery may not have re-listed cas/refs/
+
+Discovery does not list that prefix any more, and has not since discovery authority moved to the
+pool-wide `cas/ref_catalog` object. The registry records the change in as many words: "Value 10 is
+retired: discovery authority is the pool-wide `cas/ref_catalog` object rather than a roots registry
+object or a physical stream listing." A grep of the CAS tree finds no listing of `cas/refs/` at all.
+
+**The card did the right thing.** It carries a not-vacuous guard, and that guard is what fired: rather
+than reporting a serene PASS for an injection that reached nothing, it failed and said the injection
+reached nothing. A scenario without that guard would have been quietly reporting success against a
+retired code path for as long as the path has been retired.
+
+**The subject is not gone, only moved.** LIST is still load-bearing, for GC rather than discovery:
+`CasNamespaceJanitor` pages `namespaceRootPrefix()`, `CasOrphanManifestSweep` pages
+`casManifestsPrefix()`, and `CasGc` pages its own prefix. Pagination ambiguity on any of those is
+exactly the hazard S27 was written for, and none of them is covered today.
+
+**Fix direction:** re-aim the injection at the prefixes GC actually pages, and assert on GC's
+outcome — no object deleted that a complete listing would have shown as reachable — rather than on
+discovery's. Retiring the card instead would drop a real hazard class on the floor.
+
+## `[ca-write-buffer-allocation-concentration]` Two write-buffer constructors account for essentially all CAS allocation activity {#ca-write-buffer-allocation-concentration}
+
+**Found by profiling a one-hour chaos soak (2026-08-31) against `system.trace_log`.**
+
+**Read the counts as a ratio, not as a census.** The same export that produced them was
+CAS-filtered (`WHERE stack LIKE '%DB::Cas::%'`), so no non-CAS allocator appears here and this is
+not a ranking of server-wide allocation; and it summed 38 snapshots of a cumulative table, so every
+absolute number is inflated by roughly the number of snapshots a sample survived into. Neither
+defect touches the finding, because both act as a near-uniform multiplier across the frames being
+compared, and the finding is the **200-fold gap between second and third place** — a ratio that no
+plausible per-frame variation in either defect can manufacture. The Memory profile also rests on
+25k-154k samples rather than the CPU profile's few hundred. Do not quote the absolute sample counts
+anywhere; quote the ratio.
+
+Aggregating CAS frames by sample count, the Memory profile is not merely dominated by two frames —
+everything else is invisible next to them:
+
+| frame | Memory samples |
+|---|---:|
+| `CaContentWriteBuffer::CaContentWriteBuffer` | 85,991 |
+| `CaInlineWriteBuffer::CaInlineWriteBuffer` | 35,600 |
+| next entry (`PartWriteTxn::promote`) | 175 |
+
+A factor of 200 between second and third place. Reading the constructor explains it: each content
+write allocates its streaming buffer via `clampCasWriteBufferSize`, and then a **second per-stream
+spill buffer**, and creates a temp directory and a random temp path. Every blob write pays this.
+
+**What this does NOT establish.** These are allocation samples, not time. The Real profile's top is
+the upload wait — `ensureBlobPresent` and `fanOutBlobUploads` at ~116,000 samples each against 3,750
+CPU samples, a ratio near 31:1 — so the write path is overwhelmingly I/O-bound and buffer allocation
+is not visibly on the critical path. A pooling change could remove a great deal of allocation churn
+and move the wall clock by nothing at all.
+
+That caution is not hypothetical: on this same campaign two changes that plainly removed waste
+measured exactly zero, and one that plainly removed a copy measured a reproducible *regression*. The
+one that paid was the one whose mechanism predicted which formats would improve.
+
+**Measure before changing anything:** what fraction of a blob write's wall time is buffer
+construction, from a scoped profile of the write path rather than from the sample counts above. If it
+is under a percent, this entry should be closed as "concentrated but not costly" rather than acted
+on.
+
+**Retracted: there is no usable CPU profile from this soak, so nothing here ranks by CPU.**
+An earlier revision of this entry ranked `ObjectStorageBackend::nativeHead` in "the CPU top" and
+then explained the mechanism. Three defects, each fatal on its own, mean no CPU ranking from this
+run may be cited:
+
+1. **Filtered by construction.** The export ran `WHERE stack LIKE '%DB::Cas::%'`, so every frame not
+   named `DB::Cas::*` — hashing, compression, serialization, the whole of the generic engine — was
+   excluded before aggregation. Asking why checksums are absent from that file is asking why a file
+   does not contain what it was built to exclude.
+2. **No samples to speak of.** Over the hour the `CPU` trace type accrued **369 samples**, against
+   963,049 for `Real`. The CPU profiler fires on thread CPU time, and these threads spent almost
+   none: the workload is S3-bound. A few hundred samples cannot support a ranking.
+3. **Multiply counted.** The dump queried the cumulative `system.trace_log` every ten minutes and
+   the frame aggregate summed 38 such snapshots, so the same sample is counted once per snapshot it
+   survived into. The arithmetic shows it plainly: the retained stacks hold 1,460 samples while the
+   top frame claims 4,713.
+
+The `Real` profile does not share defects 2 and 3's severity — 963k samples — but is subject to
+defect 1, and remains the basis for the only claim worth keeping from this run: the write path waits
+far more than it computes.
+
+**What a real answer needs:** a CPU-bound workload (bulk insert of large parts, where content
+hashing actually has bytes to chew) profiled with an unfiltered query and a single end-of-run
+snapshot. Until that exists, this entry asserts nothing about where CAS spends CPU.
+
 ## `[ref-catalog-write-hotspot]` The pool-wide ref catalog is the only object that timed out under a full-suite workload {#ref-catalog-write-hotspot}
 
 **Found by the first full local run of the stateless suite on CAS storage (2026-08-30), 11,137 tests.**

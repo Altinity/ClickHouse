@@ -31,6 +31,13 @@ def _insert_one_big_part(node, name, *, rows, payload_bytes, op_id=0, timeout=24
     A single INSERT ... SELECT over numbers(rows) produces ONE pipeline block (numbers' block =
     max_block_size >= rows for our row counts), i.e. the WHOLE payload allocated at once —
     at --scale full (100 GiB) that is an instant MEMORY_LIMIT_EXCEEDED (observed live 2026-07-03).
+
+    That failure was the FIXTURE's, in the query pipeline generating the data, and it is why the
+    insert below is batched. Do not read it as a reason to avoid --scale full: a
+    MEMORY_LIMIT_EXCEEDED anywhere in the batched insert, the merge, or the upload IS this
+    scenario's failure, because streaming the blob is the whole property under test. At 100 GiB
+    against a machine with less RAM than that, materialization is not merely undesirable but
+    impossible, which makes full the only scale at which a pass proves anything qualitative.
     A huge part is only constructible the way production constructs one: bounded inserts (one
     ~1 GiB part each), then OPTIMIZE FINAL streams them into the single huge part/blob on disk.
     The merge phase IS the huge-blob upload under test (streamed via Backend::publishBlob)."""
