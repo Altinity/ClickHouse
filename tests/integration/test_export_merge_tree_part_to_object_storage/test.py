@@ -9,6 +9,12 @@ from helpers.cluster import ClickHouseCluster
 from helpers.network import PartitionManager
 
 
+EXTRA_SOURCE_COLUMN_MODES = [
+    pytest.param("POSITION", id="by-position"),
+    pytest.param("NAME", id="by-name"),
+]
+
+
 def skip_if_remote_database_disk_enabled(cluster):
     """Skip test if any instance in the cluster has remote database disk enabled.
 
@@ -373,38 +379,12 @@ REJECTED_PART_EXPORT_CASES = [
     pytest.param(
         RejectedPartExportCase(
             src_columns="a Int32, b Int32, c Int32, val String",
-            src_partition_by="(a, b, c)",
-            dst_columns="a Int32, b Int32, c Int32, val String",
-            dst_partition_by="(c, b, a)",
-            insert_values="(1, 2, 3, 'x')",
-            error_substrings=(
-                "Tables have different partition key",
-            ),
-        ),
-        id="multi_column_partition_key_order_mismatch",
-    ),
-    pytest.param(
-        RejectedPartExportCase(
-            src_columns="a Int32, b Int32, c Int32, val String",
-            src_partition_by="(a, b, c)",
-            dst_columns="a Int32, b Int32, c Int32, val String",
-            dst_partition_by="(a, b)",
-            insert_values="(1, 2, 3, 'x')",
-            error_substrings=(
-                "Tables have different partition key",
-            ),
-        ),
-        id="multi_column_partition_key_fewer_in_destination",
-    ),
-    pytest.param(
-        RejectedPartExportCase(
-            src_columns="a Int32, b Int32, c Int32, val String",
             src_partition_by="(a, b)",
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(a, b, c)",
             insert_values="(1, 2, 3, 'x')",
             error_substrings=(
-                "Tables have different partition key",
+                "column 'c', which is not part of the source MergeTree partition key",
             ),
         ),
         id="multi_column_partition_key_more_in_destination",
@@ -499,7 +479,15 @@ def test_export_part_partition_key_mismatch_variants_are_rejected(cluster, case)
         )
 
 
-def test_export_part_multi_column_partition_key_success(cluster):
+@pytest.mark.parametrize(
+    "dst_partition_by",
+    ["(a, b, c)", "(c, b, a)", "(a, b)"],
+    ids=["same", "reordered", "coarser"],
+)
+def test_export_part_multi_column_partition_key_success(cluster, dst_partition_by):
+    """The source key pins every column the destination partitions by, so the destination may
+    also name them in another order or leave some out: each destination expression is still
+    single-valued over a source partition."""
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
 
@@ -518,7 +506,7 @@ def test_export_part_multi_column_partition_key_success(cluster):
     node.query(f"""
         CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
         ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY (a, b, c)
+        PARTITION BY {dst_partition_by}
     """)
 
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x'), (1, 2, 3, 'y')")
@@ -621,38 +609,6 @@ def test_export_part_tuple_fields_reordered_for_partition_key_is_rejected(
     )
 
 
-def test_export_part_unnamed_tuple_partition_key_owner_matching_named_destination_is_allowed(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"unnamed_tuple_ok_mt_table_{postfix}"
-    s3_table = f"unnamed_tuple_ok_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(Int32, Int32), val String)
-        ENGINE = MergeTree()
-        PARTITION BY tupleElement(t, 1)
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(x Int32, y Int32), val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY tupleElement(t, 1)
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES ((1, 99), 'x')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-
-
 def test_export_part_subcolumn_partition_key_different_subcolumn_is_rejected(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
@@ -687,16 +643,15 @@ def test_export_part_subcolumn_partition_key_different_subcolumn_is_rejected(clu
     )
     assert (
         "BAD_ARGUMENTS" in error
-        and "Tables have different partition key"
+        and "column 'a.c', which is not part of the source MergeTree partition key"
         in error
     ), (
         f"Both tables declare `a` as the same Tuple(b Int32, c Int32) (so the column-cast "
         f"check passes and the owner-name-only `partition_key_owner_columns` contains "
         f"only `a`, so `verifyExportSchemaCastable` cannot distinguish `a.b` from "
-        f"`a.c`), but the source "
-        f"partitions by `a.b` and the destination by `a.c` — a genuinely different "
-        f"partition key that must be caught by the `PARTITION BY` AST comparison; "
-        f"got: {error!r}"
+        f"`a.c`), but the source partitions by `a.b` while the destination partitions by "
+        f"`a.c`, which the source key does not pin, so the compatibility gate has to "
+        f"reject it; got: {error!r}"
     )
 
 
@@ -1030,7 +985,53 @@ def test_export_part_column_count_mismatch_source_fewer_is_rejected(cluster):
     node.query(f"DROP TABLE {s3_table}")
 
 
-def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(cluster):
+@pytest.mark.parametrize(
+    "schema_match_mode,expected_error",
+    [
+        pytest.param("POSITION", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
+        pytest.param("NAME", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-name"),
+    ],
+)
+def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(
+    cluster, schema_match_mode, expected_error
+):
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"count_fewer_still_mt_table_{postfix}"
+    s3_table = f"count_fewer_still_s3_table_{postfix}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16) "
+        f"ENGINE = MergeTree() PARTITION BY year ORDER BY tuple() "
+        f"SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020)")
+
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16, extra String) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year"
+    )
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_schema_match_mode = '{schema_match_mode}', "
+        f"export_merge_tree_part_ignore_extra_source_columns = 1"
+    )
+    assert expected_error in error, (
+        f"Expected {expected_error} for source<dest column count with {schema_match_mode}, got: {error}"
+    )
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination table after rejected export, got {count}"
+
+    node.query(f"DROP TABLE {mt_table}")
+    node.query(f"DROP TABLE {s3_table}")
+
+
+@pytest.mark.parametrize("schema_match_mode", EXTRA_SOURCE_COLUMN_MODES)
+def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(cluster, schema_match_mode):
     node = cluster.instances["node1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
@@ -1050,7 +1051,8 @@ def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(clust
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
-        f"SETTINGS export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'"
+        f"SETTINGS export_merge_tree_part_schema_match_mode = '{schema_match_mode}', "
+        f"export_merge_tree_part_ignore_extra_source_columns = 1"
     )
     wait_for_export_part(node=node, table=mt_table, part="2020_1_1_0")
 
@@ -1059,6 +1061,77 @@ def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(clust
 
     result = node.query(f"SELECT id, year FROM {s3_table} ORDER BY id").strip()
     assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected data:\n{result}"
+
+    node.query(f"DROP TABLE {mt_table}")
+    node.query(f"DROP TABLE {s3_table}")
+
+
+def test_export_part_match_by_name_with_equal_column_count_reordered(cluster):
+    """Test that match_by_name matches columns by name even with an equal source/destination column count."""
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"match_by_name_mt_table_{postfix}"
+    s3_table = f"match_by_name_s3_table_{postfix}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16, payload String) "
+        f"ENGINE = MergeTree() PARTITION BY year ORDER BY tuple() "
+        f"SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, 'foo'), (2, 2020, 'bar')")
+
+    node.query(
+        f"CREATE TABLE {s3_table} (payload String, id UInt64, year UInt16) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year"
+    )
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_schema_match_mode = 'NAME'"
+    )
+    wait_for_export_part(node=node, table=mt_table, part="2020_1_1_0")
+
+    result = node.query(f"SELECT id, year, payload FROM {s3_table} ORDER BY id").strip()
+    assert result == "1\t2020\tfoo\n2\t2020\tbar", f"Unexpected data:\n{result}"
+
+    node.query(f"DROP TABLE {mt_table}")
+    node.query(f"DROP TABLE {s3_table}")
+
+
+def test_export_part_match_by_name_with_equal_column_count_rejects_unmatched_source_column(cluster):
+    """Test that match_by_name rejects an unmatched source column unless export_merge_tree_part_ignore_extra_source_columns is set."""
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"match_by_name_unmatched_mt_table_{postfix}"
+    s3_table = f"match_by_name_unmatched_s3_table_{postfix}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16, extra String) "
+        f"ENGINE = MergeTree() PARTITION BY year ORDER BY tuple() "
+        f"SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, 'foo'), (2, 2020, 'bar')")
+
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year"
+    )
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_schema_match_mode = 'NAME'"
+    )
+    assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in error, (
+        f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH for an unmatched source column with "
+        f"match_by_name and export_merge_tree_part_ignore_extra_source_columns = 0, got: {error}"
+    )
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination table after rejected export, got {count}"
 
     node.query(f"DROP TABLE {mt_table}")
     node.query(f"DROP TABLE {s3_table}")
