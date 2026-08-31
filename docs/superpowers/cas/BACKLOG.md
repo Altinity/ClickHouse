@@ -1039,7 +1039,7 @@ simultaneous store anomalies. Fix: reject an empty ETag token at the conditional
 (fail-closed `LOGICAL_ERROR`-class throw) so no future call site can turn a fence into a clobber,
 plus a Native-backend unit test. P2 — missing guard, not a demonstrated data-loss path.
 
-## `[s06-column-subset-verdict-measures-an-untouched-counter]` S06's column-subset check counts `CASBlobGet`, which the data read path never increments {#s06-column-subset-verdict-inert}
+## FIXED 2026-08-31 (S06 verified PASS 10/10; S21 fix landed, run not yet taken) `[s06-column-subset-verdict-measures-an-untouched-counter]` S06's column-subset check counts `CASBlobGet`, which the data read path never increments {#s06-column-subset-verdict-inert}
 
 **Found by rerunning S06 at `--scale full` (2026-08-31) after `dev` and `ci` both left it
 `INCONCLUSIVE`.** Scale is not the blocker, and no scale setting can be.
@@ -1251,3 +1251,31 @@ shell `date`, where `%M` genuinely means minutes.
 the verdict's `note` field all along. I first read `detail`/`evidence`, found them empty, and
 concluded the verdicts carried no reason. The `Verdict` record's fields are `name`, `expected`,
 `observed`, `note`. Read `note`.
+
+## `[s23-idle-baseline-measures-the-telemetry]` An idle CAS pool's background allocator is system-log flushing, not CAS {#s23-idle-baseline-measures-telemetry}
+
+**Measured 2026-08-31, using the `Memory` trace collection enabled the same day.** Fifteen idle
+minutes on an empty pool, all tables dropped, the trace aggregate scoped to the window itself.
+
+**RSS did not accumulate:** +19 MB drift inside an oscillation of roughly plus or minus 80 MB
+(1,033 to 1,193 MB). **No CAS frame appears in the background allocation top at all.** What does
+appear is an INSERT — `MergeTreeSink::consume` into `MergeTreeDataWriter::writeTempPart`, 1,705
+samples — and `system.part_log` names the destinations: about 1,055 inserts across eight system log
+tables in fifteen minutes, `metric_log` alone accounting for 43.98 MiB, `trace_log` for 88,215 rows.
+An idle server is busy writing telemetry about itself, and part of that is self-inflicted: the 10 ms
+query profiler in `configs/profiling.xml` plus the memory sampling produce the very `trace_log` rows
+whose flush then allocates.
+
+**This reframes S23's verdict rather than settling it.** A verdict named "memory flat over idle
+window" is, at this profiling configuration, mostly measuring the cost of observing the server —
+roughly 176 MB/hour of system-log data before any CAS work exists. Either the threshold accounts for
+that churn, or the scenario quiets the profiler for the duration of the idle measurement. Measuring
+CAS's idle cost through an amplified telemetry path measures the wrong thing.
+
+**What this probe does NOT establish, and the reason is that it is not S23's experiment.** It began
+at 1,102 MB, which is where S23 *ended* (1,178 MB), because a write workload had run before the
+tables were dropped. S23 began at 677 MB on a freshly booted server and climbed. So the two runs
+converge on the same plateau by different routes, and the plateau is stable — but that the climb from
+677 MB stops there is plausible, not shown. A fresh boot idled for 60-plus minutes, read as a curve,
+is what would show it. Until then nothing here may be recorded as a leak, and nothing may be recorded
+as warm-up either.
