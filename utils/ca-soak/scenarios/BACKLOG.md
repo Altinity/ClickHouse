@@ -3266,3 +3266,136 @@ than to an error.
 - **Run:** 20260830T094300_S41_seed20260830
 - **Observed:** scenario raised: cluster did not become healthy after reset
 
+## S43-20260830T183522-1: quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table
+
+- **Logged (UTC):** 2026-08-30T18:37:25
+- **Severity:** finding
+- **Run:** 20260830T183522_S43_seed20260830
+- **Observed:** quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table default.w3_recreated (3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b) is not replicated. (BAD_ARGUMENTS) (version 26.6.2.20000.altinityantalya) | sql=SYSTEM SYNC REPLICA w3_recreated
+
+## S07-20260831T010131-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-08-31T01:02:00
+- **Severity:** finding
+- **Run:** 20260831T010131_S07_seed20260831
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S15-20260831T011742-1: S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Excepti
+
+- **Logged (UTC):** 2026-08-31T01:19:53
+- **Severity:** finding
+- **Run:** 20260831T011742_S15_seed20260831
+- **Observed:** S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 01:August:17' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 01:August:17'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S15-20260831T011742-2: S15 variant gc_shards2 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exce
+
+- **Logged (UTC):** 2026-08-31T01:19:53
+- **Severity:** finding
+- **Run:** 20260831T011742_S15_seed20260831
+- **Observed:** S15 variant gc_shards2 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 01:August:53' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 01:August:53'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S15-20260831T011742-3: S15 variant gc_shards8 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exce
+
+- **Logged (UTC):** 2026-08-31T01:19:53
+- **Severity:** finding
+- **Run:** 20260831T011742_S15_seed20260831
+- **Observed:** S15 variant gc_shards8 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 01:August:22' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 01:August:22'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S39-20260831T013706-1: scenario raised: S39 requires at least 500s; requested 300s. The minimum covers 
+
+- **Logged (UTC):** 2026-08-31T01:37:22
+- **Severity:** suspected-bug
+- **Run:** 20260831T013706_S39_seed20260831
+- **Observed:** scenario raised: S39 requires at least 500s; requested 300s. The minimum covers two complete short pulses, the past-TTL long fault, bounded remount/post-clear write recovery, and final fsck/cleanup.
+
+## S40-20260831T013722-1: quiescence failed: Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table
+
+- **Logged (UTC):** 2026-08-31T01:41:28
+- **Severity:** finding
+- **Run:** 20260831T013722_S40_seed20260831
+- **Observed:** quiescence failed: Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table default.s40_dedup_outage does not exist. (UNKNOWN_TABLE) (version 26.6.2.20000.altinityantalya) | sql=SYSTEM SYNC REPLICA s40_dedup_outage
+
+## S43-20260831T014553-1: quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table
+
+- **Logged (UTC):** 2026-08-31T01:48:06
+- **Severity:** finding
+- **Run:** 20260831T014553_S43_seed20260831
+- **Observed:** quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table default.w3_recreated (3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b) is not replicated. (BAD_ARGUMENTS) (version 26.6.2.20000.altinityantalya) | sql=SYSTEM SYNC REPLICA w3_recreated
+
+## S07-20260831T055958-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-08-31T06:02:25
+- **Severity:** finding
+- **Run:** 20260831T055958_S07_seed20260831
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S15-20260831T060327-1: S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Excepti
+
+- **Logged (UTC):** 2026-08-31T06:06:11
+- **Severity:** finding
+- **Run:** 20260831T060327_S15_seed20260831
+- **Observed:** S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 06:August:59' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 06:August:59'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S15-20260831T060327-2: S15 variant gc_shards2 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exce
+
+- **Logged (UTC):** 2026-08-31T06:06:11
+- **Severity:** finding
+- **Run:** 20260831T060327_S15_seed20260831
+- **Observed:** S15 variant gc_shards2 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 06:August:53' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 06:August:53'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S15-20260831T060327-3: S15 variant gc_shards8 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exce
+
+- **Logged (UTC):** 2026-08-31T06:06:11
+- **Severity:** finding
+- **Run:** 20260831T060327_S15_seed20260831
+- **Observed:** S15 variant gc_shards8 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 06:August:32' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 06:August:32'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S07-20260831T071619-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-08-31T07:26:45
+- **Severity:** finding
+- **Run:** 20260831T071619_S07_seed20260831
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S10-20260831T072653-1: forced GC left 1 orphan object(s): {'unreachable:_manifests': 1}. If explicit GC
+
+- **Logged (UTC):** 2026-08-31T07:38:34
+- **Severity:** suspected-bug
+- **Run:** 20260831T072653_S10_seed20260831
+- **Observed:** forced GC left 1 orphan object(s): {'unreachable:_manifests': 1}. If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK.
+
+## S10-20260831T072653-2: forced GC left 1 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible
+
+- **Logged (UTC):** 2026-08-31T07:38:34
+- **Severity:** suspected-bug
+- **Run:** 20260831T072653_S10_seed20260831
+- **Observed:** forced GC left 1 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible GC leak; full residual by prefix: {'_manifests': 1}. bookkeeping-only residual (other=0) is expected and bounded.
+
+## S15-20260831T073843-1: S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Excepti
+
+- **Logged (UTC):** 2026-08-31T07:46:46
+- **Severity:** finding
+- **Run:** 20260831T073843_S15_seed20260831
+- **Observed:** S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 07:August:34' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 07:August:34'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S15-20260831T073843-2: S15 variant gc_shards2 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exce
+
+- **Logged (UTC):** 2026-08-31T07:46:46
+- **Severity:** finding
+- **Run:** 20260831T073843_S15_seed20260831
+- **Observed:** S15 variant gc_shards2 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 07:August:06' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 07:August:06'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S15-20260831T073843-3: S15 variant gc_shards8 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exce
+
+- **Logged (UTC):** 2026-08-31T07:46:46
+- **Severity:** finding
+- **Run:** 20260831T073843_S15_seed20260831
+- **Observed:** S15 variant gc_shards8 raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 07:August:29' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 07:August:29'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) | sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars)
+
+## S21-20260831T131942-1: scenario raised: Node(localhost:8123) HTTP 408: Code: 159. DB::Exception: SYNC R
+
+- **Logged (UTC):** 2026-08-31T13:25:57
+- **Severity:** suspected-bug
+- **Run:** 20260831T131942_S21_seed20260831
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 408: Code: 159. DB::Exception: SYNC REPLICA default.s21_wide (8266336c-22d7-4d97-b32e-596929445d6b): command timed out. See the 'receive_timeout' setting. (TIMEOUT_EXCEEDED) (version 26.6.2.20000.altinityantalya) | sql=SYSTEM SYNC REPLICA s21_wide
+

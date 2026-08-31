@@ -528,3 +528,77 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-08-30T09:53:30 | S45 | 4 | dev | 900s | fail | 817ca63299c6 | 20260830T095217_S45_seed4 |  |
 | 2026-08-30T09:56:47 | S45 | 4 | dev | 900s | pass | 817ca63299c6 | 20260830T095537_S45_seed4 |  |
 | 2026-08-30T09:57:36 | S41 | 20260830 | dev | 900s | pass | 817ca63299c6 | 20260830T095648_S41_seed20260830 |  |
+| 2026-08-30T18:35:22 | S38 | 20260830 | dev | 900s | pass | 3c948a46d1c4 | 20260830T183409_S38_seed20260830 |  |
+| 2026-08-30T18:37:25 | S43 | 20260830 | dev | 900s | pass | 3c948a46d1c4 | 20260830T183522_S43_seed20260830 | quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table default.w3_recreated (3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b) is not replicated. (BAD_ARGUMENTS) (version 26.6.2.20000.altinityantalya) / sql=SYSTEM SYNC REPLICA w3_recreated |
+| 2026-08-30T18:37:59 | S44 | 1 | dev | 300s | pass | 3c948a46d1c4 | 20260830T183725_S44_seed1 |  |
+| 2026-08-30T18:53:25 | S39 | 20260830 | dev | 900s | pass | 3c948a46d1c4 | 20260830T183759_S39_seed20260830 |  |
+| 2026-08-30T18:54:42 | S16 | 20260830 | dev | 900s | pass | 3c948a46d1c4 | 20260830T185326_S16_seed20260830 |  |
+| 2026-08-30T18:55:55 | S45 | 4 | dev | 900s | pass | 3c948a46d1c4 | 20260830T185442_S45_seed4 |  |
+| 2026-08-30T18:56:27 | S44 | 1 | dev | 300s | pass | 3c948a46d1c4 | 20260830T185555_S44_seed1 |  |
+| 2026-08-30T18:58:17 | S41 | 20260830 | dev | 900s | pass | 3c948a46d1c4 | 20260830T185730_S41_seed20260830 |  |
+| 2026-08-31T00:57:35 | S01 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T005703_S01_seed20260831 |  |
+| 2026-08-31T00:58:00 | S02 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T005735_S02_seed20260831 |  |
+| 2026-08-31T00:58:51 | S03 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T005800_S03_seed20260831 |  |
+| 2026-08-31T00:59:31 | S04 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T005851_S04_seed20260831 |  |
+| 2026-08-31T01:00:57 | S05 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T005931_S05_seed20260831 |  |
+| 2026-08-31T01:01:30 | S06 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T010057_S06_seed20260831 |  |
+| 2026-08-31T01:02:00 | S07 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T010131_S07_seed20260831 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-08-31T01:08:49 | S08 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T010201_S08_seed20260831 |  |
+| 2026-08-31T01:09:20 | S09 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T010851_S09_seed20260831 |  |
+| 2026-08-31T01:09:53 | S10 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T010920_S10_seed20260831 |  |
+| 2026-08-31T01:10:58 | S11 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T010954_S11_seed20260831 |  |
+| 2026-08-31T01:12:16 | S12 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T011059_S12_seed20260831 |  |
+| 2026-08-31T01:16:18 | S13 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T011216_S13_seed20260831 |  |
+| 2026-08-31T01:17:41 | S14 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T011619_S14_seed20260831 |  |
+| 2026-08-31T01:19:53 | S15 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T011742_S15_seed20260831 | S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 01:August:17' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 01:August:17'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) / sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars) |
+| 2026-08-31T01:20:57 | S16 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T011953_S16_seed20260831 |  |
+| 2026-08-31T01:21:24 | S17 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012057_S17_seed20260831 |  |
+| 2026-08-31T01:22:19 | S18 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012124_S18_seed20260831 |  |
+| 2026-08-31T01:22:47 | S19 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012219_S19_seed20260831 |  |
+| 2026-08-31T01:23:17 | S20 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T012247_S20_seed20260831 |  |
+| 2026-08-31T01:23:49 | S21 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T012317_S21_seed20260831 |  |
+| 2026-08-31T01:24:54 | S22 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012349_S22_seed20260831 |  |
+| 2026-08-31T01:25:49 | S23 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T012454_S23_seed20260831 |  |
+| 2026-08-31T01:26:20 | S25 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012549_S25_seed20260831 |  |
+| 2026-08-31T01:26:54 | S26 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012620_S26_seed20260831 |  |
+| 2026-08-31T01:28:07 | S27 | 20260831 | dev | 300s | fail | b8c7c72cabac | 20260831T012654_S27_seed20260831 |  |
+| 2026-08-31T01:28:46 | S28 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012807_S28_seed20260831 |  |
+| 2026-08-31T01:29:11 | S29 | 20260831 | dev | 300s | inconclusive | b8c7c72cabac | 20260831T012846_S29_seed20260831 |  |
+| 2026-08-31T01:29:56 | S30 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012911_S30_seed20260831 |  |
+| 2026-08-31T01:30:28 | S31 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T012956_S31_seed20260831 |  |
+| 2026-08-31T01:30:54 | S32 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T013028_S32_seed20260831 |  |
+| 2026-08-31T01:31:24 | S33 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T013054_S33_seed20260831 |  |
+| 2026-08-31T01:32:06 | S34 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T013124_S34_seed20260831 |  |
+| 2026-08-31T01:32:47 | S35 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T013207_S35_seed20260831 |  |
+| 2026-08-31T01:34:21 | S36 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T013248_S36_seed20260831 |  |
+| 2026-08-31T01:35:49 | S37 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T013421_S37_seed20260831 |  |
+| 2026-08-31T01:37:06 | S38 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T013549_S38_seed20260831 |  |
+| 2026-08-31T01:37:22 | S39 | 20260831 | dev | 300s | fail | b8c7c72cabac | 20260831T013706_S39_seed20260831 | S39 requires at least 500s; requested 300s. The minimum covers two complete short pulses, the past-TTL long fault, bounded remount/post-clear write recovery, and final fsck/cleanup. |
+| 2026-08-31T01:41:28 | S40 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T013722_S40_seed20260831 | quiescence failed: Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table default.s40_dedup_outage does not exist. (UNKNOWN_TABLE) (version 26.6.2.20000.altinityantalya) / sql=SYSTEM SYNC REPLICA s40_dedup_outage |
+| 2026-08-31T01:45:49 | S42 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T014134_S42_seed20260831 |  |
+| 2026-08-31T01:48:06 | S43 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T014553_S43_seed20260831 | quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table default.w3_recreated (3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b) is not replicated. (BAD_ARGUMENTS) (version 26.6.2.20000.altinityantalya) / sql=SYSTEM SYNC REPLICA w3_recreated |
+| 2026-08-31T01:48:40 | S44 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T014806_S44_seed20260831 |  |
+| 2026-08-31T01:49:53 | S45 | 20260831 | dev | 300s | pass | b8c7c72cabac | 20260831T014841_S45_seed20260831 |  |
+| 2026-08-31T02:07:43 | S39 | 20260831 | dev | 900s | pass | b8c7c72cabac | 20260831T015226_S39_seed20260831 |  |
+| 2026-08-31T02:08:32 | S41 | 20260830 | dev | 900s | pass | b8c7c72cabac | 20260831T020747_S41_seed20260830 |  |
+| 2026-08-31T05:57:11 | S01 | 20260831 | ci | 900s | pass | b8c7c72cabac | 20260831T055625_S01_seed20260831 |  |
+| 2026-08-31T05:58:20 | S04 | 20260831 | ci | 900s | pass | b8c7c72cabac | 20260831T055711_S04_seed20260831 |  |
+| 2026-08-31T05:59:56 | S06 | 20260831 | ci | 900s | inconclusive | b8c7c72cabac | 20260831T055820_S06_seed20260831 |  |
+| 2026-08-31T06:02:25 | S07 | 20260831 | ci | 900s | inconclusive | b8c7c72cabac | 20260831T055958_S07_seed20260831 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-08-31T06:03:26 | S10 | 20260831 | ci | 900s | inconclusive | b8c7c72cabac | 20260831T060236_S10_seed20260831 |  |
+| 2026-08-31T06:06:11 | S15 | 20260831 | ci | 900s | inconclusive | b8c7c72cabac | 20260831T060327_S15_seed20260831 | S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 06:August:59' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 06:August:59'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) / sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars) |
+| 2026-08-31T06:06:42 | S20 | 20260831 | ci | 900s | inconclusive | b8c7c72cabac | 20260831T060611_S20_seed20260831 |  |
+| 2026-08-31T07:10:34 | S23 | 20260831 | ci | 900s | inconclusive | a43907805789 | 20260831T070642_S23_seed20260831 |  |
+| 2026-08-31T07:11:04 | S29 | 20260831 | ci | 900s | inconclusive | a43907805789 | 20260831T071034_S29_seed20260831 |  |
+| 2026-08-31T07:16:15 | S06 | 20260831 | full | 3600s | inconclusive | a43907805789 | 20260831T071152_S06_seed20260831 |  |
+| 2026-08-31T07:26:45 | S07 | 20260831 | full | 3600s | inconclusive | a43907805789 | 20260831T071619_S07_seed20260831 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-08-31T07:38:34 | S10 | 20260831 | full | 3600s | fail | 7278a1e183fe | 20260831T072653_S10_seed20260831 | forced GC left 1 orphan object(s): {'unreachable:_manifests': 1}. If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK. |
+| 2026-08-31T07:46:46 | S15 | 20260831 | full | 3600s | inconclusive | 7278a1e183fe | 20260831T073843_S15_seed20260831 | S15 variant default raised: Node(localhost:8123) HTTP 400: Code: 41. DB::Exception: Cannot read DateTime: unexpected number of decimal digits after hour: 0: while converting '2026-08-31 07:August:34' to DateTime: while executing function greaterOrEquals on arguments __table1.event_time DateTime UInt32(size = 0), '2026-08-31 07:August:34'_String String Const(size = 0, String(size = 1)). (CANNOT_PARSE_DATETIME) (version 26.6.2.20000.altinityantalya) / sql=SELECT event_time, gc_id, trigger, round, outcome, candidates_marked, objects_deleted, objects_absent, objects_replaced, objects_spared, manifests_deleted, entries_condemned, entries_graduated, entrie...(187 more chars) |
+| 2026-08-31T07:47:27 | S20 | 20260831 | full | 3600s | inconclusive | 7278a1e183fe | 20260831T074647_S20_seed20260831 |  |
+| 2026-08-31T08:02:52 | S23 | 20260831 | full | 3600s | fail | 7278a1e183fe | 20260831T074727_S23_seed20260831 |  |
+| 2026-08-31T08:04:19 | S29 | 20260831 | full | 3600s | inconclusive | 7278a1e183fe | 20260831T080253_S29_seed20260831 |  |
+| 2026-08-31T11:32:38 | S06 | 20260831 | ci | 600s | pass | 32e39e521879 | 20260831T113045_S06_seed20260831 |  |
+| 2026-08-31T12:25:30 | S15 | 20260831 | ci | 900s | pass | b34ad0c95972 | 20260831T122233_S15_seed20260831 |  |
+| 2026-08-31T13:25:57 | S21 | 20260831 | full | 2400s | fail | 3257a1407ebb | 20260831T131942_S21_seed20260831 | Node(localhost:8123) HTTP 408: Code: 159. DB::Exception: SYNC REPLICA default.s21_wide (8266336c-22d7-4d97-b32e-596929445d6b): command timed out. See the 'receive_timeout' setting. (TIMEOUT_EXCEEDED) (version 26.6.2.20000.altinityantalya) / sql=SYSTEM SYNC REPLICA s21_wide |
+| 2026-08-31T14:20:23 | S21 | 20260831 | full | 2400s | pass | 3257a1407ebb | 20260831T141151_S21_seed20260831 |  |
+| 2026-08-31T15:10:36 | S20 | 20260831 | full | 900s | inconclusive | 385e230faeff | 20260831T150942_S20_seed20260831 |  |
