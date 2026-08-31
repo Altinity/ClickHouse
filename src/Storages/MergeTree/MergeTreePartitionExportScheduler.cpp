@@ -94,25 +94,34 @@ CancellationCode MergeTreePartitionExportScheduler::kill(const String & transact
     {
         std::lock_guard lock(mutex);
 
-        const auto it = tasks.find(transaction_id);
+        /// `tasks` is keyed by (partition, destination); KILL arrives with a transaction_id.
+        TaskEntry * entry = nullptr;
+        const String * composite_key = nullptr;
+        for (auto & [key, candidate] : tasks)
+            if (candidate.descriptor.transaction_id == transaction_id)
+            {
+                composite_key = &key;
+                entry = &candidate;
+                break;
+            }
 
-        if (it == tasks.end())
+        if (!entry)
             return CancellationCode::NotFound;
 
-        if (it->second.descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+        if (entry->descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
             return CancellationCode::CancelCannotBeSent;
 
-        if (it->second.committing)
+        if (entry->committing)
         {
             LOG_INFO(storage.log, "ExportPartition: commit in progress for {}, cannot cancel export partition task", transaction_id);
             return CancellationCode::CancelCannotBeSent;
         }
 
-        auto updated = it->second.descriptor;
+        auto updated = entry->descriptor;
 
         updated.status = MergeTreePartitionExportTask::Status::KILLED;
-        persist(it->first, updated.toJsonString());
-        it->second.descriptor = std::move(updated);
+        persist(*composite_key, updated.toJsonString());
+        entry->descriptor = std::move(updated);
     }
 
     /// cancel in-flight operations

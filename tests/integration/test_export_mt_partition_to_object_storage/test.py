@@ -198,9 +198,13 @@ def test_kill_export(cluster):
         node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
         wait_for_export_to_start(node, mt_table, s3_table, "2020", system_table=SYSTEM_TABLE)
 
-        node.query(
+        kill_result = node.query(
             f"KILL EXPORT PARTITION WHERE partition_id = '2020'"
             f" AND source_table = '{mt_table}' AND destination_table = '{s3_table}'"
+        )
+        kill_status = kill_result.split("\t")[0].strip()
+        assert kill_status == "waiting", (
+            f"Expected kill_status 'waiting' (CancelSent), got: {kill_result!r}"
         )
 
     wait_for_export_status(node, mt_table, s3_table, "2020", "KILLED", system_table=SYSTEM_TABLE, timeout=30)
