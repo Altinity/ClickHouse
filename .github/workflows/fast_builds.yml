@@ -3,6 +3,7 @@
 name: Fast Builds
 concurrency:
   group: ${{ github.workflow }}
+  cancel-in-progress: true
 on:
   workflow_dispatch:
   workflow_call:

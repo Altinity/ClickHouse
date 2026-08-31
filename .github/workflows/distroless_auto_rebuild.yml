@@ -22,6 +22,7 @@ name: DistrolessAutoRebuild
 
 concurrency:
   group: distroless-auto-rebuild
+  cancel-in-progress: true
 
 permissions:
   actions: write

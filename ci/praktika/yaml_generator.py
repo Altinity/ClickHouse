@@ -104,6 +104,7 @@ jobs:
 name: {NAME}
 concurrency:
   group: ${{{{{{{{ github.workflow }}}}}}}}
+  cancel-in-progress: true
 on:
   workflow_dispatch:{DISPATCH_INPUTS_BLOCK}{WORKFLOW_CALL}{TAG_PUSH_TRIGGER}
 
