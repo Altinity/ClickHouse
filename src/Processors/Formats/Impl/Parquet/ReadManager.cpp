@@ -127,12 +127,13 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
     pool_fraction[size_t(MemoryPool::Decoded)] = 1.0 - 0.05 - compressed_fraction;
 
     /// Plan the index reads (bloom filter headers, column indexes, offset indexes, dictionary pages)
-    /// of *every* row group up front, in delivery order. These are the reads that serialize row
-    /// groups if they're issued stage by stage, one row group at a time: each is only a few KB, but
-    /// each costs a round trip. `pumpIssueQueue` below issues as many of them as the bytes-in-flight
-    /// target allows, and the rest follow as earlier reads land.
-    for (size_t i = 0; i < reader.row_groups.size(); ++i)
-        enqueueRowGroupIndexReads(i);
+    /// in delivery order. These are the reads that serialize row groups if they're issued stage by
+    /// stage, one row group at a time: each is only a few KB, but each costs a round trip. Only a
+    /// horizon's worth is planned here and more follows as row groups complete -- planning the whole
+    /// file up front fetches indexes for row groups the column index later prunes, and makes every
+    /// queue operation proportional to the file's row-group count (2274 planned groups on one bench
+    /// query whose whole execution created 4649 reads).
+    planAheadIndexReads();
 
     /// The NotStarted stage completed for all row groups, transition to next stage.
     MemoryUsageDiff diff(ReadStage::NotStarted);
@@ -290,6 +291,9 @@ void ReadManager::finishRowGroupStage(size_t row_group_idx, ReadStage stage, Mem
             if (first_incomplete_row_group.compare_exchange_weak(i, i + 1))
             {
                 diff.scheduleAllStages();
+
+                /// The horizon moved with the cursor: plan the row groups that just came into it.
+                planAheadIndexReads();
 
                 /// Notify read() if everything is done or if it's relying on
                 /// first_incomplete_row_group to deliver chunks in order.
@@ -690,10 +694,66 @@ void ReadManager::enqueueRowGroupIndexReads(size_t row_group_idx)
 
     if (planned.empty())
         return;
+
+    /// Feeds `indexReadHorizon`: how far ahead to plan depends on how much a row group's index reads
+    /// weigh against the bytes-in-flight target.
+    size_t planned_bytes = 0;
+    for (const PlannedRead & p : planned)
+        planned_bytes += p.bytes;
+    const size_t prev_avg = avg_index_bytes_per_row_group.load(std::memory_order_relaxed);
+    avg_index_bytes_per_row_group.store(prev_avg == 0 ? planned_bytes : (prev_avg * 3 + planned_bytes) / 4,
+                                        std::memory_order_relaxed);
+
     std::lock_guard lock(issue_mutex);
     for (PlannedRead & p : planned)
         issue_queue.push_back(std::move(p));
     issue_queue_size.store(issue_queue.size(), std::memory_order_relaxed);
+}
+
+size_t ReadManager::indexReadHorizon() const
+{
+    const size_t num_row_groups = reader.row_groups.size();
+    /// No target means no read-ahead (a local source, see `bytesInFlightTarget`): plan only the row
+    /// group that is being delivered, so the queue holds what the demand path is about to take anyway.
+    const size_t target = bytesInFlightTarget();
+    if (target == 0)
+        return 1;
+    const size_t avg = avg_index_bytes_per_row_group.load(std::memory_order_relaxed);
+    /// Before the first row group is planned there is nothing to divide by. A small window is enough
+    /// to get started; it grows on the next call, once `avg` exists.
+    if (avg == 0)
+        return std::min<size_t>(num_row_groups, 8);
+    return std::clamp<size_t>(target / avg, 1, num_row_groups);
+}
+
+void ReadManager::planAheadIndexReads()
+{
+    /// `input_format_parquet_min_bytes_in_flight = 0` turns read-ahead planning off entirely; the
+    /// enqueue below would return immediately, but there is no reason to walk the row groups for it.
+    if (reader.options.format.parquet.min_bytes_in_flight == 0)
+        return;
+
+    const size_t num_row_groups = reader.row_groups.size();
+    if (planned_through_row_group.load(std::memory_order_relaxed) >= num_row_groups)
+        return;
+
+    const size_t plan_until = std::min(
+        num_row_groups,
+        first_incomplete_row_group.load(std::memory_order_relaxed) + indexReadHorizon());
+
+    for (;;)
+    {
+        size_t idx = planned_through_row_group.load(std::memory_order_relaxed);
+        if (idx >= plan_until)
+            break;
+        /// Claim this row group before planning it, so two threads arriving here together plan
+        /// different ones and none is planned twice.
+        if (!planned_through_row_group.compare_exchange_weak(idx, idx + 1, std::memory_order_relaxed))
+            continue;
+        /// Row groups excluded before reading (bucket pruning) never need their indexes.
+        if (reader.row_groups[idx].need_to_process)
+            enqueueRowGroupIndexReads(idx);
+    }
 }
 
 void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx)
@@ -940,6 +1000,11 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
         issue_queue_size.store(issue_queue.size(), std::memory_order_relaxed);
         ProfileEvents::increment(ProfileEvents::ParquetPlannedReads);
     }
+
+    /// A drained queue with budget to spare means the horizon has been consumed: plan further ahead
+    /// rather than waiting for the next row group to complete.
+    if (issue_queue_size.load(std::memory_order_relaxed) == 0 && !blocked)
+        planAheadIndexReads();
 
     /// One event per pump that ran into a full budget (not one per entry it looked at), so the count
     /// reads as "times read-ahead had to wait", not as a function of how deep the queue happens to be.

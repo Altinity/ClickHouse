@@ -149,6 +149,20 @@ private:
     /// `issue_queue`, so it is exact for readers that hold the lock and at most one mutation stale for
     /// those that do not, which is all the early-out needs.
     std::atomic<size_t> issue_queue_size {0};
+
+    /// Index reads are planned lazily, a horizon ahead of the row group being delivered, rather than
+    /// for the whole file up front: see `planAheadIndexReads`. This is the first row group not yet
+    /// planned; a thread claims a row group by advancing it, so two threads never plan the same one.
+    std::atomic<size_t> planned_through_row_group {0};
+    /// Mean bytes of index reads planned per row group, from the row groups planned so far. Sizes the
+    /// horizon: 0 until the first row group has been planned.
+    std::atomic<size_t> avg_index_bytes_per_row_group {0};
+
+    /// Plan the index reads of row groups from `planned_through_row_group` up to a horizon ahead of the
+    /// row group being delivered. Cheap and idempotent; safe to call from any thread.
+    void planAheadIndexReads();
+    /// How many row groups ahead to plan: enough index reads to fill the bytes-in-flight target.
+    size_t indexReadHorizon() const;
     /// Row groups whose data-page reads for the first step have been planned (`enqueueRowGroupPageReads`
     /// covers all subgroups at once, so it must happen only once per row group).
     AtomicBitSet page_reads_planned;
