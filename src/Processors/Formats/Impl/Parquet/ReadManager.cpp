@@ -665,6 +665,7 @@ void ReadManager::enqueueRowGroupIndexReads(size_t row_group_idx)
     std::lock_guard lock(issue_mutex);
     for (PlannedRead & p : planned)
         issue_queue.push_back(std::move(p));
+    issue_queue_size.store(issue_queue.size(), std::memory_order_relaxed);
 }
 
 void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx)
@@ -736,6 +737,7 @@ void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx
     std::lock_guard lock(issue_mutex);
     for (PlannedRead & p : planned)
         issue_queue.push_back(std::move(p));
+    issue_queue_size.store(issue_queue.size(), std::memory_order_relaxed);
 }
 
 void ReadManager::takeQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx, MemoryUsageDiff & diff)
@@ -754,6 +756,7 @@ void ReadManager::takeQueuedReads(ReadStage stage, size_t row_group_idx, size_t 
             reader.prefetcher.startPrefetch(it->handles, &diff);
             diff.cur_stage = saved_stage;
             it = issue_queue.erase(it);
+            issue_queue_size.store(issue_queue.size(), std::memory_order_relaxed);
         }
         else
             ++it;
@@ -764,6 +767,7 @@ void ReadManager::dropQueuedReads(size_t row_group_idx)
 {
     std::lock_guard lock(issue_mutex);
     std::erase_if(issue_queue, [&](const PlannedRead & p) { return p.row_group_idx == row_group_idx; });
+    issue_queue_size.store(issue_queue.size(), std::memory_order_relaxed);
 }
 
 bool ReadManager::hasQueuedReads(ReadStage stage, size_t row_group_idx, size_t row_subgroup_idx, size_t step_idx)
@@ -822,14 +826,17 @@ bool ReadManager::isPrivilegedRead(const PlannedRead & planned) const
 
 void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
 {
-    {
-        /// Cheap early-out: this runs on every `flushMemoryUsageDiff`. Also the whole of the
-        /// disabled case (`input_format_parquet_min_bytes_in_flight = 0`), where nothing is planned.
-        std::lock_guard lock(issue_mutex);
-        if (issue_queue.empty())
-            return;
-    }
+    /// Lock-free early-out first: this runs on every `flushMemoryUsageDiff`, so on a query that
+    /// decodes a hundred thousand batches it is one of the hottest paths in the reader, and taking
+    /// `issue_mutex` there puts every decoding thread in line behind every other. An atomic counter
+    /// of what is queued answers the common cases -- nothing planned at all (the disabled case), or
+    /// nothing left to issue -- without the lock.
+    if (issue_queue_size.load(std::memory_order_relaxed) == 0)
+        return;
 
+    /// Deliberately no budget-based early-out here: privileged reads bypass the budget, and skipping
+    /// the pump when the budget is spent would leave them to the demand path, which issues them later.
+    /// That trade needs measuring on a workload where read-ahead matters before it is worth making.
     const size_t target = bytesInFlightTarget();
     bool blocked = false;
 
@@ -897,6 +904,7 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
         reader.prefetcher.startPrefetch(it->handles, &diff);
         diff.cur_stage = saved_stage;
         issue_queue.erase(it);
+        issue_queue_size.store(issue_queue.size(), std::memory_order_relaxed);
         ProfileEvents::increment(ProfileEvents::ParquetPlannedReads);
     }
 

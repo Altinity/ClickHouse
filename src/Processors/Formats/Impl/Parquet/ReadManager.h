@@ -143,6 +143,12 @@ private:
     /// group's handles through the queue any more.
     std::mutex issue_mutex;
     std::deque<PlannedRead> issue_queue;
+    /// `issue_queue.size()`, readable without the mutex. `pumpIssueQueue` runs on every memory-usage
+    /// flush -- once per decoded batch -- so its "nothing to issue" case must not take a lock that
+    /// every decoding thread then queues behind. Written under `issue_mutex` beside every mutation of
+    /// `issue_queue`, so it is exact for readers that hold the lock and at most one mutation stale for
+    /// those that do not, which is all the early-out needs.
+    std::atomic<size_t> issue_queue_size {0};
     /// Row groups whose data-page reads for the first step have been planned (`enqueueRowGroupPageReads`
     /// covers all subgroups at once, so it must happen only once per row group).
     AtomicBitSet page_reads_planned;
