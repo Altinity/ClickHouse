@@ -69,8 +69,8 @@ private:
 
     struct TaskEntry
     {
-        MergeTreePartitionExportTask descriptor;
         /// Pins the source parts so they are not physically removed before the export finishes.
+        /// Cleared by `setDescriptor` when the installed snapshot is terminal.
         std::vector<DataPartPtr> part_references;
         /// Parts currently scheduled on the background move executor (avoids double scheduling).
         std::unordered_set<String> in_flight_parts;
@@ -86,6 +86,20 @@ private:
             time_t next_retry_time = 0;
         };
         std::unordered_map<String, PartBackoff> part_backoff;
+
+        const MergeTreePartitionExportTask & getDescriptor() const { return descriptor; }
+
+        /// Install a (typically just-persisted) snapshot. A terminal status drops the source-part
+        /// pins so outdated parts can be physically removed without a restart.
+        void setDescriptor(MergeTreePartitionExportTask new_descriptor)
+        {
+            descriptor = std::move(new_descriptor);
+            if (descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+                part_references.clear();
+        }
+
+    private:
+        MergeTreePartitionExportTask descriptor;
     };
 
     mutable std::mutex mutex;

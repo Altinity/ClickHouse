@@ -70,13 +70,13 @@ void MergeTreePartitionExportScheduler::addTask(
                     "Set `export_merge_tree_partition_force_export` to overwrite it.",
                     composite_key);
 
-            previous_transaction_id = it->second.descriptor.transaction_id;
+            previous_transaction_id = it->second.getDescriptor().transaction_id;
         }
 
         TaskEntry entry;
-        entry.descriptor = std::move(descriptor);
         entry.part_references = std::move(part_references);
-        persist(composite_key, entry.descriptor.toJsonString());
+        entry.setDescriptor(std::move(descriptor));
+        persist(composite_key, entry.getDescriptor().toJsonString());
         tasks.insert_or_assign(composite_key, std::move(entry));
     }
 
@@ -100,7 +100,7 @@ CancellationCode MergeTreePartitionExportScheduler::kill(const String & transact
         TaskEntry * entry = nullptr;
         const String * composite_key = nullptr;
         for (auto & [key, candidate] : tasks)
-            if (candidate.descriptor.transaction_id == transaction_id)
+            if (candidate.getDescriptor().transaction_id == transaction_id)
             {
                 composite_key = &key;
                 entry = &candidate;
@@ -110,7 +110,7 @@ CancellationCode MergeTreePartitionExportScheduler::kill(const String & transact
         if (!entry)
             return CancellationCode::NotFound;
 
-        if (entry->descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+        if (entry->getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
             return CancellationCode::CancelCannotBeSent;
 
         if (entry->committing)
@@ -119,11 +119,11 @@ CancellationCode MergeTreePartitionExportScheduler::kill(const String & transact
             return CancellationCode::CancelCannotBeSent;
         }
 
-        auto updated = entry->descriptor;
+        auto updated = entry->getDescriptor();
 
         updated.status = MergeTreePartitionExportTask::Status::KILLED;
         persist(*composite_key, updated.toJsonString());
-        entry->descriptor = std::move(updated);
+        entry->setDescriptor(std::move(updated));
     }
 
     /// cancel in-flight operations
@@ -139,7 +139,7 @@ std::vector<PartitionExportInfo> MergeTreePartitionExportScheduler::getInfo() co
     result.reserve(tasks.size());
     for (const auto & [key, entry] : tasks)
     {
-        const auto & descriptor = entry.descriptor;
+        const auto & descriptor = entry.getDescriptor();
         PartitionExportInfo info;
         info.source_database = descriptor.source_database;
         info.source_table = descriptor.source_table;
@@ -173,14 +173,14 @@ namespace
 
 bool MergeTreePartitionExportScheduler::tryPersistTimeoutKill(const String & composite_key, TaskEntry & entry, time_t now)
 {
-    const auto transaction_id = entry.descriptor.transaction_id;
-    const auto timeout_seconds = entry.descriptor.task_timeout_seconds;
+    const auto transaction_id = entry.getDescriptor().transaction_id;
+    const auto timeout_seconds = entry.getDescriptor().task_timeout_seconds;
 
-    auto updated = entry.descriptor;
+    auto updated = entry.getDescriptor();
     updated.status = MergeTreePartitionExportTask::Status::KILLED;
     updated.last_exception.message = fmt::format(
         "Export partition task timed out: exceeded export_merge_tree_partition_task_timeout_seconds={} (created at {}, now {})",
-        timeout_seconds, entry.descriptor.create_time, now);
+        timeout_seconds, entry.getDescriptor().create_time, now);
     updated.last_exception.part = "";
     updated.last_exception.time = now;
     updated.last_exception.count += 1;
@@ -195,7 +195,7 @@ bool MergeTreePartitionExportScheduler::tryPersistTimeoutKill(const String & com
         return false;
     }
 
-    entry.descriptor = std::move(updated);
+    entry.setDescriptor(std::move(updated));
     LOG_WARNING(storage.log,
         "ExportPartition: task {} exceeded task_timeout_seconds={}s, transitioned PENDING -> KILLED",
         transaction_id, timeout_seconds);
@@ -212,10 +212,10 @@ bool MergeTreePartitionExportScheduler::enforceTimeouts()
         const auto now = time(nullptr);
         for (auto & [key, entry] : tasks)
         {
-            if (entry.descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+            if (entry.getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
                 continue;
 
-            if (!isTimedOut(entry.descriptor, now))
+            if (!isTimedOut(entry.getDescriptor(), now))
             {
                 any_pending = true;
                 continue;
@@ -229,7 +229,7 @@ bool MergeTreePartitionExportScheduler::enforceTimeouts()
                 continue;
             }
 
-            timed_out_transactions.push_back(entry.descriptor.transaction_id);
+            timed_out_transactions.push_back(entry.getDescriptor().transaction_id);
         }
     }
 
@@ -268,7 +268,7 @@ bool MergeTreePartitionExportScheduler::run()
         size_t scheduled = 0;
         for (auto & [key, entry] : tasks)
         {
-            auto & descriptor = entry.descriptor;
+            const auto & descriptor = entry.getDescriptor();
             if (descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
                 continue;
 
@@ -322,14 +322,14 @@ void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transacti
         std::lock_guard lock(mutex);
         TaskEntry * entry = nullptr;
         for (auto & [key, candidate] : tasks)
-            if (candidate.descriptor.transaction_id == transaction_id)
+            if (candidate.getDescriptor().transaction_id == transaction_id)
             {
                 entry = &candidate;
                 break;
             }
         if (!entry)
             return;
-        descriptor_copy = entry->descriptor;
+        descriptor_copy = entry->getDescriptor();
     }
 
     const StorageID destination_storage_id{descriptor_copy.destination_database, descriptor_copy.destination_table};
@@ -338,7 +338,7 @@ void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transacti
     {
         std::lock_guard lock(mutex);
         for (auto & [key, entry] : tasks)
-            if (entry.descriptor.transaction_id == transaction_id)
+            if (entry.getDescriptor().transaction_id == transaction_id)
             {
                 entry.in_flight_parts.erase(part_name);
                 break;
@@ -382,7 +382,7 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
         const String * composite_key = nullptr;
         TaskEntry * entry = nullptr;
         for (auto & [key, candidate] : tasks)
-            if (candidate.descriptor.transaction_id == transaction_id)
+            if (candidate.getDescriptor().transaction_id == transaction_id)
             {
                 composite_key = &key;
                 entry = &candidate;
@@ -394,7 +394,7 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
         entry->in_flight_parts.erase(part_name);
 
         /// Task already terminal (KILLED / FAILED / COMPLETED): ignore late completions.
-        if (entry->descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+        if (entry->getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
             return;
 
         /// A cancelled export (KILL, or SYSTEM STOP MOVES) is not a real failure: leave the part
@@ -407,7 +407,7 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
         /// the write throws we leave the in-memory descriptor unchanged (so the part is retried) and
         /// swallow the error -- a completion callback must not surface a local disk error as a part
         /// failure.
-        auto updated = entry->descriptor;
+        auto updated = entry->getDescriptor();
 
         if (result.success)
         {
@@ -438,18 +438,18 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
             return;
         }
 
-        entry->descriptor = std::move(updated);
+        entry->setDescriptor(std::move(updated));
 
         if (result.success)
         {
             entry->part_backoff.erase(part_name);
-            if (entry->descriptor.allPartsDone() && !entry->committing)
+            if (entry->getDescriptor().allPartsDone() && !entry->committing)
             {
                 entry->committing = true;
                 ready_to_commit = true;
             }
         }
-        else if (entry->descriptor.status == MergeTreePartitionExportTask::Status::FAILED)
+        else if (entry->getDescriptor().status == MergeTreePartitionExportTask::Status::FAILED)
         {
             LOG_WARNING(storage.log, "ExportPartition: task {} failed on part {} with non-retryable error",
                 transaction_id, part_name);
@@ -460,8 +460,8 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
             ++backoff.attempts;
             const auto backoff_seconds = ExportPartitionUtils::computeRetryBackoffSeconds(
                 backoff.attempts,
-                entry->descriptor.retry_initial_backoff_seconds,
-                entry->descriptor.retry_max_backoff_seconds);
+                entry->getDescriptor().retry_initial_backoff_seconds,
+                entry->getDescriptor().retry_max_backoff_seconds);
             const auto now = time(nullptr);
             const size_t headroom = static_cast<size_t>(std::numeric_limits<time_t>::max() - now);
             backoff.next_retry_time = now + static_cast<time_t>(std::min(backoff_seconds, headroom));
@@ -482,7 +482,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
         std::lock_guard lock(mutex);
         TaskEntry * entry = nullptr;
         for (auto & [key, candidate] : tasks)
-            if (candidate.descriptor.transaction_id == transaction_id)
+            if (candidate.getDescriptor().transaction_id == transaction_id)
             {
                 entry = &candidate;
                 break;
@@ -490,14 +490,14 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
         if (!entry)
             return;
 
-        if (entry->descriptor.status != MergeTreePartitionExportTask::Status::PENDING || !entry->descriptor.allPartsDone())
+        if (entry->getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING || !entry->getDescriptor().allPartsDone())
         {
             entry->committing = false;
             return;
         }
 
         entry->committing = true;
-        descriptor_copy = entry->descriptor;
+        descriptor_copy = entry->getDescriptor();
     }
 
     const StorageID destination_storage_id{descriptor_copy.destination_database, descriptor_copy.destination_table};
@@ -545,7 +545,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
         const String * composite_key = nullptr;
         TaskEntry * entry = nullptr;
         for (auto & [key, candidate] : tasks)
-            if (candidate.descriptor.transaction_id == transaction_id)
+            if (candidate.getDescriptor().transaction_id == transaction_id)
             {
                 composite_key = &key;
                 entry = &candidate;
@@ -558,13 +558,13 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
 
         /// A concurrent KILL may have won the race while we were committing. Its terminal state is
         /// already durable, so there is nothing to persist here.
-        if (entry->descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+        if (entry->getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
             return;
 
         /// Persist-then-apply under the lock. Note the destination commit above already happened
         /// (effect-first): if this local write throws, we leave the task PENDING with all parts done
         /// so run() retries the commit -- idempotent thanks to the transaction id / commit file.
-        auto updated = entry->descriptor;
+        auto updated = entry->getDescriptor();
         if (success)
         {
             updated.status = MergeTreePartitionExportTask::Status::COMPLETED;
@@ -591,7 +591,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
             return;
         }
 
-        entry->descriptor = std::move(updated);
+        entry->setDescriptor(std::move(updated));
     }
 }
 
@@ -661,7 +661,7 @@ void MergeTreePartitionExportScheduler::loadFromDisk()
                 }
             }
 
-            entry.descriptor = std::move(descriptor);
+            entry.setDescriptor(std::move(descriptor));
             tasks.emplace(composite_key, std::move(entry));
 
             LOG_INFO(storage.log, "ExportPartition: loaded export task from disk (key {})", composite_key);
