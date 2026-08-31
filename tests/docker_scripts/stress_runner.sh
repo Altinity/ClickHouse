@@ -346,3 +346,9 @@ if [[ "$USE_CAS_S3_STORAGE_FOR_MERGE_TREE" != "1" && "$USE_CAS_STORAGE_FOR_MERGE
 fi
 
 mv /var/log/clickhouse-server/stderr.log /test_output/
+
+# The job uploads /test_output only, and rustfs.log is the sole record of
+# pool-side S3 failures (412 mismatches, 503 saturation) behind a CAS disk.
+if [[ -f /repo/ci/tmp/rustfs.log ]]; then
+    zstd --threads=0 -o /test_output/rustfs.log.zst /repo/ci/tmp/rustfs.log ||:
+fi
