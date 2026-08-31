@@ -1222,3 +1222,32 @@ S10 residual finding must be re-derived from `gc_log` and `fsck` until this is f
 **First step:** count events against `attempted` rather than against `manifests_deleted` — the phase
 already records `attempted` as a metric — and check whether `system.ca_event_log` shows drops of its
 own before looking for a bug in the emitter.
+
+## `[s15-month-name-timestamp]` FIXED: S15 failed every variant on a format specifier {#s15-month-name-timestamp}
+
+**Diagnosed and fixed 2026-08-31.** S15 had been `INCONCLUSIVE` at every scale, and the cause was
+neither scale, nor shard counts, nor measurement. All three of its compose variants ran; all three
+raised.
+
+The verdict `variant <name> workload` is declared inconclusive when `_run_variant` throws, and the
+throw was `Code: 41 ... while converting '2026-08-31 07:August:34' to DateTime`. The minutes field
+holds `August`, because the card built its since-timestamp with
+`formatDateTime(now(),'%Y-%m-%d %H:%M:%S')` and in ClickHouse **`%M` is the month name** — minutes
+are `%i`. Every later query scoped by that timestamp then threw, taking the whole variant with it, so
+five of eight verdicts could never resolve.
+
+Fixed by using `toString(now())`, which yields the canonical form directly, at both call sites.
+
+**The part worth remembering is that this trap was already documented in this very tree.**
+`scenarios/run.py` carries a helper whose comment reads: "Do NOT use `formatDateTime` with `'%M'` —
+in ClickHouse `'%M'` is the MONTH NAME, not minutes, which silently corrupts the since-timestamp used
+to scope every card's GC/event-log queries." The card fell into it anyway, twice. A warning in a
+comment beside the correct helper did not stop a second implementation of the wrong thing; only a
+grep for `formatDateTime` with `%M` across the tree would have, and that sweep now finds exactly
+these two sites and nothing else. The other `%M` hits in `utils/ca-soak` are Python `strftime` and
+shell `date`, where `%M` genuinely means minutes.
+
+**Also worth noting for anyone reading a report:** the exception text was never hidden — it sat in
+the verdict's `note` field all along. I first read `detail`/`evidence`, found them empty, and
+concluded the verdicts carried no reason. The `Verdict` record's fields are `name`, `expected`,
+`observed`, `note`. Read `note`.
