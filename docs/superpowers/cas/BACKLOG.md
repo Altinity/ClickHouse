@@ -1038,3 +1038,42 @@ path that can legitimately produce an empty token on a `Done` write is `tokenFro
 simultaneous store anomalies. Fix: reject an empty ETag token at the conditional-write entry
 (fail-closed `LOGICAL_ERROR`-class throw) so no future call site can turn a fence into a clobber,
 plus a Native-backend unit test. P2 — missing guard, not a demonstrated data-loss path.
+
+## `[s06-column-subset-verdict-measures-an-untouched-counter]` S06's column-subset check counts `CASBlobGet`, which the data read path never increments {#s06-column-subset-verdict-inert}
+
+**Found by rerunning S06 at `--scale full` (2026-08-31) after `dev` and `ci` both left it
+`INCONCLUSIVE`.** Scale is not the blocker, and no scale setting can be.
+
+The verdict asks whether a few-column `SELECT` fetches far fewer blobs than an all-column scan, and
+measures it as a `CASBlobGet` delta around each scan. At `full` — 10,000 columns, 2,000-row blocks —
+both windows measured **zero**, so the card took its `all_gets == 0` branch and declared itself
+inconclusive. It did the honest thing; the premise it needs was never established.
+
+Zero is not explained by the reads being cheap or cached, because the run demonstrably moved data:
+`CASBlobPut` 61,650, 60,078 objects and 300 MB in the pool. The discriminator is which code path
+increments the counter. `CASBlobGet` is raised in `CasInstrumentedBackend::get`, on the CAS
+metadata/object path — the one GC and the ref machinery use. Column `.bin` data is read by the
+object-storage disk through `ReadBufferFromS3`, which never calls that backend. The cumulative
+counters show the split directly: `S3GetObject` 50,146 against `CASBlobGet` 14,509.
+
+So the check is inert by construction, at `dev`, `ci` and `full` alike, and the two prior
+`INCONCLUSIVE` verdicts carried no information about the property under test.
+
+**Fix:** measure the delta the read path actually moves — `DiskS3GetObject` (or `S3GetObject`) —
+and keep `CASBlobGet` only where a CAS backend get is genuinely expected. **Confirming experiment
+before changing the verdict:** run the two scans unchanged and record both counters; the fix is
+warranted only if `DiskS3GetObject` moves while `CASBlobGet` stays flat. If neither moves, the reads
+are being served locally and the card needs a cache-drop, which is a different defect.
+
+**The sweep is done, and it found one more.** Four cards touch `CASBlobGet`:
+
+- **S06** (`s06_s08_manifest_parts.py`) — the verdict above.
+- **S21** (`s19_s22_clone_fetch.py`) — `column-subset fetches only required blobs`, gated on
+  `1-column CASBlobGet << all-column CASBlobGet`. **Same defect, same inert branch**, and it too has
+  been `INCONCLUSIVE` at every scale it has been run at. Fix both together.
+- **S12/S14** (`s12_s14_faults.py`) — reads the counter into observations, but its verdict is about
+  `CASRootList`/`CASRootGet` at startup, which genuinely do traverse the CAS backend. Correct as is.
+- **S41** (`s41_wide_insert_baseline.py`) — observations only, and its own docstring states that
+  "`CASBlobGet` is a metadata GET here". That is independent corroboration of the discriminator:
+  the counter's metadata scope was already understood and written down in this tree, which is what
+  makes S06's and S21's use of it to measure column-data reads wrong rather than merely unlucky.
