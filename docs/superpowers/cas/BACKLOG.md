@@ -1051,10 +1051,22 @@ inconclusive. It did the honest thing; the premise it needs was never establishe
 
 Zero is not explained by the reads being cheap or cached, because the run demonstrably moved data:
 `CASBlobPut` 61,650, 60,078 objects and 300 MB in the pool. The discriminator is which code path
-increments the counter. `CASBlobGet` is raised in `CasInstrumentedBackend::get`, on the CAS
-metadata/object path — the one GC and the ref machinery use. Column `.bin` data is read by the
-object-storage disk through `ReadBufferFromS3`, which never calls that backend. The cumulative
-counters show the split directly: `S3GetObject` 50,146 against `CASBlobGet` 14,509.
+increments the counter, and the data read path is worth spelling out because it looks at first like
+it could not possibly avoid the backend — a blob carries a fixed-length envelope, so its payload
+cannot be read as if it started at byte zero.
+
+It does not. `CasManifestReader::locate` returns a `BlobLocation` whose `offset` is the pool's
+**fixed** `blob_header_len`, so no per-object header read is needed. `readBlobPayload` then calls
+`object_storage->readObject` — the generic `IObjectStorage`, not `Cas::Backend` — and wraps the
+result in a `ReadBufferFromFileView` starting at that offset. So the envelope IS skipped, by the
+view's start offset rather than by a backend call, and `CasInstrumentedBackend` is nowhere on the
+path. `checkOpAdmitted(CasOpClass::ContentRead)` is the only CAS-side gate on it, and it counts
+nothing.
+
+`CASBlobGet` is raised only in `CasInstrumentedBackend::get`, on the metadata/object path GC and the
+ref machinery use; the sibling `CASBlobGetStream` is the backend's streaming get and is equally off
+this path, which is why it too stayed at zero. The cumulative counters show the split directly:
+`S3GetObject` 50,146 against `CASBlobGet` 14,509.
 
 So the check is inert by construction, at `dev`, `ci` and `full` alike, and the two prior
 `INCONCLUSIVE` verdicts carried no information about the property under test.
@@ -1077,3 +1089,69 @@ are being served locally and the card needs a cache-drop, which is a different d
   "`CASBlobGet` is a metadata GET here". That is independent corroboration of the discriminator:
   the counter's metadata scope was already understood and written down in this tree, which is what
   makes S06's and S21's use of it to measure column-data reads wrong rather than merely unlucky.
+
+## `[s23-idle-rss-growth-500mb]` 500 MB of RSS growth on an empty, idle pool over 15 minutes {#s23-idle-rss-growth}
+
+**Found by rerunning S23 at `--scale full` (2026-08-31), which FAILED where `dev` and `ci` were
+inconclusive.** The `dev` window is 4 minutes at 5 s per minute; `full` is 15 real minutes, and that
+is what made the verdict discriminate.
+
+`memory flat over idle window` failed with `idle_rss_growth` = **500,146,176 bytes**. Per node,
+resident went 677 MB to 1,178 MB on `ch1` and 641 MB to 1,087 MB on `ch2`. It is not only allocator
+noise: ClickHouse's own `mem_tracking` roughly doubled too, 337 MB to 666 MB.
+
+What makes it worth a look is what the pool held while this happened: **nothing**. `pool_shape` is
+zero across every class — no blobs, no manifests, no refs, no roots, no files — `leftover_ca_tables`
+is empty, `max_s3_ops_per_round` is 0, and GC deleted nothing across 11 successful rounds.
+
+**Not yet established as a leak, and the reason is the window.** Fifteen minutes cannot separate a
+server settling into its steady state — thread pools, caches and arenas materializing after boot —
+from growth that does not stop. Peak resident (1,158 MB) sits close to final (1,181 MB), which is
+weak evidence for a plateau.
+
+**Experiment that decides it:** one idle run with a 60-plus-minute window, sampling RSS and
+`mem_tracking` each minute, and read the shape of the curve rather than its endpoints. A plateau
+means the verdict's threshold is wrong for a freshly booted server; continued linear growth on an
+empty pool means a leak worth chasing. Do not file a leak against the product on the 15-minute
+number alone.
+
+## `[s10-patch-setting-applied-at-the-wrong-level]` S10 never creates a patch part, so its premise has never held {#s10-patch-setting-wrong-level}
+
+**Found at `--scale full` (2026-08-31).** `max_patch_parts_observed` = **0**, and the reason is
+recorded in the run's own observations: `patch_part_settings_rejected` holds
+`apply_patches_on_merge` with `Code: 115 ... neither a builtin setting nor started with the prefix
+'SQL_'`.
+
+The setting exists — `MergeTreeSettings.cpp:861` declares it — but it is a **MergeTree table
+setting**, and the card sets it at session level, where no such name is registered. So the throw is
+correct and the card swallowed it into an observation.
+
+Consequently `patch parts observed in system.parts` has been inconclusive at `dev`, `ci` and `full`
+alike, for the same reason each time, and the two verdicts that read as patch-content findings are
+not measuring patch content at all.
+
+**Fix:** apply it as a table setting — `CREATE TABLE ... SETTINGS apply_patches_on_merge = 1`, or
+`ALTER TABLE ... MODIFY SETTING` — and let a rejection fail the scenario at entry instead of being
+absorbed into observations. A premise that cannot be established must stop the run, not quietly
+downgrade its own verdict.
+
+## `[s10-one-unreachable-manifest-survives-gc-fixpoint]` A single unreachable manifest survives GC to fixpoint, three rounds running {#s10-manifest-residual}
+
+**Found at `--scale full` (2026-08-31); the same run as the entry above, so read that first — the
+patch-part premise did not hold, and this residual arises from the lightweight-delete workload
+rather than from patch content.**
+
+`no unbounded leftovers` and `obsolete patch content reclaimed` both failed on one object:
+`fsck_final` reports `unreachable: 1, dangling: 0` against `reachable: 163`, and
+`residual_classification` puts it in `leak` as `unreachable:_manifests: 1` — not `pipeline`, not
+`bookkeeping`. `reclaimable_drain_check` agrees it is reclaimable. `gc_fixpoint_history` is
+`[1, 1, 1]`: GC was driven to fixpoint three times and the residual did not move.
+
+One object is small but the shape is not benign — a reclaimable, unreachable manifest that survives
+repeated fixpoints is by definition not being reclaimed. Also worth a glance in the same run:
+`graduation_drain_history` is a run of ones with a single **128** in it.
+
+**Before calling it a product defect:** identify the object and what still points at it, and
+re-derive whether the workload can legitimately leave it (a manifest published after the fold's
+coverage seal is bookkeeping, not a leak). The classification is the card's, and the card's premise
+was broken in the same run.
