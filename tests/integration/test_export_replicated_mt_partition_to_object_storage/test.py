@@ -16,6 +16,12 @@ from helpers.export_partition_helpers import (
 from helpers.network import PartitionManager
 
 
+EXTRA_SOURCE_COLUMN_MODES = [
+    pytest.param("POSITION", id="by-position"),
+    pytest.param("NAME", id="by-name"),
+]
+
+
 
 def skip_if_remote_database_disk_enabled(cluster):
     """Skip test if any instance in the cluster has remote database disk enabled.
@@ -2266,7 +2272,8 @@ def test_export_partition_multi_column_partition_key_success_all(cluster):
     assert result == "1\t2\t3\tx\n4\t5\t6\ty", f"Unexpected exported data:\n{result}"
 
 
-def test_export_partition_schema_mismatch_mode_honored_by_non_initiating_replica(cluster):
+@pytest.mark.parametrize("schema_match_mode", EXTRA_SOURCE_COLUMN_MODES)
+def test_export_partition_schema_match_mode_honored_by_non_initiating_replica(cluster, schema_match_mode):
     replica1 = cluster.instances["replica1"]
     replica2 = cluster.instances["replica2"]
 
@@ -2288,7 +2295,8 @@ def test_export_partition_schema_mismatch_mode_honored_by_non_initiating_replica
 
     replica1.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-        f" SETTINGS export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'"
+        f" SETTINGS export_merge_tree_part_schema_match_mode = '{schema_match_mode}',"
+        f" export_merge_tree_part_ignore_extra_source_columns = 1"
     )
 
     wait_for_export_status(node=replica1, source_table=mt_table, dest_table=s3_table,
@@ -2299,5 +2307,106 @@ def test_export_partition_schema_mismatch_mode_honored_by_non_initiating_replica
 
     result = replica1.query(f"SELECT id, year FROM {s3_table} ORDER BY id").strip()
     assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected data:\n{result}"
+
+    replica1.query(f"SYSTEM START MOVES {mt_table}")
+
+
+def test_export_partition_match_by_name_honored_by_non_initiating_replica(cluster):
+    replica1 = cluster.instances["replica1"]
+    replica2 = cluster.instances["replica2"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"match_by_name_cross_replica_mt_{postfix}"
+    s3_table = f"match_by_name_cross_replica_s3_{postfix}"
+
+    source_columns = "id UInt64, year UInt16, omitted String, payload String"
+    make_rmt(
+        node=replica1,
+        name=mt_table,
+        columns=source_columns,
+        partition_by="year",
+        replica_name="replica1",
+    )
+    make_rmt(
+        node=replica2,
+        name=mt_table,
+        columns=source_columns,
+        partition_by="year",
+        replica_name="replica2",
+    )
+    replica1.query(
+        f"INSERT INTO {mt_table} VALUES "
+        f"(1, 2020, 'left', 'first'), (2, 2020, 'right', 'second')"
+    )
+    replica2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    for replica in (replica1, replica2):
+        replica.query(
+            f"CREATE TABLE {s3_table} (payload String, year UInt16, id UInt64) "
+            f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, "
+            f"partition_strategy='hive') PARTITION BY year"
+        )
+
+    replica1.query(f"SYSTEM STOP MOVES {mt_table}")
+
+    replica1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+        f" SETTINGS export_merge_tree_part_schema_match_mode = 'NAME',"
+        f" export_merge_tree_part_ignore_extra_source_columns = 1"
+    )
+
+    wait_for_export_status(
+        node=replica1,
+        source_table=mt_table,
+        dest_table=s3_table,
+        partition_id="2020",
+        expected_status="COMPLETED",
+        timeout=60,
+    )
+
+    result = replica1.query(
+        f"SELECT payload, year, id FROM {s3_table} ORDER BY id"
+    ).strip()
+    assert result == "first\t2020\t1\nsecond\t2020\t2", f"Unexpected data:\n{result}"
+
+    replica1.query(f"SYSTEM START MOVES {mt_table}")
+
+
+def test_export_partition_match_by_name_with_equal_column_count_reordered(cluster):
+    """Test that match_by_name matches columns by name even with an equal source/destination column count."""
+    replica1 = cluster.instances["replica1"]
+    replica2 = cluster.instances["replica2"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"match_by_name_equal_count_mt_{postfix}"
+    s3_table = f"match_by_name_equal_count_s3_{postfix}"
+
+    source_columns = "id UInt64, year UInt16, payload String"
+    make_rmt(node=replica1, name=mt_table, columns=source_columns,
+             partition_by="year", replica_name="replica1")
+    make_rmt(node=replica2, name=mt_table, columns=source_columns,
+             partition_by="year", replica_name="replica2")
+    replica1.query(f"INSERT INTO {mt_table} VALUES (1, 2020, 'foo'), (2, 2020, 'bar')")
+    replica2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    for replica in (replica1, replica2):
+        replica.query(
+            f"CREATE TABLE {s3_table} (payload String, id UInt64, year UInt16) "
+            f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, "
+            f"partition_strategy='hive') PARTITION BY year"
+        )
+
+    replica1.query(f"SYSTEM STOP MOVES {mt_table}")
+
+    replica1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+        f" SETTINGS export_merge_tree_part_schema_match_mode = 'NAME'"
+    )
+
+    wait_for_export_status(node=replica1, source_table=mt_table, dest_table=s3_table,
+                            partition_id="2020", expected_status="COMPLETED", timeout=60)
+
+    result = replica1.query(f"SELECT id, year, payload FROM {s3_table} ORDER BY id").strip()
+    assert result == "1\t2020\tfoo\n2\t2020\tbar", f"Unexpected data:\n{result}"
 
     replica1.query(f"SYSTEM START MOVES {mt_table}")
