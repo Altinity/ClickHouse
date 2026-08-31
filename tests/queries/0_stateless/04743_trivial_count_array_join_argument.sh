@@ -30,14 +30,16 @@ SELECT count(1) FROM t_04743 SETTINGS optimize_trivial_count_query = 1;
 SELECT count(n) FROM t_04743 SETTINGS optimize_trivial_count_query = 1;
 SELECT count() FROM t_04743 ARRAY JOIN A SETTINGS optimize_trivial_count_query = 1;
 
--- plans: the optimization is refused for the arrayJoin argument and kept otherwise
-SELECT count() > 0 FROM (EXPLAIN SELECT count(arrayJoin(A)) FROM t_04743 SETTINGS optimize_trivial_count_query = 1)
+-- plans: the optimization is refused for the arrayJoin argument and kept otherwise.
+-- enable_parallel_replicas = 0 pins the local plan: under a parallel-replicas profile the read
+-- step is a remote-replicas step, not ReadFromMergeTree, and the shape here is what we assert on.
+SELECT count() > 0 FROM (EXPLAIN SELECT count(arrayJoin(A)) FROM t_04743 SETTINGS optimize_trivial_count_query = 1, enable_parallel_replicas = 0)
 WHERE explain ILIKE '%Optimized trivial count%';
-SELECT count() > 0 FROM (EXPLAIN SELECT count(arrayJoin(A)) FROM t_04743 SETTINGS optimize_trivial_count_query = 1)
+SELECT count() > 0 FROM (EXPLAIN SELECT count(arrayJoin(A)) FROM t_04743 SETTINGS optimize_trivial_count_query = 1, enable_parallel_replicas = 0)
 WHERE explain ILIKE '%ReadFromMergeTree%';
-SELECT count() > 0 FROM (EXPLAIN SELECT count() FROM t_04743 SETTINGS optimize_trivial_count_query = 1)
+SELECT count() > 0 FROM (EXPLAIN SELECT count() FROM t_04743 SETTINGS optimize_trivial_count_query = 1, enable_parallel_replicas = 0)
 WHERE explain ILIKE '%Optimized trivial count%';
-SELECT count() > 0 FROM (EXPLAIN SELECT count(n) FROM t_04743 SETTINGS optimize_trivial_count_query = 1)
+SELECT count() > 0 FROM (EXPLAIN SELECT count(n) FROM t_04743 SETTINGS optimize_trivial_count_query = 1, enable_parallel_replicas = 0)
 WHERE explain ILIKE '%Optimized trivial count%';
 
 DROP TABLE t_04743;
