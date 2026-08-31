@@ -1155,12 +1155,40 @@ lw_supported:` branch never fires and the lightweight `DELETE FROM` beneath it i
 falls through to `ALTER TABLE ... DELETE`, which produces mutations, not patch parts. No setting and
 no scale can produce a patch part while that line stands.
 
-The comment above it states the reason: lightweight `DELETE` is "unreliable on this build (CA storage
-path diverges)". **That claim is the thing to test first**, because the two outcomes lead opposite
-ways. If it is stale, the workaround is the only blocker and removing it restores the premise. If it
-is current, then lightweight `DELETE` diverging on the CA path is a product defect that deserves its
-own entry and its own test, rather than living as a silent `False` inside one scenario — a card that
-works around a product defect hides it.
+**The claim justifying that line is stale, and there is no product defect. Tested 2026-08-31.**
+The comment says lightweight `DELETE` is "unreliable on this build (CA storage path diverges)". It was
+added 2026-07-01 in the commit that introduced the whole suite (`b3fa29f29266`), whose message never
+mentions lightweight `DELETE` — so the assertion stood for two months with no recorded error text, no
+issue and no reproduction behind it.
+
+Measured directly against a CA-disk table with a row-count-and-checksum oracle: 50,000 rows, two
+`DELETE FROM ... WHERE bucket = N` statements, expected survivors 40,000 with checksum
+1441566520450331260. Result: **40,000 rows and exactly that checksum**, no error. Lightweight `DELETE`
+is correct on the CA path.
+
+**But removing the flag would still not produce a patch part, and that is the more useful finding.**
+Lightweight `DELETE` creates none: the run left 0 patch parts and one `Wide` part. Patch parts come
+from lightweight **UPDATE**, and reaching them needs three table settings, each of which the server
+names in an error until supplied:
+
+| requirement | how it announces itself |
+|---|---|
+| `enable_block_number_column = 1` | `Code: 48 ... supported only for tables with materialized _block_number column` |
+| `enable_block_offset_column = 1` | the same error, now naming `_block_offset` |
+| `apply_patches_on_merge = 1` | a **table** setting; the session `SET` S10 uses throws `Code: 115` |
+
+With all three plus `allow_experimental_lightweight_update`, an `UPDATE ... WHERE bucket = 5` on a CA
+table succeeds and yields `patch-c46b00d08453527290352a2e6e9ad36f-all_3_3_0_2`, 2,000 rows, oracle
+matching exactly (2,000 patched of 20,000).
+
+**S10's detector is already correct** and needs no change: it matches `part_type = 'Patch' OR name
+LIKE 'patch-%'`, and the real part carries that prefix.
+
+**One caution before removing the flag.** Its comment gives two reasons and only the first is refuted.
+"Unreliable" is false; "force the ALTER TABLE DELETE fallback for correct oracle semantics" is a
+separate claim about how the card counts rows. The oracle used here counts through `SELECT`, which
+honours the delete mask — but S10's own oracle must be checked against masked rows before its delete
+path is switched, not assumed equivalent.
 
 **Secondary, and worth fixing regardless:** `_probe_patch_parts` issues `SET apply_patches_on_merge
 = 1`, which throws `Code: 115` because the name is a **MergeTree table setting**
