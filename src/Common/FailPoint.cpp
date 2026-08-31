@@ -161,6 +161,7 @@ static struct InitFiu
     ONCE(smt_commit_exception_before_op) \
     ONCE(disk_object_storage_fail_commit_metadata_transaction) \
     ONCE(disk_object_storage_fail_precommit_metadata_transaction) \
+    REGULAR(part_storage_fail_commit_transaction) \
     ONCE(write_file_operation_fail_on_read) \
     REGULAR(slowdown_parallel_replicas_local_plan_read) \
     ONCE(iceberg_writes_cleanup) \
@@ -175,6 +176,7 @@ static struct InitFiu
     REGULAR(export_partition_processed_paths_sync_fail) \
     REGULAR(export_part_non_retryable_throw) \
     REGULAR(export_part_retryable_throw) \
+    PAUSEABLE_ONCE(export_part_pause_before_schema_validation) \
     ONCE(backup_add_empty_memory_table) \
     PAUSEABLE_ONCE(backup_pause_on_start) \
     PAUSEABLE_ONCE(restore_pause_on_start) \
@@ -229,7 +231,9 @@ static struct InitFiu
     PAUSEABLE(transaction_after_commit_pause) \
     REGULAR(mt_mutate_task_can_skip_conversion_to_nullable_force_null_column_desc) \
     REGULAR(tcp_handler_fail_connection_setup) \
-    REGULAR(distributed_plan_status_check_reenqueue_fault)
+    REGULAR(distributed_plan_status_check_reenqueue_fault) \
+    REGULAR(cas_relink_receiver_force_mechanism_failure) \
+    PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm)
 
 namespace FailPoints
 {

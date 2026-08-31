@@ -260,7 +260,7 @@ def _git_log_merge_prs(
         if not m:
             continue
         pr_number, head_owner = int(m.group(1)), m.group(2)
-        if head_owner.lower() != repo.split("/")[0].lower():
+        if head_owner == 'ClickHouse':
             continue
         rows.append(
             {
@@ -280,7 +280,9 @@ def _find_release_baseline(
     branch_ref: str, repo: str, cwd: str | None
 ) -> tuple[str | None, str | None, str | None]:
     """Return (tag_name, tag_sha, published_date YYYY-MM-DD) for the latest
-    non-draft release tag that is an ancestor of branch_ref."""
+    non-draft release tag that is an ancestor of branch_ref.
+    Version-tag refs skip the matching release so the range is previous→this tag.
+    """
     if not GITHUB_TOKEN:
         return None, None, None
     headers = {
@@ -295,6 +297,8 @@ def _find_release_baseline(
         raise Exception(
             f"GitHub API request failed: {response.status_code} {response.text}"
         )
+    parsed = _parse_release_ref(branch_ref)
+    skip_current = parsed is not None and parsed[2] is not None
     for rel in response.json():
         if rel.get("draft"):
             continue
@@ -305,6 +309,8 @@ def _find_release_baseline(
         if not tag_sha:
             continue
         if not _git_is_ancestor(tag_sha, branch_ref, cwd):
+            continue
+        if skip_current and _git_is_ancestor(branch_ref, tag_sha, cwd):
             continue
         published_at = rel.get("published_at") or rel.get("created_at") or ""
         published_date = published_at[:10] if published_at else None
@@ -362,8 +368,8 @@ def get_prs_in_release_dataframe(
     f"""
     PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
     Release tag on this history, or after the oldest rebase bootstrap if no such tag exists.
-    Only merge commits whose subject has from <repo_owner>/ (e.g. from Altinity/) are included.
-    Columns: pr_number, pr_name, labels. Omits PRs labeled cicd.
+    Merge commits whose subject is from the upstream repository (ClickHouse/) are omitted.
+    Columns: pr_number, pr_name, labels.
 
     Returns (dataframe, baseline_date YYYY-MM-DD or None).
     """
@@ -387,11 +393,18 @@ def get_prs_in_release_dataframe(
         check=False,
     )
 
+    parsed = _parse_release_ref(branch_ref)
+    fetch_ref = (
+        f"refs/tags/{branch_ref}"
+        if parsed is not None and parsed[2] is not None
+        else branch_ref
+    )
+
     baseline_sha = None
     baseline_date = None
     for _ in range(DEEPEN_CAP // DEEPEN_STEP):
         subprocess.run(
-            ["git", "fetch", f"--deepen={DEEPEN_STEP}", "origin", branch_ref],
+            ["git", "fetch", f"--deepen={DEEPEN_STEP}", "origin", fetch_ref],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -691,6 +704,10 @@ def get_new_fails_this_pr(
 
     # Combine both types of fails and select only desired columns
     desired_columns = ["job_name", "test_name", "test_status", "results_link"]
+    if len(checks_fails) > 0 and "labels" in checks_fails.columns:
+        desired_columns.insert(desired_columns.index("results_link"), "labels")
+        if len(regression_fails) > 0:
+            regression_fails["labels"] = ""
     all_pr_fails = pd.concat([checks_fails, regression_fails], ignore_index=True)[
         desired_columns
     ]
@@ -976,6 +993,82 @@ def format_test_status(text: str) -> str:
     return f'<span style="font-weight: bold; color: {color}">{text}</span>'
 
 
+def _label_names_from_ext(ext: dict) -> list[str]:
+    names = []
+    for item in ext.get("labels") or []:
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, dict) and item.get("name"):
+            name = item["name"]
+        else:
+            continue
+        if name != "cidb":
+            names.append(name)
+    return names
+
+
+def fetch_workflow_result_json(
+    pr_number: int, branch: str, commit_sha: str
+) -> dict | None:
+    if pr_number == 0:
+        ref_param = f"REF={branch}"
+        workflow_name = "MasterCI"
+    else:
+        ref_param = f"PR={pr_number}"
+        workflow_name = "PR"
+
+    status_file = f"result_{workflow_name.lower()}.json"
+    s3_path = (
+        f"https://{S3_BUCKET}.s3.amazonaws.com/"
+        f"{ref_param.replace('=', 's/')}/{commit_sha}/{status_file}"
+    )
+    try:
+        response = requests.get(s3_path, timeout=30)
+        if response.status_code != 200:
+            return None
+        return response.json()
+    except Exception as e:
+        print(f"WARNING:Failed to fetch workflow result from {s3_path}: {e}")
+        return None
+
+
+def get_failure_labels_from_workflow(workflow_data: dict | None) -> dict:
+    if not workflow_data:
+        return {}
+    labels_map = {}
+    for job in workflow_data.get("results") or []:
+        job_name = job.get("name")
+        if not job_name:
+            continue
+        for leaf in job.get("results") or []:
+            test_name = leaf.get("name")
+            if not test_name:
+                continue
+            names = _label_names_from_ext(leaf.get("ext") or {})
+            if names:
+                labels_map[(job_name, test_name)] = ", ".join(names)
+    return labels_map
+
+
+def add_labels_to_checks_fails(
+    checks_fails: pd.DataFrame, workflow_data: dict | None
+) -> pd.DataFrame:
+    if checks_fails is None or len(checks_fails) == 0:
+        return checks_fails
+    labels_map = get_failure_labels_from_workflow(workflow_data)
+    df = checks_fails.copy()
+    df["labels"] = df.apply(
+        lambda row: labels_map.get((row["job_name"], row["test_name"]), ""),
+        axis=1,
+    )
+    cols = [c for c in df.columns if c != "labels"]
+    if "results_link" in cols:
+        cols.insert(cols.index("results_link"), "labels")
+    else:
+        cols.append("labels")
+    return df[cols]
+
+
 def format_results_as_html_table(results, *, branch_name: str = "") -> str:
     if not isinstance(results, pd.DataFrame):
         return results
@@ -1012,47 +1105,36 @@ def format_results_as_html_table(results, *, branch_name: str = "") -> str:
         "PR Labels": lambda labels: format_pr_labels_with_verification(
             labels, branch_name=branch_name
         ),
+        "Labels": lambda labels: html.escape(str(labels), quote=True) if labels else "",
     }
 
-    html = results.to_html(
+    return results.to_html(
         index=False,
         formatters=formatters,
         escape=False,
         border=0,
         classes=["test-results-table"],
     )
-    return html
 
 
 def backfill_skipped_statuses(
-    job_statuses: pd.DataFrame, pr_number: int, branch: str, commit_sha: str
+    job_statuses: pd.DataFrame,
+    workflow_result: dict | None,
 ):
     """
     Fill in the job statuses for skipped jobs.
     """
-
-    if pr_number == 0:
-        ref_param = f"REF={branch}"
-        workflow_name = "MasterCI"
-    else:
-        ref_param = f"PR={pr_number}"
-        workflow_name = "PR"
-
-    status_file = f"result_{workflow_name.lower()}.json"
-    s3_path = f"https://{S3_BUCKET}.s3.amazonaws.com/{ref_param.replace('=', 's/')}/{commit_sha}/{status_file}"
-    response = requests.get(s3_path)
-
-    if response.status_code != 200:
+    if workflow_result is None:
         return job_statuses
 
-    status_data = response.json()
     skipped_jobs = []
-    for job in status_data["results"]:
-        if job["status"] == "skipped" and len(job["links"]) > 0:
+    for job in workflow_result["results"]:
+        status = job["status"].lower()
+        if status == "skipped" and len(job["links"]) > 0:
             skipped_jobs.append(
                 {
                     "job_name": job["name"],
-                    "job_status": job["status"],
+                    "job_status": status,
                     "message": job["info"],
                     "results_link": job["links"][0],
                 }
@@ -1192,10 +1274,15 @@ def create_workflow_report(
         settings={"use_numpy": True},
     )
 
+    workflow_result = fetch_workflow_result_json(pr_number, branch_name, commit_sha)
+
     results_dfs = {
         "prs_in_release": [],
         "job_statuses": get_commit_statuses(commit_sha),
-        "checks_fails": get_checks_fails(db_client, commit_sha, branch_name),
+        "checks_fails": add_labels_to_checks_fails(
+            get_checks_fails(db_client, commit_sha, branch_name),
+            workflow_result,
+        ),
         "checks_known_fails": [],
         "pr_new_fails": [],
         "checks_errors": get_checks_errors(db_client, commit_sha, branch_name),
@@ -1257,7 +1344,8 @@ def create_workflow_report(
             pr_info = {}
 
     results_dfs["job_statuses"] = backfill_skipped_statuses(
-        results_dfs["job_statuses"], pr_number, branch_name, commit_sha
+        results_dfs["job_statuses"],
+        workflow_result,
     )
 
     high_cve_count = 0

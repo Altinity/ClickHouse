@@ -240,13 +240,15 @@ namespace Setting
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
-    extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
     extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
     extern const SettingsBool allow_insert_into_iceberg;
     extern const SettingsUInt64 iceberg_insert_max_bytes_in_data_file;
     extern const SettingsUInt64 iceberg_insert_max_rows_in_data_file;
+    extern const SettingsTimezone iceberg_partition_timezone;
 }
 
 
@@ -524,6 +526,18 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     {
         if (disk->getDataSourceDescription().metadata_type == MetadataStorageType::Keeper)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "ReplicatedMergeTree doesn't work with 's3_with_keeper' disk type");
+
+        /// B33 (lifted, CAS replication 2b + Phase 3.2): ReplicatedMergeTree on a content-addressed disk
+        /// is allowed. INSERT/SELECT/merge/mutation and fetch-by-relink (the CA analogue of zero-copy
+        /// replication) route through the working whole-part CA transaction / the relink path. The
+        /// replication-queue CLONE paths (queue-driven REPLACE/MOVE/ATTACH PARTITION FROM, the
+        /// cloneAndLoadDataPart-on-the-queue path) were audited in Phase 3.2: they reach the SAME
+        /// whole-part ContentAddressedTransaction the non-replicated stack uses (see
+        /// `MergeTreeData::checkAlterPartitionIsPossible`, reached here by dynamic dispatch — the
+        /// Phase 3.2 fail-closed override in this class was a pure delegation and was deleted by the
+        /// tail de-patch), NOT the per-file-autocommit B21 mode, so they are now permitted. The
+        /// zero-copy lockSharedData/unlockSharedData calls these reach are safe no-ops on CA (they
+        /// early-return on !supportZeroCopyReplication, which CA is).
     }
 
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
@@ -8629,12 +8643,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     auto src_snapshot = getInMemoryMetadataPtr(query_context, false);
     auto destination_snapshot = dest_storage->getInMemoryMetadataPtr(query_context, false);
 
-    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
     ExportPartitionUtils::verifyExportSchemaCastable(
         src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
-
-    if (!dest_storage->isDataLake())
-        ExportPartitionUtils::assertPartitionKeyASTAreEqual(src_snapshot, destination_snapshot);
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 
@@ -8753,7 +8763,9 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     manifest.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
     manifest.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
-    manifest.schema_mismatch_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value;
+    manifest.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
+    manifest.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
+    manifest.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;
 
     if (dest_storage->isDataLake())
     {
@@ -8788,7 +8800,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
         ExportPartitionUtils::verifyIcebergPartitionCompatibility(
             metadata_object,
-            src_snapshot->getPartitionKeyAST());
+            src_snapshot,
+            destination_snapshot,
+            parts,
+            partition_id,
+            query_context);
 
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
@@ -8801,6 +8817,15 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 #else
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
+    }
+    else
+    {
+        ExportPartitionUtils::verifyPlainPartitionCompatibility(
+            src_snapshot,
+            destination_snapshot,
+            parts,
+            partition_id,
+            query_context);
     }
 
     ops.emplace_back(zkutil::makeCreateRequest(
