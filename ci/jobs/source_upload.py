@@ -23,11 +23,18 @@ def checkout_submodules():
     )
 
 
+def get_version() -> CHVersion:
+    version = CHVersion.get_current_version_from_ci_pipeline()
+    if not version:
+        version = CHVersion.get_current_version(no_strict=True)
+    return version
+
+
 def main():
     stopwatch = Utils.Stopwatch()
 
-    version = CHVersion.get_version()
-    tarball = REPO_PATH.parent / f"clickhouse-{version}.src.tar.gz"
+    version = get_version()
+    tarball = REPO_PATH.parent / f"clickhouse-{version.string}.src.tar.gz"
 
     results = [
         Result.from_commands_run(

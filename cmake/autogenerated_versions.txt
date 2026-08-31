@@ -11,6 +11,6 @@ SET(VERSION_DESCRIBE v26.8.1.10001.altinitytest)
 SET(VERSION_STRING 26.8.1.10001.altinitytest)
 # end of autochange
 
-SET(VERSION_TWEAK 20001)
-SET(VERSION_FLAVOUR altinityantalya)
+SET(VERSION_TWEAK 10001)
+SET(VERSION_FLAVOUR altinitytest)
 
