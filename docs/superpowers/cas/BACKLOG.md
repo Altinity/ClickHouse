@@ -1109,11 +1109,30 @@ server settling into its steady state — thread pools, caches and arenas materi
 from growth that does not stop. Peak resident (1,158 MB) sits close to final (1,181 MB), which is
 weak evidence for a plateau.
 
-**Experiment that decides it:** one idle run with a 60-plus-minute window, sampling RSS and
-`mem_tracking` each minute, and read the shape of the curve rather than its endpoints. A plateau
+**There is no `trace_log` evidence for this, and three separate things must change before a rerun
+can produce any.** Asked whether the trace told us where the 500 MB went, the answer is no:
+
+1. **The artifact dump does not collect it.** `predown_dump.sh` loops `for tt in CPU Real` — the
+   `Memory` trace type is never queried, so no allocation stacks reach the run directory.
+2. **There would be nothing to collect.** `total_memory_profiler_step` — the server-level knob that
+   samples background and idle allocations — defaults to **0**, meaning off, and `ca-soak`'s
+   `profiling.xml` sets only the two query profilers. The per-query `memory_profiler_step` (4 MiB)
+   cannot fire during an idle window because no query is running. This is why the earlier one-hour
+   chaos soak did have ~25k `Memory` samples while an idle run would have none: those came from
+   queries.
+3. **What was collected is not time-scoped.** The `Real` aggregate covers the whole server lifetime
+   with no window, so although S23's dump is full of CAS write frames — `commit` 380 samples,
+   `publishStaging` 378, `publishBlob` 365, `fanOutBlobUploads` 368, and
+   `CityHash128BlobHashingWriteBuffer::nextImpl` 172 — those most plausibly belong to the setup phase
+   and cannot be attributed to the idle minutes either way. The pool was empty by the end.
+
+**Experiment that decides it,** with those three fixed first: set `total_memory_profiler_step` to a
+few MiB on the server, have the dump query the `Memory` trace type, and scope the aggregate to the
+idle window by `event_time`. Then run one idle scenario with a 60-plus-minute window, sampling RSS
+and `mem_tracking` each minute, and read the shape of the curve rather than its endpoints. A plateau
 means the verdict's threshold is wrong for a freshly booted server; continued linear growth on an
-empty pool means a leak worth chasing. Do not file a leak against the product on the 15-minute
-number alone.
+empty pool means a leak, and the `Memory` stacks will say whose. Do not file a leak against the
+product on the 15-minute number alone.
 
 ## `[s10-patch-setting-applied-at-the-wrong-level]` S10 never creates a patch part, so its premise has never held {#s10-patch-setting-wrong-level}
 
