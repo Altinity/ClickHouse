@@ -13,6 +13,13 @@ from ci.praktika.result import Result
 from ci.praktika.settings import Settings
 from ci.praktika.utils import Shell
 
+
+def resolve_workflow_branch(info) -> str:
+    if getattr(info, "pr_number", 0) > 0:
+        return getattr(info, "base_branch", "") or getattr(info, "git_branch", "")
+    return getattr(info, "git_branch", "")
+
+
 # Query to fetch failed tests from CIDB for a given PR.
 # Pre-filters out commit/check_name combinations with >= 20 failures — these indicate
 # widespread failures (e.g. build broken, environment issue) where every test failed,
@@ -98,8 +105,9 @@ class Targeting:
         "tests/config/",
     )
 
-    def __init__(self, info: Info):
+    def __init__(self, info: Info, branch: str = ""):
         self.info = info
+        self.branch = branch or resolve_workflow_branch(info)
         self._cidb = None
         if "stateless" in info.job_name.lower():
             self.job_type = self.STATELESS_JOB_TYPE
@@ -509,6 +517,14 @@ class Targeting:
     def _escape_sql_string(s: str) -> str:
         return s.replace("\\", "\\\\").replace("'", "\\'")
 
+    def _coverage_cutoff(self, table: str) -> str:
+        cidb = self._ci_db()
+        result = (cidb.query(
+            f"SELECT max(check_start_time) - interval 3 day FROM {table}"
+            f" WHERE branch = '{self._escape_sql_string(self.branch)}' AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'",
+        ) or "").strip()
+        return result or "now() - interval 3 day"
+
     @staticmethod
     def _stored_path(path: str) -> str:
         """Convert a repo-relative diff path to the stored coverage path format.
@@ -721,6 +737,7 @@ class Targeting:
         # penalises them via the 1/region_test_count denominator.  Only truly
         # ubiquitous regions (> HARD_CAP) are dropped to keep response size sane.
         BROAD_REGION_HARD_CAP = 3000  # scoring handles broad regions; very ubiquitous dropped
+        cutoff = self._coverage_cutoff('checks_coverage_lines')
         query = f"""
         SELECT
             file,
@@ -729,9 +746,10 @@ class Targeting:
             groupArray(test_name) AS tests,
             groupArray(min_depth) AS depths,
             uniqExact(test_name) AS region_test_count
-        FROM checks_coverage_lines
-        WHERE check_start_time > now() - interval 3 days
+        FROM checks_coverage_lines FINAL
+        WHERE check_start_time >= '{cutoff}'
           AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+          AND branch = '{self._escape_sql_string(self.branch)}'
           AND notEmpty(test_name)
           AND ({per_file_conds})
         GROUP BY file, line_start, line_end
@@ -806,16 +824,18 @@ class Targeting:
         # above a test covering only 1 file at 74 regions.
         broad_query = f"""
         SELECT test_name, count() AS cov_regions, uniqExact(file) AS files_covered
-        FROM checks_coverage_lines
-        WHERE check_start_time > now() - interval 3 days
+        FROM checks_coverage_lines FINAL
+        WHERE check_start_time >= '{cutoff}'
           AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+          AND branch = '{self._escape_sql_string(self.branch)}'
           AND notEmpty(test_name)
           AND ({per_file_conds})
           AND (file, line_start, line_end) IN (
               SELECT file, line_start, line_end
-              FROM checks_coverage_lines
-              WHERE check_start_time > now() - interval 3 days
+              FROM checks_coverage_lines FINAL
+              WHERE check_start_time >= '{cutoff}'
                 AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+                AND branch = '{self._escape_sql_string(self.branch)}'
                 AND ({per_file_conds})
               GROUP BY file, line_start, line_end
               HAVING uniqExact(test_name) > {BROAD_REGION_HARD_CAP}
@@ -987,16 +1007,18 @@ class Targeting:
             ULTRA_BROAD_REGION_CAP = 30000
             ultra_query = f"""
             SELECT test_name, count() AS cov_regions, uniqExact(file) AS files_covered
-            FROM checks_coverage_lines
-            WHERE check_start_time > now() - interval 3 days
+            FROM checks_coverage_lines FINAL
+            WHERE check_start_time >= '{cutoff}'
               AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+              AND branch = '{self._escape_sql_string(self.branch)}'
               AND notEmpty(test_name)
               AND ({per_file_conds})
               AND (file, line_start, line_end) IN (
                   SELECT file, line_start, line_end
-                  FROM checks_coverage_lines
-                  WHERE check_start_time > now() - interval 3 days
+                  FROM checks_coverage_lines FINAL
+                  WHERE check_start_time >= '{cutoff}'
                     AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+                    AND branch = '{self._escape_sql_string(self.branch)}'
                     AND ({per_file_conds})
                   GROUP BY file, line_start, line_end
                   HAVING uniqExact(test_name) > {VERY_BROAD_REGION_CAP}
@@ -1119,9 +1141,10 @@ class Targeting:
                    groupArray(test_name) AS tests,
                    groupArray(min_depth) AS depths,
                    uniqExact(test_name) AS region_test_count
-            FROM checks_coverage_lines
-            WHERE check_start_time > now() - interval 3 days
+            FROM checks_coverage_lines FINAL
+            WHERE check_start_time >= '{cutoff}'
               AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+              AND branch = '{self._escape_sql_string(self.branch)}'
               AND notEmpty(test_name)
               AND ({sparse_conds})
             GROUP BY file, line_start, line_end
@@ -1350,6 +1373,7 @@ class Targeting:
         # tests via Jaccard.  Seeds from other narrow regions in the same file have
         # broader callee coverage and higher overlap with domain-related tests.
         FILE_SEED_RC = 30   # narrower than MAX_TESTS_PER_LINE; avoids pulling in broad seeds
+        cutoff = self._coverage_cutoff('checks_coverage_lines')
         if sparse_files:
             _cidb = self._ci_db()
             # sparse_files are already stored-paths (./src/...)
@@ -1361,9 +1385,10 @@ class Targeting:
             SELECT file, line_start, line_end,
                    groupArray(test_name) AS tests,
                    uniqExact(test_name) AS rc
-            FROM checks_coverage_lines
-            WHERE check_start_time > now() - interval 3 days
+            FROM checks_coverage_lines FINAL
+            WHERE check_start_time >= '{cutoff}'
               AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+              AND branch = '{self._escape_sql_string(self.branch)}'
               AND notEmpty(test_name)
               AND ({sparse_conds})
             GROUP BY file, line_start, line_end
@@ -1446,43 +1471,49 @@ class Targeting:
         n_primary = len(primary_tests)
         MIN_SHARED    = max(1, min(10, n_primary // 5))   # 2 for tiny, 10 for large
         MIN_SECONDARY = max(5, min(50, n_primary * 3))   # 15 for tiny, 50 for large
+        ic_cutoff = self._coverage_cutoff('checks_coverage_indirect_calls')
         query = f"""
         SELECT
             ic2.test_name,
             count(DISTINCT ic1.callee_offset) AS shared_callees,
             ic2_tot.tot_callees,
             count(DISTINCT ic1.callee_offset) * 100.0 / ic2_tot.tot_callees AS jaccard_pct
-        FROM checks_coverage_indirect_calls ic1
-        JOIN checks_coverage_indirect_calls ic2 ON ic1.callee_offset = ic2.callee_offset
+        FROM checks_coverage_indirect_calls ic1 FINAL
+        JOIN checks_coverage_indirect_calls ic2 FINAL ON ic1.callee_offset = ic2.callee_offset
         JOIN (
             -- Total number of specific (non-ubiquitous) callees each secondary test
             -- uses.  Used as the Jaccard denominator.
             SELECT test_name, count(DISTINCT callee_offset) AS tot_callees
-            FROM checks_coverage_indirect_calls
-            WHERE check_start_time > now() - interval 3 days
+            FROM checks_coverage_indirect_calls FINAL
+            WHERE check_start_time >= '{ic_cutoff}'
               AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+              AND branch = '{self._escape_sql_string(self.branch)}'
               AND callee_offset IN (
                   SELECT callee_offset
-                  FROM checks_coverage_indirect_calls
-                  WHERE check_start_time > now() - interval 3 days
+                  FROM checks_coverage_indirect_calls FINAL
+                  WHERE check_start_time >= '{ic_cutoff}'
                     AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+                    AND branch = '{self._escape_sql_string(self.branch)}'
                   GROUP BY callee_offset
                   HAVING uniqExact(test_name) < {MAX_CALLEE_TEST_COUNT}
               )
             GROUP BY test_name
             HAVING tot_callees >= {MIN_SECONDARY}
         ) ic2_tot ON ic2.test_name = ic2_tot.test_name
-        WHERE ic1.check_start_time > now() - interval 3 days
-          AND ic2.check_start_time > now() - interval 3 days
+        WHERE ic1.check_start_time >= '{ic_cutoff}'
+          AND ic2.check_start_time >= '{ic_cutoff}'
           AND ic1.check_name LIKE '{self._escape_sql_string(self.job_type)}%'
           AND ic2.check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+          AND ic1.branch = '{self._escape_sql_string(self.branch)}'
+          AND ic2.branch = '{self._escape_sql_string(self.branch)}'
           AND ic1.test_name IN ({escaped_primary})
           AND ic2.test_name NOT IN ({escaped_primary})
           AND ic1.callee_offset IN (
               SELECT callee_offset
-              FROM checks_coverage_indirect_calls
-              WHERE check_start_time > now() - interval 3 days
+              FROM checks_coverage_indirect_calls FINAL
+              WHERE check_start_time >= '{ic_cutoff}'
                 AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+                AND branch = '{self._escape_sql_string(self.branch)}'
               GROUP BY callee_offset
               HAVING uniqExact(test_name) < {MAX_CALLEE_TEST_COUNT}
           )
@@ -1652,11 +1683,13 @@ class Targeting:
         MAX_SIBLING_FILE_TESTS = self.MAX_TESTS_PER_LINE  # same cap as direct coverage
         n_primary = len(primary_tests)
         min_sibling_coverage = max(2, n_primary // 5)
+        cutoff = self._coverage_cutoff('checks_coverage_lines')
         query = f"""
         SELECT DISTINCT test_name
-        FROM checks_coverage_lines
-        WHERE check_start_time > now() - interval 3 days
+        FROM checks_coverage_lines FINAL
+        WHERE check_start_time >= '{cutoff}'
           AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+          AND branch = '{self._escape_sql_string(self.branch)}'
           AND notEmpty(test_name)
           AND test_name NOT IN ({escaped_primary})
           AND ({dir_conds})
@@ -1664,8 +1697,8 @@ class Targeting:
           {sibling_file_filter}
           AND file NOT IN (
               SELECT file
-              FROM checks_coverage_lines
-              WHERE check_start_time > now() - interval 3 days
+              FROM checks_coverage_lines FINAL
+              WHERE check_start_time >= '{cutoff}'
                 AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
                 AND ({dir_conds})
                 {sibling_file_filter}
@@ -1674,8 +1707,10 @@ class Targeting:
           )
           AND file IN (
               SELECT file
-              FROM checks_coverage_lines
-              WHERE check_start_time > now() - interval 3 days
+              FROM checks_coverage_lines FINAL
+              WHERE check_start_time >= '{cutoff}'
+                AND check_name LIKE '{self._escape_sql_string(self.job_type)}%'
+                AND branch = '{self._escape_sql_string(self.branch)}'
                 AND test_name IN ({escaped_primary})
                 AND ({dir_conds})
                 AND ({not_changed})

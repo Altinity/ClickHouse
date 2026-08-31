@@ -25,8 +25,11 @@ class Workflow:
         name: str
         event: str
         jobs: List[Job.Config]
+        additional_jobs: List[str] = field(default_factory=list)
+        if_condition: str = ""
         branches: List[str] = field(default_factory=list)
         base_branches: List[str] = field(default_factory=list)
+        tags: List[str] = field(default_factory=list)
         artifacts: List[Artifact.Config] = field(default_factory=list)
         dockers: List[Docker.Config] = field(default_factory=list)
         secrets: List[Secret.Config] = field(default_factory=list)
@@ -146,5 +149,6 @@ class Workflow:
             description: str
             is_required: bool
             default_value: str
+            input_type: str
             options: Optional[List] = None
             is_boolean: bool = False

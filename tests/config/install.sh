@@ -29,6 +29,8 @@ while [[ "$#" -gt 0 ]]; do
         --fast-test) FAST_TEST=1 && EXPORT_S3_STORAGE_POLICIES=0 ;;
         --analyzer) USE_OLD_ANALYZER=1 ;;
         --s3-storage) EXPORT_S3_STORAGE_POLICIES=1 && USE_S3_STORAGE_FOR_MERGE_TREE=1 && RANDOMIZE_OBJECT_KEY_TYPE=1 ;;
+        --cas-storage) USE_CAS_STORAGE_FOR_MERGE_TREE=1 ;;
+        --cas-s3-storage) USE_CAS_S3_STORAGE_FOR_MERGE_TREE=1 ;;
         --parallel-rep) USE_PARALLEL_REPLICAS=1 ;;
         --db-replicated) USE_DATABASE_REPLICATED=1 ;;
         --distributed-plan) USE_DISTRIBUTED_PLAN=1 ;;
@@ -118,6 +120,7 @@ ln -sf $SRC_PATH/config.d/predicate_statistics_log.xml $DEST_SERVER_PATH/config.
 ln -sf $SRC_PATH/config.d/custom_settings_prefixes.xml $DEST_SERVER_PATH/config.d/
 ln -sf $SRC_PATH/config.d/database_catalog_drop_table_concurrency.xml $DEST_SERVER_PATH/config.d/
 ln -sf $SRC_PATH/config.d/enable_access_control_improvements.xml $DEST_SERVER_PATH/config.d/
+ln -sf $SRC_PATH/config.d/allow_experimental_export_merge_tree_partition.xml $DEST_SERVER_PATH/config.d/
 ln -sf $SRC_PATH/config.d/macros.xml $DEST_SERVER_PATH/config.d/
 ln -sf $SRC_PATH/config.d/secure_ports.xml $DEST_SERVER_PATH/config.d/
 ln -sf $SRC_PATH/config.d/clusters.xml $DEST_SERVER_PATH/config.d/
@@ -445,6 +448,20 @@ if [[ "$USE_S3_STORAGE_FOR_MERGE_TREE" == "1" ]]; then
     else
         ln -sf $SRC_PATH/config.d/s3_storage_policy_for_merge_tree_by_default.xml $DEST_SERVER_PATH/config.d/
     fi
+elif [[ "$USE_CAS_STORAGE_FOR_MERGE_TREE" == "1" ]]; then
+    # Content-addressed disk (over local object storage) as the default MergeTree policy.
+    # Installs ONLY this config so the suite runs with CA-as-default without disturbing
+    # other storage variants (no s3/azure default policies are set up in this mode).
+    ln -sf $SRC_PATH/config.d/cas_storage_policy_for_merge_tree_by_default.xml $DEST_SERVER_PATH/config.d/
+elif [[ "$USE_CAS_S3_STORAGE_FOR_MERGE_TREE" == "1" ]]; then
+    # Content-addressed disk over S3 (minio) as the default MergeTree policy. This is the
+    # real-S3 (north star) counterpart of --cas-storage, which uses local
+    # object storage. minio is started unconditionally by the stateless praktika job (see
+    # ci/jobs/functional_tests.py start_minio), so the disk just needs minio reachable at
+    # localhost:11111 with the `test` bucket and the clickhouse/clickhouse creds, which
+    # setup_minio.sh provides. Installs ONLY this policy to keep the variant clean (no s3/azure
+    # default policies are set up in this mode).
+    ln -sf $SRC_PATH/config.d/cas_s3_storage_policy_for_merge_tree_by_default.xml $DEST_SERVER_PATH/config.d/
 elif [[ "$USE_AZURE_STORAGE_FOR_MERGE_TREE" == "1" ]]; then
     if [[ -n "$USE_ENCRYPTED_STORAGE" ]] && [[ "$USE_ENCRYPTED_STORAGE" -eq 1 ]]; then
         ln -sf $SRC_PATH/config.d/azure_encrypted_storage_policy_by_default.xml $DEST_SERVER_PATH/config.d/

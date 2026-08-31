@@ -95,6 +95,7 @@ DEFAULT_ENV_NAME = ".env"
 # the cwd, which differs between a CI job and a native pytest run.
 TEMP_ABS_DIR = p.abspath(p.join(HELPERS_DIR, "..", temp_dir))
 
+sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|KEY|TOKEN|AZURE)[A-Z_]*")
 
 def find_default_config_path():
     path = os.environ.get("CLICKHOUSE_TESTS_BASE_CONFIG_DIR", None)
@@ -145,7 +146,8 @@ CLICKHOUSE_ERROR_LOG_FILE = "/var/log/clickhouse-server/clickhouse-server.err.lo
 # Minimum version we use in integration tests to check compatibility with old releases
 # Keep in mind that we only support upgrading between releases that are at most 1 year different.
 # This means that this minimum need to be, at least, 1 year older than the current release
-CLICKHOUSE_CI_MIN_TESTED_VERSION = "25.3"
+# NOTE(vnemkov): this is a docker tag, make sure it doesn't include initial 'v'
+CLICKHOUSE_CI_MIN_TESTED_VERSION = "23.3.19.33.altinitystable"
 
 # `Nullable(Tuple)` experimental feature is introduced in 26.1. This has lead to changes in the output return type
 # of many aggregate functions from `Tuple(...)` to `Nullable(Tuple(...))`. This version can be used as baseline to do
@@ -577,7 +579,10 @@ class ClickHouseCluster:
         with_dolor=False,
     ):
         for param in list(os.environ.keys()):
-            logging.debug("ENV %40s %s" % (param, os.environ[param]))
+            value = os.environ[param]
+            if sensitive_var_pattern.match(param):
+                value = f"SECRET[{param}]"
+            logging.debug("ENV %40s %s" % (param, value))
         self.base_path = base_path
         self.base_dir = p.dirname(base_path)
         self.name = name if name is not None else extract_test_name(base_path)
@@ -1403,7 +1408,7 @@ class ClickHouseCluster:
 
         env_variables["keeper_binary"] = binary_path
         env_variables["keeper_cmd_prefix"] = keeper_cmd_prefix
-        env_variables["image"] = "clickhouse/integration-test:" + DOCKER_BASE_TAG
+        env_variables["image"] = "altinityinfra/integration-test:" + DOCKER_BASE_TAG
         env_variables["user"] = str(os.getuid())
         env_variables["keeper_fs"] = "bind"
         for i in range(1, 4):
@@ -2158,7 +2163,7 @@ class ClickHouseCluster:
         hostname=None,
         env_variables=None,
         instance_env_variables=False,
-        image="clickhouse/integration-test",
+        image="altinityinfra/integration-test",
         tag=None,
         # keep the docker container running when clickhouse server is stopped
         stay_alive=False,
@@ -3747,7 +3752,7 @@ class ClickHouseCluster:
                     )
 
             self.login_to_ecr()
-            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=180)
+            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=600)
 
             def logging_compose_up(**kwargs):
                 if "exception" in kwargs:
@@ -4259,7 +4264,7 @@ class ClickHouseCluster:
             if self.with_letsencrypt_pebble and self.base_letsencrypt_pebble_cmd:
                 letsencrypt_pebble_pull_cmd = self.base_letsencrypt_pebble_cmd + ["pull"]
                 retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(
-                    run_and_check, letsencrypt_pebble_pull_cmd, timeout=180
+                    run_and_check, letsencrypt_pebble_pull_cmd, timeout=600
                 )
                 letsencrypt_pebble_start_cmd = self.base_letsencrypt_pebble_cmd + common_opts
                 run_and_check(letsencrypt_pebble_start_cmd)
@@ -4972,7 +4977,7 @@ class ClickHouseInstance:
         hostname=None,
         env_variables=None,
         instance_env_variables=False,
-        image="clickhouse/integration-test",
+        image="altinityinfra/integration-test",
         tag="latest",
         stay_alive=False,
         ipv4_address=None,
@@ -6389,7 +6394,7 @@ class ClickHouseInstance:
 
         if (
             self.randomize_settings
-            and self.image == "clickhouse/integration-test"
+            and self.image == "altinityinfra/integration-test"
             and self.tag == DOCKER_BASE_TAG
             and self.base_config_dir == DEFAULT_BASE_CONFIG_DIR
         ):

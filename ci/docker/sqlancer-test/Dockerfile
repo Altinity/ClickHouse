@@ -1,4 +1,4 @@
-# docker build -t clickhouse/sqlancer-test .
+# docker build -t altinityinfra/sqlancer-test .
 #
 # This image hosts two fuzzers that both run against clickhouse-server over the
 # `com.clickhouse` client-v2 transport under JDK 25:

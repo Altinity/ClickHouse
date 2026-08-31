@@ -1,41 +1,61 @@
 from praktika import Artifact, Docker, Secret
 from praktika.utils import MetaClasses, Utils
+from settings import altinity_overrides
 
 # i.e. "ClickHouse/ci/tmp"
 TEMP_DIR = f"{Utils.cwd()}/ci/tmp"  # == _Settings.TEMP_DIR != env_helper.TEMP_PATH
 
-SYNC = "CH Inc sync"
+SYNC = "Altinity sync"
 
 GH_AUTH_TRUSTED_LAMBDA_NAME = "mint-token-trusted-lambda-terraform"
 
-S3_BUCKET_NAME = "clickhouse-builds"
-S3_REPORT_BUCKET_NAME = "clickhouse-test-reports"
-S3_BUCKET_HTTP_ENDPOINT = "clickhouse-builds.s3.amazonaws.com"
-S3_REPORT_BUCKET_HTTP_ENDPOINT = "s3.amazonaws.com/clickhouse-test-reports"
+S3_BUCKET_NAME = altinity_overrides.S3_BUCKET_NAME
+S3_REPORT_BUCKET_NAME = altinity_overrides.S3_REPORT_BUCKET_NAME
+S3_BUCKET_HTTP_ENDPOINT = altinity_overrides.S3_BUCKET_HTTP_ENDPOINT
+S3_REPORT_BUCKET_HTTP_ENDPOINT = altinity_overrides.S3_REPORT_BUCKET_HTTP_ENDPOINT
 
 
 class RunnerLabels:
     CI_SERVICES = "ci_services"
     CI_SERVICES_EBS = "ci_services_ebs"
-    FUNC_TESTER_AMD = ["self-hosted", "amd-medium"]
-    FUNC_TESTER_ARM = ["self-hosted", "arm-medium"]
-    AMD_LARGE = ["self-hosted", "amd-large"]
-    ARM_LARGE = ["self-hosted", "arm-large"]
-    ARM_LARGE_STORAGE = ["self-hosted", "arm-large-storage"]
-    AMD_MEDIUM = ["self-hosted", "amd-medium"]
-    ARM_MEDIUM = ["self-hosted", "arm-medium"]
-    AMD_MEDIUM_CPU = ["self-hosted", "amd-medium-cpu"]
-    ARM_MEDIUM_CPU = ["self-hosted", "arm-medium-cpu"]
-    AMD_MEDIUM_MEM = ["self-hosted", "amd-medium-mem"]
-    ARM_MEDIUM_MEM = ["self-hosted", "arm-medium-mem"]
-    AMD_SMALL = ["self-hosted", "amd-small"]
-    ARM_SMALL = ["self-hosted", "arm-small"]
-    AMD_SMALL_MEM = ["self-hosted", "amd-small-mem"]
-    ARM_SMALL_MEM = ["self-hosted", "arm-small-mem"]
+    BUILDER_AMD = ["self-hosted", "altinity-on-demand", "altinity-builder"]
+    BUILDER_ARM = ["self-hosted", "altinity-on-demand", "altinity-builder"]
+    FUNC_TESTER_AMD = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
+    FUNC_TESTER_ARM = [
+        "self-hosted",
+        "altinity-on-demand",
+        "altinity-func-tester-aarch64",
+    ]
+    AMD_LARGE = ["self-hosted", "altinity-on-demand", "altinity-builder", "64g"]
+    ARM_LARGE = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64", "16c"]
+    ARM_LARGE_STORAGE = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
+    AMD_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester", "16c"]
+    ARM_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64", "16c"]
+    AMD_MEDIUM_CPU = ["self-hosted", "altinity-on-demand", "altinity-func-tester", "16c"]
+    ARM_MEDIUM_CPU = [
+        "self-hosted",
+        "altinity-on-demand",
+        "altinity-func-tester-aarch64",
+        "16c",
+    ]
+    AMD_MEDIUM_MEM = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
+    ARM_MEDIUM_MEM = [
+        "self-hosted",
+        "altinity-on-demand",
+        "altinity-func-tester-aarch64",
+    ]
+    AMD_SMALL = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
+    ARM_SMALL = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
+    AMD_SMALL_MEM = ["self-hosted", "altinity-on-demand", "altinity-func-tester", "32g"]
+    ARM_SMALL_MEM = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64", "32g"]
     MACOS_ARM_SMALL = ["self-hosted", "macos_m2"]
     MACOS_AMD_SMALL = ["self-hosted", "amd_macos_m1"]
-    STYLE_CHECK_AMD = ["self-hosted", "style-checker"]
-    STYLE_CHECK_ARM = ["self-hosted", "style-checker-aarch64"]
+    STYLE_CHECK_AMD = ["self-hosted", "altinity-on-demand", "altinity-style-checker"]
+    STYLE_CHECK_ARM = [
+        "self-hosted",
+        "altinity-on-demand",
+        "altinity-style-checker-aarch64",
+    ]
 
 
 class CIFiles:
@@ -43,7 +63,7 @@ class CIFiles:
     UNIT_TESTS_BIN = f"{TEMP_DIR}/build/src/unit_tests_dbms"
 
 
-BASE_BRANCH = "master"
+BASE_BRANCH = altinity_overrides.MAIN_BRANCH
 
 azure_secret = Secret.Config(
     name="azure_connection_string",
@@ -52,39 +72,37 @@ azure_secret = Secret.Config(
 
 SECRETS = [
     Secret.Config(
-        name="dockerhub_robot_password",
-        type=Secret.Type.AWS_SSM_PARAMETER,
+        name=altinity_overrides.DOCKERHUB_SECRET,
+        type=Secret.Type.GH_SECRET,
     ),
     Secret.Config(
-        name="clickhouse-test-stat-url",
-        type=Secret.Type.AWS_SSM_PARAMETER,
-        region="us-east-1",
+        name=altinity_overrides.SECRET_CI_DB_URL,
+        type=Secret.Type.GH_SECRET,
     ),
     Secret.Config(
-        name="clickhouse-test-stat-login",
-        type=Secret.Type.AWS_SSM_PARAMETER,
-        region="us-east-1",
+        name=altinity_overrides.SECRET_CI_DB_USER,
+        type=Secret.Type.GH_SECRET,
     ),
     Secret.Config(
-        name="clickhouse-test-stat-password",
-        type=Secret.Type.AWS_SSM_PARAMETER,
-        region="us-east-1",
+        name=altinity_overrides.SECRET_CI_DB_PASSWORD,
+        type=Secret.Type.GH_SECRET,
     ),
-    azure_secret,
+    # azure_secret,
     Secret.Config(
-        name="/github-app/clickhouse-gh.clickhouse-app-id",
-        type=Secret.Type.AWS_SSM_SECRET,
-        region="us-east-1",
+        name="AWS_ACCESS_KEY_ID",
+        type=Secret.Type.GH_SECRET,
     ),
     Secret.Config(
-        name="/github-app/clickhouse-gh.clickhouse-app-key",
-        type=Secret.Type.AWS_SSM_SECRET,
-        region="us-east-1",
+        name="AWS_SECRET_ACCESS_KEY",
+        type=Secret.Type.GH_SECRET,
     ),
     Secret.Config(
-        name="/github-app/clickhouse-gh.installation_id",
-        type=Secret.Type.AWS_SSM_SECRET,
-        region="us-east-1",
+        name="GPG_BINARY_SIGNING_KEY",
+        type=Secret.Type.GH_SECRET,
+    ),
+    Secret.Config(
+        name="GPG_BINARY_SIGNING_PASSPHRASE",
+        type=Secret.Type.GH_SECRET,
     ),
 ]
 
@@ -93,234 +111,235 @@ SECRETS = [
 # and have no IPv6 route; the in-region mirror is reachable and fast. Passed as
 # build args to the Ubuntu-based images, whose Dockerfiles keep canonical
 # defaults so local builds are unchanged.
-APT_MIRROR_BUILD_ARGS = {
-    "apt_archive": "http://us-east-1.ec2.archive.ubuntu.com",
-    "apt_ports_archive": "http://us-east-1.ec2.ports.ubuntu.com",
-}
+#APT_MIRROR_BUILD_ARGS = {
+#    "apt_archive": "http://us-east-1.ec2.archive.ubuntu.com",
+#    "apt_ports_archive": "http://us-east-1.ec2.ports.ubuntu.com",
+# }
+APT_MIRROR_BUILD_ARGS = {} # NOTE (strtgbb): Our runners are not primarily on aws
 
 DOCKERS = [
     Docker.Config(
-        name="clickhouse/style-test",
+        name="altinityinfra/style-test",
         path="./ci/docker/style-test",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
-        build_args=APT_MIRROR_BUILD_ARGS,
+        #build_args=APT_MIRROR_BUILD_ARGS,
     ),
     Docker.Config(
         name="clickhouse/fasttest",
         path="./ci/docker/fasttest",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
-        build_args=APT_MIRROR_BUILD_ARGS,
+        #build_args=APT_MIRROR_BUILD_ARGS,
     ),
     Docker.Config(
-        name="clickhouse/binary-builder",
+        name="altinityinfra/binary-builder",
         path="./ci/docker/binary-builder",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/fasttest"],
+        depends_on=["altinityinfra/fasttest"],
     ),
     Docker.Config(
-        name="clickhouse/wasm-builder",
+        name="altinityinfra/wasm-builder",
         path="./ci/docker/wasm-builder",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/stateless-test",
+        name="altinityinfra/stateless-test",
         path="./ci/docker/stateless-test",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/test-base"],
+        depends_on=["altinityinfra/test-base"],
     ),
     Docker.Config(
-        name="clickhouse/cctools",
+        name="altinityinfra/cctools",
         path="./ci/docker/cctools",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/fasttest"],
+        depends_on=["altinityinfra/fasttest"],
     ),
     Docker.Config(
-        name="clickhouse/utils",
+        name="altinityinfra/utils",
         path="./ci/docker/utils",
         platforms=[Docker.Platforms.AMD],
-        depends_on=["clickhouse/fasttest"],
+        depends_on=["altinityinfra/fasttest"],
     ),
     Docker.Config(
-        name="clickhouse/test-base",
+        name="altinityinfra/test-base",
         path="./ci/docker/test-base",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
-        build_args=APT_MIRROR_BUILD_ARGS,
+        #build_args=APT_MIRROR_BUILD_ARGS,
     ),
     Docker.Config(
-        name="clickhouse/stress-test",
+        name="altinityinfra/stress-test",
         path="./ci/docker/stress-test",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/stateless-test"],
+        depends_on=["altinityinfra/stateless-test"],
     ),
     Docker.Config(
-        name="clickhouse/fuzzer",
+        name="altinityinfra/fuzzer",
         path="./ci/docker/fuzzer",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/test-base"],
+        depends_on=["altinityinfra/test-base"],
     ),
     Docker.Config(
-        name="clickhouse/performance-comparison",
+        name="altinityinfra/performance-comparison",
         path="./ci/docker/performance-comparison",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/test-base"],
+        depends_on=["altinityinfra/test-base"],
     ),
     Docker.Config(
-        name="clickhouse/keeper-jepsen-test",
+        name="altinityinfra/keeper-jepsen-test",
         path="./ci/docker/keeper-jepsen-test",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/test-base"],
+        depends_on=["altinityinfra/test-base"],
     ),
     Docker.Config(
-        name="clickhouse/server-jepsen-test",
+        name="altinityinfra/server-jepsen-test",
         path="./ci/docker/server-jepsen-test",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/test-base"],
+        depends_on=["altinityinfra/test-base"],
     ),
     Docker.Config(
-        name="clickhouse/integration-test",
+        name="altinityinfra/integration-test",
         path="./ci/docker/integration/base",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/test-base"],
+        depends_on=["altinityinfra/test-base"],
     ),
     Docker.Config(
-        name="clickhouse/integration-tests-runner",
+        name="altinityinfra/integration-tests-runner",
         path="./ci/docker/integration/runner",
         platforms=Docker.Platforms.arm_amd,
-        depends_on=["clickhouse/test-base"],
+        depends_on=["altinityinfra/test-base"],
     ),
     Docker.Config(
-        name="clickhouse/integration-test-with-unity-catalog",
+        name="altinityinfra/integration-test-with-unity-catalog",
         path="./ci/docker/integration/clickhouse_with_unity_catalog",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/integration-test-with-hms",
+        name="altinityinfra/integration-test-with-hms",
         path="./ci/docker/integration/clickhouse_with_hms_catalog",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/integration-helper",
+        name="altinityinfra/integration-helper",
         path="./ci/docker/integration/helper_container",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/kerberos-kdc",
+        name="altinityinfra/kerberos-kdc",
         path="./ci/docker/integration/kerberos_kdc",
         platforms=[Docker.Platforms.AMD],
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/test-mysql80",
+        name="altinityinfra/test-mysql80",
         path="./ci/docker/integration/mysql80",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/test-mysql57",
+        name="altinityinfra/test-mysql57",
         path="./ci/docker/integration/mysql57",
         platforms=Docker.Platforms.AMD,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/mysql-golang-client",
+        name="altinityinfra/mysql-golang-client",
         path="./ci/docker/integration/mysql_golang_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/mysql-java-client",
+        name="altinityinfra/mysql-java-client",
         path="./ci/docker/integration/mysql_java_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/mysql-js-client",
+        name="altinityinfra/mysql-js-client",
         path="./ci/docker/integration/mysql_js_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/arrowflight-server-test",
+        name="altinityinfra/arrowflight-server-test",
         path="./ci/docker/integration/arrowflight",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/dotnet-client",
+        name="altinityinfra/dotnet-client",
         path="./ci/docker/integration/dotnet_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/mysql-php-client",
+        name="altinityinfra/mysql-php-client",
         path="./ci/docker/integration/mysql_php_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/nginx-dav",
+        name="altinityinfra/nginx-dav",
         path="./ci/docker/integration/nginx_dav",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/postgresql-java-client",
+        name="altinityinfra/postgresql-java-client",
         path="./ci/docker/integration/postgresql_java_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
-        build_args=APT_MIRROR_BUILD_ARGS,
+        #build_args=APT_MIRROR_BUILD_ARGS,
     ),
     Docker.Config(
-        name="clickhouse/python-bottle",
+        name="altinityinfra/python-bottle",
         path="./ci/docker/integration/resolver",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/s3-proxy",
+        name="altinityinfra/s3-proxy",
         path="./ci/docker/integration/s3_proxy",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/docs-builder",
+        name="altinityinfra/docs-builder",
         path="./ci/docker/docs-builder",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/install-deb-test",
+        name="altinityinfra/install-deb-test",
         path="./ci/docker/install/deb",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
-        build_args=APT_MIRROR_BUILD_ARGS,
+        #build_args=APT_MIRROR_BUILD_ARGS,
     ),
     Docker.Config(
-        name="clickhouse/install-rpm-test",
+        name="altinityinfra/install-rpm-test",
         path="./ci/docker/install/rpm",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/sqlancer-test",
+        name="altinityinfra/sqlancer-test",
         path="./ci/docker/sqlancer-test",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
-        build_args=APT_MIRROR_BUILD_ARGS,
+        #build_args=APT_MIRROR_BUILD_ARGS,
     ),
     Docker.Config(
-        name="clickhouse/mysql_dotnet_client",
+        name="altinityinfra/mysql_dotnet_client",
         path="./ci/docker/integration/mysql_dotnet_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
-        build_args=APT_MIRROR_BUILD_ARGS,
+        #build_args=APT_MIRROR_BUILD_ARGS,
     ),
 ]
 

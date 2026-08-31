@@ -14,7 +14,7 @@ workflow = Workflow.Config(
     name="MergeQueueCI",
     event=Workflow.Event.MERGE_QUEUE,
     jobs=[
-        JobConfigs.style_check,
+        # JobConfigs.style_check, # NOTE (strtgbb): We don't use style check
         JobConfigs.fast_test,
         *[job for job in JobConfigs.build_jobs if job.name == "Build (amd_binary)"],
         # Reruns the PR's new/changed stateless tests against the merge group
@@ -43,8 +43,8 @@ workflow = Workflow.Config(
     workflow_filter_hooks=[should_skip_merge_queue_job],
     pre_hooks=[
         "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/set_dummy_sync_commit_status.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/check_sync_pr_mergeable.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/set_dummy_sync_commit_status.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/check_sync_pr_mergeable.py",
     ],
     # check_sync_pr_mergeable.py needs a token with a broader permission scope -
     # mint it from the dedicated lambda.

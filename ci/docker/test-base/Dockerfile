@@ -1,4 +1,4 @@
-# docker build -t clickhouse/test-base .
+# docker build -t altinityinfra/test-base .
 FROM ubuntu:22.04
 
 # ARG for quick switch to a given ubuntu mirror. Defaults stay canonical so local

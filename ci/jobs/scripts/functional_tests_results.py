@@ -13,6 +13,7 @@ FAIL_SIGN = "[ FAIL "
 UNKNOWN_SIGN = "[ UNKNOWN "
 SKIPPED_SIGN = "[ SKIPPED "
 NOT_FAILED_SIGN = "[ NOT_FAILED "
+BROKEN_SIGN = "[ BROKEN "
 HUNG_SIGN = "Found hung queries in processlist"
 DATABASE_SIGN = "Database: "
 
@@ -86,7 +87,7 @@ RETRIES_SIGN = "Some tests were restarted"
 # Test names can contain letters, digits, underscores, hyphens, and dots.
 TEST_RESULT_PATTERN = re.compile(
     r"^.{0,36}?"
-    r"([\w\-\.]+):\s+(\[ (?:OK|FAIL|SKIPPED|UNKNOWN|NOT_FAILED) \])\s+([\d.]+) sec\."
+    r"([\w\-\.]+):\s+(\[ (?:OK|FAIL|SKIPPED|BROKEN|UNKNOWN|NOT_FAILED) \])\s+([\d.]+) sec\."
 )
 
 
@@ -98,6 +99,7 @@ class FTResultsProcessor:
         unknown: int
         failed: int
         success: int
+        broken: int
         test_results: List[Result]
         hung: bool = False
         retries: bool = False
@@ -105,9 +107,10 @@ class FTResultsProcessor:
         no_tests_run: bool = False
         test_end: bool = True
 
-    def __init__(self, wd):
+    def __init__(self, wd, test_options):
         self.tests_output_file = f"{wd}/test_result.txt"
         self.debug_files = []
+        self.test_options = test_options
 
     def _process_test_output(self):
         total = 0
@@ -115,6 +118,7 @@ class FTResultsProcessor:
         unknown = 0
         failed = 0
         success = 0
+        broken = 0
         hung = False
         retries = False
         success_finish = False
@@ -170,13 +174,16 @@ class FTResultsProcessor:
                     elif SKIPPED_SIGN in status_marker:
                         skipped += 1
                         test_results.append((test_name, "SKIPPED", test_time, []))
+                    elif BROKEN_SIGN in line:
+                        broken += 1
+                        test_results.append((test_name, "BROKEN", test_time, []))
                     else:
                         success += int(OK_SIGN in status_marker)
                         test_results.append((test_name, "OK", test_time, []))
                     test_end = False
                 elif (
                     len(test_results) > 0
-                    and test_results[-1][1] in ("FAIL", "SKIPPED", "NOT_FAILED")
+                    and test_results[-1][1] in ("FAIL", "SKIPPED", "BROKEN", "NOT_FAILED")
                     and not test_end
                 ):
                     test_results[-1][3].append(original_line)
@@ -224,6 +231,7 @@ class FTResultsProcessor:
             unknown=unknown,
             failed=failed,
             success=success,
+            broken=broken,
             test_results=test_results,
             hung=hung,
             success_finish=success_finish,
@@ -363,7 +371,7 @@ class FTResultsProcessor:
                 )
 
         if not info:
-            info = f"Failed: {s.failed}, Passed: {s.success}, Skipped: {s.skipped}"
+            info = f"Failed: {s.failed}, Passed: {s.success}, Skipped: {s.skipped}, Broken: {s.broken}"
 
         result = Result.create_from(
             name=task_name,

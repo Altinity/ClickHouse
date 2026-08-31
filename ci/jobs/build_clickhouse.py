@@ -130,13 +130,17 @@ def setup_build_caches_env(info):
         os.environ["SCCACHE_S3_READ_ONLY"] = "true"
     os.makedirs(build_dir, exist_ok=True)
 
-    if info.is_local_run:
+    if info.is_local_run or info.is_community_pr:
         if os.environ.get("SCCACHE_ENDPOINT"):
             print(f"NOTE: Using custom sccache endpoint: {os.environ['SCCACHE_ENDPOINT']}")
-        if os.environ.get("AWS_ACCESS_KEY_ID"):
+        if os.environ.get("AWS_ACCESS_KEY_ID") and not info.is_community_pr:
             print("NOTE: Using custom AWS credentials for sccache")
         else:
             os.environ["SCCACHE_S3_NO_CREDENTIALS"] = "true"
+        # NOTE (strtgbb): sccache will throw an error if AWS credentials are present with SCCACHE_S3_NO_CREDENTIALS=1
+        os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+        os.environ.pop("AWS_ACCESS_KEY_ID", None)
+
     else:
         # Default timeout (10min), can be too low, we run this in docker
         # anyway, will be terminated once the build is finished

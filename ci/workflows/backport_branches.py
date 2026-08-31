@@ -1,6 +1,7 @@
 from praktika import Workflow
 
 from ci.defs.defs import DOCKERS, SECRETS, ArtifactConfigs
+from ci.defs.altinity_jobs import AltinityJobConfigs
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
 
@@ -45,6 +46,7 @@ workflow = Workflow.Config(
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *ArtifactConfigs.clickhouse_binaries,
+        *ArtifactConfigs.clickhouse_stripped_binaries,
         *ArtifactConfigs.clickhouse_darwin_plain_binaries,
         *ArtifactConfigs.clickhouse_debians,
         *ArtifactConfigs.clickhouse_rpms,

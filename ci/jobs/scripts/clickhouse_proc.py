@@ -8,6 +8,7 @@ import time
 import threading
 import traceback
 import uuid
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import List
@@ -1213,7 +1214,7 @@ clickhouse-client --query "SELECT count() FROM test.visits"
             "trace_log",
             "transactions_info_log",
             "metric_log",
-            "blob_storage_log",
+            # "blob_storage_log", # NOTE (strtgbb): contains Azure container name, currently considered secret by s3 upload secret scanner.
             "error_log",
             "query_metric_log",
             "part_log",
@@ -1447,6 +1448,7 @@ if __name__ == "__main__":
     res = False
     try:
         if command == "logs_export_config":
+            exit(0) # Note (strtgbb): We don't use log exports
             if not Info().is_local_run:
                 # Disable log export for local runs - ideally this command wouldn't be triggered,
                 # but conditional disabling is complex in legacy bash scripts (run_fuzzer.sh, stress_runner.sh)
@@ -1454,6 +1456,7 @@ if __name__ == "__main__":
             else:
                 res = True
         elif command == "logs_export_start":
+            exit(0) # Note (strtgbb): We don't use log exports
             # FIXME: the start_time must be preserved globally in ENV or something like that
             # to get the same values in different DBs
             # As a wild idea, it could be stored in a Info.check_start_timestamp
@@ -1464,6 +1467,7 @@ if __name__ == "__main__":
             else:
                 res = True
         elif command == "logs_export_stop":
+            exit(0) # Note (strtgbb): We don't use log exports
             if not Info().is_local_run:
                 # Disable log export for local runs - ideally this command wouldn't be triggered,
                 # but conditional disabling is complex in legacy bash scripts (run_fuzzer.sh, stress_runner.sh)

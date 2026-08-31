@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import random
 import subprocess
 import zlib
@@ -9,7 +10,7 @@ from pathlib import Path
 from ci.jobs.scripts.bugfix_validation import bugfix_build_types, find_master_builds
 from ci.jobs.scripts.cidb_cluster import CIDBCluster
 from ci.jobs.scripts.clickhouse_proc import ClickHouseProc
-from ci.jobs.scripts.find_tests import Targeting
+from ci.jobs.scripts.find_tests import Targeting, resolve_workflow_branch
 from ci.jobs.scripts.functional_tests.export_coverage import CoverageExporter
 from ci.jobs.scripts.functional_tests_results import FTResultsProcessor
 from ci.jobs.scripts.workflow_hooks.pr_labels_and_category import Labels
@@ -176,6 +177,10 @@ OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "azure": " --azure-blob-storage --no-random-settings --no-random-merge-tree-settings",  # azurite is slow, with randomization it can be super slow
     "parallel": "--no-sequential",
     "sequential": "--no-parallel",
+    "amd_tsan": " --timeout 1200",  # NOTE (strtgbb): tsan is slow, increase the timeout to avoid timeout errors
+    "amd_debug": " --timeout 1200", # NOTE (carlosfelipeor): debug jobs hit network-latency tails on Altinity infra
+    "arm_binary": " --timeout 1200", # NOTE (carlosfelipeor): binary jobs hit network-latency tails on Altinity infra
+    "amd_binary": " --timeout 1200", # NOTE (carlosfelipeor): binary jobs hit network-latency tails on Altinity infra
     "flaky check": "--flaky-check",
     "targeted": "--flaky-check --no-self-parallel",
 }
@@ -412,7 +417,7 @@ def main():
     is_per_test_coverage = False
     runner_options = ""
     # optimal value for most of the jobs
-    nproc = int(Utils.cpu_count() * 0.6)
+    nproc = int(Utils.cpu_count() * 0.5)
     info = Info()
 
     for to in test_options:
@@ -574,6 +579,9 @@ def main():
             nproc = int(Utils.cpu_count() * 0.4)
         elif "msan" in args.options:
             # MSan is slow
+            nproc = int(Utils.cpu_count() * 0.4)
+        elif "debug" in args.options and nproc < 24:
+            # leave more room for clickhouse-server on medium runners.
             nproc = int(Utils.cpu_count() * 0.4)
         elif is_azure_storage:
             # azure FT runs only under ASan; concurrent heavy queries overrun the
@@ -780,7 +788,11 @@ def main():
         if not has_stateful:
             has_stateful_tests = False
 
-    targeter = Targeting(info=info)
+    if not info.is_community_pr:
+        targeter = Targeting(info=info)
+    else:
+        targeter = None
+
     if is_flaky_check or is_bugfix_validation:
         if info.is_local_run:
             assert (
@@ -876,12 +888,13 @@ def main():
 
     if res and JobStages.INSTALL_CLICKHOUSE in stages:
 
-        def configure_log_export():
-            if not info.is_local_run:
-                print("prepare log export config")
-                return CH.create_log_export_config()
-            else:
-                print("skip log export config for local run")
+        # NOTE (strtgbb): Disable log export throughout this file, it depends on aws ssm, which we don't have configured
+        # def configure_log_export():
+        #     if not info.is_local_run:
+        #         print("prepare log export config")
+        #         return CH.create_log_export_config()
+        #     else:
+        #         print("skip log export config for local run")
 
         commands = [
             "rm -rf /etc/clickhouse-client/* /etc/clickhouse-server/* /etc/clickhouse-server1/* /etc/clickhouse-server2/*",
@@ -940,8 +953,8 @@ def main():
             f"prof_prefix:{temp_dir}/jemalloc_profiles/clickhouse.jemalloc"
         )
 
-        if not is_llvm_coverage:
-            commands.append(configure_log_export)
+        # if not is_llvm_coverage:
+        #     commands.append(configure_log_export)
 
         results.append(
             Result.from_commands_run(name="Install ClickHouse", command=commands)
@@ -988,11 +1001,13 @@ def main():
                 # Fail fast on infra setup errors so we don't burn time
                 # triaging Kafka/Avro test failures caused by a broken setup.
                 return False
+            
 
-            if not Info().is_local_run:
-                if not CH.start_log_exports(stop_watch.start_time):
-                    info.add_workflow_warning("Failed to start log export")
-                    print("Failed to start log export")
+            # Note (strtgbb): We don't use this
+            # if not Info().is_local_run:
+            #     if not CH.start_log_exports(stop_watch.start_time):
+            #         info.add_workflow_warning("Failed to start log export")
+            #         print("Failed to start log export")
 
             res = True
             if has_stateful_tests:
@@ -1037,13 +1052,15 @@ def main():
             results[-1].set_info(note)
         res = results[-1].is_ok()
 
+    runner_options += f" --known-fails-file-path tests/broken_tests.yaml"
+
     test_result = None
     if res and JobStages.TEST in stages:
         stop_watch_ = Utils.Stopwatch()
         step_name = "Tests"
         print(step_name)
 
-        ft_res_processor = FTResultsProcessor(wd=temp_dir)
+        ft_res_processor = FTResultsProcessor(wd=temp_dir, test_options=test_options)
 
         global_time_limit = 0
         if is_flaky_check:
@@ -1259,7 +1276,9 @@ def main():
                         test_result.status = Result.Status.ERROR
                         break
 
-                    ft_res_processor_bt = FTResultsProcessor(wd=temp_dir)
+                    ft_res_processor_bt = FTResultsProcessor(
+                        wd=temp_dir, test_options=test_options
+                    )
                     bt_runner_exit_code = run_tests(
                         batch_num=0,
                         batch_total=0,
@@ -1421,6 +1440,7 @@ def main():
                     src=CH,
                     dest=cidb_cluster,
                     job_name=info.job_name,
+                    branch=resolve_workflow_branch(info),
                 ).do(),
             )
         )
@@ -1525,6 +1545,10 @@ def main():
         stacktrace_log_path = Path(stacktrace_log)
         if stacktrace_log_path.exists():
             debug_files.append(stacktrace_log_path)
+
+    broken_tests_handler_log = os.path.join(temp_dir, "broken_tests_handler.log")
+    if os.path.exists(broken_tests_handler_log):
+        debug_files.append(broken_tests_handler_log)
 
     R = Result.create_from(
         results=results,

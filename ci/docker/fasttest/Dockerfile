@@ -1,4 +1,4 @@
-# docker build -t clickhouse/fasttest .
+# docker build -t altinityinfra/fasttest .
 FROM ubuntu:24.04
 
 # ARG for quick switch to a given ubuntu mirror. Defaults stay canonical so local

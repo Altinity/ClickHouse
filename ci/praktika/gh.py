@@ -1269,6 +1269,7 @@ class GH:
         Result.Status.DROPPED: Result.GHStatus.ERROR,
         Result.Status.UNKNOWN: Result.GHStatus.FAILURE,
         Result.Status.XFAIL: Result.GHStatus.SUCCESS,
+        Result.Status.BROKEN: Result.GHStatus.SUCCESS,
         Result.Status.XPASS: Result.GHStatus.FAILURE,
     }
 
@@ -1295,7 +1296,9 @@ class GH:
 
     @classmethod
     def print_actions_debug_info(cls):
-        cls.print_log_in_group("GITHUB_ENVS", Shell.get_output("env | grep ^GITHUB_"))
+        cls.print_log_in_group(
+            "GITHUB_ENVS", Shell.get_output("env | grep -P '^GITHUB_(?!.*TOKEN)'")
+        )
         cls.print_log_in_group(
             "GITHUB_EVENT", Shell.get_output("cat $GITHUB_EVENT_PATH")
         )

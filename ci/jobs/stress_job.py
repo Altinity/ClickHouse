@@ -1,6 +1,7 @@
 import csv
 import logging
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -134,6 +135,12 @@ def get_additional_envs(info, check_name: str) -> List[str]:
     result.append("RANDOMIZE_KEEPER_FEATURE_FLAGS=1")
     if "azure" in check_name:
         result.append("USE_AZURE_STORAGE_FOR_MERGE_TREE=1")
+        result.extend([
+            "AZURE_STORAGE_KEY=$AZURE_STORAGE_KEY",
+            "AZURE_ACCOUNT_NAME=$AZURE_ACCOUNT_NAME",
+            "AZURE_CONTAINER_NAME=$AZURE_CONTAINER_NAME",
+            "AZURE_STORAGE_ACCOUNT_URL=$AZURE_STORAGE_ACCOUNT_URL",
+        ])
 
     if "s3" in check_name:
         result.append("USE_S3_STORAGE_FOR_MERGE_TREE=1")
@@ -163,12 +170,24 @@ def get_run_command(
     else:
         run_script = "/repo/tests/docker_scripts/stress_runner.sh"
 
+    # Nested docker does not inherit the runner /etc/hosts.
+    # --network=host would expose minio and azurite. Skip --add-host when the
+    # name is unknown (CI Tests e2e / local) rather than failing the job.
+    proxy_host = "dockerhub-proxy.dockerhub-proxy-zone"
+    add_host = ""
+    try:
+        proxy_ip = socket.getaddrinfo(proxy_host, None)[0][4][0]
+        add_host = f"--add-host={proxy_host}:{proxy_ip} "
+    except OSError:
+        logging.info("Could not resolve %s; not passing --add-host", proxy_host)
+
     cmd = (
         "docker run --cap-add=SYS_PTRACE "
         # For dmesg and sysctl
         "--privileged "
         # azurite-rs (in-process Azure Blob Storage emulator) needs many fds under parallel load
         "--ulimit nofile=1048576:1048576 "
+        f"{add_host}"
         # a static link, don't use S3_URL or S3_DOWNLOAD
         "-e S3_URL='https://s3.amazonaws.com/clickhouse-datasets' "
         "--tmpfs /tmp/clickhouse:mode=1777 "
@@ -260,7 +279,7 @@ def run_stress_test(upgrade_check: bool = False) -> None:
 
     packages_path = temp_path
 
-    docker_image = DockerImage.get_docker_image("clickhouse/stress-test").pull_image()
+    docker_image = DockerImage.get_docker_image("altinityinfra/stress-test").pull_image()
 
     server_log_path = temp_path / "server_log"
     server_log_path.mkdir(parents=True, exist_ok=True)
