@@ -64,6 +64,10 @@ struct MergeTreePartitionExportTask
     Status status = Status::PENDING;
     LastException last_exception;
 
+    size_t retry_initial_backoff_seconds = 5;
+    size_t retry_max_backoff_seconds = 300;
+    size_t task_timeout_seconds = 86400;
+
     /// Export settings. Field names are intentionally identical to
     /// `ExportReplicatedMergeTreePartitionManifest` so that
     /// `ExportPartitionUtils::getContextCopyWithTaskSettings` works for both descriptors.
@@ -167,6 +171,9 @@ struct MergeTreePartitionExportTask
         exception_object->set("count", last_exception.count);
         json.set("last_exception", exception_object);
 
+        json.set("retry_initial_backoff_seconds", retry_initial_backoff_seconds);
+        json.set("retry_max_backoff_seconds", retry_max_backoff_seconds);
+        json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("max_threads", max_threads);
         json.set("parallel_formatting", parallel_formatting);
         json.set("parquet_parallel_encoding", parquet_parallel_encoding);
@@ -238,6 +245,9 @@ struct MergeTreePartitionExportTask
             task.last_exception.count = exception_object->getValue<size_t>("count");
         }
 
+        task.retry_initial_backoff_seconds = json->getValue<size_t>("retry_initial_backoff_seconds");
+        task.retry_max_backoff_seconds = json->getValue<size_t>("retry_max_backoff_seconds");
+        task.task_timeout_seconds = json->getValue<size_t>("task_timeout_seconds");
         task.max_threads = json->getValue<size_t>("max_threads");
         task.parallel_formatting = json->getValue<bool>("parallel_formatting");
         task.parquet_parallel_encoding = json->getValue<bool>("parquet_parallel_encoding");

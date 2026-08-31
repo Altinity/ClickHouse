@@ -27,6 +27,11 @@ namespace ExportPartitionUtils
 {
     bool isNonRetryableExportError(int code);
 
+    /// Capped exponential back-off, matching the standard ClickHouse convention
+    /// (see ZooKeeperRetriesControl): delay = min(initial << (retry_count - 1), max).
+    /// `retry_count` is the number of failures so far (>= 1 when a retry is pending).
+    size_t computeRetryBackoffSeconds(size_t retry_count, size_t initial_backoff_seconds, size_t max_backoff_seconds);
+
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
     /// Build a query context carrying the export task's persisted settings. Templated on the

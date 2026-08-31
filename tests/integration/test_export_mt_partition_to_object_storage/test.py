@@ -9,6 +9,7 @@ from helpers.export_partition_helpers import (
     unique_suffix,
     wait_for_export_status,
     wait_for_export_to_start,
+    wait_for_exception_count,
 )
 from helpers.network import PartitionManager
 
@@ -217,6 +218,118 @@ def test_kill_export(cluster):
         == "0\n"
     ), "Partition 2020 was committed despite being killed"
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "0\n"
+
+
+def test_export_task_timeout_kills_stuck_pending_task(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node"]
+
+    postfix = unique_suffix()
+    mt_table = f"timeout_mt_{postfix}"
+    s3_table = f"timeout_s3_{postfix}"
+
+    create_tables_and_insert_data(node, mt_table, s3_table)
+
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        pm.add_rule({
+            "instance": node,
+            "destination": node.ip_address,
+            "protocol": "tcp",
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        })
+        pm.add_rule({
+            "instance": node,
+            "destination": minio_ip,
+            "protocol": "tcp",
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        })
+
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5"
+        )
+
+        wait_for_export_status(node, mt_table, s3_table, "2020", "KILLED", system_table=SYSTEM_TABLE, timeout=30)
+
+    last_exception = node.query(
+        f"SELECT last_exception FROM system.{SYSTEM_TABLE}"
+        f" WHERE source_table = '{mt_table}'"
+        f"   AND destination_table = '{s3_table}'"
+        f"   AND partition_id = '2020'"
+    ).strip()
+    assert "timed out" in last_exception, (
+        f"Expected last_exception to mention the timeout reason, got: {last_exception!r}"
+    )
+
+    assert (
+        node.query(
+            f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)"
+        )
+        == "0\n"
+    ), "Commit file exists despite task timeout"
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "0\n"
+
+
+def test_export_retry_backoff_paces_retries(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node"]
+
+    postfix = unique_suffix()
+    mt_table = f"backoff_mt_{postfix}"
+    s3_table = f"backoff_s3_{postfix}"
+
+    create_tables_and_insert_data(node, mt_table, s3_table)
+
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        pm.add_rule({
+            "instance": node,
+            "destination": node.ip_address,
+            "protocol": "tcp",
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        })
+        pm.add_rule({
+            "instance": node,
+            "destination": minio_ip,
+            "protocol": "tcp",
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        })
+
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+            f"SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = 30, "
+            f"export_merge_tree_partition_retry_max_backoff_seconds = 30"
+        )
+
+        count_after_first = wait_for_exception_count(
+            node, mt_table, s3_table, "2020", min_exception_count=1, timeout=60, system_table=SYSTEM_TABLE
+        )
+
+        # While the part is backing off (~30s) it must not be retried again. Without back-off the
+        # ~5s tick would add roughly five more failures.
+        time.sleep(25)
+        count_during_backoff = int(node.query(
+            f"SELECT exception_count FROM system.{SYSTEM_TABLE}"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{s3_table}'"
+            f"   AND partition_id = '2020'"
+        ).strip())
+        assert count_during_backoff - count_after_first <= 2, (
+            f"exception_count jumped during the back-off window: "
+            f"{count_after_first} -> {count_during_backoff}; back-off was not applied"
+        )
+
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED", system_table=SYSTEM_TABLE, timeout=120)
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "3\n"
 
 
 def test_export_partition_resumes_after_restart(cluster):

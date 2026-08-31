@@ -1,7 +1,9 @@
 #pragma once
 
+#include <ctime>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
@@ -75,6 +77,15 @@ private:
         /// True while a commit attempt is in progress, so run() and completion callbacks do not
         /// drive commitExportPartitionTransaction concurrently for the same task.
         bool committing = false;
+        /// In-memory per-part retry back-off. Keyed by part name so a force-replace of the same
+        /// composite key does not inherit a prior instance's delay. Not persisted: after restart
+        /// the first retry is immediate, then back-off resumes from subsequent failures.
+        struct PartBackoff
+        {
+            size_t attempts = 0;
+            time_t next_retry_time = 0;
+        };
+        std::unordered_map<String, PartBackoff> part_backoff;
     };
 
     mutable std::mutex mutex;

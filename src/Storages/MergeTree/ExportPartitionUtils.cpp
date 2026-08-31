@@ -12,6 +12,7 @@
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <Parsers/IAST.h>
 #include <algorithm>
+#include <limits>
 #include <filesystem>
 #include <thread>
 #include <unordered_map>
@@ -157,6 +158,27 @@ namespace ExportPartitionUtils
             ErrorCodes::DECIMAL_OVERFLOW,
         };
         return non_retryable_codes.contains(code);
+    }
+
+    size_t computeRetryBackoffSeconds(size_t retry_count, size_t initial_backoff_seconds, size_t max_backoff_seconds)
+    {
+        const size_t initial = std::min(initial_backoff_seconds, max_backoff_seconds);
+
+        if (retry_count <= 1 || initial == 0)
+            return initial;
+
+        const size_t shift = retry_count - 1;
+
+        /// If shifting would overflow size_t, the result is certainly clamped to the cap.
+        static constexpr size_t bits = sizeof(size_t) * 8;
+        if (shift >= bits)
+            return max_backoff_seconds;
+
+        const size_t headroom = std::numeric_limits<size_t>::max() >> shift;
+        if (initial > headroom)
+            return max_backoff_seconds;
+
+        return std::min(initial << shift, max_backoff_seconds);
     }
 
     Block getPartitionSourceBlockForIcebergCommit(

@@ -114,6 +114,9 @@ namespace Setting
     extern const SettingsUInt64 max_parts_to_move;
     extern const SettingsUpdateParallelMode update_parallel_mode;
     extern const SettingsBool export_merge_tree_partition_force_export;
+    extern const SettingsUInt64 export_merge_tree_partition_retry_initial_backoff_seconds;
+    extern const SettingsUInt64 export_merge_tree_partition_retry_max_backoff_seconds;
+    extern const SettingsUInt64 export_merge_tree_partition_task_timeout_seconds;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
     extern const SettingsParquetCompression output_format_parquet_compression_method;
@@ -3874,6 +3877,9 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     for (const auto & part : parts)
         descriptor.parts.push_back({part->name, /*done*/ false, /*paths*/ {}});
 
+    descriptor.retry_initial_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_initial_backoff_seconds];
+    descriptor.retry_max_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_max_backoff_seconds];
+    descriptor.task_timeout_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_task_timeout_seconds];
     descriptor.max_threads = query_context->getSettingsRef()[Setting::max_threads];
     descriptor.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];
     descriptor.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];

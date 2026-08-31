@@ -16,6 +16,8 @@
 #include <IO/ReadBufferFromFileBase.h>
 #include <Core/Defines.h>
 #include <base/types.h>
+#include <algorithm>
+#include <limits>
 
 #include <filesystem>
 
@@ -162,23 +164,73 @@ std::vector<PartitionExportInfo> MergeTreePartitionExportScheduler::getInfo() co
 
 bool MergeTreePartitionExportScheduler::run()
 {
-    /// Fast path: if no task is PENDING there is nothing to do, so report "no pending work" and let
-    /// the schedule-pool task go idle instead of waking every tick. New work re-arms the task via
-    /// triggerPartitionExportTask (from addTask) and via loadFromDisk at startup.
+    std::vector<String> timed_out_transactions;
+    bool any_pending = false;
+
+    /// Timeout is checked first, before the "cannot make progress this tick" early returns,
+    /// so a wedged task (no move executors, memory pressure, ...) still expires.
     {
         std::lock_guard lock(mutex);
-        bool any_pending = false;
-        for (const auto & [key, entry] : tasks)
+        const auto now = time(nullptr);
+        for (auto & [key, entry] : tasks)
         {
-            if (entry.descriptor.status == MergeTreePartitionExportTask::Status::PENDING)
+            auto & descriptor = entry.descriptor;
+            if (descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+                continue;
+
+            if (descriptor.task_timeout_seconds > 0
+                && descriptor.create_time + static_cast<time_t>(descriptor.task_timeout_seconds) < now)
             {
-                any_pending = true;
-                break;
+                /// A commit already in flight may have landed on the destination; do not overwrite
+                /// it with KILLED (same as a user KILL that sees `committing`).
+                if (entry.committing)
+                {
+                    any_pending = true;
+                    continue;
+                }
+
+                const auto transaction_id = descriptor.transaction_id;
+                const auto timeout_seconds = descriptor.task_timeout_seconds;
+                auto updated = descriptor;
+                updated.status = MergeTreePartitionExportTask::Status::KILLED;
+                updated.last_exception.message = fmt::format(
+                    "Export partition task timed out: exceeded export_merge_tree_partition_task_timeout_seconds={} (created at {}, now {})",
+                    timeout_seconds, descriptor.create_time, now);
+                updated.last_exception.part = "";
+                updated.last_exception.time = now;
+                updated.last_exception.count += 1;
+
+                try
+                {
+                    persist(key, updated.toJsonString());
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(storage.log, "ExportPartition: failed to persist timeout kill, will retry");
+                    any_pending = true;
+                    continue;
+                }
+
+                entry.descriptor = std::move(updated);
+                timed_out_transactions.push_back(transaction_id);
+                LOG_WARNING(storage.log,
+                    "ExportPartition: task {} exceeded task_timeout_seconds={}s, transitioned PENDING -> KILLED",
+                    transaction_id, timeout_seconds);
+                continue;
             }
+
+            any_pending = true;
         }
-        if (!any_pending)
+
+        if (!any_pending && timed_out_transactions.empty())
             return false;
     }
+
+    for (const auto & transaction_id : timed_out_transactions)
+        storage.killExportPart(transaction_id);
+
+    if (!any_pending)
+        return false;
 
     /// There is pending work. Even if we cannot make progress this tick (no move executors, moves
     /// stopped, or memory pressure), keep the scheduler awake so it retries on the next tick.
@@ -198,6 +250,7 @@ bool MergeTreePartitionExportScheduler::run()
 
     {
         std::lock_guard lock(mutex);
+        const auto now = time(nullptr);
         size_t scheduled = 0;
         for (auto & [key, entry] : tasks)
         {
@@ -222,6 +275,9 @@ bool MergeTreePartitionExportScheduler::run()
                 if (scheduled >= available_move_executors)
                     break;
                 if (part.done || entry.in_flight_parts.contains(part.part_name))
+                    continue;
+                if (const auto backoff_it = entry.part_backoff.find(part.part_name);
+                    backoff_it != entry.part_backoff.end() && now < backoff_it->second.next_retry_time)
                     continue;
 
                 entry.in_flight_parts.insert(part.part_name);
@@ -372,6 +428,7 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
 
         if (result.success)
         {
+            entry->part_backoff.erase(part_name);
             if (entry->descriptor.allPartsDone() && !entry->committing)
             {
                 entry->committing = true;
@@ -385,8 +442,18 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
         }
         else
         {
-            LOG_INFO(storage.log, "ExportPartition: task {} part {} failed with retryable error, will retry",
-                transaction_id, part_name);
+            auto & backoff = entry->part_backoff[part_name];
+            ++backoff.attempts;
+            const auto backoff_seconds = ExportPartitionUtils::computeRetryBackoffSeconds(
+                backoff.attempts,
+                entry->descriptor.retry_initial_backoff_seconds,
+                entry->descriptor.retry_max_backoff_seconds);
+            const auto now = time(nullptr);
+            const size_t headroom = static_cast<size_t>(std::numeric_limits<time_t>::max() - now);
+            backoff.next_retry_time = now + static_cast<time_t>(std::min(backoff_seconds, headroom));
+
+            LOG_INFO(storage.log, "ExportPartition: task {} part {} failed with retryable error, will retry at {}",
+                transaction_id, part_name, backoff.next_retry_time);
         }
     }
 
