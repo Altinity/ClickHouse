@@ -647,14 +647,13 @@ void MergeTreePartitionExportScheduler::loadFromDisk()
 
             TaskEntry entry;
 
-            /// Re-pin the not-yet-exported parts of a resumable task so background merges do not
-            /// remove them before the export finishes.
+            /// Re-pin every source part of a resumable task, including already-exported ones.
+            /// Unfinished parts still need to be read; Iceberg commit also derives partition
+            /// values from the original parts, so they must survive until COMPLETED/FAILED/KILLED.
             if (descriptor.status == MergeTreePartitionExportTask::Status::PENDING)
             {
                 for (const auto & part : descriptor.parts)
                 {
-                    if (part.done)
-                        continue;
                     if (auto data_part = storage.getPartIfExists(
                             part.part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}))
                         entry.part_references.push_back(data_part);

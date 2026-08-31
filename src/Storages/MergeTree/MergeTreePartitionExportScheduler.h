@@ -58,8 +58,6 @@ public:
     /// the task go idle until the next addTask/startup trigger.
     bool run();
 
-    /// Reloads persisted descriptors from disk and re-pins the parts of PENDING tasks. Called once
-    /// during table startup, before background merges can remove parts.
     void loadFromDisk();
 
     static String compositeKey(const String & partition_id, const String & destination_database, const String & destination_table);
@@ -69,7 +67,8 @@ private:
 
     struct TaskEntry
     {
-        /// Pins the source parts so they are not physically removed before the export finishes.
+        /// Pins the source parts so they are not physically removed before the export finishes,
+        /// including already-exported parts that Iceberg commit still reads for partition values.
         /// Cleared by `setDescriptor` when the installed snapshot is terminal.
         std::vector<DataPartPtr> part_references;
         /// Parts currently scheduled on the background move executor (avoids double scheduling).
