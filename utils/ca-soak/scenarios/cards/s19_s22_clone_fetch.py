@@ -34,9 +34,9 @@ from . import _common
 MIB = 1024 * 1024
 
 
-def _make_table(node, name, *, columns, order_by, partition_by=None):
+def _make_table(node, name, *, columns, order_by, partition_by=None, extra_settings=None):
     sql.create_ca_table(node, name, columns=columns, order_by=order_by,
-                        partition_by=partition_by, wide=True)
+                        partition_by=partition_by, wide=True, extra_settings=extra_settings)
 
 
 def _blob_body_puts(delta):
@@ -483,10 +483,14 @@ class S21(Scenario):
                            f"(scale={ctx.scale})", "pass",
                            "dev/ci are scaled down; cache pressure is clearest at --scale full"))
 
-        for n in cl.nodes():
-            _make_table(n, table, columns=cols_sql, order_by="id")
-
-        # Merges are stopped for the whole measured window, for two independent reasons.
+        # No merge may be selected for this table, and the mechanism matters: an earlier attempt used
+        # `SYSTEM STOP MERGES`, which blocks merge EXECUTION while the leader keeps ASSIGNING merge
+        # entries into the replication queue. The queue then cannot drain and the `SYSTEM SYNC REPLICA`
+        # below times out, failing the scenario before it measures anything (observed 2026-08-31:
+        # `Code: 159 ... command timed out`). Capping the merge budget at one byte means no candidate
+        # is ever eligible, so no entry is created and replication proceeds normally.
+        #
+        # Merges must not happen here for two independent reasons.
         #
         # They destroy the premise: this card's shape is `parts` x `ncols` distinct column blobs, and
         # a background merge collapses those parts, so the "many refs" the verdicts reason about
@@ -498,7 +502,8 @@ class S21(Scenario):
         # 2026-08-31 at 67% of GETs refused with a merge running, whereupon the SDK's retry backoff
         # stalled the concurrent insert outright.
         for n in cl.nodes():
-            n.command(f"SYSTEM STOP MERGES {table}")
+            _make_table(n, table, columns=cols_sql, order_by="id",
+                        extra_settings={"max_bytes_to_merge_at_max_space_in_pool": "1"})
 
         # --- prefill: many parts, many columns (NOT part of the measured read window) -------------
         t_prefill = time.monotonic()
@@ -645,10 +650,14 @@ class S21(Scenario):
 
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
                                       name="S21 replica agreement")
-        # Hand the table back in its normal state before the shared end-checkpoint runs fsck and GC.
-        for n in cl.nodes():
-            n.command(f"SYSTEM START MERGES {table}")
-        _common.standard_end(ctx, result, [table])
+        # `optimize=False`: the shared end checkpoint quiesces by issuing `OPTIMIZE TABLE ... FINAL`,
+        # which ignores `max_bytes_to_merge_at_max_space_in_pool` and so forces exactly the merge this
+        # card forbids, here across all 100 parts at once. Measured 2026-08-31: a 1.1 GiB merge on this
+        # fixture takes 1,212 s, so 19.7 GB outlasts any sensible timeout and the run died in the
+        # checkpoint rather than at any verdict. The quiesce still syncs replicas and drains queues;
+        # only the forced merge is skipped, which is correct for a table whose premise is that its
+        # parts stay unmerged.
+        _common.standard_end(ctx, result, [table], optimize=False)
 
 
 # ---------------------------------------------------------------------------
