@@ -312,7 +312,6 @@ class JobConfigs:
             provides=[
                 ArtifactNames.CH_AMD_DEBUG,
                 ArtifactNames.CH_AMD_DEBUG_GH,
-                ArtifactNames.DEB_AMD_DEBUG,
             ],
             runs_on=RunnerLabels.FUNC_TESTER_AMD,
         ),
@@ -346,14 +345,6 @@ class JobConfigs:
             provides=[
                 ArtifactNames.CH_ARM_ASAN_UBSAN,
                 ArtifactNames.CH_ARM_ASAN_UBSAN_GH,
-            ],
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.ARM_UBSAN,
-            provides=[
-                ArtifactNames.CH_ARM_UBSAN,
-                ArtifactNames.CH_ARM_UBSAN_GH,
             ],
             runs_on=RunnerLabels.FUNC_TESTER_AMD,
         ),
@@ -432,6 +423,7 @@ class JobConfigs:
             parameter=BuildTypes.AMD_RELEASE,
             provides=[
                 ArtifactNames.CH_AMD_RELEASE,
+                ArtifactNames.CH_AMD_RELEASE_STRIPPED,
                 ArtifactNames.DEB_AMD_RELEASE,
                 ArtifactNames.RPM_AMD_RELEASE,
                 ArtifactNames.TGZ_AMD_RELEASE,
@@ -443,6 +435,7 @@ class JobConfigs:
             parameter=BuildTypes.ARM_RELEASE,
             provides=[
                 ArtifactNames.CH_ARM_RELEASE,
+                ArtifactNames.CH_ARM_RELEASE_STRIPPED,
                 ArtifactNames.DEB_ARM_RELEASE,
                 ArtifactNames.RPM_ARM_RELEASE,
                 ArtifactNames.TGZ_ARM_RELEASE,
@@ -1742,7 +1735,7 @@ class JobConfigs:
                 "./ci/docker/sqlancer-test",
             ],
         ),
-        run_in_docker="clickhouse/sqlancer-test",
+        run_in_docker="altinityinfra/sqlancer-test",
         timeout=3600,
     ).parametrize(
         Job.ParamSet(

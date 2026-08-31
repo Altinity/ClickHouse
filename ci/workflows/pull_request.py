@@ -60,7 +60,7 @@ CORE_BLOCKING_JOB_NAMES = [
 STYLE_AND_FAST_TESTS = [
     # JobNames.STYLE_CHECK,
     JobNames.FAST_TEST,
-    *[j.name for j in JobConfigs.tidy_build_arm_jobs],
+    # *[j.name for j in JobConfigs.tidy_build_arm_jobs],
 ]
 
 CODE_REVIEW_BLOCKING_JOBS = [

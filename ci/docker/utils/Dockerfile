@@ -1,7 +1,7 @@
 # docker build -t clickhouse/utils .
 
 ARG FROM_TAG=latest
-FROM clickhouse/fasttest:$FROM_TAG
+FROM altinityinfra/fasttest:$FROM_TAG
 
 RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
         libjson-c5 \

@@ -16,7 +16,7 @@ from ci.workflows.pull_request import REGULAR_BUILD_NAMES
 
 # Add long retention tags to subset of artifacts
 clickhouse_binaries_with_tags = []
-for artifact in ArtifactConfigs.clickhouse_binaries:
+for artifact in ArtifactConfigs.clickhouse_binaries + ArtifactConfigs.clickhouse_stripped_binaries:
     if artifact.name in BINARIES_WITH_LONG_RETENTION:
         artifact = artifact.add_tags({"retention": "long"})
     clickhouse_binaries_with_tags.append(artifact)
@@ -30,8 +30,8 @@ workflow = Workflow.Config(
             name="no_cache",
             description="Run without cache",
             is_required=False,
-            input_type="boolean",
             default_value="false",
+            is_boolean=True,
         ),
     ],
     jobs=[
@@ -58,7 +58,7 @@ workflow = Workflow.Config(
         *JobConfigs.compatibility_test_jobs,
         *[
             j
-            for j in FUNCTIONAL_TESTS_JOBS
+            for j in JobConfigs.functional_tests_jobs
             if "coverage" not in j.name
         ],
         # *JobConfigs.functional_test_llvm_coverage_jobs,

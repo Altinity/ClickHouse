@@ -71,6 +71,11 @@ DISABLED_WORKFLOWS = [
     "optimize_clickhouse.py",
     "pr_version_info.py",
     "VectorSearchStress.py",
+    "auto_releases.py",
+    "create_release.py",
+    "nightly_docs_autogen.py",
+    "nightly_sqlancer.py",
+    "weekly_cfi.py",
 ]
 
 DEFAULT_LOCAL_TEST_WORKFLOW = "pull_request.py"

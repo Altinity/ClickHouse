@@ -2,13 +2,11 @@ import copy
 from praktika import Workflow, Artifact
 
 from ci.defs.defs import BASE_BRANCH, DOCKERS, ArtifactConfigs, JobNames
-from ci.defs.altinity_jobs import AltinityJobConfigs
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
 
 FUNCTIONAL_TESTS_JOBS = [
     *JobConfigs.functional_tests_jobs,
-    *AltinityJobConfigs.cas_functional_tests_jobs,
 ]
 
 FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [

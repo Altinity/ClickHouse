@@ -134,7 +134,6 @@ jobs:
       {NAME}:
         description: {DESCRIPTION}
         required: {IS_REQUIRED}
-        type: {INPUT_TYPE}
         default: {DEFAULT_VALUE}\
 """
 
@@ -588,7 +587,6 @@ class PullRequestPushYamlGen:
                     DESCRIPTION=input_item.description,
                     IS_REQUIRED="true" if input_item.is_required else "false",
                     DEFAULT_VALUE=input_item.default_value or "''",
-                    INPUT_TYPE=input_item.input_type,
                 )
             else:
                 dispatch_inputs += (
@@ -681,7 +679,8 @@ class PullRequestPushYamlGen:
 
             format_kwargs = {
                 "DISPATCH_INPUTS_BLOCK": (
-                    f"\n    inputs:{dispatch_inputs}" if dispatch_inputs else "",
+                    f"\n    inputs:{dispatch_inputs}" if dispatch_inputs else ""
+                ),
                 "TAG_PUSH_TRIGGER": (
                     f"\n  push:\n    tags: {self.workflow_config.tags}"
                     if self.workflow_config.tags

@@ -126,7 +126,7 @@ DOCKERS = [
         #build_args=APT_MIRROR_BUILD_ARGS,
     ),
     Docker.Config(
-        name="clickhouse/fasttest",
+        name="altinityinfra/fasttest",
         path="./ci/docker/fasttest",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
@@ -482,11 +482,13 @@ class ArtifactNames:
     LLVM_COVERAGE_FILE = "LLVM_COVERAGE_FILE"  # .profdata file
     LLVM_COVERAGE_INFO_FILE = "LLVM_COVERAGE_INFO_FILE"  # .info file generated from .profdata, used for debugging coverage results
     CH_AMD_RELEASE = "CH_AMD_RELEASE"
+    CH_AMD_RELEASE_STRIPPED = "CH_AMD_RELEASE_STRIPPED"
     CH_AMD_ASAN_UBSAN = "CH_AMD_ASAN_UBSAN"
     CH_AMD_TSAN = "CH_AMD_TSAN"
     CH_AMD_MSAN = "CH_AMD_MSAN"
     CH_AMD_BINARY = "CH_AMD_BINARY"
     CH_ARM_RELEASE = "CH_ARM_RELEASE"
+    CH_ARM_RELEASE_STRIPPED = "CH_ARM_RELEASE_STRIPPED"
     CH_ARM_DEBUG = "CH_ARM_DEBUG"
     CH_ARM_ASAN_UBSAN = "CH_ARM_ASAN_UBSAN"
     CH_ARM_TSAN = "CH_ARM_TSAN"
@@ -511,6 +513,20 @@ class ArtifactNames:
     CH_LOONGARCH64 = "CH_LOONGARCH64_BIN"
     CH_WASM64 = "CH_WASM64_BIN"
     CH_WASM_PARSER = "CH_WASM_PARSER_BIN"
+
+    # GitHub Actions copies of the self-extracting binary. The runner strips a
+    # trailing `_GH` to find the matching S3 artifact on cache hit / expired
+    # retention, so `CH_ARM_BINARY_GH` must be `CH_ARM_BIN_GH`.
+    CH_AMD_DEBUG_GH = "CH_AMD_DEBUG_GH"
+    CH_ARM_DEBUG_GH = "CH_ARM_DEBUG_GH"
+    CH_AMD_BINARY_GH = "CH_AMD_BINARY_GH"
+    CH_ARM_BINARY_GH = "CH_ARM_BIN_GH"
+    CH_AMD_TSAN_GH = "CH_AMD_TSAN_GH"
+    CH_AMD_MSAN_GH = "CH_AMD_MSAN_GH"
+    CH_AMD_ASAN_UBSAN_GH = "CH_AMD_ASAN_UBSAN_GH"
+    CH_ARM_TSAN_GH = "CH_ARM_TSAN_GH"
+    CH_ARM_ASAN_UBSAN_GH = "CH_ARM_ASAN_UBSAN_GH"
+    CH_ARM_MSAN_GH = "CH_ARM_MSAN_GH"
 
     FAST_TEST = "FAST_TEST"
 
@@ -597,11 +613,13 @@ LLVM_ARTIFACTS_LIST = (
 BINARIES_WITH_LONG_RETENTION = [
     ArtifactNames.CH_AMD_DEBUG,
     ArtifactNames.CH_AMD_RELEASE,
+    ArtifactNames.CH_AMD_RELEASE_STRIPPED,
     ArtifactNames.CH_AMD_ASAN_UBSAN,
     ArtifactNames.CH_AMD_TSAN,
     ArtifactNames.CH_AMD_MSAN,
     ArtifactNames.CH_AMD_BINARY,
     ArtifactNames.CH_ARM_RELEASE,
+    ArtifactNames.CH_ARM_RELEASE_STRIPPED,
     ArtifactNames.CH_ARM_DEBUG,
     ArtifactNames.CH_ARM_ASAN_UBSAN,
     ArtifactNames.CH_ARM_TSAN,
@@ -643,6 +661,34 @@ class ArtifactConfigs:
             ArtifactNames.CH_S390X,
             ArtifactNames.CH_LOONGARCH64,
             ArtifactNames.CH_AMD_CFI,
+        ]
+    )
+    clickhouse_stripped_binaries = Artifact.Config(
+        name="...",
+        type=Artifact.Type.S3,
+        path=f"{TEMP_DIR}/build/programs/self-extracting/clickhouse-stripped",
+    ).parametrize(
+        names=[
+            ArtifactNames.CH_AMD_RELEASE_STRIPPED,
+            ArtifactNames.CH_ARM_RELEASE_STRIPPED,
+        ]
+    )
+    clickhouse_binaries_gh = Artifact.Config(
+        name="...",
+        type=Artifact.Type.GH,
+        path=f"{TEMP_DIR}/build/programs/self-extracting/clickhouse",
+    ).parametrize(
+        names=[
+            ArtifactNames.CH_AMD_DEBUG_GH,
+            ArtifactNames.CH_AMD_BINARY_GH,
+            ArtifactNames.CH_ARM_BINARY_GH,
+            ArtifactNames.CH_AMD_TSAN_GH,
+            ArtifactNames.CH_AMD_MSAN_GH,
+            ArtifactNames.CH_AMD_ASAN_UBSAN_GH,
+            ArtifactNames.CH_ARM_ASAN_UBSAN_GH,
+            ArtifactNames.CH_ARM_MSAN_GH,
+            ArtifactNames.CH_ARM_DEBUG_GH,
+            ArtifactNames.CH_ARM_TSAN_GH,
         ]
     )
     clickhouse_darwin_plain_binaries = Artifact.Config(
