@@ -363,18 +363,25 @@ class S10(Scenario):
 
             # A lightweight UPDATE is the ONLY thing here that produces a patch part -- lightweight
             # DELETE does not, which is why this card observed zero of them for as long as it has
-            # existed. It touches a bucket that is NOT in `deleted_buckets`, so it cannot disturb the
-            # delete oracle: the oracle predicts surviving ROW COUNT, and an update changes a payload
-            # rather than a row count. Failure is recorded and does not abort the burst, because the
-            # delete workload this card also covers must still run.
-            upd_bucket = next((x for x in range(99, 0, -1) if x not in deleted_buckets), None)
-            if upd_bucket is not None:
-                try:
-                    cl.node1.command(
-                        f"UPDATE {table} SET payload = 'patched' WHERE k = {upd_bucket} "
-                        f"SETTINGS allow_experimental_lightweight_update = 1", timeout=300)
-                except Exception as e:
-                    result.note_anomaly(f"S10 lightweight UPDATE k={upd_bucket} failed: {e}")
+            # existed.
+            #
+            # The bucket is chosen freely and NOT filtered against `deleted_buckets`. Filtering was the
+            # first attempt and it silently disabled this step at `--scale full`: there
+            # `deletes_per_burst` is 100 and the bucket is `(b * deletes_per_burst + d) % 100`, so the
+            # very first burst deletes all 100 and no unfiltered bucket is ever left. The filter was
+            # unnecessary anyway on two counts -- the delete oracle predicts surviving ROW COUNT and an
+            # update changes a payload rather than a row count, and a deleted bucket is legitimately
+            # repopulated by the next insert, so membership in `deleted_buckets` does not mean empty.
+            #
+            # Failure is recorded and does not abort the burst, because the delete workload this card
+            # also covers must still run.
+            upd_bucket = 99
+            try:
+                cl.node1.command(
+                    f"UPDATE {table} SET payload = 'patched' WHERE k = {upd_bucket} "
+                    f"SETTINGS allow_experimental_lightweight_update = 1", timeout=300)
+            except Exception as e:
+                result.note_anomaly(f"S10 lightweight UPDATE k={upd_bucket} failed: {e}")
 
             # force a checkpoint after the burst: drain mutations, observe patch parts mid-life.
             _wait_mutations_done(cl, table, timeout_s=600)
