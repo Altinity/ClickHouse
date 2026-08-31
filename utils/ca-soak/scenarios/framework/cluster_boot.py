@@ -9,6 +9,7 @@ Two compose variants are supported: the default (`gc_shards=1`) and `gc_shards2`
 same docker-compose project (directory name `ca-soak`), so container names are stable across variants.
 """
 
+import os
 import shutil
 import subprocess
 import time
@@ -54,6 +55,36 @@ _VARIANT_FILE = {
 }
 
 # Replica count per compose variant — drives the N-node Cluster + health wait + log-dir prep.
+# Endpoint overrides for variants whose compose publishes different host ports or container names.
+# The requirement was documented in `_VARIANT_FILE`'s s41 comment and enforced nowhere, so a suite run
+# reached S41, brought up its compose on host port 18123, then probed the default 8123 and reported
+# "only 0/1 replicas healthy at timeout" for five minutes before failing with zero verdicts
+# (2026-09-01). A variant that needs different endpoints must carry them, not rely on the operator
+# exporting them by hand.
+_VARIANT_ENV = {
+    "s41": {
+        "CA_SOAK_NODE1_PORT": "18123",
+        "CA_SOAK_NODE1_CONTAINER": "ca-s41-ch1-1",
+        "CA_SOAK_RUSTFS_CONTAINER": "ca-s41-rustfs1-1",
+        "CA_SOAK_CH_CONTAINERS": "ca-s41-ch1-1",
+        "CA_SOAK_FSCK_CONTAINER": "ca-s41-ch1-1",
+    },
+}
+
+# Every key any variant can set, so switching AWAY from a variant clears what it set. Without this a
+# later scenario would inherit s41's port and probe 18123 against the ordinary `ca-soak` stack.
+_VARIANT_ENV_KEYS = {k for env in _VARIANT_ENV.values() for k in env}
+
+
+def apply_variant_env(variant) -> None:
+    """Point the framework's Cluster/probes at the endpoints `variant` actually publishes."""
+    wanted = _VARIANT_ENV.get(variant, {})
+    for k in _VARIANT_ENV_KEYS - set(wanted):
+        os.environ.pop(k, None)
+    for k, v in wanted.items():
+        os.environ[k] = v
+
+
 _VARIANT_NODES = {
     None: 2, "default": 2, "gc_shards2": 2,
     "tenreplicas": 10, "gc_shards8": 2, "s3faultproxy": 2, "s3listproxy": 2, "s38": 2,
@@ -255,6 +286,8 @@ def reset_cluster(variant=None, *, archive_tag=None, log_fn=print, timeout_s=300
 
     `overrides`: for variant="tuned" only — a dict of <ca> disk config overrides rendered via
     `render_tuned_config` before `up` (see that function for the soak-matrix use case)."""
+    # Before any probe: this variant's compose may publish different ports/containers.
+    apply_variant_env(variant)
     n = node_count_for(variant)
     # The 10-replica compose serializes startup (ch2 waits ch1, ..., ch10 waits ch9) to avoid the CA
     # capability-probe race on the shared pool, so bring-up scales with node count — widen the bound.

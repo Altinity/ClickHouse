@@ -718,13 +718,28 @@ class S11(Scenario):
                     pass
         result.observations["gc_max_round_ms"] = max_round_ms
         forced_gc_s = result.timings.get("forced_gc_s")
+        # The ceiling scales with the work a round has to do, because the property being tested is
+        # that reclaim does not RUN AWAY -- that is, does not grow superlinearly. A fixed 30s was
+        # anchored to dev and applied at every scale, so at `ci` (16x the rows of dev) it failed on a
+        # round that was in fact 10x BETTER than linear: 48,529 ms observed against 480,000 ms of
+        # linear budget. That verdict was measuring the scale it ran at, not the product.
+        #
+        # Anchor: 30s for dev's parts x rows. A round that stays within the same cost per row at any
+        # scale passes; one that grows faster than the work does not.
+        dev_units = 16 * 1000
+        units = max(1, int(p["parts"]) * int(p["rows_per_part"]))
+        ceiling_ms = int(30000 * units / dev_units)
+        result.observations["gc_round_ceiling_ms"] = ceiling_ms
         if max_round_ms:
-            ok = max_round_ms < 30000
+            ok = max_round_ms < ceiling_ms
             result.add(Verdict.check(
-                "GC round duration bounded", "< 30s per round at dev scale",
+                "GC round duration bounded",
+                f"< {ceiling_ms} ms per round (30s at dev, scaled by parts x rows)",
                 f"{max_round_ms} ms", ok,
-                "" if ok else "a forced GC round exceeded 30s — investigate runaway reclaim cost"))
+                "" if ok else
+                "a forced GC round exceeded the work-scaled ceiling — reclaim cost is growing faster "
+                "than the workload, which is what 'runaway' means here"))
         else:
             result.add(Verdict.inconclusive(
-                "GC round duration bounded", "< 30s per round",
+                "GC round duration bounded", f"< {ceiling_ms} ms per round",
                 "no GC finish rows with a duration were recorded for this run window"))
