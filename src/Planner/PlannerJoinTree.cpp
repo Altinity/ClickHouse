@@ -20,6 +20,7 @@
 #include <Access/ContextAccess.h>
 
 #include <Storages/IStorage.h>
+#include <Storages/IStorageCluster.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/StorageDictionary.h>
 #include <Storages/StorageDistributed.h>
@@ -41,6 +42,8 @@
 
 #include <Parsers/ExpressionListParsers.h>
 #include <Parsers/parseQuery.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
 
 #include <Processors/Sources/NullSource.h>
 #include <Processors/QueryPlan/SortingStep.h>
@@ -357,6 +360,12 @@ bool applyTrivialCountIfPossible(
     chassert(function_node.getAggregateFunction() != nullptr);
     const auto * count_func = typeid_cast<const AggregateFunctionCount *>(function_node.getAggregateFunction().get());
     if (!count_func)
+        return false;
+
+    /// `arrayJoin` in the argument multiplies rows above the source read, so the aggregate does not
+    /// observe `totalRows()` rows. Must precede `optimize_trivial_count`: storages that count in
+    /// read() act on that flag even when this function later declines.
+    if (hasFunctionNode(aggregates.front(), "arrayJoin"))
         return false;
 
     /// Some storages can optimize trivial count in read() method instead of totalRows() because it still can
@@ -1169,7 +1178,17 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(QueryTreeNodePtr table_expres
                         return false;
                     };
 
-                    if (query_context->canUseParallelReplicasCustomKey() && query_context->getClientInfo().distributed_depth == 0)
+                    /// The custom-key read below replaces the plan with a remote read at the fixed stage
+                    /// `WithMergeableStateAfterAggregationAndLimit`, so it is only allowed when the requested
+                    /// stage is not below that: a plan built up to a partial stage - e.g. a `Merge` table plans
+                    /// its children up to `WithMergeableState` when one of the underlying tables is read through
+                    /// an interpreter - must not receive finalized (post-aggregation, post-LIMIT) data instead
+                    /// of the partial aggregation states its consumer expects.
+                    const bool to_stage_supports_custom_key = select_query_options.to_stage == QueryProcessingStage::Complete
+                        || select_query_options.to_stage == QueryProcessingStage::WithMergeableStateAfterAggregationAndLimit;
+
+                    if (query_context->canUseParallelReplicasCustomKey() && to_stage_supports_custom_key
+                        && query_context->getClientInfo().distributed_depth == 0)
                     {
                         if (auto cluster = query_context->getClusterForParallelReplicas();
                             query_context->canUseParallelReplicasCustomKeyForCluster(*cluster))
@@ -2536,6 +2555,35 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
       * Examples: Distributed, LiveView, Merge storages.
       */
     auto left_table_expression = table_expressions_stack.front();
+
+    /** If the leftmost table uses IStorageCluster (e.g., s3Cluster, hdfsCluster)
+      * and there are multiple tables (indicating a JOIN), we must wrap it in a subquery.
+      * This prevents IStorageCluster from receiving the full JOIN query, which it cannot handle.
+      *
+      * IStorageCluster is a simple storage that just forwards queries to remote nodes.
+      * Unlike StorageDistributed, it cannot decompose and handle JOINs across multiple tables,
+      * because remote nodes don't have access to other tables in the JOIN.
+      *
+      * StorageDistributed has sophisticated query planning logic to handle JOINs and should
+      * NOT be wrapped (wrapping breaks tests like 03577_server_constant_folding).
+      */
+    bool should_wrap_left_table = false;
+    bool has_multiple_tables = table_expressions_stack.size() > 1;
+
+    if (has_multiple_tables)
+    {
+        // Get the actual storage to check its type
+        auto * table_node = left_table_expression->as<TableNode>();
+        auto * table_function_node = left_table_expression->as<TableFunctionNode>();
+
+        if (table_node || table_function_node)
+        {
+            const auto & storage = table_node ? table_node->getStorage() : table_function_node->getStorage();
+            // Only wrap if it's specifically IStorageCluster, not StorageDistributed or other remote storages
+            should_wrap_left_table = (dynamic_cast<const IStorageCluster *>(storage.get()) != nullptr);
+        }
+    }
+
     auto left_table_expression_query_plan = buildQueryPlanForTableExpression(
         left_table_expression,
         parent_join_tree,
@@ -2543,7 +2591,7 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
         select_query_options,
         planner_context,
         is_single_table_expression,
-        false /*wrap_read_columns_in_subquery*/);
+        should_wrap_left_table /*wrap_read_columns_in_subquery*/);
     if (left_table_expression_query_plan.stage != QueryProcessingStage::FetchColumns)
         return left_table_expression_query_plan;
 
