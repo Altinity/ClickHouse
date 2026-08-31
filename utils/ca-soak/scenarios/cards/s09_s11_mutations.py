@@ -298,7 +298,16 @@ class S10(Scenario):
         extra = "(number % 100) AS k"
 
         for n in cl.nodes():
-            sql.create_ca_table(n, table, columns=columns, order_by="id", wide=True)
+            # Patch parts need all three, and each is a TABLE setting: the server refuses a
+            # lightweight UPDATE with `Code: 48` naming `_block_number`, then again naming
+            # `_block_offset`, until both materialized columns exist, and `apply_patches_on_merge`
+            # governs whether a merge applies the patch instead of dropping it. Measured 2026-08-31:
+            # with all three, an `UPDATE ... WHERE k = N` yields a part named `patch-<hash>-all_...`,
+            # which is exactly what `_patch_part_count` already matches.
+            sql.create_ca_table(n, table, columns=columns, order_by="id", wide=True,
+                                extra_settings={"enable_block_number_column": "1",
+                                                "enable_block_offset_column": "1",
+                                                "apply_patches_on_merge": "1"})
 
         # In-process oracle: a set of surviving k-buckets, and the per-insert row generator is
         # deterministic, so expected_rows = sum over inserts of (rows survived given deleted buckets).
@@ -307,9 +316,15 @@ class S10(Scenario):
         deleted_buckets = set()
         inserted_rows = 0
 
-        # S10: lightweight DELETE is unreliable on this build (CA storage path diverges).
-        # Force the ALTER TABLE DELETE fallback for correct oracle semantics.
-        lw_supported = False
+        # Lightweight DELETE is exercised here, which is what this card's title promises. It was
+        # previously forced off with the claim that it is "unreliable on this build (CA storage path
+        # diverges)" and that ALTER DELETE was needed "for correct oracle semantics". Both were tested
+        # on 2026-08-31 and neither holds. Against a CA-disk table, two `DELETE FROM ... WHERE bucket`
+        # statements over 50,000 rows left exactly the predicted 40,000 survivors with the predicted
+        # checksum and no error; and this card's oracle compares `SELECT count()`, which honours the
+        # delete mask, so it needs no change. The `except` branch below still falls back to ALTER
+        # DELETE and records an anomaly, so a real regression degrades rather than disappears.
+        lw_supported = True
         # Probe whether patch parts are producible (apply_patches_on_merge / patch-on-the-fly updates).
         patch_supported = self._probe_patch_parts(ctx, result, cl, table)
 
@@ -345,6 +360,21 @@ class S10(Scenario):
                         deleted_buckets.add(bucket)
                     except Exception as e:
                         result.note_anomaly(f"S10 ALTER DELETE k={bucket} failed: {e}")
+
+            # A lightweight UPDATE is the ONLY thing here that produces a patch part -- lightweight
+            # DELETE does not, which is why this card observed zero of them for as long as it has
+            # existed. It touches a bucket that is NOT in `deleted_buckets`, so it cannot disturb the
+            # delete oracle: the oracle predicts surviving ROW COUNT, and an update changes a payload
+            # rather than a row count. Failure is recorded and does not abort the burst, because the
+            # delete workload this card also covers must still run.
+            upd_bucket = next((x for x in range(99, 0, -1) if x not in deleted_buckets), None)
+            if upd_bucket is not None:
+                try:
+                    cl.node1.command(
+                        f"UPDATE {table} SET payload = 'patched' WHERE k = {upd_bucket} "
+                        f"SETTINGS allow_experimental_lightweight_update = 1", timeout=300)
+                except Exception as e:
+                    result.note_anomaly(f"S10 lightweight UPDATE k={upd_bucket} failed: {e}")
 
             # force a checkpoint after the burst: drain mutations, observe patch parts mid-life.
             _wait_mutations_done(cl, table, timeout_s=600)
@@ -486,17 +516,23 @@ class S10(Scenario):
         Patch parts are produced by on-the-fly / patch-on-merge update application. The exact enabling
         setting varies by build; we try the documented session setting and record the outcome honestly
         rather than asserting a behavior the build may not have."""
-        for setting in ("apply_patches_on_merge", "allow_experimental_lightweight_update"):
+        # Only session settings may be probed with `SET`. `apply_patches_on_merge` is a MergeTree
+        # TABLE setting (`MergeTreeSettings.cpp`), so probing it this way threw `Code: 115` on every
+        # run and the rejection was absorbed into an observation; it is applied at CREATE instead.
+        for setting in ("allow_experimental_lightweight_update",):
             try:
                 cl.node1.command(f"SET {setting} = 1", timeout=30)
                 result.observations.setdefault("patch_part_settings_accepted", []).append(setting)
             except Exception as e:
                 result.observations.setdefault("patch_part_settings_rejected", {})[setting] = f"{e}"
-        accepted = result.observations.get("patch_part_settings_accepted")
-        if accepted:
+        # Support requires the session setting AND the table settings this card creates the table
+        # with. Any single acceptance used to satisfy this, which reported support on the strength of
+        # a setting that does not by itself produce a patch part.
+        accepted = result.observations.get("patch_part_settings_accepted") or []
+        if "allow_experimental_lightweight_update" in accepted:
             return True
-        return ("no patch-part enabling setting accepted by this build "
-                f"(tried apply_patches_on_merge, allow_experimental_lightweight_update)")
+        return ("this build rejected allow_experimental_lightweight_update, so no lightweight UPDATE "
+                "and therefore no patch part can be produced")
 
 
 # ===========================================================================
