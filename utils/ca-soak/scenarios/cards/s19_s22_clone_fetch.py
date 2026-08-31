@@ -313,6 +313,13 @@ class S20(Scenario):
             result.observations["leader_checksum_before_fetch"] = leader_sum
             pool_before_fetch = observe.pool_shape(timeout_s=120)
             result.observations["pool_before_fetch"] = pool_before_fetch.get("_total")
+            # Open the counters window BEFORE the follower starts: its replication
+            # thread begins FETCHing as soon as /ping answers, so the whole fetch can
+            # (and at full scale did) complete inside wait_healthy below — an empty
+            # window then read as CASRootCompareSwap=0 on a fetch that demonstrably
+            # relinked (queue drained, checksums converged, pool grew 9 objects),
+            # the same window defect S06 and S21 carried.
+            counters = _common.counters_window(ctx)
         finally:
             # --- start the follower and let it FETCH + relink -------------------------------------
             ctx.log(f"S20: starting follower {self.FOLLOWER} and waiting for it to fetch")
@@ -327,9 +334,6 @@ class S20(Scenario):
                 f"follower {self.FOLLOWER} did not become healthy within {fetch_wait}s after start"))
             return
 
-        # Snapshot follower-only counters across the fetch window: per-node deltas are keyed by
-        # container in the counters_window result.
-        counters = _common.counters_window(ctx)
         # Drive + wait for the fetch deterministically rather than sleeping on a guess.
         cl.node2.command(f"SYSTEM SYNC REPLICA {table}", timeout=fetch_wait)
         # Wait for the replication queue on the follower to drain (no fixed sleep masking a race).
