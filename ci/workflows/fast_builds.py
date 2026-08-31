@@ -14,7 +14,7 @@ for artifact in ArtifactConfigs.clickhouse_binaries + ArtifactConfigs.clickhouse
 
 builds_for_release_branch = [
     job.unset_provides("unittest")
-    for job in JobConfigs.build_jobs + JobConfigs.release_build_jobs
+    for job in JobConfigs.build_jobs + JobConfigs.release_build_jobs_with_examples
     if "coverage" not in job.name
 ]
 
@@ -27,7 +27,7 @@ BLOCKING_BUILD_JOBS = [
 ]
 
 workflow = Workflow.Config(
-    name="Release Builds",
+    name="Fast Builds",
     event=Workflow.Event.DISPATCH,
     jobs=[
         *[
@@ -53,6 +53,7 @@ workflow = Workflow.Config(
     artifacts=[
         *clickhouse_binaries_with_tags,
         *ArtifactConfigs.clickhouse_binaries_gh,
+        ArtifactConfigs.clickhouse_examples,
         *ArtifactConfigs.clickhouse_debians,
         *ArtifactConfigs.clickhouse_rpms,
         *ArtifactConfigs.clickhouse_tgzs,

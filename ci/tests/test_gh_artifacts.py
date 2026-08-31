@@ -126,7 +126,7 @@ def test_stripped_release_binaries_are_configured_and_provided():
 
 def test_enabled_workflows_using_stripped_binaries_import():
     import ci.workflows.pull_request
-    import ci.workflows.release_builds
+    import ci.workflows.fast_builds
 
     assert ci.workflows.pull_request.workflow
-    assert ci.workflows.release_builds.workflow
+    assert ci.workflows.fast_builds.workflow

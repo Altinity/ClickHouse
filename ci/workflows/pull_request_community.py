@@ -5,9 +5,21 @@ from ci.defs.defs import BASE_BRANCH, DOCKERS, ArtifactConfigs, JobNames
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
 
+# Functional tests with sanitizers are trimmed down in pull requests: instead of
+# the full suite, their `selected tests` counterparts run only the tests selected
+# for the change. Keep this aligned with `ci/workflows/pull_request.py`.
+# See ClickHouse/ClickHouse#114725.
+SANITIZERS = ("asan_ubsan", "tsan", "msan")
+
 FUNCTIONAL_TESTS_JOBS = [
-    *JobConfigs.functional_tests_jobs,
-]
+    job
+    for job in JobConfigs.functional_tests_jobs
+    if not any(sanitizer in job.name for sanitizer in SANITIZERS)
+    # All existing Wasm UDF functional tests are `no-msan`, so selected test
+    # discovery cannot provide a representative WasmEdge smoke test. Keep the
+    # established full-suite MSan/WasmEdge lanes until that coverage exists.
+    or "amd_msan, WasmEdge" in job.name
+] + JobConfigs.stateless_tests_selected_pr_jobs
 
 FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
     job.name
@@ -17,8 +29,10 @@ FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
         for substr in (
             "_debug, parallel",
             "_binary, parallel",
-            "_asan, distributed plan, parallel",
-            # "_tsan, parallel",
+            "_binary, sequential",
+            "_asan_ubsan, distributed plan, parallel",
+            "_asan_ubsan, db disk, distributed plan, sequential",
+            "_tsan, parallel",
         )
     )
 ]
