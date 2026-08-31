@@ -1134,25 +1134,32 @@ means the verdict's threshold is wrong for a freshly booted server; continued li
 empty pool means a leak, and the `Memory` stacks will say whose. Do not file a leak against the
 product on the 15-minute number alone.
 
-## `[s10-patch-setting-applied-at-the-wrong-level]` S10 never creates a patch part, so its premise has never held {#s10-patch-setting-wrong-level}
+## `[s10-patch-premise-blocked-by-a-hardcoded-workaround]` S10 forces the non-patch delete path, so its patch-part premise cannot hold {#s10-patch-premise-blocked}
 
-**Found at `--scale full` (2026-08-31).** `max_patch_parts_observed` = **0**, and the reason is
-recorded in the run's own observations: `patch_part_settings_rejected` holds
-`apply_patches_on_merge` with `Code: 115 ... neither a builtin setting nor started with the prefix
-'SQL_'`.
+**Supersedes an earlier entry of mine that named the wrong cause.** I first attributed
+`max_patch_parts_observed = 0` to `apply_patches_on_merge` being set at session level. That setting
+defect is real, but it is not why patch parts are absent.
 
-The setting exists — `MergeTreeSettings.cpp:861` declares it — but it is a **MergeTree table
-setting**, and the card sets it at session level, where no such name is registered. So the throw is
-correct and the card swallowed it into an observation.
+The actual cause is one line: `lw_supported = False` is **hardcoded** in S10, so the `if
+lw_supported:` branch never fires and the lightweight `DELETE FROM` beneath it is dead code. The card
+falls through to `ALTER TABLE ... DELETE`, which produces mutations, not patch parts. No setting and
+no scale can produce a patch part while that line stands.
 
-Consequently `patch parts observed in system.parts` has been inconclusive at `dev`, `ci` and `full`
-alike, for the same reason each time, and the two verdicts that read as patch-content findings are
-not measuring patch content at all.
+The comment above it states the reason: lightweight `DELETE` is "unreliable on this build (CA storage
+path diverges)". **That claim is the thing to test first**, because the two outcomes lead opposite
+ways. If it is stale, the workaround is the only blocker and removing it restores the premise. If it
+is current, then lightweight `DELETE` diverging on the CA path is a product defect that deserves its
+own entry and its own test, rather than living as a silent `False` inside one scenario — a card that
+works around a product defect hides it.
 
-**Fix:** apply it as a table setting — `CREATE TABLE ... SETTINGS apply_patches_on_merge = 1`, or
-`ALTER TABLE ... MODIFY SETTING` — and let a rejection fail the scenario at entry instead of being
-absorbed into observations. A premise that cannot be established must stop the run, not quietly
-downgrade its own verdict.
+**Secondary, and worth fixing regardless:** `_probe_patch_parts` issues `SET apply_patches_on_merge
+= 1`, which throws `Code: 115` because the name is a **MergeTree table setting**
+(`MergeTreeSettings.cpp:861`), not a session one. The probe then returns `True` anyway, because
+`allow_experimental_lightweight_update` was accepted and any single acceptance satisfies it. So the
+probe reports patch support on the strength of a setting that does not by itself produce patch parts,
+and swallows the one genuine rejection into an observation. Apply it with `ALTER TABLE ... MODIFY
+SETTING` or at `CREATE`, and make the probe require the setting that actually matters rather than any
+of them.
 
 ## `[s10-one-unreachable-manifest-survives-gc-fixpoint]` A single unreachable manifest survives GC to fixpoint, three rounds running {#s10-manifest-residual}
 
@@ -1174,3 +1181,34 @@ repeated fixpoints is by definition not being reclaimed. Also worth a glance in 
 re-derive whether the workload can legitimately leave it (a manifest published after the fold's
 coverage seal is bookkeeping, not a leak). The classification is the card's, and the card's premise
 was broken in the same run.
+
+## `[ca-event-log-loses-gc-manifest-deletes]` GC deleted 517 manifests and the CA event log recorded one {#ca-event-log-loses-manifest-deletes}
+
+**Found while auditing S10's leftover-manifest finding in `cas_log` (2026-08-31).** This is why that
+audit could not be done.
+
+In the full-scale S10 run, `ch1`'s `gc_log` sums to exactly **517** `manifests_deleted` across its
+rounds — round 6 alone deletes 133 — while `ch1`'s `cas_log` holds exactly **one**
+`manifest_delete` event. `ch2` deleted none and logged none, so the whole discrepancy sits on one
+node.
+
+It is not a semantics mismatch between the two numbers. `CasGc.cpp` PHASE 15/18 emits
+`CasEventType::ManifestDelete` **unconditionally, once per attempt**, inside the `mf_cleanup_now`
+loop, and increments `report.manifests_deleted` only when the outcome classifies as `Deleted`. So
+attempts are greater than or equal to deletions, and the event count must be **at least** 517.
+It is 1.
+
+One event did land — round 1, for a namespace owned by the other server root — so the emitter is
+wired and reachable. That argues for events being dropped or lost rather than never produced.
+Candidates not yet distinguished: a bounded queue in the event sink discarding under burst (round 6's
+133 deletions in one phase is exactly a burst), a per-call `EventEmitter{*store}` binding to a sink
+that is not the disk's configured log on most calls, or rows buffered in `ca_event_log` and lost when
+the scenario tears the cluster down.
+
+**Consequence for anything that reads `cas_log`:** manifest reclaim is effectively invisible there,
+so `cas_log` cannot support any claim about whether a manifest was deleted, retried or skipped. The
+S10 residual finding must be re-derived from `gc_log` and `fsck` until this is fixed.
+
+**First step:** count events against `attempted` rather than against `manifests_deleted` — the phase
+already records `attempted` as a metric — and check whether `system.ca_event_log` shows drops of its
+own before looking for a bug in the emitter.

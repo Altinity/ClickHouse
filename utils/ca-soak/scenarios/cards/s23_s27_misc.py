@@ -581,7 +581,11 @@ class S27(Scenario):
     name = "S27"
     title = "backend list pagination ambiguity"
     priority = "P2"
-    # Runs on the S3 proxy compose in LIST-anomaly mode: the proxy perturbs LIST(cas/refs/) responses
+    # The prefix is `cas/ns/stream/` because that is what `Layout::casRefsPrefix` returns and what
+    # `Gc::enumerateRefPrefix` LISTs -- "GC's one hot namespace enumeration". This card previously
+    # named `cas/refs/`, which exists nowhere in the layout, so every anomaly it armed was applied to
+    # a prefix no caller ever listed and the scenario could not fail for the reason it was written.
+    # Runs on the S3 proxy compose in LIST-anomaly mode: the proxy perturbs LIST(cas/ns/stream/) responses
     # (duplicate keys / dropped continuation token) — the prefix GC discovery (discoverUniverse) uses.
     compose_variant = "s3listproxy"
 
@@ -605,7 +609,7 @@ class S27(Scenario):
 
     def run(self, ctx, result):
         """Paginated / unstable LIST anomalies must force safe rereads, NEVER a skipped fold. GC
-        discovery enumerates `(namespace, shard)` via `LIST(cas/refs/)`; the proxy perturbs those
+        discovery enumerates `(namespace, shard)` via `LIST(cas/ns/stream/)`; the proxy perturbs those
         responses (duplicate keys, dropped continuation token). The safety invariant: under injected
         list anomalies GC must still be correct — no committed ref to a missing object (`fsck
         dangling==0`), dropped content still reclaims (reclaimable drains to 0 — a falsely-skipped
@@ -628,7 +632,7 @@ class S27(Scenario):
             return
         result.observations["proxy"] = {"healthz": hz}
 
-        # Build many (namespace, shard) refs so cas/refs/ has real breadth to LIST.
+        # Build many (namespace, shard) refs so cas/ns/stream/ has real breadth to LIST.
         self._ctl("/config", {"rate": 0.0, "list_anomaly": None})
         for t in tables:
             for n in nodes:
@@ -641,12 +645,12 @@ class S27(Scenario):
         base_delta = base_before().get("_total", {})
         result.observations["baseline_CasRootGet"] = int(base_delta.get("CASRootGet", 0))
 
-        # ARM LIST anomalies on the cas/refs/ prefix, then churn + GC so discovery keeps re-listing.
-        self._ctl("/config", {"list_anomaly": "duplicate", "list_prefix": "cas/refs/"})
+        # ARM LIST anomalies on the cas/ns/stream/ prefix, then churn + GC so discovery keeps re-listing.
+        self._ctl("/config", {"list_anomaly": "duplicate", "list_prefix": "cas/ns/stream/"})
         anomaly_before = _common.counters_window(ctx)
         gc_errors = []
         # Drop half the tables (creates owner transitions the fold must not skip) and drive GC while
-        # the proxy perturbs each cas/refs/ LIST.
+        # the proxy perturbs each cas/ns/stream/ LIST.
         for i, t in enumerate(tables):
             if i % 2 == 0:
                 try:
@@ -656,7 +660,7 @@ class S27(Scenario):
         for r in range(gc_rounds):
             # alternate the two anomaly kinds across rounds
             self._ctl("/config", {"list_anomaly": "drop_token" if r % 2 else "duplicate",
-                                  "list_prefix": "cas/refs/"})
+                                  "list_prefix": "cas/ns/stream/"})
             try:
                 gc_mod.gc_drive_round(cl, log_fn=ctx.log)
             except Exception as e:
@@ -672,9 +676,9 @@ class S27(Scenario):
         # 1. The anomaly path was actually exercised.
         perturbed = int(stats.get("list_perturbed", 0))
         result.add(Verdict.check(
-            "LIST anomalies were injected on cas/refs/ (test not vacuous)", "> 0 perturbed LISTs",
+            "LIST anomalies were injected on cas/ns/stream/ (test not vacuous)", "> 0 perturbed LISTs",
             f"{perturbed}", perturbed > 0,
-            "" if perturbed > 0 else "proxy perturbed 0 LISTs — discovery may not have re-listed cas/refs/"))
+            "" if perturbed > 0 else "proxy perturbed 0 LISTs — the enumeration may not have re-listed cas/ns/stream/"))
 
         # 2. GC never errored under the injected anomalies (a malformed page must not crash the round).
         result.observations["gc_errors"] = gc_errors

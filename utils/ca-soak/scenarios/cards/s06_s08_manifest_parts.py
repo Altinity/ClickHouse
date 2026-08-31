@@ -233,7 +233,14 @@ class S06(Scenario):
             except Exception as e:
                 ctx.log(f"S06: subset scan raised: {e}")
             sub_delta = cw().get("_total", {})
-            subset_gets = sub_delta.get("CASBlobGet", 0)
+            # `DiskS3GetObject`, not `CASBlobGet`: column `.bin` data is read by the object-storage
+            # disk through `ReadBufferFromFileView` over `object_storage->readObject`, with the
+            # envelope skipped by a start offset the manifest supplies. The instrumented CAS backend
+            # is not on that path, so `CASBlobGet` and `CASBlobGetStream` both stay flat on a column
+            # read and cannot express this verdict. Measured 2026-08-31 on 300 columns: subset of 8
+            # moved `DiskS3GetObject` by 17 and the all-column scan by 602 (ratio 0.028 against a
+            # column ratio of 0.027), while both CAS counters stayed at zero.
+            subset_gets = sub_delta.get("DiskS3GetObject", 0)
 
             cl.node1.command("SYSTEM DROP MARK CACHE")
             cl.node1.command("SYSTEM DROP UNCOMPRESSED CACHE")
@@ -245,25 +252,25 @@ class S06(Scenario):
             except Exception as e:
                 ctx.log(f"S06: all-column scan raised: {e}")
             all_delta = cw2().get("_total", {})
-            all_gets = all_delta.get("CASBlobGet", 0)
+            all_gets = all_delta.get("DiskS3GetObject", 0)
 
-            result.observations["s06_subset_CasBlobGet"] = subset_gets
-            result.observations["s06_allcol_CasBlobGet"] = all_gets
+            result.observations["s06_subset_DiskS3GetObject"] = subset_gets
+            result.observations["s06_allcol_DiskS3GetObject"] = all_gets
             result.observations["s06_subset_cols"] = subset_cols
             if all_gets > 0 and subset_gets >= 0:
                 # subset reads ~subset_cols of n_cols column blobs -> must be well below the all-scan.
                 ok = subset_gets < max(1, all_gets // 2)
                 result.add(Verdict.check(
                     "column-subset avoids full fetch",
-                    f"subset CASBlobGet << all-column ({subset_cols}/{n_cols} cols)",
+                    f"subset DiskS3GetObject << all-column ({subset_cols}/{n_cols} cols)",
                     f"subset={subset_gets} all={all_gets}", ok,
                     "" if ok else "a few-column SELECT fetched ~as many blobs as an all-column scan"))
             elif all_gets == 0:
                 # Caches/inline may serve the read entirely from metadata; record honestly.
                 result.add(Verdict.inconclusive(
                     "column-subset avoids full fetch", "subset << all-column",
-                    "all-column scan issued 0 CASBlobGet (served from cache/inline) — "
-                    "cannot compare blob-fetch counts at this scale"))
+                    "all-column scan issued 0 DiskS3GetObject — the read was served locally, so "
+                    "there are no fetches to compare; drop the disk cache before rerunning"))
 
         _common.standard_end(ctx, result, [table])
 

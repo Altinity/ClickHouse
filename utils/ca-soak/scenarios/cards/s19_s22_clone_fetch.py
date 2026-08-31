@@ -431,7 +431,12 @@ class S21(Scenario):
                 "point_lookups": 20, "readers": 4, "scan_rounds": 3},
         "ci": {"parts": 30, "rows_per_part": 2000, "ncols": 30, "col_bytes": 8192,
                "point_lookups": 60, "readers": 8, "scan_rounds": 5},
-        "full": {"parts": 100, "rows_per_part": 20000, "ncols": 60, "col_bytes": 16384,
+        # `full` is bounded to fit a ~100 GB rig, and the trim is deliberately asymmetric. What this
+        # card tests is a SHAPE: how many refs exist (`parts` x `ncols` = 6,000 column blobs) and how
+        # small a subset one column is (1/`ncols`). Both are preserved exactly. Only the bytes behind
+        # each column shrink, which no verdict here reads. The previous values were
+        # 100 x 20000 x 60 x 16384 = 1.97 TB, unrunnable on any rig we have; these are 19.7 GB.
+        "full": {"parts": 100, "rows_per_part": 800, "ncols": 60, "col_bytes": 4096,
                  "point_lookups": 200, "readers": 16, "scan_rounds": 10},
     }
 
@@ -509,15 +514,18 @@ class S21(Scenario):
         counters_1col = _common.counters_window(ctx)
         cl.node1.query(f"SELECT sum(length(c0)) FROM {table} FORMAT Null")
         d1 = counters_1col().get("_total", {})
-        blob_get_1col = int(d1.get("CASBlobGet", 0))
+        # `DiskS3GetObject`, not `CASBlobGet`: column `.bin` data is read by the object-storage disk,
+        # never through the instrumented CAS backend, so `CASBlobGet` and `CASBlobGetStream` both stay
+        # flat on a column read. See the same correction in S06 for the measurement behind it.
+        blob_get_1col = int(d1.get("DiskS3GetObject", 0))
 
         all_cols_expr = " + ".join(f"length({c})" for c in data_cols)
         counters_allcol = _common.counters_window(ctx)
         cl.node1.query(f"SELECT sum({all_cols_expr}) FROM {table} FORMAT Null")
         dall = counters_allcol().get("_total", {})
-        blob_get_all = int(dall.get("CASBlobGet", 0))
+        blob_get_all = int(dall.get("DiskS3GetObject", 0))
         result.observations["column_subset_blob_get"] = {
-            "one_col_CasBlobGet": blob_get_1col, "all_col_CasBlobGet": blob_get_all,
+            "one_col_DiskS3GetObject": blob_get_1col, "all_col_DiskS3GetObject": blob_get_all,
             "ncols": ncols}
         # 1-column should fetch roughly 1/ncols of the bodies; assert it is strictly, materially less.
         # If both counts are 0 the table data was fully cached and we cannot compare; declare
@@ -525,14 +533,14 @@ class S21(Scenario):
         if blob_get_1col == 0 and blob_get_all == 0:
             result.add(Verdict.inconclusive(
                 "column-subset fetches only required blobs",
-                f"1-column CASBlobGet << all-column CASBlobGet (~1/{ncols})",
-                f"1col=0 all=0 — both scans hit the blob cache entirely at this scale; "
-                "cannot compare blob-get counts (increase scale or payload to spill the cache)"))
+                f"1-column DiskS3GetObject << all-column DiskS3GetObject (~1/{ncols})",
+                f"1col=0 all=0 — neither scan reached the object store, so there are no fetches "
+                "to compare; drop the disk cache before rerunning"))
         else:
             ok_subset = blob_get_1col < blob_get_all
             result.add(Verdict.check(
                 "column-subset fetches only required blobs",
-                f"1-column CASBlobGet << all-column CASBlobGet (~1/{ncols})",
+                f"1-column DiskS3GetObject << all-column DiskS3GetObject (~1/{ncols})",
                 f"1col={blob_get_1col} all={blob_get_all}",
                 ok_subset,
                 "" if ok_subset else
