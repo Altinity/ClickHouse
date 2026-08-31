@@ -428,7 +428,7 @@ TEST(IcebergMetadataGenerator, AddColumnFirstPlacesFieldAtIndexZero)
             break;
         }
     }
-    ASSERT_NE(current_schema, nullptr);
+    ASSERT_NE(current_schema.get(), nullptr);
 
     auto fields = current_schema->getArray(f_fields);
     ASSERT_GE(fields->size(), 1u);
@@ -456,7 +456,7 @@ TEST(IcebergMetadataGenerator, AddColumnAfterPlacesFieldAfterNamedColumn)
             break;
         }
     }
-    ASSERT_NE(current_schema, nullptr);
+    ASSERT_NE(current_schema.get(), nullptr);
 
     auto fields = current_schema->getArray(f_fields);
     ASSERT_EQ(fields->size(), 3u);
