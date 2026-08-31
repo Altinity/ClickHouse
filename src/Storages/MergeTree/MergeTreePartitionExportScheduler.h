@@ -95,6 +95,15 @@ private:
     void handlePartCompletion(const String & transaction_id, const String & part_name, const MergeTreePartExportManifest::CompletionCallbackResult & result);
     void tryCommit(const String & transaction_id);
 
+    /// Wall-clock timeout pass. Transitions expired PENDING tasks to KILLED (unless a commit is
+    /// already in flight) and cancels their in-flight parts. Returns true if any PENDING work
+    /// remains, so the caller should keep polling.
+    bool enforceTimeouts();
+
+    /// Caller must hold `mutex`. Persist `KILLED` with a timeout reason. Returns false if the
+    /// local write fails (descriptor is left unchanged so the next tick retries).
+    bool tryPersistTimeoutKill(const String & composite_key, TaskEntry & entry, time_t now);
+
     /// Atomically write `descriptor_json` to the task's on-disk file (tmp + replace), named by the
     /// composite key so a force-replace naturally overwrites the previous record. Always invoked
     /// while holding the registry `mutex` (write-through), so writes are serialized by that lock.

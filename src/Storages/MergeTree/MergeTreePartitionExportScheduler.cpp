@@ -162,74 +162,88 @@ std::vector<PartitionExportInfo> MergeTreePartitionExportScheduler::getInfo() co
     return result;
 }
 
-bool MergeTreePartitionExportScheduler::run()
+namespace
+{
+    bool isTimedOut(const MergeTreePartitionExportTask & descriptor, time_t now)
+    {
+        return descriptor.task_timeout_seconds > 0
+            && descriptor.create_time + static_cast<time_t>(descriptor.task_timeout_seconds) < now;
+    }
+}
+
+bool MergeTreePartitionExportScheduler::tryPersistTimeoutKill(const String & composite_key, TaskEntry & entry, time_t now)
+{
+    const auto transaction_id = entry.descriptor.transaction_id;
+    const auto timeout_seconds = entry.descriptor.task_timeout_seconds;
+
+    auto updated = entry.descriptor;
+    updated.status = MergeTreePartitionExportTask::Status::KILLED;
+    updated.last_exception.message = fmt::format(
+        "Export partition task timed out: exceeded export_merge_tree_partition_task_timeout_seconds={} (created at {}, now {})",
+        timeout_seconds, entry.descriptor.create_time, now);
+    updated.last_exception.part = "";
+    updated.last_exception.time = now;
+    updated.last_exception.count += 1;
+
+    try
+    {
+        persist(composite_key, updated.toJsonString());
+    }
+    catch (...)
+    {
+        tryLogCurrentException(storage.log, "ExportPartition: failed to persist timeout kill, will retry");
+        return false;
+    }
+
+    entry.descriptor = std::move(updated);
+    LOG_WARNING(storage.log,
+        "ExportPartition: task {} exceeded task_timeout_seconds={}s, transitioned PENDING -> KILLED",
+        transaction_id, timeout_seconds);
+    return true;
+}
+
+bool MergeTreePartitionExportScheduler::enforceTimeouts()
 {
     std::vector<String> timed_out_transactions;
     bool any_pending = false;
 
-    /// Timeout is checked first, before the "cannot make progress this tick" early returns,
-    /// so a wedged task (no move executors, memory pressure, ...) still expires.
     {
         std::lock_guard lock(mutex);
         const auto now = time(nullptr);
         for (auto & [key, entry] : tasks)
         {
-            auto & descriptor = entry.descriptor;
-            if (descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+            if (entry.descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
                 continue;
 
-            if (descriptor.task_timeout_seconds > 0
-                && descriptor.create_time + static_cast<time_t>(descriptor.task_timeout_seconds) < now)
+            if (!isTimedOut(entry.descriptor, now))
             {
-                /// A commit already in flight may have landed on the destination; do not overwrite
-                /// it with KILLED (same as a user KILL that sees `committing`).
-                if (entry.committing)
-                {
-                    any_pending = true;
-                    continue;
-                }
-
-                const auto transaction_id = descriptor.transaction_id;
-                const auto timeout_seconds = descriptor.task_timeout_seconds;
-                auto updated = descriptor;
-                updated.status = MergeTreePartitionExportTask::Status::KILLED;
-                updated.last_exception.message = fmt::format(
-                    "Export partition task timed out: exceeded export_merge_tree_partition_task_timeout_seconds={} (created at {}, now {})",
-                    timeout_seconds, descriptor.create_time, now);
-                updated.last_exception.part = "";
-                updated.last_exception.time = now;
-                updated.last_exception.count += 1;
-
-                try
-                {
-                    persist(key, updated.toJsonString());
-                }
-                catch (...)
-                {
-                    tryLogCurrentException(storage.log, "ExportPartition: failed to persist timeout kill, will retry");
-                    any_pending = true;
-                    continue;
-                }
-
-                entry.descriptor = std::move(updated);
-                timed_out_transactions.push_back(transaction_id);
-                LOG_WARNING(storage.log,
-                    "ExportPartition: task {} exceeded task_timeout_seconds={}s, transitioned PENDING -> KILLED",
-                    transaction_id, timeout_seconds);
+                any_pending = true;
                 continue;
             }
 
-            any_pending = true;
-        }
+            /// A commit already in flight may have landed on the destination; do not overwrite
+            /// it with KILLED (same as a user KILL that sees `committing`).
+            if (entry.committing || !tryPersistTimeoutKill(key, entry, now))
+            {
+                any_pending = true;
+                continue;
+            }
 
-        if (!any_pending && timed_out_transactions.empty())
-            return false;
+            timed_out_transactions.push_back(entry.descriptor.transaction_id);
+        }
     }
 
     for (const auto & transaction_id : timed_out_transactions)
         storage.killExportPart(transaction_id);
 
-    if (!any_pending)
+    return any_pending;
+}
+
+bool MergeTreePartitionExportScheduler::run()
+{
+    /// Timeouts first, before the "cannot make progress this tick" early returns, so a wedged
+    /// task (no move executors, memory pressure, ...) still expires.
+    if (!enforceTimeouts())
         return false;
 
     /// There is pending work. Even if we cannot make progress this tick (no move executors, moves
