@@ -221,14 +221,27 @@ def check_host_headroom(log_fn=print, *, min_disk_gb=80, min_free_ram_gb=8) -> l
     return concerns
 
 
-def predown_dump(label: str, *, log_fn=print, timeout=600) -> int:
+def predown_dump(label: str, *, log_fn=print, timeout=120) -> int:
     """Dump the servers' system tables to `logs/predown/<node>/<label>/` before a teardown.
 
-    See `scripts/predown_dump.sh` for what it captures and why. BEST-EFFORT: the return code is logged
-    and returned but never raised on, because a teardown must not be blocked by a cluster that is
-    already down — the script itself distinguishes a failed query from a legitimately empty answer."""
+    See `scripts/predown_dump.sh` for what it captures and why. BEST-EFFORT, and that now includes
+    the TIMEOUT: `subprocess.run` raises `TimeoutExpired`, which this used to let escape, so a
+    diagnostic step could abort the scenario it exists to serve. That is not hypothetical — on
+    2026-08-31 a scenario left the object store saturated, this dump then exceeded its timeout while
+    reading heavy system tables, and S22, S23 and S25 each died on entry without producing a single
+    verdict, ten minutes apart. Worse, it dies BEFORE the `compose down -v` that would have healed the
+    cluster, so the damage propagates to the next scenario instead of being reset. A dump must never
+    be able to do that.
+
+    The default is 120s rather than 600s for the same reason: this runs before EVERY scenario, and a
+    dump that needs ten minutes is reporting a sick cluster, not producing useful evidence."""
     script = str((CA_SOAK_DIR / "scripts" / "predown_dump.sh").resolve())
-    rc = _run([script, label], timeout=timeout, log_fn=log_fn)
+    try:
+        rc = _run([script, label], timeout=timeout, log_fn=log_fn)
+    except subprocess.TimeoutExpired:
+        log_fn(f"predown_dump: exceeded {timeout}s and was abandoned (best-effort); "
+               f"the cluster is likely saturated — the teardown below proceeds regardless")
+        return -1
     if rc != 0:
         log_fn(f"predown_dump: exit {rc} (best-effort; see logs/predown/*/{label}/manifest.txt)")
     return rc
