@@ -780,6 +780,21 @@ size_t ReadManager::bytesInFlightTarget() const
 {
     /// `io_threads` is the size of the pool that actually executes the reads (0 before it's created).
     size_t io_threads = std::max<size_t>(1, parser_shared_resources->io_threads.load(std::memory_order_relaxed));
+
+    /// Read-ahead exists to hide round trips. When this file's reads have no round trip to hide -- a
+    /// local disk, or an object store whose bytes are already in the filesystem cache -- issuing them
+    /// early buys nothing and costs memory-pool churn, lock traffic and locality: measured on a wide
+    /// GROUP BY served entirely from the filesystem cache, read-ahead cost 26% wall and 33% CPU, and
+    /// turning it off matched the on-demand path exactly. The fitted round-trip time says which case
+    /// this is, so let it decide rather than the operator.
+    ///
+    /// Only once there is evidence: with no samples the priors stand in, and a cold first read is
+    /// exactly when read-ahead is worth most.
+    constexpr double no_latency_to_hide_us = 2000;
+    const Prefetcher::ReadStats stats = reader.prefetcher.readStats();
+    if (stats.samples >= 8 && stats.rtt_us < no_latency_to_hide_us)
+        return 0;
+
     return std::max(
         reader.prefetcher.targetBytesInFlight(io_threads),
         reader.options.format.parquet.min_bytes_in_flight);
@@ -852,7 +867,15 @@ void ReadManager::pumpIssueQueue(MemoryUsageDiff & diff)
             /// up to its own size times that amplification, which `input_format_parquet_max_read_amplification`
             /// bounds; the overshoot is at most one entry's worth because the next iteration sees the
             /// real usage.
+            /// Bound the queue as well as the bytes: a task waiting for an IO thread delivers no
+            /// bytes earlier than one issued later, so queueing more than the pool can start soon is
+            /// pure overhead. Two per thread keeps every thread fed with one in hand.
+            const size_t io_threads = std::max<size_t>(1,
+                parser_shared_resources->io_threads.load(std::memory_order_relaxed));
+            const size_t max_tasks_waiting = io_threads * 2;
+
             if (reader.prefetcher.bytesInFlight() + it->bytes > target ||
+                reader.prefetcher.tasksQueued() >= max_tasks_waiting ||
                 pool_usage_now + it->bytes > poolLimits(pool).memory_high_watermark)
             {
                 blocked = true;

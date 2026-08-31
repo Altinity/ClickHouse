@@ -102,6 +102,11 @@ public:
     /// Sum of `length` of tasks that are `Scheduled` or `Running`, i.e. including the ones still
     /// waiting for an IO thread. Diagnostics only: no budget is derived from it.
     size_t bytesQueued() const { return bytes_in_flight.load(std::memory_order_relaxed); }
+    /// Number of tasks handed to the IO pool that no thread has started yet. This, not a byte count,
+    /// is what read-ahead must bound: queueing more than the pool can start soon buys no earlier
+    /// bytes and costs memory-pool churn, lock traffic and locality (measured: with a 1 GiB target
+    /// and 32 IO threads, +38% CPU on a wide GROUP BY whose reads were all cache-resident).
+    size_t tasksQueued() const { return tasks_queued.load(std::memory_order_relaxed); }
     /// Length of the range a handle pins, 0 for an empty handle. Doesn't touch the handle's task or
     /// any other shared state, so the read-path planner can use it to size reads it hasn't started.
     size_t requestLength(const PrefetchHandle & handle) const;
@@ -289,6 +294,10 @@ private:
     /// read-ahead target is compared against. A task dropped while still `Scheduled` never enters
     /// this counter, so `decreaseTaskRefcount` has nothing to undo here.
     std::atomic<size_t> bytes_executing {0};
+
+    /// See `tasksQueued`. Incremented in `scheduleTask`, decremented when a thread takes the task
+    /// (`Scheduled` -> `Running` in `runTask`) or when it is dropped while still `Scheduled`.
+    std::atomic<size_t> tasks_queued {0};
 
     /// Protects the ReadStats accumulators below. Updated at most once per completed task (rare),
     /// so a mutex is simpler than lock-free fixed-point atomics.

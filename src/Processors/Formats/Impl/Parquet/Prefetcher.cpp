@@ -71,6 +71,7 @@ Prefetcher::~Prefetcher()
     /// any still-running tasks, none should be left in flight.
     chassert(bytes_in_flight.load(std::memory_order_relaxed) == 0);
     chassert(bytes_executing.load(std::memory_order_relaxed) == 0);
+    chassert(tasks_queued.load(std::memory_order_relaxed) == 0);
 }
 
 Prefetcher::ReadStats Prefetcher::readStats() const
@@ -548,7 +549,10 @@ void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount)
     /// executing (or about to) and will subtract them itself when it finishes; if it was `Done` or
     /// `Exception`, `runTask` already did.
     if (prev_state == Task::State::Scheduled)
+    {
         task->owner->bytes_in_flight.fetch_sub(task->length, std::memory_order_relaxed);
+        task->owner->tasks_queued.fetch_sub(1, std::memory_order_relaxed);
+    }
 
     /// This path only runs when no `PrefetchHandle` references the task any more, so nobody can be
     /// blocked in `waitForBytes` for it.
@@ -656,6 +660,7 @@ void Prefetcher::scheduleTask(Task * task)
     /// to reach `runTask` exactly once, whether scheduled onto `io_runner` here or run synchronously
     /// from `getRangeData`), or in `decreaseTaskRefcount` if the task is dropped before that happens.
     bytes_in_flight.fetch_add(task->length, std::memory_order_relaxed);
+    tasks_queued.fetch_add(1, std::memory_order_relaxed);
 
     if (parser_shared_resources && !parser_shared_resources->io_runner.isDisabled())
         parser_shared_resources->io_runner([this, task, _shutdown = shutdown]
@@ -726,6 +731,8 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
     /// end of this function; the CAS above succeeds for exactly one caller, so the pair is exact, and
     /// a task dropped while still `Scheduled` never touches this counter.
     bytes_executing.fetch_add(task->length, std::memory_order_relaxed);
+    /// It is no longer waiting for a thread: it has one.
+    tasks_queued.fetch_sub(1, std::memory_order_relaxed);
 
     task->stopwatch.restart();
 
