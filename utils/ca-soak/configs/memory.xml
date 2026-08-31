@@ -7,4 +7,12 @@
          survives `docker compose down -v`. The node stays alive and the consumer is NAMED, instead
          of a silent kernel OOM-kill that destroys all evidence (soak #7 / B165). -->
     <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Sample background and idle allocations, not only per-query ones. This knob defaults to 0,
+         meaning off, and the per-query `memory_profiler_step` cannot fire when no query is running,
+         which is exactly the case an idle-growth question asks about. Without this,
+         `system.trace_log` holds no `Memory` rows for an idle window, so the question comes back
+         unanswerable rather than answered. It belongs here and not in `profiling.xml`: that file is
+         mounted into `users.d`, where a server setting is ignored. 4 MiB keeps the rate modest. -->
+    <total_memory_profiler_step>4194304</total_memory_profiler_step>
 </clickhouse>

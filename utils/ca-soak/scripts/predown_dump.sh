@@ -90,7 +90,14 @@ for spec in $NODES; do
     # literal with itself and the filter never fires. That exact bug shipped every pre-2026-07-29
     # specimen as an unfiltered mix of ALL trace types in both files (found by the GC audit: __poll
     # with identical Real and CPU sample counts).
-    for tt in CPU Real; do
+    # `Memory` belongs here as much as CPU and Real: an allocation question (does RSS grow on an
+    # idle pool?) cannot be answered from the other two, and this dump is the only thing that survives
+    # the harness's `docker compose down -v`. Note the server-side prerequisite: background and idle
+    # allocations are sampled only when `total_memory_profiler_step` is set, which defaults to 0 (off)
+    # -- `configs/profiling.xml` sets it. Without that, a `Memory` dump of an idle window is empty
+    # even though a query-heavy one is not, because the per-query `memory_profiler_step` cannot fire
+    # with no query running.
+    for tt in CPU Real Memory; do
         q "$port" "
             SELECT
                 multiIf(query_id = '', 'background', 'query') AS side,

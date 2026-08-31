@@ -1120,11 +1120,21 @@ can produce any.** Asked whether the trace told us where the 500 MB went, the an
    cannot fire during an idle window because no query is running. This is why the earlier one-hour
    chaos soak did have ~25k `Memory` samples while an idle run would have none: those came from
    queries.
-3. **What was collected is not time-scoped.** The `Real` aggregate covers the whole server lifetime
-   with no window, so although S23's dump is full of CAS write frames — `commit` 380 samples,
+3. **What was collected is not time-scoped — but the capability exists and is simply unused.**
+   `predown_dump.sh` already accepts `FROM_TS`/`TO_TS` and folds them into a `${WINDOW}` clause on
+   every trace query; the scenario runner just never passes them. So S23's `Real` aggregate spans the
+   whole server lifetime, and although it is full of CAS write frames — `commit` 380 samples,
    `publishStaging` 378, `publishBlob` 365, `fanOutBlobUploads` 368, and
    `CityHash128BlobHashingWriteBuffer::nextImpl` 172 — those most plausibly belong to the setup phase
-   and cannot be attributed to the idle minutes either way. The pool was empty by the end.
+   and cannot be attributed to the idle minutes either way. The pool was empty by the end. Fixing
+   this is a matter of the card passing the window it already knows, not of adding a feature.
+
+**Items 1 and 2 are now fixed and verified (2026-08-31).** `predown_dump.sh` dumps `Memory` alongside
+`CPU` and `Real`, and `configs/memory.xml` sets `total_memory_profiler_step` to 4 MiB. The setting
+had to go in `memory.xml` rather than `profiling.xml`, because the latter is mounted into `users.d`
+where a server setting is ignored. Verified on a live cluster: the setting reports `changed = 1`, a
+write workload produced **1,064 background** `Memory` samples where the count would previously have
+been zero, and the dump wrote 1.27 MB of `Memory` stacks with no error output.
 
 **Experiment that decides it,** with those three fixed first: set `total_memory_profiler_step` to a
 few MiB on the server, have the dump query the `Memory` trace type, and scope the aggregate to the
