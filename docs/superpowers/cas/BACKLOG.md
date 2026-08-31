@@ -1279,3 +1279,39 @@ converge on the same plateau by different routes, and the plateau is stable — 
 677 MB stops there is plausible, not shown. A fresh boot idled for 60-plus minutes, read as a curve,
 is what would show it. Until then nothing here may be recorded as a leak, and nothing may be recorded
 as warm-up either.
+
+## `[soak-retry-budget-turns-a-503-into-a-livelock]` A 500-attempt retry budget converts RustFS's read-concurrency limit into an indefinite stall {#soak-retry-budget-livelock}
+
+**Observed live 2026-08-31 while verifying an S21 fix; the merge sat at progress 0.11 having read
+20.67 MiB of 1.10 GiB, and advanced 0 bytes in 40 seconds.** Every link below is measured or quoted,
+because two earlier explanations of mine were not.
+
+- RustFS says exactly what is wrong, 3,884 times in twelve minutes:
+  `SlowDown: disk read concurrency limit reached, please reduce your request rate`. It is a
+  **concurrency** ceiling, not a volume problem — the store answers a direct probe in 1.2 ms while
+  refusing the merge's reads.
+- The client does not pace itself: `s3_max_get_rps` and `s3_max_get_burst` are both **0**.
+- The retry budget is **500** (`s3_retry_attempts`), and the log shows `Attempt 19/501`.
+
+So a persistent 503 becomes neither success nor failure. Every thread keeps retrying, concurrency
+therefore never falls back under the ceiling, and the operation cannot finish or give up. 104 threads
+were parked in `RetryRequestSleep` at once.
+
+**The failure mode is already named in this repo, for a different trigger.** `configs/storage_conf.xml`
+carries a B187 comment describing "the 500x5s retry storm that wedges the merge finalize", caused by
+rustfs closing mid-body on a conditional PUT, and mitigates *that* path with
+`expect_continue_min_bytes = 65536`. The read path has no equivalent mitigation, so the same wedge
+returns through the concurrency limit. **Two workarounds interacting: a retry budget raised to survive
+one rustfs defect turns a second rustfs behaviour into a livelock.**
+
+**Fix, in the order the evidence supports it.** Set `s3_max_get_rps` so the client stays under the
+store's ceiling — this is precisely what the error message asks for, and it is a rig configuration
+gap, not a product defect. Then reconsider whether 500 attempts is right: a budget that large cannot
+distinguish "retry until the transient clears" from "wait forever", and a persistent, self-caused 503
+deserves to surface as an error long before attempt 500. Both are wider than S21 — every scenario
+doing concurrent reads at scale is exposed.
+
+**What is NOT established:** whether RustFS's read-concurrency ceiling is configurable in
+`1.0.0-rc.3`. `configs/rustfs.env` already disables the scanner and heal for related 503 bursts
+("multi-minute `503 ServiceUnavailable` bursts in this single-disk ephemeral fixture"), so raising the
+ceiling may not be available and pacing the client may be the only lever.

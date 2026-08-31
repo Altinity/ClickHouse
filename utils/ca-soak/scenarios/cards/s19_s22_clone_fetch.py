@@ -349,6 +349,14 @@ class S20(Scenario):
         delta = counters()
         follower_delta = delta.get(self.FOLLOWER, {})
         total_delta = delta.get("_total", {})
+        # Record the FULL per-node delta, not a hand-picked five. The `follower publishes its own
+        # refs` verdict below gates on `CASRootCompareSwap`, and a fetch that demonstrably succeeded
+        # (queue drained, checksums converged, pool +9 objects) still reported zero for it — so the
+        # counter is very likely not the one this path moves, the same defect S06 and S21 carried.
+        # Keeping every CAS counter that moved lets the next run name the right one instead of
+        # guessing, without changing any verdict on a hypothesis.
+        result.observations["follower_fetch_counters_full"] = {
+            k: int(v) for k, v in sorted(follower_delta.items()) if str(k).startswith("CAS") and v}
         result.observations["follower_fetch_counters"] = {
             k: int(follower_delta.get(k, 0)) for k in (
                 "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASRootCompareSwap",
@@ -430,14 +438,26 @@ class S21(Scenario):
         "dev": {"parts": 8, "rows_per_part": 200, "ncols": 12, "col_bytes": 4096,
                 "point_lookups": 20, "readers": 4, "scan_rounds": 3},
         "ci": {"parts": 30, "rows_per_part": 2000, "ncols": 30, "col_bytes": 8192,
-               "point_lookups": 60, "readers": 8, "scan_rounds": 5},
+               "point_lookups": 60, "readers": 4, "scan_rounds": 5},
+        # `readers` is deliberately NOT scaled with the scale: it is 4 at every tier. Concurrency is
+        # bounded by what the object store will serve, not by the property under test, and `ci` at 8
+        # throttled just as `full` at 16 did. Scaling it was the mistake, not the value.
+        #
+        # Two independent limits bind here, and bytes were only the first. Cutting bytes fixed
+        # capacity but not throughput: at `readers: 16` this rig's single-node RustFS refused ~95% of
+        # GETs (10,211 throttled of 10,740) and the AWS SDK's `AttemptExhaustively` backoff then
+        # stalled the run outright. The first six inserts took 0.2 s each; the seventh made no progress
+        # in 900 s, parked in `RetryRequestSleep`. Concurrency is not part of what this card proves --
+        # the shape is the blob count and the subset ratio, and `readers` changes neither -- so it
+        # drops to 4 and the run costs wall-clock instead of not finishing.
+        #
         # `full` is bounded to fit a ~100 GB rig, and the trim is deliberately asymmetric. What this
         # card tests is a SHAPE: how many refs exist (`parts` x `ncols` = 6,000 column blobs) and how
         # small a subset one column is (1/`ncols`). Both are preserved exactly. Only the bytes behind
         # each column shrink, which no verdict here reads. The previous values were
         # 100 x 20000 x 60 x 16384 = 1.97 TB, unrunnable on any rig we have; these are 19.7 GB.
         "full": {"parts": 100, "rows_per_part": 800, "ncols": 60, "col_bytes": 4096,
-                 "point_lookups": 200, "readers": 16, "scan_rounds": 10},
+                 "point_lookups": 200, "readers": 4, "scan_rounds": 10},
     }
 
     def run(self, ctx, result):
@@ -465,6 +485,20 @@ class S21(Scenario):
 
         for n in cl.nodes():
             _make_table(n, table, columns=cols_sql, order_by="id")
+
+        # Merges are stopped for the whole measured window, for two independent reasons.
+        #
+        # They destroy the premise: this card's shape is `parts` x `ncols` distinct column blobs, and
+        # a background merge collapses those parts, so the "many refs" the verdicts reason about
+        # quietly stops existing while they are being measured. Pinning the part count in the params
+        # is worthless if the server is free to reduce it.
+        #
+        # They also swamp the object store. A merge of six 197 MB parts reads and rewrites 1.18 GB as
+        # sixty column blobs, and on a single-node store that burst throttles everything: observed
+        # 2026-08-31 at 67% of GETs refused with a merge running, whereupon the SDK's retry backoff
+        # stalled the concurrent insert outright.
+        for n in cl.nodes():
+            n.command(f"SYSTEM STOP MERGES {table}")
 
         # --- prefill: many parts, many columns (NOT part of the measured read window) -------------
         t_prefill = time.monotonic()
@@ -611,6 +645,9 @@ class S21(Scenario):
 
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
                                       name="S21 replica agreement")
+        # Hand the table back in its normal state before the shared end-checkpoint runs fsck and GC.
+        for n in cl.nodes():
+            n.command(f"SYSTEM START MERGES {table}")
         _common.standard_end(ctx, result, [table])
 
 
