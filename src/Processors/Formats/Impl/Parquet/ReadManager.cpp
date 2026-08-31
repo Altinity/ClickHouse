@@ -11,6 +11,7 @@
 #include <Common/logger_useful.h>
 
 #include <algorithm>
+#include <limits>
 #include <deque>
 #include <mutex>
 #include <shared_mutex>
@@ -32,6 +33,7 @@ namespace ProfileEvents
     extern const Event ParquetReadRowGroups;
     extern const Event ParquetPrunedRowGroups;
     extern const Event ParquetPlannedReads;
+    extern const Event ParquetPlannedReadsSkippedLocal;
     extern const Event ParquetIssueQueueStalls;
 }
 
@@ -609,6 +611,27 @@ void ReadManager::advanceDeliveryPtrIfNeeded(size_t row_group_idx, MemoryUsageDi
     }
 }
 
+/// Whether every byte a planned read would fetch is already in a local cache, so pre-issuing it can
+/// save no round trip. Such a read is left to the stage that needs it, which gets it at memcpy cost:
+/// pre-issuing it instead consumes a pool slot, charges the compressed-memory pool and lengthens the
+/// issue queue for nothing (measured on a cluster whose filesystem cache held the whole working set:
+/// 26% wall and 33% CPU).
+static bool spanIsLocal(const DB::Parquet::Prefetcher & prefetcher, const std::vector<Parquet::PrefetchHandle *> & handles)
+{
+    size_t begin = std::numeric_limits<size_t>::max();
+    size_t end = 0;
+    for (const Parquet::PrefetchHandle * h : handles)
+    {
+        const size_t o = prefetcher.requestOffset(*h);
+        const size_t l = prefetcher.requestLength(*h);
+        if (l == 0)
+            continue;
+        begin = std::min(begin, o);
+        end = std::max(end, o + l);
+    }
+    return end > begin && prefetcher.rangeIsLocal(begin, end - begin);
+}
+
 void ReadManager::enqueueRowGroupIndexReads(size_t row_group_idx)
 {
     /// `input_format_parquet_min_bytes_in_flight = 0` turns read-ahead planning off: nothing is
@@ -625,6 +648,11 @@ void ReadManager::enqueueRowGroupIndexReads(size_t row_group_idx)
         std::erase_if(handles, [](const PrefetchHandle * h) { return !*h; });
         if (handles.empty())
             return;
+        if (spanIsLocal(reader.prefetcher, handles))
+        {
+            ProfileEvents::increment(ProfileEvents::ParquetPlannedReadsSkippedLocal);
+            return;
+        }
         size_t bytes = 0;
         for (const PrefetchHandle * h : handles)
             bytes += reader.prefetcher.requestLength(*h);
@@ -723,6 +751,11 @@ void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx
         std::erase_if(handles, [](const PrefetchHandle * h) { return !*h; });
         if (handles.empty())
             continue;
+        if (spanIsLocal(reader.prefetcher, handles))
+        {
+            ProfileEvents::increment(ProfileEvents::ParquetPlannedReadsSkippedLocal);
+            continue;
+        }
         size_t bytes = 0;
         for (const PrefetchHandle * h : handles)
             bytes += reader.prefetcher.requestLength(*h);

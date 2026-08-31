@@ -59,6 +59,7 @@ public:
     /// follows the same thread-safety rules as `readBigAt`: concurrent calls are allowed. Advisory
     /// only -- a block can be evicted between this call and the read that follows it.
     bool isBigRangeCached(size_t offset, size_t n) const;
+    bool isRangeLocal(size_t offset, size_t n) const override { return isBigRangeCached(offset, n); }
 
     PageCache::MappedPtr getPageCacheCell() const { return chunk; }
     PageCachePtr getPageCache() const { return cache; }

@@ -54,6 +54,8 @@ public:
     /// Used only for unit test.
     const ImplPtr & getImpl() { return impl; }
 
+    bool isRangeLocal(size_t offset, size_t n) const override { return impl && impl->isRangeLocal(offset, n); }
+
     /// NOTE: readBigAt() does not use the async logic of AsynchronousBoundedReadBuffer; it calls impl's
     /// (when supported), which is possible because readBigAt is asynchronous on its own. If a (small-object)
     /// initial prefetch is in flight it is consumed first: the requested range is served from the prefetched

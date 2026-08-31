@@ -110,6 +110,12 @@ public:
     /// Length of the range a handle pins, 0 for an empty handle. Doesn't touch the handle's task or
     /// any other shared state, so the read-path planner can use it to size reads it hasn't started.
     size_t requestLength(const PrefetchHandle & handle) const;
+    /// File offset of the range a handle pins; 0 for an empty handle. Same reasoning as
+    /// `requestLength`: the planner needs to locate a read it has not started.
+    size_t requestOffset(const PrefetchHandle & handle) const;
+    /// Whether the source can serve [offset, offset + length) without a round trip, because a cache
+    /// (userspace page cache or filesystem cache) already holds it. Advisory; false when unknown.
+    bool rangeIsLocal(size_t offset, size_t length) const;
     /// How many bytes we'd like to have in flight at once, given `concurrency` concurrent readers:
     /// bandwidth * round-trip time is the amount of data one stream keeps "in the pipe"; multiplying
     /// by `concurrency` and by a headroom factor of 2 keeps all streams busy despite jitter. Floored
@@ -146,6 +152,10 @@ private:
         size_t range_set_idx = 0;
         size_t range_idx = UINT64_MAX;
         size_t length = 0;
+        /// File offset of this range. Written once when the range is registered (and again if the
+        /// range is split), read without the mutex by `requestOffset` so the read-path planner can ask
+        /// the source whether the range is already local before deciding to pre-issue it.
+        size_t offset = 0;
         size_t task_offset = 0;
     };
 

@@ -117,6 +117,12 @@ public:
     /// Sometimes however seek is basically free because underlying read buffer wasn't yet initialised (or re-initialised after reset).
     virtual bool isSeekCheap() { return false; }
 
+    /// Whether [offset, offset + n) can be served without a round trip to the remote storage, because
+    /// a local cache already holds it. Advisory and thread-safe under the same rules as `readBigAt`:
+    /// callers use it to decide whether a read is worth issuing early or reading through, never for
+    /// correctness, and a range may be evicted right after the call returns. Default: nothing is local.
+    virtual bool isRangeLocal(size_t /*offset*/, size_t /*n*/) const { return false; }
+
     /// For tables that have an external storage (like S3) as their main storage we'd like to distinguish whether we're reading from this storage or from a local cache.
     /// It allows to reuse all the optimisations done for reading from local tables when reading from cache.
     /// Usually `offset` is equal to getPosition().

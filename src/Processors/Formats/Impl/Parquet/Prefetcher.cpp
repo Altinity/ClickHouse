@@ -84,6 +84,16 @@ Prefetcher::ReadStats Prefetcher::readStats() const
         .samples = stat_samples};
 }
 
+size_t Prefetcher::requestOffset(const PrefetchHandle & handle) const
+{
+    return handle ? handle.request->offset : 0;
+}
+
+bool Prefetcher::rangeIsLocal(size_t offset, size_t length) const
+{
+    return reader && read_mode == ReadMode::RandomRead && length != 0 && reader->isRangeLocal(offset, length);
+}
+
 size_t Prefetcher::requestLength(const PrefetchHandle & handle) const
 {
     return handle ? handle.request->length : 0;
@@ -238,6 +248,7 @@ PrefetchHandle Prefetcher::registerRange(size_t offset, size_t length, bool like
         throw Exception(ErrorCodes::INCORRECT_DATA, "Range out of bounds: offset {}, length {}, file size {}", offset, length, file_size);
     RequestState & req = requests.emplace_back();
     req.length = length;
+    req.offset = offset;
     req.allow_incidental_read.store(likely_to_be_used || length < min_bytes_for_seek, std::memory_order_relaxed);
     range_sets[0].ranges.push_back(RangeState {.request = &req, .start = offset, .end = offset + length});
     return PrefetchHandle(&req);
@@ -351,6 +362,7 @@ std::vector<PrefetchHandle> Prefetcher::splitRange(
                     req->range_set_idx = new_range_set_idx;
                     req->range_idx = i;
                     req->length = length;
+                    req->offset = start;
 
                     RangeState & r = new_ranges.emplace_back();
                     r.start = start;
@@ -374,6 +386,7 @@ std::vector<PrefetchHandle> Prefetcher::splitRange(
         req->state.store(RequestState::State::HasTask, std::memory_order_relaxed);
         req->task = task;
         req->length = subranges[i].second;
+        req->offset = subranges[i].first;
         req->task_offset = subranges[i].first - task->offset;
     }
 
@@ -639,9 +652,9 @@ bool Prefetcher::gapIsCached(size_t offset, size_t length) const
     /// `readBigAt`-family only, and only worth probing for gaps a task could actually absorb: the
     /// probe is a hash lookup per cache block, so bounding it by `bytes_per_read_task` keeps the cost
     /// proportional to the read it may enable.
-    if (!cache_probe || read_mode != ReadMode::RandomRead || length == 0 || length > bytes_per_read_task)
+    if (length == 0 || length > bytes_per_read_task)
         return false;
-    return cache_probe->isBigRangeCached(offset, length);
+    return rangeIsLocal(offset, length);
 }
 
 void Prefetcher::scheduleTask(Task * task)
