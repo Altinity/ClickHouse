@@ -65,10 +65,18 @@ class S01(Scenario):
     name = "S01"
     title = "huge single blob"
     priority = "P0"
+    # `full` is 8 GiB, not the 100 GiB it used to be. The verdict here is a RATIO -- RSS growth
+    # against blob size, with a 128 MiB floor below which query-pipeline noise swamps the signal --
+    # so it discriminates at any size well above that floor, and 8 GiB leaves 64x of headroom. It
+    # caught the shape this card exists for at `ci` already: 512 MiB blob, 0 bytes of RSS growth.
+    #
+    # 100 GiB was not more rigorous, only unrunnable. Measured 2026-08-31 it needs 550+ GiB of disk
+    # (scratch spills the whole part per node, and a shared-pool replica re-spills its own), and it
+    # filled this host's disk once before a watchdog stopped it.
     param_table = {
         "dev": {"blob_mib": 64, "payload_mib": 1, "mid_write_gc": True},
         "ci": {"blob_mib": 512, "payload_mib": 2, "mid_write_gc": True},
-        "full": {"blob_mib": 102400, "payload_mib": 8, "mid_write_gc": True},  # 100 GiB
+        "full": {"blob_mib": 8192, "payload_mib": 8, "mid_write_gc": True},  # 8 GiB
     }
 
     def run(self, ctx, result):
@@ -196,7 +204,7 @@ class S02(Scenario):
     param_table = {
         "dev": {"blob_mib": 64, "payload_mib": 1},
         "ci": {"blob_mib": 512, "payload_mib": 2},
-        "full": {"blob_mib": 102400, "payload_mib": 8},
+        "full": {"blob_mib": 8192, "payload_mib": 8},  # 8 GiB; see S01's note on why not 100
     }
 
     def run(self, ctx, result):
