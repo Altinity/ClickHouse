@@ -1,170 +1,254 @@
 ---
-description: 'Design for refusing an empty expected token at the CAS conditional-write entry, so a fenced write can never degrade into an unconditional clobber on an ETag store.'
-sidebar_label: 'Empty conditional token guard'
+description: 'Design for rejecting a token that cannot name an exact incarnation at the CAS conditional-mutation entry, so a fenced write can never degrade into an unconditional clobber.'
+sidebar_label: 'Exact-token entry guard'
 sidebar_position: 43
 slug: /superpowers/specs/cas-empty-conditional-token-guard
-title: 'CAS empty conditional token guard'
+title: 'CAS exact-token entry guard'
 doc_type: 'guide'
 ---
 
-# CAS empty conditional token guard {#cas-empty-conditional-token-guard}
+# CAS exact-token entry guard {#cas-exact-token-entry-guard}
+
+Revision 2. Revision 1 was reviewed and rejected; [what revision 1 got wrong](#what-revision-1-got-wrong)
+records why, because two of its errors would have made things worse rather than merely incomplete.
 
 ## Problem {#problem}
 
-Every safety-critical CAS mutation is conditional on a token. On an ETag store the condition is
-carried by `If-Match`, and `WriteBufferFromS3` adds that header **only when the value is non-empty**
-(`WriteBufferFromS3.cpp:656`; `WriteBufferFromAzureBlobStorage.cpp:234` does the same). So an empty
-expected token does not produce a condition that fails — it produces **no condition at all**, and the
-"fenced" write becomes an unconditional overwrite of whatever is currently there, including a live
-holder's object.
-
-Nothing in the backend stops that today. The three conditional entry points validate only the token's
-**dialect**:
+Every safety-critical CAS mutation is conditional on a token that must name **one exact incarnation**.
+Three entry points forward that token, and each validates only its **dialect**:
 
 | entry point | guard | where the value reaches the wire |
 |---|---|---|
 | `putOverwrite` | `mintingTypeMatches(expected.type)` (`CasObjectStorageBackend.cpp:963`) | `:969` |
-| `casPut` (swap form) | `mintingTypeMatches(expected->type)` (`:987`) | `:994` |
+| `casPut`, swap form | `mintingTypeMatches(expected->type)` (`:987`) | `:994` |
 | `deleteExact` | `mintingTypeMatches(token.type)` (`:1029`) | `:1040` |
 
-**The hole is exactly one configuration: Native mode on an ETag store.** A default-constructed
-`Token{}` has type `ETag`, so on a generation store and in emulated mode the dialect guard already
-rejects it. But `tokenForHead` stamps `native_token_type` onto whatever string it is given
-(`CasObjectStorageBackend.h:159-162`), so on an ETag store an empty ETag becomes `Token{"", ETag}` — a
-**correctly typed, empty-valued** token that passes every existing check.
+A value that passes the dialect check but cannot name an exact incarnation is forwarded anyway. The
+sharpest case is the empty string: `WriteBufferFromS3` attaches `If-Match` **only when the value is
+non-empty** (`WriteBufferFromS3.cpp:656` and `:746`, its two upload sites;
+`WriteBufferFromAzureBlobStorage.cpp:234` does the same). So an empty expected token does not make a condition that fails — it makes **no condition at
+all**, and a fenced write becomes an unconditional overwrite of whatever is currently there, including
+a live holder's object.
 
-Empty tokens are reachable, not merely constructible. `tokenFromWriteResult`'s `HEAD` fallback returns
-`hr ? hr->token : Token{}` (`CasObjectStorageBackend.cpp:866`), and `nativeHead` validates emptiness
-only for generation tokens (`:149-158`). The value then flows into `MountLeaseKeeper::last_token` and
-becomes the expected token of the next renewal.
+**Reachability.** `tokenForHead` stamps `native_token_type` onto whatever string it is given
+(`CasObjectStorageBackend.h:159-162`), and `nativeHead` validates emptiness only for generation tokens
+(`:149-158`). `tokenFromWriteResult`'s `HEAD` fallback returns `hr ? hr->token : Token{}`
+(`CasObjectStorageBackend.cpp:866`), and that value flows into `MountLeaseKeeper::last_token`. That is
+the naturally minted path, and it exists on ETag stores.
 
-The same file already treats an empty ETag as unusable one function away: `tokenForList` returns
-`std::nullopt` for it, on the stated grounds that a token that cannot discriminate is worse than no
-token (`CasObjectStorageBackend.h:167-172`). The head-and-write path never got the same treatment.
+Two further sources make this **not** a single-dialect problem, contrary to revision 1:
 
-This is `[empty-token-unconditional-write-guard]`, triaged P2 as "missing guard, not a demonstrated
-data-loss path". It is being taken now because it is a prerequisite of the self-authored mount reclaim
-design, which turns a conditional write into a safety argument.
+- **Deserialization.** `TokenFields::build` requires both fields to be *present* but accepts an empty
+  value, in any dialect (`CasWireVocab.cpp:110-115`); the binary condemned-row decoder likewise accepts
+  `token_len == 0` (`CasBlobInDegree.cpp:205`). A condemned row's token reaches `deleteExact` on GC's
+  destructive path.
+- **Direct construction.** `Token{"", TokenType::Generation}` passes `mintingTypeMatches` on a
+  generation store, and the GCS adapter validates an `If-Match` only when one is present rather than
+  requiring a condition on every conditional request — so the PUT goes out unconditioned there too.
+
+**Not every entry point fails the same way, and this is the fact revision 1 missed.** The write paths
+put the value in `WriteSettings`, where an empty string means "omit the header". The delete path calls
+`request.SetIfMatch(etag)` unconditionally (`S3ObjectStorage.cpp:513`), so an empty token produces a
+malformed request rather than an unconditioned one. The codebase already knows this and says so in
+`CasProbe`'s cleanup comment: "A deleteExact with the absent HeadResult's EMPTY token is a malformed
+conditional op — AWS S3 answers `400 InvalidArgument` (`If-Match cannot be empty`)". **Deletion is
+fail-loud today.** Any change there must keep it that way.
+
+This is `[empty-token-unconditional-write-guard]`, triaged P2. It is being taken now because it is a
+prerequisite of the self-authored mount reclaim design, which turns a conditional write into a safety
+argument.
 
 ## The change {#the-change}
 
-Refuse an empty token value at the same three entry points, immediately after the dialect check, using
-each site's existing refusal outcome:
+One predicate, applied at all three entry points immediately after the dialect check and **before** the
+mode branch; two different reactions, chosen by what each site does today.
 
-| entry point | refusal |
+### The predicate {#the-predicate}
+
+Not "non-empty" — "can only match the exact incarnation it names". Emptiness is the reachable case, but
+it is not the only value that fails that test, and drawing the guard at emptiness would leave aliases
+that defeat exactness just as completely:
+
+| dialect | accepted |
 |---|---|
-| `putOverwrite` | `{PutOutcome::PreconditionFailed, {}}` |
-| `casPut` | `{CasOutcome::Conflict, {}}` |
-| `deleteExact` | `DeleteOutcome::Kind::TokenMismatch` |
+| Generation | non-empty, all ASCII digits, and already canonical (`value == normalizeTokenValue(value)`) — a quoted `"123"` is unequal to `123` under `Token::operator==` yet the GCS adapter unquotes it, so it can commit against a token it does not equal |
+| ETag | non-empty, and not the wildcard `*` after trimming optional whitespace — `If-Match: *` means "any current representation exists" under HTTP semantics, which is precisely not an exact incarnation |
+| Emulated | non-empty |
 
-The check goes **before** the `Native` / `EmulatedSingleProcess` branch, so the refusal is uniform
-across modes even though only the native ETag path can be harmed by it. A uniform guard is cheaper to
-reason about than a mode-conditional one, and it makes the emulated backends able to reproduce the
-refusal in a test.
+**Deliberately not included: a full entity-tag grammar.** A comma-separated `If-Match` list matches any
+listed tag, and Azure documents evaluating multiple values with logical OR — so a list is also not
+exact. But S3-compatible stores vary in what they accept, and imposing a strict grammar without a
+compatibility survey risks refusing tokens real stores mint. Empty and wildcard are unambiguous and
+cost nothing; the list case is recorded in [Out of scope](#out-of-scope) with the survey it needs.
 
-`casPut`'s create-if-absent form (`expected == nullopt`) is untouched: it carries no token and rides
-`If-None-Match: *`.
+### The reaction, per site {#reaction-per-site}
 
-## Why refuse rather than throw {#refuse-not-throw}
+**`putOverwrite` and `casPut`'s swap form: refuse**, with each site's existing outcome
+(`PreconditionFailed` / `Conflict`). Today these silently clobber; any refusal is strictly better, and
+the refusal is shaped exactly like the dialect guard one line above, so callers already handle it.
 
-The backlog entry proposed a `LOGICAL_ERROR`-class throw. Refusing is better, for three reasons.
+**`deleteExact`: throw.** It must not reuse `TokenMismatch`. `Backend` documents that outcome as proof
+that **another incarnation is current** (`CasBackend.h:93-95`), and callers act on it as evidence:
 
-**It is what the neighbouring guard does.** The dialect check one line above returns each site's
-refusal outcome rather than throwing. An empty token is the same kind of fact — a token that can match
-nothing — and it should not have a different shape.
+- GC's blob redelete sees `TokenMismatch`, HEADs the key, finds the object present, labels it
+  `Replaced`, drops it from the retirement pipeline and forgets its condemn-marker confirmation
+  (`CasGc.cpp:683`, `:728`). With an invalid token it may be the *same* undeleted incarnation — a false
+  audit record and a permanently leaked blob;
+- wholesale prefix cleanup ignores the outcome, counts the object as deleted, and can declare a prefix
+  drained (`CasGc.cpp:3434-3441`: the outcome is discarded and `++deleted` is unconditional),
+  advancing retention over objects that still exist;
+- GC metadata deletion turns from a logged exception into a silent no-op (`CasGcMetaWriter.cpp:72`);
+- `CasPlainObjects::casRemoveObject` turns an immediate exception into 100 `HEAD`/refuse cycles before
+  `ABORTED` (`CasPlainObjects.cpp:77`).
 
-**It needs no caller changes, because every caller already handles the outcome.** A refusal is what a
-lost condition looks like, and the whole protocol is built to re-validate on one.
+So a refusal outcome at `deleteExact` would convert a loud malformed-request failure into quiet,
+data-affecting misinformation. Throwing `CORRUPTED_DATA` preserves today's shape — the operation fails
+loudly — while moving the failure from the wire to the caller's own process, where the message can name
+the token and the key. No delete caller changes, because every one of them already propagates or logs
+an exception from this call.
 
-**It self-heals through a path that already exists.** Trace the case that matters, a renewal whose
-`last_token` is empty:
+## What it does and does not fix {#what-it-fixes}
 
-1. `putOverwriteControlled` calls `putOverwrite`, which now refuses with `PreconditionFailed`;
-2. the controller's resolve-by-get reads the slot: the bytes are the *previous* body, not the one this
-   renewal is writing, and the token differs from the (empty) expected one, so it reports `Conflict`
-   (`CasRequestControl.cpp:703-707`);
-3. `MountLeaseKeeper::renew` turns a conflict into a terminal renewal, the mount fences, and the
-   remount allocates a fresh `writer_epoch` and claims — obtaining a **fresh, non-empty token**.
+**Fixed:** no conditional mutation can be issued with a token that cannot name an exact incarnation. On
+the write paths that closes a real fail-open hole. On the delete path it turns a remote 400 into a
+local, self-describing failure and removes the possibility that a future transport change makes an
+invalid delete token silently unconditional.
 
-So the corrupt token is discarded by the existing recovery, with no new failure mode and no livelock.
-A throw would take a different route: `terminalResult` rethrows `LOGICAL_ERROR` rather than converting
-it to a terminal renewal result (`CasServerRoot.cpp:1636-1638`), so a `LOGICAL_ERROR` here would
-escape the renewal's own containment. `CORRUPTED_DATA` would be converted, but it would still turn a
-refusal into an exception on a path whose callers are written for refusals.
+**Not fixed, and revision 1 claimed otherwise: this is not self-healing in general.** Revision 1 traced
+one favourable branch — refusal, resolve-by-get reports `Conflict`, terminal renewal, fence, remount
+with a fresh token — and presented it as the outcome. The controller reports `Conflict` only when the
+resolving `GET` returns **both** a different token and different bytes (`CasRequestControl.cpp:703-707`).
+If the store keeps returning an empty ETag, the resolve reads the same empty token, `got->token ==
+expected` holds, and the controller concludes our attempt never applied and retries until its budget is
+spent — no conflict, no terminal, no remount. And a remount only obtains a usable token if the store has
+started returning one.
+
+The honest statement is narrower: **the refusal always fails closed — no mutation is sent — but what
+happens next is the caller's, and for a persistent store anomaly it is a bounded failure rather than a
+recovery.** Per caller:
+
+| caller | behaviour under a persistently invalid token |
+|---|---|
+| `PoolMeta::admitOrValidate` | **unbounded** `for (;;)` conflict loop (`CasPoolMeta.cpp:75`) — a tight livelock; filed separately |
+| `CasPlainObjects` | 100 retries, then `ABORTED` |
+| ref-catalog mutation, epoch allocation, checkpoint publication | bounded, then fail |
+| GC lease acquire/renew | bounded, returns false |
+| GC heartbeat | silently ignores the conflict (`CasGc.cpp:4360`) |
+| mount-floor fencing | four retries, conservatively classifies the holder as live |
+
+None of these is worse than today's unconditional write in terms of *damage*; several are worse in
+terms of *availability*, and the unbounded loop is a genuine new hazard that the guard exposes rather
+than creates. It is worth fixing in the same series.
 
 ## Observability {#observability}
 
-A refusal that looks like an ordinary lost condition would make the anomaly invisible, and an empty
-token is never ordinary. Each refusal:
+A refusal that looks like an ordinary lost condition would make the anomaly invisible, and an invalid
+token is never ordinary. Each refusal or throw:
 
-- increments a new `CASConditionalWriteEmptyTokenRefused` profile event, and
-- logs once at `Warning` with the key and the operation, rate-limited, saying plainly that a token with
-  no value was presented as a condition, that the write was refused rather than sent unconditioned,
-  and that the source is an object-storage response that carried no ETag.
+- increments a new `CASConditionalWriteInvalidTokenRefused` profile event, and
+- logs once at `Warning`, rate-limited, naming the key, the operation and **which rule failed**
+  (empty, wildcard, non-canonical generation).
 
-The event is the thing to alert on: it is zero in every healthy deployment, and a non-zero value means
-the store returned a write or head response with no ETag.
+The message must not assert a cause. Revision 1's did — it blamed "an object-storage response that
+carried no ETag" — but a decoded record, a directly constructed token and a test seam are equally
+possible sources, and a message that names the wrong one sends the reader to the wrong place.
 
-## What this does not do {#what-this-does-not-do}
-
-**It does not stop an empty token being minted.** `tokenForHead` still produces `Token{"", ETag}` and
-`tokenFromWriteResult` still falls back to a fresh `HEAD`. This change makes such a token harmless at
-the point where it could do damage, which is the whole safety property; making the read and write paths
-stop producing it is a larger change with its own consumers to consider.
-
-**It does not address token provenance.** A *non-empty* token from `tokenFromWriteResult`'s fallback
-`HEAD` may belong to a different writer's object entirely, and there is already a consumer where that
-is not fail-safe — `Gc::acquireOrRenewLease` stores it and the round commit CASes against it. That is
-`[write-token-provenance-not-in-the-api]`, and this change neither fixes nor worsens it.
-
-**It does not change the emulated backends' behaviour in practice.** They already refuse an empty
-token, by dialect (a default `Token{}` is not `Emulated`) or by value comparison. The guard makes the
-refusal explicit and testable there; it changes no outcome.
+The event is the thing to alert on: zero in every healthy deployment, non-zero means a token that
+cannot fence reached a fencing operation.
 
 ## Verification {#verification}
 
-**The test that matters must run against the native backend.** Emulated and in-memory backends refuse
-an empty token already, so a test on them passes with the defect fully present — that is precisely why
-this survived to now. The native path needs a real conditional-write backend (the CA-s3 lane, or a
-gtest against the S3-compatible store used by the backend contract tests).
+Revision 1's plan could false-pass in two ways, and both are fixed here: a fake native backend that
+treats an empty `object_storage_write_if_match` as a *failed condition* never exercises
+`WriteBufferFromS3`'s omission, and `InMemoryBackend` is a separate implementation that would not run
+the guard at all.
 
-1. **Native, ETag mode, `putOverwrite` with `Token{"", ETag}`** against a key holding someone else's
-   object: the object is **unchanged** afterwards, and the call returns `PreconditionFailed`. Without
-   the guard this test fails by overwriting — it is the regression test for the defect itself.
-2. The same for `casPut`'s swap form and for `deleteExact`: the object survives, the outcome is
-   `Conflict` / `TokenMismatch`.
-3. `casPut` with `expected == nullopt` still creates: the guard did not catch the create form.
-4. A non-empty token still commits, and a non-empty **wrong** token still refuses: the guard did not
-   change ordinary conditional behaviour.
-5. Generation mode is unaffected: an empty generation token is still refused, now by the value guard
-   rather than only by the dialect guard, and the outcome is the same.
-6. The profile event increments exactly once per refusal, and the emulated backend can drive that
-   assertion without a real store.
+**Two layers, both required.**
 
-**Integration:** the renewal trace above, end to end. Inject an empty `last_token` into a live keeper,
-and assert the sequence — refusal, conflict, terminal renewal, fence, remount with a fresh epoch — and
-that the mount slot's object is never written unconditionally along the way. This is the test that
-proves the self-healing claim rather than asserting it.
+*No-wire, against `ObjectStorageBackend` with a call-counting object storage:*
+
+1. `putOverwrite`, `casPut` swap form and `deleteExact` with `Token{"", ETag}` on an ETag backend →
+   **zero** `writeObject` and zero `removeObjectIfTokenMatches` calls; the two write paths return their
+   refusal, `deleteExact` throws;
+2. the same with `Token{"", Generation}` on a generation backend — revision 1 wrongly claimed the
+   dialect guard already covered this;
+3. `Token{"*", ETag}` and `Token{" * ", ETag}` → refused, zero calls;
+4. `Token{"\"123\"", Generation}` (non-canonical) → refused, zero calls;
+5. `casPut` with `expected == nullopt` still creates — the guard did not catch the create form;
+6. a valid token still commits, and a valid **wrong** token still refuses through the ordinary path;
+7. the profile event increments exactly once per refusal. This test must use `ObjectStorageBackend` in
+   `EmulatedSingleProcess` mode; `InMemoryBackend` does not execute this code, and its
+   `setEnforceTokens(false)` seam accepts every token by design (`CasInMemoryBackend.h:110`).
+
+*Against a real S3-compatible store, with distinct old and new bodies:* a conditional overwrite with an
+empty token leaves the object **unchanged**. This is the one test that is red without the guard and
+green with it, and it is the reason the no-wire layer alone is insufficient.
+
+*Caller-level, for the delete contract:* a delete caller presented with an invalid token must not
+record `Replaced` and must not count the object as drained. Assert on GC's redelete path and on the
+wholesale prefix cleanup that the entry stays in the pipeline and the counters do not advance.
+
+*Renewal, both branches:* inject an empty `last_token` and (a) let the resolve return a valid token —
+conflict, terminal, fence, remount with a fresh token; (b) keep the store returning an empty ETag —
+assert the bounded-retry-then-fail outcome and that **no unconditional write is ever issued**. Branch
+(b) is the one revision 1 omitted, and it is the one that documents the real behaviour.
+
+*Livelock:* `PoolMeta::admitOrValidate` against a persistently invalid token, asserting the loop is
+bounded once its own fix lands.
 
 ## Acceptance {#acceptance}
 
-1. On a native ETag store, no conditional mutation can be issued with an empty expected token, proven
-   by a test that overwrites without the guard and does not with it.
-2. No caller changed. The three refusal outcomes are the ones callers already handle.
-3. A renewal holding an empty token recovers through fence and remount, with the mount object never
-   written unconditionally.
-4. `CASConditionalWriteEmptyTokenRefused` is zero across the existing test suites, and non-zero in the
-   test that provokes it.
-5. The CA-s3 lane and the `CAS*` gtest gate stay green.
+1. No conditional mutation can be issued with a token that fails the predicate, proven by the real-store
+   test that overwrites without the guard and does not with it.
+2. `deleteExact` fails loudly and is never reported as `TokenMismatch`; no delete caller records
+   `Replaced` or counts a drain on an invalid token.
+3. No caller of the two write paths changed.
+4. `CASConditionalWriteInvalidTokenRefused` is zero across the existing suites and non-zero in the tests
+   that provoke it.
+5. Both renewal branches behave as documented, and neither issues an unconditional write.
+6. The CA-s3 lane and the `CAS*` gtest gate stay green.
 
 ## Out of scope {#out-of-scope}
 
+**Rejecting an empty token at decode.** `TokenFields::build` and the condemned-row decoder accept an
+empty value; guarding there would fail earlier and name the corrupt record rather than the operation.
+It is small and probably right, but it is a second site with its own compatibility question — a
+persisted empty token would become an undecodable record rather than a refused operation — so it is
+recorded, not folded in.
+
+**An entity-tag grammar for ETag values.** Comma-separated lists are not exact either, and Azure
+documents OR-evaluation of multiple values. Needs a compatibility survey across the S3-compatible
+stores in the test matrix before it can be enforced.
+
+**`PoolMeta::admitOrValidate`'s unbounded conflict loop.** Exposed by this change, not caused by it;
+filed separately and worth fixing in the same series.
+
 **Paired reads.** Taking the token from the `GET` response rather than a preceding `HEAD` removes a
-round trip and makes the bytes/token pair atomic by construction. It is the natural companion to this
-change and the next step in the same sequence, but it touches five call sites and a new backend read
-method; it is not folded in here.
+round trip and makes the bytes/token pair atomic by construction. Next in this sequence, not folded in.
 
 **`[write-token-provenance-not-in-the-api]`** and **`[resolved-by-get-unbounds-clone-overlap]`**, both
 filed separately.
 
-**The self-authored mount reclaim design**, which lists this change as a prerequisite.
+## What revision 1 got wrong {#what-revision-1-got-wrong}
+
+**It gave `deleteExact` a refusal outcome.** `TokenMismatch` is documented as evidence that another
+incarnation is current, and GC acts on it: labels a blob `Replaced`, drops it from the retirement
+pipeline, counts prefixes as drained. Deletion is fail-loud today — S3 answers `400 InvalidArgument`
+on an empty `If-Match`, as `CasProbe`'s own comment records — so revision 1 would have converted a loud
+failure into quiet misinformation and a leaked blob. This is the error worth remembering: the two write
+paths and the delete path fail differently at the transport, and a guard that treats them identically
+gets one of them backwards.
+
+**It scoped the hole to "Native mode on an ETag store".** True of the naturally minted path, false of
+the entry point: a typed empty generation token is accepted by the dialect guard and the GCS adapter
+does not require a condition, and decoded tokens admit an empty value in any dialect.
+
+**It claimed self-healing, no new failure mode and no livelock.** It traced one branch of the resolve
+and presented it as the outcome. A persistently empty token takes the other branch, and
+`PoolMeta::admitOrValidate` turns it into an unbounded loop.
+
+**It drew the predicate at emptiness**, leaving `*` and non-canonical generation values — both of which
+defeat exactness as completely as an empty string.
+
+**Its verification could pass with the defect present**, because a fake backend may treat an empty
+condition as failed, and because `InMemoryBackend` does not run the guard at all.
