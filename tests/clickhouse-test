@@ -258,13 +258,6 @@ def shell_get_output(
         print(f"Error running command {cmd!r}: {e}", file=sys.stderr)
         return ""
 
-class SharedEngineReplacer:
-    # Infix marker embedded into the transient per-PID test and reference copies this
-    # class creates next to the originals. It contains a dot-delimited token that no
-    # real test filename uses, so suite discovery (`is_transient_test_copy`) can
-    # recognize and skip these copies unambiguously, without constraining the names of
-    # genuine tests.
-    TEMP_FILE_MARKER = "shared_engine_replacer_tmp"
 
 @lru_cache(maxsize=1)
 def get_broken_tests_rules(broken_tests_file_path: str) -> dict:
@@ -374,8 +367,14 @@ def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path
         return False
 
 
-
 class SharedEngineReplacer:
+    # Infix marker embedded into the transient per-PID test and reference copies this
+    # class creates next to the originals. It contains a dot-delimited token that no
+    # real test filename uses, so suite discovery (`is_transient_test_copy`) can
+    # recognize and skip these copies unambiguously, without constraining the names of
+    # genuine tests.
+    TEMP_FILE_MARKER = "shared_engine_replacer_tmp"
+
     SPECIALIZED_ENGINES = "Collapsing|VersionedCollapsing|Summing|Replacing|Aggregating|Coalescing"
     ENGINES_NON_REPLICATED_REGEXP = (
         rf"(?i)ENGINE[ =]{{0,5}}(({SPECIALIZED_ENGINES}|)MergeTree\(?\)?)"
@@ -1483,6 +1482,7 @@ class TestStatus(enum.Enum):
     OK = "OK"
     SKIPPED = "SKIPPED"
     NOT_FAILED = "NOT_FAILED"
+    BROKEN = "BROKEN"
 
 
 class FailureReason(enum.Enum):
@@ -4076,6 +4076,19 @@ class TestCase:
             if result.status == TestStatus.FAIL:
                 result.description = self.add_info_about_settings(result.description)
 
+                if args.known_fails_file_path:
+                    known_fail_reason = test_is_known_fail(
+                        self.name,
+                        f"Reason: {result.reason.value} {result.description}",
+                        args.build_flags,
+                        args.known_fails_file_path,
+                    )
+                    if known_fail_reason:
+                        result.status = TestStatus.BROKEN
+                        result.description = result.description.replace(
+                            "\n", f"\nMarked as broken: {known_fail_reason}\n", 1
+                        )
+
             if args.cloud and result.status == TestStatus.FAIL:
                 # If error is in list of skipped errors, mark this test as SKIPPED
                 for skip_error in self.suite.cloud_skip_errors_list:
@@ -6431,30 +6444,14 @@ ORDER BY (test_name, callee_offset)
             clickhouse_execute(args, "SYSTEM SET COVERAGE TEST ''")
         except Exception as e:
             print("Cannot flush final coverage: ", str(e))
-        coverage_stats_timeout = 120
-        cov_rows = int(
-            clickhouse_execute(
-                args,
-                "SELECT count() FROM system.coverage_log FINAL",
-                timeout=coverage_stats_timeout,
-            )
-            or 0
-        )
-        cov_tests = int(
-            clickhouse_execute(
-                args,
-                "SELECT uniq(test_name) FROM system.coverage_log FINAL",
-                timeout=coverage_stats_timeout,
-            )
-            or 0
-        )
+        cov_rows = int(clickhouse_execute(args, "SELECT count() FROM system.coverage_log FINAL") or 0)
+        cov_tests = int(clickhouse_execute(args, "SELECT uniq(test_name) FROM system.coverage_log FINAL") or 0)
         print(f"system.coverage_log: {cov_rows} rows, {cov_tests} distinct tests")
         try:
             ic_rows = int(
                 clickhouse_execute(
                     args,
                     "SELECT count() FROM system.coverage_indirect_calls FINAL",
-                    timeout=coverage_stats_timeout,
                 )
                 or 0
             )
@@ -6462,7 +6459,6 @@ ORDER BY (test_name, callee_offset)
                 clickhouse_execute(
                     args,
                     "SELECT uniq(test_name) FROM system.coverage_indirect_calls FINAL",
-                    timeout=coverage_stats_timeout,
                 )
                 or 0
             )
@@ -6470,7 +6466,6 @@ ORDER BY (test_name, callee_offset)
                 clickhouse_execute(
                     args,
                     "SELECT uniqExact(callee_offset) FROM system.coverage_indirect_calls FINAL",
-                    timeout=coverage_stats_timeout,
                 )
                 or 0
             )
