@@ -9,6 +9,12 @@ doc_type: 'guide'
 
 # CAS exact-token entry guard {#cas-exact-token-entry-guard}
 
+> **Superseded 2026-09-02** by `2026-09-02-cas-backend-token-contract-design.md`. Both revisions of
+> this document guarded, at three entry points, a token that anyone could construct. The successor
+> removes the public constructor instead, so no invalid token can reach any entry point and the
+> per-site reactions below become unnecessary. Kept for the record of what the guard would have had to
+> get right, and why deletion had to stay fail-loud.
+
 Revision 2. Revision 1 was reviewed and rejected; [what revision 1 got wrong](#what-revision-1-got-wrong)
 records why, because two of its errors would have made things worse rather than merely incomplete.
 

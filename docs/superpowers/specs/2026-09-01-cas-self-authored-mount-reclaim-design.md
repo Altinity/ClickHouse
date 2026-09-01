@@ -9,6 +9,12 @@ doc_type: 'guide'
 
 # CAS self-authored mount reclaim {#cas-self-authored-mount-reclaim}
 
+> **Prerequisites revised 2026-09-02** by `2026-09-02-cas-backend-token-contract-design.md`. That
+> contract makes bytes and token come from one response and removes constructible tokens, so the
+> directional-read tripwire and the paired-read prerequisite below are no longer needed; the
+> byte-recognition rule and the driver-ownership capability stand. The Prerequisites section is to be
+> rewritten against it once it lands.
+
 Revision 5. Revisions 1 through 4 were reviewed and rejected;
 [what earlier revisions got wrong](#what-earlier-revisions-got-wrong) records the traps, because they
 are the ones a reader is most likely to fall into again.
