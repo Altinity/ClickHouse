@@ -45,6 +45,16 @@ curl -sL '<clickhouse-server.stress.log.zst url>' | zstd -dcq \
 `fatal.log` — written by the watchdog, contains the signal and initial stack.
 `clickhouse-server.err.log.zst` — full symbolized trace.
 
+If `fatal.log` is empty and the report is `Unknown error` or `Lost connection to server`, the
+CI host may lack `rg` (stress collection greps `<Fatal>` with `rg`). Grep the stress log
+yourself with `grep -a` (server logs can contain NUL bytes):
+
+```bash
+grep -a '<Fatal>' "tmp/investigate/$SHA/clickhouse-server.stress.log"
+# or, if the artifact is compressed:
+zstd -dcq "tmp/investigate/$SHA/clickhouse-server.stress.log.zst" | grep -a '<Fatal>'
+```
+
 **Deadlock / hung query**
 
 `hung_check.log` — output of the hung-check script; lists what was running at detection

@@ -13,10 +13,10 @@
 set -euo pipefail
 
 case "${1:-} ${2:-}" in
-  "pr view"|"pr list"|"pr diff"|"pr checks"|"issue view"|"issue list") ;;
+  "pr view"|"pr list"|"pr diff"|"pr checks"|"issue view"|"issue list"|"run view") ;;
   *)
     echo "gh-ro.sh: refusing non-read-only invocation: gh ${*:-}" >&2
-    echo "gh-ro.sh: allowed: pr {view,list,diff,checks}, issue {view,list}" >&2
+    echo "gh-ro.sh: allowed: pr {view,list,diff,checks}, issue {view,list}, run view" >&2
     exit 2
     ;;
 esac

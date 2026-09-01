@@ -7,6 +7,7 @@
  *
  * URL formats supported:
  *   - GitHub PR URLs: https://github.com/Altinity/ClickHouse/pull/12345 (fetches ALL CI reports)
+ *   - GitHub Actions job/run URLs: https://github.com/Altinity/ClickHouse/actions/runs/<id>/job/<id>
  *   - HTML URLs: https://s3.amazonaws.com/.../json.html?PR=...&sha=...&name_0=...
  *   - Direct JSON URLs: https://s3.amazonaws.com/.../result_*.json
  *
@@ -24,6 +25,7 @@
  *   node fetch_ci_report.js "https://github.com/Altinity/ClickHouse/pull/97171"
  *   node fetch_ci_report.js "https://github.com/Altinity/ClickHouse/pull/97171" --failed --cidb
  *   node fetch_ci_report.js "https://github.com/Altinity/ClickHouse/pull/97171" --report 2
+ *   node fetch_ci_report.js "https://github.com/Altinity/ClickHouse/actions/runs/33510417733/job/99879463029"
  *   node fetch_ci_report.js "https://s3.amazonaws.com/altinity-build-artifacts/json.html?PR=94537&..."
  *   node fetch_ci_report.js "https://s3.amazonaws.com/.../result_integration_tests.json"
  *   node fetch_ci_report.js "<url>" --test peak_memory --links
@@ -44,6 +46,101 @@ function normalizeTaskName(name) {
     .replace(/[^a-z0-9]/g, '_')
     .replace(/_+/g, '_')
     .replace(/_+$/, '');
+}
+
+const REPORT_HTML = {
+  altinity: 'https://s3.amazonaws.com/altinity-build-artifacts/json.html',
+  clickhouse: 'https://s3.amazonaws.com/clickhouse-test-reports/json.html',
+};
+
+/**
+ * Parse a GitHub Actions job or run URL. Returns null for every other URL shape
+ * (PR, S3 json.html, direct JSON).
+ */
+function parseGitHubActionsUrl(inputUrl) {
+  let parsed;
+  try {
+    parsed = new URL(inputUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.hostname !== 'github.com') {
+    return null;
+  }
+  const match = parsed.pathname.match(
+    /^\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)(?:\/(?:job\/(\d+)|attempts\/\d+))?(?:\/)?$/
+  );
+  if (!match) {
+    return null;
+  }
+  return {
+    owner: match[1],
+    repo: match[2],
+    runId: match[3],
+    jobId: match[4] || null,
+  };
+}
+
+function reportHtmlForOwner(owner) {
+  return owner.toLowerCase() === 'altinity' ? REPORT_HTML.altinity : REPORT_HTML.clickhouse;
+}
+
+/**
+ * Build the praktika json.html URL for a GitHub Actions run.
+ * PR-triggered runs use `PR=`; branch/dispatch runs use `REF=`.
+ */
+function reportUrlFromGitHubRun(owner, run, jobName) {
+  const sha = run && run.head_sha;
+  if (!sha) {
+    throw new Error('GitHub run has no head_sha');
+  }
+  const workflow = run.name;
+  if (!workflow) {
+    throw new Error('GitHub run has no workflow name');
+  }
+  const pr = run.pull_requests && run.pull_requests[0] && run.pull_requests[0].number;
+  const refParam = pr
+    ? `PR=${pr}`
+    : `REF=${encodeURIComponent(run.head_branch)}`;
+  if (!pr && !run.head_branch) {
+    throw new Error('GitHub run has neither pull request nor head_branch');
+  }
+  let url = `${reportHtmlForOwner(owner)}?${refParam}&sha=${sha}&name_0=${encodeURIComponent(workflow)}`;
+  if (jobName) {
+    url += `&name_1=${encodeURIComponent(jobName)}`;
+  }
+  return url;
+}
+
+function ghApiJson(path) {
+  const ghEnv = { ...process.env };
+  delete ghEnv.GH_CONFIG_DIR;
+  return JSON.parse(
+    execFileSync('gh', ['api', path], {
+      encoding: 'utf8',
+      env: ghEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+  );
+}
+
+/**
+ * Rewrite a GitHub Actions job/run URL to the S3 json.html report. Other URLs
+ * pass through unchanged. A GHA URL has no `?` query, so the later "direct JSON"
+ * path would otherwise fetch the HTML job page and die on `Unexpected token <`.
+ */
+function resolveGitHubActionsUrl(inputUrl) {
+  const parsed = parseGitHubActionsUrl(inputUrl);
+  if (!parsed) {
+    return inputUrl;
+  }
+  const { owner, repo, runId, jobId } = parsed;
+  const run = ghApiJson(`repos/${owner}/${repo}/actions/runs/${runId}`);
+  let jobName = '';
+  if (jobId) {
+    jobName = ghApiJson(`repos/${owner}/${repo}/actions/jobs/${jobId}`).name || '';
+  }
+  return reportUrlFromGitHubRun(owner, run, jobName);
 }
 
 /**
@@ -696,6 +793,14 @@ async function fetchReport(inputUrl, options = {}) {
       console.log(`Parsing URL: ${inputUrl}\n`);
     }
 
+    const resolved = resolveGitHubActionsUrl(inputUrl);
+    if (resolved !== inputUrl) {
+      if (!options.isSingleReport) {
+        console.log(`Resolved GitHub Actions URL to: ${resolved}\n`);
+      }
+      inputUrl = resolved;
+    }
+
     let jsonData, targetData;
 
     // Check if this is a GitHub PR URL
@@ -1031,6 +1136,7 @@ Usage: node fetch_ci_report.js <url> [options]
 
 URL formats:
   - GitHub PR: https://github.com/Altinity/ClickHouse/pull/12345 (fetches ALL CI reports)
+  - GitHub Actions job/run: https://github.com/Altinity/ClickHouse/actions/runs/<id>/job/<id>
   - CI HTML:   https://s3.amazonaws.com/.../json.html?PR=...&sha=...&name_0=...
   - Direct JSON: https://s3.amazonaws.com/.../result_*.json
 
@@ -1049,6 +1155,7 @@ Examples:
   node fetch_ci_report.js "https://github.com/Altinity/ClickHouse/pull/97171"
   node fetch_ci_report.js "https://github.com/Altinity/ClickHouse/pull/97171" --failed --cidb
   node fetch_ci_report.js "https://github.com/Altinity/ClickHouse/pull/97171" --report 2
+  node fetch_ci_report.js "https://github.com/Altinity/ClickHouse/actions/runs/33510417733/job/99879463029"
   node fetch_ci_report.js "https://s3.amazonaws.com/altinity-build-artifacts/json.html?PR=94537&sha=abc123&name_0=Integration%20tests"
   node fetch_ci_report.js "<url>" --test peak_memory --links
   node fetch_ci_report.js "<url>" --binary
@@ -1128,5 +1235,11 @@ Examples:
 if (require.main === module) {
   main().catch(console.error);
 } else {
-  module.exports = { parseTestResults, isFailureStatus, applyExtToTest };
+  module.exports = {
+    parseTestResults,
+    isFailureStatus,
+    applyExtToTest,
+    parseGitHubActionsUrl,
+    reportUrlFromGitHubRun,
+  };
 }

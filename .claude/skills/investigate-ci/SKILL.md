@@ -1,7 +1,7 @@
 ---
 name: investigate-ci
-description: Investigate a ClickHouse CI failure end-to-end from a PR or S3 report URL. Fetches the failed tests and their output, classifies each as flaky vs a real regression using play.clickhouse.com master history, and for every failure searches for both an existing tracking GitHub issue and an existing fix (open/merged PR) — reporting, per failure, whether an issue still needs to be created and whether a fix exists with its status (WIP, merged, already in this branch or not). Downloads and reads the harness artifacts only for failures that history does not explain, and reports a root-cause hypothesis. Read-only first pass — never commits, pushes, or edits.
-argument-hint: "<PR-url | S3-report-url | issue-url> [threshold-days]"
+description: Investigate a ClickHouse CI failure end-to-end from a PR, GitHub Actions job, or S3 report URL. Fetches the failed tests and their output, classifies each as flaky vs a real regression using play.clickhouse.com master history, and for every failure searches for both an existing tracking GitHub issue and an existing fix (open/merged PR) — reporting, per failure, whether an issue still needs to be created and whether a fix exists with its status (WIP, merged, already in this branch or not). Downloads and reads the harness artifacts only for failures that history does not explain, and reports a root-cause hypothesis. Read-only first pass — never commits, pushes, or edits.
+argument-hint: "<PR-url | S3-report-url | GHA-job-url | issue-url> [threshold-days]"
 disable-model-invocation: false
 allowed-tools: Bash, Read, Grep, Glob, Agent, Task, WebFetch
 ---
@@ -15,6 +15,7 @@ A read-only first pass over a CI failure: turn a single URL into a per-test verd
 
 - `$0` (required): one of
   - a GitHub PR URL (`https://github.com/ClickHouse/ClickHouse/pull/NNNNN`),
+  - a GitHub Actions job or run URL (`https://github.com/.../actions/runs/<id>/job/<id>`),
   - a direct S3/CI report URL (`https://s3.amazonaws.com/.../json.html?PR=...&sha=...`), or
   - a GitHub **issue** URL (`https://github.com/ClickHouse/ClickHouse/issues/NNNNN`) — typically
     a bot-generated `flaky test` issue. Resolved to its report URL in step 0.
@@ -39,8 +40,11 @@ A read-only first pass over a CI failure: turn a single URL into a per-test verd
 
 ### 0. Resolve an issue URL to a report URL
 
-`fetch_ci_report.js` accepts only PR, S3 `json.html`, and direct `result_*.json` URLs — **not**
-issue links. If `$0` is `.../issues/NNNNN`, read the issue body and extract the report URL first:
+`fetch_ci_report.js` accepts PR, GitHub Actions job/run, S3 `json.html`, and direct
+`result_*.json` URLs — **not** issue links. Pass a GitHub Actions URL as `$0` as-is; the tool
+resolves it to the S3 report. Do not hand-build a `json.html` URL from the job page.
+
+If `$0` is `.../issues/NNNNN`, read the issue body and extract the report URL first:
 
 ```bash
 .claude/tools/gh-ro.sh issue view <NNNNN> --repo ClickHouse/ClickHouse --json title,body
@@ -79,7 +83,7 @@ expired, so do not block on them.
 `fetch_ci_report.js` needs `node` on `PATH`. Run these as **separate** commands (not one compound
 block) so each matches an allowed shape under the investigate profile — a combined
 `mkdir … ; if … node …` string matches neither the exact `mkdir` allow nor the node-fetch hook and
-would prompt. Primary inputs (PR/S3) skip step 0, so create the parent working dir first:
+would prompt. Primary inputs (PR / GitHub Actions / S3) skip step 0, so create the parent working dir first:
 
 ```bash
 mkdir -p tmp/investigate
@@ -119,7 +123,7 @@ can re-read or `grep`. **If `node` is absent, the fallback depends on the input 
 - **Issue URL** (step 0 already gave you `Test name:` and the `Failing test history` link) → proceed
   without the report: run step 3 on that named test; the S3 report and step-4 artifacts are
   best-effort enrichment. A missing `node` is not fatal here.
-- **PR or S3 report URL** → `node` is **required**. Without the report you have no failed test
+- **PR, GitHub Actions, or S3 report URL** → `node` is **required**. Without the report you have no failed test
   names, job names, or labels, so steps 2–3 (issue/fix search and the `test_name IN (...)` history
   query) cannot run. Do **not** limp on with a partial investigation — stop and tell the user to
   install `node` (or re-run where `node` is on `PATH`).
@@ -541,6 +545,8 @@ Cross-check the verdict against the issue found in step 2: a known tracking issu
 *or* across other PRs strengthens **REAL**.
 
 Always keep the per-test **CIDB link** from step 1 in the final report for manual drill-down.
+`play.clickhouse.com` is ClickHouse Inc master history; Altinity `--cidb` links are drill-down
+only, not a substitute for that gate.
 
 Tests classified **FLAKY** need no artifacts — go straight to the report. Only **REAL**,
 **UNCERTAIN**, or **INFRA/BUILD** failures need the step-4 download.

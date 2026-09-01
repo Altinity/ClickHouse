@@ -48,6 +48,9 @@ CASES = [
     ("fetch --all (no redirect)", f'node {T} "{S3}json.html?PR=1" --all', "allow"),
     ("fetch private host + creds", f'node {T} "{CF}json.html?PR=1&sha=y" --failed --cidb --credentials ch-s-priv,tn#4pq@*K', "allow"),
     ("fetch issues url --report N", f'node {T} "https://github.com/ClickHouse/ClickHouse/issues/1" --report 2', "allow"),
+    ("fetch Altinity GHA job url", f'node {T} "https://github.com/Altinity/ClickHouse/actions/runs/33510417733/job/99879463029" --failed --cidb', "allow"),
+    ("fetch Altinity S3 json.html", f'node {T} "https://s3.amazonaws.com/altinity-build-artifacts/json.html?REF=x&sha=y" --failed --cidb', "allow"),
+    ("fetch evil github host", f'node {T} "https://github.com/evil/ClickHouse/pull/1" --failed', "prompt"),
 
     # --- fetch_ci_report.js -- write forms are NOT auto-approved (symlink-unsafe) ---
     ("fetch --download-logs to tmp (write)", f'node {T} "{S3}x" --failed --download-logs tmp/investigate/ci_logs.tar.gz', "prompt"),
