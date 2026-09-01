@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
 
@@ -18,27 +19,31 @@ namespace DB::Cas
 namespace
 {
 
-std::string_view outcomeKindToWord(OutcomeKind o)
+namespace GcOutcomesWire
 {
-    switch (o)
-    {
-        case OutcomeKind::Deleted:  return "deleted";
-        case OutcomeKind::Absent:   return "absent";
-        case OutcomeKind::Replaced: return "replaced";
-        case OutcomeKind::Spared:   return "spared";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: unknown OutcomeKind {}", static_cast<int>(o));
+    constexpr WireKey kind{"k"};
+    constexpr WireKey outcome{"oc"};
 }
+
+constexpr EnumWireTable<OutcomeKind, 4> kOutcomeKindWords{{{
+    {OutcomeKind::Deleted, "deleted"},
+    {OutcomeKind::Absent, "absent"},
+    {OutcomeKind::Replaced, "replaced"},
+    {OutcomeKind::Spared, "spared"},
+}}};
+
+static_assert(casEnumTableCoversEnum<kOutcomeKindWords, OutcomeKind>());
 
 OutcomeKind outcomeKindFromWord(std::string_view w)
 {
-    if (w == "deleted")  return OutcomeKind::Deleted;
-    if (w == "absent")   return OutcomeKind::Absent;
-    if (w == "replaced") return OutcomeKind::Replaced;
-    if (w == "spared")   return OutcomeKind::Spared;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: unknown outcome '{}'", w);
+    return kOutcomeKindWords.fromWord(w, "CAS outcome log outcome kind");
 }
 
+}
+
+std::string_view outcomeKindToWireWord(OutcomeKind outcome)
+{
+    return kOutcomeKindWords.toWord(outcome, "CAS outcome log outcome kind");
 }
 
 String encodeOutcomeLog(const OutcomeLog & log)
@@ -48,12 +53,10 @@ String encodeOutcomeLog(const OutcomeLog & log)
     for (const OutcomeEntry & e : log.entries)
     {
         bool first = true;
-        writeKey(out, "k", first);
-        writeStringValue(out, objectKindToWord(e.kind));
+        writeStringField(out, GcOutcomesWire::kind, objectKindToWord(e.kind), first);
         writeBlobRefFields(out, first, e.ref);   /// ha + h
         writeTokenFields(out, first, e.token);   /// tt + tv
-        writeKey(out, "oc", first);
-        writeStringValue(out, outcomeKindToWord(e.outcome));
+        writeStringField(out, GcOutcomesWire::outcome, outcomeKindToWireWord(e.outcome), first);
         closeObject(out, first);
         writeChar('\n', out);
     }
@@ -92,34 +95,21 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
         }
 
         OutcomeEntry e;
-        String ha;
-        String hhex;
-        String tv;
-        bool have_ha = false;
-        bool have_h = false;
-        bool have_tt = false;
-        TokenType tt{};
+        BlobRefFields blob_ref_fields;
+        TokenFields token_fields;
         do
         {
-            if (key == "k") e.kind = objectKindFromWord(r.readString(), "outcome log");
-            else if (key == "ha") { ha = r.readString(); have_ha = true; }
-            else if (key == "h") { hhex = r.readString(); have_h = true; }
-            else if (key == "tt") { tt = tokenTypeFromWord(r.readString(), "outcome log"); have_tt = true; }
-            else if (key == "tv") tv = r.readString();
-            else if (key == "oc") e.outcome = outcomeKindFromWord(r.readString());
+            if (key == GcOutcomesWire::kind) e.kind = objectKindFromWord(r.readString(), "outcome log");
+            else if (matchBlobRefFields(key, r, blob_ref_fields)) {}
+            else if (matchTokenFields(key, r, token_fields)) {}
+            else if (key == GcOutcomesWire::outcome) e.outcome = outcomeKindFromWord(r.readString());
             else r.skipUnknown(key);
         } while (r.nextKey(key));
 
-        if (!have_ha || !have_h || !have_tt)
+        if (!blob_ref_fields.algo_word || !blob_ref_fields.digest_hex || !token_fields.type_word)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: record missing ha/h/tt");
-        const BlobHashAlgo algo = blobHashAlgoFromWord(ha, "outcome log");
-        /// Validate the digest width before `fromHex`: a width mismatch must surface as the
-        /// CORRUPTED_DATA required for malformed serialized input, not fromHex's BAD_ARGUMENTS.
-        if (hhex.size() != blobHashLenFor(algo) * 2)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS outcome log: digest width {} does not match algo '{}'", hhex.size(), ha);
-        e.ref = BlobRef{algo, codecFor(algo).fromHex(hhex)};
-        e.token = Token{tv, tt};
+        e.ref = blob_ref_fields.build("outcome log");
+        e.token = Token{token_fields.value.value_or(""), tokenTypeFromWord(*token_fields.type_word, "outcome log")};
         if (!line_in.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: junk after record");
         log.entries.push_back(std::move(e));

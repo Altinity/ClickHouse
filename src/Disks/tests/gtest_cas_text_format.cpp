@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
@@ -32,6 +33,15 @@ void expectCode(int code, F && f)
         EXPECT_EQ(e.code(), code);
     }
 }
+}
+
+TEST(CASFormatBattery, EveryRegisteredFormatIsBatteryCovered)
+{
+    std::set<FormatId> registered;
+    for (FormatId id : allRegisteredFormatIds())
+        registered.insert(id);
+    EXPECT_EQ(registered, DB::Cas::tests::batteryCoveredIds())
+        << "a registered codec is missing from the common battery (or vice versa)";
 }
 
 /// ---- Task 2: FormatId entries for refsnaplog / blob meta / heartbeat ----

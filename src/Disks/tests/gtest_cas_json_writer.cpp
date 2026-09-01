@@ -21,7 +21,7 @@ TEST(CASJsonWriter, KeyValueSequenceMatchesCanonicalShape)
     w.u64Number(3);
     w.key("ok", first);
     w.boolValue(true);
-    w.key("o", "me", first);
+    w.key("ome", first);
     w.u64StringValue(1);
     w.closeObject(first);
     w.newline();
@@ -211,4 +211,32 @@ TEST(CASJsonWriterVocab, MatchesReferenceVocabulary)
     DB::writeChar('\n', ref);         writeChar('\n', w);
     ref.finalize();
     EXPECT_EQ(std::move(w).take(), ref.str());
+}
+
+TEST(CASJsonWriter, WireKeyFieldHelpersMatchThePrimitivePairs)
+{
+    CasJsonWriter w;
+    bool first = true;
+    constexpr WireKey k_word{"st"};
+    constexpr WireKey k_str{"hn"};
+    constexpr WireKey k_u64s{"we"};
+    constexpr WireKey k_num{"eat"};
+    constexpr WireKey k_hex{"su"};
+    constexpr WireKey k_bool{"fen"};
+    writeWordField(w, k_word, "clean", first);
+    writeStringField(w, k_str, "host-1", first);
+    writeU64StringField(w, k_u64s, 7, first);
+    writeNumberField(w, k_num, 1752537630000, first);
+    writeHex128Field(w, k_hex, DB::UInt128{1}, first);
+    writeBoolField(w, k_bool, false, first);
+    w.closeObject(first);
+    w.newline();
+    EXPECT_EQ(std::move(w).take(),
+        "{\"st\":\"clean\",\"hn\":\"host-1\",\"we\":\"7\",\"eat\":1752537630000,"
+        "\"su\":\"00000000000000000000000000000001\",\"fen\":false}\n");
+
+    /// The reader-side comparison contract: a String key compares against the constant.
+    String key = "st";
+    EXPECT_TRUE(key == k_word);
+    EXPECT_FALSE(key == k_str);
 }

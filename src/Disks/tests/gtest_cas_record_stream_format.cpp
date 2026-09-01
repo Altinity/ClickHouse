@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -26,17 +27,17 @@ BlobRef chRef(uint64_t n)
 
 SourceEdgeRecord edge(const BlobRef & ref, uint64_t source_id)
 {
-    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(source_id), .marker = kEdgeActive};
+    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(source_id), .marker = RunMarker::Edge};
 }
 
 SourceEdgeRecord zero(const BlobRef & ref)
 {
-    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = kZeroMarker};
+    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = RunMarker::Zero};
 }
 
 SourceEdgeRecord condemned(const BlobRef & ref, const Token & token, uint64_t size, uint64_t round, bool pend)
 {
-    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = kCondemned,
+    return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = RunMarker::Condemned,
                             .delete_pending = pend, .token = token, .size = size, .condemn_round = round};
 }
 
@@ -64,6 +65,19 @@ std::vector<SourceEdgeRecord> decodeRun(const String & bytes)
     return out;
 }
 
+}
+
+CAS_BATTERY_COVERS(RunFile);
+
+TEST(CASFormatBattery, RunFile)
+{
+    const std::vector<SourceEdgeRecord> records{edge(chRef(2), 5)};
+    runFormatBattery({FormatId::RunFile,
+        [&] { return sealObject(FormatId::RunFile, encodeRun(records)); },
+        [](std::string_view s) { decodeRun(std::string(openObject(FormatId::RunFile, s))); },
+        fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion()) +
+        "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n"
+        "{\"n\":1}\n"});
 }
 
 TEST(CASRecordStream, EmptyRunRoundTripsAndChecksumMatches)
@@ -98,18 +112,18 @@ TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
 
     EXPECT_EQ(back[0].ref, a);
     EXPECT_EQ(back[0].source_id, UInt128(10));
-    EXPECT_EQ(back[0].marker, kEdgeActive);
+    EXPECT_EQ(back[0].marker, RunMarker::Edge);
 
     EXPECT_EQ(back[1].ref, b);
     EXPECT_EQ(back[1].source_id, UInt128(0));
-    EXPECT_EQ(back[1].marker, kCondemned);
+    EXPECT_EQ(back[1].marker, RunMarker::Condemned);
     EXPECT_TRUE(back[1].delete_pending);
     EXPECT_EQ(back[1].token, (Token{"e-1", TokenType::ETag}));
     EXPECT_EQ(back[1].size, 4242u);
     EXPECT_EQ(back[1].condemn_round, 7u);
 
     EXPECT_EQ(back[2].ref, c);
-    EXPECT_EQ(back[2].marker, kZeroMarker);
+    EXPECT_EQ(back[2].marker, RunMarker::Zero);
 }
 
 TEST(CASRecordStream, WriterIsByteDeterministic)
@@ -201,6 +215,24 @@ TEST(CASRecordStream, TrailerCountMismatchIsCorruptData)
     ASSERT_NE(at, String::npos);
     bytes.replace(at, from.size(), to);
     EXPECT_THROW(decodeRun(bytes), DB::Exception);
+}
+
+TEST(CASRecordStream, UppercaseDigestInRecordKeyIsCorruptedData)
+{
+    String bytes = encodeRun({edge(chRef(10), 1)});
+    const size_t digest = bytes.find("0000000000000000000000000000000a");
+    ASSERT_NE(digest, String::npos);
+    bytes[digest + 31] = 'A';
+
+    try
+    {
+        static_cast<void>(decodeRun(bytes));
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
 }
 
 TEST(CASRecordStream, TruncationAtLineBoundaryFailsClosed)

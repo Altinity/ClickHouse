@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "config.h"
+#include "cas_format_test_battery.h"
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
@@ -281,6 +282,21 @@ TEST(CASRefCheckpoint, CommittedThroughHasCanonicalExactWireEncoding)
 
     EXPECT_EQ(encodeRefCkpt(ckpt), expected);
     EXPECT_EQ(decodeRefCkpt(expected), ckpt);
+}
+
+CAS_BATTERY_COVERS(RefCkpt);
+
+TEST(CASFormatBattery, RefCkpt)
+{
+    RefCkpt ckpt{.life_epoch = std::optional<uint64_t>{7},
+                 .committed_through = RefTxnId{9, 11},
+                 .checkpoint_snapshot_id = RefTxnId{9, 10},
+                 .last_epoch_seal = RefTxnId{8, 12}};
+    runFormatBattery({FormatId::RefCkpt,
+        [&] { return sealObject(FormatId::RefCkpt, encodeRefCkpt(ckpt)); },
+        [](std::string_view s) { decodeRefCkpt(std::string(openObject(FormatId::RefCkpt, s))); },
+        currentFormatHeader("cas_ref_ckpt") +
+        "{\"le\":\"7\",\"cte\":\"9\",\"cts\":\"11\",\"cse\":\"9\",\"css\":\"10\",\"lse\":\"8\",\"lss\":\"12\"}\n"});
 }
 
 /// `last_epoch_seal` is chain evidence, not an arbitrary lower bound. It either names the frontier

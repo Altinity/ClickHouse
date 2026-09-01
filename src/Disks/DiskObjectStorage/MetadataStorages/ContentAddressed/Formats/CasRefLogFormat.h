@@ -41,6 +41,10 @@ enum class RefOpKind : uint8_t
     EpochSeal = 5,
 };
 
+/// Convert a ref-log operation discriminator to its canonical wire word. Throws `LOGICAL_ERROR` if
+/// `kind` is not represented by this format.
+std::string_view refOpKindToWireWord(RefOpKind kind);
+
 /// One operation inside a `RefLogTxn`. Only the fields documented next to `kind` are meaningful for
 /// that kind, and the codec never reads or writes the others. `OwnerTransition` optionally removes
 /// `old_binding` and/or installs `new_binding`; `SetPublishedAt` carries the expected manifest and the

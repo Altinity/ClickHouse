@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <algorithm>
@@ -20,27 +21,31 @@ namespace DB::Cas
 namespace
 {
 
-std::string_view opKindToWord(RefOpKind k)
+namespace RefLogWire
 {
-    switch (k)
-    {
-        case RefOpKind::NamespaceBirth:  return "namespace_birth";
-        case RefOpKind::OwnerTransition: return "owner_transition";
-        case RefOpKind::SetPublishedAt:  return "set_published_at";
-        case RefOpKind::RemoveNamespace: return "remove_namespace";
-        case RefOpKind::EpochSeal:       return "epoch_seal";
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind {}", static_cast<uint8_t>(k));
+    constexpr WireKey ns{"ns"};
+    constexpr WireKey txn_epoch{"we"};
+    constexpr WireKey txn_seq{"rs"};
+    constexpr WireKey prev_epoch{"!pse"};
+    constexpr WireKey prev_seq{"!pss"};
+    constexpr WireKey op{"op"};
+    constexpr WireKey ref{"rn"};
+    constexpr WireKey published_ms{"ts"};
 }
+
+constexpr EnumWireTable<RefOpKind, 5> kRefOpWords{{{
+    {RefOpKind::NamespaceBirth, "namespace_birth"},
+    {RefOpKind::OwnerTransition, "owner_transition"},
+    {RefOpKind::SetPublishedAt, "set_published_at"},
+    {RefOpKind::RemoveNamespace, "remove_namespace"},
+    {RefOpKind::EpochSeal, "epoch_seal"},
+}}};
+
+static_assert(casEnumTableCoversEnum<kRefOpWords, RefOpKind>());
 
 RefOpKind opKindFromWord(std::string_view w)
 {
-    if (w == "namespace_birth")   return RefOpKind::NamespaceBirth;
-    if (w == "owner_transition")  return RefOpKind::OwnerTransition;
-    if (w == "set_published_at")  return RefOpKind::SetPublishedAt;
-    if (w == "remove_namespace")  return RefOpKind::RemoveNamespace;
-    if (w == "epoch_seal")        return RefOpKind::EpochSeal;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: unknown op kind '{}'", w);
+    return kRefOpWords.fromWord(w, "RefLogTxn");
 }
 
 /// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
@@ -69,22 +74,10 @@ void checkBudget(const std::vector<RefOp> & ops, size_t encoded_bytes)
     }
 }
 
-void writeBindingFields(CasJsonWriter & out, bool & first, std::string_view prefix, const RefOwnerBinding & b)
-{
-    checkCanonicalRefName(b.ref_name, "RefLogTxn", "owner binding ref_name");
-    checkManifestRef(b.manifest_ref, "RefLogTxn", "owner binding manifest_ref");
-    out.key(prefix, "bk", first);
-    writeStringValue(out, refOwnerKindToWord(b.kind));
-    out.key(prefix, "rn", first);
-    writeStringValue(out, b.ref_name);
-    writeManifestRefFields(out, first, prefix, b.manifest_ref);
-}
-
 void writeOp(CasJsonWriter & out, const RefOp & op)
 {
     bool first = true;
-    writeKey(out, "op", first);
-    writeStringValue(out, opKindToWord(op.kind));
+    writeWordField(out, RefLogWire::op, refOpKindToWireWord(op.kind), first);
     switch (op.kind)
     {
         case RefOpKind::NamespaceBirth:
@@ -93,57 +86,39 @@ void writeOp(CasJsonWriter & out, const RefOp & op)
             break;
         case RefOpKind::OwnerTransition:
             if (op.old_binding)
-                writeBindingFields(out, first, "o", *op.old_binding);
+                writeBindingFields(out, first, kOldBindingKeys, *op.old_binding);
             if (op.new_binding)
-                writeBindingFields(out, first, "n", *op.new_binding);
+                writeBindingFields(out, first, kNewBindingKeys, *op.new_binding);
             break;
         case RefOpKind::SetPublishedAt:
             checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_published_at ref_name");
             checkManifestRef(op.expected_manifest_ref, "RefLogTxn", "set_published_at manifest_ref");
-            writeKey(out, "rn", first);
-            writeStringValue(out, op.ref_name);
-            writeManifestRefFields(out, first, "", op.expected_manifest_ref);
-            writeKey(out, "ts", first);
-            writeIntText(op.published_at_ms, out);
+            writeStringField(out, RefLogWire::ref, op.ref_name, first);
+            writeManifestRefFields(out, first, kBareManifestRefKeys, op.expected_manifest_ref);
+            writeNumberField(out, RefLogWire::published_ms, op.published_at_ms, first);
             break;
     }
     closeObject(out, first);
     writeChar('\n', out);
 }
 
-/// Collector for a ManifestRef's three flat fields under an optional prefix.
-struct ManifestFields
-{
-    std::optional<uint64_t> me;
-    std::optional<uint64_t> mb;
-    std::optional<uint64_t> mo;
-
-    bool any() const { return me || mb || mo; }
-    ManifestRef build(std::string_view what) const
-    {
-        if (!me || !mb || !mo)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: {} manifest_ref missing me/mb/mo", what);
-        return manifestRefFromFields(*me, *mb, *mo, "RefLogTxn", what);
-    }
-};
-
 /// Collector for one binding (old/new) under a prefix.
 struct BindingFields
 {
-    std::optional<String> bk;
-    std::optional<String> rn;
-    ManifestFields mf;
+    std::optional<String> kind;
+    std::optional<String> ref;
+    ManifestRefFields manifest_fields;
 
-    bool any() const { return bk || rn || mf.any(); }
+    bool any() const { return kind || ref || manifest_fields.any(); }
     RefOwnerBinding build(std::string_view what) const
     {
-        if (!bk || !rn)
+        if (!kind || !ref)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: {} binding missing bk/rn", what);
         RefOwnerBinding b;
-        b.kind = refOwnerKindFromWord(*bk, "RefLogTxn owner binding");
-        b.ref_name = *rn;
+        b.kind = refOwnerKindFromWord(*kind, "RefLogTxn owner binding");
+        b.ref_name = *ref;
         checkCanonicalRefName(b.ref_name, "RefLogTxn", "owner binding ref_name");
-        b.manifest_ref = mf.build(what);
+        b.manifest_ref = manifest_fields.buildRef("RefLogTxn", what);
         return b;
     }
 };
@@ -160,11 +135,10 @@ struct BindingFields
 void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id, const std::optional<RefTxnId> & prev_epoch_seal)
 {
     bool first = true;
-    writeKey(out, "ns", first);
-    writeStringValue(out, ns);
-    writeRefTxnIdFields(out, first, "we", "rs", txn_id);
+    writeStringField(out, RefLogWire::ns, ns, first);
+    writeRefTxnIdFields(out, first, RefLogWire::txn_epoch, RefLogWire::txn_seq, txn_id);
     if (prev_epoch_seal)
-        writeRefTxnIdFields(out, first, "!pse", "!pss", *prev_epoch_seal);
+        writeRefTxnIdFields(out, first, RefLogWire::prev_epoch, RefLogWire::prev_seq, *prev_epoch_seal);
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -176,7 +150,7 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
 
     /// set_published_at fields
     std::optional<String> sp_rn;
-    ManifestFields sp_mf;
+    ManifestRefFields sp_manifest_fields;
     std::optional<uint64_t> sp_ts;
     /// owner_transition bindings
     BindingFields ob;
@@ -185,21 +159,27 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "rn") sp_rn = r.readString();
-        else if (key == "me") sp_mf.me = r.readU64String();
-        else if (key == "mb") sp_mf.mb = r.readU64String();
-        else if (key == "mo") sp_mf.mo = r.readU64Number();
-        else if (key == "ts") sp_ts = r.readU64Number();
-        else if (key == "obk") ob.bk = r.readString();
-        else if (key == "orn") ob.rn = r.readString();
-        else if (key == "ome") ob.mf.me = r.readU64String();
-        else if (key == "omb") ob.mf.mb = r.readU64String();
-        else if (key == "omo") ob.mf.mo = r.readU64Number();
-        else if (key == "nbk") nb.bk = r.readString();
-        else if (key == "nrn") nb.rn = r.readString();
-        else if (key == "nme") nb.mf.me = r.readU64String();
-        else if (key == "nmb") nb.mf.mb = r.readU64String();
-        else if (key == "nmo") nb.mf.mo = r.readU64Number();
+        if (key == RefLogWire::ref)
+            sp_rn = r.readString();
+        else if (matchManifestRefFields(key, r, kBareManifestRefKeys, sp_manifest_fields))
+        {
+        }
+        else if (key == RefLogWire::published_ms)
+            sp_ts = r.readU64Number();
+        else if (key == kOldBindingKeys.kind)
+            ob.kind = r.readString();
+        else if (key == kOldBindingKeys.ref)
+            ob.ref = r.readString();
+        else if (matchManifestRefFields(key, r, kOldBindingKeys.manifest, ob.manifest_fields))
+        {
+        }
+        else if (key == kNewBindingKeys.kind)
+            nb.kind = r.readString();
+        else if (key == kNewBindingKeys.ref)
+            nb.ref = r.readString();
+        else if (matchManifestRefFields(key, r, kNewBindingKeys.manifest, nb.manifest_fields))
+        {
+        }
         else if (key == "pl")
             /// `"pl"` (payload) was removed from the op wire in stage-1 T12 (the `set_payload` op became
             /// `set_published_at`). The retired op WORD is already rejected by `opKindFromWord`, but this
@@ -228,13 +208,18 @@ RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: set_published_at missing rn/ts");
             op.ref_name = *sp_rn;
             checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_published_at ref_name");
-            op.expected_manifest_ref = sp_mf.build("set_published_at manifest_ref");
+            op.expected_manifest_ref = sp_manifest_fields.buildRef("RefLogTxn", "set_published_at");
             op.published_at_ms = *sp_ts;
             break;
     }
     return op;
 }
 
+}
+
+std::string_view refOpKindToWireWord(RefOpKind kind)
+{
+    return kRefOpWords.toWord(kind, "RefLogTxn");
 }
 
 bool refLogTxnIsEpochSeal(const RefLogTxn & txn)
@@ -332,12 +317,27 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
         String key;
         while (r.nextKey(key))
         {
-            if (key == "ns") { txn.ns = r.readString(); saw_ns = true; }
-            else if (key == "we") { txn.txn_id.writer_epoch = r.readU64String(); saw_we = true; }
-            else if (key == "rs") { txn.txn_id.ref_sequence = r.readU64String(); saw_rs = true; }
-            else if (key == "!pse") pse = r.readU64String();
-            else if (key == "!pss") pss = r.readU64String();
-            else r.skipUnknown(key);
+            if (key == RefLogWire::ns)
+            {
+                txn.ns = r.readString();
+                saw_ns = true;
+            }
+            else if (key == RefLogWire::txn_epoch)
+            {
+                txn.txn_id.writer_epoch = r.readU64String();
+                saw_we = true;
+            }
+            else if (key == RefLogWire::txn_seq)
+            {
+                txn.txn_id.ref_sequence = r.readU64String();
+                saw_rs = true;
+            }
+            else if (key == RefLogWire::prev_epoch)
+                pse = r.readU64String();
+            else if (key == RefLogWire::prev_seq)
+                pss = r.readU64String();
+            else
+                r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: meta line missing ns/we/rs");
@@ -385,7 +385,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
                     "RefLogTxn: trailer count {} != {} ops", n, txn.ops.size());
             break;
         }
-        if (key != "op")
+        if (key != RefLogWire::op)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: record must start with \"op\"");
         const RefOpKind kind = opKindFromWord(r.readString());
         txn.ops.push_back(readOpRecord(r, kind));

@@ -19,6 +19,8 @@ enum class MetaState : uint8_t
                      /// so a writer may republish it by replacing the body and updating this marker.
 };
 
+std::string_view metaStateToWireWord(MetaState state);
+
 /// The durable per-hash meta record. Its text representation consists of a format header followed by
 /// one JSON object with the state word, the GC condemnation round, and the raw body size. `size` is
 /// retained for introspection, fsck, and GC accounting; reads of the blob never consult the meta.

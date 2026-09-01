@@ -285,6 +285,53 @@ TEST(CASRefCodec, RoundTripOwnerTransitionReplace)
     ASSERT_TRUE(decoded.ops[0].new_binding.has_value());
 }
 
+TEST(CASRefCodec, OwnerTransitionBindingGroupsAreAbsentOrComplete)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "old", manifestRef(1, 1, 1)};
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "new", manifestRef(1, 1, 1)};
+    txn.ops.push_back(op);
+    const String bytes = encodeRefLogTxn(txn);
+
+    const String old_group = R"(,"obk":"precommit","orn":"old","ome":"1","omb":"1","omo":1)";
+    const auto old_group_pos = bytes.find(old_group);
+    ASSERT_NE(old_group_pos, String::npos);
+    String old_absent = bytes;
+    old_absent.erase(old_group_pos, old_group.size());
+    const RefLogTxn without_old = decodeRefLogTxn(old_absent, txn.ns, txn.txn_id);
+    ASSERT_EQ(without_old.ops.size(), 1u);
+    EXPECT_FALSE(without_old.ops[0].old_binding.has_value());
+    EXPECT_TRUE(without_old.ops[0].new_binding.has_value());
+
+    const String old_ref = R"(,"orn":"old")";
+    const auto old_ref_pos = bytes.find(old_ref);
+    ASSERT_NE(old_ref_pos, String::npos);
+    String incomplete_old = bytes;
+    incomplete_old.erase(old_ref_pos, old_ref.size());
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(incomplete_old, txn.ns, txn.txn_id); });
+
+    const String new_group = R"(,"nbk":"committed","nrn":"new","nme":"1","nmb":"1","nmo":1)";
+    const auto new_group_pos = bytes.find(new_group);
+    ASSERT_NE(new_group_pos, String::npos);
+    String new_absent = bytes;
+    new_absent.erase(new_group_pos, new_group.size());
+    const RefLogTxn without_new = decodeRefLogTxn(new_absent, txn.ns, txn.txn_id);
+    ASSERT_EQ(without_new.ops.size(), 1u);
+    EXPECT_TRUE(without_new.ops[0].old_binding.has_value());
+    EXPECT_FALSE(without_new.ops[0].new_binding.has_value());
+
+    const String new_ref = R"(,"nrn":"new")";
+    const auto new_ref_pos = bytes.find(new_ref);
+    ASSERT_NE(new_ref_pos, String::npos);
+    String incomplete_new = bytes;
+    incomplete_new.erase(new_ref_pos, new_ref.size());
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(incomplete_new, txn.ns, txn.txn_id); });
+}
+
 TEST(CASRefCodec, RoundTripMultipleOpsInOneTransaction)
 {
     RefLogTxn txn;
@@ -765,6 +812,8 @@ TEST(CASRefCodec, EncodeRejectsZeroManifestRefInSetPublishedAt)
 /// ===================================================================================
 /// Shape-level failure-mode battery (truncation / v+1 gate / wrong type / leading garbage)
 /// ===================================================================================
+
+CAS_BATTERY_COVERS(RefLog);
 
 TEST(CASFormatBattery, RefLog)
 {

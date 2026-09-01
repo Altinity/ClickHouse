@@ -1,4 +1,5 @@
 #include "cas_test_helpers.h"
+#include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcMaintenanceStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMaintenanceState.h>
 #include <fmt/format.h>
@@ -22,6 +23,17 @@ public:
         throw std::runtime_error("injected maintenance read failure");
     }
 };
+}
+
+CAS_BATTERY_COVERS(GcMaintenanceState);
+
+TEST(CASFormatBattery, GcMaintenanceState)
+{
+    GcMaintenanceState state{.janitor_cursor = "cas/ns/a"};
+    runFormatBattery({FormatId::GcMaintenanceState,
+        [&] { return sealObject(FormatId::GcMaintenanceState, encodeGcMaintenanceState(state)); },
+        [](std::string_view s) { decodeGcMaintenanceState(std::string(openObject(FormatId::GcMaintenanceState, s))); },
+        currentFormatHeader("cas_gc_maintenance_state") + "{\"cur\":\"cas/ns/a\"}\n"});
 }
 
 TEST(CASGCMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)

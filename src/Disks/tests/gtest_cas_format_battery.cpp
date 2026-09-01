@@ -4,8 +4,27 @@
 
 using namespace DB::Cas;
 
+namespace
+{
+template <typename F>
+void expectThrowsCode(int expected_code, F && fn)
+{
+    try
+    {
+        fn();
+        FAIL() << "expected exception " << expected_code;
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), expected_code) << e.message();
+    }
+}
+}
+
 /// The real cas_pool_meta case replaces the phase-1 toy proving instance. Every other control-plane
 /// format registers its own battery row in its own gtest_cas_<object>_format.cpp file (Tasks 3-6).
+
+CAS_BATTERY_COVERS(PoolMeta);
 
 TEST(CASFormatBattery, PoolMeta)
 {
@@ -20,4 +39,10 @@ TEST(CASFormatBattery, PoolMeta)
         .decode = [](std::string_view s) { decodePoolMeta(std::string(openObject(FormatId::PoolMeta, s))); },
         .golden = currentFormatHeader("cas_pool_meta") +
                   "{\"pid\":\"00112233445566778899aabbccddeeff\",\"hln\":256,\"gcs\":1,\"mrg\":3,\"alg\":\"ch128\"}\n"});
+}
+
+TEST(CASPoolMeta, ValidateAlgosUsedRejectsUnknownByte)
+{
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { validatePoolAlgosUsed({7}, DB::ErrorCodes::CORRUPTED_DATA, "t"); });
 }

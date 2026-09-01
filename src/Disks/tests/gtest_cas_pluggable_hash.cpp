@@ -431,9 +431,9 @@ TEST(CASPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     ASSERT_NE(oit, frep.objects.end()) << "the sha256 blob must appear in fsck's detailed object list";
     /// The fold above already condemned it into the GC snapshot, so fsck's GC-pipeline-view
     /// classification (not the generic Unaccounted bucket -- reachable only by width-correctly pairing
-    /// the fsck-side hash against the run's kCondemned row hash) must recognize it as known-to-GC.
+    /// the fsck-side hash against the run's RunMarker::Condemned row hash) must recognize it as known-to-GC.
     EXPECT_EQ(oit->cls, FsckClass::PendingGc)
-        << "THE CRUX: fsck must pair the sha256 blob against the GC snapshot's kCondemned row (a "
+        << "THE CRUX: fsck must pair the sha256 blob against the GC snapshot's RunMarker::Condemned row (a "
            "silent-leak regression in CasFsck.cpp's unref_hashes/in_run_hashes/retired_by_hash port "
            "leaves this as the generic Unaccounted bucket instead)";
 }

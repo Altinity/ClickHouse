@@ -518,7 +518,7 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
         const auto parsed = store->layout().parseBlobTargetRunKey(run.key);
         ASSERT_TRUE(parsed.has_value());
         EXPECT_EQ(parsed->shard, run.shard);
-        EXPECT_EQ(parsed->generation, run.generation);
+        EXPECT_EQ(parsed->generation, run.key_generation);
         EXPECT_EQ(parsed->seq, 0u);
     }
     EXPECT_TRUE(run_seen[0]);

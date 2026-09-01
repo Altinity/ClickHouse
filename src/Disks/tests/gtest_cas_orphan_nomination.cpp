@@ -49,7 +49,7 @@ bool activeSourceExists(Backend & backend, const Layout & layout, const UInt128 
         String payload;
         while (view.next(key, payload))
         {
-            if (payload.empty() || payload[0] != kEdgeActive)
+            if (payload.empty() || runMarkerFromByte(payload[0], "CAS test source-edge run") != RunMarker::Edge)
                 continue;
             BlobRef ref;
             UInt128 row_source{};
@@ -74,7 +74,7 @@ size_t condemnedCount(Backend & backend, const Layout & layout)
         String key;
         String payload;
         while (view.next(key, payload))
-            count += !payload.empty() && payload[0] == kCondemned;
+            count += !payload.empty() && runMarkerFromByte(payload[0], "CAS test source-edge run") == RunMarker::Condemned;
         view.verifyAgainst(run.checksum);
     }
     return count;

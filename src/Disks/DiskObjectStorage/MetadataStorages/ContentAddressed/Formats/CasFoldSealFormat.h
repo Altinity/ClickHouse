@@ -27,7 +27,7 @@ struct RunRef
     String key;
     UInt128 checksum{};
     uint64_t shard = 0;        /// gc-shard this run belongs to (REQUIRED for blob_target_runs)
-    uint64_t generation = 0;   /// generation whose key namespace physically holds the object (for retention)
+    uint64_t key_generation = 0;   /// generation whose key namespace physically holds the object (for retention)
     bool operator==(const RunRef &) const = default;
 };
 
@@ -147,7 +147,7 @@ struct RefLifeFoldState
 /// must not be interpreted as zero.
 struct CondemnedSummary
 {
-    uint64_t condemned_total = 0;   /// count of `kCondemned` rows in this shard's sealed run
+    uint64_t condemned_total = 0;   /// count of `RunMarker::Condemned` rows in this shard's sealed run
     uint64_t pending_total = 0;     /// how many of those are `delete_pending` (a graduation is due)
     uint64_t oldest_nonpending_condemn_round = UINT64_MAX;   /// min condemn_round over non-pending; UINT64_MAX = none
     bool operator==(const CondemnedSummary &) const = default;

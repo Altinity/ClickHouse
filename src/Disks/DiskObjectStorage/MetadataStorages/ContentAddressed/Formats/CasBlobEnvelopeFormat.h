@@ -32,6 +32,9 @@ enum class ProvenanceOp : uint8_t
     Repack = 5,
 };
 
+/// Returns the persisted wire word for a validated provenance operation.
+std::string_view provenanceOpToWireWord(ProvenanceOp op);
+
 /// Optional diagnostic metadata recorded with an envelope. The fields identify when and where the
 /// incarnation was created, the ClickHouse build that wrote it, and the operation that produced it;
 /// none of them participates in object identity or a protocol decision.

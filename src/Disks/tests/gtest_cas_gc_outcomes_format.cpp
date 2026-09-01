@@ -27,6 +27,8 @@ void expectThrowsCode(int expected_code, F && fn)
 
 }
 
+CAS_BATTERY_COVERS(GcOutcomes);
+
 TEST(CASFormatBattery, GcOutcomes)
 {
     OutcomeLog log;
@@ -73,6 +75,42 @@ TEST(CASGCOutcomesFormat, MultiEntryRoundTripAllOutcomes)
     EXPECT_EQ(d.entries[3].token.value, "9");
     /// Insertion order + byte-stable text (the encoder is a pure function of the log).
     EXPECT_EQ(encodeOutcomeLog(d), text);
+}
+
+TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
+{
+    OutcomeLog log;
+    log.entries.push_back({ObjectKind::Blob,
+        BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("00112233445566778899aabbccddeeff"))},
+        Token{"e-1", TokenType::ETag}, OutcomeKind::Deleted});
+    const String bytes = encodeOutcomeLog(log);
+
+    const String token_value = R"(,"tv":"e-1")";
+    const auto token_value_pos = bytes.find(token_value);
+    ASSERT_NE(token_value_pos, String::npos);
+    String missing_token_value = bytes;
+    missing_token_value.erase(token_value_pos, token_value.size());
+    const OutcomeLog decoded = decodeOutcomeLog(missing_token_value);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].token.value, "");
+
+    for (const String & field : {String(R"(,"ha":"ch128")"), String(R"(,"h":"00112233445566778899aabbccddeeff")"), String(R"(,"tt":"etag")")})
+    {
+        const auto pos = bytes.find(field);
+        ASSERT_NE(pos, String::npos);
+        String incomplete = bytes;
+        incomplete.erase(pos, field.size());
+        try
+        {
+            decodeOutcomeLog(incomplete);
+            FAIL() << "expected DB::Exception";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+            EXPECT_EQ(e.message(), "CAS outcome log: record missing ha/h/tt");
+        }
+    }
 }
 
 TEST(CASGCOutcomesFormat, GarbageAndUnknownWordsFailClosed)

@@ -210,6 +210,8 @@ private:
 
 /// ---------- format-battery registration ----------
 
+CAS_BATTERY_COVERS(RefCatalog);
+
 TEST(CASFormatBattery, RefCatalog)
 {
     RefCatalog c;
@@ -261,6 +263,7 @@ TEST(CASRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
     const RefCatalog catalog{.entries = {removing}};
     const String encoded = encodeRefCatalog(catalog);
     EXPECT_NE(encoded.find("\"rsr\":\"19\""), String::npos);
+    EXPECT_NE(encoded.find("\"st\":\"removing\""), String::npos);
     EXPECT_EQ(decodeRefCatalog(encoded), catalog);
 
     const String inc = "00000000000000000000000000000009";
@@ -566,7 +569,7 @@ TEST(CASRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CASRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts)
 {
-    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "unknown ns state"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
+    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "outside the wire vocabulary"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
 }
 #endif
 
@@ -703,7 +706,7 @@ TEST(CASRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimal
                 .key = layout.blobTargetRunKey(max, max, shard, 0),
                 .checksum = std::numeric_limits<UInt128>::max(),
                 .shard = shard,
-                .generation = max});
+                .key_generation = max});
             seal.condemned_summary.emplace(shard, CondemnedSummary{
                 .condemned_total = max,
                 .pending_total = max,

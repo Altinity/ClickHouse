@@ -202,6 +202,7 @@ const FormatTraits & traitsFor(FormatId id);
 /// Looks up a header-line `type` string. Returns nullptr for an unregistered type; it does not throw
 /// because callers use this result to classify the input before decoding it.
 const FormatTraits * traitsForType(std::string_view type);
+std::span<const FormatId> allRegisteredFormatIds();
 /// Returns the storage-key suffix for `id`: `.zst` for `Always`, and an empty suffix otherwise.
 /// Key builders use this policy directly so a point lookup never has to inspect the object body or
 /// try multiple keys.

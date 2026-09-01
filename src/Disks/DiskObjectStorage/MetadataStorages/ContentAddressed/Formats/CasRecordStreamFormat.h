@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Common/Exception.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <IO/HashingReadBuffer.h>
@@ -11,6 +12,11 @@
 #include <memory>
 #include <string_view>
 
+namespace DB::ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+
 namespace DB::Cas
 {
 
@@ -18,14 +24,30 @@ namespace DB::Cas
 /// format, shared by this codec and the GC fold that interprets the rows.
 ///
 /// Source-edge rows use `source_id == 0` as a sentinel key. A real active edge must never use that key;
-/// both sentinel tags are restricted to it. `kZeroMarker` describes a zero transition for the current
-/// generation and is dropped when the row is carried forward. `kCondemned` carries the condemned
+/// both sentinel tags are restricted to it. `RunMarker::Zero` describes a zero transition for the current
+/// generation and is dropped when the row is carried forward. `RunMarker::Condemned` carries the condemned
 /// incarnation at the sentinel key across generations until settlement; its payload contains the full
 /// deletion token and other condemned-row state. A condemned row subsumes the zero marker for that
 /// generation.
-constexpr char kEdgeActive = 0x01;
-constexpr char kZeroMarker = 0x00;
-constexpr char kCondemned  = 0x02;
+enum class RunMarker : char
+{
+    Zero = 0x00,
+    Edge = 0x01,
+    Condemned = 0x02,
+};
+
+constexpr char runMarkerByte(RunMarker marker)
+{
+    return static_cast<char>(marker);
+}
+
+inline RunMarker runMarkerFromByte(char byte, std::string_view what)
+{
+    if (byte != runMarkerByte(RunMarker::Zero) && byte != runMarkerByte(RunMarker::Edge)
+        && byte != runMarkerByte(RunMarker::Condemned))
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "{}: unknown marker byte {}", what, static_cast<int>(byte));
+    return static_cast<RunMarker>(byte);
+}
 
 /// The `cas_run` codec represents the GC source-edge in-degree data plane as sorted NDJSON. This is
 /// the `RecordStream` family
@@ -49,18 +71,18 @@ constexpr char kCondemned  = 0x02;
 /// algo's width; `s` is the 32-hex source id. String-sorting records by (b, s) reproduces the current
 /// `(algorithm, digest, source_id)` byte order (lowercase hex preserves unsigned byte order and the
 /// algorithm byte is emitted first) — the invariant the fold's two-cursor merge depends on. The row-tag word
-/// `m` maps to the `kEdgeActive`/`kZeroMarker`/`kCondemned` bytes; a `condemned` row additionally
+/// `m` maps to the `RunMarker` bytes; a `condemned` row additionally
 /// carries the retired incarnation (`pend`/`tt`/`tv`/`sz`/`cr`) and the durable condemn-marker
 /// confirmation bit (`mc`).
 
 /// One decoded source-edge row. All fields are identifier-layer types so the codec stays backend-free.
 /// The condemned-only fields (`delete_pending`/`token`/`size`/`condemn_round`/`marker_confirmed`) are
-/// meaningful only when `marker == kCondemned`.
+/// meaningful only when `marker == RunMarker::Condemned`.
 struct SourceEdgeRecord
 {
     BlobRef ref{};
     UInt128 source_id{};
-    char marker = kEdgeActive;
+    RunMarker marker = RunMarker::Edge;
     bool delete_pending = false;
     Token token{};
     uint64_t size = 0;
@@ -70,6 +92,9 @@ struct SourceEdgeRecord
 
 /// The header-line `kind` word for the only live `cas_run` kind.
 inline constexpr std::string_view kSourceEdgeKindWord = "source_edge";
+
+/// Canonical wire word for one source-edge run marker.
+std::string_view runMarkerToWireWord(RunMarker marker);
 
 /// Write the typed header line `{"type":"cas_run","v":G_BUILD,"kind":"<kind>"}\n` with a fixed key
 /// order for byte-determinism. The `kind` field distinguishes the record schema within the run

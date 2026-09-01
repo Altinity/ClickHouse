@@ -91,8 +91,19 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     SourceEdgeRecord active;
     active.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(2))};
     active.source_id = UInt128(5);
-    active.marker = kEdgeActive;
+    active.marker = RunMarker::Edge;
     writer.append(active);
+
+    SourceEdgeRecord condemned;
+    condemned.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(3))};
+    condemned.source_id = UInt128(0);
+    condemned.marker = RunMarker::Condemned;
+    condemned.delete_pending = true;
+    condemned.token = Token{.value = "token", .type = TokenType::ETag};
+    condemned.size = 9;
+    condemned.condemn_round = 7;
+    condemned.marker_confirmed = true;
+    writer.append(condemned);
 
     writer.finish();
     out.finalize();
@@ -103,8 +114,10 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     const String header = fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion());
     const String expected_record =
         "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n";
-    const String trailer = "{\"n\":1}\n";
-    /// There is exactly one record, so the whole buffer must be byte-identical to header + record + trailer.
-    const String expected_full = header + expected_record + trailer;
+    const String expected_condemned =
+        "{\"b\":\"0100000000000000000000000000000003\",\"s\":\"00000000000000000000000000000000\",\"m\":\"condemned\",\"pend\":true,\"tt\":\"etag\",\"tv\":\"token\",\"sz\":9,\"cr\":\"7\",\"mc\":true}\n";
+    const String trailer = "{\"n\":2}\n";
+    /// Both records must remain byte-identical to their canonical stored representation.
+    const String expected_full = header + expected_record + expected_condemned + trailer;
     EXPECT_EQ(text, expected_full) << text;
 }

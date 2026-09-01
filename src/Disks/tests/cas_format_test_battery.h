@@ -4,6 +4,7 @@
 #include <Common/Exception.h>
 #include <fmt/format.h>
 #include <functional>
+#include <set>
 
 namespace DB::ErrorCodes
 {
@@ -52,6 +53,23 @@ void expectCode(int code, F && f, const String & context)
     }
 }
 }
+
+namespace DB::Cas::tests
+{
+inline std::set<FormatId> & batteryCoveredIds()
+{
+    static std::set<FormatId> ids;
+    return ids;
+}
+
+struct BatteryCoverageRegistrar
+{
+    explicit BatteryCoverageRegistrar(FormatId id) { batteryCoveredIds().insert(id); }
+};
+}
+
+#define CAS_BATTERY_COVERS(format_id) \
+    static const DB::Cas::tests::BatteryCoverageRegistrar battery_covers_##format_id{DB::Cas::FormatId::format_id}
 
 inline void runFormatBattery(const FormatBatteryCase & c)
 {

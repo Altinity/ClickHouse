@@ -154,6 +154,8 @@ TEST(CASBlobEnvelopeFormat, RefEscaperAlphabetPinned)
         << "escaper alphabet drifted: '/' must be verbatim, quote/backslash escaped, control -> \\uXXXX";
 }
 
+CAS_BATTERY_COVERS(Blob);
+
 TEST(CASFormatBattery, BlobEnvelope)
 {
     /// The golden is CONSTRUCTED from the hand-pinned json literal (same one FixedLengthAndPadZone

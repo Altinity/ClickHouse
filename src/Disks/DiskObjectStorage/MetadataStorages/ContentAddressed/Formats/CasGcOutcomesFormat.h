@@ -27,6 +27,9 @@ enum class OutcomeKind : uint8_t
     Spared = 4,     /// The merge found a positive in-degree, so the candidate was kept alive.
 };
 
+/// Canonical wire word for one `OutcomeKind`.
+std::string_view outcomeKindToWireWord(OutcomeKind outcome);
+
 /// One observation about a blob incarnation considered by GC. `token` identifies the exact
 /// incarnation that GC examined, while `ref` identifies the content address; retaining both lets
 /// replay and inspection distinguish an absent object from a replacement that won a race with GC.

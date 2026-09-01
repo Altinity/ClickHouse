@@ -471,6 +471,8 @@ TEST(CASRefEpochSealFormat, DecodeRejectsUnknownOpWordRegressionGuard)
 /// Shape-level failure-mode battery (truncation / v+1 gate / wrong type / leading garbage)
 /// ===================================================================================
 
+static const DB::Cas::tests::BatteryCoverageRegistrar battery_covers_RefLog_seal{DB::Cas::FormatId::RefLog};
+
 TEST(CASRefEpochSealFormat, FormatBatteryEpochSeal)
 {
     RefLogTxn txn;

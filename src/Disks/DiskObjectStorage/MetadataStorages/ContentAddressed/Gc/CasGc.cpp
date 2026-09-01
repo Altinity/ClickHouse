@@ -901,7 +901,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
 
     /// Retired-in-snapshot — there is NO separate retired-list object to publish anymore. The
-    /// round's surviving condemned entries were already sealed as `kCondemned` rows inside the fold's
+    /// round's surviving condemned entries were already sealed as `RunMarker::Condemned` rows inside the fold's
     /// `blob_target_runs` (durable before this CAS, via `putDeterministicArtifact`), and the per-shard
     /// `condemned_summary` the seal carries makes the next round's graduation/carry decisions zero-I/O.
 
@@ -923,13 +923,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// current shard's run back at an older generation's key). Retention must never reclaim these.
     std::set<uint64_t> referenced_generations;
     for (const RunRef & r : folded.fold_seal.blob_target_runs)
-        referenced_generations.insert(r.generation);
+        referenced_generations.insert(r.key_generation);
     /// ALSO protect every generation the PARENT (currently-adopted, pre-fold) seal references
     /// (`parent_seal_runs`, captured above): this prune runs BEFORE the round's own gc/state CAS below, so
     /// a losing leader must not destroy what the winning leader's already-adopted seal still points at —
     /// pre-CAS destructive actions may only rely on PREVIOUSLY PUBLISHED state (triage #5).
     for (const RunRef & r : parent_seal_runs)
-        referenced_generations.insert(r.generation);
+        referenced_generations.insert(r.key_generation);
     /// Retention floor uses THIS round's (post-fold) `generation`, so `gc_snapshot_generations_to_keep`
     /// keeps exactly that many generations back from the current one. If this round's `gc/state` CAS
     /// then LOSES, the prune reclaimed one generation deeper than the durably-adopted generation would
@@ -980,7 +980,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         uint64_t objects_reclaimed = 0;
         std::set<uint64_t> new_referenced_generations;
         for (const RunRef & r : folded.fold_seal.blob_target_runs)
-            new_referenced_generations.insert(r.generation);
+            new_referenced_generations.insert(r.key_generation);
 
         std::set<uint64_t> handed_off;   /// dedupe: multiple parent refs can share one generation
         /// GATED like every other destructive site, and it is also the FIRST destructive site of the
@@ -1003,11 +1003,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const RunRef & old_ref : handoff_candidates)
         {
             /// Only generations the wholesale prune already passed AND that no live ref still pins.
-            if (old_ref.generation > state.snap_pruned_through)
+            if (old_ref.key_generation > state.snap_pruned_through)
                 continue;   /// not yet pruned-through: the normal prune will reclaim it when it ages out
-            if (new_referenced_generations.contains(old_ref.generation))
+            if (new_referenced_generations.contains(old_ref.key_generation))
                 continue;   /// still referenced by a (possibly different-shard) live ref: keep it
-            if (!handed_off.insert(old_ref.generation).second)
+            if (!handed_off.insert(old_ref.key_generation).second)
                 continue;   /// already reclaimed this round via another shard's ref
             /// `bounded_remaining` draws from the hand-off's OWN reserve, never `UINT64_MAX` and never
             /// `pruneSupersededGenerations`' shared remainder: this hand-off is a ONE-SHOT event (see the
@@ -1021,13 +1021,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             if (remaining == 0)
                 break;
             const uint64_t reclaimed = deletePrefixWholesale(
-                backend, layout.gcGenPrefix(old_ref.generation), remaining);
+                backend, layout.gcGenPrefix(old_ref.key_generation), remaining);
             round_work_budget.handoff_prefix_wholesale_objects_used += reclaimed;
             objects_reclaimed += reclaimed;
             LOG_TRACE(logger,
                 "CAS GC hand-off: generation {} moved out of the live seal below the retention cursor "
                 "({} objects) — post-CAS wholesale reclaim (the prune had skipped it while referenced)",
-                old_ref.generation, reclaimed);
+                old_ref.key_generation, reclaimed);
         }
         t.metric("generations_reclaimed", handed_off.size());
         t.metric("objects_reclaimed", objects_reclaimed);
@@ -1665,7 +1665,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     result.fold_seal.ref_lives = walk_plan.successorFoldStates();
 
     /// Retired-in-snapshot: the prior generation's condemned entries RIDE the source-edge run as
-    /// `kCondemned` sentinel rows, so the round no longer reads any separate retired-list object —
+    /// `RunMarker::Condemned` sentinel rows, so the round no longer reads any separate retired-list object —
     /// the parent seal's `blob_target_runs` ARE the retired input. The per-gc-shard `condemned_summary`
     /// the seal carries below is distilled from the `still_retired` rows each shard re-emits, making the
     /// next round's `graduationDue` / pure-carry decisions zero-I/O.
@@ -2821,7 +2821,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// is deterministic (same refs for the same inputs), so seal determinism / crash-replay adoption hold.
     /// An empty delta with a NON-EMPTY retired list still runs the merge: settlement must happen every
     /// pass (carried/graduated/redeleted entries), and that pass reads the run to recompute in-degrees.
-    /// Distill one shard's `condemned_summary` entry from the `kCondemned` rows it re-emitted this pass
+    /// Distill one shard's `condemned_summary` entry from the `RunMarker::Condemned` rows it re-emitted this pass
     /// (`still_retired` mirrors those rows exactly). Folding shards call this; it makes the next
     /// round's `graduationDue` and pure-carry decisions read only the seal, never a run.
     auto summarize = [](const std::vector<RetiredEntry> & still) -> CondemnedSummary
@@ -3021,7 +3021,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         else
         {
             /// Either a real delta or a non-empty retired input: run the merge (empty deltas still settle
-            /// the kCondemned rows riding the parent run). The prior runs are the parent seal's shard-0 refs.
+            /// the RunMarker::Condemned rows riding the parent run). The prior runs are the parent seal's shard-0 refs.
             foldDeltasIntoGeneration(backend, layout, priorRunsFor(0),
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
@@ -3606,7 +3606,7 @@ bool Gc::graduationDue(const GcState & state, uint64_t current_round)
 {
     /// Retired-in-snapshot: the graduation signal is read from the adopted fold seal's per-shard
     /// `condemned_summary` — ZERO backend I/O beyond the single seal read. A summary distilled from this
-    /// generation's `kCondemned` rows says, per shard, how many entries are `delete_pending` (a graduation
+    /// generation's `RunMarker::Condemned` rows says, per shard, how many entries are `delete_pending` (a graduation
     /// is already published) and the oldest non-pending condemn round (one crosses the floor once
     /// `condemn_round < current_round`).
     if (state.snap_generation == 0)
@@ -3980,7 +3980,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     std::vector<uint64_t> attempt_of(gc_shards, 0);
     /// The fold is EDGE-ONLY here: a rebuild condemns nothing (spec §7, and the deletion below), so no
     /// condemn round is stamped and no head source is supplied. `current_round` 0 graduates nothing and
-    /// `condemn_round` 0 with an empty `head_blob` mints no `kCondemned` row -- this call is
+    /// `condemn_round` 0 with an empty `head_blob` mints no `RunMarker::Condemned` row -- this call is
     /// `foldDeltasIntoGeneration`'s pure edge form.
     auto flush_shard = [&](uint64_t shard)
     {
@@ -4315,7 +4315,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
             out.push_back(std::move(e));
         }
 
-        /// Retired-in-snapshot: stream the SAME adopted seal runs and emit every `kCondemned`
+        /// Retired-in-snapshot: stream the SAME adopted seal runs and emit every `RunMarker::Condemned`
         /// sentinel row. The stored token IS the authority — NO HEAD here (a HEAD would defeat the point
         /// and cost I/O). `delete_pending` rows are deleted next fold; the rest await graduation. Preview
         /// stays WRITE-FREE (`openSourceEdgeRun` is a pure reader). Output is a superset of the above.
@@ -4326,7 +4326,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
             String payload;
             while (reader.next(key, payload))
             {
-                if (payload.empty() || payload[0] != kCondemned)
+                if (payload.empty() || runMarkerFromByte(payload[0], "CAS source-edge run") != RunMarker::Condemned)
                     continue;
                 BlobRef ref;
                 UInt128 source_id;

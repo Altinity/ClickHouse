@@ -15,6 +15,22 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+namespace
+{
+
+namespace RefCkptWire
+{
+    constexpr WireKey life_epoch{"le"};
+    constexpr WireKey committed_epoch{"cte"};
+    constexpr WireKey committed_seq{"cts"};
+    constexpr WireKey snapshot_epoch{"cse"};
+    constexpr WireKey snapshot_seq{"css"};
+    constexpr WireKey seal_epoch{"lse"};
+    constexpr WireKey seal_seq{"lss"};
+}
+
+}
+
 void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what)
 {
     /// PRESENT means REAL. `life_epoch` may be absent (no writer of this object knew the namespace's
@@ -90,15 +106,15 @@ String encodeRefCkpt(const RefCkpt & ckpt)
     /// three ref formats cannot disagree on the encoding.
     if (ckpt.life_epoch)
     {
-        writeKey(out, "le", first);
+        writeKey(out, RefCkptWire::life_epoch, first);
         writeU64StringValue(out, *ckpt.life_epoch);
     }
     if (ckpt.committed_through)
-        writeRefTxnIdFields(out, first, "cte", "cts", *ckpt.committed_through);
+        writeRefTxnIdFields(out, first, RefCkptWire::committed_epoch, RefCkptWire::committed_seq, *ckpt.committed_through);
     if (ckpt.checkpoint_snapshot_id)
-        writeRefTxnIdFields(out, first, "cse", "css", *ckpt.checkpoint_snapshot_id);
+        writeRefTxnIdFields(out, first, RefCkptWire::snapshot_epoch, RefCkptWire::snapshot_seq, *ckpt.checkpoint_snapshot_id);
     if (ckpt.last_epoch_seal)
-        writeRefTxnIdFields(out, first, "lse", "lss", *ckpt.last_epoch_seal);
+        writeRefTxnIdFields(out, first, RefCkptWire::seal_epoch, RefCkptWire::seal_seq, *ckpt.last_epoch_seal);
     closeObject(out, first);
     writeChar('\n', out);
 
@@ -136,13 +152,13 @@ RefCkpt decodeRefCkpt(std::string_view data)
     String key;
     while (r.nextKey(key))
     {
-        if (key == "le") ckpt.life_epoch = r.readU64String();
-        else if (key == "cte") cte = r.readU64String();
-        else if (key == "cts") cts = r.readU64String();
-        else if (key == "cse") cse = r.readU64String();
-        else if (key == "css") css = r.readU64String();
-        else if (key == "lse") lse = r.readU64String();
-        else if (key == "lss") lss = r.readU64String();
+        if (key == RefCkptWire::life_epoch) ckpt.life_epoch = r.readU64String();
+        else if (key == RefCkptWire::committed_epoch) cte = r.readU64String();
+        else if (key == RefCkptWire::committed_seq) cts = r.readU64String();
+        else if (key == RefCkptWire::snapshot_epoch) cse = r.readU64String();
+        else if (key == RefCkptWire::snapshot_seq) css = r.readU64String();
+        else if (key == RefCkptWire::seal_epoch) lse = r.readU64String();
+        else if (key == RefCkptWire::seal_seq) lss = r.readU64String();
         else r.skipUnknown(key);
     }
 

@@ -564,7 +564,7 @@ TEST(CASGCShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     };
     /// Whether ANY gc-shard still holds an in-flight condemned entry (the ack-floor deletion pipeline is
     /// in flight while this is true). Retired-in-snapshot (T4): reconstructed from the adopted fold seal's
-    /// kCondemned rows across all shards, not a separate retired list.
+    /// RunMarker::Condemned rows across all shards, not a separate retired list.
     auto anyRetiredPending = [&]
     {
         return anyCondemnedInSeal(*backend, layout);

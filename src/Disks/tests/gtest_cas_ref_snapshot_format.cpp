@@ -419,6 +419,8 @@ TEST(CASRefSnapshotCodec, DecodeRejectsOversizedBufferDirectly)
 /// Shape-level failure-mode battery (truncation / v+1 gate / wrong type / leading garbage)
 /// ===================================================================================
 
+CAS_BATTERY_COVERS(RefSnapshot);
+
 TEST(CASFormatBattery, RefSnapshot)
 {
     const RefTableSnapshot s = makeLiveSnapshot();

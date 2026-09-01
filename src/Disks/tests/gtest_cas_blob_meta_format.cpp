@@ -6,6 +6,29 @@ using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
 
+namespace
+{
+/// Same tiny inline copy as `gtest_cas_wire_vocab.cpp`'s `expectThrowsCode`: stays clear of
+/// `Disks/tests/cas_test_helpers.h`'s `DB::Cas::tests::expectThrowsCode`, which would both drag
+/// in the whole CAS backend/store machinery this file otherwise has no need for AND collide (same
+/// namespace, same name and signature) if that header were ever included here too.
+template <typename F>
+void expectThrowsCode(int expected_code, F && fn)
+{
+    try
+    {
+        fn();
+        FAIL() << "expected DB::Exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), expected_code);
+    }
+}
+}
+
+CAS_BATTERY_COVERS(BlobMeta);
+
 TEST(CASFormatBattery, BlobMeta)
 {
     BlobMeta m;
@@ -40,10 +63,10 @@ TEST(CASBlobMetaFormat, FailsClosedOnUnknownStateAndTruncation)
     /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
     /// the header gate, which is the point — the BODY is what has to fail here.
     const String bad_state = "{\"type\":\"cas_blob_meta\",\"v\":3}\n{\"st\":\"zombie\",\"cr\":\"0\",\"sz\":\"0\"}\n";
-    EXPECT_THROW(decodeBlobMeta(bad_state), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeBlobMeta(bad_state); });
     /// Missing state key -> CORRUPTED_DATA.
     const String no_state = "{\"type\":\"cas_blob_meta\",\"v\":3}\n{\"cr\":\"0\",\"sz\":\"0\"}\n";
-    EXPECT_THROW(decodeBlobMeta(no_state), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeBlobMeta(no_state); });
     /// Truncated (header only) -> CORRUPTED_DATA.
-    EXPECT_THROW(decodeBlobMeta("{\"type\":\"cas_blob_meta\",\"v\":3}\n"), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeBlobMeta("{\"type\":\"cas_blob_meta\",\"v\":3}\n"); });
 }
