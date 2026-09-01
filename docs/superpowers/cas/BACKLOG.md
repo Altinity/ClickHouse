@@ -82,14 +82,26 @@ This is a deliberate scope boundary, not an oversight: `tokenFromWriteResult` wa
 "every other dialect keeps the pre-existing HEAD-fallback behavior unchanged". The GCS work saw the
 attribution problem and fixed it only where it was working.
 
-**The hazard.** Our write commits, the response carries no ETag, our fallback `HEAD` stalls, a
-same-uuid twin claims and arms authority, and our `HEAD` returns the twin's token — which we then hold
-as the token of our own write. Today that is fail-safe everywhere it lands: the value flows into
-`MountLeaseKeeper::last_token` and is used only as an `If-Match` precondition, so being wrong costs a
-failed renewal and a fence, never a wrong action. Nothing at the type level says that is the only
-correct way to consume it, and a consumer that treats the token as *identifying* our body instead of
-merely *conditioning* the next write turns it into a live-twin overwrite. Revision 4 of the reclaim
-design was exactly that consumer.
+**The hazard.** Our write commits, the response carries no ETag, our fallback `HEAD` stalls, another
+writer claims and arms authority, and our `HEAD` returns *their* token — which we then hold as the
+token of our own write.
+
+**There is already a consumer where this is not fail-safe.** `Gc::acquireOrRenewLease` takes its
+`state_token` straight from the write result (`CasGc.cpp:4397`, `:4418` — both `casPut` results), and the round commit CASes
+`gc/state` against it (`CasGc.cpp:944`). So a GC leader whose acquire response carried no ETag, and
+whose fallback `HEAD` returned a *successor* leader's token, holds a token that matches the successor's
+state — and its round commit succeeds over a leader that believes it holds the lease. The failing CAS
+that is supposed to stop a displaced leader does not fail.
+
+`MountLeaseKeeper::last_token` is the milder case: there the value is only an `If-Match` precondition,
+so a wrong token costs a failed renewal and a fence rather than a wrong action — though even there the
+containment is a property of the mount controller's own gates, not of the token. Nothing at the type
+level distinguishes the two situations, and a consumer that treats the token as *identifying* our body
+rather than merely *conditioning* the next write turns it into an overwrite of a live holder. Revision 4
+of the reclaim design was exactly that consumer, which is how this was found.
+
+(An earlier version of this entry claimed every current consumer was fail-safe. The GC lease path
+refutes that; corrected 2026-09-02.)
 
 **Fix direction: put provenance in `PutResult`, do not make the ETag path throw.** A `nullopt` is
 structural for backends with no write-time token (local files, a non-S3 `IObjectStorage`), so throwing
