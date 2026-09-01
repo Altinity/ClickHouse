@@ -620,6 +620,12 @@ void ReadManager::advanceDeliveryPtrIfNeeded(size_t row_group_idx, MemoryUsageDi
 /// pre-issuing it instead consumes a pool slot, charges the compressed-memory pool and lengthens the
 /// issue queue for nothing (measured on a cluster whose filesystem cache held the whole working set:
 /// 26% wall and 33% CPU).
+///
+/// Only usable for the index reads: dropping one of those plans is safe because the stage that needs
+/// the handles pushes them unconditionally (see `scheduleTask`), so nothing is lost by not planning
+/// them. The data-page path is not like that -- planning it claims the column chunk's dictionary and
+/// whole-chunk handles and advances `data_pages_prefetch_idx` -- so it tests locality with
+/// `columnChunkIsLocal` before it touches any of that, not after.
 static bool spanIsLocal(const DB::Parquet::Prefetcher & prefetcher, const std::vector<Parquet::PrefetchHandle *> & handles)
 {
     size_t begin = std::numeric_limits<size_t>::max();
@@ -634,6 +640,23 @@ static bool spanIsLocal(const DB::Parquet::Prefetcher & prefetcher, const std::v
         end = std::max(end, o + l);
     }
     return end > begin && prefetcher.rangeIsLocal(begin, end - begin);
+}
+
+/// Same question for a whole column chunk, answered from the chunk's metadata alone. The data-page
+/// planner has to decide before it walks the column: `determinePagesToPrefetch` advances the column's
+/// page cursor and the planner then claims the dictionary and whole-chunk handles, both of which tell
+/// the demand path in `scheduleTask` that the planner owns those reads. Dropping the plan after that
+/// point leaves handles nobody ever starts, and the decoder dereferences their absent task.
+///
+/// A chunk is contiguous, so if all of it is local then so is every page in it; and if any of it is
+/// not, planning goes ahead as usual. `total_compressed_size` covers the dictionary page too.
+static bool columnChunkIsLocal(const DB::Parquet::Prefetcher & prefetcher, const Parquet::Reader::ColumnChunk & column)
+{
+    const auto & meta = column.meta->meta_data;
+    const size_t begin = meta.__isset.dictionary_page_offset
+        ? size_t(meta.dictionary_page_offset) : size_t(meta.data_page_offset);
+    const size_t length = size_t(meta.total_compressed_size);
+    return length > 0 && prefetcher.rangeIsLocal(begin, length);
 }
 
 void ReadManager::enqueueRowGroupIndexReads(size_t row_group_idx)
@@ -785,6 +808,12 @@ void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx
             if (column.offset_index_prefetch && column.offset_index.page_locations.empty())
                 continue;
 
+            if (columnChunkIsLocal(reader.prefetcher, column))
+            {
+                ProfileEvents::increment(ProfileEvents::ParquetPlannedReadsSkippedLocal);
+                continue;
+            }
+
             reader.determinePagesToPrefetch(column, row_subgroup, row_group, handles);
 
             /// The dictionary page and the whole-column-chunk read (the latter only when there's no
@@ -811,11 +840,6 @@ void ReadManager::enqueueRowGroupPageReads(size_t row_group_idx, size_t step_idx
         std::erase_if(handles, [](const PrefetchHandle * h) { return !*h; });
         if (handles.empty())
             continue;
-        if (spanIsLocal(reader.prefetcher, handles))
-        {
-            ProfileEvents::increment(ProfileEvents::ParquetPlannedReadsSkippedLocal);
-            continue;
-        }
         size_t bytes = 0;
         for (const PrefetchHandle * h : handles)
             bytes += reader.prefetcher.requestLength(*h);
