@@ -1862,14 +1862,18 @@ bool CachedOnDiskReadBufferFromFile::isRangeLocal(size_t offset, size_t n) const
 {
     /// Unlike `isContentCached`, this asks the cache rather than this buffer: no `initialize()`, no
     /// buffer state touched, so it is const and safe to call from another thread while a positioned
-    /// read is in flight -- `readBigAt` works the same way. `getDownloadedContiguousOrEmpty` never
-    /// creates or fills segments, so probing cannot perturb the cache.
+    /// read is in flight -- `readBigAt` works the same way.
+    ///
+    /// `isRangeDownloadedContiguously` only reads the key's metadata under its lock and never takes
+    /// ownership of a segment, which matters: an earlier version of this asked through a
+    /// `FileSegmentsHolder`, and destroying that holder completed every segment it had inspected --
+    /// removing the EMPTY ones and shrinking the partially downloaded ones. Readers that had
+    /// already concluded a range was cached then failed to open its file.
     if (n == 0)
         return true;
     if (!cache)
         return false;
-    auto segments = cache->getDownloadedContiguousOrEmpty(info.cache_key, offset, n, origin.user_id);
-    return segments && !segments->empty();
+    return cache->isRangeDownloadedContiguously(info.cache_key, offset, n, origin.user_id);
 }
 
 bool CachedOnDiskReadBufferFromFile::isContentCached(size_t offset, size_t size)

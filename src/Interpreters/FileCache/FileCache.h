@@ -172,7 +172,21 @@ public:
     /// contiguously with a sufficient downloaded prefix, otherwise an EMPTY holder. Never fills holes,
     /// synthesizes DETACHED placeholders or creates segments. State is deliberately not checked:
     /// a committed Ephemeral segment stays PARTIALLY_DOWNLOADED (DOWNLOADED requires !is_unbound).
-    FileSegmentsHolderPtr getDownloadedContiguousOrEmpty(
+
+    /// Whether [offset, offset + size) is entirely covered by fully downloaded segments, i.e. can be
+    /// read from local disk without going to the source.
+    ///
+    /// Returns a plain bool, not a holder, on purpose: taking ownership of a `FileSegment` in order
+    /// to ask about it is destructive. Completing a held segment removes it when it is EMPTY or
+    /// PARTIALLY_DOWNLOADED_NO_CONTINUATION and shrinks it when it is PARTIALLY_DOWNLOADED, so a
+    /// probe that held its segments deleted cache files out from under readers that had already
+    /// concluded the range was cached.
+    ///
+    /// Only the DOWNLOADED state counts. A PARTIALLY_DOWNLOADED segment whose downloaded prefix
+    /// happens to cover the range is rejected: whoever holds it next can shrink it, so the answer
+    /// would not stay true. That excludes committed Ephemeral (unbound) segments, which never reach
+    /// DOWNLOADED -- temporary data has no source to fall back to and no caller asks this about it.
+    bool isRangeDownloadedContiguously(
         const Key & key,
         size_t offset,
         size_t size,
@@ -355,7 +369,7 @@ private:
     /// If `ignore_bypass_threshold` is true, the `enable_bypass_cache_with_threshold`
     /// short-circuit is skipped, so the actual cached segments are inspected even for
     /// large ranges. This is required by callers that need to know what is really
-    /// downloaded (e.g. `getDownloadedContiguousOrEmpty`).
+    /// downloaded (e.g. `isRangeDownloadedContiguously`).
     FileSegments getImpl(
         const LockedKey & locked_key,
         const FileSegment::Range & range,

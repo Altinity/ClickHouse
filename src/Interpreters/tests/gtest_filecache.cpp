@@ -1129,11 +1129,11 @@ catch (...)
     throw;
 }
 
-/// `getDownloadedContiguousOrEmpty` must inspect the actually downloaded segments even when
-/// `enable_bypass_cache_with_threshold` is on and the requested range exceeds the threshold.
-/// Otherwise getImpl() would return a synthetic DETACHED placeholder and the helper would
-/// wrongly report present-but-large data (e.g. distributed-cache temporary data) as missing.
-TEST_F(FileCacheTest, GetDownloadedContiguousIgnoresBypassThreshold)
+/// `isRangeDownloadedContiguously` must report downloaded data as present even when
+/// `enable_bypass_cache_with_threshold` is on and the requested range exceeds the threshold, and
+/// must answer without taking ownership of any segment -- holding one and letting the holder go
+/// completes it, which removes or shrinks it.
+TEST_F(FileCacheTest, IsRangeDownloadedContiguouslyIgnoresBypassThreshold)
 try
 {
     ServerUUID::setRandomForUnitTests();
@@ -1173,11 +1173,15 @@ try
     const auto & user_id = user.user_id;
 
     /// The whole downloaded range is larger than the threshold but must still be reported present.
-    EXPECT_FALSE(file_cache.getDownloadedContiguousOrEmpty(key, 0, downloaded_size, user_id)->empty());
+    EXPECT_TRUE(file_cache.isRangeDownloadedContiguously(key, 0, downloaded_size, user_id));
     /// A sub-range that also exceeds the threshold is present too.
-    EXPECT_FALSE(file_cache.getDownloadedContiguousOrEmpty(key, 10, downloaded_size - 10, user_id)->empty());
+    EXPECT_TRUE(file_cache.isRangeDownloadedContiguously(key, 10, downloaded_size - 10, user_id));
     /// A range past the downloaded data is correctly reported as missing.
-    EXPECT_TRUE(file_cache.getDownloadedContiguousOrEmpty(key, 0, downloaded_size + 1, user_id)->empty());
+    EXPECT_FALSE(file_cache.isRangeDownloadedContiguously(key, 0, downloaded_size + 1, user_id));
+
+    /// Asking must not have changed the cache: every segment is still there and still downloaded,
+    /// so a second identical question gets the same answer.
+    EXPECT_TRUE(file_cache.isRangeDownloadedContiguously(key, 0, downloaded_size, user_id));
 }
 catch (...)
 {
