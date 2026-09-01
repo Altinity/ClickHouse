@@ -15,6 +15,7 @@
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <Core/Defines.h>
+#include <base/scope_guard.h>
 #include <base/types.h>
 #include <algorithm>
 #include <limits>
@@ -32,6 +33,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int QUERY_WAS_CANCELLED;
     extern const int UNKNOWN_TABLE;
+    extern const int UNKNOWN_EXCEPTION;
 }
 
 MergeTreePartitionExportScheduler::MergeTreePartitionExportScheduler(StorageMergeTree & storage_)
@@ -49,6 +51,15 @@ String MergeTreePartitionExportScheduler::compositeKey(
 String MergeTreePartitionExportScheduler::getExportsRelativePath() const
 {
     return fs::path(storage.getRelativeDataPath()) / "partition_exports";
+}
+
+std::map<String, MergeTreePartitionExportScheduler::TaskEntry>::iterator
+MergeTreePartitionExportScheduler::findByTransactionId(const String & transaction_id)
+{
+    for (auto it = tasks.begin(); it != tasks.end(); ++it)
+        if (it->second.getDescriptor().transaction_id == transaction_id)
+            return it;
+    return tasks.end();
 }
 
 void MergeTreePartitionExportScheduler::addTask(
@@ -96,34 +107,26 @@ CancellationCode MergeTreePartitionExportScheduler::kill(const String & transact
     {
         std::lock_guard lock(mutex);
 
-        /// `tasks` is keyed by (partition, destination); KILL arrives with a transaction_id.
-        TaskEntry * entry = nullptr;
-        const String * composite_key = nullptr;
-        for (auto & [key, candidate] : tasks)
-            if (candidate.getDescriptor().transaction_id == transaction_id)
-            {
-                composite_key = &key;
-                entry = &candidate;
-                break;
-            }
-
-        if (!entry)
+        auto it = findByTransactionId(transaction_id);
+        if (it == tasks.end())
             return CancellationCode::NotFound;
 
-        if (entry->getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
+        auto & entry = it->second;
+
+        if (entry.getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
             return CancellationCode::CancelCannotBeSent;
 
-        if (entry->committing)
+        if (entry.committing)
         {
             LOG_INFO(storage.log, "ExportPartition: commit in progress for {}, cannot cancel export partition task", transaction_id);
             return CancellationCode::CancelCannotBeSent;
         }
 
-        auto updated = entry->getDescriptor();
+        auto updated = entry.getDescriptor();
 
         updated.status = MergeTreePartitionExportTask::Status::KILLED;
-        persist(*composite_key, updated.toJsonString());
-        entry->setDescriptor(std::move(updated));
+        persist(it->first, updated.toJsonString());
+        entry.setDescriptor(std::move(updated));
     }
 
     /// cancel in-flight operations
@@ -274,13 +277,10 @@ bool MergeTreePartitionExportScheduler::run()
 
             if (descriptor.allPartsDone())
             {
-                /// All parts exported: commit (or retry a previously-failed commit). Guard with the
-                /// committing flag so a concurrent completion callback does not commit in parallel.
+                /// All parts exported: commit (or retry a previously-failed commit). tryCommit
+                /// itself takes the committing lease; skip if a commit is already in flight.
                 if (!entry.committing)
-                {
-                    entry.committing = true;
                     tasks_to_commit.push_back(descriptor.transaction_id);
-                }
                 continue;
             }
 
@@ -320,16 +320,10 @@ void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transacti
     MergeTreePartitionExportTask descriptor_copy;
     {
         std::lock_guard lock(mutex);
-        TaskEntry * entry = nullptr;
-        for (auto & [key, candidate] : tasks)
-            if (candidate.getDescriptor().transaction_id == transaction_id)
-            {
-                entry = &candidate;
-                break;
-            }
-        if (!entry)
+        auto it = findByTransactionId(transaction_id);
+        if (it == tasks.end())
             return;
-        descriptor_copy = entry->getDescriptor();
+        descriptor_copy = it->second.getDescriptor();
     }
 
     const StorageID destination_storage_id{descriptor_copy.destination_database, descriptor_copy.destination_table};
@@ -337,12 +331,9 @@ void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transacti
     auto release_in_flight = [this, transaction_id, part_name]()
     {
         std::lock_guard lock(mutex);
-        for (auto & [key, entry] : tasks)
-            if (entry.getDescriptor().transaction_id == transaction_id)
-            {
-                entry.in_flight_parts.erase(part_name);
-                break;
-            }
+        auto it = findByTransactionId(transaction_id);
+        if (it != tasks.end())
+            it->second.in_flight_parts.erase(part_name);
     };
 
     try
@@ -379,22 +370,16 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
 
     {
         std::lock_guard lock(mutex);
-        const String * composite_key = nullptr;
-        TaskEntry * entry = nullptr;
-        for (auto & [key, candidate] : tasks)
-            if (candidate.getDescriptor().transaction_id == transaction_id)
-            {
-                composite_key = &key;
-                entry = &candidate;
-                break;
-            }
-        if (!entry)
+        auto it = findByTransactionId(transaction_id);
+        if (it == tasks.end())
             return;
 
-        entry->in_flight_parts.erase(part_name);
+        auto & entry = it->second;
+
+        entry.in_flight_parts.erase(part_name);
 
         /// Task already terminal (KILLED / FAILED / COMPLETED): ignore late completions.
-        if (entry->getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
+        if (entry.getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
             return;
 
         /// A cancelled export (KILL, or SYSTEM STOP MOVES) is not a real failure: leave the part
@@ -407,7 +392,7 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
         /// the write throws we leave the in-memory descriptor unchanged (so the part is retried) and
         /// swallow the error -- a completion callback must not surface a local disk error as a part
         /// failure.
-        auto updated = entry->getDescriptor();
+        auto updated = entry.getDescriptor();
 
         if (result.success)
         {
@@ -430,7 +415,7 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
 
         try
         {
-            persist(*composite_key, updated.toJsonString());
+            persist(it->first, updated.toJsonString());
         }
         catch (...)
         {
@@ -438,30 +423,27 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
             return;
         }
 
-        entry->setDescriptor(std::move(updated));
+        entry.setDescriptor(std::move(updated));
 
         if (result.success)
         {
-            entry->part_backoff.erase(part_name);
-            if (entry->getDescriptor().allPartsDone() && !entry->committing)
-            {
-                entry->committing = true;
+            entry.part_backoff.erase(part_name);
+            if (entry.getDescriptor().allPartsDone() && !entry.committing)
                 ready_to_commit = true;
-            }
         }
-        else if (entry->getDescriptor().status == MergeTreePartitionExportTask::Status::FAILED)
+        else if (entry.getDescriptor().status == MergeTreePartitionExportTask::Status::FAILED)
         {
             LOG_WARNING(storage.log, "ExportPartition: task {} failed on part {} with non-retryable error",
                 transaction_id, part_name);
         }
         else
         {
-            auto & backoff = entry->part_backoff[part_name];
+            auto & backoff = entry.part_backoff[part_name];
             ++backoff.attempts;
             const auto backoff_seconds = ExportPartitionUtils::computeRetryBackoffSeconds(
                 backoff.attempts,
-                entry->getDescriptor().retry_initial_backoff_seconds,
-                entry->getDescriptor().retry_max_backoff_seconds);
+                entry.getDescriptor().retry_initial_backoff_seconds,
+                entry.getDescriptor().retry_max_backoff_seconds);
             const auto now = time(nullptr);
             const size_t headroom = static_cast<size_t>(std::numeric_limits<time_t>::max() - now);
             backoff.next_retry_time = now + static_cast<time_t>(std::min(backoff_seconds, headroom));
@@ -478,26 +460,37 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
 void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
 {
     MergeTreePartitionExportTask descriptor_copy;
+    String composite_key;
+    /// This call is the sole writer of `committing`. Drop the lease on every exit after we claimed
+    /// it, including exceptions that are not `DB::Exception` (otherwise the task is wedged until
+    /// restart: timeout and KILL also refuse to act while the flag is set).
+    bool claimed = false;
+    SCOPE_EXIT(
+    {
+        if (!claimed)
+            return;
+        std::lock_guard lock(mutex);
+        auto it = tasks.find(composite_key);
+        if (it != tasks.end() && it->second.getDescriptor().transaction_id == transaction_id)
+            it->second.committing = false;
+    });
+
     {
         std::lock_guard lock(mutex);
-        TaskEntry * entry = nullptr;
-        for (auto & [key, candidate] : tasks)
-            if (candidate.getDescriptor().transaction_id == transaction_id)
-            {
-                entry = &candidate;
-                break;
-            }
-        if (!entry)
+        auto it = findByTransactionId(transaction_id);
+        if (it == tasks.end())
             return;
 
-        if (entry->getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING || !entry->getDescriptor().allPartsDone())
-        {
-            entry->committing = false;
+        auto & entry = it->second;
+        if (entry.committing)
             return;
-        }
+        if (entry.getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING || !entry.getDescriptor().allPartsDone())
+            return;
 
-        entry->committing = true;
-        descriptor_copy = entry->getDescriptor();
+        composite_key = it->first;
+        entry.committing = true;
+        claimed = true;
+        descriptor_copy = entry.getDescriptor();
     }
 
     const StorageID destination_storage_id{descriptor_copy.destination_database, descriptor_copy.destination_table};
@@ -539,32 +532,29 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
         failure = e;
         LOG_WARNING(storage.log, "ExportPartition: commit for task {} failed: {}", transaction_id, e.message());
     }
+    catch (...)
+    {
+        tryLogCurrentException(storage.log, "ExportPartition: commit for task " + transaction_id + " failed");
+        failure = Exception::createRuntime(ErrorCodes::UNKNOWN_EXCEPTION, getCurrentExceptionMessage(/*with_stacktrace=*/ false));
+    }
 
     {
         std::lock_guard lock(mutex);
-        const String * composite_key = nullptr;
-        TaskEntry * entry = nullptr;
-        for (auto & [key, candidate] : tasks)
-            if (candidate.getDescriptor().transaction_id == transaction_id)
-            {
-                composite_key = &key;
-                entry = &candidate;
-                break;
-            }
-        if (!entry)
+        auto it = tasks.find(composite_key);
+        if (it == tasks.end() || it->second.getDescriptor().transaction_id != transaction_id)
             return;
 
-        entry->committing = false;
+        auto & entry = it->second;
 
         /// A concurrent KILL may have won the race while we were committing. Its terminal state is
-        /// already durable, so there is nothing to persist here.
-        if (entry->getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
+        /// already durable, so there is nothing to persist here. `SCOPE_EXIT` still drops the lease.
+        if (entry.getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
             return;
 
         /// Persist-then-apply under the lock. Note the destination commit above already happened
         /// (effect-first): if this local write throws, we leave the task PENDING with all parts done
         /// so run() retries the commit -- idempotent thanks to the transaction id / commit file.
-        auto updated = entry->getDescriptor();
+        auto updated = entry.getDescriptor();
         if (success)
         {
             updated.status = MergeTreePartitionExportTask::Status::COMPLETED;
@@ -583,7 +573,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
 
         try
         {
-            persist(*composite_key, updated.toJsonString());
+            persist(composite_key, updated.toJsonString());
         }
         catch (...)
         {
@@ -591,7 +581,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
             return;
         }
 
-        entry->setDescriptor(std::move(updated));
+        entry.setDescriptor(std::move(updated));
     }
 }
 

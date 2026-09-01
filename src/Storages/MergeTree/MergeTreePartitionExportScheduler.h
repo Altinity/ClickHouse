@@ -73,8 +73,8 @@ private:
         std::vector<DataPartPtr> part_references;
         /// Parts currently scheduled on the background move executor (avoids double scheduling).
         std::unordered_set<String> in_flight_parts;
-        /// True while a commit attempt is in progress, so run() and completion callbacks do not
-        /// drive commitExportPartitionTransaction concurrently for the same task.
+        /// True while `tryCommit` is in the destination-commit / persist window. Callers must not
+        /// write this flag; overlapping tryCommit calls no-op when it is already set.
         bool committing = false;
         /// In-memory per-part retry back-off. Keyed by part name so a force-replace of the same
         /// composite key does not inherit a prior instance's delay. Not persisted: after restart
@@ -107,6 +107,9 @@ private:
     void scheduleOnePart(const String & transaction_id, const String & part_name);
     void handlePartCompletion(const String & transaction_id, const String & part_name, const MergeTreePartExportManifest::CompletionCallbackResult & result);
     void tryCommit(const String & transaction_id);
+
+    /// Caller must hold `mutex`. `tasks.end()` if no task has this transaction id.
+    std::map<String, TaskEntry>::iterator findByTransactionId(const String & transaction_id);
 
     /// Wall-clock timeout pass. Transitions expired PENDING tasks to KILLED (unless a commit is
     /// already in flight) and cancels their in-flight parts. Returns true if any PENDING work
