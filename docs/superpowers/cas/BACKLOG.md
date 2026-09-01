@@ -1414,3 +1414,45 @@ large enough to saturate the permit pool.
 **Do not read the dump window as the event's duration.** The three conflicts span ten seconds only
 because the `predown_dump` that captured them ran at 06:53:21; the containers were torn down
 afterwards and the rest is gone. The renewal itself took 23.7 s.
+
+## `[s05-standalone-repoints-on-the-non-transactional-path]` 1,200 committed refs repointed outside a transaction during sparse-write GC {#s05-standalone-repoints}
+
+**Found 2026-09-01, S05 at `--scale full`** (10,000 tables, one insert each). Sixteen verdicts, zero
+anomalies — the card ran cleanly and caught product behaviour, not a harness fault.
+
+`CASRefRepoint == 0 on the non-transactional path` observed **1,200**. The card's own note: "unexpected
+standalone repoint of a committed ref during sparse-write GC — investigate which op took the
+`repointRef` path".
+
+It does NOT reproduce at `dev` or `ci`, so whatever takes that path needs either the object count or
+the sparse-write shape that only `full` produces.
+
+**First question to answer:** which operation calls `repointRef` outside a transaction. The count is
+suspiciously close to a per-table figure for a 10,000-table pool, so start by checking whether it
+scales with tables, with parts, or with GC rounds. Related: `[part-removal-repoint-waste]`, where
+`delete_tmp_*` repoints were measured at ~22% of the writer PUT class — if the same call site is
+responsible, these are one finding, not two.
+
+## `[s01-rss-growth-scales-with-the-blob]` RSS growth during a large upload is a fraction of the blob, not a constant {#s01-rss-scales}
+
+**Measured 2026-09-01 across two scales of S01.** At `ci` (512 MiB blob) RSS growth during the upload
+was **exactly 0**. At `full` (8 GiB blob) it was **2.228 GiB — 28% of the blob**. Growth tracks the
+blob rather than staying flat, so it is not query-pipeline noise.
+
+The verdict passes either way, because its threshold is "growth < blob size" — which would admit 99%
+just as happily. It catches full materialization and nothing short of it.
+
+**Where the memory actually goes, from `Memory` trace samples taken over the same run:** 42% in
+`SerializationString::deserializeBinaryBulkWithSizeStream` under `MergeTreeReaderWide::readData`, 6%
+in `ColumnString::shrinkToFit` under `MergeTreeSequentialSource::generate` inside `MergeTask` — that
+is the MERGE reading String columns. Only **7%** falls in the CAS write path (`publishBlob`,
+`PartWriteTxn`). So the card's headline verdict, which exists to prove the write path streams,
+is dominated by the read side of the merge that builds the part.
+
+**Two things to settle before tightening anything.** Whether the 28% is buffering by design or the
+same effect Altinity#2233 reports (RSS growing 0.98 GiB on a 0.50 GiB blob, i.e. ABOVE the blob) —
+measuring growth at three blob sizes answers it. And whether the verdict should measure the write path
+specifically rather than whole-server RSS, which is a different verdict and needs its own design.
+
+**Caveat on the trace evidence:** 139 samples, with 43% landing in generic thread-pool frames that were
+not decomposed. Enough to show where the bulk sits, not enough to apportion precisely.

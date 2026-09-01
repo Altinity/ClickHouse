@@ -92,3 +92,63 @@ publication — both false; and the first would have produced a **green** verdic
 like success. What settled it was evidence that *distinguishes* the hypotheses rather than merely
 fitting one: part names (`all_0_5_2`, not the fetched `all_0_5_1`) and microsecond timestamps
 (publication takes 20 ms, synchronously).
+
+## Status after the second day (2026-09-01) {#status-day-two}
+
+**By variant, because a tally that does not name the variant is not an answer.** The goal is all
+scenarios green in all variants; none of the three is there yet, and `ci` is the only one that has
+had a complete post-fix pass.
+
+| variant | pass | unresolved | failing | note |
+|---|---|---|---|---|
+| `dev` | 38 | S01, S04, S07, S23, S29 | S39 | S39 is a run-parameter error of mine, not a defect: the card refuses `--duration 300` because it needs 500 s and says so |
+| `ci` | 36 | S07, S29 | **S21** | S11 and S41 were failing here and are fixed and re-verified |
+| `full` | S01, S02, S04 | — | **S03, S05** | interrupted at S06 of 44; both failures are new and appear only at this scale |
+
+The unresolved ones at `dev` are mostly physics: S01, S04 and S29 have no premise to test at that size
+and are green at larger ones. S07 and S23 are genuinely open and listed below.
+
+## Fixed on day two {#fixed-day-two}
+
+| what | evidence |
+|---|---|
+| S10 produces patch parts | first time in the card's existence: 3 at `ci`, 4 at `full`, oracle green at 3,000,000 rows |
+| S41 | 0 verdicts to **45/45** |
+| S11 | the GC-round ceiling now scales with `parts x rows`; PASS at both `dev` and `ci` |
+| S01/S02 at `full` | 100 GiB was unrunnable; 8 GiB keeps 64x of headroom over the verdict's noise floor and passes |
+| harness cascade | `predown_dump` no longer aborts the scenario it serves; verified in the wild, a 120 s timeout now logs and the run continues |
+| `EXPORT PARTITION` on CAS | Altinity#2291, verified end to end with a data oracle |
+
+**Three of day two's four defects were one bug in three files.** A value read from the environment at
+import, then used as a DEFAULT ARGUMENT — which binds it a second time, at definition — so a variant
+that needs different endpoints could never be honoured however late the variable was set. Found once
+by symptom, once by sweeping for module-level `os.environ.get`, and once only because the run stayed
+red at 43/45. The search that works is for where a value is BOUND, not where the environment is read.
+
+## Open, in the order the evidence justifies {#open-day-two}
+
+**S21** — the only scenario failing for a reason we have not explained. Hangs 4 of 4 at `ci`, passes at
+`dev`. RustFS reports `permits_in_use: 256/256`, 100% queue utilization, answering 503 after ~5 s
+while its CPU sits at 0.13%; both a query and the GC thread wait in `poll` on live connections
+(545 ESTABLISHED on both sides). `s3_max_connections = 192` cut throttling from 34% to 6.8% and did
+not fix the hang. See `[soak-retry-budget-turns-a-503-into-a-livelock]`.
+
+**S03 at `full`** — `Code: 210 mount lease not held`, root-caused to a single unresolved heartbeat
+write; see `[mount-renewal-loses-the-lease-on-one-unresolved-attempt]`. Two product concerns in it:
+no retry before the lease is surrendered, and one node giving up with 1,969 ms of confirmed budget
+left.
+
+**S05 at `full`** — 1,200 standalone repoints; see `[s05-standalone-repoints-on-the-non-transactional-path]`.
+
+**S07 and S29** — both need a limit lowered rather than a workload raised, and neither has been done.
+S07's own note says a cap-lowering test setting is required; S29's advice to "rerun at ci/full" is
+stale, because the `full` run it recommends still leaves the file too small to attribute RSS.
+
+**S23** — two verdicts blocked by "compose fixed at 2 servers" though a 10-replica compose exists, and
+a 64 MiB memory threshold that at this profiling configuration mostly measures ~176 MB/hour of the
+server's own telemetry.
+
+**Never run to completion:** the `full` variant. It reached 5 of 44 in two hours before being stopped,
+and at that rate would need ~15 hours. Running the whole thing is probably the wrong shape; the
+scenarios that are already green at `dev` and `ci` mostly re-prove themselves, while S03, S05, S07,
+S21, S29 and the heavy adversarial cards are where `full` earns its cost.
