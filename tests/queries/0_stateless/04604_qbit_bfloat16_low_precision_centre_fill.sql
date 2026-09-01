@@ -17,18 +17,18 @@ SELECT '-- 1-bit cosine distance ranks by sign (used to be constant 1 for every 
 SET optimize_qbit_distance_function_reads = 0;
 SELECT id,
        round(cosineDistance(CAST(bf, 'Array(Float32)'), [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]), 4) AS true_cos,
-       round(cosineDistanceTransposed(bf, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 1), 4) AS bf16_1bit
+       round(cosineDistanceTransposed(bf, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 1), 2) AS bf16_1bit
 FROM qbit_recon ORDER BY id;
 
 SET optimize_qbit_distance_function_reads = 1;
 SELECT id,
        round(cosineDistance(CAST(bf, 'Array(Float32)'), [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]), 4) AS true_cos,
-       round(cosineDistanceTransposed(bf, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 1), 4) AS bf16_1bit
+       round(cosineDistanceTransposed(bf, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 1), 2) AS bf16_1bit
 FROM qbit_recon ORDER BY id;
 
 SELECT '-- 1-bit L2 distance distinguishes sign patterns too';
 SELECT id,
-       round(L2DistanceTransposed(bf, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 1), 4) AS bf16_1bit_l2
+       round(L2DistanceTransposed(bf, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], 1), 1) AS bf16_1bit_l2
 FROM qbit_recon ORDER BY id;
 
 DROP TABLE qbit_recon;
@@ -64,7 +64,7 @@ SELECT dotProductTransposed(v, first, 1), dotProductTransposed(v, second, 1);
 -- and once only mantissa bits are dropped the all-zero cell is collapsed back to 0. The reviewer's repro then yields
 -- 0, not 1.
 SELECT '-- Zero cell: reduced-precision cosine of identical zero BFloat16 vectors is 0, not 1';
-SELECT cosineDistanceTransposed([0.0]::QBit(BFloat16, 1), [0.0]::Array(BFloat16), 8) AS bf16_zero_cos_p8;
+SELECT round(cosineDistanceTransposed([0.0]::QBit(BFloat16, 1), [0.0]::Array(BFloat16), 8), 2) AS bf16_zero_cos_p8;
 
 -- The first coordinate is exactly 0: at precision >= 2 every float type reconstructs it to 0; at precision 1 (pure sign
 -- quantization) it shares the positive sign and reconstructs to the positive centre, as sign quantization requires.
@@ -102,7 +102,7 @@ SELECT '-- Signed zero (-0.0) reconstructs to a zero, not a subnormal (mantissa-
 SELECT dotProductTransposed([-0.0]::QBit(Float64, 1), [1.0]::Array(Float64), 12) AS f64_neg_zero_dot,
        dotProductTransposed([-0.0]::QBit(Float32, 1), [1.0]::Array(Float32), 9) AS f32_neg_zero_dot,
        dotProductTransposed([-0.0]::QBit(BFloat16, 1), [1.0]::Array(BFloat16), 9) AS bf16_neg_zero_dot,
-       cosineDistanceTransposed([-0.0]::QBit(BFloat16, 1), [-0.0]::Array(BFloat16), 9) AS bf16_neg_zero_cos;
+       round(cosineDistanceTransposed([-0.0]::QBit(BFloat16, 1), [-0.0]::Array(BFloat16), 9), 2) AS bf16_neg_zero_cos;
 
 -- The mantissa-truncation regime must also carve out the non-finite cell: `+-inf` has an all-ones exponent and a zero
 -- kept mantissa, so a naive centre fill would OR the most significant dropped mantissa bit into it and turn `+-inf` into
@@ -129,10 +129,10 @@ SELECT '-- Odd (non-multiple-of-8) dimensions: padded lanes never contribute';
 WITH [1.0, -1.0, 0.5]::QBit(BFloat16, 3) AS v
 SELECT dotProductTransposed(v, [1.0, 1.0, 1.0]::Array(BFloat16), 1) AS bf16_dim3_dot,
        L2DistanceTransposed(v, [2.0, -2.0, 2.0]::Array(BFloat16), 1) AS bf16_dim3_l2,
-       round(cosineDistanceTransposed(v, [2.0, -2.0, 2.0]::Array(BFloat16), 1), 4) AS bf16_dim3_cos;
+       round(cosineDistanceTransposed(v, [2.0, -2.0, 2.0]::Array(BFloat16), 1), 2) AS bf16_dim3_cos;
 WITH [1.0, -1.0, 1.0, -1.0, 1.0]::QBit(BFloat16, 5) AS v
 SELECT dotProductTransposed(v, [1.0, 1.0, 1.0, 1.0, 1.0]::Array(BFloat16), 1) AS bf16_dim5_dot,
-       round(cosineDistanceTransposed(v, [2.0, -2.0, 2.0, -2.0, 2.0]::Array(BFloat16), 1), 4) AS bf16_dim5_cos;
+       round(cosineDistanceTransposed(v, [2.0, -2.0, 2.0, -2.0, 2.0]::Array(BFloat16), 1), 2) AS bf16_dim5_cos;
 WITH [100, -100, 50]::QBit(Int8, 3) AS v
 SELECT dotProductTransposed(v, [1, 0, 0]::Array(Int8), 1) AS int8_dim3_first,
        dotProductTransposed(v, [0, 1, 0]::Array(Int8), 1) AS int8_dim3_second,

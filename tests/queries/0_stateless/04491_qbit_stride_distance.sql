@@ -12,31 +12,31 @@ INSERT INTO qbit_strided VALUES (1, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 
 INSERT INTO qbit_plain VALUES (1, [1, 2, 3, 4, 5, 6, 7, 8]), (2, [16, 15, 14, 13, 12, 11, 10, 9]);
 
 SELECT 'L2: strided (first 8 dims) vs non-strided baseline, optimization on';
-WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32, 8), 4) FROM qbit_strided ORDER BY id;
-WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32), 4) FROM qbit_plain ORDER BY id;
+WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32, 8), 1) FROM qbit_strided ORDER BY id;
+WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32), 1) FROM qbit_plain ORDER BY id;
 
 SELECT 'cosine: strided (first 8 dims) vs non-strided baseline, optimization on';
-WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(cosineDistanceTransposed(vec, ref, 32, 8), 4) FROM qbit_strided ORDER BY id;
-WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(cosineDistanceTransposed(vec, ref, 32), 4) FROM qbit_plain ORDER BY id;
+WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(cosineDistanceTransposed(vec, ref, 32, 8), 2) FROM qbit_strided ORDER BY id;
+WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(cosineDistanceTransposed(vec, ref, 32), 2) FROM qbit_plain ORDER BY id;
 
 SELECT 'Same with the partial-reads optimization disabled (user-form fallback)';
 SET optimize_qbit_distance_function_reads = 0;
-WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32, 8), 4) FROM qbit_strided ORDER BY id;
-WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(cosineDistanceTransposed(vec, ref, 32, 8), 4) FROM qbit_strided ORDER BY id;
+WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32, 8), 1) FROM qbit_strided ORDER BY id;
+WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(cosineDistanceTransposed(vec, ref, 32, 8), 2) FROM qbit_strided ORDER BY id;
 SET optimize_qbit_distance_function_reads = 1;
 
 SELECT 'Full-dimension strided search (3-arg form reads all stride groups)';
-WITH arrayMap(i -> toFloat32(i), range(16)) AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32), 4) FROM qbit_strided ORDER BY id;
+WITH arrayMap(i -> toFloat32(i), range(16)) AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32), 1) FROM qbit_strided ORDER BY id;
 
 SELECT 'Reduced precision on first 8 dims';
-WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 8, 8), 4) FROM qbit_strided ORDER BY id;
+WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 8, 8), 1) FROM qbit_strided ORDER BY id;
 
 -- A nullable precision or a nullable dims argument must propagate to a Nullable result, even though the
 -- DistanceTransposedPartialReadsPass rewrites the call and removes those arguments (regression: it used to throw a logical error).
 SELECT 'Nullable precision / dims propagate to a Nullable result';
 WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT DISTINCT toTypeName(L2DistanceTransposed(vec, ref, toNullable(32), 8)) FROM qbit_strided;
 WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT DISTINCT toTypeName(L2DistanceTransposed(vec, ref, 32, toNullable(8))) FROM qbit_strided;
-WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32, toNullable(8)), 4) FROM qbit_strided ORDER BY id;
+WITH [toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS ref SELECT id, round(L2DistanceTransposed(vec, ref, 32, toNullable(8)), 1) FROM qbit_strided ORDER BY id;
 
 -- Prove the partial-read I/O contract: the DistanceTransposedPartialReadsPass must rewrite a reduced-dimension search to read ONLY the
 -- bit-plane streams of the covered stride groups, not the whole QBit column. We count the distinct `vec.N` subcolumns referenced in the

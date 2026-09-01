@@ -29,14 +29,14 @@ SELECT 'Values are identical with the optimization on and off (full precision), 
 WITH CAST(arrayMap(x -> toFloat32(x), range(8)), 'Dynamic(max_types=8)') AS ref
 SELECT id,
     round(dotProductTransposed(vec, ref, 8)::Float64, 4),
-    round(L2DistanceTransposed(vec, ref, 8)::Float64, 4),
-    round(cosineDistanceTransposed(vec, ref, 8)::Float64, 4)
+    round(L2DistanceTransposed(vec, ref, 8)::Float64, 1),
+    round(cosineDistanceTransposed(vec, ref, 8)::Float64, 2)
 FROM qbit_plain ORDER BY id SETTINGS optimize_qbit_distance_function_reads = 1;
 WITH CAST(arrayMap(x -> toFloat32(x), range(8)), 'Dynamic(max_types=8)') AS ref
 SELECT id,
     round(dotProductTransposed(vec, ref, 8)::Float64, 4),
-    round(L2DistanceTransposed(vec, ref, 8)::Float64, 4),
-    round(cosineDistanceTransposed(vec, ref, 8)::Float64, 4)
+    round(L2DistanceTransposed(vec, ref, 8)::Float64, 1),
+    round(cosineDistanceTransposed(vec, ref, 8)::Float64, 2)
 FROM qbit_plain ORDER BY id SETTINGS optimize_qbit_distance_function_reads = 0;
 
 SELECT 'A plain (non-Dynamic) array reference still uses the optimization: Float64 result';
@@ -64,14 +64,14 @@ SELECT 'Variant reference values are identical with the optimization on and off,
 WITH CAST([toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS Variant(Array(Float32), UInt8)) AS ref
 SELECT id,
     round(dotProductTransposed(vec, ref, 8)::Float64, 4),
-    round(L2DistanceTransposed(vec, ref, 8)::Float64, 4),
-    round(cosineDistanceTransposed(vec, ref, 8)::Float64, 4)
+    round(L2DistanceTransposed(vec, ref, 8)::Float64, 1),
+    round(cosineDistanceTransposed(vec, ref, 8)::Float64, 2)
 FROM qbit_plain ORDER BY id SETTINGS optimize_qbit_distance_function_reads = 1;
 WITH CAST([toFloat32(0), 1, 2, 3, 4, 5, 6, 7] AS Variant(Array(Float32), UInt8)) AS ref
 SELECT id,
     round(dotProductTransposed(vec, ref, 8)::Float64, 4),
-    round(L2DistanceTransposed(vec, ref, 8)::Float64, 4),
-    round(cosineDistanceTransposed(vec, ref, 8)::Float64, 4)
+    round(L2DistanceTransposed(vec, ref, 8)::Float64, 1),
+    round(cosineDistanceTransposed(vec, ref, 8)::Float64, 2)
 FROM qbit_plain ORDER BY id SETTINGS optimize_qbit_distance_function_reads = 0;
 
 DROP TABLE qbit_plain;

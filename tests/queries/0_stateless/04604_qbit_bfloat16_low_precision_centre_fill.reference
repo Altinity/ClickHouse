@@ -10,11 +10,11 @@
 3	1.5	1.5
 4	1.75	1.75
 -- 1-bit L2 distance distinguishes sign patterns too
-0	7.0711
-1	6.7823
-2	6.7823
-3	6.4807
-4	6.7823
+0	7.1
+1	6.8
+2	6.8
+3	6.5
+4	6.8
 -- BFloat16 reconstruction of +-1.0 at precisions 1, 8, 9, 16
 2	-2	0.5	-0.5	1.5	-1.5	1	-1
 -- Float32 and Float64 reconstruction of +-1.0 at precision 1

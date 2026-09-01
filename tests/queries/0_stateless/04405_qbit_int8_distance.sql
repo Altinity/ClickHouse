@@ -9,9 +9,10 @@ INSERT INTO qbit VALUES (3, [-8, -7, -6, -5, -4, -3, -2, -1]);
 SELECT '========== optimize_qbit_distance_function_reads = 0 ==========';
 SET optimize_qbit_distance_function_reads = 0;
 
+-- Round to match 03367/03378: SimSIMD L2/cosine differ slightly on NEON ARM (#96764).
 SELECT 'L2DistanceTransposed, full precision (8 bits)';
 WITH [0, 1, 2, 3, 4, 5, 6, 7] AS reference_vec
-SELECT id, round(L2DistanceTransposed(vec, reference_vec, 8), 3) AS dist FROM qbit ORDER BY id;
+SELECT id, round(L2DistanceTransposed(vec, reference_vec, 8), 1) AS dist FROM qbit ORDER BY id;
 
 SELECT 'cosineDistanceTransposed, full precision (8 bits)';
 WITH [0, 1, 2, 3, 4, 5, 6, 7] AS reference_vec
@@ -19,14 +20,14 @@ SELECT id, round(cosineDistanceTransposed(vec, reference_vec, 8), 2) AS dist FRO
 
 SELECT 'L2DistanceTransposed, reduced precision (4 bits)';
 WITH [0, 1, 2, 3, 4, 5, 6, 7] AS reference_vec
-SELECT id, round(L2DistanceTransposed(vec, reference_vec, 4), 3) AS dist FROM qbit ORDER BY id;
+SELECT id, round(L2DistanceTransposed(vec, reference_vec, 4), 1) AS dist FROM qbit ORDER BY id;
 
 SELECT '========== optimize_qbit_distance_function_reads = 1 ==========';
 SET optimize_qbit_distance_function_reads = 1;
 
 SELECT 'L2DistanceTransposed, full precision (8 bits)';
 WITH [0, 1, 2, 3, 4, 5, 6, 7] AS reference_vec
-SELECT id, round(L2DistanceTransposed(vec, reference_vec, 8), 3) AS dist FROM qbit ORDER BY id;
+SELECT id, round(L2DistanceTransposed(vec, reference_vec, 8), 1) AS dist FROM qbit ORDER BY id;
 
 SELECT 'cosineDistanceTransposed, full precision (8 bits)';
 WITH [0, 1, 2, 3, 4, 5, 6, 7] AS reference_vec
@@ -34,7 +35,7 @@ SELECT id, round(cosineDistanceTransposed(vec, reference_vec, 8), 2) AS dist FRO
 
 SELECT 'L2DistanceTransposed, reduced precision (4 bits)';
 WITH [0, 1, 2, 3, 4, 5, 6, 7] AS reference_vec
-SELECT id, round(L2DistanceTransposed(vec, reference_vec, 4), 3) AS dist FROM qbit ORDER BY id;
+SELECT id, round(L2DistanceTransposed(vec, reference_vec, 4), 1) AS dist FROM qbit ORDER BY id;
 
 DROP TABLE qbit;
 
@@ -45,13 +46,13 @@ SELECT '========== large dimension (no int32 overflow) ==========';
 CREATE TABLE qbit_l2 (vec QBit(Int8, 33026)) ENGINE = Memory;
 INSERT INTO qbit_l2 SELECT CAST(arrayMap(x -> toInt8(127), range(33026)) AS QBit(Int8, 33026));
 WITH arrayMap(x -> toInt8(-128), range(33026)) AS reference_vec
-SELECT round(L2DistanceTransposed(vec, reference_vec, 8), 3) AS dist FROM qbit_l2;
+SELECT round(L2DistanceTransposed(vec, reference_vec, 8), 1) AS dist FROM qbit_l2;
 DROP TABLE qbit_l2;
 -- cosine: sum(a^2) = 128^2 * 131072 > INT32_MAX. cos(127s, -128s) = -1, so distance = 2.
 CREATE TABLE qbit_cos (vec QBit(Int8, 131072)) ENGINE = Memory;
 INSERT INTO qbit_cos SELECT CAST(arrayMap(x -> toInt8(127), range(131072)) AS QBit(Int8, 131072));
 WITH arrayMap(x -> toInt8(-128), range(131072)) AS reference_vec
-SELECT round(cosineDistanceTransposed(vec, reference_vec, 8), 3) AS dist FROM qbit_cos;
+SELECT round(cosineDistanceTransposed(vec, reference_vec, 8), 2) AS dist FROM qbit_cos;
 DROP TABLE qbit_cos;
 
 -- Precision must be within the element bit-width [1, 8]
