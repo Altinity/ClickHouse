@@ -18,11 +18,10 @@
                 <secret_access_key>clickhouse</secret_access_key>
                 <!-- Real server-local scratch dir for the write-buffer spill. -->
                 <cas_scratch_path>cas_s3_scratch/</cas_scratch_path>
-                <!-- Background GC pacing: the incarnation protocol's fence/recheck handshake
-                     replaces the old grace window (M-W D-W5); a short interval so reclamation
-                     happens during the run. -->
+                <!-- DO NOT MERGE. Experiment: product default interval (60s) instead of the
+                     test-lane 5s override, to compare ASan CAS-S3 stateless wall time. -->
                 <cas_gc_enabled>1</cas_gc_enabled>
-                <cas_gc_interval_sec>5</cas_gc_interval_sec>
+                <cas_gc_interval_sec>60</cas_gc_interval_sec>
             </cas_s3>
             <!-- Optional local filesystem cache in front of the cacheless CA-S3 disk (mirrors how plain-s3
                  backs its policy with `cached_s3`). Validated: once warm it serves reads from local disk
