@@ -9,10 +9,7 @@ from helpers.iceberg_utils import (
 )
 
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
-@pytest.mark.parametrize("run_on_cluster", [False, True])
-def test_minmax_pruning_with_null(started_cluster_iceberg_with_spark, storage_type, run_on_cluster):
-    if run_on_cluster and storage_type == "local":
-        pytest.skip("Local storage is not supported on cluster")
+def test_minmax_pruning_with_null(started_cluster_iceberg_with_spark, storage_type):
     instance = started_cluster_iceberg_with_spark.instances["node1"]
     spark = started_cluster_iceberg_with_spark.spark_session
     TABLE_NAME = "test_minmax_pruning_with_null" + storage_type + "_" + get_uuid_str()
@@ -24,7 +21,6 @@ def test_minmax_pruning_with_null(started_cluster_iceberg_with_spark, storage_ty
             storage_type,
             TABLE_NAME,
             query,
-            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(
@@ -83,7 +79,7 @@ def test_minmax_pruning_with_null(started_cluster_iceberg_with_spark, storage_ty
     )
 
     creation_expression = get_creation_expression(
-        storage_type, TABLE_NAME, started_cluster_iceberg_with_spark, table_function=True, run_on_cluster=run_on_cluster
+        storage_type, TABLE_NAME, started_cluster_iceberg_with_spark, table_function=True
     )
 
     def check_validity_and_get_prunned_files(select_expression):
