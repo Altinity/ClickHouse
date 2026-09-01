@@ -445,7 +445,8 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const size_t span = std::max(end_offset, r.end) - std::min(start_offset, r.start);
         if ((r.end + gap_bytes <= start_offset && !gap_cached) || // gap too long to read through
             r.start + bytes_per_read_task <= initial_offset || // task not too big
-            exceedsAmplification(span - std::min(span, free_bytes), total_length_of_covered_ranges + r.length()) ||
+            splitsForAmplification(std::min(start_offset, r.start), span, free_bytes,
+                                   total_length_of_covered_ranges + r.length()) ||
             !r.request->allow_incidental_read.load(std::memory_order_relaxed)) // range wants to be coalesced
             break;
 
@@ -486,7 +487,8 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const size_t span = std::max(end_offset, r.end) - std::min(start_offset, r.start);
         if ((end_offset + gap_bytes <= r.start && !gap_cached) ||
             initial_offset + bytes_per_read_task <= r.end ||
-            exceedsAmplification(span - std::min(span, free_bytes), total_length_of_covered_ranges + r.length()) ||
+            splitsForAmplification(std::min(start_offset, r.start), span, free_bytes,
+                                   total_length_of_covered_ranges + r.length()) ||
             !r.request->allow_incidental_read.load(std::memory_order_relaxed))
             break;
 

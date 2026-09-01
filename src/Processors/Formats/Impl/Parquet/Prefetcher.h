@@ -372,6 +372,25 @@ private:
             return false;
         return static_cast<double>(span) > max_read_amplification * static_cast<double>(useful);
     }
+
+    /// Whether the amplification cap should split a task covering `span` bytes from `span_start` to
+    /// serve `useful` of them, `free_bytes` of which are gaps the source can serve from cache.
+    ///
+    /// The cap exists to avoid paying a network transfer for bytes nobody asked for. When the whole
+    /// span is already in a local cache there is no transfer to avoid: the surplus bytes cost a
+    /// memcpy, while the split the cap would force costs an extra read task, its scheduling, and its
+    /// share of decoding. Measured on a cache-resident lookup join, the cap cut the bytes read 6x
+    /// (1.29 GiB -> 208 MiB) and made the query 80% slower, with 46% more read tasks and 14% more
+    /// decoding tasks. `gapIsCached` already excludes individual cached gaps from the ratio; this is
+    /// the same argument applied to the whole span, which is what a fully cache-resident file hits.
+    ///
+    /// The cap is checked first because it is arithmetic, while the locality question goes to the
+    /// source: a span the cap accepts never asks it.
+    bool splitsForAmplification(size_t span_start, size_t span, size_t free_bytes, size_t useful) const
+    {
+        return exceedsAmplification(span - std::min(span, free_bytes), useful)
+            && !rangeIsLocal(span_start, span);
+    }
     static void decreaseTaskRefcount(Task * task, size_t amount);
     void scheduleTask(Task * task);
     Task::State runTask(Task * task);
