@@ -202,7 +202,7 @@ TEST(CASRefCodec, RoundTripSetPublishedAt)
 }
 
 /// No-tolerance decode pin: the `"pl"` (payload) field was removed from the
-/// ref-op wire in stage-1 T12. Although the retired `set_payload` op WORD is already rejected by
+/// ref-op wire. Although the retired `set_payload` op WORD is already rejected by
 /// `refOpKindFromWireWord`, the generic op-record reader reads all field keys before switching on kind, so a
 /// `"pl"` field paired with a still-recognized op word would otherwise be `skipUnknown`'d. It is a
 /// removed field, not a genuinely-unknown one: decoding an op record that still carries `"pl"` must FAIL

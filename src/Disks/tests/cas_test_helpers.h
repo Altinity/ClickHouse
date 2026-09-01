@@ -474,7 +474,7 @@ inline String encodeMinimalGcState(uint64_t round)
 }
 
 /// Inject condemned bookkeeping + gc/state directly (bypassing a real GC round) so a test can seed the
-/// GC ledger's condemned state at an arbitrary round. Retired-in-snapshot: the condemned entries are
+/// GC ledger's condemned state at an arbitrary round. The condemned entries are
 /// seeded the way a real round leaves them — as `RunMarker::Condemned` sentinel rows inside an adopted fold seal's
 /// shard run (there is no separate retired-list object). A synthetic +edge/-edge pair nets each blob to
 /// in-degree 0 and a `seed_head` replays the captured token/size so the fold mints the `RunMarker::Condemned` row.
@@ -542,7 +542,7 @@ inline void injectRetire(
         backend.putOverwrite(layout.gcStateKey(), state, head.token);
 }
 
-/// Adopt a fold seal carrying a given per-gc-shard `condemned_summary` (retired-in-snapshot T4) and point
+/// Adopt a fold seal carrying a given per-gc-shard `condemned_summary` and point
 /// gc/state at it (snap_generation / snap_attempt / gc_shards), bypassing a real GC round. If a seal
 /// already exists at (generation, attempt) it is overwritten with the new summary (its other fields are
 /// preserved); otherwise a fresh minimal seal is created. Read-modify-CAS on gc/state preserves the lease.
@@ -620,7 +620,7 @@ inline bool runRoundsUntilAbsent(
 }
 
 /// The CURRENT condemned entries for `shard`, read from the adopted fold seal's `blob_target_runs`
-/// (retired-in-snapshot T4): the round no longer writes a separate retired-list object — condemned
+///: the round no longer writes a separate retired-list object — condemned
 /// entries RIDE the source-edge run as `RunMarker::Condemned` sentinel rows at the zero-sentinel key. This reads
 /// the seal at (snap_generation, snap_attempt), opens every run for `shard`, and reconstructs the
 /// `RetiredEntry` shape (hash from the run key, the rest from the decoded `CondemnedRow`). Empty when
@@ -669,8 +669,7 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
 }
 
 /// True iff ANY gc-shard's adopted-seal run still holds a `RunMarker::Condemned` row — the ack-floor deletion
-/// pipeline is in flight while this is true (retired-in-snapshot T4 replacement for the old
-/// "iterate gc/state.retired_refs" probe). `gc_shards` is read from gc/state when 0 is passed.
+/// pipeline is in flight while this is true. `gc_shards` is read from gc/state when 0 is passed.
 inline bool anyCondemnedInSeal(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t gc_shards = 0)
 {

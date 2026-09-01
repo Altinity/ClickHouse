@@ -129,7 +129,7 @@ GcState readState(InMemoryBackend & b, const Pool & s)
     return decodeGcState(got->bytes);
 }
 
-/// Whether ANY gc-shard's adopted-seal run still holds a `RunMarker::Condemned` row (retired-in-snapshot T4: the
+/// Whether ANY gc-shard's adopted-seal run still holds a `RunMarker::Condemned` row (the
 /// retired state rides the snapshot run, not a separate retired-list object) — the ack-floor deletion
 /// pipeline is still in flight while this is true.
 bool anyRetiredPending(InMemoryBackend & b, const Pool & s)
@@ -540,7 +540,7 @@ TEST(CASGCRound, PublishDropReclaimsBlobAndManifestToFixpoint)
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
-/// retired-in-snapshot T4: after a round condemns one blob, the ADOPTED fold seal's per-shard
+/// After a round condemns one blob, the ADOPTED fold seal's per-shard
 /// condemned_summary reflects it (condemned_total == 1, pending_total == 0) — distilled zero-I/O from the
 /// RunMarker::Condemned rows the fold sealed into the snapshot run.
 TEST(CASGCRound, CondemnRoundSealSummaryCountsCondemned)

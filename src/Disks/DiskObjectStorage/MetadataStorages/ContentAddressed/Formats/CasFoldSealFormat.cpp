@@ -104,7 +104,7 @@ void insertRecordOnce(Map & map, const Key & key, Value && value, std::string_vi
 void writeRun(CasJsonWriter & out, std::string_view kind, const RunRef & r)
 {
     bool first = true;
-    writeStringField(out, FoldSealWire::kind, kind, first);
+    writeWordField(out, FoldSealWire::kind, kind, first);
     writeStringField(out, FoldSealWire::run_key, r.key, first);
     writeHex128Field(out, FoldSealWire::checksum, r.checksum, first);
     writeNumberField(out, FoldSealWire::shard, r.shard, first);
@@ -311,14 +311,14 @@ String encodeFoldSeal(const CasFoldSeal & seal)
                 life_state.cleanup_evidence->remove_txn_id.ref_sequence);
 
         bool first = true;
-        writeStringField(out, FoldSealWire::kind, kRefLifeTag, first);
+        writeWordField(out, FoldSealWire::kind, kRefLifeTag, first);
         writeHex128Field(out, FoldSealWire::life, life_id, first);
-        writeStringField(out, FoldSealWire::classification, classification_word, first);
+        writeWordField(out, FoldSealWire::classification, classification_word, first);
         writeU64StringField(out, FoldSealWire::fold_epoch, cov.last_folded_ref_id.writer_epoch, first);
         writeU64StringField(out, FoldSealWire::fold_seq, cov.last_folded_ref_id.ref_sequence, first);
         if (cov.hold)
         {
-            writeStringField(out, FoldSealWire::hold_reason, holdReasonToWord(cov.hold->reason), first);
+            writeWordField(out, FoldSealWire::hold_reason, holdReasonToWord(cov.hold->reason), first);
             writeU64StringField(out, FoldSealWire::hold_epoch, cov.hold->offending_position.writer_epoch, first);
             writeU64StringField(out, FoldSealWire::hold_seq, cov.hold->offending_position.ref_sequence, first);
             writeNumberField(out, FoldSealWire::retries, cov.hold->retry_count, first);
@@ -349,7 +349,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
     for (const auto & [shard, s] : seal.condemned_summary)
     {
         bool first = true;
-        writeStringField(out, FoldSealWire::kind, kCondemnedTag, first);
+        writeWordField(out, FoldSealWire::kind, kCondemnedTag, first);
         writeNumberField(out, FoldSealWire::shard, shard, first);
         writeNumberField(out, FoldSealWire::condemned_total, s.condemned_total, first);
         writeNumberField(out, FoldSealWire::pending_total, s.pending_total, first);

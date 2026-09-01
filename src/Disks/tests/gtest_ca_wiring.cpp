@@ -1903,7 +1903,7 @@ TEST(CASWiringExchange, AdoptIntoADetachedTargetPublishesADetachedRefAndNoLiveRe
     EXPECT_TRUE(storage->existsFile(detached_tmp_path + "/p.proj/data.bin"));
     EXPECT_TRUE(storage->existsFile(detached_tmp_path + "/uuid.txt"));
 
-    /// Finalization, unchanged by this task: `IMergeTreeDataPart::renameTo(detached/<part>)` is a
+    /// Finalization: `IMergeTreeDataPart::renameTo(detached/<part>)` is a
     /// moveDirectory of the staged dir to its final detached name, which on a content-addressed disk is
     /// a ref repoint WITHIN the same namespace -- the same shape the active path's
     /// `renameTempPartAndReplace` uses, and the reason the relinked detached part needs no new
@@ -2825,7 +2825,7 @@ DB::Cas::PoolPtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> & 
 }
 
 /// Condemn (kind=Blob, hash, token) by seeding gc/state + a per-shard retired set (the durable GC ledger
-/// shape — RetiredEntry, exact-token delete, unchanged by this task) AND condemning the per-hash freshness
+/// shape — `RetiredEntry`, exact-token delete) AND condemning the per-hash freshness
 /// meta, which is what the writer's condemned decision ACTUALLY point-reads (spec §meta-protocols v3).
 /// Bumps the round so the retirement is a fresh one; leaves the object itself in place (condemn, NOT delete).
 void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,

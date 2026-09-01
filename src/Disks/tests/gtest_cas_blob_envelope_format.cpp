@@ -172,6 +172,41 @@ TEST(CASBlobEnvelopeFormat, MandatoryWorstCaseBoundary)
         << "ref budget reachable through the real encoder at the default header length";
 }
 
+/// The half a `static_assert` cannot do. The compile-time bound proves the FORMULA fits under the
+/// floor; it cannot notice a formula that understates the encoder — shrink any component and the
+/// assert only grows happier. So this reconstructs the same number from bytes the real encoder
+/// produced, and the only quantity it borrows is the version field's type width:
+///
+///   what the encoder wrote at max-width values, with an empty ref
+///   + the digits the version field did NOT use at this generation
+///   == the mandatory worst case
+///
+/// Every other field in the fixture is already at its type maximum, so nothing else is missing from
+/// the measured side. An understated key cost, or a shrunken `kMaxU32DecimalLen`, moves the formula
+/// without moving the encoder and lands here.
+TEST(CASBlobEnvelopeFormat, WorstCaseFormulaMatchesTheEncoder)
+{
+    EnvelopeHeader h = maxReachableHeader("");
+    const String head = encodeEnvelopeHeader(h, static_cast<uint32_t>(kMinBlobHeaderLen));
+    /// The mandatory shape is everything up to and including the closing brace, plus the newline the
+    /// encoder reserves at the last byte; the padding between them is the ref budget this measures.
+    const size_t json_len = head.find_last_not_of(' ', kMinBlobHeaderLen - 2) + 1;
+    const size_t mandatory_at_current_version = json_len + 1;   /// + the reserved '\n'
+
+    size_t version_digits = 0;
+    for (uint32_t v = currentCompatibilityVersion(); ; v /= 10)
+    {
+        ++version_digits;
+        if (v < 10)
+            break;
+    }
+    const size_t unused_version_digits = std::numeric_limits<uint32_t>::digits10 + 1 - version_digits;
+
+    EXPECT_EQ(mandatory_at_current_version + unused_version_digits, mandatory_descriptor_worst_case)
+        << "the formula and the encoder disagree about the mandatory descriptor: encoder wrote "
+        << mandatory_at_current_version << " bytes at a " << version_digits << "-digit version";
+}
+
 TEST(CASBlobEnvelopeFormat, CriticalKeyDescriptorStillFitsAtDefaultLength)
 {
     /// The test-only `!x` critical key is written BEFORE `ref`; even at max-reachable field values

@@ -802,8 +802,8 @@ TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
 }
 
 /// The wire round trip of the same rule, driven from the OTHER producer of `last_epoch_seal`:
-/// recovery's CAS-walk (Task 6), stood in for here by its test seam. The point is the encode call
-/// site, which is this task's.
+/// recovery's CAS-walk, represented here by its test seam. The point is the encode call
+/// site.
 TEST(CASRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTheExactPrevEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();

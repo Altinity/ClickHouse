@@ -151,7 +151,7 @@ TEST(CASBackendGeneration, NativeHeadUsesNativeTokenMetadataApi)
 
     ASSERT_EQ(b->putIfAbsent("p/native-head/key", "v1").outcome, PutOutcome::Done);
 
-    /// putIfAbsent's own HEAD-fallback stamping path calls the ordinary API (untouched by this task);
+    /// `putIfAbsent`'s HEAD-fallback stamping path calls the ordinary API;
     /// reset the counters so only nativeHead's call, below, is observed.
     storage->ordinary_calls = 0;
     storage->native_calls = 0;

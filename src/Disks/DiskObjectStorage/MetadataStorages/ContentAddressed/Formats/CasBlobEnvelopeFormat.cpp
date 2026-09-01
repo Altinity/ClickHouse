@@ -153,6 +153,8 @@ void writeEnvelopeRefField(String & json, size_t budget, std::string_view raw_re
 
 }
 
+const size_t mandatory_descriptor_worst_case = kMandatoryDescriptorWorstCase;
+
 std::string_view provenanceOpToWireWord(ProvenanceOp op)
 {
     return kProvenanceOpWords.toWord(op, "CAS blob envelope");

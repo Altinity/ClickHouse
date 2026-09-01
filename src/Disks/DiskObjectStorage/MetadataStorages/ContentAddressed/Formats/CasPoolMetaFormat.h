@@ -38,7 +38,7 @@ struct PoolMeta
     /// because changing it would move the blob payload offset for existing objects; a new hash algorithm
     /// is rejected unless `allow_new` is set, and concurrent admission is retried from fresh metadata.
     ///
-    /// `allow_mint` (spec §2 [C4][D2]) gates the create-if-absent path: minting a fresh `_pool_meta` is a
+    /// `allow_mint` gates the create-if-absent path: minting a fresh `_pool_meta` is a
     /// consequential write that establishes a brand-new pool identity, so it is permitted ONLY on the
     /// writable startup path that has just passed the zero-write residual proof (`Pool::open`). Every
     /// non-bootstrap caller — a read-only/observe open, `openForDecommission` — passes `false`; an absent

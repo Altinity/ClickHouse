@@ -342,8 +342,9 @@ String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
 void Pool::throwIfLifecycleTerminal() const
 {
     /// The typed error carries the sub-state in its message so a wrong diagnosis is impossible from the
-    /// first error line (spec §1 [D5]). `Live`/`TransientNotLive` proceed here — the transient class is
-    /// still gated only by the write fence in this task (the full six-class gate is Task 8).
+    /// first error line. `Live`/`TransientNotLive` proceed here — the transient class is
+    /// still gated only by the write fence; the destructive gate additionally requires the other
+    /// lifecycle proofs.
     const PoolLifecycle lc = mount_runtime.lifecycle();
     if (lc == PoolLifecycle::Live || lc == PoolLifecycle::TransientNotLive)
         return;
@@ -1627,7 +1628,7 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
     /// requests -- never the caller's thread, and never blocking this call's own return.
     try
     {
-        /// The lease owns the pool reference for this task's lifetime; capturing one here as well would
+        /// The lease owns the pool reference until it releases it; capturing one here as well would
         /// put it outside the lease's release ordering.
         const bool dispatched = tryDispatchDetached([this, key](DetachedStopToken token)
         {

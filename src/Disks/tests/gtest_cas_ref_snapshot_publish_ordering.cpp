@@ -180,7 +180,7 @@ TEST(CASRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
 /// 3. `NeedsRecovery` ("Poisoned") lane: recovery precedes any snapshot publication
 /// ---------------------------------------------------------------------------------------------
 
-/// `Poisoned` is this task's plan's name for what the code spells `RefLaneState::NeedsRecovery` -- the
+/// `RefLaneState::NeedsRecovery` is the state for a transaction known durable but not installable in the cache -- the
 /// state the header documents as "a transaction is known durable but cannot be installed in this cache
 /// ... a hard write and certification fence until replay completes". Recorded here as the vocabulary
 /// correction for later tasks: there is no state literally named `Poisoned` anywhere in `CasRefLedger`.
