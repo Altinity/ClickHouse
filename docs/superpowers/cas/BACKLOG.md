@@ -1366,3 +1366,51 @@ rustfs, on the grounds that progress came in a burst after each restart and then
 The merge's completion refutes it. What actually happened is that the merge was slow and *uneven*, and
 I sampled a single 90-second window that fell in a pause, then concluded throughput was zero. Read a
 curve, not one interval.
+
+## `[mount-renewal-loses-the-lease-on-one-unresolved-attempt]` A single in-flight heartbeat write costs the mount lease, with no retry {#mount-renewal-single-attempt}
+
+**Observed 2026-09-01 in S03 at `--scale full`**, which failed with `Code: 210 ... mount lease not
+held`. The chain below is read off `system.ca_event_log`, not inferred.
+
+The `watermark_renew` event that starts it carries its own numbers:
+
+| field | ch1 | ch2 |
+|---|---|---|
+| `attempts_sent` | **1** | **1** |
+| `elapsed_ms` | 23,755 | 18,031 |
+| `remaining_confirmed_budget_ms` | 0 | **1,969** |
+| `unresolved_reason` | `deadline_mid_way` | `deadline_mid_way` |
+| `classification` | `external_lease_deadline` | `external_lease_deadline` |
+| `stop_cause` | `continue` | `continue` |
+
+**Two things here look wrong, and they are independent.**
+
+**One attempt costs the lease.** `attempts_sent = 1`: a single heartbeat write went out, never
+resolved, and the `external_lease_safety` deadline fired while it was still in flight
+(`deadline_mid_way`). The renewal then ended "without retained authority and fenced the mount", which
+drops the pool to `TransientNotLive` and refuses EVERY operation class with `Code: 210`. No retry was
+attempted before paying that price — while ordinary object-store reads on the same disk retry up to
+`s3_retry_attempts = 500`.
+
+**ch2 gave up with budget left.** It stopped at 18,031 ms with **1,969 ms of confirmed budget
+remaining** and `stop_cause = continue`, meaning nothing asked it to stop. Either the deadline
+arithmetic or the loop's exit condition is wrong; a renewal that abandons a live lease while it still
+holds ~2 s of proven safety margin is giving away authority it had.
+
+**What follows is downstream, and is correct behaviour being blamed for the above.** The fenced epoch
+is terminal, so the self-remount re-claims with a fresh `writer_epoch`, finds the previous epoch's
+slot present, un-fenced and not proven dead, and refuses under the "no wall-clock trust" rule — three
+`mount_conflict` events with `outcome = live_double_start`, five seconds apart. That refusal is right:
+taking a lease from a possibly-live writer on a clock guess is exactly the thing the rule prevents.
+The defect is upstream, in losing the lease on one unresolved write.
+
+**Why the write did not resolve** is the storage saturation measured the same night: RustFS reports
+`permits_in_use: 256, total_permits: 256, queue_utilization: 100.0%` and answers `503` after ~5 s,
+while its CPU sits at 0.13%. A heartbeat is an ordinary write on that path and has no privilege.
+
+**Reproduction:** S03 at `--scale full`. It does not reproduce at `dev` or `ci`, so the load has to be
+large enough to saturate the permit pool.
+
+**Do not read the dump window as the event's duration.** The three conflicts span ten seconds only
+because the `predown_dump` that captured them ran at 06:53:21; the containers were torn down
+afterwards and the rest is gone. The renewal itself took 23.7 s.
