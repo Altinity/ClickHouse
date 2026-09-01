@@ -909,7 +909,7 @@ void alter(
                 break;
             case AlterCommand::Type::MODIFY_COLUMN:
             {
-                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type, context))
+                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type, context, params[0].first, params[0].after_column))
                 {
                     succeeded = true;
                 }
