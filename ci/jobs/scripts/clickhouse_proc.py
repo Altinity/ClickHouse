@@ -839,7 +839,9 @@ fi
         command = bootstrap_vars + command
         if with_s3_storage:
             command = "USE_S3_STORAGE_FOR_MERGE_TREE=1\n" + command
-        return Shell.check(command)
+        # verbose: this step loads the stateful datasets and it is the only place in the job
+        # that can fail without printing anything at all, which is exactly what happened.
+        return Shell.check(command, verbose=True)
 
     def insert_system_zookeeper_config(self):
         for _ in range(10):

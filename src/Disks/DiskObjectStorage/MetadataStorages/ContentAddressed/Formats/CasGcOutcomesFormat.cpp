@@ -71,11 +71,16 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
     const uint64_t line_cap = traitsFor(FormatId::GcOutcomes).line_cap;
 
     OutcomeLog log;
+    /// One line scratch and one reader for the whole loop, as the other row decoders do:
+    /// rebuilding them per row costs an allocation per row for the seen-key store and the line.
+    String row_line;
+    JsonObjectReader row_reader;
     while (true)
     {
-        const String line = readLine(in, line_cap, "outcome log");
-        ReadBufferFromMemory line_in(line.data(), line.size());
-        JsonObjectReader r(line_in, KeyStrictness::Tolerant, "outcome log");
+        readLineInto(in, row_line, line_cap, "outcome log");
+        ReadBufferFromMemory line_in(row_line.data(), row_line.size());
+        row_reader.reset(line_in, KeyStrictness::Tolerant, "outcome log");
+        JsonObjectReader & r = row_reader;
 
         String key;
         /// The first key distinguishes a trailer (`n`) from a record (`kind`).

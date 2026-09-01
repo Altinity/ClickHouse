@@ -186,25 +186,39 @@ TEST(CASBlobEnvelopeFormat, MandatoryWorstCaseBoundary)
 /// without moving the encoder and lands here.
 TEST(CASBlobEnvelopeFormat, WorstCaseFormulaMatchesTheEncoder)
 {
+    /// Drive the encoder at the WIDEST version the budget reserves room for, rather than encoding at
+    /// today's one-digit version and adding the missing digits by arithmetic. Doing the arithmetic
+    /// here would re-derive the very formula this test exists to check, and would never send the
+    /// ten-digit boundary through the encoder's own number formatting.
     EnvelopeHeader h = maxReachableHeader("");
-    const String head = encodeEnvelopeHeader(h, static_cast<uint32_t>(kMinBlobHeaderLen));
+    const String head = encodeEnvelopeHeader(h, static_cast<uint32_t>(kMinBlobHeaderLen),
+                                             std::numeric_limits<uint32_t>::max());
+
     /// The mandatory shape is everything up to and including the closing brace, plus the newline the
     /// encoder reserves at the last byte; the padding between them is the ref budget this measures.
     const size_t json_len = head.find_last_not_of(' ', kMinBlobHeaderLen - 2) + 1;
-    const size_t mandatory_at_current_version = json_len + 1;   /// + the reserved '\n'
+    const size_t mandatory_at_max_version = json_len + 1;   /// + the reserved '\n'
 
-    size_t version_digits = 0;
-    for (uint32_t v = currentCompatibilityVersion(); ; v /= 10)
-    {
-        ++version_digits;
-        if (v < 10)
-            break;
-    }
-    const size_t unused_version_digits = std::numeric_limits<uint32_t>::digits10 + 1 - version_digits;
+    EXPECT_EQ(mandatory_at_max_version, mandatory_descriptor_worst_case)
+        << "the formula and the encoder disagree about the mandatory descriptor at the widest "
+           "version: encoder wrote " << mandatory_at_max_version << " bytes, formula says "
+        << mandatory_descriptor_worst_case;
 
-    EXPECT_EQ(mandatory_at_current_version + unused_version_digits, mandatory_descriptor_worst_case)
-        << "the formula and the encoder disagree about the mandatory descriptor: encoder wrote "
-        << mandatory_at_current_version << " bytes at a " << version_digits << "-digit version";
+    /// And the whole point of the budget: even at that width one byte remains spare under the floor.
+    EXPECT_LE(mandatory_descriptor_worst_case, kMinBlobHeaderLen - 1);
+}
+
+/// The version really is rendered at its full width by the encoder above, not merely accounted for.
+/// Without this, an encoder that silently clamped or dropped the override would still satisfy the
+/// equality it feeds.
+TEST(CASBlobEnvelopeFormat, MaxWidthVersionIsActuallyRendered)
+{
+    EnvelopeHeader h = maxReachableHeader("");
+    const String head = encodeEnvelopeHeader(h, static_cast<uint32_t>(kMinBlobHeaderLen),
+                                             std::numeric_limits<uint32_t>::max());
+    EXPECT_NE(head.find("\"v\":4294967295"), String::npos)
+        << "the max-width version was not rendered; the boundary above proves nothing. Header: "
+        << head;
 }
 
 TEST(CASBlobEnvelopeFormat, CriticalKeyDescriptorStillFitsAtDefaultLength)

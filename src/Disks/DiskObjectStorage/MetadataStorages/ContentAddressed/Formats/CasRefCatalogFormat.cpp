@@ -147,19 +147,17 @@ String encodeRefCatalog(const RefCatalog & catalog)
                 e.ns.string(), nsStateToWord(e.state), e.removal_started_round ? "carries" : "lacks");
 
         bool first = true;
-        writeKey(out, RefCatalogWire::kind, first);  writeStringValue(out, kEntryTag);
-        writeKey(out, RefCatalogWire::ns, first);    writeStringValue(out, e.ns.string());
-        writeKey(out, RefCatalogWire::state, first); writeStringValue(out, nsStateToWord(e.state));
-        writeKey(out, RefCatalogWire::life, first);  writeHex128Value(out, e.incarnation);
+        writeStringField(out, RefCatalogWire::kind, kEntryTag, first);
+        writeStringField(out, RefCatalogWire::ns, e.ns.string(), first);
+        writeStringField(out, RefCatalogWire::state, nsStateToWord(e.state), first);
+        writeHex128Field(out, RefCatalogWire::life, e.incarnation, first);
         if (e.removal_started_round)
-        {
-            writeKey(out, RefCatalogWire::remove_round, first); writeU64StringValue(out, *e.removal_started_round);
-        }
+            writeU64StringField(out, RefCatalogWire::remove_round, *e.removal_started_round, first);
         if (e.creator)
         {
-            writeKey(out, RefCatalogWire::creator, first); writeStringValue(out, e.creator->server_root_id);
-            writeKey(out, RefCatalogWire::creator_epoch, first); writeU64StringValue(out, e.creator->writer_epoch);
-            writeKey(out, RefCatalogWire::creator_fence, first); writeU64StringValue(out, e.creator->fence_generation);
+            writeStringField(out, RefCatalogWire::creator, e.creator->server_root_id, first);
+            writeU64StringField(out, RefCatalogWire::creator_epoch, e.creator->writer_epoch, first);
+            writeU64StringField(out, RefCatalogWire::creator_fence, e.creator->fence_generation, first);
         }
         closeObject(out, first);
         closeLine("entry");
@@ -180,11 +178,17 @@ RefCatalog decodeRefCatalog(std::string_view data)
 
     RefCatalog catalog;
     uint64_t seen = 0;
+    /// One line scratch and one reader for the whole loop: a decoder that rebuilds them per
+    /// row pays an allocation per row for the seen-key store and the line, which profiling put
+    /// at about a fifth of the instructions executed inside a row.
+    String row_line;
+    JsonObjectReader row_reader;
     for (;;)
     {
-        const String line = readLine(in, line_cap, "ref catalog");
-        ReadBufferFromMemory l(line.data(), line.size());
-        JsonObjectReader r(l, KeyStrictness::Strict, "ref catalog");
+        readLineInto(in, row_line, line_cap, "ref catalog");
+        ReadBufferFromMemory l(row_line.data(), row_line.size());
+        row_reader.reset(l, KeyStrictness::Strict, "ref catalog");
+        JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: empty line");

@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
 #include <IO/ReadBuffer.h>
@@ -187,6 +188,12 @@ private:
     HashingReadBuffer hashing;
     uint64_t seen = 0;
     bool done = false;
+    /// Reused line scratch, mirroring the writer's: `readLineInto` clears it without releasing its
+    /// buffer, so a run of any length allocates only up to the longest line it has actually seen.
+    String scratch;
+    /// Reused object reader, for the same reason: its per-object buffers then cost one allocation
+    /// for the whole run rather than one per row. It starts unbound and every row re-points it.
+    JsonObjectReader reader;
 };
 
 }

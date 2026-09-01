@@ -31,6 +31,13 @@ namespace RunWire
     constexpr WireKey confirmed{"confirmed"};
 }
 
+namespace RunHeaderWire
+{
+    constexpr WireKey type{"type"};
+    constexpr WireKey version{"v"};
+    constexpr WireKey kind{"kind"};
+}
+
 constexpr EnumWireTable<RunMarker, 3> kRunMarkerWords{{{
     {RunMarker::Zero, "zero"},
     {RunMarker::Edge, "edge"},
@@ -119,12 +126,9 @@ void writeRunHeaderLine(WriteBuffer & out, std::string_view kind)
     const FormatTraits & t = traitsFor(FormatId::RunFile);
     CasJsonWriter line(64);
     bool first = true;
-    writeKey(line, "type", first);
-    writeStringValue(line, t.type);
-    writeKey(line, "v", first);
-    writeIntText(currentCompatibilityVersion(), line);
-    writeKey(line, "kind", first);
-    writeStringValue(line, kind);
+    writeStringField(line, RunHeaderWire::type, t.type, first);
+    writeNumberField(line, RunHeaderWire::version, currentCompatibilityVersion(), first);
+    writeStringField(line, RunHeaderWire::kind, kind, first);
     closeObject(line, first);
     writeChar('\n', line);
     const std::string_view line_view = line.view();
@@ -242,9 +246,12 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     if (done)
         return false;
 
-    const String line = readLine(hashing, traitsFor(FormatId::RunFile).line_cap, "cas_run");
-    ReadBufferFromMemory line_in(line.data(), line.size());
-    JsonObjectReader r(line_in, KeyStrictness::Strict, "cas_run");
+    readLineInto(hashing, scratch, traitsFor(FormatId::RunFile).line_cap, "cas_run");
+    ReadBufferFromMemory line_in(scratch.data(), scratch.size());
+    /// Re-point the reader rather than building one per row: a fresh reader re-allocates its
+    /// seen-key store and value scratch every row, and this loop runs once per record.
+    reader.reset(line_in, KeyStrictness::Strict, "cas_run");
+    JsonObjectReader & r = reader;
 
     String key;
     if (!r.nextKey(key))

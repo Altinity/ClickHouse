@@ -47,28 +47,21 @@ ObjectKind objectKindFromWord(std::string_view w, std::string_view what)
 
 void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t)
 {
-    writeKey(out, SharedWire::token_type, first);
-    writeStringValue(out, tokenTypeToWord(t.type));
-    writeKey(out, SharedWire::token, first);
-    writeStringValue(out, t.value);
+    writeStringField(out, SharedWire::token_type, tokenTypeToWord(t.type), first);
+    writeStringField(out, SharedWire::token, t.value, first);
 }
 
 void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r)
 {
-    writeKey(out, SharedWire::algo, first);
-    writeStringValue(out, blobHashAlgoName(r.algo));
-    writeKey(out, SharedWire::digest, first);
-    writeStringValue(out, codecFor(r.algo).toHex(r.digest));
+    writeStringField(out, SharedWire::algo, blobHashAlgoName(r.algo), first);
+    writeStringField(out, SharedWire::digest, codecFor(r.algo).toHex(r.digest), first);
 }
 
 void writeManifestRefFields(CasJsonWriter & out, bool & first, const ManifestRefWireKeys & keys, const ManifestRef & r)
 {
-    writeKey(out, keys.epoch, first);
-    out.u64StringValue(r.writer_epoch);
-    writeKey(out, keys.build, first);
-    out.u64StringValue(r.build_sequence);
-    writeKey(out, keys.ord, first);
-    out.u64Number(r.manifest_ordinal);
+    writeU64StringField(out, keys.epoch, r.writer_epoch, first);
+    writeU64StringField(out, keys.build, r.build_sequence, first);
+    writeNumberField(out, keys.ord, r.manifest_ordinal, first);
 }
 
 ManifestRef manifestRefFromFields(uint64_t writer_epoch, uint64_t build_sequence, uint64_t manifest_ordinal,
