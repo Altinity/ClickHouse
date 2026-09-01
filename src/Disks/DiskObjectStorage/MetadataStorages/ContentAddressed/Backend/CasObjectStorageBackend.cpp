@@ -252,13 +252,6 @@ PutResult ObjectStorageBackend::nativeConditionalPut(const String & key, const S
 namespace
 {
 
-/// Keep the emulated backend's publication memory bound to one materialized body at a time.
-std::mutex & emulatedBlobPublicationMutex()
-{
-    static std::mutex mutex;
-    return mutex;
-}
-
 }
 
 /// True when an exception from `IObjectStorage::readObject` means "the object is simply not there".
@@ -485,7 +478,7 @@ Token ObjectStorageBackend::emuWrite(const String & key, const String & bytes, c
     return emuMintToken(key, metadata ? metadata->etag : String{}, /*just_wrote=*/true);
 }
 
-void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const String & bytes)
+void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const String & envelope, ReadBuffer & payload, uint64_t payload_size)
 {
     if (object_storage->getType() != ObjectStorageType::Local)
         throw Exception(
@@ -497,14 +490,30 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
     const String root = object_storage->getCommonKeyPrefix();
     const String destination_path = resolvePathRelativelyToBase(destination_object, root);
     const String temporary_path = resolvePathRelativelyToBase(temporary_object, root);
-    const auto existing_token_state = emu_token_state.find(key);
 
+    /// The body is STREAMED into the temporary file -- envelope, then a bounded copy of the payload --
+    /// never materialized in memory. (An earlier revision accumulated envelope+payload in one String,
+    /// whose growth doubling made the peak allocation up to 2x the payload, and serialized every
+    /// publication behind a dedicated mutex just to bound that peak to one body at a time; streaming
+    /// removes both.) The destination stays untouched until the byte count has been validated: a short
+    /// or long source aborts on the temporary file, which is then removed.
     try
     {
         auto out = object_storage->writeObject(StoredObject(temporary_object), WriteMode::Rewrite);
-        out->write(bytes.data(), bytes.size());
+        out->write(envelope.data(), envelope.size());
+        const auto copy_result = blob_publication_detail::copyBlobPayloadBounded(payload, *out, payload_size);
+        if (!copy_result.exact(payload_size))
+        {
+            out->cancel();
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "ObjectStorageBackend::publishBlob: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
+                copy_result.has_excess ? "more than " : "",
+                copy_result.copied,
+                key,
+                payload_size);
+        }
         out->finalize();
-        std::filesystem::rename(temporary_path, destination_path);
     }
     catch (...)
     {
@@ -517,7 +526,21 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
     /// existing disambiguator is sufficient: if the next observation sees the same ETag, it returns
     /// a token distinct from the old incarnation; if the ETag changed, emuMintToken resets the state
     /// to that new ETag. With no existing state, this backend has issued no same-process stale token
-    /// that needs fencing. The post-rename increment cannot allocate or throw.
+    /// that needs fencing. The post-rename increment cannot allocate or throw. `emu_mutex` spans the
+    /// rename and the bump so a concurrent emulated observation never sees the new incarnation with
+    /// the old disambiguator.
+    std::lock_guard lock(emu_mutex);
+    const auto existing_token_state = emu_token_state.find(key);
+    try
+    {
+        std::filesystem::rename(temporary_path, destination_path);
+    }
+    catch (...)
+    {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary_path, cleanup_error);
+        throw;
+    }
     if (existing_token_state != emu_token_state.end())
         ++existing_token_state->second.second;
 }
@@ -872,32 +895,9 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
 
         if (mode != Mode::Native)
         {
-            /// The emulated adapter's writes are whole-body operations. Serialize materialization so
-            /// concurrent publications retain the existing one-body peak-memory bound.
-            std::lock_guard publish_lock(emulatedBlobPublicationMutex());
-
-            String body = streaming->fresh_envelope;
-            blob_publication_detail::BlobPayloadCopyResult copy_result;
-            {
-                WriteBufferFromString out(body, AppendModeTag{});
-                copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, out, streaming->payload_size);
-                if (copy_result.exact(streaming->payload_size))
-                    out.finalize();
-                else
-                    out.cancel();
-            }
-
-            if (!copy_result.exact(streaming->payload_size))
-                throw Exception(
-                    ErrorCodes::CORRUPTED_DATA,
-                    "ObjectStorageBackend::publishBlob: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
-                    copy_result.has_excess ? "more than " : "",
-                    copy_result.copied,
-                    request.destination_key,
-                    streaming->payload_size);
-
-            std::lock_guard lock(emu_mutex);
-            emuPublishBlobAtomically(request.destination_key, body);
+            /// Streams straight into the temporary file and renames -- see emuPublishBlobAtomically.
+            emuPublishBlobAtomically(
+                request.destination_key, streaming->fresh_envelope, *payload, streaming->payload_size);
             return;
         }
 

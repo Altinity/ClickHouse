@@ -38,7 +38,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `gc_id` ([String](/sql-reference/data-types/string)) — The GC scheduler instance id (which mounter ran the round).
 - `trigger` ([Enum8](/sql-reference/data-types/enum)) — `Scheduled` (background tick) or `Manual` (`SYSTEM` command).
 - `round` ([UInt64](/sql-reference/data-types/int-uint)) — The GC round number (`0` on a `Start` row).
-- `outcome` ([Enum8](/sql-reference/data-types/enum)) — `Unknown` (on a `Start` row), `Success` (led, folded, and completed), `NotALeader` (another replica holds the GC lease), `Deferred` (led but took the skip-unchanged fast path — no fold ran, because no changed shard reached the fold threshold and no graduation was due), or `Error` (the round threw).
+- `outcome` ([Enum8](/sql-reference/data-types/enum)) — `Unknown` (on a `Start` row), `Success` (led, folded, and completed), `NotALeader` (another replica holds the GC lease), `Deferred` (led but took the skip-unchanged fast path — no fold ran, because no changed shard reached the fold threshold and no graduation was due), `Aborted` (the round threw a transient error — backend unavailability, a lost lease, a concurrent leader; the next scheduled round retries it), or `Error` (the round threw a non-transient error — investigate).
 - `candidates_marked` ([UInt64](/sql-reference/data-types/int-uint)) — Objects retired (marked) this round.
 - `objects_deleted` ([UInt64](/sql-reference/data-types/int-uint)) — Objects physically deleted this round.
 - `objects_absent` ([UInt64](/sql-reference/data-types/int-uint)) — Retire candidates found already absent.
@@ -51,7 +51,8 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `fence_outs` ([UInt64](/sql-reference/data-types/int-uint)) — Expired mounts fenced out by this round's heartbeat floor.
 - `anomalies` ([UInt64](/sql-reference/data-types/int-uint)) — Fold clamps surfaced (and survived) this round. A steady non-zero value warrants a look at the round log details.
 - `duration_ms` ([UInt64](/sql-reference/data-types/int-uint)) — The round wall-clock duration (on a `Finish` row).
-- `error` ([String](/sql-reference/data-types/string)) — The exception text when `outcome = 'Error'`.
+- `error` ([String](/sql-reference/data-types/string)) — The exception text when `outcome = 'Aborted'` or `'Error'`.
+- `error_code` ([Int32](/sql-reference/data-types/int-uint)) — The exception code when `outcome = 'Aborted'` or `'Error'`; `0` otherwise. Key monitoring on this column rather than on the `error` text. On an `Aborted` or `Error` row the counters still report everything the round completed before it threw, and `round != 0` on such a row means the round's closing compare-and-swap committed and the failure hit only post-commit cleanup.
 - `ProfileEvents` ([Map(LowCardinality(String), UInt64)](/sql-reference/data-types/map)) — On a `Start`/`Finish` row, the per-round `ProfileEvents` delta (the `CAS*` counters and S3/disk events for this round). On a `Phase` row, **that phase's** delta, so `GROUP BY phase` over `ProfileEvents['S3ListObjects']` attributes the round's `LIST` budget to the phase that spent it.
 - `round_id` ([String](/sql-reference/data-types/string)) — The correlator for every row of one round attempt: its `Start`, each of its `Phase` rows, and its `Finish`. Minted per attempt, so unlike `round` it exists even for a round that never committed and for a round that never led. Group by this column to reconstruct one round.
 - `phase` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The GC phase this row describes; empty on `Start`/`Finish`. See [Per-phase rows](#per-phase-rows) for the phase list.

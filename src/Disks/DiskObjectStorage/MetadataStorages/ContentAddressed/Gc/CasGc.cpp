@@ -348,9 +348,12 @@ void Gc::runNamespaceJanitorPage(
     t.metric("leaked", janitor_result.leaked);
 }
 
-RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy)
+RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy,
+                                RoundReport * progress)
 {
-    RoundReport report;
+    RoundReport local_report;
+    RoundReport & report = progress ? *progress : local_report;
+    report = RoundReport{};
     GcState state;
     Token state_token;
 
