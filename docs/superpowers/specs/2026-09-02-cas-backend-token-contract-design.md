@@ -259,9 +259,12 @@ every supported store.
 
 `MountLeaseKeeper`, `installKeeper`, `startKeeper`, `admitKeeperCall`, `MountLeaseKeeperState` and
 `keeper_state` read as calls into ClickHouse Keeper. They are not: the object **renews a mount lease**.
-The collision is concrete — `CasRequestControl.h:250` discusses real ZooKeeper retry semantics two
-files away from a class named `Keeper`. The precise name is `MountLeaseRenewer` (`installRenewer`,
-`startRenewer`, `admitRenewerCall`, `MountLeaseRenewerState`).
+The collision is concrete, and it is not the comment's fault: CAS lives inside `ReplicatedMergeTree`,
+whose commit path really does go through ClickHouse Keeper, so an honest error-handling analysis in
+this code **must** mention the real Keeper — `CasRequestControl.h:250` does exactly that when it rules
+out a collision with `Coordination::Exception` retriability. In a codebase where "Keeper" sometimes has
+to mean ClickHouse Keeper, a local object may not borrow the word. The precise name is
+`MountLeaseRenewer` (`installRenewer`, `startRenewer`, `admitRenewerCall`, `MountLeaseRenewerState`).
 
 Sized: 159 occurrences in 8 non-test files, 249 in tests. Mechanical, and its own commit — a rename
 folded into a contract change makes both diffs unreadable.
