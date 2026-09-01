@@ -523,7 +523,7 @@ IMPLEMENT_SETTING_ENUM(
 
 IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportFileAlreadyExistsPolicy, ErrorCodes::BAD_ARGUMENTS);
 
-IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportSchemaMismatchMode, ErrorCodes::BAD_ARGUMENTS);
+IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportSchemaMatchMode, ErrorCodes::BAD_ARGUMENTS);
 
 IMPLEMENT_SETTING_AUTO_ENUM(ExportPartitionAllOnError, ErrorCodes::BAD_ARGUMENTS);
 
