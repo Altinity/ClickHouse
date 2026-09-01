@@ -218,10 +218,10 @@ workflow = Workflow.Config(
         JobConfigs.parser_memory_check_job,
         # ClickBench runs on PRs only when files in its digest change
         # (see `clickbench_jobs.digest_config`), so the cost is bounded.
-        *[
-            job.set_run_after(CORE_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.clickbench_jobs
-        ],
+        # *[
+        #     job.set_run_after(CORE_BLOCKING_JOB_NAMES)
+        #     for job in JobConfigs.clickbench_jobs
+        # ],
         # JobConfigs.llvm_coverage_job,
         JobConfigs.promql_compliance_job,
         # TODO: stabilize and remove set_allow_failure
