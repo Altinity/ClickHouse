@@ -1260,7 +1260,7 @@ TEST(CASPartWriteTxn, AbandonRemovesStagedDebrisAndDisables)
 {
     /// Port of AbandonLeavesDebrisAndDisables to the new abandon semantics (CasPartWriteTxn.cpp abandon):
     /// abandon best-effort exact-token-DELETEs this build's STAGED manifest debris, leaves blob bodies
-    /// (full GC's job via min_active), and disables the build (further ops throw via requireAlive).
+    /// (full GC's job via min_active_build_sequence), and disables the build (further ops throw via requireAlive).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};

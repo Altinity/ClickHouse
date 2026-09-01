@@ -21,8 +21,8 @@ namespace
 
 namespace GcOutcomesWire
 {
-    constexpr WireKey kind{"k"};
-    constexpr WireKey outcome{"oc"};
+    constexpr WireKey kind{"kind"};
+    constexpr WireKey outcome{"outcome"};
 }
 
 constexpr EnumWireTable<OutcomeKind, 4> kOutcomeKindWords{{{
@@ -34,16 +34,16 @@ constexpr EnumWireTable<OutcomeKind, 4> kOutcomeKindWords{{{
 
 static_assert(casEnumTableCoversEnum<kOutcomeKindWords, OutcomeKind>());
 
-OutcomeKind outcomeKindFromWord(std::string_view w)
-{
-    return kOutcomeKindWords.fromWord(w, "CAS outcome log outcome kind");
-}
-
 }
 
 std::string_view outcomeKindToWireWord(OutcomeKind outcome)
 {
     return kOutcomeKindWords.toWord(outcome, "CAS outcome log outcome kind");
+}
+
+OutcomeKind outcomeKindFromWireWord(std::string_view w)
+{
+    return kOutcomeKindWords.fromWord(w, "CAS outcome log outcome kind");
 }
 
 String encodeOutcomeLog(const OutcomeLog & log)
@@ -54,8 +54,8 @@ String encodeOutcomeLog(const OutcomeLog & log)
     {
         bool first = true;
         writeStringField(out, GcOutcomesWire::kind, objectKindToWord(e.kind), first);
-        writeBlobRefFields(out, first, e.ref);   /// ha + h
-        writeTokenFields(out, first, e.token);   /// tt + tv
+        writeBlobRefFields(out, first, e.ref);   /// algo + digest
+        writeTokenFields(out, first, e.token);   /// token_type + token
         writeStringField(out, GcOutcomesWire::outcome, outcomeKindToWireWord(e.outcome), first);
         closeObject(out, first);
         writeChar('\n', out);
@@ -78,7 +78,7 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
         JsonObjectReader r(line_in, KeyStrictness::Tolerant, "outcome log");
 
         String key;
-        /// The first key distinguishes a trailer ("n") from a record ("k").
+        /// The first key distinguishes a trailer (`n`) from a record (`kind`).
         if (!r.nextKey(key))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: empty line");
         if (key == "n")
@@ -102,14 +102,12 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
             if (key == GcOutcomesWire::kind) e.kind = objectKindFromWord(r.readString(), "outcome log");
             else if (matchBlobRefFields(key, r, blob_ref_fields)) {}
             else if (matchTokenFields(key, r, token_fields)) {}
-            else if (key == GcOutcomesWire::outcome) e.outcome = outcomeKindFromWord(r.readString());
+            else if (key == GcOutcomesWire::outcome) e.outcome = outcomeKindFromWireWord(r.readString());
             else r.skipUnknown(key);
         } while (r.nextKey(key));
 
-        if (!blob_ref_fields.algo_word || !blob_ref_fields.digest_hex || !token_fields.type_word)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: record missing ha/h/tt");
         e.ref = blob_ref_fields.build("outcome log");
-        e.token = Token{token_fields.value.value_or(""), tokenTypeFromWord(*token_fields.type_word, "outcome log")};
+        e.token = token_fields.build("outcome log");
         if (!line_in.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: junk after record");
         log.entries.push_back(std::move(e));

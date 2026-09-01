@@ -113,8 +113,8 @@ PoolMeta PoolMeta::createOrValidate(
     validatePoolBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
     if (gc_shards == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS pool meta: gc_shards must be >= 1");
-    /// Defense against a garbage `static_cast` past the caller's own boundary: `blobHashAlgoName`
-    /// throws BAD_ARGUMENTS for anything `BlobHashAlgo` does not actually admit.
+    /// `blobHashAlgoName` rejects an out-of-range `BlobHashAlgo` with `LOGICAL_ERROR`: a programming
+    /// error that aborts debug and sanitizer builds, not an input-validation fence.
     blobHashAlgoName(blob_hash_algo);
 
     const String key = layout.poolMetaKey();

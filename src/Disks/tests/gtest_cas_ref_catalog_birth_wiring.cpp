@@ -341,13 +341,13 @@ TEST(CASRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsR
     const RootNamespace ns{"srv1/reconciled"};
 
     /// A dead predecessor's `Creating` entry: its mount lease carries the clean-farewell sentinel
-    /// (`min_active == UINT64_MAX`), one of `isCreatorFenceTerminal`'s three certificates of death.
+    /// (`min_active_build_sequence == UINT64_MAX`), one of `isCreatorFenceTerminal`'s three certificates of death.
     const CreatorFence dead_creator{.server_root_id = "dead-server", .writer_epoch = 3, .fence_generation = 1};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(0xbeef),
                              .creator = dead_creator};
     CasRefCatalog::casAdmitEntry(*backend, layout, 1, entry);
     setWatermarkMinActive(*backend, layout, "dead-server", /*writer_epoch=*/3,
-                          /*min_active=*/std::numeric_limits<uint64_t>::max());
+                          /*min_active_build_sequence=*/std::numeric_limits<uint64_t>::max());
 
     /// The production path resumes creation itself: reconciles the stale entry onto THIS mount's own
     /// fence and completes it to `Live`, over the SAME incarnation the dead creator minted.

@@ -187,7 +187,7 @@ Pipe StorageSystemContentAddressedMounts::read(
                     col_seq->insert(m.lease.seq);
                     assert_cast<ColumnDateTime64 &>(*col_started).insertValue(static_cast<Decimal64>(m.lease.started_at_ms));
                     assert_cast<ColumnDateTime64 &>(*col_expires).insertValue(static_cast<Decimal64>(m.lease.expires_at_ms));
-                    col_min_active->insert(m.lease.min_active);
+                    col_min_active->insert(m.lease.min_active_build_sequence);
                     col_fenced->insert(static_cast<UInt8>(m.lease.gc_fenced));
                     col_state->insert(m.state);
 

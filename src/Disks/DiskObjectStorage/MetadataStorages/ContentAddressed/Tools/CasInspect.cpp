@@ -168,7 +168,7 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .str();
 }
 
-/// The namespace's checkpoint (spec INV-4). Every field is optional and each absence means something
+/// The namespace's checkpoint. Every field is optional and each absence means something
 /// different an operator needs to see: no `life_epoch` means no writer that knew this namespace's
 /// genesis epoch has written here yet, no `committed_through` means the life has no committed
 /// transaction, no `checkpoint_snapshot_id` means recovery has no snapshot base, and no
@@ -258,7 +258,7 @@ String renderMountLease(const MountLease & m)
         .add("started_at_ms", jsonUInt(m.started_at_ms))
         .add("seq", jsonUInt(m.seq))
         .add("expires_at_ms", jsonUInt(m.expires_at_ms))
-        .add("min_active", jsonUInt(m.min_active))
+        .add("min_active_build_sequence", jsonUInt(m.min_active_build_sequence))
         .add("gc_fenced", jsonBool(m.gc_fenced))
         .add("write_attempt_id", jsonHex(m.write_attempt_id))
         .str();
@@ -308,7 +308,7 @@ String renderRunRef(const RunRef & r)
 String renderRefCoverage(const RefCoverage & c)
 {
     return JsonObj()
-        .add("classification", jsonUInt(c.classification))
+        .add("classification", jsonEscape(coverageClassToWord(c.classification)))
         .add("last_folded_ref_id", renderRefTxnIdObj(c.last_folded_ref_id))
         .str();
 }
@@ -378,7 +378,7 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
     return JsonObj()
         .add("kind", jsonEscape(objectKindToWord(h.kind)))
         /// The blob identity is carried by the object key, so the envelope keeps only the provenance
-        /// fields needed for forensics (`ch` and `bld`) together with its compatibility version.
+        /// fields needed for forensics (`chver` and `build`) together with its compatibility version.
         .add("compatibility_version", jsonUInt(h.compatibility_version))
         .add("incarnation_tag", jsonHex(h.incarnation_tag))
         .add("build_id", jsonHex(h.build_id))
@@ -388,7 +388,7 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
         .str();
 }
 
-/// The word vocabulary a row's marker byte renders as, matching the `cas_run` NDJSON's own `"m"` field
+/// The word vocabulary a row's marker byte renders as, matching the `cas_run` NDJSON's own `mark` field
 /// words (`runMarkerToWireWord`) so cas-inspect speaks the same vocabulary
 /// as the on-disk format rather than inventing a second one.
 String sourceEdgeRowKindName(RunMarker marker)

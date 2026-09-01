@@ -7,6 +7,8 @@
 #include <fmt/format.h>
 #include <vector>
 
+#include <magic_enum.hpp>
+
 using namespace DB;
 using namespace DB::Cas;
 
@@ -76,7 +78,7 @@ TEST(CASFormatBattery, RunFile)
         [&] { return sealObject(FormatId::RunFile, encodeRun(records)); },
         [](std::string_view s) { decodeRun(std::string(openObject(FormatId::RunFile, s))); },
         fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion()) +
-        "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n"
+        "{\"ref\":\"0100000000000000000000000000000002\",\"src\":\"00000000000000000000000000000005\",\"mark\":\"edge\"}\n"
         "{\"n\":1}\n"});
 }
 
@@ -126,6 +128,69 @@ TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
     EXPECT_EQ(back[2].marker, RunMarker::Zero);
 }
 
+/// Closed-set pin: the three `RunMarker` words, walked through `magic_enum::enum_values`, which is what proves the
+/// renderer and the parser consult the SAME table: a table entry missing altogether is already a
+/// build error at the coverage assert, but two delegates drifting onto different tables is not.
+TEST(CASRecordStream, ClosedSetPinsRunMarkerWords)
+{
+    EXPECT_EQ(runMarkerToWireWord(RunMarker::Zero), "zero");
+    EXPECT_EQ(runMarkerToWireWord(RunMarker::Edge), "edge");
+    EXPECT_EQ(runMarkerToWireWord(RunMarker::Condemned), "condemned");
+    for (const auto m : magic_enum::enum_values<RunMarker>())
+        EXPECT_EQ(runMarkerFromWireWord(runMarkerToWireWord(m)), m);
+}
+
+/// The condemned row's six fields are all-or-nothing: a row that says `condemned` but drops one of
+/// them would decode with a silently defaulted value (a zero size, an empty token, `pending` false),
+/// which is a different retention decision than the writer recorded.
+TEST(CASRecordStream, CondemnedRowMissingOneOfItsSixFieldsFailsClosed)
+{
+    const String good = encodeRun({condemned(chRef(2), Token{"e-1", TokenType::ETag}, 4242, 7, /*pend*/ true)});
+    for (const std::string_view field : {R"(,"pending":true)", R"(,"token_type":"etag")", R"(,"token":"e-1")",
+                                         R"(,"size":4242)", R"(,"condemn_round":"7")", R"(,"confirmed":false)"})
+    {
+        String bytes = good;
+        const size_t at = bytes.find(field);
+        ASSERT_NE(at, String::npos) << "fixture does not carry " << field;
+        bytes.erase(at, field.size());
+        try
+        {
+            static_cast<void>(decodeRun(bytes));
+            FAIL() << "expected CORRUPTED_DATA after dropping " << field;
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+            const String expected_message = field == R"(,"token_type":"etag")" || field == R"(,"token":"e-1")"
+                ? "CAS cas_run: token missing token_type/token"
+                : "CAS cas_run: condemned record missing pending/size/condemn_round/confirmed";
+            EXPECT_EQ(e.message(), expected_message);
+        }
+    }
+}
+
+/// The mirror fence: an active row carrying any condemned field is a row whose two halves disagree
+/// about what it is, and the reader must not pick one half.
+TEST(CASRecordStream, ActiveRowCarryingACondemnedFieldFailsClosed)
+{
+    String bytes = encodeRun({edge(chRef(1), 10)});
+    const String needle = R"(,"mark":"edge")";
+    const size_t at = bytes.find(needle);
+    ASSERT_NE(at, String::npos);
+    bytes.insert(at + needle.size(), R"(,"size":4242)");
+
+    try
+    {
+        static_cast<void>(decodeRun(bytes));
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_EQ(e.message(), "CAS cas_run: non-condemned record carries condemned fields");
+    }
+}
+
 TEST(CASRecordStream, WriterIsByteDeterministic)
 {
     std::vector<SourceEdgeRecord> recs = {
@@ -134,6 +199,24 @@ TEST(CASRecordStream, WriterIsByteDeterministic)
         condemned(chRef(2), Token{"t/with/slashes", TokenType::ETag}, 1, 2, false),
     };
     EXPECT_EQ(encodeRun(recs), encodeRun(recs));   /// pure function of the sorted record set
+}
+
+/// The run `ref` carries the algorithm as a raw leading BYTE, a second representation of the same
+/// closed set the `algo` WORD spells elsewhere. The word side is proven exhaustive at compile time by
+/// its wire table; the byte side is a hand-written switch, so nothing but this walk stops a new
+/// algorithm from being written by `renderB` and rejected by the reader -- an asymmetry that would
+/// appear as unreadable runs rather than as a failing build.
+TEST(CASRecordStream, EveryBlobHashAlgoRoundTripsThroughTheRunRefByte)
+{
+    for (const BlobHashAlgo algo : magic_enum::enum_values<BlobHashAlgo>())
+    {
+        BlobDigest digest{};
+        digest.bytes[0] = 0x10;
+        const BlobRef ref{algo, digest};
+        const std::vector<SourceEdgeRecord> back = decodeRun(encodeRun({edge(ref, 1)}));
+        ASSERT_EQ(back.size(), 1u) << "algo " << magic_enum::enum_name(algo);
+        EXPECT_EQ(back[0].ref.algo, algo) << "the leading byte did not survive the round trip";
+    }
 }
 
 TEST(CASRecordStream, SortOrderAcrossAlgosFollowsAlgoByte)
@@ -173,9 +256,9 @@ TEST(CASRecordStream, SourceIdRendersAs32Hex)
 {
     const String bytes = encodeRun({edge(chRef(1), 10)});
     /// The source id 10 is a 32-char lowercase hex string ending in 'a'.
-    EXPECT_NE(bytes.find("\"s\":\"0000000000000000000000000000000a\""), String::npos);
-    /// The record key `b` for a ch128 ref is the algo byte 01 + a 32-hex digest (34 chars total).
-    EXPECT_NE(bytes.find("\"b\":\"01"), String::npos);
+    EXPECT_NE(bytes.find("\"src\":\"0000000000000000000000000000000a\""), String::npos);
+    /// The record key `ref` for a ch128 ref is the algo byte 01 + a 32-hex digest (34 chars total).
+    EXPECT_NE(bytes.find("\"ref\":\"01"), String::npos);
 }
 
 TEST(CASRecordStream, SealChecksumMismatchFailsClosed)
@@ -248,12 +331,13 @@ TEST(CASRecordStream, HeaderGates)
 {
     /// Wrong type.
     {
-        const String s = "{\"type\":\"cas_pool_meta\",\"v\":3,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
+        const String s = "{\"type\":\"cas_pool_meta\",\"v\":1,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
         EXPECT_THROW(decodeRun(s), DB::Exception);
     }
-    /// Wrong kind.
+    /// Wrong kind. `v:1` is the baseline generation, so it always passes the header gate before the
+    /// kind check runs.
     {
-        const String s = "{\"type\":\"cas_run\",\"v\":3,\"kind\":\"blob_delta\"}\n{\"n\":0}\n";
+        const String s = "{\"type\":\"cas_run\",\"v\":1,\"kind\":\"blob_delta\"}\n{\"n\":0}\n";
         EXPECT_THROW(decodeRun(s), DB::Exception);
     }
     /// Future version -> UNKNOWN_FORMAT_VERSION.

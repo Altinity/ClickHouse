@@ -59,9 +59,9 @@ struct OrphanFixture
         /// exercising the independent sweep-deletion premise.
         casAdmitRecoverableEntry(*backend, store->layout(), ns);
         writeManifestRaw(*backend, store->layout(), ns, orphan, {blobEntryFor("a", DB::UInt128(1))});
-        /// min_active 6 > build_sequence 5: the durable watermark fact makes the prefix ELIGIBLE, which
+        /// min_active_build_sequence 6 > build_sequence 5: the durable watermark fact makes the prefix ELIGIBLE, which
         /// is the half the premise sits on top of.
-        setWatermarkMinActive(*backend, store->layout(), kServerRoot, kBuildEpoch, /*min_active*/6);
+        setWatermarkMinActive(*backend, store->layout(), kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
     }
 
     String orphanKey() const { return store->layout().manifestKey(ManifestId{ns, orphan}); }
@@ -81,7 +81,7 @@ struct UndecodableOrphanFixture
     {
         store = openPoolForTest(backend);
         casAdmitRecoverableEntry(*backend, store->layout(), ns);
-        setWatermarkMinActive(*backend, store->layout(), kServerRoot, kBuildEpoch, /*min_active*/6);
+        setWatermarkMinActive(*backend, store->layout(), kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
     }
 
     String orphanKey() const { return store->layout().manifestKey(ManifestId{ns, orphan}); }
@@ -179,7 +179,7 @@ TEST(CASSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
 
     NamespaceFoldView view;
     RefCoverage cov;
-    cov.classification = 2;
+    cov.classification = CoverageClass::Folded;
     cov.last_folded_ref_id = RefTxnId{kBuildEpoch + 1, 1};   /// rule (1) satisfied
     view.coverage = cov;
     view.tail_removal_targets.insert(key);
@@ -318,7 +318,7 @@ TEST(CASSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
                        .retry_count = 1, .next_retry_round = 4};
     seedFoldCursorForTest(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 8}, hold);
 
-    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active*/6);
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
 
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10);
 
@@ -403,9 +403,9 @@ TEST(CASSweepDeletionPremise, RecoveryWorkBudgetRetainsAndConvergesWithoutWedgin
     /// takes the fresh-`_ckpt` `putIfAbsent` path instead of `advanceRecoverableCkptForRawFixture`'s
     /// monotonic-advance-from-existing-value path (which throws on a null `committed_through`).
     casAdmitEntry(*backend, layout, ns);
-    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active*/1000);
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/1000);
 
-    /// Six orphan candidates, all eligible (build_sequence << min_active), none owned by any ref.
+    /// Six orphan candidates, all eligible (build_sequence << min_active_build_sequence), none owned by any ref.
     constexpr int kCandidates = 6;
     for (int i = 1; i <= kCandidates; ++i)
         writeManifestRaw(*backend, layout, ns, ref(i, 1),
@@ -484,7 +484,7 @@ TEST(CASSweepDeletionPremise, NamespaceWorkBudgetCapsDistinctViewsPerPage)
     /// at all (`_ckpt.committed_through` unset), so absent the namespace cap BOTH would delete.
     seedFoldCursorForTest(*backend, layout, ns_a, RefTxnId{kBuildEpoch + 1, 1});
     seedFoldCursorForTest(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 1});
-    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active*/6);
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active_build_sequence*/6);
 
     GcRoundWorkBudget budget;
     budget.max_sweep_namespaces = 1;

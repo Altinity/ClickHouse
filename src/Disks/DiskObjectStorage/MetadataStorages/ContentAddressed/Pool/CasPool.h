@@ -427,7 +427,7 @@ public:
     uint64_t minActive();
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
-    /// Renew the merged heartbeat once (bump seq, refresh min_active from the live callback, stamp a
+    /// Renew the merged heartbeat once (bump seq, refresh min_active_build_sequence from the live callback, stamp a
     /// fresh expires_at_ms). The build-watermark floor rides this beat. In production this is driven by
     /// the background renewer (background_watermark).
     void renewWatermarkOnce();

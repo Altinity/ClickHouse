@@ -26,7 +26,7 @@ using namespace DB::Cas;
 /// MountLeaseKeeper behavior: the per-server mount lease and the merged build-watermark floor ride the
 /// SAME slot, renewed by one beat. The keeper anchors durably before return, adopts a slot already
 /// written by `claimMount` (same uuid+epoch), re-reads the callback on each renew and bumps `seq`,
-/// stamps the farewell sentinel (`min_active = UINT64_MAX`, `expires_at_ms <= now`) on `release`, and
+/// stamps the farewell sentinel (`min_active_build_sequence = UINT64_MAX`, `expires_at_ms <= now`) on `release`, and
 /// returns typed terminal results on any foreign touch.
 
 namespace
@@ -171,18 +171,18 @@ TEST(CASHeartbeat, AnchorCarriesFloor)
     const String srid = "test";
     const UInt128 uuid(0x1234);
     uint64_t now_ms = 1000;
-    uint64_t min_active_now = 5;
+    uint64_t min_active_build_sequence_now = 5;
     seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [&] { return min_active_now; }, {}, std::chrono::milliseconds(0));
+                            [&] { return now_ms; }, [&] { return min_active_build_sequence_now; }, {}, std::chrono::milliseconds(0));
     keeper.start();
 
     auto hr = backend->head(layout.mountKey(srid));
     ASSERT_TRUE(hr.exists);
     auto m = decodeMountLease(backend->get(layout.mountKey(srid))->bytes);
     EXPECT_EQ(m.writer_epoch, 9u);
-    EXPECT_EQ(m.min_active, 5u);
+    EXPECT_EQ(m.min_active_build_sequence, 5u);
     EXPECT_EQ(m.seq, 1u);
     EXPECT_FALSE(m.gc_fenced);
 }
@@ -194,20 +194,20 @@ TEST(CASHeartbeat, RenewRereadsCallbackAndBumpsSeq)
     const String srid = "test";
     const UInt128 uuid(0x1234);
     uint64_t now_ms = 1000;
-    uint64_t min_active_now = 5;
+    uint64_t min_active_build_sequence_now = 5;
     seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [&] { return min_active_now; }, {}, std::chrono::milliseconds(0));
+                            [&] { return now_ms; }, [&] { return min_active_build_sequence_now; }, {}, std::chrono::milliseconds(0));
     keeper.start();
 
     /// The dynamic field moves; the renewal re-reads it off the callback and bumps seq.
     now_ms = 1500;
-    min_active_now = 8;
+    min_active_build_sequence_now = 8;
     renewKeeperOrThrow(keeper);
 
     auto m = decodeMountLease(backend->get(layout.mountKey(srid))->bytes);
-    EXPECT_EQ(m.min_active, 8u);
+    EXPECT_EQ(m.min_active_build_sequence, 8u);
     EXPECT_EQ(m.seq, 2u);
     EXPECT_EQ(m.expires_at_ms, 1500u + 100u);
 }
@@ -230,9 +230,9 @@ TEST(CASHeartbeat, StopStampsExpiredAndFarewellSentinel)
 
     auto m = decodeMountLease(backend->get(layout.mountKey(srid))->bytes);
     /// Terminal body stamps the lease already-expired (so a same-server reopen reclaims immediately)
-    /// AND folds the watermark farewell into it (min_active = UINT64_MAX).
+    /// AND folds the watermark farewell into it (min_active_build_sequence = UINT64_MAX).
     EXPECT_LE(m.expires_at_ms, now_ms);
-    EXPECT_EQ(m.min_active, std::numeric_limits<uint64_t>::max());
+    EXPECT_EQ(m.min_active_build_sequence, std::numeric_limits<uint64_t>::max());
 }
 
 /// Phase A (spec rev.4 2026-07-24): a confirmed renewal mismatch whose re-read shows OUR OWN

@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
 
+#include <magic_enum.hpp>
+
 using namespace DB::Cas;
 
 namespace
@@ -42,8 +44,8 @@ TEST(CASFormatBattery, GcOutcomes)
         [&] { return sealObject(FormatId::GcOutcomes, encodeOutcomeLog(log)); },
         [](std::string_view d) { decodeOutcomeLog(std::string(openObject(FormatId::GcOutcomes, d))); },
         currentFormatHeader("cas_gc_outcomes") +
-        "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\","
-        "\"tt\":\"etag\",\"tv\":\"e-1\",\"oc\":\"deleted\"}\n{\"n\":1}\n"});
+        "{\"kind\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
+        "\"token_type\":\"etag\",\"token\":\"e-1\",\"outcome\":\"deleted\"}\n{\"n\":1}\n"});
 }
 
 TEST(CASGCOutcomesFormat, EmptyRoundTrips)
@@ -77,7 +79,20 @@ TEST(CASGCOutcomesFormat, MultiEntryRoundTripAllOutcomes)
     EXPECT_EQ(encodeOutcomeLog(d), text);
 }
 
-TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
+/// Closed-set pin: the four `OutcomeKind` words, walked through `magic_enum::enum_values`, which is what proves the
+/// renderer and the parser consult the SAME table: a table entry missing altogether is already a
+/// build error at the coverage assert, but two delegates drifting onto different tables is not.
+TEST(CASGCOutcomesFormat, ClosedSetPinsOutcomeKindWords)
+{
+    EXPECT_EQ(outcomeKindToWireWord(OutcomeKind::Deleted), "deleted");
+    EXPECT_EQ(outcomeKindToWireWord(OutcomeKind::Absent), "absent");
+    EXPECT_EQ(outcomeKindToWireWord(OutcomeKind::Replaced), "replaced");
+    EXPECT_EQ(outcomeKindToWireWord(OutcomeKind::Spared), "spared");
+    for (const auto o : magic_enum::enum_values<OutcomeKind>())
+        EXPECT_EQ(outcomeKindFromWireWord(outcomeKindToWireWord(o)), o);
+}
+
+TEST(CASGCOutcomesFormat, RecordRequiresCompleteBlobRefAndTokenGroups)
 {
     OutcomeLog log;
     log.entries.push_back({ObjectKind::Blob,
@@ -85,16 +100,12 @@ TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
         Token{"e-1", TokenType::ETag}, OutcomeKind::Deleted});
     const String bytes = encodeOutcomeLog(log);
 
-    const String token_value = R"(,"tv":"e-1")";
-    const auto token_value_pos = bytes.find(token_value);
-    ASSERT_NE(token_value_pos, String::npos);
-    String missing_token_value = bytes;
-    missing_token_value.erase(token_value_pos, token_value.size());
-    const OutcomeLog decoded = decodeOutcomeLog(missing_token_value);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].token.value, "");
-
-    for (const String & field : {String(R"(,"ha":"ch128")"), String(R"(,"h":"00112233445566778899aabbccddeeff")"), String(R"(,"tt":"etag")")})
+    for (const auto & [field, expected_message] : {
+        std::pair{String(R"(,"algo":"ch128")"), "CAS outcome log: blob ref missing algo/digest"},
+        std::pair{String(R"(,"digest":"00112233445566778899aabbccddeeff")"), "CAS outcome log: blob ref missing algo/digest"},
+        std::pair{String(R"(,"token_type":"etag")"), "CAS outcome log: token missing token_type/token"},
+        std::pair{String(R"(,"token":"e-1")"), "CAS outcome log: token missing token_type/token"},
+    })
     {
         const auto pos = bytes.find(field);
         ASSERT_NE(pos, String::npos);
@@ -108,32 +119,32 @@ TEST(CASGCOutcomesFormat, RecordTokenValueIsOptionalButTokenIdentityIsRequired)
         catch (const DB::Exception & e)
         {
             EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-            EXPECT_EQ(e.message(), "CAS outcome log: record missing ha/h/tt");
+            EXPECT_EQ(e.message(), expected_message);
         }
     }
 }
 
 TEST(CASGCOutcomesFormat, GarbageAndUnknownWordsFailClosed)
 {
-    EXPECT_THROW(decodeOutcomeLog(String("")), DB::Exception);
-    EXPECT_THROW(decodeOutcomeLog(String("not a cas object\n")), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("")); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeOutcomeLog(String("not a cas object\n")); });
     /// A record with an unknown outcome word fails closed.
-    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n"
-                       "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\","
-                       "\"tt\":\"etag\",\"tv\":\"x\",\"oc\":\"bogus\"}\n{\"n\":1}\n";
-    EXPECT_THROW(decodeOutcomeLog(bad), DB::Exception);
+    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
+                       "{\"kind\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddeeff\","
+                       "\"token_type\":\"etag\",\"token\":\"x\",\"outcome\":\"bogus\"}\n{\"n\":1}\n";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bad); });
     /// A trailer count mismatch fails closed.
-    const String miscount = "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n{\"n\":5}\n";
-    EXPECT_THROW(decodeOutcomeLog(miscount), DB::Exception);
+    const String miscount = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n{\"n\":5}\n";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(miscount); });
 }
 
 TEST(CASGCOutcomesFormat, DigestWidthMismatchFailsClosedWithCorruptedData)
 {
-    /// `ch128` (CityHash128) digests are 16 bytes = 32 hex chars; here the "h" field is truncated
+    /// `ch128` (CityHash128) digests are 16 bytes = 32 hex chars; here the `digest` field is truncated
     /// to 30 hex chars. Must surface as CORRUPTED_DATA (malformed serialized input), not
     /// `fromHex`'s BAD_ARGUMENTS.
-    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n"
-                       "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddee\","
-                       "\"tt\":\"etag\",\"tv\":\"x\",\"oc\":\"deleted\"}\n{\"n\":1}\n";
+    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":1}\n"
+                       "{\"kind\":\"blob\",\"algo\":\"ch128\",\"digest\":\"00112233445566778899aabbccddee\","
+                       "\"token_type\":\"etag\",\"token\":\"x\",\"outcome\":\"deleted\"}\n{\"n\":1}\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bad); });
 }

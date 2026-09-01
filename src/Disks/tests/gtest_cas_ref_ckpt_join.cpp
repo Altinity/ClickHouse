@@ -41,7 +41,7 @@
 ///     so the fence would not fire on the very change it exists to catch. Only a real producer
 ///     populates a real field.
 ///   - TRANSACTIONS and WRITER EPOCHS enter as the DECIMAL WIDTH of the two id pairs. That is not
-///     equality: `{cse=1,css=1}` and `{cse=1,css=10000}` differ by four bytes. It is `O(1)` because
+///     equality: `{snapshot_epoch=1,snapshot_seq=1}` and `{snapshot_epoch=1,snapshot_seq=10000}` differ by four bytes. It is `O(1)` because
 ///     the fields are `uint64_t` and so the width is ceilinged at twenty digits, which is a bound a
 ///     test asserts on a constructed worst case -- `EncodedCkptSizeHasAConstantCeiling...` below.
 
@@ -73,9 +73,10 @@ constexpr uint64_t U64_MAX = std::numeric_limits<uint64_t>::max();
 
 /// Constraint 15's bound, as a number: the encoded size of the WIDEST `_ckpt` this build can produce
 /// (all three fields present, every integer component at `UINT64_MAX`). Pinned as a literal so that
-/// adding a field, or widening one, fails a test rather than quietly moving the bound. Generation 10
-/// added one byte to the shared format-version header (`9` became `10`); the scalar body is unchanged.
-constexpr size_t CKPT_WORST_CASE_ENCODED_BYTES = 235;
+/// adding a field, or widening one, fails a test rather than quietly moving the bound. The shared
+/// format-version header is the single-digit `v:1` baseline; a future generation bump that widens it
+/// moves this constant too.
+constexpr size_t CKPT_WORST_CASE_ENCODED_BYTES = 296;
 
 /// The high-cardinality side of the size fence, in ONE transaction. Bounded above by the append lane's
 /// 5000-operation cap on a normal-class item (`publishCommittedOps` emits two ops per ref), and kept at

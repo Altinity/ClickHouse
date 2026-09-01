@@ -16,6 +16,8 @@
 #include <type_traits>
 #include <utility>
 
+#include <magic_enum.hpp>
+
 using namespace DB::Cas;
 
 namespace ProfileEvents
@@ -56,27 +58,27 @@ namespace DB::ErrorCodes
 namespace
 {
 
-/// Hand-builds one raw "ent" line, bypassing `encodeRefCatalog` entirely -- used by the decode-side
+/// Hand-builds one raw `entry` line, bypassing `encodeRefCatalog` entirely -- used by the decode-side
 /// rejection tests, which must exercise bytes the encoder itself would refuse to produce.
-String rawEntLine(const String & ns, const String & state, const String & inc_hex,
+String rawEntryLine(const String & ns, const String & state, const String & inc_hex,
                    std::optional<std::tuple<String, uint64_t, uint64_t>> creator = std::nullopt)
 {
     if (!creator)
-        return fmt::format(R"({{"k":"ent","ns":"{}","st":"{}","inc":"{}"}})", ns, state, inc_hex);
+        return fmt::format(R"({{"kind":"entry","ns":"{}","state":"{}","life":"{}"}})", ns, state, inc_hex);
     const auto & [srid, we, fg] = *creator;
-    return fmt::format(R"({{"k":"ent","ns":"{}","st":"{}","inc":"{}","csr":"{}","cwe":"{}","cfg":"{}"}})",
+    return fmt::format(R"({{"kind":"entry","ns":"{}","state":"{}","life":"{}","creator":"{}","creator_epoch":"{}","creator_fence":"{}"}})",
                         ns, state, inc_hex, srid, we, fg);
 }
 
-/// Wraps `ent_lines` in the header/trailer a real `cas_ref_catalog` object carries. `v:1` always
+/// Wraps `entry_lines` in the header/trailer a real `cas_ref_catalog` object carries. `v:1` always
 /// passes the header gate (any version <= the build's `G_BUILD` does), matching the convention
 /// `gtest_cas_fold_seal_format.cpp`'s `RejectsOutOfRangeNsCleanupState` uses for the same reason.
-String rawCatalog(const std::vector<String> & ent_lines)
+String rawCatalog(const std::vector<String> & entry_lines)
 {
     String out = R"({"type":"cas_ref_catalog","v":1})" "\n";
-    for (const String & l : ent_lines)
+    for (const String & l : entry_lines)
         out += l + "\n";
-    out += fmt::format("{{\"n\":{}}}\n", ent_lines.size());
+    out += fmt::format("{{\"n\":{}}}\n", entry_lines.size());
     return out;
 }
 
@@ -84,7 +86,7 @@ String withRemovalStartedRound(String line, uint64_t round)
 {
     const size_t close = line.rfind('}');
     EXPECT_NE(close, String::npos);
-    line.insert(close, fmt::format(R"(,"rsr":"{}")", round));
+    line.insert(close, fmt::format(R"(,"remove_round":"{}")", round));
     return line;
 }
 
@@ -223,10 +225,23 @@ TEST(CASFormatBattery, RefCatalog)
         [&] { return sealObject(FormatId::RefCatalog, encodeRefCatalog(c)); },
         [](std::string_view s) { decodeRefCatalog(std::string(openObject(FormatId::RefCatalog, s))); },
         currentFormatHeader("cas_ref_catalog") +
-        "{\"k\":\"ent\",\"ns\":\"a\",\"st\":\"creating\",\"inc\":\"00000000000000000000000000000001\","
-        "\"csr\":\"srv1\",\"cwe\":\"5\",\"cfg\":\"2\"}\n"
-        "{\"k\":\"ent\",\"ns\":\"b\",\"st\":\"live\",\"inc\":\"00000000000000000000000000000002\"}\n"
+        "{\"kind\":\"entry\",\"ns\":\"a\",\"state\":\"creating\",\"life\":\"00000000000000000000000000000001\","
+        "\"creator\":\"srv1\",\"creator_epoch\":\"5\",\"creator_fence\":\"2\"}\n"
+        "{\"kind\":\"entry\",\"ns\":\"b\",\"state\":\"live\",\"life\":\"00000000000000000000000000000002\"}\n"
         "{\"n\":2}\n"});
+}
+
+/// Closed-set pin: the three `NsState` words, walked through `magic_enum::enum_values`, which is what
+/// proves the renderer and the parser consult the SAME table: a table entry missing altogether is
+/// already a build error at the coverage assert, but two delegates drifting onto different tables is
+/// not.
+TEST(CASRefCatalogFormat, ClosedSetPinsNsStateWords)
+{
+    EXPECT_EQ(nsStateToWord(NsState::Creating), "creating");
+    EXPECT_EQ(nsStateToWord(NsState::Live), "live");
+    EXPECT_EQ(nsStateToWord(NsState::Removing), "removing");
+    for (const auto s : magic_enum::enum_values<NsState>())
+        EXPECT_EQ(nsStateFromWord(nsStateToWord(s)), s);
 }
 
 /// ---------- codec round-trip ----------
@@ -262,16 +277,16 @@ TEST(CASRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
         .removal_started_round = 19};
     const RefCatalog catalog{.entries = {removing}};
     const String encoded = encodeRefCatalog(catalog);
-    EXPECT_NE(encoded.find("\"rsr\":\"19\""), String::npos);
-    EXPECT_NE(encoded.find("\"st\":\"removing\""), String::npos);
+    EXPECT_NE(encoded.find("\"remove_round\":\"19\""), String::npos);
+    EXPECT_NE(encoded.find("\"state\":\"removing\""), String::npos);
     EXPECT_EQ(decodeRefCatalog(encoded), catalog);
 
     const String inc = "00000000000000000000000000000009";
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { (void)decodeRefCatalog(rawCatalog({rawEntLine("missing", "removing", inc)})); });
+        [&] { (void)decodeRefCatalog(rawCatalog({rawEntryLine("missing", "removing", inc)})); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        (void)decodeRefCatalog(rawCatalog({withRemovalStartedRound(rawEntLine("forbidden", "live", inc), 21)}));
+        (void)decodeRefCatalog(rawCatalog({withRemovalStartedRound(rawEntryLine("forbidden", "live", inc), 21)}));
     });
 }
 
@@ -477,7 +492,7 @@ TEST(CASRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAbort
 #endif
 
 /// A namespace + creator server_root_id that both max out at their respective byte bounds (512 +
-/// 255), escaped worst-case, land one "ent" line over the 4 KiB line cap (~4.7 KiB) -- reachable
+/// 255), escaped worst-case, land one `entry` line over the 4 KiB line cap (~4.7 KiB) -- reachable
 /// because neither this codec nor `validateServerRootId` restricts the charset, only the length.
 /// The refusal must be `LIMIT_EXCEEDED` (a capacity refusal), not `LOGICAL_ERROR` (a bug report) --
 /// `encodeFoldSeal`'s own `checkLineBytes` raises `LIMIT_EXCEEDED` for the identical shape of gate.
@@ -496,60 +511,76 @@ TEST(CASRefCatalogFormat, EncodeLineOverCapRaisesLimitExceeded)
 
 TEST(CASRefCatalogFormat, DecodeRejectsDuplicateNamespace)
 {
-    const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(1))),
-                                    rawEntLine("a", "live", u128ToHex(UInt128(2)))});
+    const String bad = rawCatalog({rawEntryLine("a", "live", u128ToHex(UInt128(1))),
+                                    rawEntryLine("a", "live", u128ToHex(UInt128(2)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsNonCanonicalOrder)
 {
-    const String bad = rawCatalog({rawEntLine("b", "live", u128ToHex(UInt128(1))),
-                                    rawEntLine("a", "live", u128ToHex(UInt128(2)))});
+    const String bad = rawCatalog({rawEntryLine("b", "live", u128ToHex(UInt128(1))),
+                                    rawEntryLine("a", "live", u128ToHex(UInt128(2)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsCreatorPresentOnLive)
 {
-    const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(1)),
+    const String bad = rawCatalog({rawEntryLine("a", "live", u128ToHex(UInt128(1)),
                                                std::make_tuple(String("srv"), uint64_t(1), uint64_t(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsCreatorAbsentOnCreating)
 {
-    const String bad = rawCatalog({rawEntLine("a", "creating", u128ToHex(UInt128(1)))});
+    const String bad = rawCatalog({rawEntryLine("a", "creating", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsZeroIncarnation)
 {
-    const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(0)))});
+    const String bad = rawCatalog({rawEntryLine("a", "live", u128ToHex(UInt128(0)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsNameOverByteBound)
 {
     const String too_long_ns(kMaxNamespaceBytes + 1, 'a');
-    const String bad = rawCatalog({rawEntLine(too_long_ns, "live", u128ToHex(UInt128(1)))});
+    const String bad = rawCatalog({rawEntryLine(too_long_ns, "live", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsUnknownState)
 {
-    const String bad = rawCatalog({rawEntLine("a", "bogus", u128ToHex(UInt128(1)))});
+    const String bad = rawCatalog({rawEntryLine("a", "bogus", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
+}
+
+TEST(CASRefCatalogFormat, DecodeRejectsUnknownEntryKey)
+{
+    const String bad = rawCatalog(
+        {R"({"kind":"entry","ns":"a","state":"live","life":"00000000000000000000000000000001","unknown":"x"})"});
+    try
+    {
+        (void)decodeRefCatalog(bad);
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(e.message().find("unknown entry key"), String::npos) << e.message();
+    }
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsEmptyNamespace)
 {
-    const String bad = rawCatalog({rawEntLine("", "live", u128ToHex(UInt128(1)))});
+    const String bad = rawCatalog({rawEntryLine("", "live", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsMissingNamespaceKey)
 {
     /// No "ns" key at all -- must be refused exactly like an explicit empty one, not read as "".
-    const String bad = rawCatalog({R"({"k":"ent","st":"live","inc":")" + u128ToHex(UInt128(1)) + "\"}"});
+    const String bad = rawCatalog({R"({"kind":"entry","state":"live","life":")" + u128ToHex(UInt128(1)) + "\"}"});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
@@ -596,7 +627,7 @@ TEST(CASRefCatalogFormat, RegistryRowIsControlStrictWithRawStorage)
     EXPECT_EQ(traits.compression, CompressionPolicy::Never);
 }
 
-/// ---------- capacity admission: per-predicate boundary tests [codex r2/r3 finding 9] ----------
+/// ---------- capacity admission: per-predicate boundary tests ----------
 
 TEST(CASRefCatalogAdmission, Predicate1AcceptsEqualityRefusesCapPlusOne)
 {
@@ -688,7 +719,7 @@ TEST(CASRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimal
         {
             seal.ref_lives.emplace(std::numeric_limits<UInt128>::max() - i, RefLifeFoldState{
                 .coverage = RefCoverage{
-                    .classification = 4,
+                    .classification = CoverageClass::Clamped,
                     .last_folded_ref_id = RefTxnId{max, max},
                     .hold = RefHold{
                         .reason = HoldReason::UnconsumedSealCrossing,
@@ -699,7 +730,7 @@ TEST(CASRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimal
         }
         for (uint64_t shard = 0; shard < gc_shards; ++shard)
         {
-            /// Predicate 2 charges exactly `gc_shards` widest `btr` rows. This fixture is the maximum
+            /// Predicate 2 charges exactly `gc_shards` widest `blob_run` rows. This fixture is the maximum
             /// legal cardinality, not an optimistic producer convention: authoritative fold-seal
             /// grammar permits at most one run per shard and requires its canonical key to use seq 0.
             seal.blob_target_runs.push_back(RunRef{
@@ -1113,7 +1144,7 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
     CasFoldSeal held_parent;
     held_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
         .coverage = RefCoverage{
-            .classification = 4,
+            .classification = CoverageClass::Clamped,
             .last_folded_ref_id = RefTxnId{1, 2},
             .hold = RefHold{.offending_position = RefTxnId{1, 3}}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
@@ -1124,7 +1155,7 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
 
     CasFoldSeal mismatched_parent;
     mismatched_parent.ref_lives.emplace(UInt128{8}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
         backend, layout, removing, mismatched_parent, 5,
@@ -1133,7 +1164,7 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
 
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
     CatalogEntry live = removing;
@@ -1196,7 +1227,7 @@ TEST(CASRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
 
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(
         backend, layout, removing, ready_parent, 5,
@@ -1243,7 +1274,7 @@ TEST(CASRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrRepl
 
         CasFoldSeal ready_parent;
         ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-            .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+            .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
             .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
         std::optional<CatalogEntry> replacement;
         if (replace)
@@ -1290,7 +1321,7 @@ TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
         PutOutcome::Done);
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
@@ -1322,7 +1353,7 @@ TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolut
         PutOutcome::Done);
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
     size_t authority_checks = 0;
@@ -1359,7 +1390,7 @@ TEST(CASRefCatalogRemoval, CasPutExceptionPropagatesAfterMandatoryResolution)
         PutOutcome::Done);
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
     backend.armCasPutThrow(layout.refCatalogKey());
@@ -1432,12 +1463,12 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
 
     RefScanSummary ordinary_scan;
     ordinary_scan.parent_ref_lives.emplace(UInt128{1}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}}});
     ordinary_scan.parent_ref_lives.emplace(UInt128{3}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{3, 3}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{3, 3}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{3, 3}}});
     ordinary_scan.parent_ref_lives.emplace(UInt128{4}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{4, 4}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{4, 4}}});
     ordinary_scan.listed_lives = {UInt128{1}, UInt128{2}, UInt128{4}};
     ordinary_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 2}});
     ordinary_scan.holds.emplace(UInt128{2}, RefHold{.offending_position = RefTxnId{2, 2}});
@@ -1449,7 +1480,7 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     RefScanSummary rebuild_scan;
     rebuild_scan.parent_ref_lives.emplace(UInt128{1}, ordinary_scan.parent_ref_lives.at(UInt128{1}));
     rebuild_scan.parent_ref_lives.emplace(UInt128{5}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{5, 5}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{5, 5}}});
     rebuild_scan.listed_lives = {UInt128{1}, UInt128{3}, UInt128{5}};
     rebuild_scan.holds.emplace(UInt128{1}, RefHold{.offending_position = RefTxnId{1, 3}});
     rebuild_scan.holds.emplace(UInt128{3}, RefHold{.offending_position = RefTxnId{3, 4}});
@@ -1541,7 +1572,7 @@ TEST(CASGCStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
     EXPECT_NE(absent->find("terminal has not folded"), String::npos);
     EXPECT_EQ(absent->find("/_log/"), String::npos) << "an absent terminal has no exact id to name";
 
-    row.fold_state.coverage.classification = 4;
+    row.fold_state.coverage.classification = CoverageClass::Clamped;
     row.fold_state.coverage.hold = RefHold{
         .reason = HoldReason::BodyUndecodable,
         .offending_position = RefTxnId{5, 6}};
@@ -1601,7 +1632,7 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     seal.generation = 1;
     seal.ref_lives.emplace(life_id, RefLifeFoldState{
         .coverage = RefCoverage{
-            .classification = 4,
+            .classification = CoverageClass::Clamped,
             .hold = RefHold{
                 .reason = HoldReason::BodyUndecodable,
                 .offending_position = RefTxnId{5, 6},
@@ -1659,9 +1690,9 @@ TEST(CASGCRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
         .catalog = catalog, .token = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
     RefScanSummary scan;
     scan.parent_ref_lives.emplace(current_life, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{2, 3}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{2, 3}}});
     scan.parent_ref_lives.emplace(unmatched_life, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{9, 9}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{9, 9}}});
 
     const uint64_t events_before =
         ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load();
@@ -1697,7 +1728,7 @@ TEST(CASGCRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
     RefScanSummary observations;
     observations.max_log_by_life.emplace(UInt128{2}, RefTxnId{2, 7});
     observations.parent_ref_lives.emplace(UInt128{2}, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{2, 3}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{2, 3}}});
 
     const RefPlan plan = tests::buildRefWalkPlanForTest(observations, cut);
 

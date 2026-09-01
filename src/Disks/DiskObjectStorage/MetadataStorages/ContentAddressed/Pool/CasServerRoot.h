@@ -181,7 +181,7 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid,
 enum class MountPriorState
 {
     None,
-    Clean,             /// the predecessor's own graceful farewell (`min_active == UINT64_MAX`)
+    Clean,             /// the predecessor's own graceful farewell (`min_active_build_sequence == UINT64_MAX`)
     Fenced,            /// the GC leader's own (already threshold-gated) fence-out (`gc_fenced`)
     UncleanObserved,   /// OUR observation watched the write-token hold stable for the full threshold
 };
@@ -201,7 +201,7 @@ enum class MountPriorState
 ///     `claimMountAwaitingExpiry` below for how a plain "looks expired" reading is turned into one):
 ///       - `gc_fenced` (the GC leader already, itself, threshold-gated this incarnation dead; a fence
 ///         costs an epoch, so its keeper can never renew again) → reclaim, `prior = Fenced`;
-///       - the clean marker (`min_active == UINT64_MAX`, the predecessor's own graceful farewell) →
+///       - the clean marker (`min_active_build_sequence == UINT64_MAX`, the predecessor's own graceful farewell) →
 ///         reclaim, `prior = Clean`;
 ///       - `proven_dead_token` matches the CURRENTLY OBSERVED token (the caller itself watched this
 ///         exact token hold stable for the full observation threshold) → reclaim, `prior =
@@ -325,7 +325,7 @@ using MountObservationMap = std::map<String, MountTokenObservation>;
 /// dead mounts (liveness only — graduation itself paces on GC rounds, not on heartbeat acks).
 /// Classification per body:
 ///   - `gc_fenced` already set → excluded (`already_fenced`); a fenced mount is terminal, no PUT;
-///   - terminated (`min_active == UINT64_MAX`, the farewell sentinel stamped by
+///   - terminated (`min_active_build_sequence == UINT64_MAX`, the farewell sentinel stamped by
 ///     `MountLeaseKeeper::terminate`) → excluded (`terminated`). `expires_at_ms` alone cannot
 ///     distinguish a graceful farewell from an unclean stop, so the sentinel — not the timestamps — is the
 ///     terminated marker;
@@ -382,7 +382,7 @@ struct NonTerminalMountSlot
 /// still entitled to this prefix? A slot counts as terminal on exactly the two clock-free certificates
 /// the mount protocol already recognises (`computeHeartbeatFloor`'s own classification): `gc_fenced`
 /// (the GC leader fenced that incarnation out, and a fence costs an epoch, so its keeper can never
-/// renew again) and `min_active == UINT64_MAX` (the holder's own graceful farewell). Everything else is
+/// renew again) and `min_active_build_sequence == UINT64_MAX` (the holder's own graceful farewell). Everything else is
 /// reported, INCLUDING a body this build cannot decode -- an unreadable lease of some other format
 /// generation is precisely the case that must block, not the one to wave through.
 ///
@@ -398,7 +398,7 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(Backend & b, const 
 
 /// A read-only snapshot of one server's mount slot, for introspection (`system.cas_mounts`).
 /// state: `live` (lease within TTL+skew), `expired` (lease ran out; the next GC round's heartbeat floor
-/// will fence it), `terminated` (clean farewell: `min_active == UINT64_MAX`), `fenced` (`gc_fenced`),
+/// will fence it), `terminated` (clean farewell: `min_active_build_sequence == UINT64_MAX`), `fenced` (`gc_fenced`),
 /// `corrupt` (body failed to decode — surfaced as a row, never an exception).
 struct MountInfo
 {
@@ -436,7 +436,7 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
 /// identical question at pool-prefix and GC-heartbeat granularity —
 ///   - `gc_fenced` (the GC leader already fenced this incarnation; a fence costs an epoch, so its
 ///     keeper can never renew again),
-///   - the clean-farewell sentinel `min_active == UINT64_MAX`,
+///   - the clean-farewell sentinel `min_active_build_sequence == UINT64_MAX`,
 /// PLUS one more certificate available here that neither of those needs: a DIFFERENT `writer_epoch`
 /// currently live at that slot proves `writer_epoch`'s specific incarnation is superseded regardless of
 /// its OWN certificate — `allocateWriterEpoch`/`claimMount` are why an epoch, once superseded, is never
@@ -487,7 +487,7 @@ public:
     MountLeaseKeeper(
         BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-        std::function<uint64_t()> min_active_fn_,
+        std::function<uint64_t()> min_active_build_sequence_fn_,
         CasEventSink event_sink_ = {},
         std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(2000),
         /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for
@@ -504,7 +504,7 @@ public:
     uint64_t lastCommittedAttemptStartBootMs() const { return last_committed_attempt_start_boot_ms; }
 
 private:
-    String encodeBody(uint64_t seq_, uint64_t wall_ms, uint64_t min_active, UInt128 write_attempt_id) const;
+    String encodeBody(uint64_t seq_, uint64_t wall_ms, uint64_t min_active_build_sequence, UInt128 write_attempt_id) const;
     Token claim(const String & body);
     [[noreturn]] void throwRenewConflict(const CasOverwriteDiagnostics & diagnostics) const;
     MountRenewResult terminalResult(
@@ -521,7 +521,7 @@ private:
     uint64_t writer_epoch;
     std::chrono::milliseconds ttl;
     std::function<uint64_t()> now_ms_fn;
-    std::function<uint64_t()> min_active_fn;
+    std::function<uint64_t()> min_active_build_sequence_fn;
     CasEventSink event_sink;
     std::chrono::milliseconds lease_safety_margin;
     /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for

@@ -35,9 +35,8 @@ struct RefOwnerBinding
     bool operator==(const RefOwnerBinding &) const = default;
 };
 
-/// Convert an owner-kind discriminator to its canonical text word. Throws `CORRUPTED_DATA` for a
-/// value not represented by this format; accepting an unknown value would produce an ambiguous wire
-/// record.
+/// Convert an owner-kind discriminator to its canonical text word. Throws `LOGICAL_ERROR` for an
+/// out-of-range enum value.
 std::string_view refOwnerKindToWord(RefOwnerKind k);
 
 /// Parse a canonical owner-kind word. `what` identifies the containing field in the
@@ -48,7 +47,7 @@ RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what);
 /// in-progress JSON object, both as decimal STRINGS -- the representation is width-independent, so no
 /// consumer has to care how large a `ref_sequence` can get. `epoch_key`/`seq_key` name the two fields,
 /// letting each format distinguish its primary id from any secondary id it embeds (for example,
-/// `cas_ref_log`'s `we`/`rs` versus its `prev_epoch_seal` pair) while sharing one writer so the
+/// `cas_ref_log`'s `txn_epoch`/`txn_seq` versus its `prev_epoch_seal` pair) while sharing one writer so the
 /// formats can never disagree on the representation.
 void writeRefTxnIdFields(CasJsonWriter & out, bool & first, WireKey epoch_key, WireKey seq_key, const RefTxnId & id);
 

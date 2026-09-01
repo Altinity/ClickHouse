@@ -1,18 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include "cas_test_helpers.h"
 #include <algorithm>
-
-namespace DB::ErrorCodes
-{
-    extern const int UNKNOWN_FORMAT_VERSION;
-}
 
 /// Namespace files are keyed by an opaque LIFE, not by its name: `cas/ns/state/<life_id>/_files/<name>`
 /// (Stage B Task 4b, directive design change 2). This file pins the three properties that re-key exists
@@ -228,52 +222,4 @@ TEST(CASNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
     ASSERT_TRUE(row_it->second.cleanup_evidence.has_value());
     EXPECT_EQ(row_it->second.cleanup_evidence->remove_txn_id, (RefTxnId{1, 1}));
     EXPECT_TRUE(backend->head(debris_key).exists) << "cleanup evidence does not gate on physical deletion";
-}
-
-/// An old-format pool carrying unqualified `roots/<ns>/_files/x` keys is REFUSED AT OPEN. It is not
-/// read, not migrated, and not silently re-keyed: the file layer rides Task 4's format bump B, and the
-/// pool-open floor is what makes "there is nothing to migrate" true rather than merely intended.
-///
-/// Asserted at OPEN rather than at the parser on purpose: `Layout` has no unqualified key constructor
-/// at all (a compile-time concept check in `gtest_cas_namespace_life_id.cpp` pins that, and
-/// `parseNamespaceFileKey`'s refusal of a legacy key is pinned there too), so the only reachable
-/// question left is whether a pool that CONTAINS such keys can be opened. It cannot.
-TEST(CASNsFileIncarnation, LegacyUnqualifiedFileKeyIsRefusedAtOpen)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    const Layout layout("p");
-
-    /// A generation-5 `_pool_meta`: the current encoder's output with its header generation moved back
-    /// one, so every other byte is exactly what that generation really wrote.
-    PoolMeta meta;
-    meta.pool_id = hexToU128("0123456789abcdef0123456789abcdef");
-    meta.blob_header_len = 256;
-    meta.min_reader_generation = kNamespaceLifeKeyedGeneration - 1;
-    meta.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
-    String encoded = encodePoolMeta(meta);
-    const String current_v = "\"v\":" + std::to_string(G_BUILD);
-    const String legacy_v = "\"v\":" + std::to_string(kNamespaceLifeKeyedGeneration);
-    const size_t at = encoded.find(current_v);
-    /// Guard the substitution itself: a silent no-op here would leave a CURRENT-generation pool and the
-    /// test would pass by opening a pool it believes it downgraded.
-    ASSERT_NE(at, String::npos) << "pool-meta header no longer spells its generation as " << current_v;
-    encoded.replace(at, current_v.size(), legacy_v);
-    ASSERT_NE(encoded.find(legacy_v), String::npos);
-    backend->putIfAbsent(layout.poolMetaKey(), encoded);
-
-    /// The legacy artifact this task removes: a namespace file keyed by NAME ONLY, with no incarnation
-    /// segment. Written as raw bytes because no code path in the tree can produce this key any more.
-    backend->putIfAbsent("p/roots/" + kNsString + "/_files/" + kFile, "1\n");
-
-    try
-    {
-        openPoolForTest(backend);
-        FAIL() << "an old-format pool must fail closed at open, naming recreation";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find("recreate"), String::npos)
-            << "the refusal must tell the operator what to do; got: " << e.message();
-    }
 }

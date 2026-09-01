@@ -1352,11 +1352,11 @@ TEST(CASMountLease, BodyCarriesFloorAndFence)
     m.started_at_ms = 1000;
     m.seq = 3;
     m.expires_at_ms = 2000;
-    m.min_active = 5;
+    m.min_active_build_sequence = 5;
     m.gc_fenced = true;
     m.write_attempt_id = UInt128{1};
     const MountLease d = decodeMountLease(encodeMountLease(m));
-    EXPECT_EQ(d.min_active, 5u);
+    EXPECT_EQ(d.min_active_build_sequence, 5u);
     EXPECT_TRUE(d.gc_fenced);
     EXPECT_EQ(d.writer_epoch, 7u);
 }
@@ -1364,9 +1364,9 @@ TEST(CASMountLease, BodyCarriesFloorAndFence)
 TEST(CASMountLease, RetiredSentinelRoundTrips)
 {
     MountLease m;
-    m.min_active = std::numeric_limits<uint64_t>::max();
+    m.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
     m.write_attempt_id = UInt128{1};
-    EXPECT_EQ(decodeMountLease(encodeMountLease(m)).min_active,
+    EXPECT_EQ(decodeMountLease(encodeMountLease(m)).min_active_build_sequence,
               std::numeric_limits<uint64_t>::max());
 }
 
@@ -1386,7 +1386,7 @@ constexpr uint64_t kStableThresholdMs = 10'000;
 /// `putIfAbsent`) — the same interface the keeper writes through.
 MountLease seedMount(
     Backend & b, const Layout & l, const String & srid,
-    uint64_t expires_at_ms, bool gc_fenced, uint64_t min_active, uint64_t seq = 1)
+    uint64_t expires_at_ms, bool gc_fenced, uint64_t min_active_build_sequence, uint64_t seq = 1)
 {
     MountLease m;
     m.server_uuid = UInt128(srid.back());   // distinct per srid; content is irrelevant to the gate
@@ -1396,7 +1396,7 @@ MountLease seedMount(
     m.started_at_ms = kNowMs;
     m.seq = seq;
     m.expires_at_ms = expires_at_ms;
-    m.min_active = min_active;
+    m.min_active_build_sequence = min_active_build_sequence;
     m.gc_fenced = gc_fenced;
     m.write_attempt_id = UInt128{1};
     b.putIfAbsent(l.mountKey(srid), encodeMountLease(m));
@@ -1425,7 +1425,7 @@ TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
 
     /// A stamp that would have read as long-expired under the old skew-margin comparison — under
     /// rev.6 observation the stamp is never even consulted for the fence decision.
-    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
     const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, /*now_ms*/ kNowMs, /*mono_now_ms*/ 0,
@@ -1441,7 +1441,7 @@ TEST(CASHeartbeatFloor, StableTokenPastThresholdIsFenced)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
     const HeartbeatFloor floor_before = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
@@ -1465,7 +1465,7 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
     computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
@@ -1494,8 +1494,8 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
-    seedMount(*b, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    seedMount(*b, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
     computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
@@ -1526,15 +1526,15 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
 
     /// two live mounts — genuinely renewing between the two rounds below, so their observation never
     /// stabilizes.
-    seedMount(*b, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
-    seedMount(*b, l, "s2", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    seedMount(*b, l, "s2", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
     /// dead — no renewal between the two rounds below — must be fenced-out by the second call.
-    seedMount(*b, l, "s3", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s3", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
     /// already-fenced — excluded, body byte-identical after both calls (no PUT).
-    seedMount(*b, l, "s4", /*expires*/ kNowMs - 60'000, /*fenced*/ true, /*min_active*/ 0);
-    /// terminated (min_active == UINT64_MAX) with expired-looking timestamps — excluded, not fenced.
+    seedMount(*b, l, "s4", /*expires*/ kNowMs - 60'000, /*fenced*/ true, /*min_active_build_sequence*/ 0);
+    /// terminated (min_active_build_sequence == UINT64_MAX) with expired-looking timestamps — excluded, not fenced.
     seedMount(*b, l, "s5", /*expires*/ kNowMs - 60'000, /*fenced*/ false,
-              /*min_active*/ std::numeric_limits<uint64_t>::max());
+              /*min_active_build_sequence*/ std::numeric_limits<uint64_t>::max());
 
     MountObservationMap obs;
 
@@ -1627,7 +1627,7 @@ TEST(CASHeartbeatFloor, FenceOutLosesTokenRaceReclassifiesLive)
     auto b = std::make_shared<RenewOnFenceBackend>(
         l.mountKey("s1"), /*renewed_expires*/ kNowMs + 120'000);
 
-    seedMount(*b, l, "s1", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s1", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
     /// Round 1: first sight, observation starts — never reaches the fence-out path (the race
@@ -1912,7 +1912,7 @@ TEST(CASFenceTerminal, CleanFarewellIsTerminal)
     auto got = b.get(l.mountKey("r"));
     ASSERT_TRUE(got.has_value());
     MountLease retired = decodeMountLease(got->bytes);
-    retired.min_active = std::numeric_limits<uint64_t>::max();
+    retired.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
     ASSERT_EQ(b.putOverwrite(l.mountKey("r"), encodeMountLease(retired), got->token).outcome, PutOutcome::Done);
 
     EXPECT_TRUE(isCreatorFenceTerminal(b, l, "r", 7));

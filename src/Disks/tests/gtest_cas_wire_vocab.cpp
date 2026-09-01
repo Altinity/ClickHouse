@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromMemory.h>
+
+#include <magic_enum.hpp>
 
 using namespace DB::Cas;
 
@@ -44,6 +47,23 @@ TEST(CASWireVocab, EnumTablesPinTheCurrentWords)
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::XXH3_128, "t"), "xxh3");
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::Sha256, "t"), "sha256");
     EXPECT_EQ(kObjectKindWords.toWord(ObjectKind::Blob, "t"), "blob");
+    EXPECT_EQ(refOwnerKindToWord(RefOwnerKind::Committed), "committed");
+    EXPECT_EQ(refOwnerKindToWord(RefOwnerKind::Precommit), "precommit");
+}
+
+/// Every enum wire table's closed set, walked through `magic_enum::enum_values` rather than a
+/// hand-copied list -- a future enumerator the encoder can construct but no table entry covers
+/// would otherwise round-trip silently through the untested value.
+TEST(CASWireVocab, ClosedSetsRoundTripEveryEnumeratorExhaustively)
+{
+    for (const auto t : magic_enum::enum_values<TokenType>())
+        EXPECT_EQ(tokenTypeFromWord(tokenTypeToWord(t), "t"), t);
+    for (const auto k : magic_enum::enum_values<ObjectKind>())
+        EXPECT_EQ(objectKindFromWord(objectKindToWord(k), "k"), k);
+    for (const auto a : magic_enum::enum_values<BlobHashAlgo>())
+        EXPECT_EQ(blobHashAlgoFromWord(blobHashAlgoName(a), "a"), a);
+    for (const auto k : magic_enum::enum_values<RefOwnerKind>())
+        EXPECT_EQ(refOwnerKindFromWord(refOwnerKindToWord(k), "k"), k);
 }
 
 TEST(CASWireVocab, EnumWordsRoundTrip)
@@ -67,7 +87,7 @@ TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
     closeObject(out, first);
     const String rendered = std::move(out).take();
     EXPECT_EQ(rendered,
-        R"({"tt":"etag","tv":"etag-abc\"x","ha":"ch128","h":"00112233445566778899aabbccddeeff"})");
+        R"({"token_type":"etag","token":"etag-abc\"x","algo":"ch128","digest":"00112233445566778899aabbccddeeff"})");
 
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
@@ -78,10 +98,10 @@ TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
     TokenType tt{};
     while (r.nextKey(key))
     {
-        if (key == "tt") tt = tokenTypeFromWord(r.readString(), "t");
-        else if (key == "tv") tv = r.readString();
-        else if (key == "ha") ha = r.readString();
-        else if (key == "h") h = r.readString();
+        if (key == "token_type") tt = tokenTypeFromWord(r.readString(), "t");
+        else if (key == "token") tv = r.readString();
+        else if (key == "algo") ha = r.readString();
+        else if (key == "digest") h = r.readString();
         else r.skipUnknown(key);
     }
     EXPECT_EQ(tt, TokenType::ETag);
@@ -97,13 +117,13 @@ TEST(CASWireVocab, ManifestRefBundleWritesTheOldPrefixedKeys)
     bool first = true;
     writeManifestRefFields(w, first, kOldManifestRefKeys, ManifestRef{1, 2, 3});
     w.closeObject(first);
-    EXPECT_EQ(std::move(w).take(), R"({"ome":"1","omb":"2","omo":3})");
+    EXPECT_EQ(std::move(w).take(), R"({"old_epoch":"1","old_build":"2","old_ord":3})");
 }
 
 TEST(CASWireVocab, MatchAndBuildRoundTripsABlobRef)
 {
     using namespace DB::Cas;
-    const String rendered = R"({"ha":"ch128","h":"00112233445566778899aabbccddeeff"})";
+    const String rendered = R"({"algo":"ch128","digest":"00112233445566778899aabbccddeeff"})";
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
     BlobRefFields fields;
@@ -143,10 +163,10 @@ TEST(CASWireVocab, BlobRefBuildFailsClosedOnRightWidthNonHexDigest)
 TEST(CASWireVocab, MatchManifestRefFieldsAndBuildRefRoundTripInAnyKeyOrder)
 {
     using namespace DB::Cas;
-    /// Fed out of writer order (mo, me, mb) to pin key-order independence. `me`/`mb` are quoted
-    /// decimal strings and `mo` is a bare number -- a swapped read primitive between the two shapes
+    /// Fed out of writer order (ord, epoch, build) to pin key-order independence. `epoch`/`build` are quoted
+    /// decimal strings and `ord` is a bare number -- a swapped read primitive between the two shapes
     /// would fail to parse this literal.
-    const String rendered = R"({"mo":3,"me":"7","mb":"9"})";
+    const String rendered = R"({"ord":3,"epoch":"7","build":"9"})";
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
     ManifestRefFields fields;
@@ -168,10 +188,10 @@ TEST(CASWireVocab, ManifestRefFieldsBuildRefFailsClosedOnHalfAGroup)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { fields.buildRef("t", "ctx"); });
 }
 
-TEST(CASWireVocab, MatchTokenFieldsConsumesTtTvAndLeavesUnrelatedKeyUnmatched)
+TEST(CASWireVocab, MatchTokenFieldsConsumesSemanticKeysAndLeavesUnrelatedKeyUnmatched)
 {
     using namespace DB::Cas;
-    const String rendered = R"({"tt":"etag","tv":"abc","zz":1})";
+    const String rendered = R"({"token_type":"etag","token":"abc","zz":1})";
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
     TokenFields fields;
@@ -189,4 +209,50 @@ TEST(CASWireVocab, MatchTokenFieldsConsumesTtTvAndLeavesUnrelatedKeyUnmatched)
     ASSERT_TRUE(fields.value.has_value());
     EXPECT_EQ(*fields.value, "abc");
     EXPECT_TRUE(saw_unmatched);
+}
+
+TEST(CASWireVocab, TokenFieldsBuildsInAnyKeyOrderAndRequiresBothFields)
+{
+    const String rendered = R"({"token":"abc","token_type":"etag"})";
+    DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
+    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    TokenFields fields;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (matchTokenFields(key, r, fields))
+            continue;
+        r.skipUnknown(key);
+    }
+    EXPECT_EQ(fields.build("t"), (Token{"abc", TokenType::ETag}));
+
+    TokenFields only_type;
+    only_type.type_word = "etag";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { only_type.build("t"); });
+}
+
+TEST(CASWireVocab, OldManifestEpochKeyDoesNotAliasTheSemanticKey)
+{
+    const String rendered = R"({"me":"1","build":"2","ord":3})";
+    DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
+    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    ManifestRefFields fields;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (matchManifestRefFields(key, r, kBareManifestRefKeys, fields))
+            continue;
+        r.skipUnknown(key);
+    }
+
+    try
+    {
+        fields.buildRef("RefTableSnapshot", "committed");
+        FAIL() << "expected DB::Exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_EQ(e.message(), "CAS RefTableSnapshot: committed manifest_ref missing epoch/build/ord");
+    }
 }

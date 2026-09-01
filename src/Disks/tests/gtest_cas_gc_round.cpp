@@ -631,7 +631,7 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 
 /// A fully idle fold pure-carries every shard's authoritative rows verbatim. The parent is first made
 /// non-vacuous with one live blob in each of two shards; the forced no-delta successor must preserve
-/// both `btr` rows and the total `cnd` domain byte-for-byte.
+/// both `blob_run` rows and the total `condemned` domain byte-for-byte.
 TEST(CASGCRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -675,9 +675,9 @@ TEST(CASGCRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
     EXPECT_TRUE(seal1.condemned_summary.contains(0) && seal1.condemned_summary.contains(1));
     EXPECT_TRUE(seal2.condemned_summary.contains(0) && seal2.condemned_summary.contains(1));
 
-    /// Capacity reserves one widest `btr` row per shard. Pin the production pure-carry seal to the
+    /// Capacity reserves one widest `blob_run` row per shard. Pin the production pure-carry seal to the
     /// authoritative grammar that makes that bound sufficient: at most one in-range canonical seq-0
-    /// run per shard, beside exactly one `cnd` row for every shard.
+    /// run per shard, beside exactly one `condemned` row for every shard.
     bool run_seen[2] = {false, false};
     ASSERT_EQ(seal1.blob_target_runs.size(), 2u);
     ASSERT_EQ(seal2.blob_target_runs.size(), 2u);
@@ -1808,7 +1808,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     const ManifestRef r2 = ref(5, 0xCA02);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_epoch, /*min_active*/6);
+    setWatermarkMinActive(*backend, store->layout(), "test", r1.writer_epoch, /*min_active_build_sequence*/6);
 
     /// The §6 deletion premise is a second precondition on every sweep deletion: a manifest of an
     /// epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an epoch
@@ -1823,7 +1823,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     /// injected cursor would prove only that the premise reads a number, not that the number can be
     /// produced.
     ///
-    /// The live publications use build sequences ABOVE the watermark's `min_active`, so the only
+    /// The live publications use build sequences ABOVE the watermark's `min_active_build_sequence`, so the only
     /// sweep-ELIGIBLE manifests in the namespace remain the two debris bodies -- the premise, not the
     /// watermark, is what this test varies.
     publishAt(*backend, store->layout(), ns, RefTxnId{1, 1}, "tbl", /*build_sequence=*/7,
@@ -1900,7 +1900,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     foreign_config.server_root_id = "test";
     auto invalid_store = openTestPoolWithConfig(foreign_backend, std::move(foreign_config));
     const String foreign_mount_key = invalid_store->layout().mountKey("test");
-    setWatermarkMinActive(*foreign_backend, invalid_store->layout(), "test", r1.writer_epoch, /*min_active*/6);
+    setWatermarkMinActive(*foreign_backend, invalid_store->layout(), "test", r1.writer_epoch, /*min_active_build_sequence*/6);
     const auto occupant_before = foreign_backend->get(foreign_mount_key);
     ASSERT_TRUE(occupant_before.has_value());
     const uint64_t violations_before

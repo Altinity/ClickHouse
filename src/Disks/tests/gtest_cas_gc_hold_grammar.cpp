@@ -24,9 +24,9 @@
 /// DURABLE HOLDS (spec 2026-07-27 "ref chain complete cut" §5).
 ///
 /// A namespace whose ref-log walk meets an IMPOSSIBLE shape stops there, and that stop has to survive
-/// the round. Before this task the stop was a single bit — `classification == 4` — and everything that
-/// explained it (what went wrong, and exactly WHERE) lived in a log line and an in-memory anomaly, both
-/// gone by the next round. That is not enough for three separate reasons:
+/// the round. Before this task the stop was a single bit — `classification == CoverageClass::Clamped` —
+/// and everything that explained it (what went wrong, and exactly WHERE) lived in a log line and an
+/// in-memory anomaly, both gone by the next round. That is not enough for three separate reasons:
 ///
 ///   * the next round could not RETRY the exact position, so a hold only survived while the round's
 ///     hint happened to keep mentioning the namespace;
@@ -36,10 +36,10 @@
 ///     baseline that looked proven when it was not.
 ///
 /// So the hold is now DURABLE and STRICTLY GRAMMARED: `{reason, offending_position, retry_count,
-/// next_retry_round}` present if and only if `classification == 4`, rejected in both directions
-/// otherwise. It rides the seal across rounds — including rounds whose hint omits the namespace
-/// entirely — and across REBUILD, and it clears by exactly ONE event: the fold resolving the offending
-/// position and that result being adopted in `gc/state`.
+/// next_retry_round}` present if and only if `classification == CoverageClass::Clamped`, rejected in
+/// both directions otherwise. It rides the seal across rounds — including rounds whose hint omits the
+/// namespace entirely — and across REBUILD, and it clears by exactly ONE event: the fold resolving the
+/// offending position and that result being adopted in `gc/state`.
 ///
 /// The carried hold is also a WITNESS, and a better one than the listing: it is durable proof that the
 /// walk once reached that position, so an absent below it is a gap rather than a frontier no matter
@@ -177,8 +177,8 @@ RefHold holdOf(Backend & backend, const Layout & layout, const RootNamespace & n
     EXPECT_TRUE(cov.has_value()) << "no coverage row for " << ns.string();
     if (!cov)
         return RefHold{};
-    EXPECT_EQ(cov->classification, 4) << "a held namespace is classification 4";
-    EXPECT_TRUE(cov->hold.has_value()) << "classification 4 without a hold is the forbidden shape";
+    EXPECT_EQ(cov->classification, CoverageClass::Clamped) << "a held namespace is classification clamped";
+    EXPECT_TRUE(cov->hold.has_value()) << "classification clamped without a hold is the forbidden shape";
     return cov->hold ? *cov->hold : RefHold{};
 }
 
@@ -206,7 +206,7 @@ CasFoldSeal maximalHoldSeal(const String & map_key)
     seal.generation = std::numeric_limits<uint64_t>::max();
     seal.parent_generation = std::numeric_limits<uint64_t>::max();
     RefCoverage cov;
-    cov.classification = 4;
+    cov.classification = CoverageClass::Clamped;
     cov.last_folded_ref_id = RefTxnId{std::numeric_limits<uint64_t>::max(),
                                       std::numeric_limits<uint64_t>::max()};
     cov.hold = RefHold{.reason = HoldReason::UnconsumedSealCrossing,   /// the longest reason word
@@ -233,7 +233,7 @@ CasFoldSeal cleanSeal(const String & map_key)
     seal.generation = 3;
     seal.parent_generation = 2;
     RefCoverage cov;
-    cov.classification = 2;
+    cov.classification = CoverageClass::Folded;
     cov.last_folded_ref_id = RefTxnId{4, 5};
     fixtureCoverage(seal, map_key) = cov;
     return seal;
@@ -245,7 +245,7 @@ CasFoldSeal heldSeal(const String & map_key)
 {
     CasFoldSeal seal = cleanSeal(map_key);
     RefCoverage & cov = fixtureCoverage(seal, map_key);
-    cov.classification = 4;
+    cov.classification = CoverageClass::Clamped;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{4, 6},
                        .retry_count = 7, .next_retry_round = 99};
     return seal;
@@ -271,20 +271,6 @@ String sealTextWith(const String & prototype, const std::vector<String> & record
     return text + "{\"n\":" + std::to_string(records.size()) + "}\n";
 }
 
-/// Replace the coverage row's `cls` value with `raw`, VERBATIM. The point is to write integers no
-/// `RefCoverage` can hold: the field is a byte in the struct, so a wide value exists only on the wire,
-/// which is exactly where a reader has to catch it. `cls` is never the last field of a `cov` record, so
-/// the value always ends at a comma.
-String withRawClassification(const String & encoded, std::string_view raw)
-{
-    const size_t at = encoded.find("\"cls\":");
-    EXPECT_NE(at, String::npos);
-    const size_t begin = at + strlen("\"cls\":");
-    const size_t end = encoded.find(',', begin);
-    EXPECT_NE(end, String::npos);
-    return encoded.substr(0, begin) + String{raw} + encoded.substr(end);
-}
-
 /// Replace the FIRST occurrence of `field` with `replacement` (both are whole `"key":value` fragments),
 /// so a test states the exact wire shape it is feeding the decoder.
 String withField(const String & encoded, const String & field, const String & replacement)
@@ -303,24 +289,27 @@ std::vector<std::pair<const char *, CasFoldSeal>> illFormedSealsTheEncoderMustRe
 
     /// The pairing, both ways round.
     CasFoldSeal hold_on_folded = heldSeal("ns/0");
-    fixtureCoverage(hold_on_folded, "ns/0").classification = 2;
-    out.emplace_back("a hold on a folded (2) row claims a stop that did not happen", hold_on_folded);
+    fixtureCoverage(hold_on_folded, "ns/0").classification = CoverageClass::Folded;
+    out.emplace_back("a hold on a folded row claims a stop that did not happen", hold_on_folded);
 
     CasFoldSeal clamped_without_hold = heldSeal("ns/0");
     fixtureCoverage(clamped_without_hold, "ns/0").hold.reset();
-    out.emplace_back("a clamped (4) row with no hold is indistinguishable from a clean cursor once "
+    out.emplace_back("a clamped row with no hold is indistinguishable from a clean cursor once "
                      "durable", clamped_without_hold);
 
-    /// The closed set. 3 is the dangerous one: it passes the sweep's `== 4` and `== 0` refusals and
-    /// reaches the deletion premise, which is a refusal written in terms of the set.
-    CasFoldSeal classification_three = cleanSeal("ns/0");
-    fixtureCoverage(classification_three, "ns/0").classification = 3;
-    out.emplace_back("classification 3 is not one of {0,1,2,4} and passes every refusal stated in terms "
-                     "of them", classification_three);
+    /// The closed set is now the enum's declared values, so only an explicit cast reaches outside it.
+    /// 4 is the sharpest value to plant: it was the wire value for Clamped before this task's dense
+    /// renumbering, and under the new table it is simply out of range.
+    CasFoldSeal classification_retired_wire_value = cleanSeal("ns/0");
+    fixtureCoverage(classification_retired_wire_value, "ns/0").classification
+        = static_cast<CoverageClass>(4);
+    out.emplace_back("classification 4 is outside the four values the wire table declares",
+                     classification_retired_wire_value);
 
     CasFoldSeal classification_max = cleanSeal("ns/0");
-    fixtureCoverage(classification_max, "ns/0").classification = 255;
-    out.emplace_back("classification 255 is not one of {0,1,2,4}", classification_max);
+    fixtureCoverage(classification_max, "ns/0").classification = static_cast<CoverageClass>(255);
+    out.emplace_back("classification 255 is outside the four values the wire table declares",
+                     classification_max);
 
     /// The self-erasing hold, and its half-zero sibling.
     CasFoldSeal hold_at_zero = heldSeal("ns/0");
@@ -371,7 +360,7 @@ TEST(CASGCHoldGrammarBudget, SumsSaturateInsteadOfWrapping)
     EXPECT_FALSE(fitsObjectCap(kMax, 2, 256 * 1024 * 1024));
 }
 
-/// ===================== THE STRICT CLASSIFICATION-4 GRAMMAR =====================
+/// ===================== THE STRICT CLAMPED-CLASSIFICATION GRAMMAR =====================
 
 TEST(CASGCHoldGrammar, EveryHoldReasonRoundTrips)
 {
@@ -383,7 +372,7 @@ TEST(CASGCHoldGrammar, EveryHoldReasonRoundTrips)
         seal.generation = 3;
         seal.parent_generation = 2;
         RefCoverage cov;
-        cov.classification = 4;
+        cov.classification = CoverageClass::Clamped;
         cov.last_folded_ref_id = RefTxnId{4, 5};
         cov.hold = RefHold{.reason = reason, .offending_position = RefTxnId{4, 6},
                            .retry_count = 7, .next_retry_round = 99};
@@ -432,23 +421,20 @@ TEST(CASGCHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedByTheDecoder)
 
     /// Bytes some other producer wrote. Built by demoting a legitimate held row's classification, so the
     /// hold fields are exactly the ones the encoder emits.
-    cov.classification = 4;
+    cov.classification = CoverageClass::Clamped;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
                        .retry_count = 0, .next_retry_round = 1};
     fixtureCoverage(seal, "ns/0") = cov;
-    String text = encodeFoldSeal(seal);
-    const size_t at = text.find("\"cls\":4");
-    ASSERT_NE(at, String::npos);
-    text[at + 6] = '2';
+    const String text = withField(encodeFoldSeal(seal), R"("class":"clamped")", R"("class":"folded")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(text); });
 }
 
-TEST(CASGCHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
+TEST(CASGCHoldGrammar, ClampedWithoutAHoldIsRefusedByTheDecoder)
 {
     CasFoldSeal seal;
     seal.generation = 1;
     RefCoverage cov;
-    cov.classification = 4;
+    cov.classification = CoverageClass::Clamped;
     cov.last_folded_ref_id = RefTxnId{1, 1};
 
     /// Every single hold field is REQUIRED: dropping any one of them is corruption, not a default.
@@ -456,8 +442,8 @@ TEST(CASGCHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
                        .retry_count = 3, .next_retry_round = 4};
     fixtureCoverage(seal, "ns/0") = cov;
     const String whole = encodeFoldSeal(seal);
-    for (const String & field : {String(R"("hr":"body_undecodable")"), String(R"("hpe":"1")"),
-                                 String(R"("hps":"2")"), String(R"("hrc":3)"), String(R"("hnr":"4")")})
+    for (const String & field : {String(R"("hold_reason":"body_undecodable")"), String(R"("hold_epoch":"1")"),
+                                 String(R"("hold_seq":"2")"), String(R"("retries":3)"), String(R"("retry_round":"4")")})
     {
         SCOPED_TRACE("without " + field);
         const size_t at = whole.find(field);
@@ -473,18 +459,18 @@ TEST(CASGCHoldGrammar, DuplicateHoldKeyIsCorruptedData)
     CasFoldSeal seal;
     seal.generation = 1;
     RefCoverage cov;
-    cov.classification = 4;
+    cov.classification = CoverageClass::Clamped;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
                        .retry_count = 0, .next_retry_round = 5};
     fixtureCoverage(seal, "ns/0") = cov;
 
     const String whole = encodeFoldSeal(seal);
-    const String field = R"("hr":"gap_below_witness")";
+    const String field = R"("hold_reason":"gap_below_witness")";
     const size_t at = whole.find(field);
     ASSERT_NE(at, String::npos);
     /// The same key twice, with a DIFFERENT value: last-wins would silently rewrite the reason.
     String doubled = whole;
-    doubled.insert(at, R"("hr":"witness_disappeared",)");
+    doubled.insert(at, R"("hold_reason":"witness_disappeared",)");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(doubled); });
 }
 
@@ -493,7 +479,7 @@ TEST(CASGCHoldGrammar, UnknownHoldReasonWordIsCorruptedData)
     CasFoldSeal seal;
     seal.generation = 1;
     RefCoverage cov;
-    cov.classification = 4;
+    cov.classification = CoverageClass::Clamped;
     cov.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{1, 2},
                        .retry_count = 0, .next_retry_round = 5};
     fixtureCoverage(seal, "ns/0") = cov;
@@ -510,48 +496,46 @@ TEST(CASGCHoldGrammar, UnknownHoldReasonWordIsCorruptedData)
 /// The three shapes below are one finding, and it is about what a fold seal is FOR. The hold is the only
 /// durable record that a namespace stopped and where; everything downstream reads the seal and nothing
 /// re-derives the stop. So a seal that decodes into "no hold here" is not a lossy read, it is a licence
-/// to delete: the sweep's §6 refusals are stated as `classification == 4` / `== 0` / `hold.has_value()`,
-/// and a row that slips past all three reaches an irreversible delete of a manifest the fold never
-/// accounted for. Each shape gets past a DIFFERENT one of the decoder's checks, which is why they are
-/// pinned separately rather than as one "malformed seal" case.
+/// to delete: the sweep's §6 refusals are stated as `classification == Clamped` / `== Absent` /
+/// `hold.has_value()`, and a row that slips past all three reaches an irreversible delete of a manifest
+/// the fold never accounted for. Each shape gets past a DIFFERENT one of the decoder's checks, which is
+/// why they are pinned separately rather than as one "malformed seal" case.
 
-/// (1) The classification the reader never sees. `cls` is narrowed to a byte, so an integer on the wire
-/// is truncated first and validated (if at all) afterwards: 258 becomes 2, "everything through the
-/// cursor was folded". The value has to be judged WIDE, before the narrowing, or the wire can buy
-/// coverage that no fold ever performed.
+/// (1) The classification is a WORD, closed the same way `hold_reason` already is:
+/// `coverageClassFromWord` refuses anything outside the four named values as `CORRUPTED_DATA` before a
+/// `CoverageClass` is ever constructed, so there is no wide-integer narrowing attack left to catch here —
+/// the wire carries no integer at all.
 TEST(CASGCHoldGrammar, AClassificationOutsideTheGrammarIsCorruptedData)
 {
     const String clean = encodeFoldSeal(cleanSeal("ns/0"));
-    ASSERT_EQ(fixtureCoverage(decodeFoldSeal(clean), "ns/0").classification, 2)
+    ASSERT_EQ(fixtureCoverage(decodeFoldSeal(clean), "ns/0").classification, CoverageClass::Folded)
         << "the unmodified row is the one every case below deviates from";
 
-    /// In-range bytes that are simply not classifications. 3 is the one the sweep's refusals miss.
-    for (const std::string_view raw : {"3", "5", "6", "255"})
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        SCOPED_TRACE(String{"cls="} + String{raw});
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                         [&] { decodeFoldSeal(withRawClassification(clean, raw)); });
-    }
+        decodeFoldSeal(withField(clean, R"("class":"folded")", R"("class":"foldedx")"));
+    });
 
-    /// Wide integers whose LOW BYTE lands inside the grammar: 258 -> 2 (fully folded), 256 -> 0
-    /// (absent), 260 -> 4 (clamped). Each would decode as a row the fold never wrote.
-    for (const std::string_view raw : {"256", "258", "260", "18446744073709551615"})
+    /// The bare number `4` is the classification's pre-cut wire representation — the old byte-valued
+    /// form. A retired spelling is legal here because this is a marked negative fixture proving the
+    /// decoder still refuses it now that `class` takes a word; the byte-delta pins hold the other such
+    /// fixtures, and both kinds are exempt from the vocabulary sweeps for the same reason.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        SCOPED_TRACE(String{"cls="} + String{raw});
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                         [&] { decodeFoldSeal(withRawClassification(clean, raw)); });
-    }
+        decodeFoldSeal(withField(clean, R"("class":"folded")", R"("class":4)"));
+    });
 }
 
-/// And the field itself is required: an absent `cls` reads as 0, which is not "nothing was said about
-/// this namespace" but the positive claim "no round folded it".
+/// And the field itself is required: an absent `class` reads as `absent`, which is not "nothing was
+/// said about this namespace" but the positive claim "no round folded it".
 TEST(CASGCHoldGrammar, ACoverageRowWithoutAClassificationIsCorruptedData)
 {
     const String clean = encodeFoldSeal(cleanSeal("ns/0"));
-    const size_t at = clean.find("\"cls\":2,");
+    const String field = R"("class":"folded",)";
+    const size_t at = clean.find(field);
     ASSERT_NE(at, String::npos);
     String without = clean;
-    without.erase(at, strlen("\"cls\":2,"));
+    without.erase(at, field.size());
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(without); });
 }
 
@@ -567,13 +551,13 @@ TEST(CASGCHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedDa
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        decodeFoldSeal(withField(withField(held, R"("hpe":"4")", R"("hpe":"0")"),
-                                 R"("hps":"6")", R"("hps":"0")"));
+        decodeFoldSeal(withField(withField(held, R"("hold_epoch":"4")", R"("hold_epoch":"0")"),
+                                 R"("hold_seq":"6")", R"("hold_seq":"0")"));
     });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(held, R"("hpe":"4")", R"("hpe":"0")")); });
+                     [&] { decodeFoldSeal(withField(held, R"("hold_epoch":"4")", R"("hold_epoch":"0")")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(held, R"("hps":"6")", R"("hps":"0")")); });
+                     [&] { decodeFoldSeal(withField(held, R"("hold_seq":"6")", R"("hold_seq":"0")")); });
 }
 
 /// (3) The duplicate row. Two `cov` records for the same (namespace, shard) — held first, clean second —
@@ -608,7 +592,7 @@ TEST(CASGCHoldGrammar, ASecondCoverageRowForTheSameKeyIsCorruptedData)
     EXPECT_EQ(seal.ref_lives.size(), 1u);
 }
 
-/// The same one-record-per-key rule applies to `cnd`: a repeated row rewrites a shard's condemned
+/// The same one-record-per-key rule applies to `condemned`: a repeated row rewrites a shard's condemned
 /// totals, which graduation paces on.
 TEST(CASGCHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
 {
@@ -617,7 +601,7 @@ TEST(CASGCHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
                                                  .oldest_nonpending_condemn_round = 3};
     const String encoded = encodeFoldSeal(seal);
 
-    /// Lines 3..4 are `rfl`, `cnd` in the encoder's fixed order.
+    /// Lines 3..4 are `ref_life`, `condemned` in the encoder's fixed order.
     std::vector<String> lines;
     for (size_t begin = headerAndMetaOf(encoded).size(); begin < encoded.size();)
     {
@@ -626,14 +610,14 @@ TEST(CASGCHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
         lines.push_back(encoded.substr(begin, end - begin));
         begin = end + 1;
     }
-    ASSERT_EQ(lines.size(), 3u) << "rfl, cnd and the trailer";
+    ASSERT_EQ(lines.size(), 3u) << "ref_life, condemned and the trailer";
     const String ref_life_line = lines[0];
-    const String cnd_line = lines[1];
+    const String condemned_line = lines[1];
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(sealTextWith(encoded, {ref_life_line, cnd_line, cnd_line})); });
+                     [&] { decodeFoldSeal(sealTextWith(encoded, {ref_life_line, condemned_line, condemned_line})); });
     /// The unduplicated assembly is the control.
-    const std::vector<String> one_of_each{ref_life_line, cnd_line};
+    const std::vector<String> one_of_each{ref_life_line, condemned_line};
     EXPECT_NO_THROW(decodeFoldSeal(sealTextWith(encoded, one_of_each)));
 }
 
@@ -647,12 +631,12 @@ TEST(CASGCHoldGrammar, CleanupEvidenceWithAZeroRemovalIdIsCorruptedData)
     const String encoded = encodeFoldSeal(seal);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rte":"2")", R"("rte":"0")")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_epoch":"2")", R"("remove_epoch":"0")")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rts":"3")", R"("rts":"0")")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_seq":"3")", R"("remove_seq":"0")")); });
     /// Omitted entirely is the same thing: the fields default to zero.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, R"("rte":"2",)", "")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("remove_epoch":"2",)", "")); });
 }
 
 /// The OBJECT cap bounds the whole seal. Nothing on the fold-seal READ path enforces it (the seal
@@ -1018,7 +1002,7 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     ASSERT_TRUE(good_cov.has_value());
     EXPECT_FALSE(good_cov->hold.has_value()) << "the corrupt object belongs to the OTHER namespace";
     EXPECT_EQ(good_cov->last_folded_ref_id, (RefTxnId{1, 2}));
-    EXPECT_EQ(good_cov->classification, 2);
+    EXPECT_EQ(good_cov->classification, CoverageClass::Folded);
 
     /// And nothing was destroyed for the held namespace: a hold shuts the round's destructive gate, so
     /// its ref objects — including the ones a cleanup range computed WITHOUT the unreadable checkpoint
@@ -1091,7 +1075,7 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
     const auto cov = coverageOf(*backend, layout, phantom);
     ASSERT_TRUE(cov.has_value());
     EXPECT_FALSE(cov->hold.has_value()) << "a hold here could only name a position no round ever read";
-    EXPECT_EQ(cov->classification, 1) << "nothing was folded, so the row is `unchanged`";
+    EXPECT_EQ(cov->classification, CoverageClass::Unchanged) << "nothing was folded, so the row is `unchanged`";
     EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{}));
 
     /// Same isolation as the held arm: the pool keeps working.
@@ -1199,7 +1183,7 @@ TEST(CASGCHoldGrammar, HoldClearsOnlyByFoldingThroughTheOffendingPosition)
     const auto cov = coverageOf(*backend, layout, ns);
     ASSERT_TRUE(cov.has_value());
     EXPECT_FALSE(cov->hold.has_value()) << "folding through the offending position is what clears a hold";
-    EXPECT_EQ(cov->classification, 2);
+    EXPECT_EQ(cov->classification, CoverageClass::Folded);
     EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{1, 4})) << "the walk resumed past the resolved gap";
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(4)), 1)
         << "the record above the gap finally contributed its owner edge";
@@ -1261,10 +1245,10 @@ TEST(CASGCHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
     mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
     {
         RefCoverage & cov = seal.ref_lives.at(life_id).coverage;
-        cov.classification = 4;
+        cov.classification = CoverageClass::Clamped;
         cov.hold = plantedHold();
         RefCoverage gone;
-        gone.classification = 4;
+        gone.classification = CoverageClass::Clamped;
         gone.last_folded_ref_id = RefTxnId{2, 2};
         gone.hold = RefHold{.reason = HoldReason::GapBelowWitness, .offending_position = RefTxnId{2, 3},
                             .retry_count = 1, .next_retry_round = 2};
@@ -1278,7 +1262,7 @@ TEST(CASGCHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
     ASSERT_TRUE(rebuilt.has_value());
     const auto rediscovered = rebuilt->ref_lives.find(life_id);
     ASSERT_NE(rediscovered, rebuilt->ref_lives.end());
-    EXPECT_EQ(rediscovered->second.coverage.classification, 4);
+    EXPECT_EQ(rediscovered->second.coverage.classification, CoverageClass::Clamped);
     ASSERT_TRUE(rediscovered->second.coverage.hold.has_value());
     EXPECT_EQ(*rediscovered->second.coverage.hold, plantedHold());
     EXPECT_FALSE(rebuilt->ref_lives.contains(absent_life_id));
@@ -1320,7 +1304,7 @@ TEST(CASGCHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     mutateSealAt(*backend, layout, older_generation, older_attempt, [&](CasFoldSeal & seal)
     {
         RefCoverage & cov = seal.ref_lives.at(life_id).coverage;
-        cov.classification = 4;
+        cov.classification = CoverageClass::Clamped;
         cov.hold = plantedHold();
     });
 
@@ -1398,7 +1382,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWithAnUndecodablePriorSeal)
 
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":4}\nthis is not a seal body\n",
+    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":1}\nthis is not a seal body\n",
                           backend->head(seal_key).token);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.rebuildBaseline(/*force=*/true); });
@@ -1433,7 +1417,7 @@ TEST(CASGCHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
     mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
     {
         RefCoverage & cov = seal.ref_lives.at(life_id).coverage;
-        cov.classification = 4;
+        cov.classification = CoverageClass::Clamped;
         cov.hold = plantedHold();
     });
 
@@ -1470,7 +1454,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsL
 
     const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":4}\nthis is not a seal body\n",
+    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":1}\nthis is not a seal body\n",
                           backend->head(seal_key).token);
     const HeadResult sh = backend->head(layout.gcStateKey());
     ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
@@ -1537,7 +1521,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
     mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
     {
         RefCoverage & cov = seal.ref_lives.at(life_id).coverage;
-        cov.classification = 4;
+        cov.classification = CoverageClass::Clamped;
         cov.hold = plantedHold();
     });
 

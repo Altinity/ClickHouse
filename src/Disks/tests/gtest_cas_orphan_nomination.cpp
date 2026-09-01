@@ -150,7 +150,7 @@ ReadyFixture makeReadyFixture()
         .last_epoch_seal = RefTxnId{1, 2},
     });
     EXPECT_TRUE(runRegularRoundReclaiming(*f.gc).acquired_lease);
-    setWatermarkMinActive(*f.backend, f.store->layout(), "test", kCandidateEpoch, /*min_active=*/6);
+    setWatermarkMinActive(*f.backend, f.store->layout(), "test", kCandidateEpoch, /*min_active_build_sequence=*/6);
 
     std::vector<ManifestEntry> entries;
     std::vector<BlobDelta> seeded_edges;

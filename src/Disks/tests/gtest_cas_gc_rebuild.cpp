@@ -500,7 +500,7 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
     EXPECT_EQ(rep.committed_refs, blobs.size());
 
     /// Multiple rebuild flushes still converge to one authoritative row domain: no more than one
-    /// canonical seq-0 `btr` per shard and exactly one `cnd` per shard. These are the cardinalities the
+    /// canonical seq-0 `blob_run` per shard and exactly one `condemned` per shard. These are the cardinalities the
     /// catalog admission reservation over-covers independently of catalog-entry count.
     const GcState rebuilt_state = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     const CasFoldSeal rebuilt_seal = decodeFoldSeal(
@@ -535,7 +535,7 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
 }
 
 /// Trimmed-but-live (design delta 2): the precommit's journal evidence is gone (trim), the build
-/// is NOT provably dead (a live build holds min_active down) — the unowned-alive sweep must
+/// is NOT provably dead (a live build holds min_active_build_sequence down) — the unowned-alive sweep must
 /// over-protect the manifest's edges.
 TEST(CASGCRebuild, UnownedAliveManifestOverProtected)
 {
@@ -543,7 +543,7 @@ TEST(CASGCRebuild, UnownedAliveManifestOverProtected)
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
-    /// A LIVE build pins min_active at its build_seq, so higher build sequences are not provably dead.
+    /// A LIVE build pins min_active_build_sequence at its build_seq, so higher build sequences are not provably dead.
     auto live_build = store->beginPartWrite({});
     store->renewWatermarkOnce();
 

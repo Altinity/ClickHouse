@@ -321,7 +321,7 @@ CompletedRemovingFixture seedCompletedRemoving(
     CasFoldSeal parent;
     parent.generation = 1;
     parent.ref_lives.emplace(fixture.life_id, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
     for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
         parent.condemned_summary.emplace(shard, CondemnedSummary{});
@@ -368,7 +368,7 @@ void seedCompletedRemovingBatch(
     parent.generation = 1;
     for (const CatalogEntry & entry : entries)
         parent.ref_lives.emplace(entry.incarnation, RefLifeFoldState{
-            .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+            .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
             .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
     for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
         parent.condemned_summary.emplace(shard, CondemnedSummary{});
@@ -1480,7 +1480,7 @@ TEST(CASGCFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
     const ManifestRef r2{.writer_epoch = 5, .build_sequence = 0xCA02, .manifest_ordinal = 1};
     writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(0xa1))});
     writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(0xb2))});
-    setWatermarkMinActive(*backend, layout, "test", r1.writer_epoch, /*min_active*/ 0xCA03);
+    setWatermarkMinActive(*backend, layout, "test", r1.writer_epoch, /*min_active_build_sequence*/ 0xCA03);
     /// The §6 deletion premise is a second precondition on the CONTROL arm below: a manifest of an
     /// epoch-`E` build is deletable only once the namespace's sealed fold cursor sits in an epoch
     /// strictly above `E`. Sealing that cursor here is what keeps this test about the GATE — without it
@@ -2814,7 +2814,7 @@ TEST(CASGCFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDe
     const UInt128 unmatched_life = hexToU128("fedcba98765432100123456789abcdef");
     ASSERT_FALSE(parent.ref_lives.contains(unmatched_life));
     parent.ref_lives.emplace(unmatched_life, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{9, 9}}});
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{9, 9}}});
     ASSERT_EQ(
         backend->putOverwrite(parent_seal_key, encodeFoldSeal(parent), parent_object->token).outcome,
         PutOutcome::Done);
@@ -3137,7 +3137,7 @@ TEST(CASGCFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
     CasFoldSeal parent;
     parent.generation = 1;
     parent.ref_lives.emplace(life_id, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
     for (uint64_t shard = 0; shard < store->poolConfig().gc_shards; ++shard)
         parent.condemned_summary.emplace(shard, CondemnedSummary{});

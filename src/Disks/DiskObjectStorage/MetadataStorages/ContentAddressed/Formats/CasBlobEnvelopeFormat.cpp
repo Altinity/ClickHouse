@@ -1,8 +1,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasEnvelopeLimits.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <algorithm>
+#include <limits>
 
 namespace DB
 {
@@ -26,11 +29,11 @@ namespace EnvelopeWire
     constexpr WireKey type{"type"};
     constexpr WireKey version{"v"};
     constexpr WireKey tag{"tag"};
-    constexpr WireKey build{"bld"};
-    constexpr WireKey time_ms{"ts"};
-    constexpr WireKey creator{"by"};
+    constexpr WireKey build{"build"};
+    constexpr WireKey time_ms{"time_ms"};
+    constexpr WireKey creator{"creator"};
     constexpr WireKey op{"op"};
-    constexpr WireKey chver{"ch"};
+    constexpr WireKey chver{"chver"};
     constexpr WireKey ref{"ref"};
 }
 
@@ -44,6 +47,60 @@ constexpr EnumWireTable<ProvenanceOp, 6> kProvenanceOpWords{{{
 }}};
 
 static_assert(casEnumTableCoversEnum<kProvenanceOpWords, ProvenanceOp>());
+
+/// Byte cost of one JSON key as written by `CasJsonWriter::key`: the leading `{`/`,` separator (1)
+/// plus the opening quote (1), the key text, and the closing quote and colon (2).
+constexpr size_t keyCost(WireKey key)
+{
+    return 4 + key.text.size();
+}
+
+/// A quoted `hex128Value` is always exactly this wide -- 2 quote bytes plus 2 hex digits per
+/// `UInt128` byte -- because `writeHexUIntLowercase` zero-pads; there is no smaller or larger case.
+constexpr size_t kQuotedHex128Len = 2 + sizeof(UInt128) * 2;
+
+/// Maximum decimal digits an unquoted `writeIntText` value can produce for each integer width the
+/// envelope persists, taken from the type itself rather than re-typed as a literal.
+constexpr size_t kMaxU64DecimalLen = std::numeric_limits<uint64_t>::digits10 + 1;
+constexpr size_t kMaxU32DecimalLen = std::numeric_limits<uint32_t>::digits10 + 1;
+
+/// The longest persisted `op` word, found by walking the table rather than hardcoding one -- the
+/// worst case must track `kProvenanceOpWords` even if a future entry outgrows "mutation".
+constexpr size_t maxProvenanceOpWordLen()
+{
+    size_t max_len = 0;
+    for (const auto & entry : kProvenanceOpWords.entries)
+        max_len = std::max(max_len, entry.word.size());
+    return max_len;
+}
+
+/// Mandatory (always-written whenever `provenance` is set) non-`ref` fields at type maxima, in the
+/// exact field order `encodeEnvelopeHeader` writes them. `CasPoolMetaFormat.cpp` records why 240 was
+/// chosen as the floor above this bound.
+constexpr size_t kMandatoryNonRefWorstCase =
+      keyCost(EnvelopeWire::type) + 2 + kBlobType.size()
+    + keyCost(EnvelopeWire::version) + kMaxU32DecimalLen
+    + keyCost(EnvelopeWire::tag) + kQuotedHex128Len
+    + keyCost(EnvelopeWire::build) + kQuotedHex128Len
+    + keyCost(EnvelopeWire::time_ms) + kMaxU64DecimalLen
+    + keyCost(EnvelopeWire::creator) + kQuotedHex128Len
+    + keyCost(EnvelopeWire::op) + 2 + maxProvenanceOpWordLen()
+    + keyCost(EnvelopeWire::chver) + kMaxU32DecimalLen;
+
+/// The encoder always frames `ref`, even when empty: the key (`,"ref":`), the empty quotes, the
+/// closing `}`, and the trailing '\n' reserved at byte `blob_header_len - 1`.
+constexpr size_t kRefFramingAndTerminator = keyCost(EnvelopeWire::ref) + 2 + 1 + 1;
+
+/// The worst-case byte count `encodeEnvelopeHeader` can ever produce before the diagnostic `ref`
+/// gets any budget at all. Proven, not merely documented: the static_assert below fails the BUILD if
+/// a future key or type change ever closes the margin under `kMinBlobHeaderLen`.
+constexpr size_t kMandatoryDescriptorWorstCase = kMandatoryNonRefWorstCase + kRefFramingAndTerminator;
+
+static_assert(kMandatoryDescriptorWorstCase <= kMinBlobHeaderLen - 1,
+    "the mandatory blob-envelope fields plus the empty-ref framing must fit under kMinBlobHeaderLen "
+    "(the trailing '\\n' is already counted above, so the spare byte is the diagnostic ref's floor "
+    "budget, not the newline); if a field grew, either shrink it back or "
+    "raise kMinBlobHeaderLen (CasEnvelopeLimits.h) to match");
 
 /// The escaped byte-length of one raw ref char under the frozen envelope alphabet (see writeEnvelopeRefField).
 size_t escapedLen(char c)
@@ -101,6 +158,11 @@ std::string_view provenanceOpToWireWord(ProvenanceOp op)
     return kProvenanceOpWords.toWord(op, "CAS blob envelope");
 }
 
+ProvenanceOp provenanceOpFromWireWord(std::string_view w)
+{
+    return kProvenanceOpWords.fromWord(w, "CAS blob envelope");
+}
+
 String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
 {
     if (header.kind != ObjectKind::Blob)
@@ -129,7 +191,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
         {
             writeKey(buf, "!x", first); writeStringValue(buf, "1");
         }
-        json = std::move(buf).take();   /// e.g. {"type":"cas_blob","v":3,...,"ch":26006001   (no ref, no closing brace)
+        json = std::move(buf).take();   /// e.g. {"type":"cas_blob","v":1,...,"chver":26006001   (no ref, no closing brace)
     }
 
     /// Optional `ref`, truncated to the exact remaining budget. Layout after this block:
@@ -211,7 +273,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
         }
         else if (key == EnvelopeWire::op)
         {
-            prov.op = kProvenanceOpWords.fromWord(r.readString(), "CAS blob envelope");
+            prov.op = provenanceOpFromWireWord(r.readString());
             have_prov = true;
         }
         else if (key == EnvelopeWire::chver)

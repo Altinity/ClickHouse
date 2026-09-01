@@ -276,8 +276,8 @@ TEST(CASRefCheckpoint, CommittedThroughHasCanonicalExactWireEncoding)
                        .committed_through = RefTxnId{9, 11},
                        .checkpoint_snapshot_id = RefTxnId{9, 10},
                        .last_epoch_seal = RefTxnId{8, 12}};
-    const String expected = R"({"type":"cas_ref_ckpt","v":10}
-{"le":"7","cte":"9","cts":"11","cse":"9","css":"10","lse":"8","lss":"12"}
+    const String expected = R"({"type":"cas_ref_ckpt","v":1}
+{"life_epoch":"7","committed_epoch":"9","committed_seq":"11","snapshot_epoch":"9","snapshot_seq":"10","seal_epoch":"8","seal_seq":"12"}
 )";
 
     EXPECT_EQ(encodeRefCkpt(ckpt), expected);
@@ -296,7 +296,7 @@ TEST(CASFormatBattery, RefCkpt)
         [&] { return sealObject(FormatId::RefCkpt, encodeRefCkpt(ckpt)); },
         [](std::string_view s) { decodeRefCkpt(std::string(openObject(FormatId::RefCkpt, s))); },
         currentFormatHeader("cas_ref_ckpt") +
-        "{\"le\":\"7\",\"cte\":\"9\",\"cts\":\"11\",\"cse\":\"9\",\"css\":\"10\",\"lse\":\"8\",\"lss\":\"12\"}\n"});
+        "{\"life_epoch\":\"7\",\"committed_epoch\":\"9\",\"committed_seq\":\"11\",\"snapshot_epoch\":\"9\",\"snapshot_seq\":\"10\",\"seal_epoch\":\"8\",\"seal_seq\":\"12\"}\n"});
 }
 
 /// `last_epoch_seal` is chain evidence, not an arbitrary lower bound. It either names the frontier
@@ -323,9 +323,9 @@ TEST(CASRefCheckpoint, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefCkpt(unsealed_non_genesis); });
 
     String malformed = encodeRefCkpt(valid);
-    const size_t cte = malformed.find(R"("cte":"8")");
-    ASSERT_NE(cte, String::npos);
-    malformed.replace(cte, String{R"("cte":"8")"}.size(), R"("cte":"10")");
+    const size_t committed_epoch = malformed.find(R"("committed_epoch":"8")");
+    ASSERT_NE(committed_epoch, String::npos);
+    malformed.replace(committed_epoch, String{R"("committed_epoch":"8")"}.size(), R"("committed_epoch":"10")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(malformed); });
 }
 
@@ -347,13 +347,30 @@ TEST(CASRefCheckpoint, RejectsAnUnknownKey)
     expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRefCkpt(with_critical); });
 }
 
+/// Replacing the abbreviated key is a format cut, not an alias. Treating it as an optional partial
+/// pair would make an old writer's checkpoint appear to have no committed frontier.
+TEST(CASRefCheckpoint, RejectsOldCommittedEpochKeyRatherThanAliasingIt)
+{
+    /// The values are chosen so ALIASING would be harmless: the spliced `"cte":"9"` re-assigns the
+    /// epoch the object already carries, leaving a valid checkpoint. A reader that honoured the old
+    /// spelling would therefore DECODE, and this test fails; only the strict unknown-key rejection
+    /// makes it throw. Values under which aliasing corrupts the object would let the invariant
+    /// checker throw the same code and hide the alias.
+    String with_old_key = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{9},
+                                                .committed_through = RefTxnId{9, 1},
+                                                .checkpoint_snapshot_id = RefTxnId{9, 1},
+                                                .last_epoch_seal = std::nullopt});
+    with_old_key.replace(with_old_key.rfind('}'), 1, R"(,"cte":"9"})");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(with_old_key); });
+}
+
 /// A duplicate key has no single meaning, so it can never be resolved by a reader's preference.
 TEST(CASRefCheckpoint, RejectsADuplicateKey)
 {
     const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt,
                                               .last_epoch_seal = std::nullopt});
     String duplicated = good;
-    duplicated.replace(duplicated.rfind('}'), 1, R"(,"le":"9"})");
+    duplicated.replace(duplicated.rfind('}'), 1, R"(,"life_epoch":"9"})");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(duplicated); });
 }
 
@@ -377,13 +394,13 @@ TEST(CASRefCheckpoint, RejectsTruncation)
     const String empty_body = good.substr(0, good.find('\n') + 1) + "{}\n";
     EXPECT_EQ(decodeRefCkpt(empty_body), RefCkpt{});
 
-    const String half_pair = good.substr(0, good.find('\n') + 1) + R"({"le":"7","cse":"1"})" + "\n";
+    const String half_pair = good.substr(0, good.find('\n') + 1) + R"({"life_epoch":"7","snapshot_epoch":"1"})" + "\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(half_pair); });
 
-    const String other_half = good.substr(0, good.find('\n') + 1) + R"({"le":"7","lss":"2"})" + "\n";
+    const String other_half = good.substr(0, good.find('\n') + 1) + R"({"life_epoch":"7","seal_seq":"2"})" + "\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(other_half); });
 
-    const String frontier_half = good.substr(0, good.find('\n') + 1) + R"({"le":"7","cte":"1"})" + "\n";
+    const String frontier_half = good.substr(0, good.find('\n') + 1) + R"({"life_epoch":"7","committed_epoch":"1"})" + "\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(frontier_half); });
 }
 
@@ -414,9 +431,9 @@ TEST(CASRefCheckpoint, RejectsInvalidFieldsOnEncodeAndOnDecode)
     const String header = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt,
                                                 .last_epoch_seal = std::nullopt});
     const String prefix = header.substr(0, header.find('\n') + 1);
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(prefix + R"({"le":"0"})" + "\n"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(prefix + R"({"life_epoch":"0"})" + "\n"); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decodeRefCkpt(prefix + R"({"le":"7","cse":"1","css":"0"})" + "\n"); });
+        [&] { decodeRefCkpt(prefix + R"({"life_epoch":"7","snapshot_epoch":"1","snapshot_seq":"0"})" + "\n"); });
 }
 
 /// The registry row is part of the contract: Control/Strict decides how the decoder treats unknown
@@ -1227,26 +1244,21 @@ TEST(CASRefCheckpoint, CommitRefChunkDurableBytesUnchangedByExtraction)
     /// The BODY is checked as exact length plus a 128-bit SipHash of it -- not literally byte for byte,
     /// but any change that survives both is a 128-bit collision at a fixed length, which is the trade for
     /// keeping the assertion readable. It is a function of `{format generation, ns, id, ops,
-    /// chain_link}` only -- no incarnation reaches it. Generation 10 changed the shared format header;
-    /// the plaintext discriminator below removes only that change and pins every remaining byte to the
-    /// generation-9 fixture before accepting the new deterministic compressed size and hash.
+    /// chain_link}` only -- no incarnation reaches it.
     const auto got = backend->get(key);
     ASSERT_TRUE(got.has_value()) << "the birth chunk must be durable at its canonical key";
-    String as_generation_9 = openObject(FormatId::RefLog, got->bytes);
-    const String generation_10_header = R"({"type":"cas_ref_log","v":10})";
-    ASSERT_TRUE(as_generation_9.starts_with(generation_10_header));
-    as_generation_9.replace(0, generation_10_header.size(), R"({"type":"cas_ref_log","v":9})");
-    EXPECT_EQ(as_generation_9, R"({"type":"cas_ref_log","v":9}
-{"ns":"test/golden@cas@","we":"1","rs":"1"}
+    const String plaintext = openObject(FormatId::RefLog, got->bytes);
+    EXPECT_EQ(plaintext, R"({"type":"cas_ref_log","v":1}
+{"namespace":"test/golden@cas@","txn_epoch":"1","txn_seq":"1"}
 {"op":"namespace_birth"}
-{"op":"owner_transition","nbk":"precommit","nrn":"gold_ref","nme":"1","nmb":"7","nmo":1}
-{"op":"owner_transition","obk":"precommit","orn":"gold_ref","ome":"1","omb":"7","omo":1,"nbk":"committed","nrn":"gold_ref","nme":"1","nmb":"7","nmo":1}
+{"op":"owner_transition","new_kind":"precommit","new_ref":"gold_ref","new_epoch":"1","new_build":"7","new_ord":1}
+{"op":"owner_transition","old_kind":"precommit","old_ref":"gold_ref","old_epoch":"1","old_build":"7","old_ord":1,"new_kind":"committed","new_ref":"gold_ref","new_epoch":"1","new_build":"7","new_ord":1}
 {"n":3}
-)") << "generation 10 must change only the self-describing header of this ref-log fixture";
-    EXPECT_EQ(got->bytes.size(), 179u) << "the sealed ref-log body changed size";
+)") << "the sealed ref-log plaintext changed";
+    EXPECT_EQ(got->bytes.size(), 206u) << "the sealed ref-log body changed size";
     SipHash body_hash;
     body_hash.update(got->bytes.data(), got->bytes.size());
-    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "ada75a83638e933c98d731183a46b7b7")
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "21c275ad44a6b47a4d6c389c0d71bb34")
         << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
            "before the extraction";
 }

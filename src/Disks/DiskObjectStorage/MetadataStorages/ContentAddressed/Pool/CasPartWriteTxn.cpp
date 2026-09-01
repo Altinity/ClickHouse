@@ -1083,10 +1083,10 @@ void PartWriteTxn::abandon()
     /// `Uncertain` tolerance above, no-ops) -- it never corrupts.
     alive = false;
 
-    /// No longer in-flight: retire the seq so the per-server active-build floor (`min_active`) can advance
+    /// No longer in-flight: retire the seq so the per-server active-build floor (`min_active_build_sequence`) can advance
     /// (idempotent). This runs AFTER the precommit removal above (mirrors `PartWriteTxn::promote`, which retires
     /// after its commit) so the build stays active until its precommit binding's removal is durable:
-    /// retiring first would advance `min_active` past a build whose precommit binding is still live in the
+    /// retiring first would advance `min_active_build_sequence` past a build whose precommit binding is still live in the
     /// ref log, letting a freshness-window consumer judge the manifest build-dead while an un-removed
     /// precommit still names it. Ordering removal-before-retire keeps that happens-before clean.
     store->retireBuildSeq(build_seq);

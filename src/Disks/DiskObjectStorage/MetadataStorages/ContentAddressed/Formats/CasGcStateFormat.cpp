@@ -18,20 +18,20 @@ namespace DB::Cas
 
 namespace GcStateWire
 {
-    constexpr WireKey round{"rnd"};
-    constexpr WireKey gc_shards{"gcs"};
-    constexpr WireKey snap_generation{"sg"};
-    constexpr WireKey snap_pruned_through{"spt"};
-    constexpr WireKey snap_attempt{"sa"};
-    constexpr WireKey manifest_sweep_cursor{"msc"};
-    constexpr WireKey lease_owner{"lo"};
-    constexpr WireKey lease_seq{"ls"};
+    constexpr WireKey round{"round"};
+    constexpr WireKey gc_shards{"gc_shards"};
+    constexpr WireKey snap_generation{"snap_generation"};
+    constexpr WireKey snap_pruned_through{"snap_pruned_through"};
+    constexpr WireKey snap_attempt{"snap_attempt"};
+    constexpr WireKey manifest_sweep_cursor{"manifest_sweep_cursor"};
+    constexpr WireKey lease_owner{"lease_owner"};
+    constexpr WireKey lease_seq{"lease_seq"};
 }
 
 namespace GcHeartbeatWire
 {
-    constexpr WireKey owner{"by"};
-    constexpr WireKey hb_seq{"seq"};
+    constexpr WireKey owner{"owner"};
+    constexpr WireKey hb_seq{"hb_seq"};
 }
 
 String encodeGcState(const GcState & state)
@@ -89,10 +89,10 @@ GcState decodeGcState(std::string_view data)
         else
             r.skipUnknown(key);
     }
-    /// Fail closed on an absent gcs: the writer always emits it, so a missing key means a corrupt object.
+    /// Fail closed on an absent gc_shards: the writer always emits it, so a missing key means a corrupt object.
     /// Do NOT silently keep the struct default (1) — that would hide corruption (no-fallback principle).
     if (!saw_gcs)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: missing gcs");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: missing gc_shards");
     if (state.gc_shards == 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: gc_shards must be >= 1");
     if (!body_in.eof() || !in.eof())

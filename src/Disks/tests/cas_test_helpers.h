@@ -940,8 +940,8 @@ inline UInt128 catalogLifeIdForTest(
 /// real round. This is the durable fact the sweep's §6 deletion premise reads
 /// (`CasOrphanManifestSweep.cpp`): `cursor` is the namespace's `last_folded_ref_id`, and a manifest of
 /// an epoch-`E` build is deletable only once that cursor sits in an epoch STRICTLY above `E`.
-/// `hold`, when set, makes the row classification 4 — the strict grammar `encodeFoldSeal` enforces in
-/// both directions, so a hold and a non-4 classification cannot be seeded together.
+/// `hold`, when set, makes the row classification `Clamped` — the strict grammar `encodeFoldSeal`
+/// enforces in both directions, so a hold and a non-clamped classification cannot be seeded together.
 ///
 /// SHARP EDGE, HANDLED HERE SO NO CALLER HAS TO KNOW IT: a fold seal must carry a `condemned_summary`
 /// entry for EVERY shard in `0..gc_shards-1`. A later real round adopts this object as its PARENT and
@@ -988,7 +988,7 @@ inline void seedFoldCursorForTest(
     seal.generation = generation;
 
     DB::Cas::RefCoverage cov;
-    cov.classification = hold ? 4 : 2;
+    cov.classification = hold ? DB::Cas::CoverageClass::Clamped : DB::Cas::CoverageClass::Folded;
     cov.last_folded_ref_id = cursor;
     cov.hold = hold;
     seal.ref_lives[life.incarnation].coverage = cov;
@@ -1050,15 +1050,15 @@ inline uint64_t foldCursorOf(
 
 /// Set a server root's durable floor (so orphan-sweep eligibility can be driven). After the ack-floor
 /// merge the floor rides the mount lease body (`mountKey`), so this seeds a MountLease carrying
-/// `{writer_epoch, min_active}` — exactly what `prefixEligible` reads.
+/// `{writer_epoch, min_active_build_sequence}` — exactly what `prefixEligible` reads.
 inline void setWatermarkMinActive(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & server_root_id,
-    uint64_t writer_epoch, uint64_t min_active)
+    uint64_t writer_epoch, uint64_t min_active_build_sequence)
 {
     DB::Cas::MountLease m;
     m.server_uuid = DB::UInt128(0);
     m.writer_epoch = writer_epoch;
-    m.min_active = min_active;
+    m.min_active_build_sequence = min_active_build_sequence;
     m.seq = 1;
     m.write_attempt_id = DB::UInt128{1};
     const String key = layout.mountKey(server_root_id);

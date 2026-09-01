@@ -464,7 +464,7 @@ TEST(CASGCFold, DeadPrecommitWithMissingBodyIsSkippedNotClampedForever)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     /// The namespace's server-root prefix is "srv"; seed its watermark floor so build_sequence 5 is retired.
     const RootNamespace ns{"srv/tbl"};
-    setWatermarkMinActive(*backend, store->layout(), "srv", /*writer_epoch*/1, /*min_active*/10);
+    setWatermarkMinActive(*backend, store->layout(), "srv", /*writer_epoch*/1, /*min_active_build_sequence*/10);
 
     /// A precommit naming a build (writer_epoch 1, build_sequence 5) whose body is never written.
     const ManifestRef dead = ManifestRef{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};

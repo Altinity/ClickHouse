@@ -20,9 +20,9 @@ namespace
 
 namespace BlobMetaWire
 {
-    constexpr WireKey state{"st"};
-    constexpr WireKey condemn_round{"cr"};
-    constexpr WireKey size{"sz"};
+    constexpr WireKey state{"state"};
+    constexpr WireKey condemn_round{"condemn_round"};
+    constexpr WireKey size{"size"};
 }
 
 constexpr EnumWireTable<MetaState, 2> kMetaStateWords{{{
@@ -37,6 +37,11 @@ static_assert(casEnumTableCoversEnum<kMetaStateWords, MetaState>());
 std::string_view metaStateToWireWord(MetaState state)
 {
     return kMetaStateWords.toWord(state, "CAS blob meta");
+}
+
+MetaState metaStateFromWireWord(std::string_view w)
+{
+    return kMetaStateWords.fromWord(w, "CAS blob meta");
 }
 
 String encodeBlobMeta(const BlobMeta & meta)
@@ -71,7 +76,7 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
     {
         if (key == BlobMetaWire::state)
         {
-            m.state = kMetaStateWords.fromWord(r.readString(), "CAS blob meta");
+            m.state = metaStateFromWireWord(r.readString());
             saw_state = true;
         }
         else if (key == BlobMetaWire::condemn_round)
@@ -82,7 +87,7 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
             r.skipUnknown(key);
     }
     if (!saw_state)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: missing st");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: missing state");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: trailing bytes");
     return m;

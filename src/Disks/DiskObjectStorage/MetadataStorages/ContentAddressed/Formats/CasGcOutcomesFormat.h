@@ -30,6 +30,9 @@ enum class OutcomeKind : uint8_t
 /// Canonical wire word for one `OutcomeKind`.
 std::string_view outcomeKindToWireWord(OutcomeKind outcome);
 
+/// Its fail-closed inverse: an unknown word is `CORRUPTED_DATA`.
+OutcomeKind outcomeKindFromWireWord(std::string_view w);
+
 /// One observation about a blob incarnation considered by GC. `token` identifies the exact
 /// incarnation that GC examined, while `ref` identifies the content address; retaining both lets
 /// replay and inspection distinguish an absent object from a replacement that won a race with GC.

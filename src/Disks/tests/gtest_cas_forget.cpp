@@ -306,7 +306,7 @@ TEST(CASForget, ForgetOnIdentityLostPoolVanishesForgotten)
 }
 
 /// (a'') The clean-farewell is EARNED, never unconditional: on a drained pool FORGET stamps the mount lease
-/// with the terminated sentinel (`min_active == UINT64_MAX`) so a same-server restart reclaims immediately,
+/// with the terminated sentinel (`min_active_build_sequence == UINT64_MAX`) so a same-server restart reclaims immediately,
 /// but with an UNSETTLED (wedged) ref lane it must NOT — the lease is left to expire by observation.
 TEST(CASForget, ForgetCleanFarewellGatedOnDrain)
 {
@@ -318,14 +318,14 @@ TEST(CASForget, ForgetCleanFarewellGatedOnDrain)
         auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
         auto store = DB::Cas::tests::openPoolForTest(backend);
         const String mount_key = store->layout().mountKey(kSrid);
-        ASSERT_NE(decodeMountLease(backend->get(mount_key)->bytes).min_active, kTerminated);   /// baseline
+        ASSERT_NE(decodeMountLease(backend->get(mount_key)->bytes).min_active_build_sequence, kTerminated);   /// baseline
 
         store->forgetDisk([] {}, kForgetReason);
         ASSERT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
 
         const auto got = backend->get(mount_key);
         ASSERT_TRUE(got.has_value());
-        EXPECT_EQ(decodeMountLease(got->bytes).min_active, kTerminated)
+        EXPECT_EQ(decodeMountLease(got->bytes).min_active_build_sequence, kTerminated)
             << "a drained FORGET earns the clean-release farewell";
     }
 
@@ -344,7 +344,7 @@ TEST(CASForget, ForgetCleanFarewellGatedOnDrain)
 
         const auto got = backend->get(mount_key);
         ASSERT_TRUE(got.has_value()) << "the lease object must still be present (expiry by observation)";
-        EXPECT_NE(decodeMountLease(got->bytes).min_active, kTerminated)
+        EXPECT_NE(decodeMountLease(got->bytes).min_active_build_sequence, kTerminated)
             << "an unearned clean farewell must NOT be written when the ref lanes did not drain";
     }
 }

@@ -90,7 +90,7 @@ void emitTestEvent(DB::ContentAddressedMetadataStorage & storage)
     /// successor skip the observation window, so a phase-2 failure must leave it absent.
     const auto mount = backend->get(Layout(config.pool_prefix).mountKey(config.server_root_id));
     const bool clean_release = mount
-        && decodeMountLease(mount->bytes).min_active == std::numeric_limits<uint64_t>::max();
+        && decodeMountLease(mount->bytes).min_active_build_sequence == std::numeric_limits<uint64_t>::max();
     const bool marker_must_be_absent = phase == 2;
     std::_Exit(marker_must_be_absent && clean_release ? 1 : 0);
 }

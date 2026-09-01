@@ -200,8 +200,8 @@ NamespaceLifePhysicalId Layout::namespaceLifePhysicalIdOf(std::string_view key, 
     if (!incarnation)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "CasLayout: object '{}' names no life: '{}' is not 32 lower-case hex digits of a nonzero "
-            "life id. Generation-5 namespace-bearing pools are rejected by the pool-metadata format "
-            "gate before this generation-6 physical-key parser is reached",
+            "life id. Pools whose keys predate the opaque-life layout are rejected by the "
+            "pool-metadata format gate before this physical-key parser is reached",
             key, segment);
     return *incarnation;
 }

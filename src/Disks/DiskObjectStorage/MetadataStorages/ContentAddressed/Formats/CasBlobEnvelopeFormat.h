@@ -35,6 +35,9 @@ enum class ProvenanceOp : uint8_t
 /// Returns the persisted wire word for a validated provenance operation.
 std::string_view provenanceOpToWireWord(ProvenanceOp op);
 
+/// Its fail-closed inverse: an unknown word is `CORRUPTED_DATA`.
+ProvenanceOp provenanceOpFromWireWord(std::string_view w);
+
 /// Optional diagnostic metadata recorded with an envelope. The fields identify when and where the
 /// incarnation was created, the ClickHouse build that wrote it, and the operation that produced it;
 /// none of them participates in object identity or a protocol decision.
@@ -58,19 +61,20 @@ struct Provenance
 /// algorithm and digest are already present in the object key and manifest reference, `domain_id` had
 /// no validating consumer, and `header_hash` had no consumer once the CityHash64 check left the
 /// envelope. Writer forensics are represented
-/// by `ch` and `bld`, so a separate `writer_version` is unnecessary. The `v` field is the sole format
-/// compatibility gate; a reader rejects a version it does not understand before interpreting the body.
+/// by `chver` and `build`, so a separate `writer_version` is unnecessary. The `v` field is the sole
+/// format compatibility gate; a reader rejects a version it does not understand before interpreting
+/// the body.
 struct EnvelopeHeader
 {
     ObjectKind kind = ObjectKind::Blob;
     /// Set by decode from the header `v`; encode stamps `currentCompatibilityVersion`. A reader
     /// fails closed (UNKNOWN_FORMAT_VERSION) when `v` exceeds what this build understands.
     uint32_t compatibility_version = 0;
-    UInt128 incarnation_tag{};              /// `tag`
-    UInt128 build_id{};                     /// `bld`
-    std::optional<Provenance> provenance;   /// `ts` / `by` / `op` / `ch`
-    std::optional<String> intended_ref;     /// `ref` (diagnostic; truncated on encode to fit the header)
-    uint32_t header_len = 0;                /// filled by encode/decode = blob_header_len (payload offset)
+    UInt128 incarnation_tag{};                /// `tag`
+    UInt128 build_id{};                       /// `build`
+    std::optional<Provenance> provenance;     /// `time_ms` / `creator` / `op` / `chver`
+    std::optional<String> intended_ref;       /// `ref` (diagnostic; truncated on encode to fit the header)
+    uint32_t header_len = 0;                  /// filled by encode/decode = blob_header_len (payload offset)
     /// Test-only knob: emit an unknown `!`-critical key. Decoding the resulting header must fail
     /// closed with `UNKNOWN_FORMAT_VERSION`, exercising the compatibility rule for critical extensions.
     bool emit_unknown_critical_key = false;

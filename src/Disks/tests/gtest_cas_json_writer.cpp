@@ -15,17 +15,20 @@ TEST(CASJsonWriter, KeyValueSequenceMatchesCanonicalShape)
 {
     CasJsonWriter w;
     bool first = true;
-    w.key("we", first);
+    /// The names are shape labels, not format keys: this test is about the writer's primitives, and
+    /// borrowing a real wire spelling would put this file in every vocabulary sweep for no reason.
+    w.key("u64_string_field", first);
     w.u64StringValue(7);
-    w.key("mo", first);
+    w.key("number_field", first);
     w.u64Number(3);
-    w.key("ok", first);
+    w.key("bool_field", first);
     w.boolValue(true);
-    w.key("ome", first);
+    w.key("second_u64_string_field", first);
     w.u64StringValue(1);
     w.closeObject(first);
     w.newline();
-    EXPECT_EQ(std::move(w).take(), "{\"we\":\"7\",\"mo\":3,\"ok\":true,\"ome\":\"1\"}\n");
+    EXPECT_EQ(std::move(w).take(),
+        "{\"u64_string_field\":\"7\",\"number_field\":3,\"bool_field\":true,\"second_u64_string_field\":\"1\"}\n");
 }
 
 TEST(CASJsonWriter, EmptyObjectAndClear)
@@ -217,12 +220,12 @@ TEST(CASJsonWriter, WireKeyFieldHelpersMatchThePrimitivePairs)
 {
     CasJsonWriter w;
     bool first = true;
-    constexpr WireKey k_word{"st"};
-    constexpr WireKey k_str{"hn"};
-    constexpr WireKey k_u64s{"we"};
-    constexpr WireKey k_num{"eat"};
-    constexpr WireKey k_hex{"su"};
-    constexpr WireKey k_bool{"fen"};
+    constexpr WireKey k_word{"word_field"};
+    constexpr WireKey k_str{"string_field"};
+    constexpr WireKey k_u64s{"u64_string_field"};
+    constexpr WireKey k_num{"number_field"};
+    constexpr WireKey k_hex{"hex_field"};
+    constexpr WireKey k_bool{"bool_field"};
     writeWordField(w, k_word, "clean", first);
     writeStringField(w, k_str, "host-1", first);
     writeU64StringField(w, k_u64s, 7, first);
@@ -232,11 +235,12 @@ TEST(CASJsonWriter, WireKeyFieldHelpersMatchThePrimitivePairs)
     w.closeObject(first);
     w.newline();
     EXPECT_EQ(std::move(w).take(),
-        "{\"st\":\"clean\",\"hn\":\"host-1\",\"we\":\"7\",\"eat\":1752537630000,"
-        "\"su\":\"00000000000000000000000000000001\",\"fen\":false}\n");
+        "{\"word_field\":\"clean\",\"string_field\":\"host-1\",\"u64_string_field\":\"7\","
+        "\"number_field\":1752537630000,"
+        "\"hex_field\":\"00000000000000000000000000000001\",\"bool_field\":false}\n");
 
     /// The reader-side comparison contract: a String key compares against the constant.
-    String key = "st";
+    String key = "word_field";
     EXPECT_TRUE(key == k_word);
     EXPECT_FALSE(key == k_str);
 }

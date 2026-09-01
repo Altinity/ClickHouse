@@ -230,7 +230,7 @@ TEST(CASGCBoundedWalk, ARoundFoldsThroughItsRoundStartTailAndLeavesTheStragglers
     EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{1, planted}))
         << "the walk must fold through the round-start tail and no further -- it chased the writer";
     EXPECT_FALSE(cov->hold.has_value()) << "reaching the committed frontier is not a hold";
-    EXPECT_NE(cov->classification, 4) << "reaching the committed frontier is not a clamp";
+    EXPECT_NE(cov->classification, CoverageClass::Clamped) << "reaching the committed frontier is not a clamp";
     EXPECT_EQ(metric(intake, "tails_advanced"), 1u);
     EXPECT_EQ(metric(intake, "logs_applied"), planted) << "exactly the round-start backlog was folded";
 
@@ -505,7 +505,7 @@ TEST(CASGCBoundedWalk, AnAbsentManifestBodyStillHoldsWithoutAHead)
     ASSERT_TRUE(cov->hold.has_value()) << "an absent committed manifest body raises the fold barrier";
     EXPECT_EQ(cov->hold->reason, HoldReason::ManifestBodyMissing);
     EXPECT_EQ(cov->hold->offending_position, (RefTxnId{1, 2}));
-    EXPECT_EQ(cov->classification, 4);
+    EXPECT_EQ(cov->classification, CoverageClass::Clamped);
     EXPECT_EQ(backend->headCount(layout.manifestKey(gone)), 0u)
         << "absence is decided by the GET, so the missing body costs no HEAD either";
 }
@@ -558,13 +558,13 @@ TEST(CASGCBoundedWalk, ANamespaceThatFoldedNothingKeepsItsSealedCursor)
     ASSERT_TRUE(after.has_value())
         << "the coverage row was DROPPED -- the next round would re-fold this namespace from {0,0}";
     /// The CURSOR and the HOLD are what the next round trusts, and both ride unchanged.
-    /// `classification` legitimately moves from 2 ("this round folded records") to 1 ("unchanged"),
+    /// `classification` legitimately moves from `Folded` ("this round folded records") to `Unchanged`,
     /// because that is what the round did — it is the one field that may differ, so it is the one field
     /// asserted loosely.
     EXPECT_EQ(after->last_folded_ref_id, before->last_folded_ref_id)
         << "a namespace that folded nothing must keep the cursor it had";
     EXPECT_EQ(after->hold, before->hold);
-    EXPECT_NE(after->classification, 4) << "folding nothing is not a clamp";
+    EXPECT_NE(after->classification, CoverageClass::Clamped) << "folding nothing is not a clamp";
     EXPECT_EQ(metric(intake, "frontier_namespaces"), 2u)
         << "it stays in the round's universe, so its proof is still owed";
 }

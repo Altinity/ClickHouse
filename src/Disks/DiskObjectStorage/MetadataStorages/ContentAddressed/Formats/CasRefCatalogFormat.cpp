@@ -26,17 +26,17 @@ namespace
 
 namespace RefCatalogWire
 {
-    constexpr WireKey kind{"k"};
+    constexpr WireKey kind{"kind"};
     constexpr WireKey ns{"ns"};
-    constexpr WireKey state{"st"};
-    constexpr WireKey life{"inc"};
-    constexpr WireKey remove_round{"rsr"};
-    constexpr WireKey creator{"csr"};
-    constexpr WireKey creator_epoch{"cwe"};
-    constexpr WireKey creator_fence{"cfg"};
+    constexpr WireKey state{"state"};
+    constexpr WireKey life{"life"};
+    constexpr WireKey remove_round{"remove_round"};
+    constexpr WireKey creator{"creator"};
+    constexpr WireKey creator_epoch{"creator_epoch"};
+    constexpr WireKey creator_fence{"creator_fence"};
 }
 
-constexpr std::string_view kEntryTag = "ent";
+constexpr std::string_view kEntryTag = "entry";
 
 constexpr EnumWireTable<NsState, 3> kNsStateWords{{{
     {NsState::Creating, "creating"},
@@ -162,7 +162,7 @@ String encodeRefCatalog(const RefCatalog & catalog)
             writeKey(out, RefCatalogWire::creator_fence, first); writeU64StringValue(out, e.creator->fence_generation);
         }
         closeObject(out, first);
-        closeLine("ent");
+        closeLine("entry");
     }
 
     const size_t trailer_start = out.size();
@@ -202,7 +202,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
             return catalog;
         }
         if (key != RefCatalogWire::kind)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: record must start with \"k\"");
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: record must start with \"kind\"");
         const String kind = r.readString();
         if (kind != kEntryTag)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown record kind '{}'", kind);
@@ -223,13 +223,13 @@ RefCatalog decodeRefCatalog(std::string_view data)
             else if (key == RefCatalogWire::creator_epoch) cwe = r.readU64String();
             else if (key == RefCatalogWire::creator_fence) cfg = r.readU64String();
             else if (key == RefCatalogWire::remove_round) removal_started_round = r.readU64String();
-            else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown ent key '{}'", key);
+            else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown entry key '{}'", key);
         }
         if (!l.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: junk after record");
 
         if (!st_word)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing st", ns_str);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing state", ns_str);
         const NsState state = nsStateFromWord(*st_word);   /// throws CORRUPTED_DATA on an unknown word
 
         /// A missing "ns" key reads as the same empty string a present-but-empty one would, and both
@@ -245,7 +245,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
                 ns_str, ns_str.size(), kMaxNamespaceBytes);
 
         if (!inc)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing inc", ns_str);
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: entry '{}' missing life", ns_str);
         if (*inc == 0)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS ref catalog: namespace '{}' has a zero incarnation -- 0 never names a life", ns_str);
@@ -326,7 +326,7 @@ uint64_t worstCaseEntryFoldReservationBytes()
         /// coverage record plus terminal cleanup evidence, all numeric fields at maximum width.
         seal.ref_lives[std::numeric_limits<UInt128>::max()] = RefLifeFoldState{
             .coverage = RefCoverage{
-                .classification = 4,
+                .classification = CoverageClass::Clamped,
                 .last_folded_ref_id = RefTxnId{kU64Max, kU64Max},
                 .hold = RefHold{.reason = HoldReason::UnconsumedSealCrossing,
                                  .offending_position = RefTxnId{kU64Max, kU64Max},
@@ -379,7 +379,7 @@ void checkFoldSealReservation(
     /// wrap to a remainder far smaller than the true reservation, which would answer "fits" for an
     /// `entry_count` that plainly does not.
     const uint64_t ref_lives = mulByteBudget(entry_count, worstCaseEntryFoldReservationBytes());
-    /// `validateFoldSealStructure` permits at most one canonical seq-0 `btr` per shard, so charging
+    /// `validateFoldSealStructure` permits at most one canonical seq-0 `blob_run` per shard, so charging
     /// one widest row for every shard covers the full legal run domain without per-entry arithmetic.
     const uint64_t blob_target_runs = mulByteBudget(
         gc_shards, widestBlobTargetRunReservationBytes(layout, gc_shards));

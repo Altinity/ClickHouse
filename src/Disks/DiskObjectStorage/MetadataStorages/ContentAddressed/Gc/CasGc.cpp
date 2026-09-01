@@ -218,7 +218,7 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
             ++plan.dropped_holds;
             continue;
         }
-        it->second.fold_state.coverage.classification = 4;
+        it->second.fold_state.coverage.classification = CoverageClass::Clamped;
         it->second.fold_state.coverage.hold = hold;
     }
     for (const auto & [life_id, checkpoint] : ref_scan.checkpoint_observations)
@@ -1194,8 +1194,8 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
             "CAS gc fold: manifest body namespace mismatch at {} (manifestNamespaceMatches fail-closed)", key);
     /// The manifest-wide `blob_hash_len` foreign-width gate is GONE (the field
     /// itself was deleted — entries now carry their own per-entry algo/width). `decodePartManifest`
-    /// already fail-closes on an algo byte this BUILD does not know (`blobHashAlgoName` throws
-    /// CORRUPTED_DATA there) -- but a known algo may still not be ADMITTED to THIS pool yet (a stale
+    /// already fail-closes on an algo byte this BUILD does not know (`blobHashAlgoFromWord` throws
+    /// `CORRUPTED_DATA` there) -- but a known algo may still not be ADMITTED to THIS pool yet (a stale
     /// in-memory `admitted_algos` cache reading a manifest another node already admitted a new algo
     /// for). Per-entry admission validation refreshes on miss BEFORE
     /// failing closed, so a genuinely fresh admission is never mistaken for corruption.
@@ -1856,7 +1856,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     ///         absent, no listed id above it  => this namespace's frontier this round (normal end);
     ///         absent, a listed id above it   => impossible under contiguity, so the store is lying or a
     ///                                           durable record was lost: HOLD the namespace at
-    ///                                           classification 4 with its cursor unmoved.
+    ///                                           classification `Clamped` with its cursor unmoved.
     ///
     /// Epochs are crossed only over a consumed `EpochSeal` (INV-2): the seal folds as an applied table
     /// no-op (probe B2 `produced=false`) and the next epoch's start is `{E', 1}`, reached through the
@@ -2065,7 +2065,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             cursor_it != parent_ref_lives.end() ? cursor_it->second.coverage.hold : std::nullopt;
 
         RefCoverage cov;
-        cov.classification = 0;
+        cov.classification = CoverageClass::Absent;
         bool table_changed = false;
         /// THE FRONTIER PROOF for this namespace, and there is exactly one thing that establishes it:
         /// the walk read the expected-next position by exact key, found it ABSENT, and no witness put
@@ -2577,7 +2577,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 : (same_position ? UINT32_MAX : 0);
             effective->next_retry_round = current_round + 1;
             cov.hold = effective;
-            cov.classification = 4;
+            cov.classification = CoverageClass::Clamped;
             ++intake_tables_held;
             /// A held namespace is unproven BY DEFINITION -- the hold names a position the walk could
             /// not resolve, so everything at or above it is unaccounted. Stated here rather than left to
@@ -2587,7 +2587,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             unproven_reason = FoldResult::FrontierUnproven::Held;
         }
         else
-            cov.classification = table_changed ? 2 : 1;
+            cov.classification = table_changed ? CoverageClass::Folded : CoverageClass::Unchanged;
 
         result.fold_seal.ref_lives.at(target.life_id).coverage = cov;
         ++result.frontier_namespaces;
@@ -2646,7 +2646,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         for (const WalkTarget & target : walk_targets)
         {
             RefCoverage cov;
-            cov.classification = 1;
+            cov.classification = CoverageClass::Unchanged;
             if (const auto pit = parent_ref_lives.find(target.life_id); pit != parent_ref_lives.end())
             {
                 cov.last_folded_ref_id = pit->second.coverage.last_folded_ref_id;
@@ -2656,7 +2656,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 if (pit->second.coverage.hold)
                 {
                     cov.hold = pit->second.coverage.hold;
-                    cov.classification = 4;
+                    cov.classification = CoverageClass::Clamped;
                 }
             }
             RefLifeFoldState & ref_life_state = result.fold_seal.ref_lives.at(target.life_id);
@@ -4057,7 +4057,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         const RefTableState & st = recovered.state;
 
         RefCoverage cov;
-        cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps
+        cov.classification = CoverageClass::Folded;   /// unless a bodiless precommit clamps it below
         cov.last_folded_ref_id = st.getGreatestApplied();
         /// Whether the hold on this row was minted BY THIS REBUILD (and so still owes a retry round)
         /// rather than carried from the prior seal. Tracked explicitly instead of by looking for a
@@ -4103,7 +4103,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 /// still missing -- and clears once the namespace makes durable progress.
                 /// RESIDUAL, named rather than hidden: progress unrelated to this precommit also clears
                 /// it, and the precommit's edges stay missing until another rebuild.
-                cov.classification = 4;   /// Clamped
+                cov.classification = CoverageClass::Clamped;
                 cov.hold = RefHold{.reason = HoldReason::ManifestBodyMissing,
                                    .offending_position = RefTxnId{cov.last_folded_ref_id.writer_epoch,
                                                                  cov.last_folded_ref_id.ref_sequence + 1},
@@ -4126,7 +4126,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             const auto pit = prior_seal->ref_lives.find(life.incarnation);
             if (pit != prior_seal->ref_lives.end() && pit->second.coverage.hold)
             {
-                cov.classification = 4;
+                cov.classification = CoverageClass::Clamped;
                 cov.hold = pit->second.coverage.hold;
                 minted_here = false;   /// a carried hold rides VERBATIM; its retry fields are not ours
             }
