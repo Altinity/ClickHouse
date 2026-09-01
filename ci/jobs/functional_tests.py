@@ -942,9 +942,13 @@ def main():
         # (always `*_asan_ubsan`), and its validation loop later swaps to the
         # other build types, re-deriving the cap on every swap (sanitizer ->
         # 0.7, debug -> server default; see the TEST stage below).
-        memory_cap_source = build_types[0] if is_bugfix_validation else args.options
-        if any(san in memory_cap_source for san in SANITIZERS):
-            commands.append(lambda: CH.set_memory_ratio(0.7))
+        #
+        # 0.7 of 32 GiB is ~20 GiB, below the MSan hits_s3 insert. This fleet
+        # uses ZRAM for host overcommit (`LIMITED_MEM * 2`), so the 0.7 cap is
+        # not applied; the server stays at the default 0.9 ratio.
+        # memory_cap_source = build_types[0] if is_bugfix_validation else args.options
+        # if any(san in memory_cap_source for san in SANITIZERS):
+        #     commands.append(lambda: CH.set_memory_ratio(0.7))
 
         if is_flaky_check:
             commands.append(CH.enable_thread_fuzzer_config)
@@ -1016,11 +1020,8 @@ def main():
                     is_db_replicated=is_database_replicated,
                     # `args.options` (e.g. "amd_asan_ubsan, distributed plan, parallel")
                     # already carries the sanitizer name in the same format
-                    # `prepare_stateful_data`'s `is_sanitizer` check expects, so the
-                    # normal (non-bugfix-validation) path can reuse it directly - it
-                    # must not stay `None` here, since every sanitizer stateless run
-                    # now sets the tighter 0.7 memory ratio (see below) and needs the
-                    # reduced `MAX_INSERT_THREADS` to fit under it.
+                    # `prepare_stateful_data`'s preload settings expect, so the
+                    # normal (non-bugfix-validation) path can reuse it directly.
                     build_type=(
                         build_types[0] if is_bugfix_validation else args.options
                     ),
@@ -1202,10 +1203,12 @@ def main():
                     # reverts to the server default. The config tree is not
                     # reinstalled on a binary swap, so the override written
                     # for the previous build type would otherwise persist.
-                    if any(san in bugfix_bt for san in SANITIZERS):
-                        CH.set_memory_ratio(0.7)
-                    else:
-                        CH.reset_memory_ratio()
+                    # 0.7 of 32 GiB is ~20 GiB (see install stage); always
+                    # revert to the server default on a swap.
+                    # if any(san in bugfix_bt for san in SANITIZERS):
+                    #     CH.set_memory_ratio(0.7)
+                    # else:
+                    CH.reset_memory_ratio()
                     # Fail closed if the server cannot come back up after the
                     # binary swap: running tests against a dead server would
                     # produce `Server died` FAILs that the bugfix inverter
