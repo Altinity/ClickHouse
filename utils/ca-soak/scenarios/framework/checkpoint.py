@@ -17,8 +17,15 @@ from .report import Verdict
 
 def end_checkpoint(ctx, cluster, result, tables, *, table_filter=None, abandons=False,
                    expect_exception=False, since_event_time=None, optimize=True,
-                   fsck_container=lifecycle.DEFAULT_FSCK_CONTAINER) -> dict:
+                   fsck_container=None) -> dict:
     """Run the quiesced end checkpoint and the common assertions; return the end-state dict."""
+    # Resolve the fsck container HERE, not in this signature's default: a default argument binds
+    # `lifecycle.DEFAULT_FSCK_CONTAINER` at import, which is read from the environment at import too.
+    # A variant that publishes different container names then cannot be honoured however late the env
+    # is set. That is not theoretical — S41 reached 43/45 verdicts with the two fsck ones failing as
+    # "summary unavailable", because this default still named `ca-soak-ch1-1` while the stack was
+    # `ca-s41-ch1-1` (2026-09-01). Third site of the same defect, after `lifecycle` and `observe`.
+    fsck_container = fsck_container or lifecycle.fsck_container()
     t0 = time.monotonic()
     ctx.log("end checkpoint: quiescing cluster")
     try:

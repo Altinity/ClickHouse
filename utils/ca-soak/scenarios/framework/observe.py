@@ -38,6 +38,20 @@ from soak.cluster import QueryError, is_transport_error
 RUSTFS_CONTAINER = os.environ.get("CA_SOAK_RUSTFS_CONTAINER", "ca-soak-rustfs1-1")
 POOL_DIR = os.environ.get("CA_SOAK_POOL_DIR", "/data/test/soak_pool")
 
+
+def rustfs_container() -> str:
+    """Resolve the RustFS container AT CALL TIME. The module-level constant above is read once when
+    this module is imported, so a variant that publishes different container names — `reset_cluster`
+    exports `CA_SOAK_RUSTFS_CONTAINER` for s41 — could never be honoured through it. Same defect as
+    `lifecycle.fsck_container`; found by sweeping for module-level `os.environ.get` rather than by
+    reading the file that failed."""
+    return os.environ.get("CA_SOAK_RUSTFS_CONTAINER", "ca-soak-rustfs1-1")
+
+
+def pool_dir() -> str:
+    """Resolve the pool directory at call time, for the reason given in `rustfs_container`."""
+    return os.environ.get("CA_SOAK_POOL_DIR", "/data/test/soak_pool")
+
 CH_CONTAINERS = tuple(
     c for c in os.environ.get("CA_SOAK_CH_CONTAINERS", "ca-soak-ch1-1,ca-soak-ch2-1").split(",") if c)
 
@@ -321,11 +335,11 @@ def pool_shape(timeout_s: float = 120.0) -> dict:
     shape["_ok"] = False
     # `stat -c '%s %n'` over the file list is busybox/coreutils portable (avoids find -printf).
     cmd = ("cd %s 2>/dev/null && find . -type f 2>/dev/null | "
-           "xargs -r stat -c '%%s\t%%n' 2>/dev/null") % POOL_DIR
+           "xargs -r stat -c '%%s\t%%n' 2>/dev/null") % pool_dir()
     # `timeout N cd ...` is broken: `timeout` tries to EXEC `cd` (a shell builtin, no executable) and
     # fails, so the `&& find` never runs and pool_shape returned no `_total` (observed None across the
     # campaign). Wrap the whole pipe in `timeout N sh -c '<cmd>'` so timeout guards the find/xargs.
-    rc, so, se = _docker_exec(RUSTFS_CONTAINER, ["timeout", str(int(timeout_s)), "sh", "-c", cmd],
+    rc, so, se = _docker_exec(rustfs_container(), ["timeout", str(int(timeout_s)), "sh", "-c", cmd],
                               timeout_s=timeout_s + 10)
     if rc != 0 and not so:
         return shape

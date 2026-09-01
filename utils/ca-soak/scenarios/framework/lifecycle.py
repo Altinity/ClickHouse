@@ -16,6 +16,19 @@ from . import gc as gc_mod
 # Env-overridable so a scenario can fsck an ISOLATED compose stack (distinct docker-compose project,
 # e.g. S41's `ca-s41`) rather than the default `ca-soak` project. Default is the standard project.
 DEFAULT_FSCK_CONTAINER = os.environ.get("CA_SOAK_FSCK_CONTAINER", "ca-soak-ch1-1")
+
+
+def fsck_container() -> str:
+    """Resolve the fsck container AT CALL TIME, not at import.
+
+    `DEFAULT_FSCK_CONTAINER` above is read once when this module is imported, and was then used as a
+    DEFAULT ARGUMENT in the functions below — which binds it once more, at definition. A variant that
+    publishes different container names therefore could not be honoured by exporting the env var
+    later: `reset_cluster` sets `CA_SOAK_FSCK_CONTAINER` for the s41 variant, and every fsck call
+    still went to `ca-soak-ch1-1`, which does not exist in the `ca-s41` project. S41 then produced 43
+    green verdicts and failed on `no dangling after S41 inserts`, whose fsck summary came back
+    "unavailable (timeout or parse failure)" (2026-09-01)."""
+    return os.environ.get("CA_SOAK_FSCK_CONTAINER", "ca-soak-ch1-1")
 DEFAULT_FSCK_DISK = "ca_ro"
 
 
@@ -23,27 +36,31 @@ DEFAULT_FSCK_DISK = "ca_ro"
 # fsck / dry-run wrappers
 # ---------------------------------------------------------------------------
 
-def fsck_summary(container: str = DEFAULT_FSCK_CONTAINER, disk: str = DEFAULT_FSCK_DISK,
+def fsck_summary(container: str | None = None, disk: str = DEFAULT_FSCK_DISK,
                  timeout_s: float = 600.0) -> dict:
     """Summary fsck (no per-object detail) — cheap enough to poll in the GC fixpoint loop."""
+    container = container or fsck_container()
     return fsck_mod.run_fsck(container, disk=disk, detail=False, timeout_s=timeout_s)
 
 
-def fsck_detail(container: str = DEFAULT_FSCK_CONTAINER, disk: str = DEFAULT_FSCK_DISK,
+def fsck_detail(container: str | None = None, disk: str = DEFAULT_FSCK_DISK,
                 timeout_s: float = 900.0) -> dict:
     """Detailed fsck (per-object class rows) — used once at the final checkpoint for the structural
     and dry-run-subset assertions."""
+    container = container or fsck_container()
     return fsck_mod.run_fsck(container, disk=disk, detail=True, timeout_s=timeout_s)
 
 
-def dryrun(container: str = DEFAULT_FSCK_CONTAINER, disk: str = DEFAULT_FSCK_DISK,
+def dryrun(container: str | None = None, disk: str = DEFAULT_FSCK_DISK,
            timeout_s: float = 900.0) -> dict:
+    container = container or fsck_container()
     return fsck_mod.run_dryrun(container, disk=disk, timeout_s=timeout_s)
 
 
-def unreachable_probe(container: str = DEFAULT_FSCK_CONTAINER, disk: str = DEFAULT_FSCK_DISK):
+def unreachable_probe(container: str | None = None, disk: str = DEFAULT_FSCK_DISK):
     """Return a 0-arg callable giving the current fsck.unreachable int (for forced_gc_to_fixpoint).
     A failed/timed-out summary fsck raises, which the GC drive treats as a skipped probe."""
+    container = container or fsck_container()
     def _fn():
         s = fsck_summary(container, disk)
         return int(s.get("unreachable", 0))
@@ -165,11 +182,12 @@ def quiesce_cluster(cluster, tables, *, table_filter: str | None = None, optimiz
     return int(cluster.nodes()[0].scalar("SELECT toUnixTimestamp(now())"))
 
 
-def settle_fsck(container: str = DEFAULT_FSCK_CONTAINER, disk: str = DEFAULT_FSCK_DISK,
+def settle_fsck(container: str | None = None, disk: str = DEFAULT_FSCK_DISK,
                 *, stable: int = 2, timeout_s: float = 300.0, interval_s: float = 3.0,
                 log_fn=print) -> dict:
     """Poll a summary fsck until reachable+dangling are stable for `stable` reads (publishes from
     the just-drained workload have settled), then return the last summary."""
+    container = container or fsck_container()
     deadline = time.time() + timeout_s
     history = []
     last = {}

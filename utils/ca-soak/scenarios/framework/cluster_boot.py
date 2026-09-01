@@ -303,6 +303,13 @@ def reset_cluster(variant=None, *, archive_tag=None, log_fn=print, timeout_s=300
     # Tear down regardless of which variant is currently up (same project/containers). Pass the
     # tenreplicas file too so ch3..ch10 (defined only there) are torn down when switching away.
     _run(compose_cmd("tenreplicas", "down", "-v", "--remove-orphans"), timeout=boot_timeout, log_fn=log_fn)
+    # A variant with its OWN compose project (s41 declares `name: ca-s41`) is not touched by the
+    # teardown above, which only knows the default project's files. Without this its containers and
+    # their data survive the "reset": S41 came up on the right port and then failed with
+    # `Table default.s41_small_ca already exists`, because the previous run's tables were still there
+    # (2026-09-01). Tear the target variant's own stack down too, so "fresh pool" means fresh.
+    if _VARIANT_FILE.get(variant) and variant != "tenreplicas":
+        _run(compose_cmd(variant, "down", "-v", "--remove-orphans"), timeout=boot_timeout, log_fn=log_fn)
     _prep_log_dirs(node_count=n)
     if variant == "tuned" and overrides:
         render_tuned_config(overrides)
