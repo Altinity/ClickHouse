@@ -133,10 +133,10 @@ while its CPU sits at 0.13%; both a query and the GC thread wait in `poll` on li
 (545 ESTABLISHED on both sides). `s3_max_connections = 192` cut throttling from 34% to 6.8% and did
 not fix the hang. See `[soak-retry-budget-turns-a-503-into-a-livelock]`.
 
-**S03 at `full`** — `Code: 210 mount lease not held`, root-caused to a single unresolved heartbeat
-write; see `[mount-renewal-loses-the-lease-on-one-unresolved-attempt]`. Two product concerns in it:
-no retry before the lease is surrendered, and one node giving up with 1,969 ms of confirmed budget
-left.
+**S03 at `full`** — `Code: 210 mount lease not held`; see `[renewal-gives-up-with-budget-left]`. The
+"no retry" reading was wrong: that is Altinity#2244, fixed 2026-08-24, and retries are bounded by the
+confirmed lease so ch1's single attempt at zero budget is correct. What remains open is ch2 stopping
+with 1,969 ms unspent, and one attempt running 23.7 s against a documented 5 s per-attempt bound.
 
 **S05 at `full`** — 1,200 standalone repoints; see `[s05-standalone-repoints-on-the-non-transactional-path]`.
 

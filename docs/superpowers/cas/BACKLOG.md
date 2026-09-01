@@ -1367,54 +1367,58 @@ The merge's completion refutes it. What actually happened is that the merge was 
 I sampled a single 90-second window that fell in a pause, then concluded throughput was zero. Read a
 curve, not one interval.
 
-## `[mount-renewal-loses-the-lease-on-one-unresolved-attempt]` A single in-flight heartbeat write costs the mount lease, with no retry {#mount-renewal-single-attempt}
+## `[renewal-gives-up-with-budget-left]` A renewal stopped with 1,969 ms of confirmed budget unspent, and one attempt burned 23.7 s {#renewal-gives-up-with-budget-left}
 
-**Observed 2026-09-01 in S03 at `--scale full`**, which failed with `Code: 210 ... mount lease not
-held`. The chain below is read off `system.ca_event_log`, not inferred.
+**Supersedes an earlier framing of mine that reported known, fixed behaviour as a new defect.** The
+first version of this entry said "a single unresolved heartbeat write costs the mount lease, with no
+retry" — which is exactly what
+[Issue #2244](https://github.com/Altinity/ClickHouse/issues/2244) diagnosed on 2026-08-20 and whose
+minimum fix landed **2026-08-24** (`docs/superpowers/specs/2026-08-23-cas-mount-renewal-retry-design.md`),
+with focused and full TLA+, Release/Debug, proxy-integration and 15-minute S39 gates. Filing it again
+as novel was a duplicate.
 
-The `watermark_renew` event that starts it carries its own numbers:
+**Observed 2026-09-01, S03 at `--scale full`**, which then failed with `Code: 210 ... mount lease not
+held`. Read off `system.ca_event_log`:
 
 | field | ch1 | ch2 |
 |---|---|---|
-| `attempts_sent` | **1** | **1** |
-| `elapsed_ms` | 23,755 | 18,031 |
+| `attempts_sent` | 1 | **1** |
+| `elapsed_ms` | **23,755** | 18,031 |
 | `remaining_confirmed_budget_ms` | 0 | **1,969** |
 | `unresolved_reason` | `deadline_mid_way` | `deadline_mid_way` |
 | `classification` | `external_lease_deadline` | `external_lease_deadline` |
 | `stop_cause` | `continue` | `continue` |
 
-**Two things here look wrong, and they are independent.**
+**What is NOT a defect, on the current design.** The implemented protocol retries "within the time
+still justified by its last confirmed lease". ch1 had **zero** budget left, so sending no second
+attempt is the design working, not failing.
 
-**One attempt costs the lease.** `attempts_sent = 1`: a single heartbeat write went out, never
-resolved, and the `external_lease_safety` deadline fired while it was still in flight
-(`deadline_mid_way`). The renewal then ended "without retained authority and fenced the mount", which
-drops the pool to `TransientNotLive` and refuses EVERY operation class with `Code: 210`. No retry was
-attempted before paying that price — while ordinary object-store reads on the same disk retry up to
-`s3_retry_attempts = 500`.
+**What is worth investigating, and both are separate from #2244's original diagnosis.**
 
-**ch2 gave up with budget left.** It stopped at 18,031 ms with **1,969 ms of confirmed budget
-remaining** and `stop_cause = continue`, meaning nothing asked it to stop. Either the deadline
-arithmetic or the loop's exit condition is wrong; a renewal that abandons a live lease while it still
-holds ~2 s of proven safety margin is giving away authority it had.
+**ch2 stopped with 1,969 ms of confirmed budget remaining** and `stop_cause = continue`, meaning
+nothing asked it to stop — precisely the window in which the 2026-08-24 fix is supposed to retry.
+Either the budget arithmetic, the margin term (`now + margin < confirmed_deadline`), or the loop's
+exit condition keeps a retry from being issued when one is still justified.
 
-**What follows is downstream, and is correct behaviour being blamed for the above.** The fenced epoch
-is terminal, so the self-remount re-claims with a fresh `writer_epoch`, finds the previous epoch's
-slot present, un-fenced and not proven dead, and refuses under the "no wall-clock trust" rule — three
-`mount_conflict` events with `outcome = live_double_start`, five seconds apart. That refusal is right:
-taking a lease from a possibly-live writer on a clock guess is exactly the thing the rule prevents.
-The defect is upstream, in losing the lease on one unresolved write.
+**A single attempt consumed 23.7 s against a 30 s TTL.** #2244 describes renewal as "one
+5-second-timeout `PUT` per 10-second period". An attempt running 23.7 s is nearly five times that
+bound, so either the per-attempt timeout is not being applied on this path or the attempt is not the
+`PUT` alone. Whatever the answer, an attempt that can eat 79% of the TTL leaves no room for the retry
+protocol to help — the budget is gone before the second attempt could be considered.
 
-**Why the write did not resolve** is the storage saturation measured the same night: RustFS reports
-`permits_in_use: 256, total_permits: 256, queue_utilization: 100.0%` and answers `503` after ~5 s,
-while its CPU sits at 0.13%. A heartbeat is an ordinary write on that path and has no privilege.
+**Why the write did not resolve** is the storage saturation measured the same night: RustFS reporting
+`permits_in_use: 256/256`, 100% queue utilization, answering `503` after ~5 s with its CPU at 0.13%.
+A heartbeat is an ordinary write on that path and gets no privilege.
 
-**Reproduction:** S03 at `--scale full`. It does not reproduce at `dev` or `ci`, so the load has to be
-large enough to saturate the permit pool.
+**Downstream, and correct.** The fenced epoch is terminal, so the self-remount re-claims with a fresh
+`writer_epoch`, finds the previous epoch's slot un-fenced and not proven dead, and refuses under "no
+wall-clock trust" — three `mount_conflict` events with `outcome = live_double_start`, five seconds
+apart. That refusal prevents taking a lease from a possibly-live writer on a clock guess. Do not read
+those conflicts as the fault. Related: `[issue-2244-remount-retry-follow-up]`, the still-open per-step
+remount work.
 
-**Do not read the dump window as the event's duration.** The three conflicts span ten seconds only
-because the `predown_dump` that captured them ran at 06:53:21; the containers were torn down
-afterwards and the rest is gone. The renewal itself took 23.7 s.
-
+**Reproduction:** S03 at `--scale full`; does not reproduce at `dev` or `ci`. The ten-second span of
+the conflicts is an artifact of when `predown_dump` ran, not the duration of the event.
 ## `[s05-standalone-repoints-on-the-non-transactional-path]` 1,200 committed refs repointed outside a transaction during sparse-write GC {#s05-standalone-repoints}
 
 **Found 2026-09-01, S05 at `--scale full`** (10,000 tables, one insert each). Sixteen verdicts, zero

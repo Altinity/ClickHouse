@@ -81,7 +81,7 @@ value is BOUND, not where the environment is read.
 
 | entry | substance |
 |---|---|
-| `[mount-renewal-loses-the-lease-on-one-unresolved-attempt]` | S03 at `full`: `attempts_sent = 1`, one heartbeat write hung 23.7 s against a 30 s TTL, lease surrendered with no retry. Separately, one node stopped with 1,969 ms of confirmed budget left and `stop_cause = continue` |
+| `[renewal-gives-up-with-budget-left]` | S03 at `full`. NOT the "no retry" defect of Altinity#2244 — that was fixed 2026-08-24 and ch1's zero budget makes its single attempt correct. What is new: ch2 stopped with 1,969 ms of budget unspent and `stop_cause = continue`, and one attempt ran 23.7 s against a documented 5 s per-attempt timeout |
 | `[s05-standalone-repoints-on-the-non-transactional-path]` | 1,200 standalone repoints of committed refs during sparse-write GC, `full` only, 16 verdicts and zero anomalies |
 | `[s01-rss-growth-scales-with-the-blob]` | RSS growth 0 at a 512 MiB blob, 2.228 GiB (28%) at 8 GiB; trace puts 42% in String deserialization under the merge and 7% in the CAS write path |
 | `[soak-retry-budget-turns-a-503-into-a-livelock]` | a 500-attempt retry budget converts RustFS's read-concurrency refusal into an unbounded wait |
@@ -114,9 +114,11 @@ its cost.
 
 Three questions that need a measurement, not an argument.
 
-**Why the mount-lease heartbeat never retries.** One unresolved write surrenders the lease and fences
-the mount, on a disk whose ordinary reads retry up to `s3_retry_attempts = 500`. And why one node
-stopped with ~2 s of proven safety margin unspent.
+**Why a renewal stops with budget left.** Retries are bounded by the confirmed lease, so ch1's single
+attempt at zero budget is correct. ch2's is not: it stopped with 1,969 ms remaining and
+`stop_cause = continue`, in exactly the window the 2026-08-24 fix retries in. Separately, one attempt
+ran 23.7 s against the 5 s per-attempt timeout Altinity#2244 documents — an attempt that eats 79% of
+the TTL leaves the retry protocol nothing to work with.
 
 **Which operation calls `repointRef` outside a transaction.** 1,200 of them in S05. Check whether the
 count scales with tables, parts or GC rounds; if it shares a call site with the known
