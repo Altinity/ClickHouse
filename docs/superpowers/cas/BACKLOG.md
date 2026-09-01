@@ -62,6 +62,68 @@ is fine. They get triaged into the topic files above during the next grooming pa
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 isn't referenced elsewhere first.
 
+## `[write-token-provenance-not-in-the-api]` A write's token may come from a later, unrelated `HEAD`, and nothing in the type says so {#write-token-provenance}
+
+Found 2026-09-01 while designing self-authored mount reclaim; it is the blocker that killed revision 4
+of `docs/superpowers/specs/2026-09-01-cas-self-authored-mount-reclaim-design.md`.
+
+`ObjectStorageBackend::tokenFromWriteResult` decides how much to trust the token of a successful
+conditional write, and the two dialects disagree about what to do when the response carries none:
+
+- **Generation (GCS)** throws `CORRUPTED_DATA`, on the stated grounds that "there is no follow-up HEAD,
+  so a broken or lying response can never be silently patched over by a later, **unrelated** read"
+  (`CasObjectStorageBackend.h:187-193`);
+- **ETag, and any backend with no write-time token at all** issues exactly that later, unrelated read —
+  a fresh `HEAD` whose result is returned as if it were the write's token
+  (`CasObjectStorageBackend.cpp:860-865`).
+
+This is a deliberate scope boundary, not an oversight: `tokenFromWriteResult` was introduced by
+`9b887ac8886` "Bind GCS CAS writes to exact response generations" (2026-08-21), whose own message says
+"every other dialect keeps the pre-existing HEAD-fallback behavior unchanged". The GCS work saw the
+attribution problem and fixed it only where it was working.
+
+**The hazard.** Our write commits, the response carries no ETag, our fallback `HEAD` stalls, a
+same-uuid twin claims and arms authority, and our `HEAD` returns the twin's token — which we then hold
+as the token of our own write. Today that is fail-safe everywhere it lands: the value flows into
+`MountLeaseKeeper::last_token` and is used only as an `If-Match` precondition, so being wrong costs a
+failed renewal and a fence, never a wrong action. Nothing at the type level says that is the only
+correct way to consume it, and a consumer that treats the token as *identifying* our body instead of
+merely *conditioning* the next write turns it into a live-twin overwrite. Revision 4 of the reclaim
+design was exactly that consumer.
+
+**Fix direction: put provenance in `PutResult`, do not make the ETag path throw.** A `nullopt` is
+structural for backends with no write-time token (local files, a non-S3 `IObjectStorage`), so throwing
+would break them. Aligning the API means making "attributed to this write" versus "observed afterwards"
+a fact the caller can see, after which each dialect maps onto it honestly and each consumer decides:
+GCS keeps throwing (a missing generation there is a genuine anomaly), ETag and the token-less backends
+return committed-with-unattributed-token.
+
+Then revisit `MountLeaseKeeper::last_token`: an unattributed token is a guess, and the keeper might
+better treat its own write as unresolved and re-resolve than store one.
+
+Related: `[empty-token-unconditional-write-guard]` covers the *empty* token this same fallback can
+produce; this item is about a *wrong* one. Both come from the same three lines.
+
+## `[resolved-by-get-unbounds-clone-overlap]` Exact-byte resolution lets lockstep clones both stay authoritative indefinitely {#resolved-by-get-clone-overlap}
+
+Found 2026-09-01, same design work. Not a fix this release needs; recorded because two successive
+revisions of that design asserted the opposite baseline and were wrong.
+
+A VM snapshot restored twice gives two runtimes with the same `server_uuid`, the same
+`MountLeaseKeeper` state and the same `thread_local_rng` state, so they mint the same
+`write_attempt_id` (`UUID.cpp:11`). Where their other body inputs also stay in lockstep — wall time,
+hostname, PID, `seq`, watermark — they build **byte-identical** renewal bodies. One lands; the other
+loses its `If-Match`, and `putOverwriteControlled`'s resolve-by-get sees identical bytes at a changed
+token and reports `Committed` to it too (`CasRequestControl.cpp:678-687`). Both extend local authority,
+and the cycle can repeat.
+
+So the intuition that the token guard fences whichever clone loses, bounding the overlap to about one
+renew period, is false: `resolved_by_get` is what removes the bound. Cloning a running server that holds
+a CAS mount is outside supported operation, so this is a documentation and threat-model item rather than
+a fix — but the mount documentation should say it, and any future argument that reasons from "the store
+serialises us" should not assume a bound that is not there.
+
+
 
 
 The eleven items below are untouched since the 2026-08-04 consolidation-audit findings that produced
