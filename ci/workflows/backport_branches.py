@@ -5,6 +5,11 @@ from ci.defs.altinity_jobs import AltinityJobConfigs
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
 
+FUNCTIONAL_TESTS_JOBS = [
+    *JobConfigs.functional_tests_jobs,
+    *AltinityJobConfigs.cas_functional_tests_jobs,
+]
+
 workflow = Workflow.Config(
     name="BackportPR",
     event=Workflow.Event.PULL_REQUEST,
@@ -25,7 +30,7 @@ workflow = Workflow.Config(
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_jobs,
         *JobConfigs.compatibility_test_jobs,
-        *[job for job in AltinityJobConfigs.functional_tests_jobs if "amd_asan_ubsan" in job.name],
+        *[job for job in FUNCTIONAL_TESTS_JOBS if "amd_asan_ubsan" in job.name],
         *[
             job
             for job in JobConfigs.unittest_jobs

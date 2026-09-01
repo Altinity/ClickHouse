@@ -1,7 +1,7 @@
 from praktika import Artifact, Job
 
 from ci.defs.defs import TEMP_DIR, ArtifactNames, RunnerLabels
-from ci.defs.job_configs import JobConfigs, common_ft_job_config
+from ci.defs.job_configs import common_ft_job_config
 
 
 class AltinityArtifactNames:
@@ -120,13 +120,3 @@ class AltinityJobConfigs:
             requires=[ArtifactNames.CH_AMD_BINARY_GH],
         ),
     )
-
-    # The functional-tests set every workflow schedules: upstream lanes plus the CAS lanes, composed
-    # ONCE here as a NEW list. Workflows must reference this instead of appending per-file --
-    # `mangle` loads every workflow module in one process, so a per-file `+=` on the shared upstream
-    # list would append the CAS lanes once per loaded workflow.
-    functional_tests_jobs = [
-        *JobConfigs.functional_tests_jobs,
-        *cas_functional_tests_jobs,
-    ]
-
