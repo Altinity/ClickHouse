@@ -34,7 +34,7 @@ rejects it. But `tokenForHead` stamps `native_token_type` onto whatever string i
 **correctly typed, empty-valued** token that passes every existing check.
 
 Empty tokens are reachable, not merely constructible. `tokenFromWriteResult`'s `HEAD` fallback returns
-`hr ? hr->token : Token{}` (`CasObjectStorageBackend.cpp:865`), and `nativeHead` validates emptiness
+`hr ? hr->token : Token{}` (`CasObjectStorageBackend.cpp:866`), and `nativeHead` validates emptiness
 only for generation tokens (`:149-158`). The value then flows into `MountLeaseKeeper::last_token` and
 becomes the expected token of the next renewal.
 
@@ -82,7 +82,7 @@ lost condition looks like, and the whole protocol is built to re-validate on one
 1. `putOverwriteControlled` calls `putOverwrite`, which now refuses with `PreconditionFailed`;
 2. the controller's resolve-by-get reads the slot: the bytes are the *previous* body, not the one this
    renewal is writing, and the token differs from the (empty) expected one, so it reports `Conflict`
-   (`CasRequestControl.cpp:698`);
+   (`CasRequestControl.cpp:703-707`);
 3. `MountLeaseKeeper::renew` turns a conflict into a terminal renewal, the mount fences, and the
    remount allocates a fresh `writer_epoch` and claims — obtaining a **fresh, non-empty token**.
 
