@@ -104,6 +104,10 @@ private:
     mutable std::mutex mutex;
     std::map<String, TaskEntry> tasks;
 
+    /// Renders a task key for logs and error messages. Unlike `compositeKey` this is not injective,
+    /// so it must never be used as an identity.
+    static String describeKey(const MergeTreePartitionExportTask & descriptor);
+
     void scheduleOnePart(const String & transaction_id, const String & part_name);
     void handlePartCompletion(const String & transaction_id, const String & part_name, const MergeTreePartExportManifest::CompletionCallbackResult & result);
     void tryCommit(const String & transaction_id);

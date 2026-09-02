@@ -7,7 +7,9 @@
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
 #include <Common/SipHash.h>
+#include <Common/escapeForFileName.h>
 #include <Common/logger_useful.h>
+#include <Common/quoteString.h>
 #include <Disks/IDisk.h>
 #include <IO/WriteHelpers.h>
 #include <IO/ReadHelpers.h>
@@ -44,8 +46,21 @@ MergeTreePartitionExportScheduler::MergeTreePartitionExportScheduler(StorageMerg
 String MergeTreePartitionExportScheduler::compositeKey(
     const String & partition_id, const String & destination_database, const String & destination_table)
 {
-    const QualifiedTableName qualified_table_name{destination_database, destination_table};
-    return partition_id + "_" + qualified_table_name.getFullName();
+    /// `escapeForFileName` percent-encodes every character that is not alphanumeric or `_`, so an
+    /// escaped component can never contain the `.` used here as a separator. Note that `_` survives
+    /// escaping and therefore cannot be used as a separator.
+    return escapeForFileName(partition_id) + "."
+        + escapeForFileName(destination_database) + "."
+        + escapeForFileName(destination_table);
+}
+
+String MergeTreePartitionExportScheduler::describeKey(const MergeTreePartitionExportTask & descriptor)
+{
+    return fmt::format(
+        "{} -> {}.{}",
+        descriptor.partition_id,
+        backQuoteIfNeed(descriptor.destination_database),
+        backQuoteIfNeed(descriptor.destination_table));
 }
 
 String MergeTreePartitionExportScheduler::getExportsRelativePath() const
@@ -66,6 +81,8 @@ void MergeTreePartitionExportScheduler::addTask(
     MergeTreePartitionExportTask descriptor, std::vector<DataPartPtr> part_references, bool force)
 {
     const auto composite_key = compositeKey(descriptor.partition_id, descriptor.destination_database, descriptor.destination_table);
+    /// Rendered before `descriptor` is moved into the entry below.
+    const auto key_description = describeKey(descriptor);
     const auto transaction_id = descriptor.transaction_id;
 
     String previous_transaction_id;
@@ -79,7 +96,7 @@ void MergeTreePartitionExportScheduler::addTask(
                 throw Exception(ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED,
                     "Export with key {} already exported or it is being exported. "
                     "Set `export_merge_tree_partition_force_export` to overwrite it.",
-                    composite_key);
+                    key_description);
 
             previous_transaction_id = it->second.getDescriptor().transaction_id;
         }
@@ -93,11 +110,11 @@ void MergeTreePartitionExportScheduler::addTask(
 
     if (!previous_transaction_id.empty())
     {
-        LOG_INFO(storage.log, "ExportPartition: overwriting export with key {}", composite_key);
+        LOG_INFO(storage.log, "ExportPartition: overwriting export with key {}", key_description);
         storage.killExportPart(previous_transaction_id);
     }
 
-    LOG_INFO(storage.log, "ExportPartition: scheduled export task {} (key {})", transaction_id, composite_key);
+    LOG_INFO(storage.log, "ExportPartition: scheduled export task {} (key {})", transaction_id, key_description);
     storage.triggerPartitionExportTask();
 }
 
@@ -651,6 +668,8 @@ void MergeTreePartitionExportScheduler::loadFromDisk()
 
             auto descriptor = MergeTreePartitionExportTask::fromJsonString(content);
             const auto composite_key = compositeKey(descriptor.partition_id, descriptor.destination_database, descriptor.destination_table);
+            /// Rendered before `descriptor` is moved into the entry below.
+            const auto key_description = describeKey(descriptor);
 
             TaskEntry entry;
 
@@ -668,9 +687,19 @@ void MergeTreePartitionExportScheduler::loadFromDisk()
             }
 
             entry.setDescriptor(std::move(descriptor));
-            tasks.emplace(composite_key, std::move(entry));
 
-            LOG_INFO(storage.log, "ExportPartition: loaded export task from disk (key {})", composite_key);
+            /// The file name is a pure function of the composite key, so this code can never write
+            /// two records for one key. A duplicate means the directory was tampered with or holds
+            /// records written by an incompatible version; keeping an arbitrary one of them would
+            /// silently resurrect stale state, so report it instead.
+            if (!tasks.emplace(composite_key, std::move(entry)).second)
+            {
+                LOG_ERROR(storage.log, "ExportPartition: ignoring {}, another record already describes key {}",
+                    file_name, key_description);
+                continue;
+            }
+
+            LOG_INFO(storage.log, "ExportPartition: loaded export task from disk (key {})", key_description);
         }
         catch (...)
         {
