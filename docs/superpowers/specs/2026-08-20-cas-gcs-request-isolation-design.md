@@ -126,8 +126,9 @@ the operation routing around them.
   call sites.
 - Preserve existing CAS configuration and persistent token formats.
 - Do not rename or remove a non-CAS authentication option.
-- Fail closed when generation semantics, exact deletion, mutable-write single-PUT limits, metadata round trips,
-  or bucket-versioning safety cannot be verified.
+- Fail closed when generation semantics, exact deletion, mutable-write single-PUT limits, or metadata round
+  trips cannot be verified. Bucket versioning refuses the mount when verified enabled; an unverifiable
+  versioning probe warns and proceeds (decision of 2026-09-02, see the bucket-versioning section).
 
 ## Non-goals {#non-goals}
 
@@ -270,7 +271,7 @@ Read-only mounts may skip the battery because they expose no mutating surface an
 
 Decommission is a deliberate exception: it opens the pool with the access check skipped and never
 runs the battery. The fail-closed trade-off inverts there. Refusing an ordinary mount on a bucket
-whose versioning cannot be verified costs availability and protects data, whereas refusing a
+verified as versioned costs availability and protects data, whereas refusing a
 decommission strands a pool that still contains a dead replica and leaves the operator no way
 forward. The guarantee is therefore about ordinary writable mounts, and an operator decommissioning
 a pool on a versioned bucket carries the archiving hazard knowingly.
@@ -327,10 +328,13 @@ These are targeted metadata-prefix mappings, not permission for a blanket `x-amz
 
 ### Verified bucket-versioning safety {#verified-bucket-versioning-safety}
 
-Writable CAS over GCS requires a verified result showing that object versioning is disabled. An
-enabled bucket or an unverifiable versioning probe causes mount failure. Proceeding on an assumption
-would violate fail-closed behavior: exact deletion on a versioned bucket archives a noncurrent
-generation instead of reclaiming storage.
+Writable CAS over GCS checks at mount that object versioning is disabled. A bucket verified as enabled
+causes mount failure: exact deletion on a versioned bucket archives a noncurrent generation instead of
+reclaiming storage. An unverifiable probe (the credential cannot read the bucket configuration, or the
+backend cannot answer) does not fail the mount; it logs a warning naming the unverified precondition,
+and disabling versioning becomes an operator precondition in the same sense as soft delete below.
+Decision of 2026-09-02: an unreadable configuration is not evidence of a versioned bucket, and the
+earlier refusal turned a credential without `storage.buckets.get` into a hard outage on the live stand.
 
 Soft delete is an explicit operator precondition rather than a mount-time gate. The
 [GCS policy documentation](https://docs.cloud.google.com/storage/docs/use-soft-delete) exposes its
@@ -597,7 +601,8 @@ request mode or proceeds with multipart completion.
 
 - Unsupported GCS authentication modes fail the CAS capability check.
 - A writable generation backend configured with `skip_access_check=true` fails before pool open.
-- An unknown or enabled bucket-versioning state fails a writable GCS CAS mount.
+- An enabled bucket-versioning state fails a writable GCS CAS mount; an unknown state logs a warning
+  and proceeds.
 - A wrong token type or invalid generation is rejected before mutation.
 - A conditional multipart request is rejected before network I/O.
 - Any GCS CAS token-producing write above the single-PUT cap is rejected before multipart creation.
@@ -628,9 +633,10 @@ CAS continues to use numeric generations and `TokenType::Generation`; no persist
 configuration migration is needed. Operations previously relying on the globally-mutated client
 receive explicit `NativeConditional` request state instead.
 
-Writable mounts that previously proceeded when bucket-versioning state was unknown now fail. This
-is an intentional fail-closed tightening, not a compatibility promise: proceeding could make exact
-deletion archive data instead of reclaiming it.
+Writable mounts on a bucket verified as versioned fail. An unknown versioning state proceeds with a
+warning: the fail-closed variant was tried on the live stand on 2026-09-02, where a credential
+without `storage.buckets.get` became a refused mount, and an unreadable configuration is not evidence
+of a versioned bucket. Verifying it then rests with the operator, as soft delete already does.
 
 Writable generation backends also reject `skip_access_check=true`, because it would bypass the
 production conditional-operation battery that validates the exact DELETE path. Read-only mounts
@@ -771,8 +777,8 @@ proves an attributable generation. Unit tests may not manufacture the missing co
 - Other clients do not select generation capability merely because the URL resembles GCS.
 - Ordinary GCS S3-interoperability HMAC does not select generation capability from its endpoint or
   credentials and retains its existing ETag behavior.
-- Enabled and unknown versioning states both reject writable GCS CAS mount; verified disabled state
-  passes.
+- An enabled versioning state rejects writable GCS CAS mount; verified disabled passes; unknown passes
+  with a warning.
 - Writable generation mode rejects `skip_access_check=true`; read-only generation mode may skip the
   mutating battery.
 - AWS-compatible CAS remains on ETag semantics.
@@ -816,7 +822,7 @@ The implementation should remain within these responsibilities:
 - `src/Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h` and `S3ObjectStorage.cpp`:
   conditional metadata override, exact DELETE marking, capability reporting, and settings routing;
 - `CasObjectStorageBackend.h` and `CasObjectStorageBackend.cpp`: native-token settings, conditional
-  settings, strict versioning gate, and CAS metadata API selection;
+  settings, versioning gate, and CAS metadata API selection;
 - `ContentAddressedSettings.cpp`, `ContentAddressedMetadataStorage.h`, and
   `ContentAddressedMetadataStorage.cpp`: rename the GCS token-producing PUT cap and reject skipped
   writable generation probes;
@@ -928,7 +934,7 @@ The design is acceptable only if reviewers can confirm all of the following:
 - the existing Expect gate recognizes translated generation preconditions;
 - every GCS token-producing write is single-PUT and fails above the cap;
 - missing write generation never triggers a follow-up HEAD;
-- enabled or unknown bucket versioning rejects writable GCS CAS mount;
+- enabled bucket versioning rejects writable GCS CAS mount, unknown warns and proceeds;
 - the soft-delete limitation and operator precondition are explicit;
 - no generation-specific client or OAuth token cache is added beyond the existing base and
   single-attempt clients;

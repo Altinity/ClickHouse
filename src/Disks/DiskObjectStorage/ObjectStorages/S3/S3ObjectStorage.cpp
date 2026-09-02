@@ -574,7 +574,12 @@ std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled() const
 
     auto outcome = client.get()->GetBucketVersioning(request);
     if (!outcome.IsSuccess())
+    {
+        /// The caller only learns "unknown"; the reason is what the operator needs to act on.
+        LOG_WARNING(log, "GetBucketVersioning for bucket `{}` failed: {} ({})",
+            uri.bucket, outcome.GetError().GetMessage(), outcome.GetError().GetExceptionName());
         return std::nullopt;
+    }
 
     return outcome.GetResult().GetStatus() == Aws::S3::Model::BucketVersioningStatus::Enabled;
 }

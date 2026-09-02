@@ -151,7 +151,10 @@ and on any S3-compatible store regardless of the config check. Three narrow resi
   post-mount case is caught late and only on the blob-body path — decide whether the check belongs in
   the shared delete helper;
 - the GCS config check fails open, and `skip_access_check` skips the probe entirely (see
-  {#skip-access-check-no-signal}).
+  {#skip-access-check-no-signal}). Update 2026-09-02: this is now the decided behaviour, not a
+  residual — an unverifiable versioning probe logs a warning and the mount proceeds, because the
+  live stand's credential lacked `storage.buckets.get` and the refusal made a missing IAM grant a
+  hard outage. A probe that verifies `Enabled` still refuses.
 
 ## Optional-field / bound residuals in the control-object decoders {#decoder-optional-field-residuals}
 

@@ -24,6 +24,8 @@
 #include <IO/S3/Client.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
 #include <Common/tests/gtest_global_context.h>
+#include <Common/logger_useful.h>
+#include <Poco/StreamChannel.h>
 
 #include <mutex>
 #include <sstream>
@@ -123,9 +125,41 @@ std::shared_ptr<VersioningObjectStorage> makeVersioningObjectStorageForTest(std:
     return std::make_shared<VersioningObjectStorage>(std::move(settings), versioned);
 }
 
+/// Captures what `ObjectStorageBackend` logs at WARNING and above, so a test can assert both that a
+/// warning was raised and that none was. Same shape as the capture in gtest_cas_settings.cpp.
+class ScopedBackendLogCapture
+{
+public:
+    ScopedBackendLogCapture()
+        : logger(getLogger("CasObjectStorageBackend"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("warning");
+    }
+
+    ~ScopedBackendLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream;
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// `shared=true` is load-bearing: `AutoPtr(ptr)` would steal a reference the fixture never owned.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
+
 /// Every refusal reached from these mount gates is `NOT_IMPLEMENTED`, so the code alone cannot tell
 /// which one fired. Match a phrase unique to the intended message as well, or a test asserting the
-/// unverifiable-versioning refusal would pass on the enabled-bucket refusal and vice versa.
+/// enabled-versioning refusal would pass on the skip-access-check refusal and vice versa.
 template <typename F>
 void expectThrowsNotImplementedSaying(const std::string & needle, F && fn)
 {
@@ -180,17 +214,25 @@ TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
     EXPECT_EQ(hr.token.type, TokenType::Generation);
 }
 
-/// A generation-dialect (GCS) mount needs bucket versioning to be VERIFIABLY off: a token-exact
+/// A generation-dialect (GCS) mount wants bucket versioning to be verifiably off: a token-exact
 /// DELETE against a versioned bucket archives a noncurrent generation, so GC would delete objects it
-/// believes it reclaimed. A probe that cannot answer therefore refuses the mount rather than
-/// assuming the safe answer.
-TEST(CASBackendGeneration, CheckPoolPreconditionsFailsClosedOnUnverifiableVersioning)
+/// believes it reclaimed. A probe that cannot answer is not evidence of a versioned bucket, though:
+/// the usual cause is a credential without permission to read the bucket configuration, and
+/// refusing on it turns a missing IAM grant into a hard outage. So the mount proceeds, and says
+/// loudly what it could not verify and how the operator can.
+TEST(CASBackendGeneration, CheckPoolPreconditionsWarnsAndContinuesOnUnverifiableVersioning)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         makeVersioningObjectStorageForTest(std::nullopt), ObjectStorageBackend::Mode::Native);
     b->setNativeTokenTypeForTest(TokenType::Generation);
 
-    expectThrowsNotImplementedSaying("could not VERIFY", [&] { b->checkPoolPreconditions(); });
+    ScopedBackendLogCapture capture;
+    EXPECT_NO_THROW(b->checkPoolPreconditions());
+
+    const auto logged = capture.captured();
+    EXPECT_NE(logged.find("could not VERIFY"), String::npos) << logged;
+    EXPECT_NE(logged.find("versioning"), String::npos) << logged;
+    EXPECT_NE(logged.find("storage.buckets.get"), String::npos) << logged;
 }
 
 TEST(CASBackendGeneration, CheckPoolPreconditionsRejectsEnabledVersioning)
@@ -202,27 +244,31 @@ TEST(CASBackendGeneration, CheckPoolPreconditionsRejectsEnabledVersioning)
     expectThrowsNotImplementedSaying("VERSIONING enabled", [&] { b->checkPoolPreconditions(); });
 }
 
-/// The one accepting case: a probe that answered, and answered "disabled".
-TEST(CASBackendGeneration, CheckPoolPreconditionsAcceptsVerifiedDisabledVersioning)
+/// The fully verified case: a probe that answered, and answered "disabled". Nothing to warn about.
+TEST(CASBackendGeneration, CheckPoolPreconditionsAcceptsVerifiedDisabledVersioningSilently)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         makeVersioningObjectStorageForTest(false), ObjectStorageBackend::Mode::Native);
     b->setNativeTokenTypeForTest(TokenType::Generation);
 
+    ScopedBackendLogCapture capture;
     EXPECT_NO_THROW(b->checkPoolPreconditions());
+    EXPECT_TRUE(capture.captured().empty()) << capture.captured();
 }
 
 /// The ETag-dialect (AWS-compatible) backend never consults bucket versioning at all — the check is
 /// a silent no-op for any backend that is not Native + TokenType::Generation. Driven over a storage
-/// whose probe is unverifiable, which is what a generation-dialect backend now refuses: dropping the
-/// dialect guard from checkPoolPreconditions would fail this test.
+/// whose probe is unverifiable, which is what a generation-dialect backend warns about: dropping the
+/// dialect guard from checkPoolPreconditions would fail the silence assertion.
 TEST(CASBackendGeneration, CheckPoolPreconditionsNoOpOnEtagDialect)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         makeVersioningObjectStorageForTest(std::nullopt), ObjectStorageBackend::Mode::Native);
     ASSERT_EQ(b->nativeTokenType(), TokenType::ETag);
 
+    ScopedBackendLogCapture capture;
     EXPECT_NO_THROW(b->checkPoolPreconditions());
+    EXPECT_TRUE(capture.captured().empty()) << capture.captured();
 }
 
 /// A writable generation-dialect (GCS) mount may not skip the mutating capability battery: that

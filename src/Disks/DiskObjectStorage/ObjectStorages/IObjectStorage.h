@@ -427,8 +427,9 @@ public:
     virtual void pinConditionalOpsGenerationDialect(bool /*expect_generation_tokens*/) {}
 
     /// Whether the underlying bucket has object versioning enabled; nullopt when unknown or not
-    /// applicable. Used by the CAS capability probe to fail closed on GCS: on a versioned bucket
-    /// a token-exact DELETE archives a noncurrent generation instead of reclaiming storage.
+    /// applicable. Used by the CAS capability probe on GCS: a bucket verified as versioned refuses
+    /// the mount (a token-exact DELETE there archives a noncurrent generation instead of reclaiming
+    /// storage), an unknown answer is logged and tolerated.
     virtual std::optional<bool> isBucketVersioningEnabled() const { return std::nullopt; }
 
     /// True when this object storage can execute writes under the given retry profile.

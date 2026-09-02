@@ -103,8 +103,9 @@ public:
     /// Return a page after `cursor`; the next cursor is the last returned key and is empty at the end.
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
-    /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, reject the pool unless
-    /// object versioning is VERIFIABLY disabled — see Backend::checkPoolPreconditions.
+    /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, reject the pool when
+    /// object versioning is verified ENABLED; warn and continue when the probe cannot answer — see
+    /// Backend::checkPoolPreconditions.
     void checkPoolPreconditions() override;
 
     /// Fail-closed precondition: a Native, generation-dialect (GCS) backend refuses a writable mount

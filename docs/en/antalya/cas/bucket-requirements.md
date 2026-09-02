@@ -32,11 +32,13 @@ Bucket **versioning is not required** — in fact it must be **disabled** on the
 dialect (see below), because a token-exact delete on a versioned bucket archives a noncurrent
 generation instead of reclaiming storage, silently stopping GC reclamation.
 
-On the generation-token dialect that requirement is checked, and checked strictly: a writable mount
-proceeds only when the probe *confirms* versioning is disabled. A bucket reported as versioned and a
-probe that could not answer — the credential may not read the bucket's versioning configuration, or
-the backend cannot report it — both refuse the mount. `CAS` does not assume the safe answer, because
-the failure it would be assuming away is `GC` deleting objects it believes it reclaimed.
+On the generation-token dialect that requirement is checked at mount. A bucket reported as versioned
+refuses the mount. A probe that could not answer — the credential may not read the bucket's versioning
+configuration (`storage.buckets.get` on GCS), or the backend cannot report it — does not: the mount
+proceeds and logs a warning naming what it could not verify, because an unreadable configuration is
+not evidence of a versioned bucket, and refusing on it would turn a missing IAM grant into an outage.
+In that case confirming that versioning is disabled is your responsibility, exactly as soft delete is
+below; grant the permission if you want the mount to verify it for you.
 
 Because that check is part of the mount battery, `skip_access_check = true` is refused on a writable
 generation-token disk. Mount the disk read-only if you need to start before the access check can

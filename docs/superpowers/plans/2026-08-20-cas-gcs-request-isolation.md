@@ -599,7 +599,9 @@ The unknown-versioning and writable-generation `skip_access_check=true` cases mu
 
 Rename settings declaration, members, constructor parameters, docs, and tests to `gcs_max_token_producing_put_bytes`. Do not add an alias or migration shim.
 
-- [ ] **Step 4: Fail closed on unverifiable versioning**
+- [ ] **Step 4: Fail closed on unverifiable versioning** (superseded 2026-09-02: a probe that cannot
+  answer now logs a warning and the mount proceeds; only a bucket verified as versioned refuses. Do not
+  re-execute this step as written. See the spec's bucket-versioning section.)
 
 Change `ObjectStorageBackend::checkPoolPreconditions` so `std::nullopt` throws `NOT_IMPLEMENTED` with an actionable message, just like enabled versioning. Keep the no-op for non-generation and non-native modes.
 
@@ -622,7 +624,7 @@ Rewrite the stale comment in the `skip_access_check` branch near `CasPool.cpp:47
 Document:
 
 - the renamed cap applies to conditional and unconditional token-producing writes;
-- versioning must be verifiably disabled;
+- versioning must be disabled, and is refused when verified enabled (superseded 2026-09-02: an unverifiable probe warns and proceeds);
 - writable generation mounts cannot use `skip_access_check=true`;
 - GCS soft delete cannot be uniformly inspected through this XML API path, so disabling it is an explicit operator precondition for prompt physical reclamation;
 - no non-CAS GCS API or authentication configuration changes.
