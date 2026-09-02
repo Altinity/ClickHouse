@@ -9,7 +9,8 @@ doc_type: 'design'
 
 # CAS relink confirm liveness design {#cas-relink-confirm-liveness-design}
 
-Status: revision 8 of 2026-09-02, the simplification with the wedge hole closed. Revisions 1 to 7 and
+Status: revision 9 of 2026-09-02, the simplification with the wedge hole closed, and the model plan, the
+test inventory and the `carved` lifetime corrected after the codex review of revision 8. Revisions 1 to 8 and
 their reviews are recorded in [F11 spec consults](/superpowers/cas/f11-spec-consults-2026-09-02); their
 result is one fact this revision rests on: the hazard is a mutation of the queried ref that is queued or
 in flight, and every such mutation already names its ref. Revision 7 also exempted `Wedged`; a consult
@@ -104,11 +105,13 @@ what it is, an availability filter that happens to be exact for removals.
 
 **`carved`.** The confirm can see `rt.pending`, but the carve moves items out of it: in one continuous
 `ref_queue_mutex` hold the leader copies the selected front items into its local `owned_items` and pops
-them (`CasRefLedger.cpp:2881-2935`), and they are completed and erased only at the tenure's exit guard,
-also under `ref_queue_mutex` (`:2146-2166`). Between carve and completion a mutation is invisible to
-anyone holding only the runtime. The runtime gains `rt.carved`, a vector of the same
-`shared_ptr<RefMutationItem>`s, appended at the carve and cleared at the exit guard. Items of a chunk
-stay in it until the exit guard even after their install, and items that failed validation before any
+them (`CasRefLedger.cpp:2881-2935`). From there an item is completed by its chunk's install (`:3899`,
+under `ref_queue_mutex`) or earlier by a validation or write error (`complete_error`, `:2696`); the
+tenure's exit guard (`:2146-2166`) completes only a stranded survivor and releases leadership. Between
+carve and install a mutation is invisible to anyone holding only the runtime. The runtime gains
+`rt.carved`, a vector of the same `shared_ptr<RefMutationItem>`s, appended at the carve and cleared at
+the exit guard, so it retains every carved item for the whole tenure regardless of when the item was
+completed. Items of a chunk stay in it after their install, and items that failed validation before any
 send stay in it too: both are over-refusal for one tenure, never under-refusal. The failure arms of
 `flushRefBatch` that pop all of `pending` and complete the items with an error (`carve_all_pending`,
 `:2731-2895`) sent nothing and need no mirror. `forceWedgeForTest` (`:1866-1878`) is unchanged: it
@@ -118,12 +121,17 @@ produces `Wedged`, which refuses by lane state.
 before: in `flushRefBatch` step 3 (`:3045-3120`, before anything durable) a `Ref{name}` item whose
 built ops carry an `OwnerTransition` binding or a `SetPublishedAt` for a different ref fails, that item
 only, with `LOGICAL_ERROR`. Every production caller already passes the exact ref its ops mutate. The
-tests do not: an untruncated grep of `MutationScope::ref(` over `src/Disks/tests` finds one item over
-1500 refs declared as `Ref{prefix}` in `gtest_cas_confirm_exact_ref.cpp:554-557` and five more in
-`gtest_cas_ref_chunked_flush.cpp` (`:594-598`, `:703-705`, `:826-828`, `:889-891`, each `item_a`/`item_b`
-over `aaa_`/`bbb_` pairs), all rewritten to one ref with many distinct manifests, which `AddPrecommit`
-admits (`CasRefProtocol.cpp:246-260`); the two oversized-item sites (`:248`, `:285`) are rejected by the
-step-1 caps before step 3 and are aligned anyway. In debug and sanitizer builds a `LOGICAL_ERROR` aborts
+tests do not: an untruncated grep of `MutationScope::ref(` over `src/Disks/tests` finds eleven append
+expressions whose item mutates 1500 refs under a single-ref scope: two in
+`gtest_cas_confirm_exact_ref.cpp:552-558` (one helper lambda, called for `aaa_` and `bbb_`) and nine in
+`gtest_cas_ref_chunked_flush.cpp` (three at `:594-598`, two at each of `:703-705`, `:826-828`,
+`:889-891`; `item_a`/`item_b`/`item_c` over distinct-prefix pairs), all rewritten to one ref with many
+distinct manifests, which `AddPrecommit` admits because each removal erases the exact `(ref, manifest)`
+binding and its ownership before the next distinct manifest is added (`CasRefProtocol.cpp:246-268`).
+The oversized-op site (`:279-285`) declares `Ref{"oversized_op"}` while its `SetPublishedAt` names the
+padded `r...` ref; it is safe only because the step-1 size cap (`:2968`) rejects the item before step 3,
+and its scope becomes `MutationScope::ref(oversized_op.ref_name)`. The oversized-item site (`:248`)
+builds `NamespaceBirth` filler ops that name no ref and stays as it is. In debug and sanitizer builds a `LOGICAL_ERROR` aborts
 the process, so any offender left behind kills the `CAS*` gate at its first flush.
 
 Nothing else changes: no new field on the attempt, no new argument on `appendRefOps`, no part-object
@@ -156,29 +164,41 @@ identity, and only then, plus the broken lane states.
 
 `CaRelinkConfirmCore.tla`: today `SenderAdmit(nb)` admits only a transaction that retires the sender's
 edge, and rule 3 is `~sPending /\ ~sLeader`. Add a second admitted shape, `noop`, whose journal record
-is `NsNoise`'s existing edge-neutral op and which leaves `sDurableRef` unchanged; `sTouches ==
-sShape = "touching" /\ ~SabotageTouchBlind`; rule 3 becomes `~(sPending /\ sTouches)`, `sLeader` leaves
-the rule. `SenderApply`'s guard becomes shape-aware (today it requires `sDurableRef # Token`, which a
-`noop` never satisfies, so a `noop` tenure could never close). Sabotages: `SabotageStaleCache` drops the
-conjunct and must still violate `ConfirmedRelinkNeverDangles`; `SabotageTouchBlind` must violate it
-too. One witness, a history flag set inside `RConfirm`: `sawYesWhilePendingNoop` (answer `yes` while
-`sPending /\ ~sTouches`); `_main` must reach it, or a green run could be the old behaviour.
-`nextId <= MaxId` stays on every step that writes a record. No arm or install phase is introduced: the
-model's `sPending` spans admission to apply, which is the interval `pending` plus `carved` cover in the
-code for a tenure that completes, and a wedged tenure is the model's `sPoison`, refused by lane state.
-`MaxHoles = 0` as in `_main`; the LIST-completeness caveat of `CaRelinkConfirmCore_RESULTS.md` is
-unchanged and outside this design.
+is `NsNoise`'s existing edge-neutral op and which leaves `sDurableRef` unchanged; `NoopDurable == \E
+rec \in journal : rec.ns = NsS /\ rec.op = "noop"`; `sTouches == sShape = "touching" /\
+~SabotageTouchBlind`; rule 3 becomes `~(sPending /\ sTouches)`, `sLeader` leaves the rule. Both
+tenure-closing guards become shape-aware: `SenderApply` and `SenderPoison` today require `sDurableRef #
+Token`, which a `noop` never satisfies, so a `noop` tenure could neither close nor poison, although in
+the code any chunk's frontier or install failure sends the lane to `NeedsRecovery`
+(`CasRefLedger.cpp:3773`, `:3808`); a `noop` tenure closes or poisons once `NoopDurable`. Sabotages:
+`SabotageStaleCache` drops the conjunct and must still violate `ConfirmedRelinkNeverDangles`;
+`SabotageTouchBlind` must violate it too. One witness, a history flag set inside `RConfirm`:
+`sawYesWhilePendingNoop` (answer `yes` while `sPending /\ sShape = "noop" /\ NoopDurable`, so the
+witness lies in the slow window after the `PUT` and before install, the window this design opens);
+`_main` must reach it, or a green run could be the old behaviour. `nextId <= MaxId` stays on every step
+that writes a record. No arm or install phase is introduced: the model's `sPending` spans admission to
+apply, which is the interval `pending` plus `carved` cover in the code for a tenure that completes.
+`Wedged` is not modelled as its own state: the model's `sPoison` is its abstraction, and a faithful one
+for the confirm, because it takes the worst case (the ambiguous transaction is durable and GC can fold
+it) and refuses table-wide exactly as the code's `Wedged` does; the difference between "known durable,
+apply failed" and "possibly durable" changes no answer. `MaxHoles = 0` as in `_main`; the
+LIST-completeness caveat of `CaRelinkConfirmCore_RESULTS.md` is unchanged and outside this design.
 
 `CaRefLaneCore.tla` and `CaRelinkLaneComposition.tla`: `Certify` (`CaRefLaneCore.tla:714-722`) and
 `ConfirmSource` (`CaRelinkLaneComposition.tla:111`) require `lane = "Ready"`. Both become "lane is
 `Ready`, or lane is `Writing` and the outstanding mutation does not touch the identity"; `Wedged` and
 the broken states stay excluded. The lane core derives the touch from its existing same-binding writes
-(`attempt.binding # cache_binding`) and keeps `CurrentRuntime` and the identity's cache/durable
-currency; the composition, which has no transaction content, takes the touch as a nondeterministic
-parameter of `StartWrite`. Their blocked-certify sabotages (`SabotageCertifyBlocked`,
+(`attempt.binding # cache_binding`) and keeps `CurrentRuntime`; its currency check for a certification
+becomes binding equality (`cache_binding = durable_binding`) rather than transaction-id equality, because
+after a non-touching `WriteLands` (`CaRefLaneCore.tla:234`) `durable_id` is ahead of `cache_id` while
+the identity's binding is unchanged, and that post-`PUT`, pre-install window is the one this change
+opens. The composition, which has no transaction content, takes the touch as a nondeterministic
+parameter of `StartWrite` and clears it on every transition out of `Writing` (`CommitWrite`,
+`WriteUnresolved`, `RequireRecovery`). Their blocked-certify sabotages (`SabotageCertifyBlocked`,
 `SabotageConfirmBlocked`) become "certify while the outstanding mutation touches the identity", and each
-module gains one witness for a certification outside `Ready` (`W_CertifiedWhileOutstanding`,
-`W_ConfirmedOutsideReady`), because their existing witnesses are satisfied by `Ready` certifications.
+module gains one witness for a certification outside `Ready` (`W_CertifiedWhileOutstanding`, set only
+when the outstanding attempt is already durable, `durable_id = attempt.id`; `W_ConfirmedOutsideReady`),
+because their existing witnesses are satisfied by `Ready` certifications.
 `run_reflane.sh` and `run_relinklane.sh` rerun; `CaRefLaneCore_RESULTS.md` (`:43`, `:68-91`) and
 `CaRelinkConfirmCore_RESULTS.md` (`:126-142`) are rewritten from the runs. The remaining modelling
 details (where the lane core keeps the touch across `resolver_attempt`, which binding updates become

@@ -17,7 +17,7 @@ doc_type: 'plan'
 
 **Tech Stack:** C++ (ClickHouse, `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed`), gtest (`unit_tests_dbms`, gate filter `CAS*`), TLA+/TLC (`docs/superpowers/models`, `tmp/tla2tools.jar`), pytest integration tests via praktika, ca-soak (`utils/ca-soak`).
 
-**Spec:** `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md` (revision 8). Read it before any task; every task below cites the section it implements.
+**Spec:** `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md` (revision 9). Read it before any task; every task below cites the section it implements.
 
 ## Global constraints {#global-constraints}
 
@@ -32,7 +32,7 @@ doc_type: 'plan'
 - No new field on `RefAppendAttempt`, no new argument on `appendRefOps`, no part-object flag, no wait, no timer (spec §carved, last paragraph).
 - Comments carry the reason, never plan or backlog provenance. Documentation under `docs/` uses `{#anchors}` on every heading.
 - Secrets: the real GCS HMAC pair lives only in the git-ignored `utils/ca-soak/configs/gcs.env` and `ci/local.env`. Never print, quote or copy anything that starts with `GOOG` from those files; the fake `GOOG1EFAKEACCESSKEYID` already checked into `tests/integration/test_cas_gcs/configs/config.xml` is not a secret.
-- Before Task 3, read `tmp/gcs_live_20260902/codex_review_f11_spec_r8_report.md` if it exists (the codex re-review of revision 8). A REQUEST CHANGES verdict against the design stops execution and goes back to the spec; findings about tests or prose are folded into the matching task.
+- The codex review of spec revision 8 (gpt-5.6-sol, high; recorded in `docs/superpowers/cas/2026-09-02-f11-spec-consults.md`) confirmed the design's code paths and asked for three corrections, all folded into spec revision 9 and this plan: the confirm-core model's `SenderPoison` and witness must be shape-aware and the witness must lie after durability; the lane core's certification currency is binding equality, not id equality; the test inventory is eleven append expressions, not six items; the `carved` lifetime prose. No further review gates the start of Task 1.
 
 ## File structure {#file-structure}
 
@@ -49,7 +49,7 @@ Modified:
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h` — `MutationScope` comment.
 - `src/Common/ProfileEvents.cpp` — four `CASRelinkConfirmRefused*` events.
 - `src/Disks/tests/gtest_cas_confirm_exact_ref.cpp` — header, helper, four rule-3 tests, six new tests.
-- `src/Disks/tests/gtest_cas_ref_chunked_flush.cpp` — helper and the six mis-scoped items.
+- `src/Disks/tests/gtest_cas_ref_chunked_flush.cpp` — helper and the nine mis-scoped append expressions (two more are in the confirm test).
 - `tests/integration/test_cas_gcs/gcs_mocks/server.py` — `/_control/delay`.
 - `docs/superpowers/cas/BACKLOG/gcs.md`, `docs/superpowers/cas/2026-09-02-gcs-live-validation-ledger.md` — status.
 
@@ -105,9 +105,10 @@ CHECK_DEADLOCK FALSE
 
 ```text
 \* WITNESS (negated reachability) -- THE LIVENESS THIS REVISION BUYS. A confirm answers *yes* while
-\* a mutation of ANOTHER ref (shape "noop") is admitted and not yet applied. Under the old table-wide
-\* rule 3 this state is unreachable, so a green _main alone could be the old behaviour. TLC MUST
-\* report W_YesWhilePendingNoop VIOLATED.
+\* a mutation of ANOTHER ref (shape "noop") is admitted, already DURABLE and not yet applied: the
+\* slow post-PUT, pre-install window the design opens. Under the old table-wide rule 3 this state
+\* is unreachable, so a green _main alone could be the old behaviour. TLC MUST report
+\* W_YesWhilePendingNoop VIOLATED.
 SPECIFICATION Spec
 CONSTANTS
     Receivers = {r1}
@@ -207,6 +208,9 @@ Shapes == {"none", "touching", "noop"}
 (* Rule 3's predicate.  `SabotageTouchBlind` makes the confirm blind to the shape, so a touching
    mutation reads as harmless. *)
 sTouches == sShape = "touching" /\ ~SabotageTouchBlind
+
+(* The noop tenure's record is durable (at most one per behaviour, like NsNoise's). *)
+NoopDurable == \E rec \in journal : rec.ns = NsS /\ rec.op = "noop"
 ```
 
 6. `Init`: add `/\ sShape = "none"` after `sLeader = FALSE` and `/\ sawYesWhilePendingNoop = FALSE` at the end.
@@ -255,18 +259,20 @@ SenderDurable ==
               /\ journal' = journal \cup
                    { [id |-> nextId, ns |-> NsS, blob |-> "b1", src |-> SenderEdge, op |-> "del"] }
               /\ sDurableRef' = sTarget
-         ELSE /\ ~(\E rec \in journal : rec.ns = NsS /\ rec.op = "noop")
+         ELSE /\ ~NoopDurable
               /\ journal' = journal \cup
                    { [id |-> nextId, ns |-> NsS, blob |-> "b1", src |-> NoiseSrc, op |-> "noop"] }
               /\ UNCHANGED sDurableRef
     /\ UNCHANGED << sCacheRef, sTarget, sPending, sLeader, sPoison, sFence, sShape >>
     /\ UNCHANGED << gcVars, recvVars, histVars >>
 
-(* The in-memory apply succeeds; the tenure closes and the lane goes quiescent.  A touching tenure
-   closes only after its transaction is durable; a noop tenure has nothing this ref can observe. *)
+(* A tenure closes only once its transaction is durable, whatever its shape. *)
+TenureDurable == (sShape = "touching" /\ sDurableRef # Token) \/ (sShape = "noop" /\ NoopDurable)
+
+(* The in-memory apply succeeds; the tenure closes and the lane goes quiescent. *)
 SenderApply ==
     /\ sPending
-    /\ sShape = "noop" \/ sDurableRef # Token
+    /\ TenureDurable
     /\ sCacheRef' = sDurableRef
     /\ sPending' = FALSE
     /\ sLeader' = FALSE
@@ -274,13 +280,13 @@ SenderApply ==
     /\ UNCHANGED << sDurableRef, sTarget, sPoison, sFence >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars >>
 
-(* The in-memory apply THREW although the object is durable (allocation failure on the COW apply).
-   The tenure closes -- the lane looks perfectly quiescent -- but the committed row is now
-   permanently stale.  Only gate 1 rule 4 (poison) can see this. *)
+(* The in-memory apply THREW although the object is durable (allocation failure on the COW apply, or
+   in the code any chunk's frontier or install failure).  The tenure closes -- the lane looks
+   perfectly quiescent -- but the committed row may now be permanently stale.  Only gate 1 rule 4
+   (poison) can see this.  Shape-aware like SenderApply: a durable noop can poison too. *)
 SenderPoison ==
     /\ sPending
-    /\ sShape = "touching"
-    /\ sDurableRef # Token
+    /\ TenureDurable
     /\ sPoison' = TRUE
     /\ sPending' = FALSE
     /\ sLeader' = FALSE
@@ -300,7 +306,7 @@ SenderPoison ==
 10. `RConfirm`: inside the `LET ans == Gate1Answer IN` block add
 
 ```text
-         /\ sawYesWhilePendingNoop' = (sawYesWhilePendingNoop \/ (ans = "yes" /\ sPending /\ sShape = "noop"))
+         /\ sawYesWhilePendingNoop' = (sawYesWhilePendingNoop \/ (ans = "yes" /\ sPending /\ sShape = "noop" /\ NoopDurable))
 ```
 
 11. `Next`: add `\/ SenderAdmitNoop` on the line after the `SenderAdmit` disjunct.
@@ -310,7 +316,8 @@ SenderPoison ==
 13. Witnesses: after `W_ConfirmUnknown` add
 
 ```text
-(* THE LIVENESS THIS REVISION BUYS: a *yes* while a mutation of ANOTHER ref is admitted. *)
+(* THE LIVENESS THIS REVISION BUYS: a *yes* while a mutation of ANOTHER ref is admitted, durable
+   and not yet applied -- the post-PUT, pre-install window. *)
 W_YesWhilePendingNoop == ~sawYesWhilePendingNoop
 ```
 
@@ -436,7 +443,8 @@ Certify ==
          \/ ~(lane \in {"Ready", "Writing"}
               /\ CurrentRuntime
               /\ cache_binding = durable_binding))
-    /\ saw_certified_while_outstanding' = (saw_certified_while_outstanding \/ lane = "Writing")
+    /\ saw_certified_while_outstanding' =
+        (saw_certified_while_outstanding \/ (lane = "Writing" /\ durable_id = attempt.id))
     /\ UNCHANGED << lane, cache_id, durable_id, cache_binding,
                     durable_binding, attempt, runtime_generation,
                     authority_generation, resolver_attempt,
@@ -455,7 +463,7 @@ grep -c 'saw_certified_while_outstanding' docs/superpowers/models/CaRefLaneCore.
 The second count must be the first count plus the definitions added above (VARIABLES, vars, Init, TypeOK, Certify's own update, the witness) minus one (Certify's UNCHANGED list does not carry it). TLC reports any action that forgot the variable as `Successor state is not completely specified`; treat that as a build error.
 
 6. `TypeOK`: `/\ saw_certified_while_outstanding \in BOOLEAN`.
-7. Witnesses: `W_CertifiedWhileOutstanding == ~saw_certified_while_outstanding` next to `W_Commit`.
+7. Witnesses: `W_CertifiedWhileOutstanding == ~saw_certified_while_outstanding` next to `W_Commit`. The flag is set only when the outstanding attempt is already durable (`durable_id = attempt.id`), so the witness proves the post-`PUT`, pre-install certification the design opens, not merely a certification before anything was sent.
 8. Header comment: the `SabotageCertifyBlocked` line becomes "certify in `Writing` while the outstanding mutation touches the identity".
 
 - [ ] **Step 4: Composition**
@@ -556,7 +564,7 @@ Expected: no `FAIL` line, `ALL EXPECTATIONS MET` twice. `sab_certifyblocked` mus
 `CaRefLaneCore_RESULTS.md`:
 - line 43: replace "and `Ready`-only certification" with "and touch-scoped certification (`Ready`, or `Writing` while the outstanding mutation does not touch the certified identity)".
 - Relink composition section (`:68-91`): seam property 1 becomes "confirmation requires `Ready`, or `Writing` with an outstanding mutation that does not touch the identity (`ConfirmationRequiresUntouchedIdentity`);". Update the counts sentence from the new run ("All eleven expectations passed: one honest configuration, three named sabotage violations, and seven reachability witnesses") and the log paths. Rewrite the conclusion's last sentence to "The C++ implementation follows that model, and the relink seam depends only on the small certification contract: `Ready`, or `Writing` without an outstanding mutation of the certified identity."
-- Add one paragraph to the lane-core section naming the new witness: "`witness_certifyoutstanding` reaches a certification in `Writing` with a same-binding attempt outstanding, so the honest run's green `CertifiedViewIsCurrent` covers the relaxed guard and not only `Ready`."
+- Add one paragraph to the lane-core section naming the new witness: "`witness_certifyoutstanding` reaches a certification in `Writing` with a same-binding attempt outstanding and already durable, so the honest run's green `CertifiedViewIsCurrent` covers the relaxed guard in the post-`PUT`, pre-install window and not only `Ready`."
 
 `README.md`:
 - Row for `CaRelinkConfirmCore.tla` (`:141`): replace "lane quiescence" with "ref-scoped mutation refusal (the mutation's `MutationScope`)", and "each proven load-bearing" stays.
@@ -604,10 +612,12 @@ Implements spec §carved, first paragraph.
         /// The current tenure's carved items, from the carve (`flushRefBatch`'s PUBLISH phase) to the
         /// tenure's exit guard (`completeOwnedItemsAndReleaseLeadership`), both under `ref_queue_mutex`.
         /// The carve pops an item out of `pending`, so without this mirror a mutation is invisible to
-        /// `confirmExactRef` between carve and completion -- the window in which its transaction may be
-        /// durable while the committed row still lags it. Over-inclusive on purpose: an installed item
-        /// and an item that failed validation before any send both stay here until the exit guard; that
-        /// is one tenure of over-refusal for their refs, never an under-refusal.
+        /// `confirmExactRef` between carve and install -- the window in which its transaction may be
+        /// durable while the committed row still lags it. An item is completed by its chunk's install or
+        /// earlier by an error, often long before the exit guard; the mirror keeps it regardless.
+        /// Over-inclusive on purpose: an installed item and an item that failed validation before any
+        /// send both stay here until the exit guard; that is one tenure of over-refusal for their refs,
+        /// never an under-refusal.
         std::vector<std::shared_ptr<RefMutationItem>> carved;     /// guarded by ref_queue_mutex
 ```
 
@@ -638,8 +648,9 @@ Implements spec §carved, first paragraph.
 In `gtest_cas_confirm_exact_ref.cpp`, after `WedgedLaneIsUnknown`:
 
 ```cpp
-/// `carved` bookkeeping: a carved item leaves `pending` at the carve and is completed only at the
-/// tenure's exit guard, so the confirm reads it from `rt.carved` in between. Sampled at
+/// `carved` bookkeeping: a carved item leaves `pending` at the carve and is completed by its chunk's
+/// install (or earlier, by an error), while the mirror is cleared only at the tenure's exit guard, so
+/// the confirm reads the item from `rt.carved` from carve to tenure end. Sampled at
 /// `PostDurableInstall` -- the transaction is durable, nothing is installed, `pending` is already
 /// empty -- and again after the tenure: the mirror must hold exactly the carved item during, and be
 /// empty after. The hook runs on the leader's own thread with neither lane mutex held, so the seams
@@ -945,8 +956,9 @@ The relink confirm is about to read MutationScope to decide whether an
 in-flight mutation may change the asked-about ref, so the scope becomes
 safety-bearing. flushRefBatch step 3 fails, alone and before any PUT, a
 Ref{name} item whose OwnerTransition bindings or SetPublishedAt name a
-different ref (LOGICAL_ERROR). The six test items that declared one ref
-and mutated 1500 are rewritten to one ref with many manifests.
+different ref (LOGICAL_ERROR). The eleven test append expressions in two
+files that declared one ref and mutated 1500 are rewritten to one ref
+with many manifests; the oversized-op item's scope is set from its op.
 
 Spec: docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md
 
@@ -1716,7 +1728,7 @@ Spec coverage:
 - §rule-3 code and `scopeCovers` → Task 6 Step 3 (`covers`). Wedged table-wide, `Writing` with empty `carved` fails closed → same step. `try_to_lock` and zero-I/O unchanged → untouched; `StateLockBusy` counter added at the existing site.
 - §carved, `rt.carved` appended at carve, cleared at exit guard, `carve_all_pending` arms untouched, `forceWedgeForTest` unchanged → Task 3.
 - §carved, scope validation in step 3 with `LOGICAL_ERROR`, the six mis-scoped test items rewritten, the two oversized sites aligned → Task 4.
-- §model, `CaRelinkConfirmCore.tla` (`noop` shape, `sTouches`, `SabotageTouchBlind`, shape-aware `SenderApply`, `sawYesWhilePendingNoop`, `nextId <= MaxId` on every writing step, `MaxHoles = 0`) → Task 1. Lane core and composition (touch derived from `attempt.binding # cache_binding`; nondeterministic `StartWrite(touch)`; redefined blocked-certify sabotages; `W_CertifiedWhileOutstanding`, `W_ConfirmedOutsideReady`; reruns; RESULTS `:43`, `:68-91`, `:126-142`) → Tasks 1 and 2.
+- §model, `CaRelinkConfirmCore.tla` (`noop` shape, `NoopDurable`, `sTouches`, `SabotageTouchBlind`, shape-aware `SenderApply` and `SenderPoison` through `TenureDurable`, `sawYesWhilePendingNoop` set only after durability, `sPoison` as the worst-case abstraction of `Wedged`, `nextId <= MaxId` on every writing step, `MaxHoles = 0`) → Task 1. Lane core and composition (touch derived from `attempt.binding # cache_binding`; nondeterministic `StartWrite(touch)`; redefined blocked-certify sabotages; `W_CertifiedWhileOutstanding`, `W_ConfirmedOutsideReady`; reruns; RESULTS `:43`, `:68-91`, `:126-142`) → Tasks 1 and 2.
 - §tests: the four named tests (two kept, one flipped and renamed, one kept plus a real-wedge sibling) → Task 6 Step 1 (a), (b), (e); same-ref stale-row regression (d); liveness (c); `carved` bookkeeping → Task 3; scope validation with the debug split → Task 4; header `:40-46` → Task 6 Step 5; `test_cas_gcs` two-node delayed-`_ckpt` case → Task 5 (sibling directory, deviation stated); observability (four events, `LOG_TRACE`) → Task 6 Step 3.
 - §live-gate → Task 8. §docs list: `CasRefLedger.h:40,:60,:156-159` and the runtime comment → Tasks 3 and 6; `CasRefLedger.cpp:426-435`, rule 3 block, carve/exit-guard comments, step-3 comment → Tasks 3, 4, 6; `CasRefProtocol.h:56-60` → Task 6; gtest header → Task 6; models RESULTS and README → Tasks 1 and 2.
 - §rollout: no protocol or persisted-format change anywhere in the plan. §out-of-scope: nothing here touches `_ckpt` coalescing, receiver damping or LIST completeness.
