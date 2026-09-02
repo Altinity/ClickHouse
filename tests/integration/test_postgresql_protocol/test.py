@@ -605,6 +605,26 @@ def test_java_client(started_cluster):
     assert res == reference
 
 
+def test_server_version_parameter_is_numeric(started_cluster):
+    # Npgsql parses ParameterStatus server_version with System.Version, which
+    # accepts at most four numeric components. A flavour suffix such as
+    # `.altinitytest` makes connect fail.
+    node = started_cluster.instances["node"]
+    conn = psycopg.connect(
+        host=node.ip_address,
+        port=server_port,
+        user="default",
+        password="123",
+    )
+    try:
+        version = conn.info.parameter_status("server_version")
+        parts = version.split(".")
+        assert 2 <= len(parts) <= 4, version
+        assert all(part.isdigit() for part in parts), version
+    finally:
+        conn.close()
+
+
 def test_dotnet_client(started_cluster):
     node = cluster.instances["node"]
 
