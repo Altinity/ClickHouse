@@ -28,25 +28,46 @@ So the token in `ManifestCacheKey` (`Pool/CasManifestReader.h:64-69`) distinguis
 
 ## Failure asymmetry {#failure-asymmetry}
 
-Keeping the `HEAD` costs one serial round trip per uncached or `ForceFresh` access and fires only on a
-protocol violation: something deleting a manifest the ref graph still names. It never covered the blob
-half of that invariant. Removing it can never serve wrong bytes, because id to content is a function;
-it only moves detection of the violation from "the next read" to "the first uncached read, or fsck".
+For reads the change can never serve wrong bytes: id to content is a function, and a blob the
+collector removed fails typed at the first byte. For mutation evidence the guarantee is scoped, not
+absolute. `createHardLink`, `unlinkFile`, `republishRef`, `repointRef` and the relink pair copy entries
+out of a source manifest and record each blob as a tokenless `TrustedManifest` dependency with no
+backend call (`PartWriteTxn::adoptEvidence`, `Pool/CasPartWriteTxn.cpp:474-489`). `promote` validates
+the destination body it stages (`:734-741`) and issues no probe for a `TrustedManifest` leaf, by design
+(`:810-818`: "There is no per-file probe on this path: that leaf is trusted via the durable manifest
+edge"). What makes that sound is EDGE-BEFORE-OBSERVE, not the `HEAD`: the committed source ref holds a
+live edge on every blob it names, and the collector deletes a blob only when the merged in-degree at
+the delete site shows no edge (`Gc/CasBlobInDegree.cpp:417`), so under protocol-compliant GC the state
+"cached source decode, blob gone" is unconstructible.
 
-## Where the invariant is enforced without the HEAD {#enforcement}
+Out-of-band deletion by an operator or a foreign writer with raw object-store access is outside that
+contract, exactly as it is today: delete only the blob and the manifest `HEAD` passes, the
+carried-forward entry is adopted, and the destination commits a ref to an absent blob. The `HEAD`
+protected one accidental sub-case, the manifest body deleted as well, by detecting the manifest and
+never the blob. After this change that sub-case behaves like the blob-only case: the mutation commits
+and fsck reports the dangle. Keeping the `HEAD` would spend one serial round trip per uncached or
+`ForceFresh` access on a partial detector of a case the contract already excludes.
 
-- **Writer.** `promote` reads and validates the body before the ref is committed and fails closed on an
-  absent one (`Pool/CasPartWriteTxn.cpp:734-741`).
-- **GC.** A body enters `mf_cleanup` only from a folded `-1` owner-removal edge (`Gc/CasGc.cpp:1249`)
-  and is deleted after that round's CAS adopted the decrement (`:1037-1061`). The rebuild refuses a
-  committed ref naming a missing body (`:4070-4082`).
-- **Orphan sweep.** An owned key is never swept (`Gc/CasOrphanManifestSweep.cpp:560`); every candidate
-  must pass the deletion premise (`:566`).
-- **fsck.** The reachable-but-absent scan counts a dangle only after a `HEAD` and a re-resolve under
-  the original authority (`Tools/CasFsck.cpp:643-661`).
+## Where the invariant is prevented, and where it is only detected {#enforcement}
 
-Nothing is missing for enforcement. Out-of-band deletion by an operator is enforced by nothing today
-either; fsck detects it, and after this change so does the first uncached read.
+- **Writer, prevents for its own uploads.** `promote` GETs and validates the destination manifest body
+  before the ref is committed (`Pool/CasPartWriteTxn.cpp:734-741`) and refuses unless its precommit is
+  still the live owner (`:800-808`). It does not independently validate `TrustedManifest` blobs
+  (`:810-818`).
+- **GC, prevents.** A body enters `mf_cleanup` only from a folded `-1` owner-removal edge
+  (`Gc/CasGc.cpp:1249`) and is deleted after the round CAS adopted the decrement (`:1037-1061`); a blob
+  is deleted only after the delete-site in-degree re-read shows no live edge
+  (`Gc/CasBlobInDegree.cpp:417`), by exact token (`Gc/CasGc.cpp:671`). The rebuild refuses a committed
+  ref naming a missing body (`:4070-4082`).
+- **Orphan sweep, prevents.** Committed owners, live precommits and unconsumed removal edges form the
+  protection view (`Gc/CasOrphanManifestSweep.cpp:199`); an owned key is never swept (`:560`) and every
+  candidate must pass the deletion premise (`:566`).
+- **fsck, detects.** The reachable-but-absent scan counts a dangling manifest after a `HEAD` and a
+  re-resolve under the original authority (`Tools/CasFsck.cpp:643-661`), and a dangling blob under a
+  present manifest. It reports; it does not enforce or repair.
+
+Nothing prevents raw deletion, and nothing did before. What this change moves is detection of an
+out-of-band manifest deletion: from the next `readManifestShared` to the first uncached read or fsck.
 
 ## Approaches {#approaches}
 
@@ -86,12 +107,38 @@ exists, used at `:47`). `PartManifestWeight` is unchanged. The "vanished between
 `ContentAddressedMetadataStorage.h:631` and its use at `ContentAddressedMetadataStorage.cpp:853`;
 `CASPartFolderValidateSkipped` leaves `ProfileEvents.cpp`.
 
-**Comments and docs** stating the mandatory `HEAD` as fact, rewritten in the same change:
-`Pool/CasManifestReader.h:24-29,38-39,44-46`, `Pool/CasPool.h:558-566`,
-`Parts/PartFolderAccess.h:55-59,85,258-260`, `Parts/PartFolderAccess.cpp:266-267`,
-`ContentAddressedTransaction.cpp:1211-1212,1618-1620`; `docs/en/antalya/cas/architecture/read-path.md:37-48`
-(caches table, the "mandatory even on a hit" paragraph, its diagram), `docs/en/antalya/cas/configuration.md:101`,
-`docs/en/operations/storing-data.md:488,545-548`, `docs/en/antalya/cas/operations/troubleshooting.md:28`.
+**Comments and docs** stating the mandatory `HEAD` or a re-proved body as fact, rewritten in the
+same change: `Pool/CasManifestReader.h:24-29,38-39,44-46`, `Pool/CasPool.h:558-566`,
+`Parts/PartFolderAccess.h:55-59,85,258-260`, `Parts/PartFolderAccess.cpp:266-267,508-510` (the
+`republishRef` "re-proved, never from a retained view" sentence), `ContentAddressedTransaction.h:161-165`
+(the `force_fresh_validated_refs` "proves the body once" comment), `ContentAddressedTransaction.cpp:1211-1212,1618-1620`,
+`README.md:115` (names `PartFolderValidate`), `src/Disks/tests/cas_test_helpers.h:128`;
+`docs/en/antalya/cas/architecture/read-path.md:37-48` (caches table, the "mandatory even on a hit"
+paragraph, its diagram), `docs/en/antalya/cas/architecture/replication.md:111` ("re-reads the source
+manifest freshly"), `docs/en/antalya/cas/configuration.md:101`, `docs/en/operations/storing-data.md:488,545-548`,
+`docs/en/antalya/cas/operations/troubleshooting.md:28`.
+
+## Who consumes a cached decode {#consumers}
+
+Reads: every `ContentAddressedMetadataStorage` query-path caller uses `CachedForLoad` and returns from
+a warm view before reaching the reader (`Parts/PartFolderAccess.cpp:176-194`); `locate` is pure.
+
+Mutations copy entries out of the cached decode and adopt their blobs without a probe:
+
+- `createHardLink`, committed-source branch (`ContentAddressedTransaction.cpp:1213-1224`): `getView`
+  `ForceFresh`, `findFile`, `adoptEvidence`, the entry appended to the destination staging.
+- `unlinkFile` (`:1618-1626`) and then `publishStaging`'s repoint branch (`:364-372`): `getView`
+  `ForceFresh`, the surviving entries republished through `repointRef`.
+- `republishRef` (`Parts/PartFolderAccess.cpp:506-530`): `readManifestShared` on the source, equivalent
+  entries published at the destination through `prepareEntries`, which adopts every blob entry
+  (`:481`), then the source dropped.
+- `repointRef` (`:536-566`): `readManifestShared` on the committed manifest to compare the candidate; an
+  effective repoint publishes the candidate through the same adoption.
+- `getRelinkOffer` (`ContentAddressedMetadataStorage.cpp:2173-2198`): `getView` `ForceFresh`, the cached
+  decode re-encoded as the offer; the receiver's `prepareAdoptFromManifest` (`:2288-2310`) adopts the
+  blobs by hash, no body transferred, no per-blob probe.
+
+Each is sound by the live source edge, not by the `HEAD`; see the failure asymmetry above.
 
 ## Stale snapshot, end to end {#stale-snapshot}
 
@@ -103,6 +150,7 @@ or the local object storage's file-open error. It cannot be a silent empty read:
 `ReadBufferFromFileView::tryGetFileSize` answers from the manifest window, not from the object. A blob
 still present because another manifest shares it reads correctly, since the key is the content digest.
 A vanished disk is answered by `checkOpAdmitted` before any read (`ContentAddressedMetadataStorage.cpp:2079`).
+The mutation side of the same snapshot is covered under the failure asymmetry and the consumers list.
 
 ## Eviction and invalidation {#eviction}
 
@@ -138,11 +186,17 @@ edit that spec.
   deleted, and a reader opened with `manifest_decode_cache_bytes = 0` throws `FILE_DOESNT_EXIST` on the
   same deletion. The `Validate*` tests (`:796-872`) and `CASPartFolderValidateParse` (`:874-950`) are
   deleted with the setting.
-- Stale snapshot: at the pool layer, publish a part with a blob entry, read once, `deleteExact` the
-  body and the blob, read again and assert the same shared pointer with zero requests on the manifest
-  key, then `locate` and assert `backend.get` on the blob key is absent. At the wiring layer
-  (`gtest_ca_wiring.cpp`), open the part file after deleting its blob object and assert a thrown
-  `DB::Exception` with no bytes returned.
+- Stale snapshot, reads: at the pool layer, publish a part with a blob entry, read once, `deleteExact`
+  the body and the blob, read again and assert the same shared pointer with zero requests on the
+  manifest key, then `locate` and assert `backend.get` on the blob key is absent. At the wiring layer
+  (`gtest_ca_wiring.cpp`), open the part file after deleting its blob object and assert the thrown
+  code: `FILE_DOESNT_EXIST` on the local object storage (`src/IO/ReadBufferFromFile.cpp:50` maps
+  `ENOENT`), with no bytes returned.
+- Stale snapshot, the scoped contract made executable: at the pool layer, after deleting both the
+  cached source body and its blob, run the carry-forward sequence a committed source gets
+  (`adoptEvidence`, `stageManifest`, `precommitAdd`, `promote`) with no blob written; assert the
+  promote commits with zero requests on the blob key, and that `runFsck` then reports the blob as
+  `FsckClass::Dangling`. That pins the documented outcome, not a defect.
 - Soak: `CASManifestHead` (`ProfileEvents.cpp:843`, attributed per key by
   `Backend/CasInstrumentedBackend.cpp:85-96`) reads zero over a read-only window; the remaining
   legitimate sources are writer cleanup, the orphan sweep and fsck.
@@ -165,6 +219,9 @@ with a hundred columns saves on the order of three hundred requests per part.
 
 ## What this does not cover {#limits}
 
-A foreign writer placing a different body under a live id with the same self-described `ref` and
-namespace is caught by neither design. The `force_fresh_validated_refs` memo in `unlinkFile` now saves
-only a view-cache bypass and could go; that is a separate cleanup, not part of this change.
+Out-of-band deletion of a blob named by a cached source decode, with or without its manifest body,
+lets the mutation paths above commit a ref to an absent blob; fsck reports it. The manifest `HEAD`
+caught only the with-body sub-case. A foreign writer placing a different body under a live id with the
+same self-described `ref` and namespace is caught by neither design. The `force_fresh_validated_refs`
+memo in `unlinkFile` now saves only a view-cache bypass and could go; that is a separate cleanup, not
+part of this change.
