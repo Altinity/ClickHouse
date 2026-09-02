@@ -205,10 +205,10 @@ TEST(CASPartFolderAccess, RetainedHitSkipsManifestHead)
     for (int i = 0; i < 5; ++i)
         ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
 
-    /// The one-GET goal (spec acceptance 4): ONE body GET, ONE mandatory HEAD (the cold build);
+    /// ONE body GET (the cold build) and ZERO manifest HEADs: the decode cache is keyed by id, and
     /// every subsequent CachedForLoad call is a validated hit — zero manifest ops.
     EXPECT_EQ(backend->getCount(manifest_key), 1u);
-    EXPECT_EQ(backend->headCount(manifest_key), 1u);
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
     EXPECT_TRUE(access.explain(key).retained);
     EXPECT_EQ(access.explain(key).last_decision,
               Cas::CachedPartFolderAccess::LastDecision::Hit);
@@ -235,7 +235,7 @@ TEST(CASPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
 
     /// Same request oracle as RetainedHitSkipsManifestHead — one cold build, then validated hits.
     EXPECT_EQ(backend->getCount(manifest_key), 1u);
-    EXPECT_EQ(backend->headCount(manifest_key), 1u);
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
     /// The journal is never written when disabled.
     EXPECT_EQ(access.explainJournalSizeForTest(), 0u);
     /// explain() still reports live retention truthfully, but the decision defaults to Miss (unwritten).
@@ -275,12 +275,11 @@ TEST(CASPartFolderAccess, GetViewFailsClosedOnMissingBody)
     const Cas::RootNamespace ns{"srv/t1"};
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
 
-    /// Physically delete the live manifest body (a protocol violation) — every getView mode must
-    /// surface INV-NO-DANGLE as FILE_DOESNT_EXIST in Phase 2 (there is no retained view to hit).
-    /// Retention is off (the single-arg ctor below), so this is the `always` (default) part_folder_validate
-    /// mode under test regardless — the `never`/`age` skip is proven by the ValidateNever/ValidateAge
-    /// tests further down, which turn retention ON.
+    /// Physically delete the live manifest body (a protocol violation). Retention is off and the
+    /// decode cache is cold (promote reads the body through the backend, not the reader), so every
+    /// getView mode reaches the reader's miss path: one GET, no HEAD, FILE_DOESNT_EXIST.
     deleteManifestBody(*backend, layout, id);
+    backend->resetCounts();
 
     Cas::CachedPartFolderAccess access(store);
     const Cas::PartRefKey key{ns, "part_1"};
@@ -288,6 +287,7 @@ TEST(CASPartFolderAccess, GetViewFailsClosedOnMissingBody)
                            Cas::Freshness::ForceFresh,
                            Cas::Freshness::StrictValidate})
         expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST, [&] { access.getView(key, freshness); });
+    EXPECT_EQ(backend->headCount(layout.manifestKey(id)), 0u);
 }
 
 TEST(CASPartFolderAccess, WritePrimitivesRoundTrip)
@@ -717,11 +717,10 @@ TEST(CASPartFolderAccess, BaselineRequestCountsWithoutRetention)
     for (int i = 0; i < n; ++i)
         ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
 
-    /// The Phase-3 baseline (retention off): one manifest-body GET (the decode cache absorbs the
-    /// rest) but a mandatory manifest HEAD per call. Phase 4's validated hits remove the HEADs;
-    /// this test pins the numbers Phase 4 improves.
+    /// Retention off: one manifest-body GET (the decode cache absorbs the rest) and no manifest
+    /// HEAD at all — a cached decode is served without a request.
     EXPECT_EQ(backend->getCount(manifest_key), 1u);
-    EXPECT_EQ(backend->headCount(manifest_key), static_cast<uint64_t>(n));
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
 }
 
 /// ==== Phase 4 (retention) semantics battery: spec §Testing acceptance criteria ====
@@ -767,7 +766,11 @@ TEST(CASPartFolderAccess, MismatchRebuildAfterRepublish)
     EXPECT_TRUE(access.explain(key).retained);
 }
 
-TEST(CASPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)
+/// The decode cache is keyed by id and an id names one content forever, so a warm reader serves
+/// `ForceFresh` from the immutable decode with no manifest request even after the body object is
+/// gone. A retained-view hit is not what is being tested here: `ForceFresh` bypasses the view cache
+/// and rebuilds the view from the pool's manifest cache.
+TEST(CASPartFolderAccess, ForceFreshServesImmutableDecodeWithoutManifestRequestsAfterBodyDeletion)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -776,94 +779,43 @@ TEST(CASPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)
     Cas::CachedPartFolderAccess access(store, cacheOn());
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
     const Cas::PartRefKey key{ns, "part_1"};
-
-    ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);   /// retained
-    deleteManifestBody(*backend, layout, id);   /// protocol violation: live body vanishes
-
-    /// Write-evidence and strict paths surface INV-NO-DANGLE immediately (mandatory HEAD)...
-    expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST,
-        [&] { access.getView(key, Cas::Freshness::ForceFresh); });
-    expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST,
-        [&] { access.getView(key, Cas::Freshness::StrictValidate); });
-
-    /// ...while a validated CachedForLoad hit still serves the immutable decode — the documented
-    /// residual delta (spec §Staleness Equivalence): detection deferred, never for write evidence.
-    EXPECT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
-}
-
-/// ==== §3 (part_folder_validate): the ForceFresh body re-proof HEAD is configurable ====
-
-TEST(CASPartFolderAccess, ValidateNeverServesRetainedViewWithoutBodyHead)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend);
-    const Cas::Layout layout("p");
-    const Cas::RootNamespace ns{"srv/t1"};
-    const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
-
-    auto params = cacheOn();
-    params.validate = {Cas::PartFolderValidate::Mode::Never, 0};
-    Cas::CachedPartFolderAccess access(store, params);
-    const Cas::PartRefKey key{ns, "part_1"};
-
-    /// Prime the retained view (pays the HEAD once).
-    ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);
-    /// Body vanishes (a protocol violation the net would normally catch)...
-    deleteManifestBody(*backend, layout, id);
-    const auto skips_before = ProfileEvents::global_counters[ProfileEvents::CASPartFolderValidateSkipped].load();
-    /// ...but `never` serves the retained view, no HEAD, no throw.
-    EXPECT_NO_THROW(access.getView(key, Cas::Freshness::ForceFresh));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASPartFolderValidateSkipped].load() - skips_before, 1);
-}
-
-TEST(CASPartFolderAccess, ValidateAlwaysStillHeadsEveryForceFresh)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend);
-    const Cas::Layout layout("p");
-    const Cas::RootNamespace ns{"srv/t1"};
-    const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
-
-    Cas::CachedPartFolderAccess access(store, cacheOn());   /// default = Always
-    const Cas::PartRefKey key{ns, "part_1"};
-    ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);
-    deleteManifestBody(*backend, layout, id);
-    /// `always` re-proves the body every ForceFresh — the deleted body surfaces as FILE_DOESNT_EXIST.
-    expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST,
-        [&] { access.getView(key, Cas::Freshness::ForceFresh); });
-}
-
-TEST(CASPartFolderAccess, ValidateAgeSkipsWithinWindowThenHeadsAfter)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend);
-    const Cas::Layout layout("p");
-    const Cas::RootNamespace ns{"srv/t1"};
-    const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
-
-    auto params = cacheOn();
-    params.validate = {Cas::PartFolderValidate::Mode::Age, /*age_seconds=*/5};
-    /// An injected clock (spec §3 TDD requirement): the SAME function stamps the retained view's
-    /// validated_at_ms (buildView) and drives the age-window comparison (getView), so the test controls
-    /// both sides of the comparison deterministically -- no real sleep.
-    std::atomic<uint64_t> fake_now_ms{1'000'000};
-    Cas::CachedPartFolderAccess access(store, params, [&] { return fake_now_ms.load(); });
-    const Cas::PartRefKey key{ns, "part_1"};
     const String manifest_key = layout.manifestKey(id);
 
-    /// Prime the retained view (pays the HEAD once) at fake_now_ms.
-    ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);
-    const uint64_t heads_after_prime = backend->headCount(manifest_key);
+    ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);   /// warms the decode cache
+    deleteManifestBody(*backend, layout, id);   /// protocol violation: live body vanishes
+    backend->resetCounts();
 
-    /// +2s: still inside the 5s window — served from the retained view, no new HEAD.
-    fake_now_ms += 2000;
-    ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);
-    EXPECT_EQ(backend->headCount(manifest_key), heads_after_prime);
+    auto view = access.getView(key, Cas::Freshness::ForceFresh);
+    ASSERT_NE(view, nullptr);
+    EXPECT_NE(view->findFile("f"), nullptr);
+    EXPECT_EQ(backend->getCount(manifest_key), 0u);
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
+    EXPECT_EQ(access.explain(key).last_decision, Cas::CachedPartFolderAccess::LastDecision::ForceFreshRead);
+}
 
-    /// +6s from the ORIGINAL stamp (past the 5s window): re-proves the body via a fresh HEAD.
-    fake_now_ms += 4000;
+/// With the decode cache disabled a prior read leaves nothing behind, so the deleted body surfaces
+/// as FILE_DOESNT_EXIST in every mode: the miss path is the same fail-closed path a cold reader takes.
+TEST(CASPartFolderAccess, DeletedBodyFailsClosedInEveryModeWhenDecodeCacheDisabled)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = DB::Cas::Pool::open(backend,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .manifest_decode_cache_bytes = 0});
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);   /// retention off: every mode reaches the reader
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const Cas::PartRefKey key{ns, "part_1"};
+
     ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);
-    EXPECT_GT(backend->headCount(manifest_key), heads_after_prime);
+    deleteManifestBody(*backend, layout, id);
+    backend->resetCounts();
+
+    for (auto freshness : {Cas::Freshness::CachedForLoad,
+                           Cas::Freshness::ForceFresh,
+                           Cas::Freshness::StrictValidate})
+        expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST, [&] { access.getView(key, freshness); });
+    EXPECT_EQ(backend->headCount(layout.manifestKey(id)), 0u);
+    EXPECT_EQ(backend->getCount(layout.manifestKey(id)), 3u);   /// one GET per attempt, nothing cached
 }
 
 /// ==== §3: `parsePartFolderValidate` config parsing, standalone (mirrors CASS3Staging's
@@ -1003,8 +955,7 @@ TEST(CASPartFolderAccess, GetViewEmitsRefResolveOnlyOnRealResolveWork)
     ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
     EXPECT_EQ(refResolveCount(), 1) << "a warm view-cache hit must not add a RefResolve row";
 
-    /// ForceFresh always re-proves the manifest body under the default Always validation policy, so
-    /// this is real resolve work again -> +1.
+    /// ForceFresh always bypasses the retained view, so this is real resolve work again -> +1.
     ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);
     EXPECT_EQ(refResolveCount(), 2);
 
@@ -1032,10 +983,17 @@ TEST(CASPartFolderAccess, OversizedViewServedNotRetained)
     EXPECT_EQ(access.explain(key).last_decision,
               Cas::CachedPartFolderAccess::LastDecision::OversizedBypass);
 
-    const uint64_t head_before = backend->headCount(manifest_key);
+    backend->resetCounts();
     auto view2 = access.getView(key, Cas::Freshness::CachedForLoad);
     ASSERT_NE(view2, nullptr);
-    EXPECT_GT(backend->headCount(manifest_key), head_before);   /// not retained: re-HEADs every call
+    /// Not retained: every call rebuilds the view (a new view object over the SAME shared decode) and
+    /// records the bypass again; the rebuild costs no manifest request because the decode is cached.
+    EXPECT_NE(view1.get(), view2.get());
+    EXPECT_EQ(view1->manifest().get(), view2->manifest().get());
+    EXPECT_EQ(access.explain(key).last_decision,
+              Cas::CachedPartFolderAccess::LastDecision::OversizedBypass);
+    EXPECT_EQ(backend->getCount(manifest_key), 0u);
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
     EXPECT_FALSE(access.explain(key).retained);
 }
 
@@ -1056,9 +1014,10 @@ TEST(CASPartFolderAccess, DisabledModeKeepsBaseline)
     for (int i = 0; i < n; ++i)
         ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
 
-    /// Exactly the Phase-3 baseline: bytes=0 restores the no-retention call graph byte-for-byte.
+    /// bytes=0 restores the no-retention call graph: one body GET, then the decode cache serves every
+    /// rebuild with no manifest request.
     EXPECT_EQ(backend->getCount(manifest_key), 1u);
-    EXPECT_EQ(backend->headCount(manifest_key), static_cast<uint64_t>(n));
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
     EXPECT_FALSE(access.explain(key).retained);
 }
 

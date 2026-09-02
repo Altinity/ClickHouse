@@ -807,11 +807,11 @@ TEST(CASPool, LookupAndListOverManifestEntries)
     EXPECT_EQ(all[3].path, "p.proj/data.bin");
 }
 
-/// The Phase 1c manifest decode cache is keyed by (ManifestId, Token). Resolve+read the same ref twice:
-/// the second readManifest must be served from the cache (no second GET of the body). A fresh publish
-/// under a DIFFERENT ref name mints a NEW ManifestId (and a new shard token), so the cache misses and
-/// the body is fetched again. A CountingBackend asserts the body GET count.
-TEST(CASPool, ManifestCacheIsKeyedByIdAndToken)
+/// The manifest decode cache is keyed by ManifestId alone: an id is minted once and its body is
+/// written once, so one id names one content forever. Resolve+read the same ref twice: the second
+/// readManifest is served from the cache with NO request at all. A fresh publish under a DIFFERENT
+/// ref name mints a NEW ManifestId, so the cache misses and the body is fetched once.
+TEST(CASPool, ManifestCacheIsKeyedById)
 {
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -820,8 +820,9 @@ TEST(CASPool, ManifestCacheIsKeyedByIdAndToken)
 
     const ManifestId id1 = publishPart(s, ns.string(), "part_1", "payload-1");
     const String key1 = layout.manifestKey(id1);
+    b->resetCounts();
 
-    /// First read: a body GET populates the (id1, token) cache entry.
+    /// First read: a body GET populates the id1 cache entry.
     {
         auto r = s->resolveRef(ns, "part_1");
         ASSERT_TRUE(r.has_value());
@@ -831,7 +832,7 @@ TEST(CASPool, ManifestCacheIsKeyedByIdAndToken)
     const uint64_t gets_after_first = b->getCount(key1);
     ASSERT_GE(gets_after_first, 1u);               /// the first read DID fetch the body
 
-    /// Second read of the SAME id: the (id, token) cache must serve it — NO additional body GET.
+    /// Second read of the SAME id: the id-keyed cache must serve it — NO additional body GET.
     {
         auto r = s->resolveRef(ns, "part_1");
         ASSERT_TRUE(r.has_value());
@@ -840,7 +841,8 @@ TEST(CASPool, ManifestCacheIsKeyedByIdAndToken)
         ASSERT_EQ(m.entries.size(), 1u);
     }
     EXPECT_EQ(b->getCount(key1), gets_after_first)
-        << "second readManifest re-GET the body for the same (ManifestId, Token) — cache miss";
+        << "second readManifest re-GET the body for the same ManifestId — cache miss";
+    EXPECT_EQ(b->headCount(key1), 0u) << "keyed by id alone: no HEAD on a miss or a hit";
 
     /// A fresh publish under a DIFFERENT ref name mints a NEW ManifestId: the cache (keyed by id) misses.
     /// (Promoting a different manifest over the SAME committed ref is a distinct promote-over-committed
@@ -856,6 +858,7 @@ TEST(CASPool, ManifestCacheIsKeyedByIdAndToken)
     ASSERT_EQ(m2.entries.size(), 1u);
     EXPECT_GE(b->getCount(key2), 1u)               /// the new id's body WAS fetched (cache miss)
         << "fresh publish (new ManifestId) should miss the id-keyed manifest cache";
+    EXPECT_EQ(b->headCount(key2), 0u);
 }
 
 /// Phase 5 (part-folder cache spec): manifest_cache is now a byte-weighted CacheBase LRU instead of a
@@ -2471,9 +2474,41 @@ TEST(CASPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
     auto m2 = store->readManifestShared(resolved->manifest_id);
     EXPECT_EQ(m1.get(), m2.get());                          /// the SAME shared decode, no copy
     EXPECT_EQ(backend->getCount(manifest_key), 1u);         /// one body GET
-    EXPECT_EQ(backend->headCount(manifest_key), 2u);        /// mandatory HEAD per call (unchanged)
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);        /// keyed by id: no HEAD on a miss or a hit
     ASSERT_EQ(m1->entries.size(), 1u);
     EXPECT_EQ(m1->entries[0].path, "data.bin");
+}
+
+/// A miss whose object is absent is the one dangling-reference case the reader still detects
+/// itself: exactly one GET, no HEAD, one `ReadMissing` event, FILE_DOESNT_EXIST.
+TEST(CASPool, ReadManifestAbsentBodyEmitsReadMissingWithOneGetAndNoHead)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    Layout layout("p");
+    const RootNamespace ns{"srv1/tbl"};
+    const ManifestId id{.root_namespace = ns, .ref = manifestRefFor("absent-body-event")};
+    const String key = layout.manifestKey(id);
+
+    std::vector<CasEvent> events;
+    s->setEventSink([&](CasEvent e) { events.push_back(std::move(e)); });
+    b->resetCounts();
+    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->readManifest(id); });
+    s->setEventSink(nullptr);
+
+    EXPECT_EQ(b->getCount(key), 1u);
+    EXPECT_EQ(b->headCount(key), 0u);
+    size_t read_missing = 0;
+    for (const auto & e : events)
+    {
+        if (e.type != CasEventType::ReadMissing)
+            continue;
+        ++read_missing;
+        EXPECT_EQ(e.object_kind, CasEventObjectKind::Manifest);
+        EXPECT_EQ(e.detail.at("code"), "FILE_DOESNT_EXIST");
+        EXPECT_EQ(e.detail.at("site"), "readManifest");
+    }
+    EXPECT_EQ(read_missing, 1u);
 }
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)

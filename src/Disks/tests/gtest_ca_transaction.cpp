@@ -11,7 +11,7 @@
 namespace ProfileEvents
 {
 extern const Event CASRefRepoint;
-extern const Event CASManifestHead;
+extern const Event CASPartFolderViewHits;
 }
 
 namespace DB::ErrorCodes
@@ -621,13 +621,13 @@ TEST(CASTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
-/// Task 22 (URF plan phase 7): the MergeTree fast-removal shape's per-file ForceFresh proof is
-/// memoized per (transaction, ref) in `unlinkFile` — the first unlink's `ForceFresh` `getView` re-proves
-/// the manifest body with one HEAD; the rest of the burst reuses that proof via `CachedForLoad`. This
-/// pins the HEAD-count side of `UnlinkStormThenDirDropIsOneRefDrop` above (which already pins the
-/// repoint count): before this memoization, N unlinks of the same part paid N manifest-body HEADs; now
-/// the whole storm-then-drop transaction pays exactly one.
-TEST(CASTransactionRemove, UnlinkStormMemoizesOneForceFreshHead)
+/// The MergeTree fast-removal shape's per-file part-folder read is memoized per (transaction, ref) in
+/// `unlinkFile`: the first unlink reads the part `ForceFresh`, and the rest of the burst reuse that
+/// read via `CachedForLoad`. `ForceFresh` bypasses the retained view and rebuilds, so a memoized burst
+/// of N unlinks over one ref records exactly N-1 view-cache hits, and dropping the memoization would
+/// record none. This pins the read-amplification side of `UnlinkStormThenDirDropIsOneRefDrop` above,
+/// which already pins the repoint count.
+TEST(CASTransactionRemove, UnlinkStormMemoizesThePartFolderReadPerRef)
 {
     auto storage = openTxStorage();
 
@@ -643,7 +643,7 @@ TEST(CASTransactionRemove, UnlinkStormMemoizesOneForceFreshHead)
     }
     ASSERT_TRUE(storage->existsDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0"));
 
-    const uint64_t heads_before = ProfileEvents::global_counters[ProfileEvents::CASManifestHead].load();
+    const uint64_t view_hits_before = ProfileEvents::global_counters[ProfileEvents::CASPartFolderViewHits].load();
 
     /// 2. The MergeTree fast-removal shape: unlink every file one-by-one, THEN removeDirectory — all
     /// in ONE transaction (mirrors UnlinkStormThenDirDropIsOneRefDrop above).
@@ -656,13 +656,14 @@ TEST(CASTransactionRemove, UnlinkStormMemoizesOneForceFreshHead)
         tx->commit(DB::NoCommitOptions{});
     }
 
-    /// 3. The whole part is gone, and the three-file unlink storm paid exactly ONE manifest-body HEAD
-    /// (the first unlink's ForceFresh proof) — not three. removeDirectory clears the staged removal
-    /// marks, so publishStaging's own (unmemoized) ForceFresh getView never fires for this ref either
-    /// (see UnlinkStormThenDirDropIsOneRefDrop's zero-repoints assertion above).
+    /// 3. The whole part is gone, and the three-file unlink storm rebuilt the part-folder view once
+    /// (the first unlink's ForceFresh read) and reused it twice. removeDirectory clears the staged
+    /// removal marks, so publishStaging's own (unmemoized) ForceFresh getView never fires for this ref
+    /// either (see UnlinkStormThenDirDropIsOneRefDrop's zero-repoints assertion above), and a
+    /// ForceFresh read never records a view-cache hit — so these two hits are the memoized unlinks.
     EXPECT_FALSE(storage->existsDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0"));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASManifestHead].load(), heads_before + 1)
-        << "unlink-storm-then-dir-drop must pay exactly one ForceFresh manifest-body HEAD, not one per file";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASPartFolderViewHits].load(), view_hits_before + 2)
+        << "unlink-storm-then-dir-drop must read the part folder once and reuse it per extra file";
 }
 
 /// A create-then-remove of a new part in one transaction must discard both the manifest entries
