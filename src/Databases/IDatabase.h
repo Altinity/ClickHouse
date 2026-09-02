@@ -190,8 +190,7 @@ public:
     virtual bool isDatalakeCatalog() const { return false; }
 
     /// Reject an explicitly-specified table engine that is incompatible with this database, before the
-    /// table is created. A datalake catalog with a fixed storage backend rejects an Iceberg engine that
-    /// pins a different backend. Default: no-op.
+    /// table is created.
     virtual void validateCreateTableEngine(const String & /*engine_name*/) const {}
 
     /// True for databases such as `MySQL`/`PostgreSQL` whose table list lives on a remote service.
@@ -325,7 +324,6 @@ public:
         const ASTPtr & /*query*/);
 
     /// Delete the table from the database, drop table and delete the metadata.
-    /// `if_exists` is the flag of the originating query.
     virtual void dropTable( /// NOLINT
         ContextPtr /*context*/,
         const String & /*name*/,

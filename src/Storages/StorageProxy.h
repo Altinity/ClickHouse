@@ -84,10 +84,8 @@ public:
         return getNested()->write(query, metadata_snapshot, context, async_insert);
     }
 
-    /// `prepareForDrop` is deliberately NOT forwarded alongside this: it runs on the query thread, so
-    /// resolving the nested storage there would turn a resolution failure into a failed `DROP TABLE`,
-    /// while `drop` resolves it in the background where the failure is only logged. The proxies that
-    /// can forward it without resolving (`StorageTableProxy`, `StorageTableFunctionProxy`) do so.
+    /// `prepareForDrop` is not forwarded here; only the proxies that hold a nested storage
+    /// (`StorageTableProxy`, `StorageTableFunctionProxy`) forward it, and only once it is resolved.
     void drop() override { getNested()->drop(); }
 
     void truncate(
