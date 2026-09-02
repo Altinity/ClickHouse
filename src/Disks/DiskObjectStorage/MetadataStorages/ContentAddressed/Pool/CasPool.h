@@ -1040,6 +1040,13 @@ public:
     /// Test-only: the carved-item mirror's size for `ns` (see `CasRefLedger::refCarvedForTest`).
     size_t refCarvedForTest(const RootNamespace & ns) { return ref_ledger.refCarvedForTest(ns); }
 
+    /// Test-only: whether the carved item named `ref_name` is already completed (see
+    /// `CasRefLedger::refCarvedItemDoneForTest`).
+    bool refCarvedItemDoneForTest(const RootNamespace & ns, const String & ref_name)
+    {
+        return ref_ledger.refCarvedItemDoneForTest(ns, ref_name);
+    }
+
     /// Test seam: how many concurrent `ensureRefTableRecovered` callers for `ns` are
     /// PARKED right now waiting on the leader's in-flight recovery (see `RefTableRuntime::
     /// recovery_waiters_for_test`) -- lets a test `yield()`-poll for "a second caller actually reached

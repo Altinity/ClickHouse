@@ -644,6 +644,77 @@ TEST(CASConfirmExactRef, CarvedItemIsVisibleFromCarveToTenureEnd)
 }
 
 
+/// The mirror must survive an item's COMPLETION, not just its carve: an item is completed by its own
+/// chunk's commit, often chunks before the tenure ends. Two items whose op counts force a chunk split
+/// (mirrors `MidTenureChunkBoundaryIsUnknown`'s co-batching) are carved together in one tenure: chunk 1
+/// = {aaa_} alone, chunk 2 = {bbb_} alone. Sampled at chunk 2's `PostDurableInstall`, the test PROVES --
+/// via `refCarvedItemDoneForTest`, not by inferring from hook order -- that aaa_ is already done, and
+/// that it is still counted in `carved` alongside bbb_ until the tenure's exit guard.
+TEST(CASConfirmExactRef, CarvedItemSurvivesEarlierChunkCompletion)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_carved_multi_chunk"};
+    publishEmptyPart(store, ns, "seed");
+
+    std::atomic<int> boundaries{0};
+    std::atomic<bool> aaa_done_at_second_boundary{false};
+    std::atomic<size_t> carved_at_second_boundary{0};
+    store->setCarveHookForTest([&](CasRefLedger::CarvePhaseForTest phase)
+    {
+        if (phase != CasRefLedger::CarvePhaseForTest::PostDurableInstall)
+            return;
+        if (boundaries.fetch_add(1) + 1 != 2)
+            return;   /// only chunk 2's durable point is of interest
+        aaa_done_at_second_boundary.store(store->refCarvedItemDoneForTest(ns, "aaa_"));
+        carved_at_second_boundary.store(store->refCarvedForTest(ns));
+    });
+
+    /// Co-batching setup identical to `MidTenureChunkBoundaryIsUnknown`: the pre-carve hook parks the
+    /// first caller until the second is queued, so both items are carved together deterministically.
+    auto sync = std::make_shared<CaseSync>();
+    store->setRefPreCarveHookForTest([sync, store, ns]
+    {
+        std::unique_lock lk(sync->m);
+        if (sync->entered)
+            return;
+        sync->entered = true;
+        sync->cv.notify_all();
+        sync->cv.wait_for(lk, std::chrono::seconds(20),
+                          [&] { return store->refQueuePendingForTest(ns) >= 2; });
+    });
+
+    auto append = [&store, &ns](const String & prefix, uint64_t manifest_epoch)
+    {
+        std::vector<RefOp> item_ops = precommitAddRemovePairs(prefix, 1500, manifest_epoch);
+        store->appendRefOps(ns, MutationScope::ref(prefix),
+                            [ops = std::move(item_ops)](const RefTableState &) { return ops; },
+                            RootMutationOrigin::Writer, RootMutationKind::Publish);
+    };
+    std::thread a([&] { append("aaa_", 900000001); });
+    {
+        std::unique_lock lk(sync->m);
+        sync->cv.wait_for(lk, std::chrono::seconds(20), [&] { return sync->entered; });
+    }
+    std::thread b([&] { append("bbb_", 900000002); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (store->refQueuePendingForTest(ns) < 2 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    sync->cv.notify_all();
+    a.join();
+    b.join();
+    store->setRefPreCarveHookForTest(nullptr);
+    store->setCarveHookForTest(nullptr);
+
+    ASSERT_EQ(boundaries.load(), 2) << "the flush must chunk into exactly two transactions";
+    ASSERT_TRUE(aaa_done_at_second_boundary.load())
+        << "chunk 1's item must already be done by the time chunk 2 goes durable";
+    EXPECT_EQ(carved_at_second_boundary.load(), 2u)
+        << "a completed item must still be counted in the mirror until the tenure's exit guard";
+    EXPECT_EQ(store->refCarvedForTest(ns), 0u) << "the exit guard must release the mirror after both chunks";
+}
+
+
 /// `NeedsRecovery` is table-scoped, so confirmation refuses even a row that still looks perfect.
 TEST(CASConfirmExactRef, NeedsRecoveryIsUnknown)
 {

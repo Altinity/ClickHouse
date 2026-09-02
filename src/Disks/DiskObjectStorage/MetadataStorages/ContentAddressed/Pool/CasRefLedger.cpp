@@ -2163,8 +2163,9 @@ void CasRefLedger::completeOwnedItemsAndReleaseLeadership(
         std::erase(rt->pending, owned);
     }
     /// The tenure is over: every carved item is completed (above, or by its chunk's commit) and its
-    /// effect is either installed or recorded by the lane state (a wedge), so the confirm no longer
-    /// needs to see it.
+    /// effect is either installed, or its failure is recorded by the lane state (`Wedged` for an
+    /// ambiguous `PUT`, `NeedsRecovery` for a durable-but-not-installed chunk), so the confirm no
+    /// longer needs to see it.
     rt->carved.clear();
     rt->leader_active = false;
     rt->cv.notify_all();
@@ -2867,17 +2868,18 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// `seen_refs`/`batch` growth and only recorded the batch into `owned_items` afterwards, so any throw
     /// after the first pop stranded already-popped items -- neither in `pending` nor in `owned_items` --
     /// and their waiters hung forever. Instead:
-    ///   PLAN (may throw, mutates NOTHING): under `ref_queue_mutex`, scan `pending` WITHOUT popping and
-    ///   build the selection count, reserving every container (`batch`, `owned_items`) that the publish
-    ///   below grows. A throw here leaves `pending`/`owned_items` byte-for-byte unchanged, so the
-    ///   leadership-exit guard completes only the leader's own item and the untouched followers stay
-    ///   queued for a later leader.
+    ///   PLAN (may throw, mutates no CONTENT): under `ref_queue_mutex`, scan `pending` WITHOUT popping
+    ///   and build the selection count, reserving CAPACITY in every container (`batch`, `owned_items`,
+    ///   `rt->carved`) that the publish below grows -- a capacity change, never a size or content
+    ///   change. A throw here leaves `pending`/`owned_items`/`carved` byte-for-byte unchanged in
+    ///   content, so the leadership-exit guard completes only the leader's own item and the untouched
+    ///   followers stay queued for a later leader.
     ///   PUBLISH (no-throw): still under the SAME continuous `ref_queue_mutex` hold (no TOCTOU by
     ///   construction), pop the selected front items and append them to `batch` and `owned_items` using
     ///   only non-throwing operations (capacity pre-reserved; `shared_ptr` copies and `deque::pop_front`
-    ///   never throw). ProfileEvents increments are deferred past the plan so the plan is literally
-    ///   non-mutating. The same items are appended to `rt->carved`, the confirm-visible mirror the exit
-    ///   guard clears.
+    ///   never throw). ProfileEvents increments are deferred past the plan so the plan performs no
+    ///   observable mutation beyond the reserved capacity above. The same items are appended to
+    ///   `rt->carved`, the confirm-visible mirror the exit guard clears.
     std::vector<std::shared_ptr<RefMutationItem>> batch;
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
