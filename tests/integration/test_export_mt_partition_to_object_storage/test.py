@@ -400,6 +400,87 @@ def test_export_partition_feature_disabled(cluster):
     assert "experimental" in error, f"Expected experimental-feature error on KILL, got: {error}"
 
 
+def test_dispatch_fails_when_destination_dropped(cluster):
+    """A destination dropped after scheduling (while moves are stopped) must fail the
+    task on the first dispatch attempt: PENDING with no last_exception is the previous bug."""
+    node = cluster.instances["node"]
+
+    postfix = unique_suffix()
+    mt_table = f"dispatch_drop_mt_{postfix}"
+    s3_table = f"dispatch_drop_s3_{postfix}"
+
+    create_tables_and_insert_data(node, mt_table, s3_table)
+
+    node.query(f"SYSTEM STOP MOVES {mt_table}")
+    try:
+        node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
+        wait_for_export_to_start(node, mt_table, s3_table, "2020", system_table=SYSTEM_TABLE)
+
+        status = node.query(
+            f"SELECT status FROM system.{SYSTEM_TABLE}"
+            f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
+            f" AND partition_id = '2020'"
+        ).strip()
+        assert status == "PENDING", f"Expected PENDING while moves are stopped, got {status!r}"
+
+        node.query(f"DROP TABLE {s3_table} SYNC")
+        node.query(f"SYSTEM START MOVES {mt_table}")
+
+        wait_for_export_status(
+            node, mt_table, s3_table, "2020", "FAILED", system_table=SYSTEM_TABLE, timeout=30
+        )
+
+        last_exception = node.query(
+            f"SELECT last_exception FROM system.{SYSTEM_TABLE}"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{s3_table}'"
+            f"   AND partition_id = '2020'"
+        ).strip()
+        assert last_exception, f"Expected last_exception to be recorded for the dropped destination, got {last_exception!r}"
+    finally:
+        node.query(f"SYSTEM START MOVES {mt_table}")
+
+
+def test_dispatch_fails_when_destination_schema_incompatible(cluster):
+    """An incompatible destination recreated after scheduling must fail on dispatch,
+    not stay PENDING until the task timeout."""
+    node = cluster.instances["node"]
+
+    postfix = unique_suffix()
+    mt_table = f"dispatch_schema_mt_{postfix}"
+    s3_table = f"dispatch_schema_s3_{postfix}"
+
+    create_tables_and_insert_data(node, mt_table, s3_table)
+
+    node.query(f"SYSTEM STOP MOVES {mt_table}")
+    try:
+        node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
+        wait_for_export_to_start(node, mt_table, s3_table, "2020", system_table=SYSTEM_TABLE)
+
+        node.query(f"DROP TABLE {s3_table} SYNC")
+        # Extra destination column is always rejected (source has only id, year).
+        node.query(
+            f"CREATE TABLE {s3_table} (id UInt64, year UInt16, extra String) "
+            f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+            f"PARTITION BY year"
+        )
+        node.query(f"SYSTEM START MOVES {mt_table}")
+
+        wait_for_export_status(
+            node, mt_table, s3_table, "2020", "FAILED", system_table=SYSTEM_TABLE, timeout=30
+        )
+
+        last_exception = node.query(
+            f"SELECT last_exception FROM system.{SYSTEM_TABLE}"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{s3_table}'"
+            f"   AND partition_id = '2020'"
+        ).strip()
+        assert last_exception, f"Expected last_exception for the schema mismatch, got {last_exception!r}"
+    finally:
+        node.query(f"SYSTEM START MOVES {mt_table}")
+
+
 def test_pending_mutations_throw_before_export(cluster):
     node = cluster.instances["node"]
 

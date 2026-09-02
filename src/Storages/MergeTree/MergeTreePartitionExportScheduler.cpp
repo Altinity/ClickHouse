@@ -172,6 +172,15 @@ namespace
         return descriptor.task_timeout_seconds > 0
             && descriptor.create_time + static_cast<time_t>(descriptor.task_timeout_seconds) < now;
     }
+
+    /// `UNKNOWN_TABLE` is retryable on the replicated path (another replica, or a later recreate,
+    /// might restore the destination). For a local export there is no such helper: a missing
+    /// destination at dispatch or commit cannot succeed by retrying.
+    bool isNonRetryablePlainExportError(int code)
+    {
+        return ExportPartitionUtils::isNonRetryableExportError(code)
+            || code == ErrorCodes::UNKNOWN_TABLE;
+    }
 }
 
 bool MergeTreePartitionExportScheduler::tryPersistTimeoutKill(const String & composite_key, TaskEntry & entry, time_t now)
@@ -328,14 +337,6 @@ void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transacti
 
     const StorageID destination_storage_id{descriptor_copy.destination_database, descriptor_copy.destination_table};
 
-    auto release_in_flight = [this, transaction_id, part_name]()
-    {
-        std::lock_guard lock(mutex);
-        auto it = findByTransactionId(transaction_id);
-        if (it != tasks.end())
-            it->second.in_flight_parts.erase(part_name);
-    };
-
     try
     {
         auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), descriptor_copy);
@@ -354,12 +355,28 @@ void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transacti
                 handlePartCompletion(transaction_id, part_name, result);
             });
     }
+    catch (const Exception & e)
+    {
+        tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+        /// Dispatch failed before a move-executor task was queued (destination dropped, schema
+        /// mismatch, executor busy, ...). Route through the same completion-failure transition as
+        /// an async export error so last_exception is persisted and non-retryable faults become
+        /// FAILED. handlePartCompletion also releases the in-flight marker.
+        handlePartCompletion(
+            transaction_id,
+            part_name,
+            MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e));
+    }
     catch (...)
     {
         tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
-        /// Dispatch failed (e.g. destination missing, executor busy). Release the in-flight marker
-        /// so the part becomes eligible again on the next tick.
-        release_in_flight();
+        handlePartCompletion(
+            transaction_id,
+            part_name,
+            MergeTreePartExportManifest::CompletionCallbackResult::createFailure(
+                Exception::createRuntime(
+                    ErrorCodes::UNKNOWN_EXCEPTION,
+                    getCurrentExceptionMessage(/*with_stacktrace=*/ false))));
     }
 }
 
@@ -409,7 +426,7 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
             updated.last_exception.time = time(nullptr);
             updated.last_exception.count += 1;
 
-            if (result.exception && ExportPartitionUtils::isNonRetryableExportError(result.exception->code()))
+            if (result.exception && isNonRetryablePlainExportError(result.exception->code()))
                 updated.status = MergeTreePartitionExportTask::Status::FAILED;
         }
 
@@ -566,7 +583,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
             updated.last_exception.time = time(nullptr);
             updated.last_exception.count += 1;
 
-            if (failure && ExportPartitionUtils::isNonRetryableExportError(failure->code()))
+            if (failure && isNonRetryablePlainExportError(failure->code()))
                 updated.status = MergeTreePartitionExportTask::Status::FAILED;
             /// Otherwise leave PENDING: run() will retry the commit on the next tick.
         }
