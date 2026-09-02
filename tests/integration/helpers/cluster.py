@@ -4887,6 +4887,8 @@ services:
         {mem_limit}
         {cpu_limit}
         {pids_limit}
+        ulimits:
+            core: -1
         cap_add:
             - SYS_PTRACE
             - NET_ADMIN

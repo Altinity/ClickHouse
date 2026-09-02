@@ -17,6 +17,13 @@ echo '{
     "log-opts": {
         "max-size": "100m",
         "max-file": "3"
+    },
+    "default-ulimits": {
+        "core": {
+            "Name": "core",
+            "Hard": -1,
+            "Soft": -1
+        }
     }
 }' | dd of=/etc/docker/daemon.json
 

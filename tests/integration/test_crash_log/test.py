@@ -168,7 +168,11 @@ def test_sanitizer_report_in_core_dump(started_node):
     wait_for_clickhouse_stop(started_node)
 
     cores = [os.path.join(cores_dir, name) for name in os.listdir(cores_dir)]
-    assert len(cores) == 1
+    with open("/proc/sys/kernel/core_pattern") as f:
+        core_pattern = f.read().strip()
+    assert len(cores) == 1, (
+        f"expected 1 core in {cores_dir}, got {cores}; core_pattern={core_pattern!r}"
+    )
 
     report = find_report_in_core(cores[0])
     assert report is not None

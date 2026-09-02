@@ -1376,6 +1376,9 @@ tar -czf ./ci/tmp/logs.tar.gz \
             Utils.clear_dmesg()
         except Exception as ex:
             print(f"Failed to clear dmesg before integration tests: {ex}")
+        # `--daemon` chdirs to /var/lib/clickhouse/cores. A relative core_pattern
+        # writes the dump there; Ubuntu's apport/systemd-coredump pipe does not.
+        Shell.check("sysctl -w kernel.core_pattern=core", verbose=True, strict=True)
 
     clear_rabbitmq_recreation_scan_inputs()
 
