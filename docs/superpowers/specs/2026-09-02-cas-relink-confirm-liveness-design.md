@@ -9,14 +9,16 @@ doc_type: 'design'
 
 # CAS relink confirm liveness design {#cas-relink-confirm-liveness-design}
 
-Status: revision 3 of 2026-09-02. Revision 1 relied on the part state machine (gate 0) to carry the
+Status: revision 4 of 2026-09-02. Revision 1 relied on the part state machine (gate 0) to carry the
 removal argument; review found the counterexample of a live repoint that retires a blob edge while the
 part stays `Active`, and revision 1 is withdrawn. Revision 2 (rule 3 scoped to the sent transaction)
-passed two independent consults (one on another model) on the design itself; this revision folds in
-their prose findings: the model extension is now specified, the existing rule-3 tests that the design
-reverses are named with their new expectations, and the citations are corrected. The TLA+ variant and
-the code change remain to be done. Ledger finding F11, backlog item `[relink-confirm-lane-livelock]`
-in `docs/superpowers/cas/BACKLOG/gcs.md`.
+passed two independent consults, one on another model, on the design itself; revisions 3 and 4 fold in
+their prose findings: the model extension is specified transition by transition, the companion lane
+models that encode the old `Ready`-only certification contract are in scope, the existing rule-3 tests
+the design reverses are named with their new expectations, and citations are corrected. The reports are
+kept verbatim in [F11 spec consults](/superpowers/cas/f11-spec-consults-2026-09-02). The TLA+ work and
+the code change remain to be done. Ledger finding F11, backlog item `[relink-confirm-lane-livelock]` in
+`docs/superpowers/cas/BACKLOG/gcs.md`.
 
 ## The problem in one paragraph {#problem}
 
@@ -159,26 +161,45 @@ refuses. That is the property the design rests on, and it is the property the mo
 
 ### Model {#model}
 
-Today's model has no armed state: `SenderAdmit` sets `sPending` and `sLeader` together,
-`SenderDurable` is atomic, and rule 3 is `~sPending /\ ~sLeader`. The extension, kept to two booleans
-and one witness:
+Two models encode the old contract and both change.
 
-- `sArmed`, set by a new arm step that `SenderDurable` requires and `SenderApply` clears. This mirrors
-  "arm before the first send, swap out at install" (`CasRefLedger.cpp:3585-3625`, `:3855-3859`), stated
-  in the model as the code invariant it assumes.
-- `sTouches`, chosen at admit: whether the admitted transaction touches the queried ref (or the
-  namespace). A non-touching transaction leaves `sDurableRef` unchanged. No second ref and no part
-  state are introduced.
+**`CaRelinkConfirmCore.tla`.** Today `SenderAdmit` admits only a transaction that retires the sender's
+edge (`Other` or `"none"`), `SenderDurable` always emits that deletion, and `SenderApply` clears
+`sPending` and `sLeader` together; rule 3 is `~sPending /\ ~sLeader`. There is no transaction that
+touches nothing and no state "installed, tenure still open". The extension:
+
+- Two admitted shapes: `Touching` (today's edge-retiring transaction) and `NoOp` (a transaction of
+  the same namespace that leaves `sDurableRef` and the fold set unchanged, the model's stand-in for a
+  chunk about another ref). `sTouches` is derived from the shape, not chosen freely, except under the
+  sabotage below.
+- `sArmed`, set by an explicit `SenderArm` step that `SenderDurable` requires and that the install
+  step clears. This mirrors "arm before the first send, swap out at install"
+  (`CasRefLedger.cpp:3585-3625`, `:3855-3859`), stated in the model as the code invariant it assumes.
+- Install is split from tenure completion: `SenderInstall` clears `sArmed` and updates `sCacheRef`;
+  a separate `SenderTenureEnd` clears `sLeader`. Between the two the lane is Ready with no attempt and
+  the leader still active, the chunk boundary of a chunked flush.
 - Rule 3 becomes `~(sArmed /\ sTouches)`; `sPending` and `sLeader` leave the rule.
-- `SabotageStaleCache` drops that conjunct and must still violate `ConfirmedRelinkNeverDangles` (the
-  durable `m1 -> m2` repoint with the stale `sCacheRef = m1`); a second, distinct flag forces
-  `sTouches = FALSE` for a touching transaction and must violate it too.
-- A non-vacuity witness: some behaviour answers `yes` while `sLeader /\ sPending` holds. Without it a
-  green `_main` could be the old behaviour.
-- The between-chunks state (installed, no attempt, leader still active) is reachable and answers from
-  the row.
+- Sabotages: `SabotageStaleCache` drops the rule-3 conjunct entirely and must still violate
+  `ConfirmedRelinkNeverDangles` (the durable `m1 -> m2` repoint with the stale `sCacheRef = m1`);
+  `SabotageTouchBlind` forces `sTouches = FALSE` for a `Touching` transaction and must violate it too.
+- Three reachability witnesses, each a behaviour `_main` must exhibit: a confirm answering `yes`
+  while `sArmed /\ ~sTouches` (a `NoOp` chunk in flight); a confirm answering `yes` after
+  `SenderInstall` and before `SenderTenureEnd` (the chunk boundary); a confirm answering `unknown` while
+  `sArmed /\ sTouches`. Without the first two a green `_main` could be the old behaviour.
 - Run with `MaxHoles = 0`, as `_main` does. The LIST-completeness caveat recorded in
   `CaRelinkConfirmCore_RESULTS.md` is unchanged and outside this design.
+
+**`CaRefLaneCore.tla` and `CaRelinkLaneComposition.tla`.** The lane model's `Certify`
+(`CaRefLaneCore.tla:714-722`) and the composition's `ConfirmSource` (`CaRelinkLaneComposition.tla:111`)
+state the public seam as "certification requires `lane = "Ready"`", and `RefuseBlockedConfirmation`,
+`ConfirmWhileBlocked` and `ConfirmationRequiresReady` test that contract. This design replaces that
+seam: certification is permitted in `Writing` and `Wedged` when the armed attempt does not touch the
+certified identity. Both models gain the attempt's touch scope (the composition treats the lane as a
+component, so the lane exports "armed attempt touches this identity" as one more observable), the
+`Ready`-only property is rewritten as "no certification while the armed attempt touches the identity",
+`SabotageConfirmBlocked` becomes "certify while the touching attempt is armed", and
+`run_relinklane.sh` plus `CaRefLaneCore_RESULTS.md` (`:68-91`) and the models README rows for both files
+are rerun and rewritten. A green `CaRelinkConfirmCore` alone is not the model gate.
 
 Liveness is argued, not model-checked: with rule 3 scoped to the sent transaction's refs, a confirm
 about a ref that is not being mutated reaches rule 5 whenever the lane is resident and not broken, and
@@ -187,10 +208,11 @@ the only lock it needs is a `try_to_lock` against the leader's install.
 ### Consult {#consult}
 
 Two independent consults on revision 2, one on another model, each asked to refute the design,
-returned no defect in it (their reports are under `tmp/gcs_live_20260902/`, and their prose findings
-are folded into this revision). The model diff, once written, gets the same treatment before the code
-task is cut: is `sArmed` set before anything the store can observe; does every transaction that changes
-`sDurableRef` have `sTouches` true; does the witness fire.
+returned no defect in it; their prose findings are folded into revisions 3 and 4, and the reports are
+kept in [F11 spec consults](/superpowers/cas/f11-spec-consults-2026-09-02). The model diff, once
+written, gets the same treatment before the code task is cut: is `sArmed` set before anything the store
+can observe; does every transaction that changes `sDurableRef` have `sTouches` true; do all three
+witnesses fire; does the composition model's rewritten seam still catch its three sabotages.
 
 ### Tests {#tests}
 
@@ -202,8 +224,10 @@ task is cut: is `sArmed` set before anything the store can observe; does every t
   `ConcurrentAppendIsOrderedAfterTheSnapshot` becomes before admission `Yes`, admitted but unsent `Yes`,
   armed `Unknown`, installed `No`, with the same deterministic phase driving;
   `WedgedLaneIsUnknown` stays `Unknown` for every ref because `forceWedgeForTest` marks the attempt
-  namespace-wide, and gains a sibling with a real wedged transaction (a `PUT` left `Unresolved` through
-  the request-control seam) where the touched ref answers `Unknown` and an unrelated ref `Yes`.
+  namespace-wide, and gains a sibling with a real wedged transaction (`ChunkFaultBackend::Mode::Unresolved`
+  with a single-attempt budget, as `gtest_cas_ref_install_safety.cpp` already uses) where the touched
+  ref answers `Unknown` and an unrelated ref `Yes`. The file header at `:40-46`, which states that no
+  `Yes` may coexist with an admitted removal, is rewritten with the new phase table.
   New: the same-ref stale-row regression, offer `m1`, repoint the live ref to a manifest omitting one
   of `m1`'s blobs, hold the leader after the `PUT` and before install with the existing hooks, publish
   the receiver's `+1` late, assert `Unknown`; and the liveness case, a tenure held open for another ref
@@ -243,6 +267,12 @@ stays on the real bucket.
   what makes `Yes` sound and that no admitted removal can coexist with a `Yes`, and the rule 3 comment
   block at `:471-480`. Under this design an admitted, unsent removal does coexist with a `Yes`, safely,
   and the comment must say why.
+- `CasRefLedger.h:616`: the `prepared_attempt` field comment enumerates the attempt's fields as
+  "COMPLETE" and gains the two new ones.
+- `src/Disks/tests/gtest_cas_confirm_exact_ref.cpp:40-46`: the file header (see the tests section).
+- `docs/superpowers/models/CaRelinkConfirmCore_RESULTS.md:85-92` and `:126-142`: the "why it holds"
+  paragraph and the `_sab_stalecache` narrative describe rule 3 as tenure-wide; rewritten with the
+  rerun. `CaRefLaneCore_RESULTS.md:68-91` and the two models README rows: the `Ready`-only seam.
 - The operator-facing description of the confirm under `docs/en/antalya/cas/`, if it states the
   table-wide refusal.
 
