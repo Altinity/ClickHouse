@@ -74,7 +74,12 @@ The word already lives in the code ("incarnation token", the `MountLease` docume
 called `Token`, because it is not something the caller *sends*; it is something the caller *saw* — and
 saw **of one key, from one backend**. A conditional operation given an incarnation of another key, or
 minted by another backend, throws `LOGICAL_ERROR`: a programming error, not a store answer, so it does
-not reintroduce problem 9.
+not reintroduce problem 9. "Backend identity" is a per-instance id from a static counter at
+construction — not the address, which is reused after destruction — and the check lives in the
+**minting** backend's operations; `InstrumentedBackend` mints nothing and forwards without checking,
+so an incarnation's identity is its inner backend's. One constraint follows: a cache that holds an
+`Incarnation` (`CasManifestReader`'s, `readShardDecoded`'s) must not outlive the backend that minted
+it; today both are owned by the `Pool` that owns the backend.
 
 Two assertions make unconstructibility checkable at compile time; the key binding is checked by the
 operations:
@@ -93,7 +98,7 @@ incarnation — the backend parsing **its own responses**, not a contract with c
 
 | dialect | a response value is an incarnation iff |
 |---|---|
-| Generation | canonical positive decimal: digits only, no leading zero, not `0` — zero is the dialect's own absence sentinel (`If-None-Match: *` maps to `x-goog-if-generation-match: 0`) |
+| Generation | canonical positive decimal **after the SDK ETag-field quote strip** (`normalizeTokenValue` stays; the adapter installs the generation quoted): digits only, no leading zero, not `0` — zero is the dialect's own absence sentinel (`If-None-Match: *` maps to `x-goog-if-generation-match: 0`) |
 | ETag | non-empty; not `*` after trimming whitespace; no comma — a list matches any member, and no known store puts a comma in a single entity tag |
 | Emulated | non-empty |
 
@@ -131,9 +136,12 @@ Plus `probeSentinelRaw`, the bootstrap classification probe, kept and reduced to
 
 **`read`** is the only source of an `Object`. It is `IObjectStorage::readSmallObjectAndGetObjectMetadata`
 under a native-conditional request mode, once the [upstream slice](#upstream-slice) makes that
-function honest. It takes no per-call bound: one backend-wide stored-byte bound — the largest control
-cap, 256 MiB — protects memory against a rogue object and can be wrong in exactly one place, and the
-decoders already enforce each format's `object_cap` on decode. Eighty call sites each computing
+function honest. It takes no per-call bound: one backend-wide **stored**-byte bound —
+`ZSTD_compressBound` of the largest control cap, computed once beside the caps table — protects memory
+against a rogue object and can be wrong in exactly one place, and the decoders already enforce each
+format's `object_cap` on decode. The cap itself would be one place wrong: `object_cap` bounds
+*decompressed* bytes, and an incompressible `PartManifest` or `GcOutcomes` at the cap is stored at up
+to `ZSTD_compressBound(256 MiB)`, about 258 MiB, which a 256 MiB stored bound would refuse forever. Eighty call sites each computing
 `ZSTD_compressBound(object_cap)` would be a surface where a bound one byte short is a permanent read
 failure for one object. `read` allocates a fixed 64 KiB buffer: chunk size of one `GET`, not a
 request count — eight times today's sized allocation for a 3.7 KiB fold read, sixteen times less than
@@ -142,7 +150,8 @@ the unsized 1 MiB default, and needing no `HEAD` to size.
 **`head`** is for callers that do not want the body: existence, size, and an incarnation to delete
 without reading — the one legitimate `HEAD`. `Meta` drops `attributes`: no production reader exists
 outside the backends' own copying, no production write passes a non-empty `ObjectMeta`, and
-`cas_owner` has no reader or writer anywhere under `ContentAddressed/`. `ObjectMeta` on writes goes
+`cas_owner` has no reader or writer as an object attribute anywhere under `ContentAddressed/` (the
+string survives only as the `FormatId::Owner` text header). `ObjectMeta` on writes goes
 with it.
 
 **`stream`** carries no incarnation because a lazily-read stream cannot promise one: it may reissue.
@@ -159,7 +168,7 @@ Ambiguity — the store did not answer, the write may have landed — is an exce
 and `Removal`.
 
 **`remove`** is conditional only. There is no unconditional delete in the API because there is none in
-CAS — all sixteen `deleteExact` callers are conditional — and "delete whatever is there" has no safe
+CAS — all seventeen `deleteExact` call sites are conditional — and "delete whatever is there" has no safe
 meaning when a republished blob under the same key is a legitimate live object. When the store
 answers with a delete marker instead of a removal (versioning enabled — a mis-provisioned pool),
 `remove` throws: the capability probe's step 8 refuses the pool on that throw, and GC's redelete
@@ -185,8 +194,9 @@ a struct with bytes has bytes to compare, a struct without does not, and no type
 
 ## The upstream slice {#upstream-slice}
 
-Two facts make a one-`GET` read dishonest today, and both are fixed in about twenty additive lines
-across three files under `src/IO` and `src/Disks/DiskObjectStorage/ObjectStorages/S3`. The change is
+Two facts make a one-`GET` read dishonest today, and both are fixed in about thirty additive lines
+across six files under `src/IO` and `src/Disks/DiskObjectStorage/ObjectStorages/S3` — a new five-line
+header, the two settings headers, the S3 read buffer's header and source, and the S3 object storage. The change is
 generic — it makes `readSmallObjectAndGetObjectMetadata` keep its own word for every caller — and
 carries no CAS vocabulary, so it ports between branches on its own.
 
@@ -195,7 +205,11 @@ field only through `applyGcsConditionalDialectToResponse`, which `PocoHTTPClient
 `if (isNativeConditionalRequest(request))`; `ReadBufferFromS3::sendRequest` builds a plain
 `GetObjectRequest` and never marks it, and a test pins that behaviour
 (`gtest_aws_s3_client.cpp:1364`). Today's `get` works on GCS only because its token comes from
-`nativeHead`, which does mark its request. The fix is the same one line `getObjectInfo.cpp:42` already
+`nativeHead`, which does mark its request. (That test pins the response-side gate with a hand-marked
+`HEAD`; no existing test covers a marked `GET`, so the slice's test is new.) On the request side the
+dialect adapter is a no-op for a conditionless `GET`; the OAuth client strips five AWS signing headers
+from a marked request before setting its Bearer header, as it does for the marked `HEAD` today — no
+header the store reads changes. The fix is the same one line `getObjectInfo.cpp:42` already
 uses for `HEAD`:
 
 - `ObjectStorageRequestMode` (today in `WriteSettings.h:35`) moves to a five-line
@@ -214,7 +228,10 @@ promises "consistent metadata" and cannot keep it. The fix:
 
 - `ReadBufferFromS3::initialize` records the first response's ETag and, on **every** reissue, sets
   `response_identity_changed` if the new response's differs — per reissue, so an `A→B→A′` sequence is
-  caught at `B`; six lines, two members, one getter, and no change to what any reader returns;
+  caught at `B`; six lines, two members, one getter, and no change to what any reader returns.
+  `initialize` is the only response source on the `next()` path that `copyDataMaxBytes` drives
+  (`seek` and the until-position setters re-enter it); `readBigAt` obtains responses separately and
+  `read` never uses it;
 - `S3ObjectStorage::readSmallObjectAndGetObjectMetadata` throws after draining if the flag is set —
   three lines.
 
@@ -246,24 +263,33 @@ if (meta && meta->incarnation.render() == persisted)   // "dialect:value" == "di
 The incarnation handed to `remove` came from `head`, of that key, from this backend — every guarantee
 of the type holds, and the persisted string never became one. A dialect-tagged string cannot be
 misread across dialects, because the rendering carries the dialect too. A stale or garbage row simply
-fails to match, and the supersession path that already exists re-condemns the live incarnation the
-next round; nothing is retained in a special state, nothing needs a follow-up, `CasInspect` renders
-strings as strings and needs no backend, and `Formats/` keeps depending on `Primitives/` only.
+fails to match: GC records `Replaced` — justified this time by a live `HEAD`, remote evidence — keeps
+the meta as today, and drops the row. A blob that was touched in the window is re-condemned by the
+supersession path that already exists; a blob republished and then abandoned, with no edge, is
+reclaimed on the next publication of that content, which the still-`Condemned` meta forces — the
+same as today's `TokenMismatch` path, no better and no worse. Nothing is retained in a special
+state, `CasInspect` renders strings as strings and needs no backend, and `Formats/` keeps depending
+on `Primitives/` only.
 
 This is the shape of the other nine `head`-then-`remove` sites in the tree. Its cost is one `HEAD` per
 condemned-blob delete where today there is one only on a mismatch; GC's delete phase is background and
-bounded by the round budget. Both reviews of revision 3 recommended this trade; it is taken.
+bounded by the round budget. The internal review of revision 3 recommended this trade; the codex review's minimum kept a
+`parse(key, {dialect, value})` door plus a retained-unadoptable variant. This is the stricter of the
+two, and it is taken.
 
-The two consumers are GC's redelete and `CasFsck`'s retirement check, both of which already `head`.
-Orphan nomination is not one: its incarnation comes from the same live `get` that supplied the body.
-No persisted token reaches `write` anywhere.
+Four sites compare a persisted token with a live one and all become render compares: GC's redelete
+and `CasFsck`'s retirement check, which then `remove` with the head's incarnation; and the fold's
+supersede compare in `closeBlob` and the meta writer's condemn-marker confirmation registry, which
+compare and never remove. Orphan nomination is not one: its incarnation comes from the same live
+`get` that supplied the body. No persisted token reaches `write` anywhere.
 
 ## The one hard thing left {#write-anomaly}
 
 `write` must return an `Incarnation`; a response without one has nothing to return.
 `runCapabilityProbe` already depends on write tokens — `t1` from step 1 is the precondition of step 4
-— and refuses a nameless-write store today only by accident (`t2 == t1`, both empty). It will refuse
-it by name. S3 in the ETag dialect always carries an ETag, GCS always a generation once the request is
+— and refuses a nameless-write store today only by accident — when the `HEAD` is nameless too, `t2 == t1`
+with both empty; a store that names `HEAD`s but not `PUT`s passes, because the fallback fills both from
+`nativeHead`. It will refuse it by name. S3 in the ETag dialect always carries an ETag, GCS always a generation once the request is
 marked, `EmulatedSingleProcess` mints from a stat under its mutex; Azure is read-only today.
 
 At runtime a nameless write response is therefore a store anomaly — and the write **may have
@@ -305,7 +331,15 @@ that recognises its own body by bytes also recognises a restored copy. This defe
 
 - **Tests** obtain incarnations by performing operations on `InMemoryBackend`; a "wrong" one for a key
   is that key's **previous** incarnation after an overwrite — provably stale, and bound to the same key,
-  which is what the type now requires. The seventy-six test subclasses of a backend inherit the
+  which is what the type now requires.
+- **`runCapabilityProbe` is the one production site that constructs synthetic tokens today** — three
+  numeric values "in the live dialect" for its wrong-token refusal checks — and it cannot under this
+  contract. It is reordered so every wrong value is the same key's provably stale incarnation from
+  this backend: overwrite with `t1` first (yielding `t2`), then the refusal check with `t1`; on the
+  CAS key, create and commit with `ct1`, then the stale conflict with `ct1`; the wrong-token delete
+  with `t1`. Bodies differ, so content-derived ETags differ, and the store answers exactly as it does
+  today. This is the one production site the compiler lists at step 4 that is not a mechanical
+  migration. The seventy-six test subclasses of a backend inherit the
   protected minter; that is a door for tests, guarded by review, and the document does not pretend the
   `static_assert`s close it.
 - `InMemoryBackend::setEnforceTokens(false)` models a store that accepts every precondition. It stays.
@@ -315,15 +349,17 @@ that recognises its own body by bytes also recognises a restored copy. This defe
 - Fixtures that run `Mode::Native` over `LocalObjectStorage` for convenience move to
   `EmulatedSingleProcess`. The two fake families that exist to exercise Native behaviour — the fake
   generation store in `gtest_cas_s3_staging` and the S3 error-classification fakes in
-  `gtest_cas_sentinel_probe` — stay Native and override `readSmallObjectAndGetObjectMetadata`, which
-  is the seam `read` uses. The sentinel-probe fakes that arm a `HEAD` fault are rewritten to arm a
+  `gtest_cas_sentinel_probe` — stay Native and **gain** an override of `readSmallObjectAndGetObjectMetadata`, which is the seam
+  `read` uses — today both inherit the base implementation, which returns no metadata. The "read
+  never mixes" test additionally needs the scripted S3 response to carry a body and to close mid-body;
+  today it carries status and headers only. The sentinel-probe fakes that arm a `HEAD` fault are rewritten to arm a
   `GET` fault, since the probe issues no `HEAD` any more.
 - `InstrumentedBackend` counts every operation into `ProfileEvents`; the new operations get counters
   and `CAS*Get` / `CAS*GetStream` are retired with the operations they counted.
 
 ## Landing order {#landing-order}
 
-About 300 sites: 80 `get`, 24 `head`, 38 writes, 16 deletes, 26 default-constructed holders, 3 backend
+About 300 sites: 80 `get`, 24 `head`, 38 writes, 17 deletes, 26 default-constructed holders, 3 backend
 implementations and 76 test subclasses, 4 codecs, 59 test constructions in 14 files. That size is how
 the design works — an unconstructible, key-bound type makes the compiler find every place a string was
 passed off as an observation. Four steps, each green:
@@ -333,9 +369,13 @@ passed off as an observation. Four steps, each green:
    `LOGICAL_ERROR` (a caller passed a non-token; `isDeterministicLocalFailure` already rethrows that
    code through the controller), the same on the delete path across all three backends (S3 is
    fail-loud there today, Emulated and `InMemoryBackend` return `TokenMismatch` and must throw
-   instead), and the fallback `HEAD` replaced by `CAS_WRITE_UNATTRIBUTED`. Under a hundred lines. After
-   this step no clobber path is left: not empty, not `*`, not a quoted or zero-padded generation, not
-   a list, not a stranger's token.
+   instead), the same grammar applied where a `HEAD` or listing is minted into a token (as
+   `CORRUPTED_DATA`: a store answer that cannot identify — so that step 1's `LOGICAL_ERROR` genuinely
+   means a caller passed a non-token, not a store anomaly relabelled as a caller bug), and the
+   fallback `HEAD` replaced by `CAS_WRITE_UNATTRIBUTED`. Under a hundred lines. After this step no
+   clobber path is left: not empty, not `*`, not a quoted or zero-padded generation, not a list, not a
+   token from a later unrelated `HEAD`. Not yet closed at step 1: a genuine incarnation of another
+   key, which is what step 3's key binding is for.
 2. **The upstream slice, and the new operations beside the old.** The three-file slice lands as its
    own commit. Then `read`, `head`, `stream`, `write`, `remove`, `publish` are added to `Backend` with
    the old operations delegating where a delegation exists — and the document says where it does not:
@@ -367,8 +407,9 @@ client that serves `N` bytes of one body with one ETag, fails, then serves the r
 → `readSmallObjectAndGetObjectMetadata` throws; same ETag on reissue → it returns. On GCS: a marked
 `GET` returns the generation in the ETag field, and `read` mints it.
 
-**Minting refuses.** Empty, `*`, a comma list, `00123`, `0`, `"123"` → `CORRUPTED_DATA` from `head`,
-`read` and `list`.
+**Minting refuses.** Empty, `*`, a comma list, `00123`, `0`, and a generation still quoted after the
+strip → `CORRUPTED_DATA` from `head`, `read` and `list`. (`"123"` itself is a valid ETag-dialect value
+and a valid pre-strip generation; it is not a refusal example.)
 
 **Persisted compare.** A `cas_run` row whose `{type, value}` renders equal to `head`'s → `remove`
 issued; unequal (stale, garbage, foreign dialect) → no `remove`, the round completes, and the
