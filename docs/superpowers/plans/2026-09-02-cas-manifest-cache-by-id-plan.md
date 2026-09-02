@@ -156,6 +156,34 @@ then add `backend->resetCounts();` directly after the `deleteManifestBody(*backe
     EXPECT_EQ(backend->headCount(layout.manifestKey(id)), 0u);
 ```
 
+In `TEST(CASPartFolderAccess, OversizedViewServedNotRetained)` the second `getView` was proven to be a rebuild by a growing `HEAD` count. Replace the `head_before` line, the `view2` block's `EXPECT_GT` and its comment with a rebuild proof that does not depend on a request:
+
+```cpp
+    backend->resetCounts();
+    auto view2 = access.getView(key, Cas::Freshness::CachedForLoad);
+    ASSERT_NE(view2, nullptr);
+    /// Not retained: every call rebuilds the view (a new view object over the SAME shared decode) and
+    /// records the bypass again; the rebuild costs no manifest request because the decode is cached.
+    EXPECT_NE(view1.get(), view2.get());
+    EXPECT_EQ(view1->manifest().get(), view2->manifest().get());
+    EXPECT_EQ(access.explain(key).last_decision,
+              Cas::CachedPartFolderAccess::LastDecision::OversizedBypass);
+    EXPECT_EQ(backend->getCount(manifest_key), 0u);
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
+    EXPECT_FALSE(access.explain(key).retained);
+```
+
+In `TEST(CASPartFolderAccess, DisabledModeKeepsBaseline)` replace the comment `/// Exactly the Phase-3 baseline: bytes=0 restores the no-retention call graph byte-for-byte.` and the two count assertions with:
+
+```cpp
+    /// bytes=0 restores the no-retention call graph: one body GET, then the decode cache serves every
+    /// rebuild with no manifest request.
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
+```
+
+In the test that counts `RefResolve` events (find it with `grep -n "ForceFresh always re-proves the manifest body" src/Disks/tests/gtest_cas_part_folder_access.cpp`), replace that two-line comment with `/// ForceFresh always bypasses the retained view, so this is real resolve work again -> +1.`; the assertion stays.
+
 Delete `TEST(CASPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)` entirely (from its `TEST(` line through its closing `}`) and put these two tests in its place:
 
 ```cpp
@@ -220,7 +248,7 @@ Delete the section comment `/// ==== §3 (part_folder_validate): the ForceFresh 
 ninja -C build_debug unit_tests_dbms > build_debug/build_mcbi_task1a.log 2>&1; echo NINJA_EXIT=$? >> build_debug/build_mcbi_task1a.log
 build_debug/src/unit_tests_dbms --gtest_filter='CASPool.ManifestCacheIsKeyedById:CASPool.ReadManifestSharedReturnsSharedDecodeWithoutCopy:CASPool.ReadManifestAbsentBodyEmitsReadMissingWithOneGetAndNoHead:CASPartFolderAccess.*' > build_debug/test_mcbi_task1a.log 2>&1; echo GTEST_EXIT=$? >> build_debug/test_mcbi_task1a.log
 ```
-Expected (via the log subagent): `NINJA_EXIT=0`; the three pool tests and `RetainedHitSkipsManifestHead`, `HitPathJournalEmptyAndCheapWhenExplainDisabled`, `BaselineRequestCountsWithoutRetention`, `GetViewFailsClosedOnMissingBody`, `ForceFreshServesImmutableDecodeWithoutManifestRequestsAfterBodyDeletion` and `DeletedBodyFailsClosedInEveryModeWhenDecodeCacheDisabled` FAIL on `headCount` (expected 0, actual 1 or more) or on `getView` throwing `FILE_DOESNT_EXIST` where a view was expected.
+Expected (via the log subagent): `NINJA_EXIT=0`; the three pool tests and `RetainedHitSkipsManifestHead`, `HitPathJournalEmptyAndCheapWhenExplainDisabled`, `BaselineRequestCountsWithoutRetention`, `GetViewFailsClosedOnMissingBody`, `OversizedViewServedNotRetained`, `DisabledModeKeepsBaseline`, `ForceFreshServesImmutableDecodeWithoutManifestRequestsAfterBodyDeletion` and `DeletedBodyFailsClosedInEveryModeWhenDecodeCacheDisabled` FAIL on `headCount` (expected 0, actual 1 or more) or on `getView` throwing `FILE_DOESNT_EXIST` where a view was expected. Every other `CASPartFolderAccess` test passes; if one more fails on a `HEAD` count, it is a `HEAD` assertion this plan missed: change it to 0 in this task and say so in the task report.
 
 - [ ] **Step 4: Implement the reader**
 
@@ -361,9 +389,10 @@ git log -1 --format='%H %s' && git branch --show-current
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp`
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h`
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp`
-- Modify: `src/Common/ProfileEvents.cpp`
+- Modify: `src/Common/ProfileEvents.cpp` (the `CASPartFolderValidateSkipped` entry, near line 954)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md`, `src/Disks/tests/cas_test_helpers.h` (comments naming the retired type)
 - Modify: `utils/ca-soak/scenarios/tests/test_render_tuned_config.py`, `utils/ca-soak/scenarios/framework/cluster_boot.py`, `utils/ca-soak/docker-compose-tuned.yml`
-- Test: `src/Disks/tests/gtest_cas_settings.cpp`, `src/Disks/tests/gtest_cas_part_folder_access.cpp`
+- Test: `src/Disks/tests/gtest_cas_settings.cpp`, `src/Disks/tests/gtest_cas_part_folder_access.cpp`, `src/Disks/tests/gtest_cas_part_folder_view.cpp`
 
 **Interfaces:**
 - Consumes: Task 1's reader (a `ForceFresh` rebuild now costs no request).
@@ -495,8 +524,16 @@ Expected: `NINJA_EXIT=0`; the test FAILS with "expected the retired setting ... 
 - Delete `extern const Event CASPartFolderValidateSkipped;` (keep the `ProfileEvents` namespace block with `CASRefRollbackBestEffortDropFailed`).
 - Delete the `configWithDiskSection` helper and its comment. Then `grep -n "istringstream\|XMLConfiguration\|Poco::Exception" <file>`; delete `#include <sstream>`, `#include <Poco/Util/XMLConfiguration.h>` and `#include <Poco/Exception.h>` for each that has no remaining use.
 - Delete the section comment that starts `/// ==== §3: `parsePartFolderValidate` config parsing` and every `TEST(CASPartFolderValidateParse, ...)`.
-- In `cacheOn()` and in `HitPathJournalEmptyAndCheapWhenExplainDisabled` remove `, .validate = {}` from the `CacheParams` initializers.
-- `grep -n "validate\|Validate" <file>` must return only `StrictValidate` uses.
+- Remove `, .validate = {}` from every `CacheParams` initializer: `cacheOn()`, `HitPathJournalEmptyAndCheapWhenExplainDisabled`, `ExplainRecordsDecisions`, `OversizedViewServedNotRetained` (find them all with `grep -n "\.validate" <file>`; the `params.validate = {...}` lines belonged to the `Validate*` tests Task 1 deleted). In the test whose constructor line carries the trailing comment `/// retention on, validate == Always (default)` shorten the comment to `/// retention on`.
+- `grep -n "validate\|Validate" <file>` must return only `StrictValidate` uses and the words "validated hit" / "validated shared decode" inside comments.
+
+`src/Disks/tests/gtest_cas_part_folder_view.cpp`: in the fixture that builds a view directly (`std::make_shared<const Cas::PartFolderView>(...)` with the trailing `/*validated_at_ms=*/42` argument), delete that argument so the call passes `key`, `ManifestId`, `manifest_size` and `manifest` only.
+
+`src/Disks/tests/gtest_cas_settings.cpp`: in `TEST(CASContentAddressedSettings, InvalidEnumDiagnosticsNameExternalConfigKeys)` delete the third `expectLoadFailureWithExactMessage(...)` call, the one whose config carries `<cas_part_folder_validate>sometimes</cas_part_folder_validate>` and expects `BAD_ARGUMENTS`; that key is now unknown, and `RetiredPartFolderValidateIsRejected` pins the `UNKNOWN_SETTING` outcome. The `cas_blob_hash` and `cas_staging_backend` clauses stay.
+
+`src/Disks/tests/cas_test_helpers.h`: in the comment above `makeSettingsForTest` change ``(`stagingBackend`, `blobHashAlgo`, `partFolderValidate`)`` to ``(`stagingBackend`, `blobHashAlgo`)``.
+
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md`: in the `Parts/` bullet change ``(`PartRefKey` + `Freshness` + `PartFolderValidate` + `PartFolderView` + `CachedPartFolderAccess`)`` to ``(`PartRefKey` + `Freshness` + `PartFolderView` + `CachedPartFolderAccess`)``.
 
 `utils/ca-soak/scenarios/tests/test_render_tuned_config.py`: in `test_render_injects_overrides_into_ca_block` replace the override `"cas_part_folder_validate": "age 5"` with `"cas_part_folder_cache_bytes": "33554432"` and the assertion with `assert "<cas_part_folder_cache_bytes>33554432</cas_part_folder_cache_bytes>" in xml`.
 
@@ -527,7 +564,9 @@ git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/Part
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h \
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp \
         src/Common/ProfileEvents.cpp src/Disks/tests/gtest_cas_settings.cpp \
-        src/Disks/tests/gtest_cas_part_folder_access.cpp \
+        src/Disks/tests/gtest_cas_part_folder_access.cpp src/Disks/tests/gtest_cas_part_folder_view.cpp \
+        src/Disks/tests/cas_test_helpers.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md \
         utils/ca-soak/scenarios/tests/test_render_tuned_config.py \
         utils/ca-soak/scenarios/framework/cluster_boot.py utils/ca-soak/docker-compose-tuned.yml
 git commit -F - <<'EOF'
@@ -594,6 +633,23 @@ In `unlinkFile`, replace the three comment lines starting `/// One mandatory bod
             /// The first unlink resolves ForceFresh; the rest of the burst reads the retained view.
 ```
 
+`ContentAddressedTransaction.h`: replace the comment above `std::unordered_set<String> force_fresh_validated_refs;` (the block starting `/// Memoizes, per (this transaction, ref), whether `unlinkFile` has already re-proven`) with:
+```cpp
+    /// Memoizes, per (this transaction, ref), whether `unlinkFile` has already resolved a committed
+    /// ref `ForceFresh`. The MergeTree fast-removal path unlinks every file of a part through ONE
+    /// transaction right before `removeDirectory`: the first unlink resolves fresh and bypasses the
+    /// retained view; the rest of the burst reads the retained view (`Cas::Freshness::CachedForLoad`).
+    /// Cleared in `commit()`'s epilogue.
+```
+
+`Parts/PartFolderAccess.cpp`, in `republishRef`: replace the three comment lines starting `/// Content addressing has no rename, so move a committed ref by reading the source body freshly` with:
+```cpp
+    /// Content addressing has no rename, so move a committed ref by reading the source manifest
+    /// through the pool's manifest cache after a fresh ref resolve, publishing equivalent entries at
+    /// the destination, and then dropping the source. The source blobs are adopted by evidence of the
+    /// live source edge, never re-probed; the decode is never taken from a retained view.
+```
+
 - [ ] **Step 2: User docs**
 
 `docs/en/antalya/cas/architecture/read-path.md`, section `## The two caches {#caches}`:
@@ -624,10 +680,15 @@ On a miss, the `GET` is followed by the two identity checks in the diagram, each
 failure, and only a fully validated decode enters the cache. A live ref that names a missing body is
 detected on a miss, by the garbage collector before it deletes a manifest, and by `fsck`; a reader
 holding a cached decode for a manifest the collector has since removed sees a snapshot-consistent
-manifest and fails with a typed error when it reads a blob that is gone. Setting either cache's byte
-budget to `0` disables retention while leaving the `GET`-and-validate sequence intact — a cache is
-purely an optimization, never a trust boundary.
+manifest and fails with a typed error when it reads a blob that is gone. Write paths that carry
+entries forward from a committed part (hardlinks, renames, single-file rewrites, relink) adopt the
+source blobs on the strength of the source ref's live edge, which the collector honours; deleting
+objects out of band, behind the collector's back, is outside that contract and is what `fsck`
+reports. Setting either cache's byte budget to `0` disables retention while leaving the
+`GET`-and-validate sequence intact — a cache is purely an optimization, never a trust boundary.
 ```
+
+`docs/en/antalya/cas/architecture/replication.md`: in the sentence `` `republishRef` re-reads the source manifest freshly, publishes an equivalent-entry manifest under the destination ref `` replace `re-reads the source manifest freshly` with `resolves the source ref freshly and reads its manifest through the manifest cache`.
 
 `docs/en/antalya/cas/configuration.md`: delete the table row for `cas_part_folder_validate`.
 
@@ -651,7 +712,7 @@ and delete the final two sentences of the section (from `The `Always` default it
 - [ ] **Step 4: Verify**
 
 ```bash
-grep -rn "mandatory HEAD\|mandatory \`HEAD\`\|part_folder_validate\|re-proves the body\|re-prove the body" src/ docs/en/ | grep -v "^src/Disks/tests/"
+grep -rn "mandatory HEAD\|mandatory \`HEAD\`\|part_folder_validate\|re-proves the body\|re-prove the body\|re-proven\|re-proved\|proves the body once\|source manifest freshly" src/ docs/en/ | grep -v "^src/Disks/tests/"
 ```
 Expected: no output. Then check every header in the touched docs still ends in `{#...}`:
 ```bash
@@ -669,7 +730,10 @@ Expected: `NINJA_EXIT=0`.
 ```bash
 git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h \
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp \
-        docs/en/antalya/cas/architecture/read-path.md docs/en/antalya/cas/configuration.md \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.cpp \
+        docs/en/antalya/cas/architecture/read-path.md docs/en/antalya/cas/architecture/replication.md \
+        docs/en/antalya/cas/configuration.md \
         docs/en/operations/storing-data.md docs/en/antalya/cas/operations/troubleshooting.md \
         docs/superpowers/cas/BACKLOG/performance.md
 git commit -F - <<'EOF'
@@ -696,10 +760,10 @@ git log -1 --format='%H %s' && git branch --show-current
 - Test: `src/Disks/tests/gtest_ca_wiring.cpp`
 
 **Interfaces:**
-- Consumes: `Pool::readManifestShared`, `Pool::locate(const ManifestEntry &)`, `Pool::backend()`, `Pool::layout()`, `Pool::poolMeta().blob_header_len`; `ContentAddressedMetadataStorage::getBlobViewPlan(path)`, `getStorageObjects(path)`, `readBlobPayload(const Cas::BlobLocation &, path, ReadSettings)`, `store()`; helpers `publishPart(store, ns_string, ref, payload)` and `idOf` in `gtest_cas_pool.cpp`, `publishWiredPart` and `DB::Cas::tests::makeLocalObjectStorageForTest` / `makeSettingsForTest` in `gtest_ca_wiring.cpp`.
-- Produces: nothing new; these tests pin the spec's "stale snapshot, end to end" section.
+- Consumes: `Pool::readManifestShared`, `Pool::locate(const ManifestEntry &)`, `Pool::backend()`, `Pool::layout()`, `Pool::poolMeta().blob_header_len`, `Pool::beginPartWrite(PartWriteInfo)`; `PartWriteTxn::adoptEvidence`, `stageManifest`, `precommitAdd`, `promote`, `buildId`; `runFsck(Pool &, bool detail)` returning `FsckReport` with `dangling` and `objects` (`FsckObject{key, kind, size, cls, reachable_from}`, `FsckClass::Dangling`) from `Tools/CasFsck.h`; `ContentAddressedMetadataStorage::getBlobViewPlan(path)`, `getStorageObjects(path)`, `readBlobPayload(const Cas::BlobLocation &, path, ReadSettings)`, `store()`; helpers `publishPart(store, ns_string, ref, payload)` and `idOf` in `gtest_cas_pool.cpp`, `publishWiredPart` and `DB::Cas::tests::makeLocalObjectStorageForTest` / `makeSettingsForTest` in `gtest_ca_wiring.cpp`.
+- Produces: nothing new; these tests pin the spec's "stale snapshot, end to end", "failure asymmetry" and "consumers" sections.
 
-These tests pass against the code landed by Task 1 and are written now, after the behaviour, because they pin a consequence of the design rather than drive it. Each is still run once before the assertions are trusted: the executor must see them pass, and must also see the pool test fail when its final `EXPECT_FALSE` is temporarily flipped, to prove the assertion is live.
+These tests pass against the code landed by Task 1 and are written now, after the behaviour, because they pin a consequence of the design rather than drive it. Each is still run once before the assertions are trusted: the executor must see them pass, and must also see each fail when its decisive assertion is temporarily flipped, to prove the assertion is live. The third test pins the scoped contract for mutation evidence: it is an executable statement of the documented outcome under out-of-band deletion, not a defect report, and its comment must say so.
 
 - [ ] **Step 1: Pool-layer test**
 
@@ -751,6 +815,66 @@ TEST(CASPool, StaleSnapshotServesCachedManifestAndBlobAbsenceSurfacesOnRead)
 }
 ```
 
+Add `#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>` to the include block at the top of `gtest_cas_pool.cpp`, then append directly after the test above:
+
+```cpp
+/// The scoped contract for mutation evidence, executable. A carry-forward from a committed source
+/// (what createHardLink, republishRef, repointRef and the relink receiver do) adopts each entry as a
+/// tokenless TrustedManifest dependency and promote issues no probe for it: the live source edge is
+/// what keeps the blob alive, and under protocol-compliant GC the state "cached source decode, blob
+/// gone" cannot be constructed. Out-of-band deletion of BOTH the cached source body and the blob is
+/// outside that contract; the carry-forward then commits a ref to an absent blob and fsck's
+/// reachable-but-absent scan is the detector. This test pins that documented outcome so a later
+/// change that silently alters it is noticed. It is not a defect report.
+TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    Layout layout("p");
+    const RootNamespace ns{"srv1/tbl"};
+
+    const ManifestId src_id = publishPart(s, ns.string(), "part_src", "payload-src");
+    auto src = s->resolveRef(ns, "part_src");
+    ASSERT_TRUE(src.has_value());
+    const auto src_manifest = s->readManifestShared(src->manifest_id);   /// warms the decode cache
+    const String src_manifest_key = layout.manifestKey(src_id);
+    const String blob_key = layout.blobKey(idOf("payload-src"));
+
+    /// Out of band: both objects gone, the committed source ref untouched.
+    for (const String & key : {src_manifest_key, blob_key})
+    {
+        const HeadResult h = b->head(key);
+        ASSERT_TRUE(h.exists);
+        b->deleteExact(key, h.token);
+    }
+    b->resetCounts();
+
+    /// The carry-forward, in the order prepareEntries runs it for a committed source: adopt, stage,
+    /// precommit, promote. No blob body is written.
+    PartWriteInfo info;
+    info.intended_ref = ns.string() + "/part_dst";
+    info.intended_namespace = ns;
+    auto build = s->beginPartWrite(info);
+    ASSERT_EQ(src_manifest->entries.size(), 1u);
+    build->adoptEvidence(src_manifest->entries[0]);
+    const ManifestId dst_id = build->stageManifest({src_manifest->entries[0]});
+    build->precommitAdd(ns, "part_dst", dst_id);
+    EXPECT_NO_THROW(build->promote(ns, "part_dst", build->buildId(), dst_id));
+    EXPECT_EQ(b->headCount(blob_key), 0u);   /// a TrustedManifest leaf is not probed, by design
+    EXPECT_EQ(b->getCount(blob_key), 0u);
+
+    /// The documented outcome: a committed ref names an absent blob, and fsck reports it.
+    ASSERT_TRUE(s->resolveRef(ns, "part_dst").has_value());
+    const FsckReport rep = runFsck(*s, /*detail=*/true);
+    EXPECT_GE(rep.dangling, 1u);
+    bool blob_reported = false;
+    for (const FsckObject & o : rep.objects)
+        if (o.key == blob_key && o.cls == FsckClass::Dangling)
+            blob_reported = true;
+    EXPECT_TRUE(blob_reported) << "fsck must report the adopted-but-absent blob " << blob_key;
+}
+```
+
 - [ ] **Step 2: Wiring-layer test**
 
 Append to `gtest_ca_wiring.cpp` after `TEST(CASWiringRead, BlobViewPlanRidesTheStandardPipeline)`:
@@ -795,45 +919,52 @@ TEST(CASWiringRead, DeletedBlobUnderStaleViewFailsTypedNotEmpty)
         .key = objects[0].remote_path,
         .offset = pool->poolMeta().blob_header_len,
         .length = objects[0].bytes_size};
+    /// The local object storage opens the file eagerly and maps ENOENT to FILE_DOESNT_EXIST
+    /// (ReadBufferFromFile); on S3 the same read raises S3_ERROR at the first byte. Either way the
+    /// failure is a typed exception, never an empty payload.
     String got;
-    bool threw = false;
+    int code = 0;
     try
     {
         auto buf = storage->readBlobPayload(location, path, DB::ReadSettings{});
         DB::readStringUntilEOF(got, *buf);
     }
-    catch (const DB::Exception &)
+    catch (const DB::Exception & e)
     {
-        threw = true;
+        code = e.code();
     }
-    EXPECT_TRUE(threw) << "read of a deleted blob returned " << got.size() << " bytes without throwing";
+    EXPECT_EQ(code, DB::ErrorCodes::FILE_DOESNT_EXIST)
+        << "read of a deleted blob returned " << got.size() << " bytes (code " << code << ")";
     EXPECT_TRUE(got.empty());
 }
 ```
 
-If `gtest_ca_wiring.cpp` does not already include `<IO/ReadHelpers.h>` (for `readStringUntilEOF`) or `<Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>`, add them next to the existing includes at the top of the file. Do not rename `objects[0].bytes_size` or `remote_path`: these are the `StoredObject` fields the existing wiring tests already use.
+If `gtest_ca_wiring.cpp` does not already include `<IO/ReadHelpers.h>` (for `readStringUntilEOF`) or `<Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>`, add them next to the existing includes at the top of the file. If its `namespace DB::ErrorCodes` block does not declare `extern const int FILE_DOESNT_EXIST;`, add that line to the block. Do not rename `objects[0].bytes_size` or `remote_path`: these are the `StoredObject` fields the existing wiring tests already use.
 
 - [ ] **Step 3: Build and run, then prove the assertions are live**
 
 ```bash
 ninja -C build_debug unit_tests_dbms > build_debug/build_mcbi_task4a.log 2>&1; echo NINJA_EXIT=$? >> build_debug/build_mcbi_task4a.log
-build_debug/src/unit_tests_dbms --gtest_filter='CASPool.StaleSnapshotServesCachedManifestAndBlobAbsenceSurfacesOnRead:CASWiringRead.DeletedBlobUnderStaleViewFailsTypedNotEmpty' > build_debug/test_mcbi_task4a.log 2>&1; echo GTEST_EXIT=$? >> build_debug/test_mcbi_task4a.log
+build_debug/src/unit_tests_dbms --gtest_filter='CASPool.StaleSnapshotServesCachedManifestAndBlobAbsenceSurfacesOnRead:CASPool.CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports:CASWiringRead.DeletedBlobUnderStaleViewFailsTypedNotEmpty' > build_debug/test_mcbi_task4a.log 2>&1; echo GTEST_EXIT=$? >> build_debug/test_mcbi_task4a.log
 ```
-Expected: `NINJA_EXIT=0`, `GTEST_EXIT=0`, both tests pass.
+Expected: `NINJA_EXIT=0`, `GTEST_EXIT=0`, all three tests pass.
 
-Then temporarily change `EXPECT_FALSE(b->get(location.key).has_value());` to `EXPECT_TRUE(...)` in the pool test and `EXPECT_TRUE(threw)` to `EXPECT_FALSE(threw)` in the wiring test, rebuild into `build_debug/build_mcbi_task4b.log`, run the same filter into `build_debug/test_mcbi_task4b.log`, and confirm both now FAIL. Revert the two flips, rebuild into `build_debug/build_mcbi_task4c.log`, run into `build_debug/test_mcbi_task4c.log`, confirm both PASS. `git diff --stat` must show only the two test files.
+Then temporarily flip one decisive assertion in each test: `EXPECT_FALSE(b->get(location.key).has_value())` to `EXPECT_TRUE(...)` in the read test, `EXPECT_TRUE(blob_reported)` to `EXPECT_FALSE(blob_reported)` in the contract test, and `EXPECT_EQ(code, DB::ErrorCodes::FILE_DOESNT_EXIST)` to `EXPECT_EQ(code, 0)` in the wiring test. Rebuild into `build_debug/build_mcbi_task4b.log`, run the same filter into `build_debug/test_mcbi_task4b.log`, and confirm all three now FAIL. Revert the three flips, rebuild into `build_debug/build_mcbi_task4c.log`, run into `build_debug/test_mcbi_task4c.log`, confirm all three PASS. `git diff --stat` must show only the two test files.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add src/Disks/tests/gtest_cas_pool.cpp src/Disks/tests/gtest_ca_wiring.cpp
 git commit -F - <<'EOF'
-ca-tests: a stale manifest snapshot plans without I/O and fails typed on the blob read
+ca-tests: a stale manifest snapshot reads typed and carries forward by the source edge
 
-Pins the read-path consequence of the id-keyed decode cache: after the collector removes a
+Pins the consequences of the id-keyed decode cache. Reads: after the collector removes a
 manifest body and its blob, a reader that already holds the decode gets the same shared
-decode with no request, `locate` stays pure, and the missing blob surfaces as a typed
-exception at the first byte of the read, never as an empty payload.
+decode with no request, `locate` stays pure, and the missing blob surfaces as
+`FILE_DOESNT_EXIST` at the first byte, never as an empty payload. Mutation evidence: a
+carry-forward from a cached source adopts its blobs on the strength of the live source edge
+and probes nothing; after out-of-band deletion of both the source body and a blob the promote
+commits and fsck reports the dangling blob, which is the scoped contract stated in the spec.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01DAu8zEhBXrwRKTPhpXgZnS
