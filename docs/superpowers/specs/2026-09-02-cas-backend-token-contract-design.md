@@ -239,6 +239,15 @@ That function is overridable per storage, which is also the seam the Native test
 override it, and nothing in CAS casts a buffer. Azure's buffer has the same shape and its own override;
 it is not a CAS store today and is out of this slice.
 
+Two shapes that look simpler than this slice were checked and do not hold, recorded so they are not
+re-derived. Marking every `GET` on GCS clients unconditionally — no `ReadSettings` field, no header
+move — would put the generation into the ETag that the Iceberg version-hint writer (`Iceberg/Utils.cpp`)
+copies into an **unmarked** `If-Match`, breaking Iceberg over GCS through the same S3 client; the mode
+gate is necessary. Throwing inside `ReadBufferFromS3::initialize` on an ETag change — no flag, no
+getter — would be caught by `nextImpl`'s own `catch (...)`, retried `max_single_read_retries` times
+with backoff, and would need `processException` taught a new exception: more lines and worse
+behaviour. The flag checked after the drain is the minimum.
+
 Under the project's rule for shared surfaces this slice is consulted before it is written; the user
 has approved the direction.
 
@@ -375,7 +384,11 @@ passed off as an observation. Four steps, each green:
    fallback `HEAD` replaced by `CAS_WRITE_UNATTRIBUTED`. Under a hundred lines. After this step no
    clobber path is left: not empty, not `*`, not a quoted or zero-padded generation, not a list, not a
    token from a later unrelated `HEAD`. Not yet closed at step 1: a genuine incarnation of another
-   key, which is what step 3's key binding is for.
+   key, which is what step 3's key binding is for. Two existing tests change with this step, and no
+   others: `CASBackend.NullBackendShapeAndDefaults`, which expects `PreconditionFailed` and `NotFound`
+   for a default `Token{}`, and — at step 4, not here —
+   `CASObjectStorageBackend.NativeRejectsWrongDialectTokenBeforeTouchingTheWire`, which tests the
+   dialect guard that the type replaces.
 2. **The upstream slice, and the new operations beside the old.** The three-file slice lands as its
    own commit. Then `read`, `head`, `stream`, `write`, `remove`, `publish` are added to `Backend` with
    the old operations delegating where a delegation exists — and the document says where it does not:
