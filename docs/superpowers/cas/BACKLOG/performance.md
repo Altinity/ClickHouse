@@ -303,6 +303,11 @@ means something for a long-lived stable table set.
 
 ## `createHardLink` pays one manifest `HEAD` per file of the source part (2031-triage CAS-055) {#hardlink-per-file-forcefresh-head}
 
+**✅ CLOSED by the id-keyed manifest decode cache; identifier retained for provenance.** A decode-cache
+hit issues no request (`docs/superpowers/specs/2026-09-02-cas-manifest-cache-by-id-design.md`), so the
+per-file `HEAD` below is gone without the memo, and `part_folder_validate` was retired with the `HEAD`
+it paced.
+
 The committed-source carry-forward branch of `ContentAddressedTransaction::createHardLink` resolves the
 source part `ForceFresh` on every call (`ContentAddressedTransaction.cpp:1190`), and with the shipped
 `part_folder_validate = always` default (`ContentAddressedSettings.cpp:89`) `ForceFresh` never serves a
@@ -319,9 +324,7 @@ The fix already exists one function away and needs no protocol change: `unlinkFi
 per `(transaction, ref)` in `force_fresh_validated_refs` and downgrades the rest of the burst to
 `CachedForLoad` (`ContentAddressedTransaction.cpp:1595-1603`), which still revalidates the manifest id
 against a fresh resolve and rebuilds on mismatch (`Parts/PartFolderAccess.cpp:177-186`). Apply the same
-memo to the createHardLink committed-source branch. The `Always` default itself stays — it is the
-fail-closed policy, and relaxing it is the separate, gated `part_folder_validate` question
-(`{#part-folder-validate-never-gating}`).
+memo to the createHardLink committed-source branch.
 
 ## A standalone write on a committed part pays a second, throwaway manifest body (2031-triage CAS-056) {#standalone-write-scratch-manifest-cost}
 

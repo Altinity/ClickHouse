@@ -476,9 +476,10 @@ Cas::CommitOutcome CachedPartFolderAccess::publishEntries(const PartRefKey & dst
 
 bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst)
 {
-    /// Content addressing has no rename, so move a committed ref by reading the source body freshly,
-    /// publishing equivalent entries at the destination, and then dropping the source. The source
-    /// body is re-proved and is never taken from a retained view.
+    /// Content addressing has no rename, so move a committed ref by reading the source manifest
+    /// through the pool's manifest cache after a fresh ref resolve, publishing equivalent entries at
+    /// the destination, and then dropping the source. The source blobs are adopted by evidence of the
+    /// live source edge, never re-probed; the decode is never taken from a retained view.
     auto resolved = store->resolveRef(src.ns, src.ref);
     if (!resolved)
         return false;

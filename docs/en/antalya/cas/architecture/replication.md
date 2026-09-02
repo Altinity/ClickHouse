@@ -109,7 +109,8 @@ content, and that root can confirm its exact refs.
 
 `DETACH`, `ATTACH`, `delete_tmp_` cleanup, and merge-result renames all reduce to the same two
 moves: re-key any *staged* source into the destination, then `republishRef(src → dst)` for any
-*committed* source. `republishRef` re-reads the source manifest freshly, publishes an
+*committed* source. `republishRef` resolves the source ref freshly and reads its manifest through
+the manifest cache, publishes an
 equivalent-entry manifest under the destination ref — a **new** manifest id, with blobs untouched
 and adopted by evidence — then drops the source ref. A destination that already exists with
 identical entries just drops the source, an idempotent re-drive; one with different entries
