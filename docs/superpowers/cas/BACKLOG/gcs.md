@@ -46,9 +46,22 @@ Proved on the real bucket with the `gcs_hmac` client, binary of 2026-09-02:
 ## Failure class 1: relink-confirm liveness (F11) {#relink-confirm-lane-livelock}
 
 - **[relink-confirm-lane-livelock] two replicas starve each other's fetch-by-relink confirms** — HARD /
-  RELEASE GATE (data divergence, not data loss). IMPLEMENTED, REVIEWED, LIVE GATE PENDING: the live
-  ten-minute phase-3 soak on the real GCS stand has not run yet (Task 8 of the implementation plan
-  below runs it next).
+  RELEASE GATE (data divergence, not data loss). IMPLEMENTED, REVIEWED, LIVE GATE RUN AND OPEN
+  (2026-09-03): the ten-minute phase-3 soak ran on the real GCS stand and the fix passed every direct
+  measurement, but the run did not pass the gate as specified and the item stays open on two
+  harness-side blockers, F13 and F14 in the live ledger. What the run established, on the real bucket:
+  230 fetch-by-relink confirms across the two replicas all answered yes, with zero occurrences of
+  `Relink confirm is unproven` — which the answering peer logs for every non-`Yes` answer, including
+  the arms that refuse without incrementing a counter — zero `NO_REPLICA_HAS_PART`, both replication
+  queues empty at the end, no divergence at any checkpoint, and all five refusal counters zero on both
+  nodes throughout. The same stand on the pre-fix binary had answered unproven 2999 times in two hours.
+  Why it is not closed: the soak exited non-zero on a checkpoint leak assert that fires on the pool
+  prefix's inherited debris rather than on anything the run did (F13), and a checkpoint longer than the
+  whole timeline consumed the chaos window, so one of four scheduled faults fired and the fence-losing
+  freeze never ran (F14). No refusal path fired live, so the increment-to-`system.events` step is still
+  unproven for all five counters, though all five are registered under their names on both servers. A
+  re-run against a fresh pool prefix removes both blockers and is what would close this.
+  Gate report: `.superpowers/sdd/2026-09-02-cas-relink-confirm-liveness/task-8-report.md`.
   Design: [relink confirm liveness design](/superpowers/specs/cas-relink-confirm-liveness-design),
   revision 10 (rule 3 refuses while a queued or in-flight mutation names the queried ref, read from
   the `MutationScope` every lane item already carries; `Wedged` and broken lanes refuse table-wide).
