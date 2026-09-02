@@ -53,9 +53,13 @@
                                    answers *yes* over blobs the token's manifest no longer owns.
      SabotageStaleCache         -> gate 1 rule 3 dropped entirely -> the confirm reads a committed row
                                    that lags a DURABLE removal or repoint of the queried ref.
-     SabotageTouchBlind         -> gate 1 rule 3 kept but blind to the admitted mutation's SHAPE ->
-                                   a touching mutation reads as a mutation of some other ref, and the
-                                   stale row confirms exactly as under SabotageStaleCache.
+     SabotageTouchBlind         -> gate 1 rule 3's touch check is blind to the admitted mutation's
+                                   SHAPE; with only two admitted shapes that leaves rule 3 with no
+                                   case in which it can refuse, so it degenerates to unconditionally
+                                   quiescent and the same stale row confirms as under
+                                   SabotageStaleCache -- the two configurations share one
+                                   counterexample, kept as the model's record that the touch check
+                                   is what carries rule 3's content, not its mere presence.
      SabotageNoPoison           -> gate 1 rule 4 dropped -> a durable-but-unapplied removal leaves
                                    a permanently stale row on a QUIESCENT lane; only rule 4 sees it.
      SabotageNoFence            -> gate 1 rule 6 dropped -> a fence-less instance answers about a
@@ -71,8 +75,9 @@
 
    RULE 3 IS REF-SCOPED.  The sender's lane admits two SHAPES of mutation: "touching" (a removal or
    repoint of THE ref the receiver asks about -- the hazard) and "noop" (a mutation of another ref,
-   recorded as `NsNoise`'s edge-neutral op, which leaves the queried binding alone -- the F11 load).
-   Rule 3 refuses while a touching mutation is admitted and not yet applied, and ONLY then.  The
+   recorded as `NsNoise`'s edge-neutral op, which leaves the queried binding alone -- legitimate
+   concurrent traffic the old table-wide rule refused for no reason).  Rule 3 refuses while a
+   touching mutation is admitted and not yet applied, and ONLY then.  The
    model's `sPending` spans admission to apply, which is `pending` plus `carved` in the code; a
    wedged tenure is `sPoison`, refused by lane state. *)
 EXTENDS Integers, FiniteSets
@@ -84,7 +89,7 @@ CONSTANTS
     MaxHoles,                     \* how many rounds in the whole behaviour may return an INCOMPLETE
                                   \* page (0 = the LIST is assumed complete; 1 = one holey page)
     SabotageNoGate1,              \* gate 1 rule 5: name-match instead of exact ManifestRef
-    SabotageStaleCache,           \* gate 1 rule 3: ignore lane quiescence (pending / leader tenure)
+    SabotageStaleCache,           \* gate 1 rule 3: ignore whether a touching mutation is pending
     SabotageTouchBlind,           \* gate 1 rule 3: blind to whether the admitted mutation touches the ref
     SabotageNoPoison,             \* gate 1 rule 4: ignore the apply-pending poison state
     SabotageNoFence,              \* gate 1 rule 6: ignore the mount fence / current-writer check
@@ -200,13 +205,14 @@ SenderAdmit(nb) ==
     /\ UNCHANGED << sDurableRef, sCacheRef, sPoison, sFence >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars >>
 
-(* Admission of a mutation of ANOTHER ref (the F11 shape): its record is edge-neutral and it leaves
-   the queried binding alone.  It needs no `sDurableRef = Token` guard -- the other ref's life is
-   independent of ours. *)
+(* Admission of a mutation of ANOTHER ref: its record is edge-neutral and it leaves the queried
+   binding alone.  It needs no `sDurableRef = Token` guard -- the other ref's life is independent
+   of ours. *)
 SenderAdmitNoop ==
     /\ sFence
     /\ ~sPending
     /\ ~sPoison
+    /\ ~NoopDurable
     /\ nextId <= MaxId
     /\ sPending' = TRUE
     /\ sLeader' = TRUE

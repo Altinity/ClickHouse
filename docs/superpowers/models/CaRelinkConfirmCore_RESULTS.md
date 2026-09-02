@@ -5,20 +5,23 @@ Model: `CaRelinkConfirmCore.tla`. Gates the **publish-then-confirm relink** prot
 `2026-07-24-cas-publish-confirm-and-ref-lane-safety.md`. This is the gate that blocks all of Part B.
 
 Runner: `./run_relinkconfirm.sh <cfg-basename>`. TLC 2 (tla2tools, Java 21),
-`java -XX:+UseParallelGC -workers auto`, `CHECK_DEADLOCK FALSE` in every cfg. All fifteen rows below
-were re-run on 2026-09-02 against the ref-scoped rule 3 revision (`SabotageTouchBlind`, `sShape`); the
-numbers are the real TLC output, not estimates.
+`java -XX:+UseParallelGC -workers auto`, `CHECK_DEADLOCK FALSE` in every cfg. All fifteen
+configurations were re-run on 2026-09-02 against the ref-scoped rule 3 revision (`SabotageTouchBlind`,
+`sShape`; `_empty_receivers` runs too but, as before this revision, is not carried in the table below);
+the numbers are the real TLC output, not estimates.
 
 Constants unless the row says otherwise: `Receivers = {r1}`, `MaxId = 5`, `MaxRound = 5`,
 `MaxHoles = 0`.
 
 ## Headline
 
-1. **The confirm protocol is GREEN** — `ConfirmedRelinkNeverDangles` holds exhaustively, and all
-   four non-vacuity witnesses fire, so it is not green for free.
-2. **Every sabotage violates.** Gate 1's exact-`ManifestRef` equality (rule 5), lane quiescence
-   (rule 3), the poison state (rule 4), the mount-fence/current-writer check (rule 6) and the
-   publish-BEFORE-confirm ordering are each *individually* load-bearing.
+1. **The confirm protocol is GREEN** — `ConfirmedRelinkNeverDangles` holds exhaustively, all four
+   non-vacuity witnesses fire (so it is not green for free), and a fifth witness,
+   `W_YesWhilePendingNoop`, is reachable — proving this revision's liveness gain, not the theorem's
+   non-vacuity.
+2. **Every sabotage violates.** Gate 1's exact-`ManifestRef` equality (rule 5), the touch-scoped
+   pending check (rule 3), the poison state (rule 4), the mount-fence/current-writer check (rule 6)
+   and the publish-BEFORE-confirm ordering are each *individually* load-bearing.
 3. *** **FINDING — `ConfirmedRelinkNeverDangles` is violable INDEPENDENTLY of the confirm
    protocol.** *** Modelling the GC fold cursor honestly (it advances over the records a round
    OBSERVED, and discovery is a paginated `LIST` with no completeness proof) breaks the theorem
@@ -35,22 +38,22 @@ Constants unless the row says otherwise: `Receivers = {r1}`, `MaxId = 5`, `MaxRo
 
 | cfg | check | expected | TLC verdict | states (gen / distinct) | depth |
 |---|---|---|---|---|---|
-| `_main` | `TypeOK` `GraduationIsPhased` `ConfirmedRelinkNeverDangles` `PromotedNeverDangles` | PASS | **PASS** — `Model checking completed. No error has been found.` | 668,872 / 195,692 | 24 |
-| `_main2r` (2 receivers, `MaxId = 7`, `MaxRound = 6`) | same four | PASS | **PASS** — `Model checking completed. No error has been found.` | 183,359,655 / 48,275,480 | 30 |
-| `_sab_nogate1` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 88,946 / 32,927 | 13 |
-| `_sab_stalecache` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 48,534 / 18,723 | 12 |
-| `_sab_touchblind` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 48,534 / 18,723 | 12 |
-| `_sab_nopoison` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 91,109 / 34,082 | 13 |
-| `_sab_nofence` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 83,287 / 31,155 | 12 |
-| `_sab_publishafterconfirm` | `PromotedNeverDangles` | violation | **VIOLATED (as required)** | 80,266 / 31,372 | 11 |
-| `_sab_holeylist` (`MaxHoles = 1`, **no confirm rule removed**) | `ConfirmedRelinkNeverDangles` | violation = FINDING | **VIOLATED** | 471,214 / 142,194 | 13 |
-| `_witness_confirmno` | `W_ConfirmNo` | violation (reachable) | **VIOLATED (as required)** | 432 / 242 | 6 |
+| `_main` | `TypeOK` `GraduationIsPhased` `ConfirmedRelinkNeverDangles` `PromotedNeverDangles` | PASS | **PASS** — `Model checking completed. No error has been found.` | 539,101 / 163,384 | 22 |
+| `_main2r` (2 receivers, `MaxId = 7`, `MaxRound = 6`) | same four | PASS | **PASS** — `Model checking completed. No error has been found.` | 142,823,666 / 38,972,632 | 28 |
+| `_sab_nogate1` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 84,264 / 31,479 | 13 |
+| `_sab_stalecache` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 46,891 / 18,252 | 12 |
+| `_sab_touchblind` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 46,891 / 18,252 | 12 |
+| `_sab_nopoison` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 86,759 / 32,747 | 13 |
+| `_sab_nofence` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 78,818 / 29,716 | 12 |
+| `_sab_publishafterconfirm` | `PromotedNeverDangles` | violation | **VIOLATED (as required)** | 77,689 / 30,607 | 11 |
+| `_sab_holeylist` (`MaxHoles = 1`, **no confirm rule removed**) | `ConfirmedRelinkNeverDangles` | violation = FINDING | **VIOLATED** | 439,065 / 133,592 | 13 |
+| `_witness_confirmno` | `W_ConfirmNo` | violation (reachable) | **VIOLATED (as required)** | 431 / 242 | 6 |
 | `_witness_confirmunknown` | `W_ConfirmUnknown` | violation (reachable) | **VIOLATED (as required)** | 47 / 31 | 4 |
 | `_witness_confirmyes` | `W_ConfirmYesPromoted` | violation (reachable) | **VIOLATED (as required)** | 106 / 72 | 4 |
-| `_witness_delete` | `W_BlobDeleted` | violation (reachable) | **VIOLATED (as required)** | 7,920 / 3,581 | 9 |
-| `_witness_yespendingnoop` | `W_YesWhilePendingNoop` | violation (reachable) | **VIOLATED (as required)** | 254 / 157 | 5 |
+| `_witness_delete` | `W_BlobDeleted` | violation (reachable) | **VIOLATED (as required)** | 7,844 / 3,572 | 9 |
+| `_witness_yespendingnoop` | `W_YesWhilePendingNoop` | violation (reachable) | **VIOLATED (as required)** | 253 / 157 | 5 |
 
-All runs finish in under 4 s except `_main2r` (13 min 30 s, 48.3M distinct states).
+All runs finish in under 3 s except `_main2r` (10 min 34 s, 39.0M distinct states).
 
 ## The theorem
 
@@ -73,7 +76,7 @@ sabotage shows the ordering is load-bearing rather than incidental.
 
 ```
 Model checking completed. No error has been found.
-668872 states generated, 195692 distinct states found, 0 states left on queue.
+539101 states generated, 163384 distinct states found, 0 states left on queue.
 ```
 
 `_main2r` re-runs the same four invariants with **two** receivers both relinking over the **same
@@ -82,7 +85,7 @@ plus wider id/round budgets:
 
 ```
 Model checking completed. No error has been found.
-183359655 states generated, 48275480 distinct states found, 0 states left on queue.
+142823666 states generated, 38972632 distinct states found, 0 states left on queue.
 ```
 
 Why it holds, in one paragraph: a confirm *yes* requires (rules 3, 4, 6) that the sender's
@@ -103,7 +106,11 @@ TLC reports a "violation" for a `_witness_*` config exactly when the negated sta
 - `W_BlobDeleted` violated ⇒ **the consequent is not trivially true**: GC in this model really does
   run condemn → `delete_pending` → physical delete to completion.
 - `W_ConfirmNo` violated ⇒ the exact-equality *no* branch really fires (not dead code).
-- `W_ConfirmUnknown` violated ⇒ the lane-quiescence/poison/fence *unknown* branch really fires.
+- `W_ConfirmUnknown` violated ⇒ the touch-pending/poison/fence *unknown* branch really fires.
+
+A fifth `_witness_*` row, `_witness_yespendingnoop`, is not a non-vacuity check on this theorem: it
+proves reachable the *liveness* this revision buys — a *yes* while an unrelated ref's mutation is
+open. See [`_witness_yespendingnoop`](#witness-yespendingnoop) below.
 
 ## Sabotages
 
@@ -115,18 +122,23 @@ NAME is bound to something" — the naive `resolveRef`-by-name confirm rev.2 rej
 - **S2–S4** `SenderAdmit("m2")` → `SenderDurable` → `SenderApply`: the sender **repoints** the ref
   from the token manifest `m1` to a different manifest `m2`. The durable transaction is a `-1` on
   source edge `s_m1`; the committed row now reads `m2`; the lane is quiescent again.
-- **S5–S10** three GC rounds on a complete fold: `folded = {}` → in-degree 0 → **condemn** (round 1)
-  → **`delete_pending`** (round 2) → **physical delete**, `present[b1] = FALSE` (round 3).
-- **S11** `RPublish`: the receiver's `+1` becomes durable — over a blob that is *already gone*. (No
-  presence probe: promotion does not probe tokenless adopted leaves.)
-- **S12** `RConfirm` → **"yes"**, because the name is still bound (to `m2`). `rDurableBefore = TRUE`.
-- **S13** `RPromote` → promoted manifest `m1` references a deleted blob. **Violation.**
+- **S5–S9** two GC rounds on a complete fold (`GFold`/`GSettle` alternating): `folded = {}` →
+  in-degree 0 → **condemn** (round 1, `GSettle` at S6) → **`delete_pending`** (round 2, `GSettle` at
+  S8), then a third `GFold` at S9 with nothing new to observe. The blob is not physically deleted
+  yet — round 3's `GSettle` is deferred to S13, after the promote.
+- **S10** `RPublish`: the receiver's `+1` becomes durable — over a blob GC has already scheduled for
+  deletion (condemned and `delete_pending`), though not yet deleted. (No presence probe: promotion
+  does not probe tokenless adopted leaves.)
+- **S11** `RConfirm` → **"yes"**, because the name is still bound (to `m2`). `rDurableBefore = TRUE`.
+- **S12** `RPromote` → the receiver promotes on the false *yes*.
+- **S13** `GSettle` (round 3): in-degree still 0 → **physical delete**, `present[b1] = FALSE` — a
+  promoted manifest `m1` now references a deleted blob. **Violation.**
 
-With rule 5 intact the same trace answers **"no"** at S12 (`sCacheRef = "m2" ≠ Token`) and the
+With rule 5 intact the same trace answers **"no"** at S11 (`sCacheRef = "m2" ≠ Token`) and the
 receiver aborts. This is the ABA the A3 `precommitAdd` mint-tightening exists to make impossible to
 re-create at the same identity.
 
-### `_sab_stalecache` — gate 1 rule 3 (lane quiescence) is load-bearing {#sab-stalecache}
+### `_sab_stalecache` — gate 1 rule 3 (the touch-scoped pending check) is load-bearing {#sab-stalecache}
 
 `ConfirmedRelinkNeverDangles is violated`. Rule 3 is dropped, so the confirm reads the committed row
 without checking whether an admitted mutation touches the ref.
@@ -134,14 +146,17 @@ without checking whether an admitted mutation touches the ref.
 - **S2–S3** `SenderAdmit` → `SenderDurable`: the removal is **durable**; `sDurableRef = "m2"` while
   `sCacheRef` is still `"m1"` and `sPending = sLeader = TRUE`. This is the post-durable-PUT window
   (spec §Problem 2) — the object is on S3 and GC can fold it, but the in-memory row has not moved.
-- **S4–S10** GC folds the `-1` and runs the three phases; `present[b1] = FALSE` at round 3. The
-  sender's apply has still not happened — the tenure is simply slow (a chunked flush commits several
-  durable transactions inside one tenure).
-- **S9** `RPublish`: `+1` durable.
-- **S11** `RConfirm` → **"yes"** off the stale row (`sCacheRef = "m1" = Token`). **S12** promote →
-  **violation**.
+- **S4–S8** two GC rounds on a complete fold (`GFold`/`GSettle` alternating): `folded = {}` →
+  **condemn** → **`delete_pending`**, then a third `GFold` at S8 with nothing new to observe — the
+  physical delete is not reached yet (its `GSettle` is deferred to S12). The sender's apply has
+  still not happened — the tenure is simply slow (a chunked flush commits several durable
+  transactions inside one tenure).
+- **S9** `RPublish`: `+1` durable, over a blob GC has already condemned.
+- **S10** `RConfirm` → **"yes"** off the stale row (`sCacheRef = "m1" = Token`).
+- **S11** `RPromote` → the receiver promotes on the false *yes*.
+- **S12** `GSettle` (round 3) → **physical delete**, `present[b1] = FALSE`. **Violation.**
 
-With rule 3 intact S11 answers **"unknown"**: the admitted mutation is `touching` and `sPending` spans
+With rule 3 intact S10 answers **"unknown"**: the admitted mutation is `touching` and `sPending` spans
 admission to apply, which is `pending` plus `carved` in the code. Rule 3 is written against the
 mutation's *scope*, not against the tenure: `_witness_yespendingnoop` reaches a *yes* during a tenure
 whose mutation does not touch the ref, and `_sab_touchblind` shows that ignoring the scope re-opens
@@ -157,8 +172,9 @@ shapes a confirm blind to shape can never see a touching mutation as touching.
 - **S2–S3** `SenderAdmit("m2")` → `SenderDurable`: a **touching** mutation (`sShape = "touching"`) is
   admitted and its removal becomes durable; `sDurableRef = "m2"` while `sCacheRef` is still `"m1"` and
   the tenure stays open (`sPending = sLeader = TRUE`).
-- **S4–S8** three GC rounds on a complete fold — `folded = {}` → **condemn** → **`delete_pending`** →
-  the physical delete is not reached yet (it lands at S12).
+- **S4–S8** two GC rounds on a complete fold — `folded = {}` → **condemn** → **`delete_pending`**,
+  then a third `GFold` at S8 with nothing new to observe — the physical delete is not reached yet
+  (its `GSettle` is deferred to S12).
 - **S9** `RPublish`: the receiver's `+1` becomes durable over a blob GC has already condemned.
 - **S10** `RConfirm` → **"yes"**: `sTouches = sShape = "touching" /\ ~SabotageTouchBlind` is `FALSE`
   regardless of `sShape`, so `quiescent` reads `TRUE` and the stale row confirms.
@@ -217,8 +233,10 @@ is only a safety net for the *confirm*; it is A1 (no-throw install) that stops t
 - **S3** `ForeignRemove` — the namespace's *new* writer durably removes the binding. The deposed
   instance's committed row never learns: `sCacheRef = "m1"`, `sDurableRef = "none"`, and the lane is
   perfectly quiescent and unpoisoned.
-- **S4–S9** GC folds the foreign `-1` and graduates; **S9** publish; **S10** confirm → **"yes"** off
-  a view that is authoritative for nobody; **S11** promote; **S12** delete. **Violation.**
+- **S4–S8** GC folds the foreign `-1` through two rounds (**condemn**, **`delete_pending`**), with a
+  third `GFold` at S8 observing nothing new. **S9** publish; **S10** confirm → **"yes"** off a view
+  that is authoritative for nobody; **S11** promote; **S12** `GSettle` (round 3) → physical delete.
+  **Violation.**
 
 With rule 6 intact S10 answers **"unknown"**.
 
@@ -229,9 +247,13 @@ promote first, publish the `+1` afterwards.
 
 - **S2** `RConfirm` from `init` → **"yes"** (the sender is genuinely still bound to `m1`, everything
   quiescent). `rDurableBefore = FALSE` — the receiver has no durable evidence yet.
-- **S3–S4** the sender admits and durably repoints.
-- **S5–S11** GC folds, condemns, graduates and deletes `b1` (promote lands at S8, in between).
-  **Violation** of `PromotedNeverDangles`.
+- **S3–S4** the sender admits and durably repoints (no apply/poison step follows in this trace; the
+  tenure stays open).
+- **S5** `RPromote`: the receiver promotes on the earlier *yes* — nothing about the sender's lane
+  gates a promote once confirmed.
+- **S6–S11** three GC rounds on a complete fold: **condemn** (`GSettle` at S7), **`delete_pending`**
+  (`GSettle` at S9), **physical delete** (`GSettle` at S11), `present[b1] = FALSE`. **Violation** of
+  `PromotedNeverDangles`.
 
 Note the *guarded* theorem is NOT violated here — its `rDurableBefore` antecedent is false — which
 is exactly the point: a *yes* is only worth anything if the receiver's evidence was already durable
@@ -337,7 +359,7 @@ implementation lands — the models gate the design, not the code.
   refused relink does not accidentally keep blobs alive and mask the theorem.
 - **Bounds** `MaxId = 5`, `MaxRound = 5`, one receiver in `_main`. `MaxRound = 5` gives one round of
   slack over the three needed for condemn → `delete_pending` → delete. `_main2r` re-checks the
-  universal quantifier at two receivers with `MaxId = 7`, `MaxRound = 6` (48.3M distinct states);
+  universal quantifier at two receivers with `MaxId = 7`, `MaxRound = 6` (39.0M distinct states);
   nothing was shrunk to make a config pass.
 
 ### Deliberately out of scope
