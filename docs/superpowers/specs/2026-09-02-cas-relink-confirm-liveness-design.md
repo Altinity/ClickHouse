@@ -9,7 +9,10 @@ doc_type: 'design'
 
 # CAS relink confirm liveness design {#cas-relink-confirm-liveness-design}
 
-Status: revision 9 of 2026-09-02, the simplification with the wedge hole closed, and the model plan, the
+Status: revision 10 of 2026-09-02, revision 9 plus a fifth observability counter
+(`CASRelinkConfirmRefusedMountCannotSpeak`, for the two refusal arms that mean this mount cannot speak
+for the namespace at all) added during implementation and folded into the observability paragraph below.
+Revision 9 was the simplification with the wedge hole closed, and the model plan, the
 test inventory and the `carved` lifetime corrected after the codex review of revision 8. Revisions 1 to 8 and
 their reviews are recorded in [F11 spec consults](/superpowers/cas/f11-spec-consults-2026-09-02); their
 result is one fact this revision rests on: the hazard is a mutation of the queried ref that is queued or

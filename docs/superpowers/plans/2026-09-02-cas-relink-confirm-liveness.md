@@ -1086,9 +1086,10 @@ NODES = ("node1", "node2")
 
 # Every `_ckpt` PUT sleeps this long: a flush's committed-frontier publication, and so the tenure, lasts
 # at least this long. Chosen well above the fake's own latency and well below the replication queue's
-# retry backoff, so the lanes stay busy without the test taking minutes.
-CKPT_DELAY_MS = 250
-INSERTS_PER_NODE = 40
+# retry backoff, so the lanes stay busy. At 250ms/40 inserts the starvation did not reproduce; committed
+# at 1000ms/80 inserts, which does, at a cost of about six and a half minutes per run.
+CKPT_DELAY_MS = 1000
+INSERTS_PER_NODE = 80
 ROWS_PER_INSERT = 1000
 DRAIN_TIMEOUT_S = 180
 
@@ -1598,9 +1599,16 @@ ninja -C build clickhouse > build/build_f11_task6_server.log 2>&1; echo NINJA_EX
 ls -la ci/tmp/clickhouse build/programs/clickhouse
 python3 -m ci.praktika run "integration" --test test_cas_gcs > build/itest_cas_gcs_task6.log 2>&1; echo EXIT=$?
 jq -r 'select(.outcome=="failed") | "\(.nodeid)\n\(.longrepr)"' ci/tmp/pytest_parallel.jsonl | head -40
+python3 -m ci.praktika run "integration" --test test_cas_gcs_relink_liveness > build/itest_cas_gcs_liveness_task6.log 2>&1; echo EXIT=$?
 ```
 
-`--test test_cas_gcs` matches both `test_cas_gcs` and `test_cas_gcs_relink_liveness`. Expected: `Failures: 0/<N>`; the liveness case prints both nodes' refusal counters with `CASRelinkConfirmRefusedRefMutationInFlight` present and `LaneWedged`/`LaneBroken` at zero. Also run the replicated relink battery, which exercises the confirm end to end on RustFS: `python3 -m ci.praktika run "integration" --test test_cas_replicated_relink > build/itest_cas_replicated_relink_task6.log 2>&1` and expect `Failures: 0`.
+`ci/jobs/integration_test_job.py`'s `test_match` treats a `--test` argument with no slash as a
+directory name and matches it exactly, so `--test test_cas_gcs` matches only `test_cas_gcs/test.py` and
+never reaches `test_cas_gcs_relink_liveness/test.py`; the liveness suite must be named on its own with
+`--test test_cas_gcs_relink_liveness`. Expected: both runs `Failures: 0/<N>`; the liveness case prints
+both nodes' refusal counters with `CASRelinkConfirmRefusedRefMutationInFlight` present and
+`LaneWedged`/`LaneBroken` at zero. Also run the replicated relink battery, which exercises the confirm
+end to end on RustFS: `python3 -m ci.praktika run "integration" --test test_cas_replicated_relink > build/itest_cas_replicated_relink_task6.log 2>&1` and expect `Failures: 0`.
 
 Fresh-agent review of the whole diff. Then:
 

@@ -46,10 +46,16 @@ Proved on the real bucket with the `gcs_hmac` client, binary of 2026-09-02:
 ## Failure class 1: relink-confirm liveness (F11) {#relink-confirm-lane-livelock}
 
 - **[relink-confirm-lane-livelock] two replicas starve each other's fetch-by-relink confirms** — HARD /
-  RELEASE GATE (data divergence, not data loss).
+  RELEASE GATE (data divergence, not data loss). IMPLEMENTED, REVIEWED, LIVE GATE PENDING: the live
+  ten-minute phase-3 soak on the real GCS stand has not run yet (Task 8 of the implementation plan
+  below runs it next).
   Design: [relink confirm liveness design](/superpowers/specs/cas-relink-confirm-liveness-design),
-  revision 8 (rule 3 refuses while a queued or in-flight mutation names the queried ref, read from
+  revision 10 (rule 3 refuses while a queued or in-flight mutation names the queried ref, read from
   the `MutationScope` every lane item already carries; `Wedged` and broken lanes refuse table-wide).
+  Plan: [implementation plan](/superpowers/plans/cas-relink-confirm-liveness); commits: `1d0be22d4cd`,
+  `0ccdf5a8f53`, `12e81e7871c`, `b51b72cf7ea`, `89a60b1b7f8`, `10d571917c7`, `9c18abd0a70`,
+  `347351bbcd8`, `3041e79068e`, `70f2ce78bed`, `b0b980ac8d9`, `a43e2ef89d3`, `bf44441fe61`,
+  `f4c87d0a6d8`.
 
 **What happened.** After the connect storm both replication queues wedged with
 `NO_REPLICA_HAS_PART: Source ... did not prove it still holds the manifest it offered ... by relink`;
@@ -87,6 +93,35 @@ runtime keeps `carved` items visible until completion. Revision 1 (gate 0 + part
 the live-repoint trace; revisions 2 to 6 (reading the sent transaction's ops) were correct but heavier
 than needed. TLA variant and the two-model consult are mandatory before code.
 
+**Reproduced on the fake, then fixed.** The two-node fake-GCS liveness case
+(`tests/integration/test_cas_gcs_relink_liveness`) did not reproduce the starvation at its original
+parameters (a 250ms `_ckpt` delay, 40 inserts per node: the run passed). Escalated to a 1000ms delay
+and 80 inserts per node, it reproduced cleanly against the table-wide rule 3: both replication queues
+stuck at 79 and 80 entries after the drain deadline, and each node logged the confirm refusal over
+1,500 times in the run. Against the ref-scoped rule 3 the same escalated workload produces zero
+refusals of any kind on node1 — not one of the refusal counters at zero, but no row for any of them in
+`system.events`. That is the intended consequence of the fix, not a wiring gap: a refusal now needs a
+queued or carved mutation naming the exact ref the peer is asking about, and in this workload each
+node's lane stays busy with its own newer parts while its peer asks about a part committed only
+seconds earlier. The escalated case takes about six and a half minutes per run (up from a few seconds
+at the original parameters).
+
+**Open items carried forward.**
+
+- `CASRelinkConfirmRefusedStateLockBusy` is exercised by no test. The `state_mutex` acquisition it
+  counts is non-blocking (`try_to_lock`), and nothing in the current code gives a test a seam that
+  forces a miss; closing this needs a new test hook, not asked for by this plan.
+- Of the five refusal counters, only `CASRelinkConfirmRefusedLaneWedged` and
+  `CASRelinkConfirmRefusedLaneBroken` are proven to reach `system.events` end to end, by the
+  integration case's own assertion. `CASRelinkConfirmRefusedRefMutationInFlight`,
+  `CASRelinkConfirmRefusedMountCannotSpeak` and `CASRelinkConfirmRefusedStateLockBusy` have unit-level
+  fences only, so the live gate (Task 8 of the plan) is the first place a break between the
+  `ProfileEvents::increment` call and the `system.events` row would show for those three.
+- The liveness case's two escalated constants (the 1000ms checkpoint delay and the 80-insert count)
+  were raised together, as one step, once the original parameters failed to reproduce. Nobody has
+  measured whether the longer delay alone reproduces the starvation at the original 40-insert count,
+  which would roughly halve the suite's six-and-a-half-minute runtime if it does.
+
 **Options considered.**
 
 1. **Narrow rule 3 to a "durable-but-unapplied" flag.** Superseded: `RefLaneState::Writing` already
@@ -112,9 +147,11 @@ than needed. TLA variant and the two-model consult are mandatory before code.
 **Operational workaround that works today:** alternate `SYSTEM STOP FETCHES` on one replica while the
 other drains, then swap; converged the stand to 244,024 = 244,024 rows on 2026-09-02.
 
-**Verification gates for any fix:** the TLA variant green under all sabotage flags; `CAS*` gtest; a
-two-hour phase-3 soak on the GCS stand (the only reproduction), read through the confirm-refusal
-counters below.
+**Verification gates for any fix:** the TLA variant green under all sabotage flags; `CAS*` gtest; the
+fake-GCS two-node liveness case at escalated parameters (now reproduces the starvation without the
+real bucket); a ten-minute phase-3 soak on the real GCS stand as the per-task live gate, read through
+the confirm-refusal counters below, with the full two-hour soak run once as the campaign's closing
+gate after every fix has landed.
 
 ## Failure class 2: hot control keys and the GCS mutation limit (F3, F12) {#gcs-hot-control-keys-429}
 
