@@ -2587,6 +2587,16 @@ TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
     }
     b->resetCounts();
 
+    /// The carry-forward reaches its source through the reader, the way every production caller does,
+    /// and the cache answers: the same decode as before, with no request on the body just deleted.
+    /// Adopting from the `shared_ptr` held across the deletion would prove nothing about the cache --
+    /// were the cache to stop retaining, this re-read would fetch and throw, and the rest of this
+    /// scenario would be unreachable in production for the same reason.
+    const auto cached_manifest = s->readManifestShared(src->manifest_id);
+    ASSERT_EQ(cached_manifest.get(), src_manifest.get());
+    EXPECT_EQ(b->getCount(src_manifest_key), 0u);
+    EXPECT_EQ(b->headCount(src_manifest_key), 0u);
+
     /// The carry-forward, in the order prepareEntries runs it for a committed source: adopt, stage,
     /// precommit, promote. No blob body is written.
     PartWriteInfo info;
@@ -2594,8 +2604,8 @@ TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
     info.intended_namespace = ns;
     auto build = s->beginPartWrite(info);
     ASSERT_EQ(src_manifest->entries.size(), 1u);
-    build->adoptEvidence(src_manifest->entries[0]);
-    const ManifestId dst_id = build->stageManifest({src_manifest->entries[0]});
+    build->adoptEvidence(cached_manifest->entries[0]);
+    const ManifestId dst_id = build->stageManifest({cached_manifest->entries[0]});
     build->precommitAdd(ns, "part_dst", dst_id);
     EXPECT_NO_THROW(build->promote(ns, "part_dst", build->buildId(), dst_id));
     EXPECT_EQ(b->headCount(blob_key), 0u);   /// a TrustedManifest leaf is not probed, by design
