@@ -1,5 +1,5 @@
 ---
-description: 'Design for a CAS backend API in which callers never hold a token: one opaque Incarnation minted only by the backend, seven operations that map one-to-one onto what object stores offer, one seam for persisted incarnations, and a landing order whose first step closes the clobber today.'
+description: 'Design for a CAS backend API in which callers never hold a token: one opaque, key-bound Incarnation minted only by the backend, seven operations that map one-to-one onto what object stores offer, no string-to-incarnation path at all, a twenty-line upstream slice that makes one-GET reads honest on S3 and GCS, and a landing order whose first step closes the clobber today.'
 sidebar_label: 'Backend incarnation contract'
 sidebar_position: 43
 slug: /superpowers/specs/cas-backend-token-contract
@@ -9,18 +9,15 @@ doc_type: 'guide'
 
 # CAS backend incarnation contract {#cas-backend-incarnation-contract}
 
-Revision 3. Revisions 1 and 2 kept a `Token` in callers' hands and tried to lock it — a private
-constructor, minting rules, a test minter, `adopt`, `static_assert`s — and each review found a new way
-the string leaked: forty-odd rules to guard one value. This revision removes the value from the API
-instead. [What earlier revisions got wrong](#what-earlier-revisions-got-wrong) keeps the record.
-
-This document supersedes `2026-09-02-cas-empty-conditional-token-guard-design.md` and revises the
+Revision 4. Revision 3 was reviewed twice, independently, and rejected on the same three points by
+both; [what earlier revisions got wrong](#what-earlier-revisions-got-wrong) keeps the record. This
+document supersedes `2026-09-02-cas-empty-conditional-token-guard-design.md` and revises the
 prerequisites of `2026-09-01-cas-self-authored-mount-reclaim-design.md`.
 
 ## Problem {#problem}
 
 Callers hold a **string** and hand it back to the backend as proof of what they observed. Everything
-else follows. Seven review rounds found nine ways to manufacture that string, every one verified in
+else follows. Eight review rounds found nine ways to manufacture that string, every one verified in
 code:
 
 1. an empty value passes, and `WriteBufferFromS3` attaches `If-Match` only when the value is
@@ -36,26 +33,33 @@ code:
 6. dialect is a runtime check at three entry points, not a property of the type;
 7. the same invalid input fails differently at the write paths (header omitted) and the delete path
    (`SetIfMatch` unconditional, `400`);
-8. decoders accept an empty persisted token in any dialect, and it reaches the destructive
-   `deleteExact`;
+8. decoders accept an empty persisted token in any dialect, and a `RetiredEntry::token` reaches the
+   destructive `deleteExact`;
 9. `TokenMismatch` is documented as remote evidence that another incarnation is current, yet the
    existing dialect guard returns it for a local refusal — and GC labels the blob `Replaced` and counts
    the prefix drained.
 
-Eight of the nine are ways to make a `Token`. The ninth — same-content replay — is a property of the
-store and is the one assumption this contract states.
+Two more, found while reviewing the fix: a genuine observation of key `a` can be applied to key `b` —
+identical bytes give identical ETags on S3, and nothing binds the value to the object it came from;
+and the persisted representation's dialect tag exists precisely because `"123"` is a valid ETag, a
+valid emulated mtime and a valid generation at once, so a dialect-free string can never be classified.
+
+Eight of the nine are ways to make a `Token`; the two additions are ways to misapply a real one. The
+one remaining item — same-content replay — is a property of the store and is the assumption this
+contract states.
 
 A second waste rides along. `get` always issues a `HEAD` and a `GET` though a `GET` returns everything
 a `HEAD` does plus the body; `MountLeaseKeeper::claim` pays two requests on its mint path and four on
 its adopt path; `GetStreamResult::token` is produced by a `HEAD` on every stream open and consumed by
-nobody; `probeSentinelRaw` is a `HEAD` then a `GET`.
+nobody; `probeSentinelRaw` is a raw `HEAD`, then `get`'s `HEAD`, then a `GET`.
 
 ## The idea {#the-idea}
 
-**Callers never hold a token.** They hold what the store told them — an *incarnation* — and they can
-only get one by performing an operation. There is nothing to construct, so nothing to construct wrongly.
+**Callers never hold a token.** They hold what the store told them about one object — an
+*incarnation* — and they can only get one by performing an operation on that object. There is nothing
+to construct, and nothing to apply to a different key.
 
-The store offers exactly this: an object version (ETag on S3, generation on GCS), and conditional
+The store offers exactly this: an object version (ETag on S3, generation on GCS) and conditional
 operations on it — `GET`, `HEAD`, `PUT` with `If-Match` or `If-None-Match`, `DELETE` with `If-Match`.
 The API is that, and not one word more.
 
@@ -63,57 +67,85 @@ The API is that, and not one word more.
 
 ```cpp
 class Incarnation;   // opaque; operator==; created only by a Backend; no default constructor
+                     // privately: {backend identity, key, dialect, value}; render() for logs and compares
 ```
 
 The word already lives in the code ("incarnation token", the `MountLease` documentation). It is not
-called `Token`, because it is not something the caller *sends*; it is something the caller *saw*.
+called `Token`, because it is not something the caller *sends*; it is something the caller *saw* — and
+saw **of one key, from one backend**. A conditional operation given an incarnation of another key, or
+minted by another backend, throws `LOGICAL_ERROR`: a programming error, not a store answer, so it does
+not reintroduce problem 9.
 
-Two assertions make the property checkable at compile time:
+Two assertions make unconstructibility checkable at compile time; the key binding is checked by the
+operations:
 
 ```cpp
 static_assert(!std::is_default_constructible_v<Incarnation>);
 static_assert(!std::is_constructible_v<Incarnation, String>);
 ```
 
+**Opaque means not constructible, not unreadable.** `render()` yields `dialect:value` for
+`system.content_addressed_log`, `CasInspect`, and the one comparison in
+[persisted incarnations](#persisted-incarnations). There is no inverse.
+
 Backends mint through one protected path. Minting applies the rules a value must meet to name one
-incarnation — and these are the backend parsing **its own responses**, not a contract with callers:
+incarnation — the backend parsing **its own responses**, not a contract with callers:
 
 | dialect | a response value is an incarnation iff |
 |---|---|
-| Generation | canonical decimal: non-empty, digits only, no leading zero unless the value is `0` |
+| Generation | canonical positive decimal: digits only, no leading zero, not `0` — zero is the dialect's own absence sentinel (`If-None-Match: *` maps to `x-goog-if-generation-match: 0`) |
 | ETag | non-empty; not `*` after trimming whitespace; no comma — a list matches any member, and no known store puts a comma in a single entity tag |
 | Emulated | non-empty |
 
 A response value that fails is not an incarnation; the operation that received it throws
-`CORRUPTED_DATA` naming the key. No fallback, no second lookup.
+`CORRUPTED_DATA` naming the key. No fallback, no second lookup. `list` mints through the same path
+where it surfaces per-key tokens (`tokenForList`, `supportsListTokens`), and is the fourth producer
+after `read`, `head` and `write`.
 
-"Not yet" is spelled `std::optional<Incarnation>`. Roughly twenty-five production sites that
+Because the backend mints only its own dialect, `mintingTypeMatches` and its three call sites are
+deleted. "Not yet" is spelled `std::optional<Incarnation>`; the twenty-six production sites that
 default-construct a `Token` today become optionals, are constructed from an operation, or are
-restructured; the implementation plan carries the list from the review of revision 1.
+restructured — the reviews of revisions 1 and 3 list them.
 
 ## Seven operations {#seven-operations}
 
 ```cpp
 struct Object { String bytes;  Incarnation incarnation; };
-struct Meta   { uint64_t size; Incarnation incarnation; ObjectAttributes attributes; };
+struct Meta   { uint64_t size; Incarnation incarnation; };
 
-std::optional<Object>      read(key, size_t cap);       // one GET; bytes never from two incarnations
-std::optional<Meta>        head(key);                   // one HEAD
-std::unique_ptr<ReadBuffer> stream(key);                // bytes only, no incarnation
+std::optional<Object>       read(key);            // one GET; bytes never from two incarnations
+std::optional<Meta>         head(key);            // one HEAD
+std::unique_ptr<ReadBuffer> stream(key);          // bytes only, no incarnation
 
 std::expected<Incarnation, Conflict>
-                           write(key, bytes, std::optional<Incarnation> expected);
-                                                        // nullopt = the key must be absent
+                            write(key, bytes, std::optional<Incarnation> expected);
+                                                  // nullopt = the key must be absent
 enum class Removal { Removed, Gone, Mismatch };
-Removal                    remove(key, Incarnation expected);
+Removal                     remove(key, Incarnation expected);   // throws if the store archived instead
 
-Incarnation                publish(key, BlobPublishRequest);   // unconditional; content-addressed keys only
-ListPage                   list(prefix, cursor, limit);
+void                        publish(BlobPublishRequest);          // unconditional; content-addressed keys only
+ListPage                    list(prefix, cursor, limit);
 ```
 
-**`read`** is the only source of an `Object`. **`head`** is for callers that do not want the body:
-existence, size, and an incarnation to delete without reading — the one legitimate `HEAD`. **`stream`**
-carries no incarnation because a lazily-read stream cannot promise one: it may reissue.
+Plus `probeSentinelRaw`, the bootstrap classification probe, kept and reduced to one `GET`.
+
+**`read`** is the only source of an `Object`. It is `IObjectStorage::readSmallObjectAndGetObjectMetadata`
+under a native-conditional request mode, once the [upstream slice](#upstream-slice) makes that
+function honest. It takes no per-call bound: one backend-wide stored-byte bound — the largest control
+cap, 256 MiB — protects memory against a rogue object and can be wrong in exactly one place, and the
+decoders already enforce each format's `object_cap` on decode. Eighty call sites each computing
+`ZSTD_compressBound(object_cap)` would be a surface where a bound one byte short is a permanent read
+failure for one object. `read` allocates a fixed 64 KiB buffer: chunk size of one `GET`, not a
+request count — eight times today's sized allocation for a 3.7 KiB fold read, sixteen times less than
+the unsized 1 MiB default, and needing no `HEAD` to size.
+
+**`head`** is for callers that do not want the body: existence, size, and an incarnation to delete
+without reading — the one legitimate `HEAD`. `Meta` drops `attributes`: no production reader exists
+outside the backends' own copying, no production write passes a non-empty `ObjectMeta`, and
+`cas_owner` has no reader or writer anywhere under `ContentAddressed/`. `ObjectMeta` on writes goes
+with it.
+
+**`stream`** carries no incarnation because a lazily-read stream cannot promise one: it may reissue.
 
 **`write`** is one operation with the precondition as a parameter, so the condition is visible at every
 call site: `write(k, b, std::nullopt)` claims to be first; `write(k, b, seen)` changes what it saw.
@@ -123,222 +155,254 @@ thirty-six files under `src/` already — so success yields the incarnation of w
 `PutResult{PreconditionFailed, {}}` was exactly that extraction, and it is how empty tokens entered
 circulation. `Conflict` means one thing in both forms: the store said the precondition does not hold.
 Ambiguity — the store did not answer, the write may have landed — is an exception, as today.
+`putIfAbsent`, `putOverwrite` and `casPut` collapse into `write`; three outcome enums into `expected`
+and `Removal`.
 
-`putIfAbsent`, `putOverwrite` and `casPut` collapse into `write`; three outcome enums collapse into
-`expected` and `Removal`.
+**`remove`** is conditional only. There is no unconditional delete in the API because there is none in
+CAS — all sixteen `deleteExact` callers are conditional — and "delete whatever is there" has no safe
+meaning when a republished blob under the same key is a legitimate live object. When the store
+answers with a delete marker instead of a removal (versioning enabled — a mis-provisioned pool),
+`remove` throws: the capability probe's step 8 refuses the pool on that throw, and GC's redelete
+guard becomes unnecessary. No fourth `Removal` state.
 
-**`remove`** is conditional only. There is no unconditional delete in the API because there are no
-unconditional deletes in CAS — all fourteen `deleteExact` callers are conditional — and "delete whatever
-is there" has no safe meaning when a republished blob under the same key is a legitimate live object.
+**`publish`** is the one unconditional mutation **in this API**, as `publishBlob` is today. It is a
+separate verb, not a third state of `write`'s precondition, because its safety argument is different
+— a content-addressed key has one payload, so an unconditional `PUT` is safe whoever wins — and a
+separate verb lets a reviewer find every unconditional site by name. It returns `void`: the staged
+copy transport goes through `IObjectStorage::copyObject`, which returns nothing; the emulated transport
+is a rename; and no consumer of a publication's incarnation exists. Three unconditional mutations
+live **outside** this API by design — the S3 staging upload, the staging cleanup and
+`sweepOwnMountStaging` — on mount-owned staging keys that carry no incarnation and are never read
+through `read`; the contract does not cover them and says so.
 
-**`publish`** is the one unconditional mutation, as `publishBlob` is today. It is a separate verb, not
-a third state of `write`'s precondition, because its safety argument is different — a content-addressed
-key has one possible content, so an unconditional `PUT` is idempotent — and a separate verb lets a
-reviewer find every unconditional site by name. It returns the incarnation the store named, for the same
-reason `write` does.
+### Why not `Snapshot`, `Identity`, `Precondition`, `parse` {#why-not-more}
 
-### Why not `Snapshot`, `Identity`, `Precondition` {#why-not-more-types}
-
-An intermediate draft had five nominal types around one value. `Object` and `Meta` are plain results —
+An intermediate draft had five nominal types around one value. `Object` and `Meta` are plain results:
 a struct with bytes has bytes to compare, a struct without does not, and no type is needed to say so.
-`optional<Incarnation>` as precondition is the existing idiom. A `variant<Absent, Incarnation>` would
-be a wrapper around the same two states.
+`optional<Incarnation>` as precondition is the existing idiom. And revision 3's
+`parse(String) -> optional<Incarnation>` — the one string-to-incarnation door — is gone entirely;
+[persisted incarnations](#persisted-incarnations) says what replaced it.
 
-## Three things that stay hard {#three-hard-things}
+## The upstream slice {#upstream-slice}
 
-Each is irreducible, and the design's job is to give it one place.
+Two facts make a one-`GET` read dishonest today, and both are fixed in about twenty additive lines
+across three files under `src/IO` and `src/Disks/DiskObjectStorage/ObjectStorages/S3`. The change is
+generic — it makes `readSmallObjectAndGetObjectMetadata` keep its own word for every caller — and
+carries no CAS vocabulary, so it ports between branches on its own.
 
-### GC must remember which publication it condemned {#persisted-incarnations}
+**Fact one: a plain `GET` never carries a GCS generation.** The generation reaches the SDK's ETag
+field only through `applyGcsConditionalDialectToResponse`, which `PocoHTTPClient` invokes only
+`if (isNativeConditionalRequest(request))`; `ReadBufferFromS3::sendRequest` builds a plain
+`GetObjectRequest` and never marks it, and a test pins that behaviour
+(`gtest_aws_s3_client.cpp:1364`). Today's `get` works on GCS only because its token comes from
+`nativeHead`, which does mark its request. The fix is the same one line `getObjectInfo.cpp:42` already
+uses for `HEAD`:
 
-A blob is addressed by content hash, so a republished blob is **byte-identical** to the condemned one.
-The only thing that distinguishes them is which publication — the incarnation. GC therefore persists
-it in `cas_run` (`SourceEdgeRecord`) and GC outcomes.
+- `ObjectStorageRequestMode` (today in `WriteSettings.h:35`) moves to a five-line
+  `IO/ObjectStorageRequestMode.h` included by both settings headers;
+- `ReadSettings` gains `object_storage_request_mode = Default` — one field, one default, no
+  existing reader changes; `ReadBufferFromS3` already holds `read_settings` as a member, so no
+  constructor changes;
+- `ReadBufferFromS3::sendRequest` adds
+  `req.setNativeConditional(read_settings.object_storage_request_mode == NativeConditional)`.
 
-Persisted, it is a `String` — not a `Token`, not a `PersistedIdentity`, a string. Decoders keep it a
-string; `CasInspect` and the benchmark render strings and need no backend; `Formats/` keeps depending on
-`Primitives/` only. There is exactly one way from a string to an `Incarnation`:
+**Fact two: a reissued `GET` can straddle a replacement.** `ReadBufferFromS3::nextImpl` reissues from
+the current offset on a mid-body failure, without `If-Match` and without comparing ETags, and
+`getObjectMetadataFromTheLastRequest` reports the last response — so a failure at byte `k` can yield
+`[0,k)` of one incarnation, `[k,end)` of another, and the second's ETag. `readSmallObjectAndGetObjectMetadata`
+promises "consistent metadata" and cannot keep it. The fix:
 
-```cpp
-std::optional<Incarnation> parse(String persisted);   // nullopt: this cannot fence anything
+- `ReadBufferFromS3::initialize` records the first response's ETag and, on **every** reissue, sets
+  `response_identity_changed` if the new response's differs — per reissue, so an `A→B→A′` sequence is
+  caught at `B`; six lines, two members, one getter, and no change to what any reader returns;
+- `S3ObjectStorage::readSmallObjectAndGetObjectMetadata` throws after draining if the flag is set —
+  three lines.
+
+That function is overridable per storage, which is also the seam the Native test fakes use: they
+override it, and nothing in CAS casts a buffer. Azure's buffer has the same shape and its own override;
+it is not a CAS store today and is out of this slice.
+
+Under the project's rule for shared surfaces this slice is consulted before it is written; the user
+has approved the direction.
+
+## Persisted incarnations {#persisted-incarnations}
+
+GC must remember which publication it condemned. A republished blob is *payload*-identical to the
+condemned one but not *byte*-identical — the envelope carries a fresh random `incarnation_tag` per
+upload attempt — and that difference is exactly what makes a content-derived ETag differ between
+publications. Either way, the only thing GC can hold across rounds is the incarnation it saw, so it
+persists one in `cas_run` (`SourceEdgeRecord`) and GC outcomes, as the two strings the format already
+carries: `token_type` and `token`.
+
+**There is no way from those strings to an `Incarnation`.** Not `parse`, not `adopt`, nothing. The
+persisted pair is compared, as text, against the rendering of a **live** observation of the same key:
+
+```
+auto meta = head(blob_key);                       // one HEAD
+if (meta && meta->incarnation.render() == persisted)   // "dialect:value" == "dialect:value"
+    remove(blob_key, meta->incarnation);
 ```
 
-It is called in **one** place — the fold's intake, where a `CondemnedRow` becomes a `RetiredEntry` and
-the backend is already in hand for the supersession `HEAD`. It must be there and not at `remove`,
-because `foldDeltasIntoGeneration` moves a `delete_pending` entry into `redelete` and drops it from
-`still_retired` **before** the delete phase; a refusal at `remove` is too late to keep the entry. An
-unparseable row is carried as retained-unadoptable, republished into the successor run so it is not
-lost, and logged once per round. Recovery is a follow-up
-(`[gc-unadoptable-incarnation-recovery]`) — not `rebuildBaseline`, which condemns nothing by design.
-`remove` never sees an invalid incarnation, so `Mismatch` means only what the store said.
+The incarnation handed to `remove` came from `head`, of that key, from this backend — every guarantee
+of the type holds, and the persisted string never became one. A dialect-tagged string cannot be
+misread across dialects, because the rendering carries the dialect too. A stale or garbage row simply
+fails to match, and the supersession path that already exists re-condemns the live incarnation the
+next round; nothing is retained in a special state, nothing needs a follow-up, `CasInspect` renders
+strings as strings and needs no backend, and `Formats/` keeps depending on `Primitives/` only.
 
-Orphan nomination is not a persisted consumer: its incarnation comes from the same live `get` that
-supplied the body. `CasFsck`'s compare of a `head` against a persisted string goes through `parse` as
-well — the second and last call site.
+This is the shape of the other nine `head`-then-`remove` sites in the tree. Its cost is one `HEAD` per
+condemned-blob delete where today there is one only on a mismatch; GC's delete phase is background and
+bounded by the round budget. Both reviews of revision 3 recommended this trade; it is taken.
 
-### `read` cannot forbid a second request, but it can notice one {#read-drift}
+The two consumers are GC's redelete and `CasFsck`'s retirement check, both of which already `head`.
+Orphan nomination is not one: its incarnation comes from the same live `get` that supplied the body.
+No persisted token reaches `write` anywhere.
 
-`ReadBufferFromS3` reissues the `GET` from the current offset on a mid-body failure, without `If-Match`
-and without comparing ETags, and `getObjectMetadataFromTheLastRequest` reports the **last** response —
-so a failure at byte `k` yields `[0,k)` of one incarnation, `[k,end)` of another, and the second's
-token. Per-request retry policy cannot be pushed through `readSmallObjectAndGetObjectMetadata`: the S3
-request settings come from the disk, and `read_hint` is ignored. Azure's buffer has the same shape and
-additionally reinitialises on credential refresh.
+## The one hard thing left {#write-anomaly}
 
-So `read` **detects** rather than prevents. It owns the small-object read itself — the same
-`dynamic_cast` to the concrete buffer that `S3ObjectStorage::readSmallObjectAndGetObjectMetadata` does —
-and asks the buffer for its response metadata **twice**: after the first chunk and after draining. A
-different ETag means a reissue straddled a replacement, and `read` throws `CORRUPTED_DATA`. The same
-ETag means, by the store's own token-implies-content contract (`CasBackend.h:226`), that every byte came
-from one incarnation, however many requests the buffer made. The check lives in one function because
-`Object` is born in one function.
+`write` must return an `Incarnation`; a response without one has nothing to return.
+`runCapabilityProbe` already depends on write tokens — `t1` from step 1 is the precondition of step 4
+— and refuses a nameless-write store today only by accident (`t2 == t1`, both empty). It will refuse
+it by name. S3 in the ETag dialect always carries an ETag, GCS always a generation once the request is
+marked, `EmulatedSingleProcess` mints from a stat under its mutex; Azure is read-only today.
 
-The promise is stated as what is true: **`read` never returns bytes from two incarnations.** Not "one
-request". `readSmallObjectAndGetObjectMetadata` violates its own "consistent metadata" contract under
-retry for every caller, not only CAS; that is filed upstream and this design does not wait for it.
-
-`cap` bounds **stored** bytes. `FormatTraits::object_cap` is a decompressed cap, and a zstd frame of an
-incompressible body at the cap is slightly larger than the cap, so the bound is
-`ZSTD_compressBound(object_cap)` for `CompressionPolicy::Always` formats and `object_cap` otherwise;
-overflow is `CANNOT_READ_ALL_DATA`, and `readGcMaintenanceState` must classify it alongside
-`CORRUPTED_DATA`. `read` allocates a fixed 64 KiB buffer: the buffer is the chunk size of one `GET`,
-not a request count, and 64 KiB is sixteen times smaller than the 1 MiB default the current
-`casSizedReadSettings` exists to avoid, without needing the exact size a `HEAD` used to supply.
-
-### The store may not name what it wrote {#write-anomaly}
-
-`write` and `publish` must return an `Incarnation`; a response without one has nothing to return.
-`runCapabilityProbe` already depends on write tokens structurally — `t1` from step 3 is the
-precondition of step 4 — so it refuses a writable pool whose writes carry none, and says so. S3 in the
-ETag dialect always carries an ETag, GCS always a generation, `EmulatedSingleProcess` mints from a stat
-under its mutex; Azure is read-only today.
-
-At runtime, then, a nameless write response is a store anomaly — and the write **may have committed**.
-It throws a dedicated code, `CAS_WRITE_UNATTRIBUTED`, which `classifyConditionalWriteResult` classifies
-as **ambiguous**, so every controller method resolves it by reading back and comparing bytes
-(`resolved_by_get`, now on `read`). Revision 2 used `CORRUPTED_DATA` here; `isDeterministicLocalFailure`
-lists that code as deterministic, so three of the four controller methods would have rethrown it before
-resolving. For raw callers outside the controller an exception after a possible commit is the same
-class as a network failure after a commit — pre-existing, and handled where it is handled today; the
-one place it can duplicate data, the read-then-freeze append in `ContentAddressedTransaction::writeFile`,
-is filed as its own item because it is not new.
+At runtime a nameless write response is therefore a store anomaly — and the write **may have
+committed**. It throws `CAS_WRITE_UNATTRIBUTED`, a code that `classifyConditionalWriteResult` treats
+as ambiguous by default (every non-S3 exception is, provided the code is kept out of
+`isDeterministicLocalFailure`), so all four controller methods resolve it by reading back — three by
+comparing bytes, `slotOccupy` by returning `Occupied` for its caller to adjudicate. The fallback
+`HEAD` in `tokenFromWriteResult` is deleted; nothing replaces it. For the thirty raw callers outside
+the controller, both reviews traced every one: each either propagates to a caller whose next attempt
+re-reads the key, or catches and resolves by read; none reads an exception as "not committed". It is
+a new trigger on a path that today returns *something* — and what it returns today can be another
+writer's incarnation, which is the defect. The one place a post-commit exception can duplicate data,
+the read-then-freeze append in `ContentAddressedTransaction::writeFile`, is pre-existing and filed.
 
 ## What is promised about requests {#request-promises}
 
 Only what the backend does itself. **No operation issues a `HEAD` it does not need**: `read`, `stream`
-and `probeSentinelRaw` issue no `HEAD`; `head` issues exactly one; `probeSentinelRaw` becomes one `GET`,
-whose 404 body distinguishes `NoSuchKey` from `NoSuchBucket` where a `HEAD` 404 cannot. That is
-checkable at the `IObjectStorage` call boundary and is the whole of the claim.
+and `probeSentinelRaw` issue none; `head` issues one. Checkable at the `IObjectStorage` boundary.
 
-Not promised, and stated so it is not inferred: multipart writes above `max_single_part_upload_size`
-are several requests; `list` prefetches the next page; `stream` is lazy and may issue several; the S3
-client has its own redirect and credential loops.
+**Reading an object's metadata is one `GET`, at the caller level too.** The two callers that do `head`
+then `get` on one key today collapse: `MountLeaseKeeper::claim` from two and four requests to two and
+two (`read`, then `write`); `CasManifestReader` to zero on a cache hit and one on a miss, which is its
+own bounded change (`2026-09-02-cas-manifest-cache-by-id-design.md`) and lands first. Every other
+`head`/`get` adjacency is two different keys, or a `head` before a bodiless `write`.
 
-**And at the caller level: reading an object's metadata is one `GET`, not a `HEAD` and a `GET`.** Every
-caller that today does `head` then `get` on the same key collapses to `read`. There are two.
-`MountLeaseKeeper::claim` (`CasServerRoot.cpp:1462→1476`, two requests on its mint path and four on its
-adopt path) becomes one and two. `CasManifestReader` (`CasManifestReader.cpp:65→87`) issues a `HEAD` on
-every read to validate its cache by token and to detect a dangling reference — but a manifest is
-written once under an id that is never reused, so the token in its cache key is redundant and the
-`HEAD` is per-read detection of a GC-side invariant. That is its own bounded change, decided and
-specified in `2026-09-02-cas-manifest-cache-by-id-design.md`: cache by id, no I/O on a hit, one `read`
-on a miss, and dangling-reference detection where it belongs, in GC before deletion and in fsck. It
-lands first and independently of this document. Every other `head`/`get` adjacency in the tree is either
-two different keys or a `head` followed by a `write` with no body wanted, which is `head`'s purpose.
+Not promised: multipart writes above `max_single_part_upload_size` are several requests; `list`
+prefetches the next page; `stream` is lazy; the S3 client has its own redirect and credential loops.
 
 ## Assumptions {#assumptions}
 
-**One.** An incarnation names one version, and the store never reuses one for **different** content.
-What no contract can promise is that identical content never yields the same incarnation: an S3 ETag is
-content-derived, so a restored copy of an old body may carry the old ETag, and a design that recognises
-its own body by bytes also recognises a restored copy. This defeats `proven_dead_token` observation just
-as much; it is stated here once.
+**One, and it is assumed, not probed.** An incarnation names one version, and the store never reuses
+one for **different** content. `CasBackend.h:234-236` says the capability probe does not test this;
+it is a requirement on every backend. What no contract can promise is that identical content never
+yields the same incarnation — a restored copy of an old body may carry the old ETag — and a design
+that recognises its own body by bytes also recognises a restored copy. This defeats
+`proven_dead_token` observation just as much; it is stated here once.
 
 ## Seams, named {#seams}
 
-- **Tests** obtain incarnations by performing operations on `InMemoryBackend`. There is no test minter.
-  A "wrong" incarnation for a key is that key's **previous** one after an overwrite — provably stale for
-  that key — not another key's, since preconditions are key-scoped and generation values are not
-  globally unique. `CasProbe` uses `t1` after overwriting to `t2`.
-- `InMemoryBackend::setEnforceTokens(false)` models a store that accepts every precondition. It stays;
-  it is about the store.
+- **Tests** obtain incarnations by performing operations on `InMemoryBackend`; a "wrong" one for a key
+  is that key's **previous** incarnation after an overwrite — provably stale, and bound to the same key,
+  which is what the type now requires. The seventy-six test subclasses of a backend inherit the
+  protected minter; that is a door for tests, guarded by review, and the document does not pretend the
+  `static_assert`s close it.
+- `InMemoryBackend::setEnforceTokens(false)` models a store that accepts every precondition. It stays.
 - `EmulatedSingleProcess` mints under `emu_mutex`, an instance member though its header says
-  "process-wide" (`CasObjectStorageBackend.h:39` vs `:210`); the comment is corrected. Its
-  `emuMintToken` nonce fallback for an empty stat etag — an incarnation from no response — is removed;
-  that path throws.
-- Test fixtures that run `Mode::Native` over `LocalObjectStorage` for convenience move to
-  `EmulatedSingleProcess`. Fixtures that exist to exercise Native fakes — the fake generation store in
-  `gtest_cas_s3_staging`, the S3 error-classification fakes in `gtest_cas_sentinel_probe` — stay
-  Native with fakes that implement the small-object read.
+  "process-wide" (`CasObjectStorageBackend.h:39` vs `:211`); the comment is corrected. Its
+  `emuMintToken` nonce fallback for an empty stat etag is removed; that path throws.
+- Fixtures that run `Mode::Native` over `LocalObjectStorage` for convenience move to
+  `EmulatedSingleProcess`. The two fake families that exist to exercise Native behaviour — the fake
+  generation store in `gtest_cas_s3_staging` and the S3 error-classification fakes in
+  `gtest_cas_sentinel_probe` — stay Native and override `readSmallObjectAndGetObjectMetadata`, which
+  is the seam `read` uses. The sentinel-probe fakes that arm a `HEAD` fault are rewritten to arm a
+  `GET` fault, since the probe issues no `HEAD` any more.
+- `InstrumentedBackend` counts every operation into `ProfileEvents`; the new operations get counters
+  and `CAS*Get` / `CAS*GetStream` are retired with the operations they counted.
 
 ## Landing order {#landing-order}
 
-The diff is about 250 sites: 60 `get`, ~30 `head`, 29 writes, 14 deletes, ~25 default-constructed
-holders, 3 backend implementations and ~30 test subclasses, 4 codecs, 55 test constructions in 14
-files. That size is not a cost of the design; it is how the design works — an unconstructible type makes
-the compiler find every place a string was passed off as an observation. It lands in four steps, each
-green:
+About 300 sites: 80 `get`, 24 `head`, 38 writes, 16 deletes, 26 default-constructed holders, 3 backend
+implementations and 76 test subclasses, 4 codecs, 59 test constructions in 14 files. That size is how
+the design works — an unconstructible, key-bound type makes the compiler find every place a string was
+passed off as an observation. Four steps, each green:
 
-1. **Safety, inside the backend, small.** The two defects that produce a clobber today — an empty value
-   reaching `If-Match`, and the fallback `HEAD` in `tokenFromWriteResult` — are fixed in
-   `ObjectStorageBackend` with no caller change: refuse an empty or wildcard value at the wire on the
-   write paths, throw on the delete path (which is fail-loud today and must stay so — a refusal outcome
-   there is read by GC as evidence), and replace the fallback with `CAS_WRITE_UNATTRIBUTED`. About
-   fifty lines. After this step the clobber is impossible, before any of the API exists.
-2. **New operations beside the old.** `read`, `head`, `stream`, `write`, `remove`, `publish` are added
-   to `Backend`; the old operations delegate. Nothing breaks.
-3. **Migration, file by file**, each its own commit: the 60 `get` sites first — the largest and most
-   mechanical block, with the `read`-or-`stream` decision already tabulated per site by the review of
-   revision 1 — then writes, then deletes with `parse` at the fold's intake. Mechanical work, delegated
-   and reviewed.
-4. **The lock.** The old operations are deleted, `Incarnation` loses every public constructor, the
-   `static_assert`s go in. The compiler lists what was missed.
+1. **Safety, inside the backend, small.** In `ObjectStorageBackend`, with no caller change: the
+   **full** minting grammar — not only empty and `*` — enforced at the legacy write entry points as
+   `LOGICAL_ERROR` (a caller passed a non-token; `isDeterministicLocalFailure` already rethrows that
+   code through the controller), the same on the delete path across all three backends (S3 is
+   fail-loud there today, Emulated and `InMemoryBackend` return `TokenMismatch` and must throw
+   instead), and the fallback `HEAD` replaced by `CAS_WRITE_UNATTRIBUTED`. Under a hundred lines. After
+   this step no clobber path is left: not empty, not `*`, not a quoted or zero-padded generation, not
+   a list, not a stranger's token.
+2. **The upstream slice, and the new operations beside the old.** The three-file slice lands as its
+   own commit. Then `read`, `head`, `stream`, `write`, `remove`, `publish` are added to `Backend` with
+   the old operations delegating where a delegation exists — and the document says where it does not:
+   `getStream`'s token needs a `HEAD` the new `stream` will not issue, and `get`'s `attributes` and
+   `Range` have no new source, so those old bodies stay until step 4 deletes them.
+3. **Migration, file by file**, each its own commit: the 80 `get` sites first, with the `read`-or-`stream`
+   decision already tabulated per site by the review of revision 1; then writes; then deletes, with GC's
+   redelete and fsck taking the `head`-render-compare shape. Mechanical work, delegated and reviewed.
+4. **The lock.** The old operations, `Token` and `mintingTypeMatches` are deleted, `Incarnation` loses
+   every public constructor, the `static_assert`s go in. The compiler lists what was missed.
 
-Stated plainly: unconstructibility is a property of step 4. Until then the new API is additive and the
-safety rests on step 1 — which is what is needed immediately; steps 2–4 are what makes the next such
-defect impossible to write.
+Unconstructibility is a property of step 4, and key binding of step 3. Until then the safety rests on
+step 1 — which is what is needed immediately; the rest is what makes the next such defect impossible
+to write.
 
 ## Verification {#verification}
 
-**Compile time.** The two `static_assert`s; `grep` for `Incarnation{` and `Incarnation(` with arguments
-outside the backend minter returns nothing.
+**Compile time.** The two `static_assert`s; `grep` for `Incarnation{` and `Incarnation(` with
+arguments outside the backend minter returns nothing.
 
-**No needless `HEAD`.** Against a call-counting `IObjectStorage`: `read`, `stream`, `probeSentinelRaw`
-issue zero `getObjectMetadata` calls; `head` issues one.
+**Key binding.** `head("a")` applied to `write("b", …)` and to `remove("b", …)` throws `LOGICAL_ERROR`
+before any request; the same for an incarnation from a second backend instance.
 
-**`read` never mixes.** A fake `IObjectStorage` whose read buffer yields `N` bytes of one body with one
-ETag, then fails, then serves a different body with a different ETag on reissue: `read` throws. Same
-body, same ETag on reissue: `read` returns it. This is the test that could not have been written under
-revision 2's "one request" framing.
+**No needless `HEAD`.** Against a call-counting `IObjectStorage`: `read`, `stream` and
+`probeSentinelRaw` issue zero `getObjectMetadata` calls; `head` issues one.
 
-**Minting refuses.** Empty, `*`, a comma list, `00123` → `CORRUPTED_DATA` from `head` and `read`.
+**`read` never mixes** — at the slice, where the fakes live: a scripted `GetObject` on the fake S3
+client that serves `N` bytes of one body with one ETag, fails, then serves the rest with another ETag
+→ `readSmallObjectAndGetObjectMetadata` throws; same ETag on reissue → it returns. On GCS: a marked
+`GET` returns the generation in the ETag field, and `read` mints it.
 
-**`parse` refuses.** A `cas_run` row and a GC outcome with an empty or foreign-dialect string: the fold
-carries the entry as unadoptable, republishes it, issues no `remove`, logs once; `CasInspect` renders
-both unchanged.
+**Minting refuses.** Empty, `*`, a comma list, `00123`, `0`, `"123"` → `CORRUPTED_DATA` from `head`,
+`read` and `list`.
 
-**The write anomaly.** A store returning no ETag on write: the probe refuses the pool; on an already
-mounted pool `write` throws `CAS_WRITE_UNATTRIBUTED`, and all four controller methods resolve it by
-`read`.
+**Persisted compare.** A `cas_run` row whose `{type, value}` renders equal to `head`'s → `remove`
+issued; unequal (stale, garbage, foreign dialect) → no `remove`, the round completes, and the
+supersession path re-condemns a live blob on the next round. `CasInspect` renders both rows unchanged.
 
-**`expected` cannot leak.** A `Conflict` carries no incarnation — a compile-time property of the type.
+**The write anomaly.** A fake S3 client returning no ETag on `PutObject`: the probe refuses the pool by
+name; on an already mounted pool `write` throws `CAS_WRITE_UNATTRIBUTED`, all four controller methods
+resolve by `read`, and `isDeterministicLocalFailure` does not list the code.
 
-**Step 1 in isolation.** Before any API exists: on a real S3-compatible store, a conditional overwrite
-with an empty expected value leaves the object unchanged; a delete with one throws; a write whose
-response lacks an ETag (fake) throws `CAS_WRITE_UNATTRIBUTED`.
+**`expected` cannot leak.** A `Conflict` carries no incarnation — a compile-time property.
 
-**Existing gates.** The CA-s3 lane and the `CAS*` gtest gate stay green at every step.
+**Step 1 in isolation.** On a real S3-compatible store: a conditional overwrite with each value in the
+grammar table's refusal set leaves the object unchanged and throws `LOGICAL_ERROR`; a delete with one
+throws on all three backends; a write whose response lacks an ETag throws `CAS_WRITE_UNATTRIBUTED`.
+
+**Existing gates.** The CA-s3 lane and the `CAS*` gtest gate stay green at every step; the upstream
+slice's own tests (`gtest_aws_s3_client`, the S3 object-storage tests) stay green with the request mode
+at `Default`.
 
 ## Acceptance {#acceptance}
 
 1. Step 1 lands and its isolated tests pass before any API work.
-2. After step 4: both `static_assert`s hold; `get`, `getStream`, `putIfAbsent`, `putOverwrite`,
-   `casPut`, `deleteExact`, `Token`, `mintingTypeMatches` and the fallback `HEAD` no longer exist.
-3. No needless `HEAD`; `read` throws on drift; `parse` is called from exactly two sites; no caller
-   issues `head` and `read` on the same key in one operation.
-4. `remove` never reports `Mismatch` for any reason other than the store's own mismatch.
-5. The probe refuses a nameless-write store; a runtime nameless write is resolved by every controller
-   method.
-6. Existing lanes and gates green at every step.
+2. The upstream slice lands as one commit, under a hundred lines, touching only `IO/` and
+   `ObjectStorages/S3/`, with no CAS identifier in it.
+3. After step 4: both `static_assert`s hold; `get`, `getStream`, `putIfAbsent`, `putOverwrite`,
+   `casPut`, `deleteExact`, `Token`, `mintingTypeMatches`, `ObjectMeta` on writes, `Meta::attributes`
+   and the fallback `HEAD` no longer exist; `probeSentinelRaw` is one `GET`; `publish` returns `void`.
+4. No needless `HEAD`; `read` throws on drift; no caller issues `head` and `read` on one key in one
+   operation; no string becomes an `Incarnation` anywhere.
+5. `remove` never reports `Mismatch` for any reason other than the store's own mismatch, and throws on
+   a delete marker.
+6. The probe refuses a nameless-write store by name; a runtime nameless write is resolved by every
+   controller method.
+7. Existing lanes and gates green at every step.
 
 ## Companion change: the `Keeper` name {#companion-keeper-rename}
 
@@ -348,33 +412,37 @@ a mount lease. The collision is real and not the comment's fault — CAS lives i
 `ReplicatedMergeTree`, whose commit path goes through ClickHouse Keeper, so `CasRequestControl.h:250`
 must name the real Keeper when it rules out a `Coordination::Exception` collision. In a codebase where
 "Keeper" sometimes has to mean ClickHouse Keeper, a local object may not borrow the word. The name is
-`MountLeaseRenewer`. Sized by those seven identifiers: 101 occurrences in 6 non-test files, 98 in
+`MountLeaseRenewer`. Sized by those seven identifiers: 101 occurrences in 6 non-test files, 99 in
 tests. Mechanical, its own commit.
 
 ## Out of scope {#out-of-scope}
 
-**Upstream:** `readSmallObjectAndGetObjectMetadata` consistent under retry; a per-request read retry
-policy in `IObjectStorage`. Filed; not waited for.
+**Azure**: the same slice shape applies to its read buffer and override, when Azure becomes a writable
+CAS store.
 
 **Pre-existing, filed:** `PoolMeta::admitOrValidate`'s unbounded conflict loop; the read-then-freeze
-append's duplicate on post-commit exception; `resolved_by_get` under lockstep clones; recovery for an
-unadoptable persisted incarnation.
+append's duplicate on post-commit exception; `resolved_by_get` under lockstep clones.
 
 **The remount driver's ownership capability**, which the reclaim design needs and this contract does
 not touch.
 
 ## What earlier revisions got wrong {#what-earlier-revisions-got-wrong}
 
-**Revisions 1 and 2** kept `Token` in the API and locked it: private constructor, minting rules, a
-`Token::forTest` minter, `PersistedToken` and `adopt`, `static_assert`s. Each review found a leak the
-previous lock had not closed — public members, a default constructor, a public test minter, a decoder
-without a backend — because a value that callers hold has to be defended everywhere it is held.
-Revision 2 also promised "one physical request", which no `IObjectStorage` interface can deliver, and
-told `Gc::acquireOrRenewLease` to step down on a missing token when its acquire had already committed —
-a silent wedge. Its `CORRUPTED_DATA` on a nameless write was classified deterministic and rethrown by
-three of four controller methods. Its `object_cap` bound measured decompressed bytes against stored
-ones. Its adopt point sat after the fold had already dropped the entry.
+**Revisions 1 and 2** kept `Token` in the API and locked it; each review found a leak the previous
+lock had not closed, because a value callers hold must be defended everywhere it is held. Revision 2
+also promised "one physical request", which no `IObjectStorage` interface can deliver, told
+`Gc::acquireOrRenewLease` to step down on a missing token when its acquire had already committed, used
+`CORRUPTED_DATA` for a nameless write when the controller classifies that code as deterministic, and
+put the persisted-token adoption after the fold had dropped the entry.
 
-**An intermediate draft** replaced `Token` with `Snapshot`, `Identity`, `PersistedIdentity`,
-`Precondition` and `Absent` — five names around one value, and a `create` whose conditional nature was
-in a comment. The user's objection — "a wrapper over a wrapper" — was correct.
+**An intermediate draft** had `Snapshot`, `Identity`, `PersistedIdentity`, `Precondition`, `Absent` —
+five names around one value — and a `create` whose conditional nature was in a comment.
+
+**Revision 3** removed the token from callers' hands but not from the program: its `parse(String)`
+was a string-to-incarnation door that could not classify a dialect, because `"123"` is valid in all
+three; its `Incarnation` was not bound to a key, so a genuine observation of `a` could clobber `b`; its
+one-`GET` `read` could not mint on GCS at all, because a plain `GET` never carries a generation; its
+two-point ETag check left an `A→B→A′` hole; its `dynamic_cast` inside CAS had no test seam; its
+`publish` returned an incarnation three of four transports cannot produce; its `Removal` dropped the
+delete-marker signal; its step 1 refused only empty and `*` and left quoted, zero-padded and listed
+values as live clobber paths; and it accepted generation `0`.
