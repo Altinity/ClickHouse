@@ -188,13 +188,21 @@ TEST(CASPartFolderAccess, RetainedHitCostsNoRequest)
     const Cas::PartRefKey key{ns, "part_1"};
     const String manifest_key = layout.manifestKey(id);
 
+    /// Cold build: warms the retained view and the decode cache. Excluded from the counts below so
+    /// they measure only the warm hits that follow.
+    ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
+
     backend->resetCounts();
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 4; ++i)
         ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
 
-    /// ONE body GET (the cold build): the decode cache is keyed by id, and every subsequent
-    /// CachedForLoad call is a retained hit that costs no request at all.
-    EXPECT_EQ(backend->getCount(manifest_key), 1u);
+    /// A retained hit costs no request at all -- not merely no manifest GET on this key, but no
+    /// backend traffic of ANY kind (GET, HEAD, LIST, streamed GET) against ANY key.
+    EXPECT_EQ(backend->getCount(manifest_key), 0u);
+    EXPECT_EQ(backend->getTotal(), 0u);
+    EXPECT_EQ(backend->headTotal(), 0u);
+    EXPECT_EQ(backend->listTotal(), 0u);
+    EXPECT_EQ(backend->getStreamTotal(), 0u);
     EXPECT_TRUE(access.explain(key).retained);
     EXPECT_EQ(access.explain(key).last_decision,
               Cas::CachedPartFolderAccess::LastDecision::Hit);
