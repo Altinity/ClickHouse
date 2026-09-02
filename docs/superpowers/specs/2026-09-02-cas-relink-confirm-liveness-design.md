@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS relink confirm liveness design {#cas-relink-confirm-liveness-design}
 
-Status: revision 6 of 2026-09-02. Revision 1 relied on the part state machine (gate 0) to carry the
+Status: revision 6 of 2026-09-02, amended with the codex round-5 residual (fence-loss phase mapping, lane-core details left to the model author). Revision 1 relied on the part state machine (gate 0) to carry the
 removal argument; review found the counterexample of a live repoint that retires a blob edge while the
 part stays `Active`, and revision 1 is withdrawn. Revision 2 (rule 3 scoped to the sent transaction)
 passed two independent consults, one on another model, on the design itself; revisions 3 to 6 fold in
@@ -186,7 +186,13 @@ task implements:
 | `SenderInstall` | `sPhase = durable` | `sCacheRef' = sDurableRef`, `sPhase' = installed`; `sLeader` unchanged (the code's install-and-swap at `:3855-3859`) |
 | `SenderTenureEnd` | `sPhase = installed` | `sPhase' = idle`, `sShape' = none`, `sLeader' = FALSE` (the code's tenure exit at `:2165`) |
 | `SenderPoison` | `sPhase = durable` | `sPoison' = TRUE`, `sPhase' = idle`, `sLeader' = FALSE`; the current `sDurableRef # Token` conjunct goes, so a `noop` install can poison too |
-| `FenceLoss` | as today, with `sPending` read as `sPhase # idle` | unchanged |
+| `FenceLoss` | as today, with the former `sPending` read as `sPhase \in {admitted, armed, durable}` (not `installed`: the attempt is gone after install) | unchanged |
+
+Where the lane core is concerned, the model author decides two implementation details this document
+does not: where `attempt_touches_identity` lives so that it follows the attempt into `resolver_attempt`
+during wedge resolution, and which of the scalar binding updates in `WriteLands`, `ObserveDurable`,
+`InstallCommitted` and recovery become identity-conditional. The objective check is the battery: the
+sabotage configs must still violate, the new witnesses must be reached.
 
 `sArmed` is `sPhase \in {armed, durable}`: the attempt is armed from before the first send until install,
 which is exactly the interval in which the store may hold a transaction the row does not reflect. Rule 3

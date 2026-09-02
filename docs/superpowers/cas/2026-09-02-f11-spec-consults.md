@@ -11,7 +11,7 @@ doc_type: 'reference'
 
 Verbatim reports produced while the design in
 [relink confirm liveness](/superpowers/specs/cas-relink-confirm-liveness-design) moved from revision 1
-to revision 5. Kept because the spec cites them and because two of them contain the evidence walks
+to revision 6. Kept because the spec cites them and because two of them contain the evidence walks
 (attempt lifetime, committed-ref mutation inventory) that the spec summarises. Model names and effort:
 codex `gpt-5.6-sol` at high reasoning, read-only sandbox; the Claude consult is an independent `ca-arch`
 agent with no access to the codex transcripts. Line numbers refer to the tree at the time of each round.
@@ -467,3 +467,25 @@ REQUEST CHANGES — fully specify and witness the honest non-touching and betwee
    The status and committed consult record agree with the history: three Codex rounds and one independent Claude consult. Describing revision 2 as passing “on the design itself” is accurate; the objections were prose/model-plan specification findings.
 
 REQUEST CHANGES — define an explicit durable/install phase for both transaction shapes; make `SenderInstall` require durability, clear `sPending` and `sArmed`, and retain `sLeader`; record all three witnesses at the actual `RConfirm` transition; preserve authority and identity-specific cache correctness in `CaRefLaneCore`; model the composition observable independently; rerun both `run_reflane.sh` and `run_relinklane.sh`; and correct “two models” to three modules.
+
+## Codex round 5, revision 5: REQUEST CHANGES (model plan prose) {#codex-round-5}
+
+1. **PROSE — MAJOR — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:175-187`**  
+   The translation of old `sPending` reads to `sPhase # idle` is incorrect. After `SenderInstall`, `sPhase = installed`, so this expression still says “pending” even though installation has cleared the attempt. Applied literally to the existing actions (`CaRelinkConfirmCore.tla:204-219`), it both enables `SenderPoison` after successful installation and prevents `FenceLoss` during the installed/open-tenure interval. Define pending as `sPhase \in {admitted, armed, durable}`, or give the actions explicit phase guards: `SenderPoison` should run only from `durable` and close the tenure; `FenceLoss` should retain the old no-pending meaning, including the `installed` phase. Also state whether a durable `noop` may poison.
+
+2. **PROSE — MAJOR — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:202-220`**  
+   Both proposed certification predicates admit broken lanes. `Outstanding` covers only `Writing` and `Wedged` (`CaRefLaneCore.tla:143-144`), so `CurrentRuntime /\ ~(Outstanding /\ attempt_touches_identity)` permits `Certify` in `NeedsRecovery`, `Closed`, and `Faulted`. A reachable `NeedsRecovery` state with stale cache can therefore execute `Certify` and make the honest `run_reflane.sh` battery fail. The composition has the same defect: `~(lane # "Ready" /\ attempt_touches_source)` permits `ConfirmSource` in every broken state when the prior attempt was non-touching. Use an explicit allowable-lane predicate such as `lane = "Ready" \/ (lane \in {"Writing", "Wedged"} /\ ~attempt_touches_identity)`; broken states must always refuse. Apply the corresponding predicate to `ConfirmSource`, `RefuseBlockedConfirmation`, the sabotage action, and the renamed invariant.
+
+3. **PROSE — MAJOR — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:202-213`**  
+   `CaRefLaneCore` still lacks an implementable definition of identity-specific currency. Its existing `WriteLands`, `ObserveDurable`, `InstallCommitted`, resolution, and recovery actions update the scalar bindings unconditionally (`CaRefLaneCore.tla:234-260,310-322,363-443`). The plan does not say where `attempt_touches_identity` lives, how it follows `attempt` into `resolver_attempt`, or which binding updates are suppressed for a transaction about another identity. Specify a fixed certified-row projection and carry the touch bit with the exact attempt/resolver; touching actions update that row, while non-touching actions advance the global transaction frontier without changing it. The complete `Certify`/`bad_certification` predicate must retain `CurrentRuntime`, the allowable-lane predicate, and that row’s cache/durable equality. Preserve the `SabotageNoFence` bypass explicitly; with the stated absolute `CurrentRuntime` guard, `CaRefLaneCore_sab_nofence.cfg` can no longer produce its expected counterexample.
+
+4. **PROSE — MAJOR — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:202-223`**  
+   The companion modules still have no non-vacuity gate for the newly allowed behavior. Existing `W_Confirmation` can be reached in `Ready`, and the lane model has no certification witness, so both runners could pass after accidentally retaining the old `Ready`-only contract. Add history flags, witness invariants, configurations, and runner entries proving `Certify` and `ConfirmSource` occur while an outstanding `Writing`/`Wedged` attempt is non-touching. Preferably, the lane witness should cover the post-land state where the global durable frontier is ahead while the certified row remains current.
+
+5. **PROSE — INFO (closed) — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:166-200`**  
+   Apart from finding 1, the round-4 confirm-core concerns are closed: the phases distinguish pre-arm, durable, and post-install states; `SenderInstall` requires durability and retains tenure; all three witnesses are recorded atomically inside `RConfirm`; and both `SabotageStaleCache` and `SabotageTouchBlind` retain reachable dangling-relink counterexamples.
+
+6. **PROSE — INFO (closed) — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:164,210-223`**  
+   The plan now correctly says three modules, gives the composition its own touch observable, and names both `run_reflane.sh` and `run_relinklane.sh`.
+
+REQUEST CHANGES — correct the `sPending`-to-phase mapping and poison/fence transitions; restrict certification to `Ready` or non-touching `Writing`/`Wedged` while always refusing broken lanes; fully specify `CaRefLaneCore` touch propagation, identity-row updates, and `SabotageNoFence`; and add companion-module witnesses for certification during a non-touching outstanding attempt.
