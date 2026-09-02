@@ -3566,15 +3566,38 @@ bool Aggregator::mergeOnBlock(Columns columns, size_t rows, bool is_overflows, A
 }
 
 
+std::vector<Int32> Aggregator::sortBucketsByRowCountDescending(std::vector<std::pair<Int32, UInt64>> buckets_by_rows)
+{
+    std::sort(buckets_by_rows.begin(), buckets_by_rows.end(),
+        [](const auto & a, const auto & b) { return a.second > b.second; });
+
+    std::vector<Int32> result;
+    result.reserve(buckets_by_rows.size());
+    for (const auto & bucket_and_rows : buckets_by_rows)
+        result.push_back(bucket_and_rows.first);
+    return result;
+}
+
 void Aggregator::mergeBlocks(BucketToChunks bucket_to_chunks, AggregatedDataVariants & result, std::atomic<bool> & is_cancelled)
 {
     if (bucket_to_chunks.empty())
         return;
 
     UInt64 total_input_rows = 0;
+    /// Real two-level buckets (bucket >= 0) paired with their row count, for longest-processing-
+    /// time-first merge dispatch below. Bucket -1 (single-level/overflow blocks) is handled
+    /// separately and excluded here.
+    std::vector<std::pair<Int32, UInt64>> buckets_by_rows;
+    buckets_by_rows.reserve(bucket_to_chunks.size());
     for (auto & bucket : bucket_to_chunks)
+    {
+        UInt64 bucket_rows = 0;
         for (auto & agg_chunk : bucket.second)
-            total_input_rows += agg_chunk.chunk.getNumRows();
+            bucket_rows += agg_chunk.chunk.getNumRows();
+        total_input_rows += bucket_rows;
+        if (bucket.first >= 0)
+            buckets_by_rows.emplace_back(bucket.first, bucket_rows);
+    }
 
     /** `minus one` means the absence of information about the bucket
       * - in the case of single-level aggregation, as well as for blocks with "overflowing" values.
@@ -3613,19 +3636,24 @@ void Aggregator::mergeBlocks(BucketToChunks bucket_to_chunks, AggregatedDataVari
 
         LOG_TRACE(log, "Merging partially aggregated two-level data.");
 
-        std::atomic<UInt32> next_bucket_to_merge = 0;
+        /// Longest-processing-time-first dispatch order (see sortBucketsByRowCountDescending):
+        /// start the biggest buckets while every thread is still free to help absorb them, instead
+        /// of plain ascending bucket-id order, which lets threads that luck into small buckets go
+        /// idle while a handful of stragglers grind through oversized buckets alone.
+        std::vector<Int32> buckets_to_merge = sortBucketsByRowCountDescending(std::move(buckets_by_rows));
 
-        auto merge_bucket = [&bucket_to_chunks, &result, &is_cancelled, &next_bucket_to_merge, max_bucket, this](Arena * aggregates_pool)
+        std::atomic<size_t> next_bucket_index = 0;
+
+        auto merge_bucket = [&bucket_to_chunks, &result, &is_cancelled, &next_bucket_index, &buckets_to_merge, this](Arena * aggregates_pool)
         {
             while (true)
             {
-                const Int32 bucket = next_bucket_to_merge.fetch_add(1);
+                const size_t index = next_bucket_index.fetch_add(1);
 
-                if (bucket > max_bucket)
+                if (index >= buckets_to_merge.size())
                     break;
 
-                if (!bucket_to_chunks.contains(bucket))
-                    continue;
+                const Int32 bucket = buckets_to_merge[index];
 
                 if (is_cancelled.load())
                     return;
