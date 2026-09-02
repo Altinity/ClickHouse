@@ -63,6 +63,28 @@ is fine. They get triaged into the topic files above during the next grooming pa
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
 isn't referenced elsewhere first.
 
+## `[relink-confirm-model-prose]` Five prose imprecisions left in `CaRelinkConfirmCore` and its results {#relink-confirm-model-prose}
+
+Found 2026-09-02 by the reviews of the ref-scoped rule 3 change (spec
+`docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md`). All prose, none blocking;
+they were held out of the fix loop deliberately and are listed here so a later pass can take them
+together.
+
+- `"With only two admitted shapes"` is given as the reason rule 3 can never refuse under
+  `SabotageTouchBlind`, in four places including a commit message. It is not the reason: the predicate
+  is constant false under the flag whatever the shape count, so a reader would wrongly conclude that
+  adding a third shape restores the sabotage.
+- The `~NoopDurable` guard on `SenderAdmitNoop` carries no comment. A future reader could delete it as
+  redundant with the else-arm guard and silently reinstate the defect it fixes (a second noop tenure
+  closing, and poisoning, having written nothing).
+- `CaRelinkConfirmCore_sab_stalecache.cfg`'s header still calls rule 3 "lane quiescence -- no pending
+  item, no leader tenure, no wedge", which is no longer what the rule reads.
+- The module header's "removes exactly ONE load-bearing rule" invites a partition reading now that two
+  flags target rule 3.
+- `SenderDurable`'s "same guard as `NsNoise`" is analogous, not identical; and the `_sab_nopoison`
+  narrative is loose about where graduation completes.
+
+
 ## `[write-token-provenance-not-in-the-api]` A write's token may come from a later, unrelated `HEAD`, and nothing in the type says so {#write-token-provenance}
 
 Found 2026-09-01 while designing self-authored mount reclaim; it is the blocker that killed revision 4
