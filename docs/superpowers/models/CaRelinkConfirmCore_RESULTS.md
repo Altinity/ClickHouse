@@ -5,8 +5,9 @@ Model: `CaRelinkConfirmCore.tla`. Gates the **publish-then-confirm relink** prot
 `2026-07-24-cas-publish-confirm-and-ref-lane-safety.md`. This is the gate that blocks all of Part B.
 
 Runner: `./run_relinkconfirm.sh <cfg-basename>`. TLC 2 (tla2tools, Java 21),
-`java -XX:+UseParallelGC -workers auto`, `CHECK_DEADLOCK FALSE` in every cfg. Every run below was
-executed on 2026-07-25; the numbers are the real TLC output, not estimates.
+`java -XX:+UseParallelGC -workers auto`, `CHECK_DEADLOCK FALSE` in every cfg. All fifteen rows below
+were re-run on 2026-09-02 against the ref-scoped rule 3 revision (`SabotageTouchBlind`, `sShape`); the
+numbers are the real TLC output, not estimates.
 
 Constants unless the row says otherwise: `Receivers = {r1}`, `MaxId = 5`, `MaxRound = 5`,
 `MaxHoles = 0`.
@@ -34,20 +35,22 @@ Constants unless the row says otherwise: `Receivers = {r1}`, `MaxId = 5`, `MaxRo
 
 | cfg | check | expected | TLC verdict | states (gen / distinct) | depth |
 |---|---|---|---|---|---|
-| `_main` | `TypeOK` `GraduationIsPhased` `ConfirmedRelinkNeverDangles` `PromotedNeverDangles` | PASS | **PASS** — `Model checking completed. No error has been found.` | 72,984 / 22,165 | 19 |
-| `_main2r` (2 receivers, `MaxId = 7`, `MaxRound = 6`) | same four | PASS | **PASS** — `Model checking completed. No error has been found.` | 17,166,053 / 4,815,496 | 25 |
-| `_sab_nogate1` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 29,515 / 10,209 | 15 |
-| `_sab_stalecache` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 24,983 / 8,724 | 16 |
-| `_sab_nopoison` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 28,362 / 9,973 | 16 |
-| `_sab_nofence` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 25,240 / 8,798 | 16 |
-| `_sab_publishafterconfirm` | `PromotedNeverDangles` | violation | **VIOLATED (as required)** | 54,456 / 18,556 | 17 |
-| `_sab_holeylist` (`MaxHoles = 1`, **no confirm rule removed**) | `ConfirmedRelinkNeverDangles` | violation = FINDING | **VIOLATED** | 123,419 / 35,896 | 18 |
-| `_witness_confirmno` | `W_ConfirmNo` | violation (reachable) | **VIOLATED (as required)** | 619 / 370 | 9 |
-| `_witness_confirmunknown` | `W_ConfirmUnknown` | violation (reachable) | **VIOLATED (as required)** | 215 / 152 | 8 |
-| `_witness_confirmyes` | `W_ConfirmYesPromoted` | violation (reachable) | **VIOLATED (as required)** | 1,947 / 1,009 | 9 |
-| `_witness_delete` | `W_BlobDeleted` | violation (reachable) | **VIOLATED (as required)** | 9,725 / 3,948 | 13 |
+| `_main` | `TypeOK` `GraduationIsPhased` `ConfirmedRelinkNeverDangles` `PromotedNeverDangles` | PASS | **PASS** — `Model checking completed. No error has been found.` | 668,872 / 195,692 | 24 |
+| `_main2r` (2 receivers, `MaxId = 7`, `MaxRound = 6`) | same four | PASS | **PASS** — `Model checking completed. No error has been found.` | 183,359,655 / 48,275,480 | 30 |
+| `_sab_nogate1` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 88,946 / 32,927 | 13 |
+| `_sab_stalecache` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 48,534 / 18,723 | 12 |
+| `_sab_touchblind` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 48,534 / 18,723 | 12 |
+| `_sab_nopoison` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 91,109 / 34,082 | 13 |
+| `_sab_nofence` | `ConfirmedRelinkNeverDangles` | violation | **VIOLATED (as required)** | 83,287 / 31,155 | 12 |
+| `_sab_publishafterconfirm` | `PromotedNeverDangles` | violation | **VIOLATED (as required)** | 80,266 / 31,372 | 11 |
+| `_sab_holeylist` (`MaxHoles = 1`, **no confirm rule removed**) | `ConfirmedRelinkNeverDangles` | violation = FINDING | **VIOLATED** | 471,214 / 142,194 | 13 |
+| `_witness_confirmno` | `W_ConfirmNo` | violation (reachable) | **VIOLATED (as required)** | 432 / 242 | 6 |
+| `_witness_confirmunknown` | `W_ConfirmUnknown` | violation (reachable) | **VIOLATED (as required)** | 47 / 31 | 4 |
+| `_witness_confirmyes` | `W_ConfirmYesPromoted` | violation (reachable) | **VIOLATED (as required)** | 106 / 72 | 4 |
+| `_witness_delete` | `W_BlobDeleted` | violation (reachable) | **VIOLATED (as required)** | 7,920 / 3,581 | 9 |
+| `_witness_yespendingnoop` | `W_YesWhilePendingNoop` | violation (reachable) | **VIOLATED (as required)** | 254 / 157 | 5 |
 
-All runs finish in under one second except `_main2r` (9 s).
+All runs finish in under 4 s except `_main2r` (13 min 30 s, 48.3M distinct states).
 
 ## The theorem
 
@@ -70,7 +73,7 @@ sabotage shows the ordering is load-bearing rather than incidental.
 
 ```
 Model checking completed. No error has been found.
-72984 states generated, 22165 distinct states found, 0 states left on queue.
+668872 states generated, 195692 distinct states found, 0 states left on queue.
 ```
 
 `_main2r` re-runs the same four invariants with **two** receivers both relinking over the **same
@@ -79,7 +82,7 @@ plus wider id/round budgets:
 
 ```
 Model checking completed. No error has been found.
-17166053 states generated, 4815496 distinct states found, 0 states left on queue.
+183359655 states generated, 48275480 distinct states found, 0 states left on queue.
 ```
 
 Why it holds, in one paragraph: a confirm *yes* requires (rules 3, 4, 6) that the sender's
@@ -125,8 +128,8 @@ re-create at the same identity.
 
 ### `_sab_stalecache` — gate 1 rule 3 (lane quiescence) is load-bearing {#sab-stalecache}
 
-`ConfirmedRelinkNeverDangles is violated`, 12-state counterexample. Rule 3 is dropped, so the
-confirm reads the committed row without checking `pending` / `leader_active`.
+`ConfirmedRelinkNeverDangles is violated`. Rule 3 is dropped, so the confirm reads the committed row
+without checking whether an admitted mutation touches the ref.
 
 - **S2–S3** `SenderAdmit` → `SenderDurable`: the removal is **durable**; `sDurableRef = "m2"` while
   `sCacheRef` is still `"m1"` and `sPending = sLeader = TRUE`. This is the post-durable-PUT window
@@ -138,9 +141,57 @@ confirm reads the committed row without checking `pending` / `leader_active`.
 - **S11** `RConfirm` → **"yes"** off the stale row (`sCacheRef = "m1" = Token`). **S12** promote →
   **violation**.
 
-With rule 3 intact S11 answers **"unknown"** (`sPending`/`sLeader` are set for the whole tenure) and
-the receiver aborts. This is why the spec's rule 3 is written against the *tenure*, not against
-individual transactions.
+With rule 3 intact S11 answers **"unknown"**: the admitted mutation is `touching` and `sPending` spans
+admission to apply, which is `pending` plus `carved` in the code. Rule 3 is written against the
+mutation's *scope*, not against the tenure: `_witness_yespendingnoop` reaches a *yes* during a tenure
+whose mutation does not touch the ref, and `_sab_touchblind` shows that ignoring the scope re-opens
+this very trace.
+
+### `_sab_touchblind` — rule 3 must read the mutation's scope {#sab-touchblind}
+
+`ConfirmedRelinkNeverDangles is violated`, 12-state counterexample, structurally identical to
+`_sab_stalecache`'s: rule 3's `quiescent` predicate stays `TRUE` unconditionally under
+`SabotageTouchBlind` just as it does under `SabotageStaleCache`, because with only two admitted
+shapes a confirm blind to shape can never see a touching mutation as touching.
+
+- **S2–S3** `SenderAdmit("m2")` → `SenderDurable`: a **touching** mutation (`sShape = "touching"`) is
+  admitted and its removal becomes durable; `sDurableRef = "m2"` while `sCacheRef` is still `"m1"` and
+  the tenure stays open (`sPending = sLeader = TRUE`).
+- **S4–S8** three GC rounds on a complete fold — `folded = {}` → **condemn** → **`delete_pending`** →
+  the physical delete is not reached yet (it lands at S12).
+- **S9** `RPublish`: the receiver's `+1` becomes durable over a blob GC has already condemned.
+- **S10** `RConfirm` → **"yes"**: `sTouches = sShape = "touching" /\ ~SabotageTouchBlind` is `FALSE`
+  regardless of `sShape`, so `quiescent` reads `TRUE` and the stale row confirms.
+- **S11** `RPromote` → the receiver promotes on the false *yes*.
+- **S12** `GSettle` (round 3) → **physical delete**, `present[b1] = FALSE`, while `r1` is `promoted`
+  with `rAnswer = "yes"` and `rDurableBefore = TRUE`. **Violation.**
+
+With `SabotageTouchBlind = FALSE` the same admission sequence sets `sTouches = TRUE` while `sPending`,
+so S10 answers **"unknown"** instead — this is the counterexample `_sab_stalecache`'s closing
+paragraph points to as "re-opened" by blindness to scope.
+
+### `_witness_yespendingnoop` — the liveness gain is reachable {#witness-yespendingnoop}
+
+`W_YesWhilePendingNoop is violated` (a TLC "violation" here means the negated state IS reachable),
+5-state witness trace — **the liveness this revision buys**, and without it a green `_main` could
+still be the old table-wide rule in disguise:
+
+- **S2** `SenderAdmitNoop`: a mutation of **another** ref is admitted — `sShape' = "noop"`,
+  `sPending' = TRUE`, `sLeader' = TRUE` — while the queried ref's `sDurableRef` stays `Token`.
+- **S3** `SenderDurable`: the noop tenure's transaction becomes durable (`NsNoise`'s edge-neutral
+  `op = "noop"` record, `src = "noise"`); `sDurableRef` is unchanged because the shape is `noop`. The
+  tenure is still open — this is the post-PUT, pre-install window the design opens for an untouched
+  ref.
+- **S4** `RPublish(r1)`: the receiver's `+1` becomes durable.
+- **S5** `RConfirm(r1)` → **"yes"**: `sTouches = FALSE` because `sShape = "noop"`, so rule 3's
+  `quiescent` is `TRUE` although a tenure is open and durable-but-unapplied.
+  `sawYesWhilePendingNoop' = TRUE` because `ans = "yes" /\ sPending /\ sShape = "noop" /\ NoopDurable`
+  all hold at this instant.
+
+Under the pre-revision table-wide rule 3 (`~sPending /\ ~sLeader`, no shape distinction) this state is
+unreachable: any open tenure — touching or not — refuses the confirm. This trace is the formal record
+that the ref-scoped rule 3 admits strictly more legitimate *yes* answers than the table-wide rule did,
+without opening `_sab_touchblind`'s hazard.
 
 ### `_sab_nopoison` — gate 1 rule 4 is separately load-bearing {#sab-nopoison}
 
@@ -275,9 +326,9 @@ implementation lands — the models gate the design, not the code.
   absent is a silent no-op.
 - **`GFold` and `GSettle` are separate steps**, so a `+1` that becomes durable after a round's fold
   cut is invisible to that round's settlement. That window is real and the model keeps it.
-- **The sender's ref lane is split into four steps** (`SenderAdmit`, `SenderDurable`,
-  `SenderApply` | `SenderPoison`) precisely so the post-durable-PUT window and the poisoned-apply
-  state are reachable and separately observable by the gate.
+- **The sender's ref lane is split into five steps** (`SenderAdmit` | `SenderAdmitNoop`,
+  `SenderDurable`, `SenderApply` | `SenderPoison`) precisely so the post-durable-PUT window and the
+  poisoned-apply state are reachable and separately observable by the gate, for both admitted shapes.
 - **`NsNoise` is edge-neutral** (`op = "noop"`): it changes nothing about reachability. Its only
   role is to give the fold cursor a higher same-namespace id to advance to, which is what converts
   an omitted page entry into a permanent skip. It exists in **all** configs, including `_main` —
@@ -286,7 +337,7 @@ implementation lands — the models gate the design, not the code.
   refused relink does not accidentally keep blobs alive and mask the theorem.
 - **Bounds** `MaxId = 5`, `MaxRound = 5`, one receiver in `_main`. `MaxRound = 5` gives one round of
   slack over the three needed for condemn → `delete_pending` → delete. `_main2r` re-checks the
-  universal quantifier at two receivers with `MaxId = 7`, `MaxRound = 6` (4.8M distinct states);
+  universal quantifier at two receivers with `MaxId = 7`, `MaxRound = 6` (48.3M distinct states);
   nothing was shrunk to make a config pass.
 
 ### Deliberately out of scope

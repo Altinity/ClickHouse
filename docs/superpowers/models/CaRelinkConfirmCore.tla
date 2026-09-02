@@ -51,8 +51,11 @@
      SabotageNoGate1            -> gate 1 rule 5 degenerates to ref-NAME match (drops exact
                                    ManifestRef equality) -> ABA: a repoint to another manifest
                                    answers *yes* over blobs the token's manifest no longer owns.
-     SabotageStaleCache         -> gate 1 rule 3 (lane quiescence) dropped -> the confirm reads a
-                                   committed row that lags a DURABLE removal.
+     SabotageStaleCache         -> gate 1 rule 3 dropped entirely -> the confirm reads a committed row
+                                   that lags a DURABLE removal or repoint of the queried ref.
+     SabotageTouchBlind         -> gate 1 rule 3 kept but blind to the admitted mutation's SHAPE ->
+                                   a touching mutation reads as a mutation of some other ref, and the
+                                   stale row confirms exactly as under SabotageStaleCache.
      SabotageNoPoison           -> gate 1 rule 4 dropped -> a durable-but-unapplied removal leaves
                                    a permanently stale row on a QUIESCENT lane; only rule 4 sees it.
      SabotageNoFence            -> gate 1 rule 6 dropped -> a fence-less instance answers about a
@@ -64,7 +67,14 @@
    rev.5 to an availability filter -- it authorizes nothing, so it has no safety content to gate);
    gate 1 rule 2 (warm/recovered -- streaming recovery publishes atomically, `CasRefLedger.h:492`,
    so no half-recovered view is observable); the condemn-marker durability gate
-   (`CaGcCondemnMarkerGate.tla`); multi-leader GC (`CaRetiredInRunFoldAbortWitness.tla`). *)
+   (`CaGcCondemnMarkerGate.tla`); multi-leader GC (`CaRetiredInRunFoldAbortWitness.tla`).
+
+   RULE 3 IS REF-SCOPED.  The sender's lane admits two SHAPES of mutation: "touching" (a removal or
+   repoint of THE ref the receiver asks about -- the hazard) and "noop" (a mutation of another ref,
+   recorded as `NsNoise`'s edge-neutral op, which leaves the queried binding alone -- the F11 load).
+   Rule 3 refuses while a touching mutation is admitted and not yet applied, and ONLY then.  The
+   model's `sPending` spans admission to apply, which is `pending` plus `carved` in the code; a
+   wedged tenure is `sPoison`, refused by lane state. *)
 EXTENDS Integers, FiniteSets
 
 CONSTANTS
@@ -75,6 +85,7 @@ CONSTANTS
                                   \* page (0 = the LIST is assumed complete; 1 = one holey page)
     SabotageNoGate1,              \* gate 1 rule 5: name-match instead of exact ManifestRef
     SabotageStaleCache,           \* gate 1 rule 3: ignore lane quiescence (pending / leader tenure)
+    SabotageTouchBlind,           \* gate 1 rule 3: blind to whether the admitted mutation touches the ref
     SabotageNoPoison,             \* gate 1 rule 4: ignore the apply-pending poison state
     SabotageNoFence,              \* gate 1 rule 6: ignore the mount fence / current-writer check
     SabotagePublishAfterConfirm   \* invert the design order: confirm+promote BEFORE the durable +1
@@ -116,23 +127,34 @@ VARIABLES
     sTarget,        \* the binding an admitted-but-not-yet-durable ref op will install
     sPending,       \* an item is admitted to the queue (`pending`), not yet durable
     sLeader,        \* a leader tenure is active (spans several durable chunk transactions)
+    sShape,         \* {"none","touching","noop"} -- what the admitted mutation does to the queried ref
     sPoison,        \* apply-pending POISON: a durable transaction whose in-memory apply threw
     sFence,         \* the mount fence is live / this instance is the namespace's current writer
     rState,         \* [Receivers -> {"init","published","confirmed","promoted","aborted"}]
     rAnswer,        \* [Receivers -> {"none","yes","no","unknown"}]
     rDurableBefore, \* [Receivers -> BOOLEAN] -- the +1 was durable BEFORE the confirm (T1 < T2)
     sawConfirmNo,   \* witness history: a confirm answered *no*
-    sawConfirmUnk   \* witness history: a confirm answered *unknown*
+    sawConfirmUnk,  \* witness history: a confirm answered *unknown*
+    sawYesWhilePendingNoop  \* witness history: *yes* answered while a "noop" mutation was admitted
 
 gcVars     == << round, present, condemned, pendingDelete, folded, cursor, gcPhase, holes >>
-senderVars == << sDurableRef, sCacheRef, sTarget, sPending, sLeader, sPoison, sFence >>
+senderVars == << sDurableRef, sCacheRef, sTarget, sPending, sLeader, sPoison, sFence, sShape >>
 recvVars   == << rState, rAnswer, rDurableBefore >>
 logVars    == << journal, nextId >>
-histVars   == << sawConfirmNo, sawConfirmUnk >>
+histVars   == << sawConfirmNo, sawConfirmUnk, sawYesWhilePendingNoop >>
 vars       == << gcVars, senderVars, recvVars, logVars, histVars >>
 
 Max(S)  == CHOOSE x \in S : \A y \in S : y <= x
 Indeg(b) == Cardinality({ e \in folded : e.b = b })
+
+Shapes == {"none", "touching", "noop"}
+
+(* Rule 3's predicate.  `SabotageTouchBlind` makes the confirm blind to the shape, so a touching
+   mutation reads as harmless. *)
+sTouches == sShape = "touching" /\ ~SabotageTouchBlind
+
+(* The noop tenure's record is durable (at most one per behaviour, like NsNoise's). *)
+NoopDurable == \E rec \in journal : rec.ns = NsS /\ rec.op = "noop"
 
 Init ==
     /\ round = 0
@@ -151,6 +173,7 @@ Init ==
     /\ sTarget = Token
     /\ sPending = FALSE
     /\ sLeader = FALSE
+    /\ sShape = "none"
     /\ sPoison = FALSE
     /\ sFence = TRUE
     /\ rState = [r \in Receivers |-> "init"]
@@ -158,11 +181,12 @@ Init ==
     /\ rDurableBefore = [r \in Receivers |-> FALSE]
     /\ sawConfirmNo = FALSE
     /\ sawConfirmUnk = FALSE
+    /\ sawYesWhilePendingNoop = FALSE
 
 (* ---- the sender's ref lane ---------------------------------------------------------------- *)
 
-(* Admission: the op enters the queue and a leader tenure opens.  `pending` and `leader_active`
-   are exactly the two predicates gate 1 rule 3 reads under `ref_queue_mutex`. *)
+(* Admission of a mutation of THE ref: the op enters the queue and a leader tenure opens.  The
+   scope is recorded here, under the same mutex as admission, before anything is sent. *)
 SenderAdmit(nb) ==
     /\ sFence
     /\ ~sPending
@@ -172,41 +196,68 @@ SenderAdmit(nb) ==
     /\ sPending' = TRUE
     /\ sLeader' = TRUE
     /\ sTarget' = nb
+    /\ sShape' = "touching"
     /\ UNCHANGED << sDurableRef, sCacheRef, sPoison, sFence >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars >>
 
+(* Admission of a mutation of ANOTHER ref (the F11 shape): its record is edge-neutral and it leaves
+   the queried binding alone.  It needs no `sDurableRef = Token` guard -- the other ref's life is
+   independent of ours. *)
+SenderAdmitNoop ==
+    /\ sFence
+    /\ ~sPending
+    /\ ~sPoison
+    /\ nextId <= MaxId
+    /\ sPending' = TRUE
+    /\ sLeader' = TRUE
+    /\ sShape' = "noop"
+    /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sPoison, sFence >>
+    /\ UNCHANGED << gcVars, recvVars, logVars, histVars >>
+
 (* The conditional PUT is acked: the transaction is DURABLE and GC can fold it.  The in-memory
-   committed row is NOT yet updated -- this is the post-durable-PUT window (§Problem 2). *)
+   committed row is NOT yet updated -- this is the post-durable-PUT window (§Problem 2).  A noop
+   tenure writes NsNoise's edge-neutral record at most once per behaviour (same guard as NsNoise). *)
 SenderDurable ==
     /\ sPending
-    /\ sDurableRef = Token
     /\ nextId <= MaxId
-    /\ journal' = journal \cup
-         { [id |-> nextId, ns |-> NsS, blob |-> "b1", src |-> SenderEdge, op |-> "del"] }
     /\ nextId' = nextId + 1
-    /\ sDurableRef' = sTarget
-    /\ UNCHANGED << sCacheRef, sTarget, sPending, sLeader, sPoison, sFence >>
+    /\ IF sShape = "touching"
+         THEN /\ sDurableRef = Token
+              /\ journal' = journal \cup
+                   { [id |-> nextId, ns |-> NsS, blob |-> "b1", src |-> SenderEdge, op |-> "del"] }
+              /\ sDurableRef' = sTarget
+         ELSE /\ ~NoopDurable
+              /\ journal' = journal \cup
+                   { [id |-> nextId, ns |-> NsS, blob |-> "b1", src |-> NoiseSrc, op |-> "noop"] }
+              /\ UNCHANGED sDurableRef
+    /\ UNCHANGED << sCacheRef, sTarget, sPending, sLeader, sPoison, sFence, sShape >>
     /\ UNCHANGED << gcVars, recvVars, histVars >>
+
+(* A tenure closes only once its transaction is durable, whatever its shape. *)
+TenureDurable == (sShape = "touching" /\ sDurableRef # Token) \/ (sShape = "noop" /\ NoopDurable)
 
 (* The in-memory apply succeeds; the tenure closes and the lane goes quiescent. *)
 SenderApply ==
     /\ sPending
-    /\ sDurableRef # Token
+    /\ TenureDurable
     /\ sCacheRef' = sDurableRef
     /\ sPending' = FALSE
     /\ sLeader' = FALSE
+    /\ sShape' = "none"
     /\ UNCHANGED << sDurableRef, sTarget, sPoison, sFence >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars >>
 
-(* The in-memory apply THREW although the object is durable (allocation failure on the COW apply).
-   The tenure closes -- the lane looks perfectly quiescent -- but the committed row is now
-   permanently stale.  Only gate 1 rule 4 (poison) can see this. *)
+(* The in-memory apply THREW although the object is durable (allocation failure on the COW apply, or
+   in the code any chunk's frontier or install failure).  The tenure closes -- the lane looks
+   perfectly quiescent -- but the committed row may now be permanently stale.  Only gate 1 rule 4
+   (poison) can see this.  Shape-aware like SenderApply: a durable noop can poison too. *)
 SenderPoison ==
     /\ sPending
-    /\ sDurableRef # Token
+    /\ TenureDurable
     /\ sPoison' = TRUE
     /\ sPending' = FALSE
     /\ sLeader' = FALSE
+    /\ sShape' = "none"
     /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sFence >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars >>
 
@@ -215,7 +266,7 @@ FenceLoss ==
     /\ sFence
     /\ ~sPending
     /\ sFence' = FALSE
-    /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sPending, sLeader, sPoison >>
+    /\ UNCHANGED << sDurableRef, sCacheRef, sTarget, sPending, sLeader, sPoison, sShape >>
     /\ UNCHANGED << gcVars, recvVars, logVars, histVars >>
 
 (* The namespace's NEW writer removes the binding.  Durable, folded by GC -- and completely
@@ -228,7 +279,7 @@ ForeignRemove ==
          { [id |-> nextId, ns |-> NsS, blob |-> "b1", src |-> SenderEdge, op |-> "del"] }
     /\ nextId' = nextId + 1
     /\ sDurableRef' = "none"
-    /\ UNCHANGED << sCacheRef, sTarget, sPending, sLeader, sPoison, sFence >>
+    /\ UNCHANGED << sCacheRef, sTarget, sPending, sLeader, sPoison, sFence, sShape >>
     /\ UNCHANGED << gcVars, recvVars, histVars >>
 
 (* ---- the receiver ------------------------------------------------------------------------- *)
@@ -266,7 +317,7 @@ NsNoise(r) ==
    gate 1).  Zero object-store I/O by contract, so it reads the in-memory committed row
    `sCacheRef`; rules 3, 4 and 6 are exactly what make that row trustworthy at this instant. *)
 Gate1Answer ==
-    LET quiescent == SabotageStaleCache \/ (~sPending /\ ~sLeader)   \* rule 3
+    LET quiescent == SabotageStaleCache \/ ~(sPending /\ sTouches)     \* rule 3 (ref-scoped)
         clean     == SabotageNoPoison   \/ ~sPoison                  \* rule 4
         fenced    == SabotageNoFence    \/ sFence                    \* rule 6
         bound     == IF SabotageNoGate1                              \* rule 5
@@ -282,6 +333,7 @@ RConfirm(r) ==
          /\ rAnswer' = [rAnswer EXCEPT ![r] = ans]
          /\ sawConfirmNo'  = (sawConfirmNo  \/ ans = "no")
          /\ sawConfirmUnk' = (sawConfirmUnk \/ ans = "unknown")
+         /\ sawYesWhilePendingNoop' = (sawYesWhilePendingNoop \/ (ans = "yes" /\ sPending /\ sShape = "noop" /\ NoopDurable))
     /\ rDurableBefore' = [rDurableBefore EXCEPT ![r] = (rState[r] = "published")]
     /\ rState' = [rState EXCEPT ![r] = "confirmed"]
     /\ UNCHANGED << gcVars, senderVars, logVars >>
@@ -366,6 +418,7 @@ NoOp == UNCHANGED vars
 
 Next ==
     \/ \E nb \in {Other, "none"} : SenderAdmit(nb)
+    \/ SenderAdmitNoop
     \/ SenderDurable \/ SenderApply \/ SenderPoison
     \/ FenceLoss \/ ForeignRemove
     \/ \E r \in Receivers : RPublish(r) \/ NsNoise(r) \/ RConfirm(r) \/ RPromote(r) \/ RAbort(r)
@@ -389,10 +442,12 @@ TypeOK ==
     /\ nextId \in 1..(MaxId + 1)
     /\ sDurableRef \in Bindings /\ sCacheRef \in Bindings /\ sTarget \in Bindings
     /\ sPending \in BOOLEAN /\ sLeader \in BOOLEAN /\ sPoison \in BOOLEAN /\ sFence \in BOOLEAN
+    /\ sShape \in Shapes
     /\ rState \in [Receivers -> {"init", "published", "confirmed", "promoted", "aborted"}]
     /\ rAnswer \in [Receivers -> {"none", "yes", "no", "unknown"}]
     /\ rDurableBefore \in [Receivers -> BOOLEAN]
     /\ sawConfirmNo \in BOOLEAN /\ sawConfirmUnk \in BOOLEAN
+    /\ sawYesWhilePendingNoop \in BOOLEAN
 
 LiveBlobs == { b \in Blobs : present[b] }
 Promoted(r) == rState[r] = "promoted"
@@ -423,6 +478,10 @@ W_ConfirmNo == ~sawConfirmNo
 
 (* The confirm's *unknown* branch actually fires. *)
 W_ConfirmUnknown == ~sawConfirmUnk
+
+(* THE LIVENESS THIS REVISION BUYS: a *yes* while a mutation of ANOTHER ref is admitted, durable
+   and not yet applied -- the post-PUT, pre-install window. *)
+W_YesWhilePendingNoop == ~sawYesWhilePendingNoop
 
 (* NON-VACUITY OF THE THEOREM: the antecedent (promoted + yes + activation durable first) is
    reachable.  Without this, `_main` passing would prove nothing. *)

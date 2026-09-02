@@ -18,6 +18,7 @@ CONFIGS=(
     "sab_nopoison            violation  ConfirmedRelinkNeverDangles"
     "sab_publishafterconfirm violation  PromotedNeverDangles"
     "sab_stalecache          violation  ConfirmedRelinkNeverDangles"
+    "sab_touchblind          violation  ConfirmedRelinkNeverDangles"
     "main                    green      -"
     "main2r                  green      -"
     "empty_receivers         green      -"
@@ -25,6 +26,7 @@ CONFIGS=(
     "witness_confirmunknown  violation  W_ConfirmUnknown"
     "witness_confirmyes      violation  W_ConfirmYesPromoted"
     "witness_delete          violation  W_BlobDeleted"
+    "witness_yespendingnoop  violation  W_YesWhilePendingNoop"
 )
 
 selected()
