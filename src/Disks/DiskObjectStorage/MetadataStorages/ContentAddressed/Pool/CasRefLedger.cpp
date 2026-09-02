@@ -57,6 +57,10 @@ namespace ProfileEvents
     extern const Event CASRefAppendDefiniteFailure;
     extern const Event CASRefAppendSealRejected;
     extern const Event CASRefAppendOccupantUnreadable;
+    extern const Event CASRelinkConfirmRefusedRefMutationInFlight;
+    extern const Event CASRelinkConfirmRefusedLaneWedged;
+    extern const Event CASRelinkConfirmRefusedLaneBroken;
+    extern const Event CASRelinkConfirmRefusedStateLockBusy;
     extern const Event CASRefNeedsRecovery;
     extern const Event CASRefSweepDeferred;
     extern const Event CASRefSweepRearmed;
@@ -423,15 +427,17 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     ///   `sweepStalePrecommitsForRead` and `maybeScheduleSnapshotPublish`, the three maintenance calls
     ///   `resolveRef` performs and all three of which can do I/O.
     ///
-    ///   ONE snapshot across BOTH lane mutexes. `pending`/`leader_active` live under
+    ///   ONE snapshot across BOTH lane mutexes. `pending`/`carved` live under
     ///   `ref_queue_mutex`, the rows and the wedge under `state_mutex`, and the whole point of the
     ///   rules is their CONJUNCTION -- read at different instants they would prove nothing. The lock
     ///   ORDER is the one the rest of this file already establishes (`enforceRefTableCacheBudget`
     ///   nests `state_mutex` under `ref_queue_mutex`, and nothing anywhere takes them the other way
     ///   round). Because admission (`appendRefOps`' `pending.push_back`) happens under
-    ///   `ref_queue_mutex`, an append is either entirely before this snapshot -- and then visible as a
-    ///   pending item -- or entirely after it. There is no interleaving in which a removal is admitted
-    ///   and this function still answers `Yes`.
+    ///   `ref_queue_mutex`, an append is either entirely before this snapshot -- and then visible in
+    ///   `pending` or, once carved, in `carved` -- or entirely after it. There is no interleaving in
+    ///   which a mutation of the asked-about ref is admitted and this function still answers `Yes`; a
+    ///   mutation of another ref may be admitted, and the answer is still right, because it cannot move
+    ///   this ref's row.
     ///
     /// What a `Yes` does NOT prove, stated so nobody has to rediscover it: that this runtime's
     /// recovered view is a COMPLETE replay of the durable log. Completeness is recovery's contract, not
@@ -450,6 +456,18 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
         return ConfirmAnswer::Unknown;
     RefTableRuntime & rt = *it->second.current;
 
+    /// Every refusal below is attributed here, on the node that computed it: `ConfirmAnswer` crosses
+    /// two interfaces as a three-value enum and stays that way, so the counters and this trace line are
+    /// the only way a live gate can tell load (`RefMutationInFlight`) from a fault (`LaneWedged`,
+    /// `LaneBroken`) or contention (`StateLockBusy`).
+    const auto refuse = [&](ProfileEvents::Event reason, std::string_view why)
+    {
+        ProfileEvents::increment(reason);
+        LOG_TRACE(getLogger("CasRefLedger"), "Relink confirm for ref '{}' in namespace '{}' is unknown: {}",
+                  ref_name, ns.string(), why);
+        return ConfirmAnswer::Unknown;
+    };
+
     /// `try_to_lock`, not a blocking acquire: `ensureRefTableRecovered` holds `state_mutex` across its
     /// whole exact replay, so blocking here would make a confirm WAIT on someone else's recovery --
     /// up to the full retry envelope -- while holding `ref_queue_mutex`, which is pool-wide append
@@ -459,7 +477,7 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// and same non-blocking rationale, as `enforceRefTableCacheBudget`'s candidate loop.)
     std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
     if (!slock.owns_lock())
-        return ConfirmAnswer::Unknown;
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, "the table's state lock is held");
 
     /// Rule 2 (warm). An unrecovered or mid-recovery runtime has an EMPTY `state`, which would read as
     /// "the ref does not exist" -- knowledge it does not have. `superseded_by_remount` is the same
@@ -471,14 +489,36 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
         || rt.superseded_by_remount.load(std::memory_order_acquire))
         return ConfirmAnswer::Unknown;
 
-    /// Rule 3 (lane quiescent). A wedge is "an object that may be durable and is not applied" -- it may
-    /// BE the removal being asked about. A pending item or an active leader tenure is a mutation this
-    /// table has already admitted; mid-tenure, a chunked flush has committed some of its transactions
-    /// and not others, and `leader_active` spans the whole tenure, so that partially-durable window is
-    /// covered too. None of the three says anything about WHICH ref is affected, so all three are
-    /// table-scoped refusals.
-    if (rt.lane_state != RefLaneState::Ready || !rt.pending.empty() || rt.leader_active)
-        return ConfirmAnswer::Unknown;
+    /// Rule 3 (no admitted mutation of THIS ref). The hazard is a committed row that lags a transaction
+    /// of the asked-about ref: the leader does not hold `state_mutex` across the `PUT`, so between
+    /// "durable" and "installed" that ref's row is stale, and a `Yes` read off it would authorize a
+    /// receiver to promote over a blob the transaction may already have retired. A mutation of ANOTHER
+    /// ref cannot change this ref's binding or the blobs its manifest protects, so its row is exactly as
+    /// authoritative as on an idle lane; refusing for it is what starved two replicas of each other on a
+    /// slow control plane. Every admitted mutation names its scope (`MutationScope`, recorded at
+    /// admission under `ref_queue_mutex` and validated against its ops at flush), and it is visible in
+    /// `pending` from admission to carve and in `carved` from carve to the tenure's exit guard, so "a
+    /// change of this ref is queued or in flight" is read from those two. The lane states other than
+    /// `Ready`/`Writing` refuse table-wide: `Wedged` holds a transaction that may be durable and is
+    /// recorded nowhere but in the attempt and the lane state (its items are completed with an error
+    /// before the tenure ends), and `NeedsRecovery`, `Closed`, `Faulted` are fences on the whole view.
+    /// `Writing` with nothing carved cannot happen; it fails closed.
+    if (rt.lane_state == RefLaneState::Wedged)
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneWedged, "the lane holds an unresolved append");
+    if (rt.lane_state != RefLaneState::Ready && rt.lane_state != RefLaneState::Writing)
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is neither Ready nor Writing");
+    if (rt.lane_state == RefLaneState::Writing && rt.carved.empty())
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is Writing with nothing carved");
+    const auto covers = [&](const MutationScope & scope)
+    {
+        return scope.kind == MutationScope::Kind::WholeShard || scope.ref_name == ref_name;
+    };
+    for (const auto & item : rt.pending)
+        if (covers(item->scope))
+            return refuse(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight, "a queued mutation names this ref");
+    for (const auto & item : rt.carved)
+        if (covers(item->scope))
+            return refuse(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight, "a carved mutation names this ref");
 
     /// Rule 5 (exact row equality) -- the only rule that can answer `No` at all. On a table that passed
     /// rules 2-4 the committed map is this writer's view, so a missing row or a different `ManifestRef`

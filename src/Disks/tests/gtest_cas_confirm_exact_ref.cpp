@@ -12,9 +12,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
+#include <Common/ProfileEvents.h>
 
 #include <atomic>
 #include <cctype>
@@ -44,8 +46,10 @@
 ///     recover from storage to answer, and it must not even MATERIALIZE a runtime -- a read-only
 ///     interserver query must never be able to make this writer do work.
 ///   - The snapshot spans BOTH lane mutexes, so an append admitted concurrently is ordered strictly
-///     after it: there is no window in which the confirm says `Yes` while a removal of that ref is
-///     already admitted.
+///     after it: there is no window in which the confirm says `Yes` while a mutation OF THAT REF is
+///     already admitted. A queued or in-flight mutation of another ref does not refuse -- rule 3 reads
+///     each item's `MutationScope`, and refusing for the whole table starved two replicas of each other
+///     under load on a slow control plane.
 ///
 /// The suite name is prefixed `Cas` so it is covered by the `Cas*` unit-test gate filter.
 
@@ -54,6 +58,12 @@ namespace DB::ErrorCodes
 extern const int CORRUPTED_DATA;
 extern const int MEMORY_LIMIT_EXCEEDED;
 extern const int LOGICAL_ERROR;
+}
+
+namespace ProfileEvents
+{
+    extern const Event CASRelinkConfirmRefusedRefMutationInFlight;
+    extern const Event CASRelinkConfirmRefusedLaneBroken;
 }
 
 using namespace DB::Cas;
@@ -471,8 +481,8 @@ TEST(CASConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
 /// Rule 3, the in-flight case: an append is admitted and its leader is parked in the pre-carve window.
 /// Nothing is durable yet and the committed row still matches EXACTLY -- which is precisely why a
 /// naive implementation answers `Yes` here, and precisely why that is the TOCTOU this design closes.
-/// The apply-state is still `Clean` at this point, so rule 3 is what produces the `Unknown`, not
-/// rule 4.
+/// The lane state is still `Ready` and the item is in `pending`, so rule 3 reading the item's scope is
+/// what produces the `Unknown`.
 TEST(CASConfirmExactRef, InFlightAppendIsUnknown)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -502,18 +512,19 @@ TEST(CASConfirmExactRef, InFlightAppendIsUnknown)
     EXPECT_EQ(apply_state, RefLaneState::Ready)
         << "the pre-carve window is before any PUT, so rule 4 must not be what answers here";
     EXPECT_EQ(while_in_flight, ConfirmAnswer::Unknown)
-        << "an admitted append makes the whole table's committed view provisional";
+        << "an admitted mutation of THIS ref makes its committed row provisional";
 
     EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::No);
 }
 
 
-/// Rule 3, mid-tenure (spec §testing "mid-tenure chunked flush", `CarvePhaseForTest::ChunkReseed`):
-/// one leader tenure commits MULTIPLE durable transactions, so at a chunk boundary the table is
-/// PARTIALLY durable. `leader_active` covers the whole tenure, so this is already `Unknown` -- a wider
-/// unknown window under load, never a hole. The confirm is issued on the leader's own thread, which is
-/// safe because the boundary holds neither lane mutex.
-TEST(CASConfirmExactRef, MidTenureChunkBoundaryIsUnknown)
+/// Rule 3 at a chunk boundary (`CarvePhaseForTest::ChunkReseed`): one leader tenure commits MULTIPLE
+/// durable transactions, so between two chunks the table is PARTIALLY durable -- for the refs those
+/// chunks mutate. The seed ref is touched by neither, so its row is exactly as authoritative as on an
+/// idle lane and it confirms; the carved items' own refs refuse, because their transactions may be
+/// durable and not installed. The confirm is issued on the leader's own thread, which is safe because
+/// the boundary holds neither lane mutex.
+TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -523,7 +534,8 @@ TEST(CASConfirmExactRef, MidTenureChunkBoundaryIsUnknown)
     ASSERT_EQ(store->confirmExactRef(ns, "seed", id.ref), ConfirmAnswer::Yes);
 
     std::atomic<int> boundaries{0};
-    std::atomic<int> unknown_at_boundary{0};
+    std::atomic<int> yes_for_seed_at_boundary{0};
+    std::atomic<int> unknown_for_carved_ref_at_boundary{0};
     std::atomic<int> requests_at_boundary{0};
     store->setCarveHookForTest([&](CasRefLedger::CarvePhaseForTest phase)
     {
@@ -531,8 +543,12 @@ TEST(CASConfirmExactRef, MidTenureChunkBoundaryIsUnknown)
             return;
         boundaries.fetch_add(1);
         const uint64_t before = backendRequests(*backend);
-        if (store->confirmExactRef(ns, "seed", id.ref) == ConfirmAnswer::Unknown)
-            unknown_at_boundary.fetch_add(1);
+        if (store->confirmExactRef(ns, "seed", id.ref) == ConfirmAnswer::Yes)
+            yes_for_seed_at_boundary.fetch_add(1);
+        /// "aaa_" has no committed row (rule 5 would say `No`), so an `Unknown` here can only come from
+        /// rule 3 reading the carved item's scope.
+        if (store->confirmExactRef(ns, "aaa_", id.ref) == ConfirmAnswer::Unknown)
+            unknown_for_carved_ref_at_boundary.fetch_add(1);
         requests_at_boundary.fetch_add(static_cast<int>(backendRequests(*backend) - before));
     });
 
@@ -578,11 +594,13 @@ TEST(CASConfirmExactRef, MidTenureChunkBoundaryIsUnknown)
     store->setCarveHookForTest(nullptr);
 
     ASSERT_GE(boundaries.load(), 1) << "the flush did not chunk -- the mid-tenure window was not exercised";
-    EXPECT_EQ(unknown_at_boundary.load(), boundaries.load())
-        << "a mid-tenure, partially-durable table must never confirm";
+    EXPECT_EQ(yes_for_seed_at_boundary.load(), boundaries.load())
+        << "a ref no carved item names must confirm mid-tenure -- that is the liveness this rule exists for";
+    EXPECT_EQ(unknown_for_carved_ref_at_boundary.load(), boundaries.load())
+        << "a ref a carved item names must not confirm while its transaction may be durable and not installed";
     EXPECT_EQ(requests_at_boundary.load(), 0) << "the mid-tenure confirm must still be I/O-free";
 
-    /// The tenure is over: the seed ref is untouched by it and confirms again.
+    /// The tenure is over: the seed ref confirms as before.
     EXPECT_EQ(store->confirmExactRef(ns, "seed", id.ref), ConfirmAnswer::Yes);
 }
 
@@ -608,6 +626,55 @@ TEST(CASConfirmExactRef, WedgedLaneIsUnknown)
     EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
     EXPECT_EQ(backendRequests(*backend), 0u)
         << "a wedged lane must answer Unknown without trying to resolve the wedge";
+}
+
+
+/// Rule 3, a REAL wedge: the removal of x is sent, the response is lost, the single-attempt budget is
+/// exhausted, and the lane wedges. `commitRefChunk` completes the chunk's items with an error before
+/// the tenure ends, so the transaction that may be durable is recorded nowhere but in the attempt and
+/// the lane state -- `pending` and `carved` are both empty. Every ref refuses: x because its removal
+/// may be durable, `other` because nothing but the lane state records WHICH ref the wedged transaction
+/// touched.
+TEST(CASConfirmExactRef, WedgedTransactionRefusesEveryRef)
+{
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    PoolConfig cfg;
+    /// Single-attempt budget: one ambiguous PUT is a conclusive wedge, no inter-attempt sleep. The
+    /// operation deadline is deliberately far wider than one attempt, so the pre-send gate never
+    /// refuses before the injected fault is reached and the outcome is decided by the fault, not by
+    /// how loaded the machine is.
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 5000;
+    budget.lease_safety_margin_ms = 100;
+    cfg.cas_request_budget = budget;
+    auto store = openPoolWithConfig(backend, cfg);
+    const RootNamespace ns{"srv1/confirm_real_wedge"};
+    /// Pins the namespace to the fixture life BEFORE its first real touch, so the fault key computed
+    /// from that same life below is the key production actually writes to.
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns);
+
+    const ManifestId id_x = publishEmptyPart(store, ns, "x");
+    const ManifestId id_other = publishEmptyPart(store, ns, "other");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
+    ASSERT_EQ(store->confirmExactRef(ns, "other", id_other.ref), ConfirmAnswer::Yes);
+
+    backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
+    backend->fault_skip = 0;
+    backend->fault_count = 1;
+    EXPECT_THROW(store->dropRef(ns, "x"), DB::Exception);
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    ASSERT_EQ(store->refQueuePendingForTest(ns), 0u);
+    ASSERT_EQ(store->refCarvedForTest(ns), 0u)
+        << "the wedged item was completed and released; only the lane state records its transaction";
+
+    backend->resetCounts();
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Unknown) << "x's removal may be durable";
+    EXPECT_EQ(store->confirmExactRef(ns, "other", id_other.ref), ConfirmAnswer::Unknown)
+        << "a wedge refuses table-wide: no per-ref record of the wedged transaction survives the tenure";
+    EXPECT_EQ(backendRequests(*backend), 0u) << "a wedged lane must answer without trying to resolve the wedge";
 }
 
 
@@ -878,6 +945,131 @@ TEST(CASConfirmExactRef, ConcurrentAppendIsOrderedAfterTheSnapshot)
 
     /// Phase 3: durable and applied.
     EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::No) << "phase 3: after the removal";
+}
+
+
+/// The livelock shape: a mutation of ANOTHER ref is queued and its leader is parked before the carve,
+/// so the lane has a pending item and an active tenure. A confirm about an untouched committed ref must
+/// answer `Yes` -- the queued mutation cannot change this ref's binding or the blobs its manifest
+/// protects -- while the queued ref itself answers `Unknown`.
+TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_liveness"};
+
+    const ManifestId id_x = publishEmptyPart(store, ns, "x");
+    const ManifestId id_other = publishEmptyPart(store, ns, "other");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
+
+    LeaderLatch latch;
+    latch.arm(store);
+    std::thread dropper([&] { store->dropRef(ns, "other"); });
+    latch.awaitEntered();
+
+    /// Sampled while parked, asserted after the join (a failed assertion here would skip the release).
+    const bool leader_active = store->refLeaderActiveForTest(ns);
+    const size_t pending = store->refQueuePendingForTest(ns);
+    /// The refusal counters are the only way a live gate can read WHY a confirm said `Unknown`, so the
+    /// attribution is pinned here rather than left to the reader of the .cpp: this pair of confirms is
+    /// the one place where a `Yes` and a scope-driven `Unknown` are produced back to back from the same
+    /// lane state.
+    const auto in_flight_before = ProfileEvents::global_counters[
+        ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight].load();
+    const auto broken_before = ProfileEvents::global_counters[
+        ProfileEvents::CASRelinkConfirmRefusedLaneBroken].load();
+    const ConfirmAnswer untouched = store->confirmExactRef(ns, "x", id_x.ref);
+    const auto in_flight_after_untouched = ProfileEvents::global_counters[
+        ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight].load();
+    const ConfirmAnswer touched = store->confirmExactRef(ns, "other", id_other.ref);
+    const auto in_flight_after_touched = ProfileEvents::global_counters[
+        ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight].load();
+    const auto broken_after = ProfileEvents::global_counters[
+        ProfileEvents::CASRelinkConfirmRefusedLaneBroken].load();
+
+    latch.release();
+    dropper.join();
+    store->setRefPreCarveHookForTest(nullptr);
+
+    EXPECT_TRUE(leader_active);
+    EXPECT_EQ(pending, 1u);
+    EXPECT_EQ(in_flight_after_untouched - in_flight_before, 0u)
+        << "a confirm that answers Yes must not be counted as a refusal";
+    EXPECT_EQ(in_flight_after_touched - in_flight_after_untouched, 1u)
+        << "the refused confirm must be attributed to the ref-scoped mutation, which is what a live "
+           "gate reads to tell load from a lane fault";
+    EXPECT_EQ(broken_after - broken_before, 0u)
+        << "the lane is Ready here: a refusal attributed to a broken lane would misreport a fault";
+    EXPECT_EQ(untouched, ConfirmAnswer::Yes)
+        << "a queued mutation of another ref must not refuse this one";
+    EXPECT_EQ(touched, ConfirmAnswer::Unknown)
+        << "the queued ref's own row is provisional";
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
+    EXPECT_EQ(store->confirmExactRef(ns, "other", id_other.ref), ConfirmAnswer::No);
+}
+
+
+/// The stale-row hazard rule 3 exists for, on the same ref: a repoint of x from m1 to m2 is DURABLE
+/// and NOT installed, so the committed row still says m1. A `Yes` here would let a receiver promote a
+/// manifest whose blobs the durable repoint may already have retired. The leader is parked at the
+/// SECOND `PostDurableInstall` of the repointing publish (the first is its precommit), with no lane
+/// mutex held; `pending` is already empty, so only the carved mirror can refuse.
+TEST(CASConfirmExactRef, SameRefRepointDurableButNotInstalledIsUnknown)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_stale_row"};
+    const ManifestId m1 = publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", m1.ref), ConfirmAnswer::Yes);
+
+    struct Hold
+    {
+        std::mutex m;
+        std::condition_variable cv;
+        int seen = 0;
+        bool parked = false;
+        bool released = false;
+    };
+    auto hold = std::make_shared<Hold>();
+    store->setCarveHookForTest([hold](CasRefLedger::CarvePhaseForTest phase)
+    {
+        if (phase != CasRefLedger::CarvePhaseForTest::PostDurableInstall)
+            return;
+        std::unique_lock lk(hold->m);
+        if (++hold->seen != 2)
+            return;   /// 1 = the precommit's chunk; 2 = the promote (the repoint) -- park here
+        hold->parked = true;
+        hold->cv.notify_all();
+        hold->cv.wait_for(lk, std::chrono::seconds(20), [&] { return hold->released; });
+    });
+
+    ManifestId m2;
+    std::thread repointer([&] { m2 = publishEmptyPart(store, ns, "x", /*allow_repoint=*/true); });
+    bool parked = false;
+    {
+        std::unique_lock lk(hold->m);
+        parked = hold->cv.wait_for(lk, std::chrono::seconds(20), [&] { return hold->parked; });
+    }
+    const size_t pending_now = store->refQueuePendingForTest(ns);
+    const size_t carved_now = store->refCarvedForTest(ns);
+    const RefLaneState lane_now = store->laneStateForTest(ns);
+    const ConfirmAnswer stale = store->confirmExactRef(ns, "x", m1.ref);
+    {
+        std::lock_guard lk(hold->m);
+        hold->released = true;
+    }
+    hold->cv.notify_all();
+    repointer.join();
+    store->setCarveHookForTest(nullptr);
+
+    ASSERT_TRUE(parked) << "the repoint never reached its post-durable window";
+    EXPECT_EQ(pending_now, 0u) << "the repoint was carved: pending cannot be what refuses";
+    EXPECT_EQ(carved_now, 1u) << "the carved mirror is what the confirm must read";
+    EXPECT_EQ(lane_now, RefLaneState::Writing);
+    EXPECT_EQ(stale, ConfirmAnswer::Unknown)
+        << "x's durable repoint is not installed: its row is stale and must not confirm m1";
+    EXPECT_EQ(store->confirmExactRef(ns, "x", m1.ref), ConfirmAnswer::No) << "installed: m1 is no longer x's binding";
+    EXPECT_EQ(store->confirmExactRef(ns, "x", m2.ref), ConfirmAnswer::Yes);
 }
 
 

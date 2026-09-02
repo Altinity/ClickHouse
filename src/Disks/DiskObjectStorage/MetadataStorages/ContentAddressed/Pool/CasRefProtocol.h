@@ -60,6 +60,10 @@ enum class RootMutationOrigin : uint8_t
 /// call touches. The flat-combining batch builder admits at most ONE mutation per ref name into a
 /// single flush (per-ref durable histories stay bit-identical to the unbatched protocol) and flushes
 /// `WholeShard` calls SOLO (dropNamespace and anything touching multiple refs wholesale).
+///
+/// It is also safety-bearing: `CasRefLedger::confirmExactRef` refuses to certify a ref while a queued
+/// or carved item's scope covers it, and `flushRefBatch` fails an item whose ops name a ref outside its
+/// declared scope, so a caller must name exactly the ref its ops mutate.
 struct MutationScope
 {
     enum class Kind : uint8_t { Ref, WholeShard };
