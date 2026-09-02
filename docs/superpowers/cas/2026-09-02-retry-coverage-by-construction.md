@@ -9,6 +9,13 @@ doc_type: 'design'
 
 # Making retry coverage structural {#retry-coverage-by-construction}
 
+> **Superseded (2026-09-03).** Proposals 1, 3 and 4 are absorbed into revision 5 of
+> `../specs/2026-09-02-cas-backend-token-contract-design.md`: `Backend` becomes private to
+> `CasRequests`, every call names a `Retry` policy, `ThrottlingBackend` gates the suite, and
+> control-plane reads move onto the single-attempt client under the CAS engine's deadline. Proposal 2
+> (an ambient context) was rejected there in favour of an explicit policy parameter with no default.
+> This note is kept as the argument; the spec is the design.
+
 Written 2026-09-02, after the [retry-coverage audit](/superpowers/cas/gcs-retry-coverage-audit-2026-09-02)
 found twenty-three production call sites issuing a conditional write with nothing above them that
 retries. The audit answers *where*; this note answers *how not to have to ask again*.
