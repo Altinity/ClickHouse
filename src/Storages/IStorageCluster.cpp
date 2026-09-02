@@ -86,14 +86,16 @@ IStorageCluster::IStorageCluster(
 
 void ReadFromCluster::applyFilters(ActionDAGNodes added_filter_nodes)
 {
+    /// Query plan optimizations run this multiple times as the plan is refined (e.g. a later
+    /// pass may insert another FilterStep above this source), so filter_actions_dag can still
+    /// grow richer after this call returns. The task/file list must not be built here: doing so
+    /// would freeze it against whatever predicate happens to be known at this arbitrary point in
+    /// the optimization sequence, silently dropping conditions that only become visible on a
+    /// later pass (this previously caused Iceberg partition/row-group pruning to under-prune for
+    /// queries whose plan needed extra passes, e.g. GROUP BY on the partition column). The
+    /// extension is instead built once, lazily, in initializePipeline() — the only point where
+    /// filter_actions_dag is guaranteed final — mirroring ReadFromObjectStorageStep::createIterator().
     SourceStepWithFilter::applyFilters(std::move(added_filter_nodes));
-
-    const ActionsDAG::Node * predicate = nullptr;
-    const ActionsDAG * filter = filter_actions_dag ? filter_actions_dag.get() : query_info.filter_actions_dag.get();
-    if (filter)
-        predicate = filter->getOutputs().at(0);
-
-    createExtension(predicate);
 }
 
 void ReadFromCluster::createExtension(const ActionsDAG::Node * predicate)
@@ -596,7 +598,12 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     if (current_settings[Setting::max_parallel_replicas] > 1)
         max_replicas_to_use = std::min(max_replicas_to_use, current_settings[Setting::max_parallel_replicas].value);
 
-    createExtension(nullptr);
+    /// Build off the final, fully-optimized filter_actions_dag — see the comment in applyFilters().
+    const ActionsDAG::Node * predicate = nullptr;
+    const ActionsDAG * filter = filter_actions_dag ? filter_actions_dag.get() : query_info.filter_actions_dag.get();
+    if (filter)
+        predicate = filter->getOutputs().at(0);
+    createExtension(predicate);
 
     ProfileEvents::increment(ProfileEvents::Shards, max_replicas_to_use);
 
