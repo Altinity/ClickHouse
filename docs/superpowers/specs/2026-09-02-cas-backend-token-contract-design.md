@@ -234,16 +234,16 @@ are several requests; `list` prefetches the next page; `stream` is lazy and may 
 client has its own redirect and credential loops.
 
 **And at the caller level: reading an object's metadata is one `GET`, not a `HEAD` and a `GET`.** Every
-caller that today does `head` then `get` on the same key collapses to `read`. There are two:
+caller that today does `head` then `get` on the same key collapses to `read`. There are two.
 `MountLeaseKeeper::claim` (`CasServerRoot.cpp:1462→1476`, two requests on its mint path and four on its
-adopt path, becoming one and two), and `CasManifestReader` (`CasManifestReader.cpp:65→87`), which is
-the one deliberate exception and stays partly as it is: its `HEAD` is a **cache validation** — it proves
-the live reference still names the cached incarnation, and a body is fetched only on a miss. Under this
-design a miss is one `read` instead of a `GET` after the `HEAD`; a hit stays one `HEAD` with no body,
-which is the cheap case. Collapsing hit and miss into one request each needs a conditional `GET` with
-`If-None-Match` — `304` on a hit, body on a miss — which `IObjectStorage` does not offer; filed upstream
-beside the retry policy. Every other `head`/`get` adjacency in the tree is either two different keys or
-a `head` followed by a `write` with no body wanted, which is `head`'s purpose.
+adopt path) becomes one and two. `CasManifestReader` (`CasManifestReader.cpp:65→87`) issues a `HEAD` on
+every read to validate its cache by token and to detect a dangling reference — but a manifest is
+written once under an id that is never reused, so the token in its cache key is redundant and the
+`HEAD` is per-read detection of a GC-side invariant. That is its own bounded change, decided and
+specified in `2026-09-02-cas-manifest-cache-by-id-design.md`: cache by id, no I/O on a hit, one `read`
+on a miss, and dangling-reference detection where it belongs, in GC before deletion and in fsck. It
+lands first and independently of this document. Every other `head`/`get` adjacency in the tree is either
+two different keys or a `head` followed by a `write` with no body wanted, which is `head`'s purpose.
 
 ## Assumptions {#assumptions}
 
@@ -334,8 +334,7 @@ response lacks an ETag (fake) throws `CAS_WRITE_UNATTRIBUTED`.
 2. After step 4: both `static_assert`s hold; `get`, `getStream`, `putIfAbsent`, `putOverwrite`,
    `casPut`, `deleteExact`, `Token`, `mintingTypeMatches` and the fallback `HEAD` no longer exist.
 3. No needless `HEAD`; `read` throws on drift; `parse` is called from exactly two sites; no caller
-   issues `head` and `read` on the same key in one operation, except `CasManifestReader`'s
-   validate-then-read-on-miss, which is named.
+   issues `head` and `read` on the same key in one operation.
 4. `remove` never reports `Mismatch` for any reason other than the store's own mismatch.
 5. The probe refuses a nameless-write store; a runtime nameless write is resolved by every controller
    method.
@@ -355,8 +354,7 @@ tests. Mechanical, its own commit.
 ## Out of scope {#out-of-scope}
 
 **Upstream:** `readSmallObjectAndGetObjectMetadata` consistent under retry; a per-request read retry
-policy in `IObjectStorage`; a conditional `GET` (`If-None-Match`) so cache validation is one request
-whether it hits or misses. Filed; not waited for.
+policy in `IObjectStorage`. Filed; not waited for.
 
 **Pre-existing, filed:** `PoolMeta::admitOrValidate`'s unbounded conflict loop; the read-then-freeze
 append's duplicate on post-commit exception; `resolved_by_get` under lockstep clones; recovery for an
