@@ -47,8 +47,9 @@ Proved on the real bucket with the `gcs_hmac` client, binary of 2026-09-02:
 
 - **[relink-confirm-lane-livelock] two replicas starve each other's fetch-by-relink confirms** — HARD /
   RELEASE GATE (data divergence, not data loss).
-  Design approved 2026-09-02: [relink confirm liveness design](/superpowers/specs/cas-relink-confirm-liveness-design)
-  (rule 3 refuses only a broken lane; gate 0 plus the part state machine carry the removal argument).
+  Design: [relink confirm liveness design](/superpowers/specs/cas-relink-confirm-liveness-design),
+  revision 2 (rule 3 refuses only the SENT transaction that touches the queried ref, read from
+  `append_attempt`; revision 1's gate-0 argument was refuted in review by the live-repoint trace).
 
 **What happened.** After the connect storm both replication queues wedged with
 `NO_REPLICA_HAS_PART: Source ... did not prove it still holds the manifest it offered ... by relink`;
@@ -77,12 +78,13 @@ them. The hazard is exactly the interval "durable, not yet applied". A `pending`
 and a `PUT` still in flight are not durable and do not break the T1 < T2 argument; today's rule
 refuses far more than the argument requires.
 
-**Decision (2026-09-02, spec above).** Rule 3 refuses only a broken lane (`Wedged`, `NeedsRecovery`,
-`Closed`, `Faulted`). The removal hazard is carried by gate 0 and the part state machine: the only
-entry to physical removal is `asMutableDeletingPart` (`Deleting`/`DeleteOnDestroy` only), the ref drop
-lives inside `remove()`, and renames go through `republishRef` publish-then-drop. Verified path by
-path in code before the decision; the TLA+ model must carry the part state and the ordering before
-code, and the two-model consult is mandatory.
+**Decision (2026-09-02, spec revision 2).** Rule 3 refuses on `Writing`/`Wedged` only when the sent
+transaction (`RefTableRuntime::append_attempt`, armed before the first send and swapped out at install)
+touches the queried ref or the whole namespace; `NeedsRecovery`/`Closed`/`Faulted` refuse for all;
+`pending` and `leader_active` no longer refuse. `RefAppendAttempt` gains the touched-ref set, filled
+where the attempt is built. Revision 1 (gate 0 + part state machine) was refuted in review: a live
+repoint through `publishStaging` → `repointRef` retires a blob edge while the part stays `Active`, the
+model's `_sab_stalecache` trace. TLA variant and the two-model consult are mandatory before code.
 
 **Options considered.**
 
