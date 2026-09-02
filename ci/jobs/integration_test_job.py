@@ -1405,7 +1405,11 @@ tar -czf ./ci/tmp/logs.tar.gz \
         test_results.extend(test_result_parallel.results)
         _mark_infrastructure_errors(test_result_parallel.results)
         failed_test_cases.extend(
-            [t.name for t in test_result_parallel.results if t.is_failure()]
+            [
+                t.name
+                for t in test_result_parallel.results
+                if t.is_failure() and ".py" in t.name
+            ]
         )
         if test_result_parallel.files:
             failed_tests_files.extend(test_result_parallel.files)
@@ -1447,7 +1451,11 @@ tar -czf ./ci/tmp/logs.tar.gz \
             test_results.extend(test_result_sequential.results)
             _mark_infrastructure_errors(test_result_sequential.results)
             failed_test_cases.extend(
-                [t.name for t in test_result_sequential.results if t.is_failure()]
+                [
+                    t.name
+                    for t in test_result_sequential.results
+                    if t.is_failure() and ".py" in t.name
+                ]
             )
             if test_result_sequential.files:
                 failed_tests_files.extend(test_result_sequential.files)
@@ -1557,8 +1565,10 @@ tar -czf ./ci/tmp/logs.tar.gz \
             if Path("./ci/tmp/docker-in-docker.log").exists():
                 attached_files.append("./ci/tmp/docker-in-docker.log")
 
-    # Rerun failed tests if any to check if failure is reproducible
-    if 0 < len(failed_test_cases) < 10 and not (
+    # Rerun failed tests if any to check if failure is reproducible.
+    # Skip after a session-timeout: the synthetic `Timeout` row is not a pytest
+    # node, and a further 7000s retry on an already over-budget job is wasted.
+    if 0 < len(failed_test_cases) < 10 and not timed_out and not (
         is_flaky_check or is_bugfix_validation or is_targeted_check or info.is_local_run
     ):
         test_result_retries, _ = run_pytest_and_collect_results(
