@@ -295,7 +295,7 @@ void tryAddClusterWrapFilter(QueryPlan & query_plan, const TableExpressionData &
     filter_dag = ActionsDAG::merge(std::move(rename_dag), std::move(filter_dag));
     source->addFilter(std::move(filter_dag), filter_column_name);
     /// Wrap subquery planning already called `applyFilters` with no predicate.
-    /// Apply now so icebergCluster listing is recreated with the WHERE.
+    /// Apply now so `ReadFromCluster` can keep the copied `WHERE` for listing.
     source->SourceStepWithFilterBase::applyFilters();
 }
 

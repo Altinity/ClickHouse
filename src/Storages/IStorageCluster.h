@@ -173,12 +173,10 @@ private:
     LoggerPtr log;
 
     std::optional<RemoteQueryExecutor::Extension> extension;
-    bool extension_has_predicate = false;
-    UInt64 extension_filter_hash = 0;
-    bool extension_used_in_pipeline = false;
+    std::shared_ptr<const ActionsDAG> listing_filter_dag;
     std::optional<Tables> external_tables;
 
-    void createExtension(const ActionsDAG::Node * predicate);
+    void createExtension();
     ContextPtr updateSettings(const Settings & settings);
 };
 
