@@ -2687,8 +2687,9 @@ namespace
 {
 /// The first ref name `op` mutates that differs from `scope_ref`, or nullptr when every name it
 /// carries is `scope_ref` or it carries none (`NamespaceBirth`, `RemoveNamespace` and `EpochSeal` are
-/// namespace-level and belong to no ref). Both bindings of an `OwnerTransition` count: a promotion
-/// names the ref twice and a rename-shaped transition would name two refs.
+/// namespace-level and belong to no ref). Both bindings of an `OwnerTransition` count -- a promotion
+/// names the ref twice -- because this check runs before the transition's shape is validated, so
+/// either binding may still carry any name at this point.
 const String * refNamedOutsideScope(const RefOp & op, const String & scope_ref)
 {
     if (op.kind == RefOpKind::OwnerTransition)

@@ -2,6 +2,8 @@
 
 #include "config.h"
 
+#include <base/defines.h>
+
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
@@ -36,6 +38,7 @@ namespace DB::ErrorCodes
 extern const int LIMIT_EXCEEDED;
 extern const int CORRUPTED_DATA;
 extern const int NETWORK_ERROR;
+extern const int LOGICAL_ERROR;
 }
 
 namespace ProfileEvents
@@ -245,9 +248,9 @@ TEST(CASRefWriterChunkedFlush, OversizedItemFailsAlone)
     auto sync = std::make_shared<CaseSync>();
     armPreCarveBlock(store, ns, sync, 2);
 
-    /// `fillerOps` builds default `NamespaceBirth` ops that name no ref, so the item's scope names a ref
-    /// its ops never mention -- harmless here because step 1's op-count cap rejects the item before the
-    /// scope is ever checked against its ops (step 3).
+    /// `fillerOps` returns default `RefOp{}` of kind `NamespaceBirth`, which names no ref, so the
+    /// item's scope name is never compared against anything and the scope check (step 3) would pass
+    /// this item even with the op-count cap removed -- the cap is what's under test here, not the scope.
     Caller oversized = launchAppend(store, ns, MutationScope::ref("oversized"),
         [](const RefTableState &) -> std::vector<RefOp> { return fillerOps(ref_txn_max_ops + 1); });
     waitEntered(sync);
@@ -304,6 +307,49 @@ TEST(CASRefWriterChunkedFlush, OversizedOpFailsItsItemAlone)
     EXPECT_TRUE(neighbor_err == nullptr) << "the co-batched neighbor must commit despite the oversized op";
     EXPECT_FALSE(store->resolveRef(ns, "neighbor").has_value()) << "neighbor's drop must have committed";
 }
+
+/// Per-item isolation of the `MutationScope` validation (`CasRefLedger.cpp`'s `flushRefBatch` step 3):
+/// a mis-scoped item co-batched with an innocent neighbor must fail ALONE, and the neighbor's mutation
+/// must COMMIT -- not merely avoid throwing -- exactly the batch-isolation shape
+/// `OversizedOpFailsItsItemAlone` proves for the step-1 admission caps. Release-arm only: in a debug or
+/// sanitizer build the mis-scoped item's `LOGICAL_ERROR` aborts the whole process, taking the co-batched
+/// neighbor down with it before either assertion can run.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASRefWriterChunkedFlush, MisScopedItemFailsAloneNeighborCommits)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/chunked_misscoped"};
+    publishEmptyPart(store, ns, "neighbor");
+    ASSERT_TRUE(store->resolveRef(ns, "neighbor").has_value());
+
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "y", ManifestRef{900000004, 1, 1}};
+
+    auto sync = std::make_shared<CaseSync>();
+    armPreCarveBlock(store, ns, sync, 2);
+
+    Caller misscoped = launchAppend(store, ns, MutationScope::ref("x"),
+        [add](const RefTableState &) -> std::vector<RefOp> { return {add}; });
+    waitEntered(sync);
+    Caller neighbor = launchDrop(store, ns, "neighbor");
+    waitPendingAtLeast(store, ns, 2);
+    sync->cv.notify_all();
+
+    ASSERT_EQ(misscoped.fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "mis-scoped item must not hang";
+    ASSERT_EQ(neighbor.fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "neighbor must not hang";
+    const std::exception_ptr misscoped_err = misscoped.fut.get();
+    const std::exception_ptr neighbor_err = neighbor.fut.get();
+    misscoped.t.join();
+    neighbor.t.join();
+    store->setRefPreCarveHookForTest(nullptr);
+
+    expectFailedWithCode(misscoped_err, DB::ErrorCodes::LOGICAL_ERROR, "mis-scoped item");
+    EXPECT_TRUE(neighbor_err == nullptr) << "the co-batched neighbor must commit despite the mis-scoped item";
+    EXPECT_FALSE(store->resolveRef(ns, "neighbor").has_value()) << "neighbor's drop must have committed";
+}
+#endif
 
 /// Test 12, canonical round-trip leg: the maximum legally-admissible normal-class transaction under
 /// the new counts-only caps -- `ref_txn_max_ops` ops, each padded to exactly `ref_op_max_bytes` --
