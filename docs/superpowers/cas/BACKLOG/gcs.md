@@ -223,7 +223,11 @@ mention it yet.
   with no retry above the single-attempt profile** — HARD for GCS, and the mechanism behind F12.
 
 Full audit, twenty-one object kinds with their coverage and twelve gaps by severity:
-[GCS retry-coverage audit](/superpowers/cas/gcs-retry-coverage-audit-2026-09-02).
+[GCS retry-coverage audit](/superpowers/cas/gcs-retry-coverage-audit-2026-09-02). How to stop having
+to find these by inspection, in four changes ordered by payoff:
+[making retry coverage structural](/superpowers/cas/retry-coverage-by-construction) — the first of
+them, private virtuals plus a controller-only handle, turns every future omission into a compile
+error and needs no change to any backend implementation or test double.
 
 **The three states, which must not be conflated.** A CAS request is either driven by
 `CasRequestController` (up to 16 attempts inside a 90 s deadline, capped-exponential backoff, and an
