@@ -104,7 +104,7 @@ what it is, an availability filter that happens to be exact for removals.
 
 **`carved`.** The confirm can see `rt.pending`, but the carve moves items out of it: in one continuous
 `ref_queue_mutex` hold the leader copies the selected front items into its local `owned_items` and pops
-them (`CasRefLedger.cpp:2917-2935`), and they are completed and erased only at the tenure's exit guard,
+them (`CasRefLedger.cpp:2881-2935`), and they are completed and erased only at the tenure's exit guard,
 also under `ref_queue_mutex` (`:2146-2166`). Between carve and completion a mutation is invisible to
 anyone holding only the runtime. The runtime gains `rt.carved`, a vector of the same
 `shared_ptr<RefMutationItem>`s, appended at the carve and cleared at the exit guard. Items of a chunk
@@ -115,11 +115,16 @@ send stay in it too: both are over-refusal for one tenure, never under-refusal. 
 produces `Wedged`, which refuses by lane state.
 
 **Scope validation.** `MutationScope` becomes safety-bearing, so it is checked where it was a hint
-before: in `flushRefBatch` step 3 (`:3060-3120`, before anything durable) a `Ref{name}` item whose
+before: in `flushRefBatch` step 3 (`:3045-3120`, before anything durable) a `Ref{name}` item whose
 built ops carry an `OwnerTransition` binding or a `SetPublishedAt` for a different ref fails, that item
-only, with `LOGICAL_ERROR`. Every production caller already passes the exact ref its ops mutate; the
-only offender in the tree is a test helper (`gtest_cas_confirm_exact_ref.cpp:554-557`, one item over
-1500 refs declared as `Ref{prefix}`), which is rewritten to one ref with 1500 manifests.
+only, with `LOGICAL_ERROR`. Every production caller already passes the exact ref its ops mutate. The
+tests do not: an untruncated grep of `MutationScope::ref(` over `src/Disks/tests` finds one item over
+1500 refs declared as `Ref{prefix}` in `gtest_cas_confirm_exact_ref.cpp:554-557` and five more in
+`gtest_cas_ref_chunked_flush.cpp` (`:594-598`, `:703-705`, `:826-828`, `:889-891`, each `item_a`/`item_b`
+over `aaa_`/`bbb_` pairs), all rewritten to one ref with many distinct manifests, which `AddPrecommit`
+admits (`CasRefProtocol.cpp:246-260`); the two oversized-item sites (`:248`, `:285`) are rejected by the
+step-1 caps before step 3 and are aligned anyway. In debug and sanitizer builds a `LOGICAL_ERROR` aborts
+the process, so any offender left behind kills the `CAS*` gate at its first flush.
 
 Nothing else changes: no new field on the attempt, no new argument on `appendRefOps`, no part-object
 flag, no wait, no timer.
@@ -201,8 +206,10 @@ of m1's blobs, hold the leader after the `PUT` and before install with the exist
 receiver's `+1` late, assert `Unknown`); the liveness case (a tenure held open for another ref while a
 confirm about an untouched committed ref answers `Yes`); `carved` bookkeeping (an item is visible from
 carve to completion, and a completed tenure leaves `carved` empty); and scope validation (a `Ref{X}`
-item whose ops name Y fails before durability, with `LOGICAL_ERROR`). The rule 2, 5 and 6 tests are
-unchanged. The file header at `:40-46`, which says no `Yes` may coexist with an admitted removal, is
+item whose ops name Y fails before durability). The last one follows the tree's debug split for
+`LOGICAL_ERROR`: `EXPECT_THROW` with a code check under `#ifndef DEBUG_OR_SANITIZER_BUILD`, `EXPECT_DEATH`
+under `#if defined(DEBUG_OR_SANITIZER_BUILD)`, as `gtest_cas_promote_republish.cpp:293-337` does. The
+rule 2, 5 and 6 tests are unchanged. The file header at `:40-46`, which says no `Yes` may coexist with an admitted removal, is
 rewritten: no `Yes` may coexist with an admitted mutation *of that ref*.
 
 `test_cas_gcs` (fake GCS) gains a two-node case with delayed `_ckpt` writes: continuous inserts on both,

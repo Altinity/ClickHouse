@@ -490,7 +490,7 @@ REQUEST CHANGES — define an explicit durable/install phase for both transactio
 
 REQUEST CHANGES — correct the `sPending`-to-phase mapping and poison/fence transitions; restrict certification to `Ready` or non-touching `Writing`/`Wedged` while always refusing broken lanes; fully specify `CaRefLaneCore` touch propagation, identity-row updates, and `SabotageNoFence`; and add companion-module witnesses for certification during a non-touching outstanding attempt.
 
-## Claude consult (fresh agent), revision 7: REQUEST CHANGES, the wedge hole {#claude-consult-rev7}
+## Claude consult (fresh agent), revision 7: REQUEST CHANGES; revision 8 check: APPROVE WITH NITS {#claude-consult-rev7}
 
 ### Consult: F11 spec revision 7 (`2026-09-02-cas-relink-confirm-liveness-design.md`) {#consult-f11-spec-revision-7-2026-09-02-cas-relink-confirm-li}
 
@@ -710,3 +710,102 @@ to finding 5. Lane-model sentences are consistent with `Certify` (`CaRefLaneCore
   ledger's for the F11 window only; a wedge under chaos would cost that namespace's confirms until
   its next flush, which under write load is immediate.
 - The LIST-completeness caveat is unchanged and outside this design, as the spec says.
+
+---
+
+### Revision 8 check (commit `82eb144fadf`) {#revision-8-check-commit-82eb144fadf}
+
+#### Verdict: APPROVE WITH NITS {#verdict-approve-with-nits}
+
+The safety argument is closed. Every required change from the revision 7 report is present in the
+text and matches the code it cites. Two new defects, both in the test plan, must be fixed in the
+spec before a plan is written from it; neither reopens the design.
+
+#### Required changes from revision 7: status {#required-changes-from-revision-7-status}
+
+| # | Required change | Rev 8 | Where |
+|---|---|---|---|
+| 1 | `Wedged` refuses table-wide; rule 3 first line `!= Ready && != Writing` | closed | `:79-80`, `:91-97` |
+| 1 | optional self-check `Writing && carved.empty() -> Unknown` | closed | `:81-82` |
+| 1 | wedged-item paragraph and `forceWedgeForTest` change removed | closed | `:114-115` |
+| 2 | scope validation in `flushRefBatch` step 3, `LOGICAL_ERROR`, offending item only | closed | `:117-122` |
+| 2 | confirm-test helper rewritten to one ref, 1500 manifests | closed | `:121-122` |
+| 2 | `MutationScope` comment in the docs list | closed | `:241-242` |
+| 3 | "`Writing` no longer refuses by itself" | closed | `:91-92` |
+| 3 | `sPending`/`carved` equivalence restated; wedge = `sPoison` | closed | `:161-163` |
+| 3 | wedge sibling test expects `Unknown` for both refs | closed | `:193-197` |
+| 3 | lane models exempt only `Writing` | closed | `:167-170` |
+| 3 | counters gain `LaneWedged` | closed | `:212`, `:226` |
+| 4 | rule attribution inside the ledger, no API widening | closed | `:213-215` |
+| 5 | `SenderApply` guard shape-aware | closed | `:156-157` |
+| 6 | `carve_all_pending` arms need no mirror | closed | `:112-114` |
+
+Verified against the code, not only the text: the self-check's "cannot happen" (`:82`) holds today.
+`Writing` is set only at `CasRefLedger.cpp:3593`, inside `commitRefChunk`, which is reached only
+after a non-empty carve (`:2934`), and every exit from `Writing` is a lane transition (list in the
+revision 7 report, finding 1). The helper rewrite is feasible: `AddPrecommit` requires only that the
+exact `(ref, manifest)` is absent and the manifest has no other owner (`CasRefProtocol.cpp:246-260`),
+which sequential add/remove pairs on one ref with distinct manifests satisfy.
+
+#### New findings {#new-findings}
+
+##### R8-1. PROSE, Major: "the only offender in the tree is a test helper" is false {#r8-1-prose-major-the-only-offender-in-the-tree-is-a-test-hel}
+
+`:120-122` claims the confirm-test helper is the only `Ref{X}` item whose ops touch other refs.
+Untruncated grep of `MutationScope::ref(` over `src/Disks/tests/` finds five more, all in
+`gtest_cas_ref_chunked_flush.cpp`, all the same shape (`Ref{"item_a"}` over
+`addRemovePrecommitPairs("aaa_", ...)`, which builds bindings on `aaa_ref_000000` and so on,
+`:461-479`):
+
+- `:594-598` (`item_a`/`item_b`/`item_c` over `aaa_`/`bbb_`/`ccc_` pairs, `:580-582`)
+- `:703-705`
+- `:826-828`
+- `:889-891`
+
+With the scope validation as specified, each of these items fails with `LOGICAL_ERROR`, which in a
+debug or sanitizer build aborts the process (`Exception.cpp:88-92`), so the whole `CAS*` gate binary
+dies at the first of them. These tests exist to exercise chunking, so they need co-batched items with
+distinct scopes; the fix is the same as for the confirm-test helper: one ref per item, distinct
+manifests. Add the five sites to `:120-122` and to the tests section.
+
+Two more sites are safe only by ordering, worth aligning anyway: `:248` (`Ref{"oversized"}` over
+`fillerOps`, default `RefOp{}` = `NamespaceBirth`, not a checked kind) and `:285`
+(`Ref{"oversized_op"}` over a `SetPublishedAt` whose `ref_name` is a padded string, `:164-166`). Both
+items fail the step-1 caps (`:2977-2992`) before step 3 runs. If the check is ever moved ahead of the
+caps, `:285` breaks. Cheapest is to give that item the scope its op names.
+
+Every other test-side `Ref{X}` verified consistent: `gtest_cas_ref_lane_exception_safety.cpp:60,
+129, 202` (empty ops), `gtest_cas_ref_recovery_cas_walk.cpp:443, 459` and siblings (`"a"`/`"b"`
+match `publishCommittedOps`), `gtest_cas_part_write.cpp:1700` (`"part_1"` matches), and the five
+`publishRef`/`publishBirth` helpers in `gtest_cas_ref_ckpt.cpp:76`,
+`gtest_cas_ref_catalog_birth_wiring.cpp:107`, `gtest_cas_detached_work.cpp:269, 284`,
+`gtest_cas_ref_snapshot_publish_ordering.cpp:70`, `gtest_cas_ref_contiguous_alloc.cpp:146` (`ref`
+matches; `NamespaceBirth` is not a checked kind, correctly, since `precommitAdd` emits it under a
+`Ref` scope at `CasPartWriteTxn.cpp:693-700`).
+
+##### R8-2. TEST, Major: the scope-validation gtest must be a death test in debug and sanitizer builds {#r8-2-test-major-the-scope-validation-gtest-must-be-a-death-t}
+
+`:203-204` says the new test asserts the item "fails before durability, with `LOGICAL_ERROR`". A
+`LOGICAL_ERROR` constructed in a debug or sanitizer build aborts (`Exception.cpp:88-92`); the abort
+happens on the leader thread when `complete_error`'s exception object is built, exactly as for the
+existing exit-guard and `!attempt_armed` arms (`:2153`, `:3610`). The file must use the established
+split: `EXPECT_THROW` plus a code check under `#ifndef DEBUG_OR_SANITIZER_BUILD`, `EXPECT_DEATH`
+under `#if defined(DEBUG_OR_SANITIZER_BUILD)` (pattern at
+`gtest_cas_promote_republish.cpp:293-337`). Say so in the tests section, or the first debug gate run
+is red. `LOGICAL_ERROR` remains the right class: the mismatch is reachable only through an in-tree
+caller, never through input.
+
+##### R8-3. PROSE, Minor: three citations drifted {#r8-3-prose-minor-three-citations-drifted}
+
+- `:107` "`CasRefLedger.cpp:2917-2935`" for the carve: the block runs `:2876-2933` (`batch` declared
+  at `:2876`, `if (batch.empty())` at `:2934`).
+- `:118` "step 3 (`:3060-3120`)": the step-3 comment starts at `:3045`.
+- `:94` "`:3993-4006`" is right (`Wedged` at `:3997`, counter at `:3999`); "`:3634-3644`" is right.
+
+#### Limits {#limits}
+
+- Text and cited code lines were checked; nothing was run. R8-1 predicts that the five
+  `gtest_cas_ref_chunked_flush.cpp` sites fail once the scope check lands; the implementer's first
+  gate run is the experiment.
+- I did not re-derive the lane-window coverage; revision 8 changes rule 3 exactly as the revision 7
+  report required and adds no new state or path.
