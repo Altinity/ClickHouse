@@ -11,6 +11,11 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
+# S3Queue starts listing the empty MinIO prefix as soon as CREATE succeeds.
+# AWSClient logs the 404 at Error; the harness default `send_logs_level=warning`
+# forwards that onto stderr and fails the test even though CREATE is fine.
+CLICKHOUSE_CLIENT=$(echo "${CLICKHOUSE_CLIENT}" | sed "s/--send_logs_level=${CLICKHOUSE_CLIENT_SERVER_LOGS_LEVEL}/--send_logs_level=fatal/g")
+
 DB="$CLICKHOUSE_DATABASE"
 TABLE="s3queue_creds_${DB}"
 NC="s3queue_creds_nc_${DB}"
