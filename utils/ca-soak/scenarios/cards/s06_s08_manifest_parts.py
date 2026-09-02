@@ -244,15 +244,37 @@ class S06(Scenario):
 
             cl.node1.command("SYSTEM DROP MARK CACHE")
             cl.node1.command("SYSTEM DROP UNCOMPRESSED CACHE")
+            scan_comment = f"s06_allcol_scan_{ctx.timestamp}"
             cw2 = _common.counters_window(ctx)
             try:
                 cl.node1.query(
                     f"SELECT sum(cityHash64(*)) FROM {table} "
-                    f"SETTINGS max_threads=1 FORMAT TabSeparated")
+                    f"SETTINGS max_threads=1, log_comment='{scan_comment}' FORMAT TabSeparated")
             except Exception as e:
                 ctx.log(f"S06: all-column scan raised: {e}")
             all_delta = cw2().get("_total", {})
             all_gets = all_delta.get("DiskS3GetObject", 0)
+
+            # Manifest reads on a scan pay no HEAD: the decode cache is keyed by id and a hit is served
+            # without a request. Attributed to the scan through its own query_log row rather than a
+            # wall-clock counter window, because the orphan sweep and fsck legitimately HEAD manifest
+            # keys and a background GC round may overlap the window. A missing row is a harness
+            # failure, not a pass.
+            cl.node1.command("SYSTEM FLUSH LOGS")
+            scan_heads_txt = cl.node1.query(
+                "SELECT ProfileEvents['CASManifestHead'] FROM system.query_log "
+                f"WHERE log_comment = '{scan_comment}' AND type = 'QueryFinish' "
+                "ORDER BY event_time_microseconds DESC LIMIT 1 FORMAT TabSeparated").strip()
+            if scan_heads_txt == "":
+                raise RuntimeError(f"S06: no QueryFinish row for log_comment={scan_comment!r} in system.query_log")
+            scan_manifest_heads = int(scan_heads_txt)
+            result.observations["s06_allcol_CASManifestHead"] = scan_manifest_heads
+            result.add(Verdict.check(
+                "scan issues no manifest HEAD",
+                "CASManifestHead == 0 for the all-column scan",
+                f"CASManifestHead={scan_manifest_heads}", scan_manifest_heads == 0,
+                "" if scan_manifest_heads == 0
+                else "a read-only scan issued manifest HEADs: a decode-cache hit is not being served without a request"))
 
             result.observations["s06_subset_DiskS3GetObject"] = subset_gets
             result.observations["s06_allcol_DiskS3GetObject"] = all_gets
