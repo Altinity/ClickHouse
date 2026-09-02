@@ -11,7 +11,7 @@ doc_type: 'reference'
 
 Verbatim reports produced while the design in
 [relink confirm liveness](/superpowers/specs/cas-relink-confirm-liveness-design) moved from revision 1
-to revision 6. Kept because the spec cites them and because two of them contain the evidence walks
+to revision 8. Kept because the spec cites them and because two of them contain the evidence walks
 (attempt lifetime, committed-ref mutation inventory) that the spec summarises. Model names and effort:
 codex `gpt-5.6-sol` at high reasoning, read-only sandbox; the Claude consult is an independent `ca-arch`
 agent with no access to the codex transcripts. Line numbers refer to the tree at the time of each round.
@@ -489,3 +489,224 @@ REQUEST CHANGES — define an explicit durable/install phase for both transactio
    The plan now correctly says three modules, gives the composition its own touch observable, and names both `run_reflane.sh` and `run_relinklane.sh`.
 
 REQUEST CHANGES — correct the `sPending`-to-phase mapping and poison/fence transitions; restrict certification to `Ready` or non-touching `Writing`/`Wedged` while always refusing broken lanes; fully specify `CaRefLaneCore` touch propagation, identity-row updates, and `SabotageNoFence`; and add companion-module witnesses for certification during a non-touching outstanding attempt.
+
+## Claude consult (fresh agent), revision 7: REQUEST CHANGES, the wedge hole {#claude-consult-rev7}
+
+### Consult: F11 spec revision 7 (`2026-09-02-cas-relink-confirm-liveness-design.md`) {#consult-f11-spec-revision-7-2026-09-02-cas-relink-confirm-li}
+
+Independent adversarial read of revision 7 against the code on `cas-gc-rebuild`. Read-only. I did not read
+`tmp/` or the consults document.
+
+#### Verdict: REQUEST CHANGES {#verdict-request-changes}
+
+One CODE-level hole (finding 1) reopens the `_sab_stalecache` hazard for the wedged lane. Everything
+else in the design holds against the code. The fix is one line in rule 3 plus the prose that rests on
+the false premise.
+
+#### Failure asymmetry, stated first {#failure-asymmetry-stated-first}
+
+- Over-refusing costs the receiver one retry-later (`NO_REPLICA_HAS_PART`, `DataPartsExchange.cpp:1554-1562`).
+- Under-refusing lets a receiver promote a manifest whose blob GC may already have deleted
+  (`CaRelinkConfirmCore_RESULTS.md:126-142`, `_sab_stalecache`). Not recoverable by a retry.
+
+So every doubt below is resolved toward refusal. The F11 evidence itself bounds what liveness needs:
+the ledger records `wedged_namespace_count` 0 throughout the livelock
+(`2026-09-02-gcs-live-validation-ledger.md:160`). Wedges were not the cause; `pending`/`leader_active`
+were. A fix that keeps `Wedged` refusing loses nothing F11 needs.
+
+#### Findings {#findings}
+
+##### 1. CODE, Critical: a wedged transaction is in neither `pending` nor `carved`, and rev 7 stops `Wedged` from refusing {#1-code-critical-a-wedged-transaction-is-in-neither-pending-n}
+
+The spec claims (`:102-105`): "A wedged or unresolved item is not `done`, so it stays in `carved` and
+keeps refusing for its ref until resolution or `NeedsRecovery`." The code does the opposite. Both
+`Unresolved` arms of `commitRefChunk` complete the chunk's items with an error *before returning*:
+
+- exception path: `CasRefLedger.cpp:3634-3644` sets `Writing -> Wedged` under `state_mutex`, then
+  `complete_error(chunk_survivors, write_error)` (`done = true`, `:3243-3251`);
+- outcome path: `CasRefLedger.cpp:3993-4006` sets `Wedged`, then `complete_error(chunk_survivors, ...)`.
+
+The leader then exits and the exit guard (`:2146-2166`), where the spec clears `carved`, runs. Result:
+lane `Wedged`, `append_attempt` holds a transaction that *may be durable*, the committed row does not
+reflect it, `pending` and `carved` are empty for that ref. Under rev 7's rule 3 (`:77-85`) nothing
+refuses. A confirm about the wedged ref reads the stale row and answers `Yes`.
+
+This is exactly the hazard in §safety: the wedged transaction can be a removal or repoint of P that
+landed; GC folds durable objects, not cached rows. The window is unbounded by design: there is no
+background retry, the wedge waits for the next flush of that namespace or a remount
+(`CasRefLedger.h:1132-1137`, `CasRefLedger.cpp:2371-2375`). Between the wedge and its adoption
+(`:2534`) every confirm about the wedged ref is a `Yes` off a stale row.
+
+Prediction that confirms the mechanism: the spec's own proposed sibling test (`:172-177`, real wedge
+via `ChunkFaultBackend::Mode::Unresolved`, "the wedged ref answers `Unknown`") fails against a faithful
+implementation of rev 7, because the wedged item is `done` and `carved` is empty. The test is right;
+the design does not deliver it.
+
+The same gap exists in the model text (`:142-143`): "the model's `sPending` spans admission to apply,
+which is exactly the interval `pending` plus `carved` covers in the code". False on the wedge path,
+where `pending` plus `carved` end at `complete_error` while durability is still unknown.
+
+**Required change (minimum, recommended):** keep `Wedged` as a table-wide refusal. Rule 3's first line
+becomes `lane_state != Ready && lane_state != Writing -> Unknown`. `Writing` is safe to exempt because
+the chunk's items are in `carved` and not `done` from carve until the install swap at `:3855-3859`
+(`done` follows the install at `:3900-3908`), and every exit from `Writing` is a lane transition
+(`Ready` `:3859`/`:3925`/`:3969`, `Wedged` `:3641`/`:3997`, `NeedsRecovery` `:3778`/`:3787`/`:3813`/`:3846`,
+`Closed` `:3711`, `Faulted` `:3689`/`:3737`). No new state, no allocation after the send, matches
+today's behaviour for the state F11 never touched. In the confirm-core model `Wedged` maps onto the
+existing `sPoison` semantics ("tenure closed, row stale, only a lane-state refusal can see it"); no new
+model state is needed for it.
+
+**Alternative (only if wedge-time liveness for unrelated refs is wanted):** record the chunk's scopes on
+`RefAppendAttempt` in `prepareRefChunk` (`:3212-3215`, pre-send, so §A1 holds) and have rule 3 read
+`rt.append_attempt->scopes` whenever the attempt is set. That makes `carved` unnecessary (between carve
+and arming nothing has been sent, so the row is current) and is what the spec's lane-core sentence
+("touch derived from `attempt.binding`", `:149-150`) actually describes. It is a larger change and
+reintroduces the send/arm phase reasoning rev 7 set out to remove. Either is sound; do not ship neither.
+
+##### 2. CODE, Major: `MutationScope` becomes safety-bearing but nothing checks it against the ops {#2-code-major-mutationscope-becomes-safety-bearing-but-nothin}
+
+Today the scope is a batching hint (`CasRefProtocol.h:56-60`, `CasRefLedger.cpp:2870-2935`); a wrong
+scope costs a duplicate-ref batch cut at worst. Under rev 7 a `Ref{X}` item whose `build_ops` mutates
+Y is a stale-cache hole for Y. No site validates the declared scope against the emitted ops. The tree
+already contains such an item: `gtest_cas_confirm_exact_ref.cpp:554-557` declares
+`MutationScope::ref(prefix)` for an item whose ops touch `prefix + i` for 1500 refs
+(`precommitAddRemovePairs`, `:180-198`). Harmless today, a counterexample to the design's invariant
+tomorrow.
+
+Audit of production callers (question A), all consistent:
+`CasPartWriteTxn.cpp:657` (precommit add + optional `NamespaceBirth`, binding on `final_ref_name`),
+`:769` (promote: old-committed removal, precommit->committed transition, `SetPublishedAt`, all
+`final_ref_name`, `:900-920`), `:1044` (precommit removal of `precommit_final_ref`);
+`CasPool.cpp:1524` (precommit removal of `duty->ref_name`); `PartFolderAccess.cpp:660` (committed
+removal of `key.ref`); `CasRefLedger.cpp:4672` (`wholeShard`, many precommit removals), `:4729`
+(committed removal of `ref_name`), `:4772` (`SetPublishedAt` on `ref_name`), `:5149` (`wholeShard`,
+whole-namespace removal). `republishRef` (`PartFolderAccess.cpp:506-535`) is two separate appends,
+destination promote via `publishEntries` then `dropRef(src)`, each with its own scope. No binding
+change happens outside these three installers of `rt->state`: recovery `:1625`, wedge adoption
+`:2534`, commit `:3855`.
+
+**Required change:** in `flushRefBatch` step 3 (`CasRefLedger.cpp:3060-3120`, pre-durability), for a
+`Kind::Ref` item, fail the item (`LOGICAL_ERROR`, fail-closed, only that item) if any
+`OwnerTransition` binding's `ref_name` or any `SetPublishedAt.ref_name` differs from
+`scope.ref_name`. Add a gtest. Adapt `MidTenureChunkBoundaryIsUnknown`'s helper to a single-ref item
+(same ref, 1500 distinct manifests; precommits are keyed by `(ref, manifest)`, `:4661`) so two items
+still co-batch and chunk. Update the `MutationScope` doc comment (`CasRefProtocol.h:56-60`), which is
+missing from the spec's docs list.
+
+##### 3. PROSE, Major: spec sentences that rest on finding 1's false premise {#3-prose-major-spec-sentences-that-rest-on-finding-1-s-false-}
+
+- `:88-89` "`Writing` and `Wedged` no longer refuse by themselves" -> only `Writing`.
+- `:102-105` the wedged-item paragraph -> replace with: a wedged transaction's items are completed
+  with an error before the tenure ends; the lane state carries the refusal.
+- `:104-105` `forceWedgeForTest` pushing a `WholeShard` item into `carved` -> unnecessary; the seam
+  stays as it is (`:1866-1878`).
+- `:142-143` the `sPending`/`carved` equivalence -> `pending` plus `carved` cover the non-wedged tenure;
+  `Wedged` is covered by the lane state (model: `sPoison`).
+- `:172-177` sibling test -> with a real wedge, *both* the wedged ref and the unrelated ref answer
+  `Unknown`; the wedged ref by lane state, the unrelated ref because the lane state is table-wide.
+- `:146-155` lane models -> "`Ready`, or `Writing` and the outstanding attempt does not touch the
+  identity"; `Wedged` stays excluded, alongside the broken states. The lane core keeps the attempt in
+  both states (`CaRefLaneCore.tla:1062`), so the sabotage "certify while the attempt touches" and the
+  witness "certified while `Writing`" are expressible as written.
+- `:189-195` counters -> split `Wedged` out of `LaneBroken` (or name it) so the live gate can tell
+  whether wedges ever cost liveness.
+
+##### 4. PROSE, Minor: "the refusing rule named in the existing debug line" needs an API change {#4-prose-minor-the-refusing-rule-named-in-the-existing-debug-}
+
+`ConfirmAnswer` is a three-value enum (`CasRefLedger.h:69`) and the debug line at
+`DataPartsExchange.cpp:294` receives only `CasConfirmAnswer` through
+`ContentAddressedMetadataStorage::confirmExactRef` (`:2105-2145`) and the exchange interface
+(`ContentAddressedExchange.h:177`). Naming the rule there means widening the return type through
+three layers, which contradicts `:107-108` "no new API". Either state the API change or keep the
+rule attribution inside the ledger (ProfileEvents plus a ledger-side `LOG_TRACE`). Recommend the
+latter.
+
+##### 5. PROSE, Minor: the `noop` shape cannot close its tenure in the model as sketched {#5-prose-minor-the-noop-shape-cannot-close-its-tenure-in-the-}
+
+`SenderApply` (`CaRelinkConfirmCore.tla:192-198`) is guarded by `sDurableRef # Token`. A `noop`
+tenure leaves `sDurableRef = Token`, so it can never apply and `SenderAdmit`'s `~sPending` (`:166`)
+blocks any later touching admit. The interleaving "yes while noop pending, then a touching mutation
+admitted after T2, durable, folded" would be unreachable, and it is the one the protocol argument
+(`:111-114`) claims is safe. Make `SenderApply`'s guard shape-aware. `SenderDurable` (`:180`) works for
+`noop` with `sTarget = Token` as long as its journal record is the edge-neutral `NsNoise` op, as the
+spec says.
+
+##### 6. PROSE, Minor: `carve_all_pending` is a second carve path the spec does not mention {#6-prose-minor-carve-all-pending-is-a-second-carve-path-the-s}
+
+`flushRefBatch`'s failure arms (`CasRefLedger.cpp:2731-2737`, `:2751-2755`, `:2764-2769`, `:2788-2792`,
+`:2839-2843`, `:2887-2895`) pop *all* of `pending` and complete the items with an error without ever
+adding them to `owned_items`. Nothing was sent for them, so no `carved` mirror is needed. Say so in
+the carve comment, or a future reader will "fix" it.
+
+##### 7. Optional, Minor: make the `Writing` exemption self-checking {#7-optional-minor-make-the-writing-exemption-self-checking}
+
+Under the recommended fix the safety of exempting `Writing` rests on "`Writing` implies the chunk's
+items are in `carved` and not `done`". Cheap to make executable: in rule 3, `lane_state == Writing &&
+rt.carved.empty() -> Unknown` (plus a `chassert`). Fail-closed if a future arm ever leaves `Writing`
+without a leader.
+
+#### Questions B to E, answered against the code {#questions-b-to-e-answered-against-the-code}
+
+**B, window coverage (with finding 1 fixed).** Admission `pending.push_back` `:2047` under
+`ref_queue_mutex`; carve `:2917-2935` is one continuous `ref_queue_mutex` hold, PLAN then no-throw
+PUBLISH, so `carved` can be appended atomically with the pop. The leader's own item sits in `pending`
+until carved (`owned_items` at `:2099` is not the marker; the item is still queued). Validation
+failures (`:2999`, `:3115`) leave never-sent items in `carved` until the exit guard: over-refusal only.
+Multi-chunk: chunk N's items stay in `carved` after install until the exit guard: over-refusal only.
+Frontier failure and both install refusals go to `NeedsRecovery` (`:3778`, `:3787`, `:3813`, `:3846`),
+refused; re-recovery runs with `recovery_in_progress` (`:1409`), refused by rule 2, and installs the
+full replay with `lane_state = Ready` (`:1638-1640`). Faulted arms `:3686-3690`, `:3734-3738` and the
+non-`Ready`-at-allocation arm `:3378-3382` reset the attempt and refuse. `Closed` `:3708-3712`,
+`:2490-2493` refuses. `DefiniteFailure` `:3919-3927` and `NoAttemptSent` `:3963-3972` return to `Ready`
+with nothing sent. Restart: no in-memory wedge survives, recovery replays the durable log. Every
+instant in which a mutation of P may be durable and the row not updated is then covered by `carved`
+(Writing) or by the lane state (Wedged/NeedsRecovery/Closed/Faulted).
+
+**C, locking.** Confirm holds `ref_queue_mutex` throughout and `try_lock`s `state_mutex` under it
+(`:437`, `:456`). Carve, `done`, and the exit-guard erase are all under `ref_queue_mutex`
+(`:2917`, `:3243`, `:2151`). Install is under `state_mutex` only (`:3801`), with `done` afterwards under
+`ref_queue_mutex` (`:3900`); the confirm that lands between them sees the item in `carved` and not
+`done`, so it refuses. No TOCTOU. Lock order queue-then-state is never inverted by the leader
+(`complete_error` is always called after the `state_mutex` scope closes).
+
+**D, cross-ref effects.** `OwnerTransition` shapes are AddPrecommit, RemovePrecommit, RemoveCommitted
+(one binding) and Promote, which requires `old.ref_name == new.ref_name`
+(`CasRefProtocol.cpp:130-154`). `SetPublishedAt` names one ref. `NamespaceBirth` has no binding.
+`RemoveNamespace` is only reachable under `wholeShard` (`:5149`). `EpochSeal` is minted only by the
+recovery walk (`:1107`, `makeEpochSealTxn` `:137`), not through the lane, and carries no table content.
+No op changes a binding other than the one its scope names.
+
+**E, what the old refusals protected that scope does not.** `Wedged`: finding 1. `Writing`: covered by
+`carved`. `leader_active`: added nothing beyond `carved` plus `Wedged`. Non-empty `pending`: covered by
+scope. The receiver-side T1 < T2 order the argument needs holds (`DataPartsExchange.cpp:1462-1480`
+publishes and makes the `+1` durable before the confirm at `:1509-1536`).
+
+**F, tests and model.** `InFlightAppendIsUnknown` (`:472`) and `ConcurrentAppendIsOrderedAfterTheSnapshot`
+(`:672`) park the leader before the carve, so the same-ref item is in `pending`: `Unknown` by scope,
+expectations hold. `MidTenureChunkBoundaryIsUnknown` (`:512`) confirms an untouched ref at the reseed:
+`Yes` is correct (after the item-scope fix of finding 2). `WedgedLaneIsUnknown` (`:589`) stays `Unknown`
+under the recommended fix with no seam change. The sibling test's second expectation is wrong (finding
+3). `SabotageTouchBlind` and the `sawYesWhilePendingNoop` witness are non-vacuous as sketched, subject
+to finding 5. Lane-model sentences are consistent with `Certify` (`CaRefLaneCore.tla:714-722`) and
+`ConfirmSource` (`CaRelinkLaneComposition.tla:111`) once `Wedged` is kept excluded.
+
+#### Simplifications (more than the minimum) {#simplifications-more-than-the-minimum}
+
+1. Drop the `forceWedgeForTest` change (`:104-105`); with `Wedged` refusing it is not needed.
+2. Drop "named in the existing debug line" (`:191-192`); ProfileEvents inside the ledger suffice and
+   need no API change.
+3. §safety's `MergeTree`-level paragraph (`:50-59`) is background; rule 3 plus rule 5 carry the
+   safety, gate 0 is declared an availability filter (`:93`). Keep one sentence.
+4. The confirm-core model needs no new state for `Wedged` under the recommended fix; do not add an arm
+   or phase. Only the `noop` shape, the shape-aware `SenderApply`, the sabotage and the witness.
+
+#### Limits of what I established {#limits-of-what-i-established}
+
+- I verified coverage of the lane windows from the code paths cited above. I did not run anything; no
+  test or model was executed for this report.
+- I did not verify that the ref drop of a whole-part removal happens inside `remove()` (`:53`); it is
+  not load-bearing for the design as written.
+- I did not measure wedge frequency on GCS under chaos. The `wedged_namespace_count` 0 figure is the
+  ledger's for the F11 window only; a wedge under chaos would cost that namespace's confirms until
+  its next flush, which under write load is immediate.
+- The LIST-completeness caveat is unchanged and outside this design, as the spec says.

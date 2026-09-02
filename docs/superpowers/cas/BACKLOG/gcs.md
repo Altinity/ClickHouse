@@ -48,8 +48,8 @@ Proved on the real bucket with the `gcs_hmac` client, binary of 2026-09-02:
 - **[relink-confirm-lane-livelock] two replicas starve each other's fetch-by-relink confirms** — HARD /
   RELEASE GATE (data divergence, not data loss).
   Design: [relink confirm liveness design](/superpowers/specs/cas-relink-confirm-liveness-design),
-  revision 7 (rule 3 refuses while a queued or in-flight mutation names the queried ref, read from
-  the `MutationScope` every lane item already carries).
+  revision 8 (rule 3 refuses while a queued or in-flight mutation names the queried ref, read from
+  the `MutationScope` every lane item already carries; `Wedged` and broken lanes refuse table-wide).
 
 **What happened.** After the connect storm both replication queues wedged with
 `NO_REPLICA_HAS_PART: Source ... did not prove it still holds the manifest it offered ... by relink`;
@@ -78,10 +78,11 @@ them. The hazard is exactly the interval "durable, not yet applied". A `pending`
 and a `PUT` still in flight are not durable and do not break the T1 < T2 argument; today's rule
 refuses far more than the argument requires.
 
-**Decision (2026-09-02, spec revision 7).** Rule 3 refuses while a queued or in-flight mutation names
+**Decision (2026-09-02, spec revision 8).** Rule 3 refuses while a queued or in-flight mutation names
 the queried ref (its `MutationScope`, which every lane item already carries: `Ref{name}` or
-`WholeShard`), plus the broken lane states `NeedsRecovery`/`Closed`/`Faulted`. `Writing`/`Wedged`,
-`leader_active` and a non-empty `pending` no longer refuse by themselves. One bookkeeping change: the
+`WholeShard`), plus every lane state other than `Ready` and `Writing` (`Wedged` stays table-wide: a
+wedged chunk's items are completed before the tenure ends, so only the lane state records it).
+`Writing`, `leader_active` and a non-empty `pending` no longer refuse by themselves. One bookkeeping change: the
 runtime keeps `carved` items visible until completion. Revision 1 (gate 0 + part state) was refuted by
 the live-repoint trace; revisions 2 to 6 (reading the sent transaction's ops) were correct but heavier
 than needed. TLA variant and the two-model consult are mandatory before code.
