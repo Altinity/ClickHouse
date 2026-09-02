@@ -791,6 +791,16 @@ TEST(CASPartFolderAccess, ForceFreshServesImmutableDecodeWithoutManifestRequests
     EXPECT_EQ(backend->getCount(manifest_key), 0u);
     EXPECT_EQ(backend->headCount(manifest_key), 0u);
     EXPECT_EQ(access.explain(key).last_decision, Cas::CachedPartFolderAccess::LastDecision::ForceFreshRead);
+
+    /// `StrictValidate` serves the same immutable decode: an id names one content, so once the id is
+    /// resolved there is nothing stricter left to prove about the body. It bypasses retention, so its
+    /// recorded decision differs from the `ForceFresh` one above.
+    auto strict_view = access.getView(key, Cas::Freshness::StrictValidate);
+    ASSERT_NE(strict_view, nullptr);
+    EXPECT_EQ(strict_view->manifest().get(), view->manifest().get());
+    EXPECT_EQ(backend->getCount(manifest_key), 0u);
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);
+    EXPECT_EQ(access.explain(key).last_decision, Cas::CachedPartFolderAccess::LastDecision::StrictBypass);
 }
 
 /// With the decode cache disabled a prior read leaves nothing behind, so the deleted body surfaces
