@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <optional>
 #include <IO/CompressionMethod.h>
 #include <base/defines.h>
 #include "config.h"
@@ -59,6 +60,7 @@ struct ManifestFileCacheKey
     Int64 added_sequence_number;
     Int64 added_snapshot_id;
     Iceberg::ManifestFileContentType content_type;
+    std::optional<UInt64> first_row_id;
 };
 
 using ManifestFileCacheKeys = std::vector<ManifestFileCacheKey>;
