@@ -2,6 +2,8 @@
 
 #include "config.h"
 
+#include <base/defines.h>
+
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
@@ -51,6 +53,7 @@ namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
 extern const int MEMORY_LIMIT_EXCEEDED;
+extern const int LOGICAL_ERROR;
 }
 
 using namespace DB::Cas;
@@ -174,16 +177,17 @@ struct CaseSync
     bool entered = false;
 };
 
-/// `num_pairs` add-then-remove precommit op pairs for distinct refs, each naming a distinct manifest.
-/// Every pair is undone immediately, so the LIVE state stays ~empty and validating thousands of ops
-/// stays linear -- it is the OP COUNT, not the resident state, that drives the chunk split under test.
-std::vector<RefOp> precommitAddRemovePairs(const String & prefix, size_t num_pairs, uint64_t manifest_epoch)
+/// `num_pairs` add-then-remove precommit op pairs on ONE ref, each pair naming a distinct manifest,
+/// so an item scoped `MutationScope::ref(ref)` names exactly the ref its ops mutate (the flush
+/// validates that). Every pair is undone immediately, so the LIVE state stays ~empty and validating
+/// thousands of ops stays linear -- it is the OP COUNT, not the resident state, that drives the chunk
+/// split under test.
+std::vector<RefOp> precommitAddRemovePairs(const String & ref, size_t num_pairs, uint64_t manifest_epoch)
 {
     std::vector<RefOp> ops;
     ops.reserve(num_pairs * 2);
     for (size_t i = 0; i < num_pairs; ++i)
     {
-        const String ref = prefix + std::to_string(i);
         const ManifestRef manifest{manifest_epoch, i + 1, 1};
         RefOp add;
         add.kind = RefOpKind::OwnerTransition;
@@ -549,10 +553,10 @@ TEST(CASConfirmExactRef, MidTenureChunkBoundaryIsUnknown)
                           [&] { return store->refQueuePendingForTest(ns) >= 2; });
     });
 
-    auto append = [&store, &ns](const String & prefix, uint64_t manifest_epoch)
+    auto append = [&store, &ns](const String & ref, uint64_t manifest_epoch)
     {
-        std::vector<RefOp> item_ops = precommitAddRemovePairs(prefix, 1500, manifest_epoch);
-        store->appendRefOps(ns, MutationScope::ref(prefix),
+        std::vector<RefOp> item_ops = precommitAddRemovePairs(ref, 1500, manifest_epoch);
+        store->appendRefOps(ns, MutationScope::ref(ref),
                             [ops = std::move(item_ops)](const RefTableState &) { return ops; },
                             RootMutationOrigin::Writer, RootMutationKind::Publish);
     };
@@ -643,6 +647,59 @@ TEST(CASConfirmExactRef, CarvedItemIsVisibleFromCarveToTenureEnd)
     EXPECT_EQ(store->refCarvedForTest(ns), 0u) << "the exit guard must release the mirror";
 }
 
+/// Scope validation: `MutationScope` is what the confirm reads to decide whether an in-flight mutation
+/// may change the ref it is asked about, so an item scoped to ref X whose ops mutate ref Y must fail,
+/// alone, before anything is durable. It throws `LOGICAL_ERROR`, which aborts the process in debug and
+/// sanitizer builds instead of behaving like a catchable exception --
+/// `CASConfirmExactRefDeathTest.MisScopedItemAborts` below proves the abort positively in those builds.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASConfirmExactRef, MisScopedItemFailsBeforeAnythingIsDurable)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_misscoped"};
+    const ManifestId seed = publishEmptyPart(store, ns, "seed");   /// the namespace is born already
+
+    const uint64_t puts_before = backend->putTotal();
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "y", ManifestRef{900000003, 1, 1}};
+    try
+    {
+        store->appendRefOps(ns, MutationScope::ref("x"),
+                            [add](const RefTableState &) { return std::vector<RefOp>{add}; },
+                            RootMutationOrigin::Writer, RootMutationKind::Publish);
+        FAIL() << "an item scoped to ref 'x' whose op binds ref 'y' must be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+    }
+    EXPECT_EQ(backend->putTotal(), puts_before) << "the refusal must happen before any object is written";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready) << "a validation failure is not a lane fault";
+    EXPECT_EQ(store->confirmExactRef(ns, "seed", seed.ref), ConfirmAnswer::Yes)
+        << "the failed item must leave the table exactly as it was";
+}
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASConfirmExactRefDeathTest, MisScopedItemAborts)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_misscoped"};
+    publishEmptyPart(store, ns, "seed");
+
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "y", ManifestRef{900000003, 1, 1}};
+    EXPECT_DEATH({
+        store->appendRefOps(ns, MutationScope::ref("x"),
+                            [add](const RefTableState &) { return std::vector<RefOp>{add}; },
+                            RootMutationOrigin::Writer, RootMutationKind::Publish);
+    }, "");
+}
+#endif
 
 /// The mirror must survive an item's COMPLETION, not just its carve: an item is completed by its own
 /// chunk's commit, often chunks before the tenure ends. Two items whose op counts force a chunk split
@@ -684,10 +741,10 @@ TEST(CASConfirmExactRef, CarvedItemSurvivesEarlierChunkCompletion)
                           [&] { return store->refQueuePendingForTest(ns) >= 2; });
     });
 
-    auto append = [&store, &ns](const String & prefix, uint64_t manifest_epoch)
+    auto append = [&store, &ns](const String & ref, uint64_t manifest_epoch)
     {
-        std::vector<RefOp> item_ops = precommitAddRemovePairs(prefix, 1500, manifest_epoch);
-        store->appendRefOps(ns, MutationScope::ref(prefix),
+        std::vector<RefOp> item_ops = precommitAddRemovePairs(ref, 1500, manifest_epoch);
+        store->appendRefOps(ns, MutationScope::ref(ref),
                             [ops = std::move(item_ops)](const RefTableState &) { return ops; },
                             RootMutationOrigin::Writer, RootMutationKind::Publish);
     };

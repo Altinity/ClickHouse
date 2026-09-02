@@ -2683,6 +2683,28 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     return result;
 }
 
+namespace
+{
+/// The first ref name `op` mutates that differs from `scope_ref`, or nullptr when every name it
+/// carries is `scope_ref` or it carries none (`NamespaceBirth`, `RemoveNamespace` and `EpochSeal` are
+/// namespace-level and belong to no ref). Both bindings of an `OwnerTransition` count: a promotion
+/// names the ref twice and a rename-shaped transition would name two refs.
+const String * refNamedOutsideScope(const RefOp & op, const String & scope_ref)
+{
+    if (op.kind == RefOpKind::OwnerTransition)
+    {
+        if (op.old_binding && op.old_binding->ref_name != scope_ref)
+            return &op.old_binding->ref_name;
+        if (op.new_binding && op.new_binding->ref_name != scope_ref)
+            return &op.new_binding->ref_name;
+        return nullptr;
+    }
+    if (op.kind == RefOpKind::SetPublishedAt && op.ref_name != scope_ref)
+        return &op.ref_name;
+    return nullptr;
+}
+}
+
 void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                                  std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
 {
@@ -3058,10 +3080,23 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         /// this item. `item_ops` was built in step 1 against the pre-boundary state; the carve
         /// deduplicates ref names within a batch, so the overflowing item operates on a ref distinct
         /// from the just-committed chunk's and re-validating it against the reseeded `working` is
-        /// consistent.
+        /// consistent. The scope is validated here as well, because the confirm relies on it (see
+        /// `confirmExactRef`, rule 3).
         RefTableState item_scratch = working;
         try
         {
+            /// Scope validation. `MutationScope` is what `confirmExactRef` reads to decide whether a
+            /// queued or in-flight mutation may change the ref it is asked about, so a `Ref{name}` item
+            /// whose ops mutate ANOTHER ref would let the confirm answer `Yes` off a row this very item is
+            /// about to change. Checked before anything durable and failing only this item: every
+            /// production caller names the exact ref its ops mutate, so a mismatch is a programming error.
+            if (it->scope.kind == MutationScope::Kind::Ref)
+                for (const RefOp & op : item_ops)
+                    if (const String * other = refNamedOutsideScope(op, it->scope.ref_name))
+                        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "ref mutation on namespace '{}' is scoped to ref '{}' but its {} op names ref '{}'",
+                            ns.string(), it->scope.ref_name, refOpKindToWireWord(op.kind), *other);
+
             /// Whole-item shape validation (prerequisite to `dropNamespace`): the
             /// per-op loop below previews each op as its OWN single-op trial transaction, so a
             /// whole-transaction-shape rule like "remove_namespace must be the FINAL op" trivially

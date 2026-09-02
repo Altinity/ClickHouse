@@ -245,6 +245,9 @@ TEST(CASRefWriterChunkedFlush, OversizedItemFailsAlone)
     auto sync = std::make_shared<CaseSync>();
     armPreCarveBlock(store, ns, sync, 2);
 
+    /// `fillerOps` builds default `NamespaceBirth` ops that name no ref, so the item's scope names a ref
+    /// its ops never mention -- harmless here because step 1's op-count cap rejects the item before the
+    /// scope is ever checked against its ops (step 3).
     Caller oversized = launchAppend(store, ns, MutationScope::ref("oversized"),
         [](const RefTableState &) -> std::vector<RefOp> { return fillerOps(ref_txn_max_ops + 1); });
     waitEntered(sync);
@@ -282,7 +285,7 @@ TEST(CASRefWriterChunkedFlush, OversizedOpFailsItsItemAlone)
     auto sync = std::make_shared<CaseSync>();
     armPreCarveBlock(store, ns, sync, 2);
 
-    Caller oversized = launchAppend(store, ns, MutationScope::ref("oversized_op"),
+    Caller oversized = launchAppend(store, ns, MutationScope::ref(oversized_op.ref_name),
         [oversized_op](const RefTableState &) -> std::vector<RefOp> { return {oversized_op}; });
     waitEntered(sync);
     Caller neighbor = launchDrop(store, ns, "neighbor");
@@ -449,22 +452,22 @@ PoolPtr openPoolWith(const BackendPtr & backend, PoolConfig cfg)
     return Pool::open(backend, cfg);
 }
 
-/// `num_pairs` add-then-remove precommit op pairs (2 * `num_pairs` ops total) for distinct refs
-/// (`prefix` + zero-padded index) each naming a distinct valid manifest. Every pair adds a precommit
-/// binding and immediately removes it, so the LIVE state (the `precommits` set, the committed COW map,
-/// the owned-manifest index) stays ~empty throughout the whole transaction -- keeping the per-op
-/// `admits` preview and the sanitizer-only body-counter assert O(1), so validating a maximal chunk of
-/// thousands of ops stays O(ops), not O(ops^2). It is the OP COUNT (not the resident state) that drives
-/// the chunk split under test; each op is tiny (well under `ref_op_max_bytes`), so the whole run is
-/// admissible on a `Live` namespace. The durable transaction still carries every op verbatim, so a
-/// chunk's ops can be compared against the exact expected vector.
-std::vector<RefOp> addRemovePrecommitPairs(const String & prefix, size_t num_pairs, uint64_t manifest_epoch)
+/// `num_pairs` add-then-remove precommit op pairs (2 * `num_pairs` ops total) on ONE ref, each pair
+/// naming a distinct valid manifest, so an item scoped `MutationScope::ref(ref)` names exactly the ref
+/// its ops mutate (the flush validates that). Every pair adds a precommit binding and immediately
+/// removes it, so the LIVE state (the `precommits` set, the committed COW map, the owned-manifest
+/// index) stays ~empty throughout the whole transaction -- keeping the per-op `admits` preview and the
+/// sanitizer-only body-counter assert O(1), so validating a maximal chunk of thousands of ops stays
+/// O(ops), not O(ops^2). It is the OP COUNT (not the resident state) that drives the chunk split under
+/// test; each op is tiny (well under `ref_op_max_bytes`), so the whole run is admissible on a `Live`
+/// namespace. The durable transaction still carries every op verbatim, so a chunk's ops can be compared
+/// against the exact expected vector.
+std::vector<RefOp> addRemovePrecommitPairs(const String & ref, size_t num_pairs, uint64_t manifest_epoch)
 {
     std::vector<RefOp> ops;
     ops.reserve(num_pairs * 2);
     for (size_t i = 0; i < num_pairs; ++i)
     {
-        const String ref = prefix + paddedRefName(i);
         const ManifestRef manifest{manifest_epoch, i + 1, 1};
         RefOp add;
         add.kind = RefOpKind::OwnerTransition;
@@ -577,9 +580,9 @@ TEST(CASRefWriterChunkedFlush, ChunkedFlushCommitsPerChunk)
 
     /// 2000 ops per item (1000 add/remove pairs) -> 6000 > ref_txn_max_ops (5000): chunk 1 =
     /// {item_a,item_b} (4000), chunk 2 = {item_c} (2000).
-    const std::vector<RefOp> ops1 = addRemovePrecommitPairs("aaa_", 1000, 900000001);
-    const std::vector<RefOp> ops2 = addRemovePrecommitPairs("bbb_", 1000, 900000002);
-    const std::vector<RefOp> ops3 = addRemovePrecommitPairs("ccc_", 1000, 900000003);
+    const std::vector<RefOp> ops1 = addRemovePrecommitPairs("item_a", 1000, 900000001);
+    const std::vector<RefOp> ops2 = addRemovePrecommitPairs("item_b", 1000, 900000002);
+    const std::vector<RefOp> ops3 = addRemovePrecommitPairs("item_c", 1000, 900000003);
     auto c1 = std::make_shared<std::atomic<int>>(0);
     auto c2 = std::make_shared<std::atomic<int>>(0);
     auto c3 = std::make_shared<std::atomic<int>>(0);
@@ -700,9 +703,9 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
     armPreCarveBlock(store, ns, sync, 2);
     /// 3000 ops per item (1500 add/remove pairs) -> 6000 > ref_txn_max_ops: chunk 1 = {item_a},
     /// chunk 2 = {item_b}.
-    AppendCaller a = launchAppendOps(store, ns, MutationScope::ref("item_a"), addRemovePrecommitPairs("aaa_", 1500, 900000001), nullptr);
+    AppendCaller a = launchAppendOps(store, ns, MutationScope::ref("item_a"), addRemovePrecommitPairs("item_a", 1500, 900000001), nullptr);
     waitEntered(sync);
-    AppendCaller b = launchAppendOps(store, ns, MutationScope::ref("item_b"), addRemovePrecommitPairs("bbb_", 1500, 900000002), nullptr);
+    AppendCaller b = launchAppendOps(store, ns, MutationScope::ref("item_b"), addRemovePrecommitPairs("item_b", 1500, 900000002), nullptr);
     waitPendingAtLeast(store, ns, 2);
     sync->cv.notify_all();
 
@@ -823,9 +826,9 @@ TEST(CASRefWriterChunkedFlush, LeaderOwnItemCommittedBeforeThrow)
     auto sync = std::make_shared<CaseSync>();
     armPreCarveBlock(store, ns, sync, 2);
     /// 3000 ops per item (1500 add/remove pairs) -> chunk 1 = {item_a}, boundary throw before chunk 2.
-    AppendCaller a = launchAppendOps(store, ns, MutationScope::ref("item_a"), addRemovePrecommitPairs("aaa_", 1500, 900000001), c1);
+    AppendCaller a = launchAppendOps(store, ns, MutationScope::ref("item_a"), addRemovePrecommitPairs("item_a", 1500, 900000001), c1);
     waitEntered(sync);
-    AppendCaller b = launchAppendOps(store, ns, MutationScope::ref("item_b"), addRemovePrecommitPairs("bbb_", 1500, 900000002), c2);
+    AppendCaller b = launchAppendOps(store, ns, MutationScope::ref("item_b"), addRemovePrecommitPairs("item_b", 1500, 900000002), c2);
     waitPendingAtLeast(store, ns, 2);
     sync->cv.notify_all();
 
@@ -848,7 +851,7 @@ TEST(CASRefWriterChunkedFlush, LeaderOwnItemCommittedBeforeThrow)
         if (txn.txn_id == ra.id)
             chunk1_txn = txn;
     ASSERT_TRUE(chunk1_txn.has_value()) << "chunk 1 must be durable";
-    EXPECT_EQ(chunk1_txn->ops, addRemovePrecommitPairs("aaa_", 1500, 900000001));
+    EXPECT_EQ(chunk1_txn->ops, addRemovePrecommitPairs("item_a", 1500, 900000001));
     /// item_a's build_ops ran once (chunk 1); item_b's ran once (before the boundary throw preempted its
     /// validation) and is NOT re-invoked -- the at-most-once contract holds through the failed tenure.
     EXPECT_EQ(c1->load(), 1);
@@ -886,9 +889,9 @@ TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
     auto sync = std::make_shared<CaseSync>();
     armPreCarveBlock(store, ns, sync, 2);
     /// 3000 ops per item (1500 add/remove pairs) -> chunk 1 = {item_a}, chunk 2 = {item_b}.
-    AppendCaller a = launchAppendOps(store, ns, MutationScope::ref("item_a"), addRemovePrecommitPairs("aaa_", 1500, 900000001), nullptr);
+    AppendCaller a = launchAppendOps(store, ns, MutationScope::ref("item_a"), addRemovePrecommitPairs("item_a", 1500, 900000001), nullptr);
     waitEntered(sync);
-    AppendCaller b = launchAppendOps(store, ns, MutationScope::ref("item_b"), addRemovePrecommitPairs("bbb_", 1500, 900000002), nullptr);
+    AppendCaller b = launchAppendOps(store, ns, MutationScope::ref("item_b"), addRemovePrecommitPairs("item_b", 1500, 900000002), nullptr);
     waitPendingAtLeast(store, ns, 2);
     sync->cv.notify_all();
 
