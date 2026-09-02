@@ -30,7 +30,10 @@ Control surface, reserved under the bucket name ``_control``:
   - ``POST /_control/reset`` — drop the capture log and the counters (objects are kept), and clear the
     delay knob below;
   - ``POST /_control/delay?substr=S&ms=N`` — every PUT whose key contains ``S`` sleeps ``N``
-    milliseconds before it is served, outside the store lock so other requests keep flowing.
+    milliseconds before it is served, outside the store lock so other requests keep flowing. A fixed
+    per-request delay, not a modelled per-object rate cap: it charges an isolated write the same as a
+    burst. Each delayed PUT also increments the ``DelayedPut`` counter (visible at
+    ``/_control/counters``), so a caller can prove the knob fired rather than infer it from timing.
     ``substr=&ms=0`` clears it;
   - ``POST /_control/mode?if_match=reject|ignore&omit_generation=0|1`` — select the adversarial
     behaviours below. Global, not per bucket: the client reuses connections across buckets and a
@@ -129,8 +132,8 @@ class Store:
         self.if_match_mode = "reject"
         self.omit_generation = False
         # `/_control/delay`: every PUT whose key contains `delay_substr` sleeps `delay_ms` before it is
-        # served, outside the store lock so other requests keep flowing. The shape of a provider whose
-        # per-object mutation rate is capped (GCS: about one per second per object).
+        # served, outside the store lock so other requests keep flowing. A fixed per-request delay, not
+        # a modelled rate cap — see the module docstring's `/_control/delay` bullet.
         self.delay_substr = ""
         self.delay_ms = 0
         self._next_generation = _GENERATION_SEED
@@ -866,11 +869,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         stripped = path.lstrip("/")
         bucket, _, key = stripped.partition("/")
 
-        if method == "PUT" and STORE.delay_ms and STORE.delay_substr and STORE.delay_substr in key:
+        delayed = method == "PUT" and STORE.delay_ms and STORE.delay_substr and STORE.delay_substr in key
+        if delayed:
             time.sleep(STORE.delay_ms / 1000.0)
 
         with _LOCK:
             STORE.count("method_" + method)
+            # A caller that only checks queue drainage cannot tell a delay that fired from a delay
+            # knob that silently stopped matching (a renamed endpoint, a renamed query param, a
+            # substring that no longer matches the key) — this counter is the caller's proof the
+            # sleep above actually ran.
+            if delayed:
+                STORE.count("DelayedPut")
             request_class = _request_class(bucket, key)
             operation = _request_operation(bucket, request_class, method, query, headers)
             if method == "PUT":
@@ -945,8 +955,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1])
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    # `bind_and_activate=False`, then raise the listen backlog, then bind+activate by hand: the base
+    # class calls `socket.listen()` (which locks in the backlog) from inside `__init__` when
+    # `bind_and_activate` is left at its default, before this line could change it.
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler, bind_and_activate=False)
     server.daemon_threads = True
+    # The default listen backlog (5) starves unrelated connections once `/_control/delay` holds a
+    # few dozen handler threads asleep at once: a caller under `test_cas_gcs_relink_liveness`
+    # measured `connect timed out` on keys the delay knob was never meant to slow.
+    server.request_queue_size = 128
+    server.server_bind()
+    server.server_activate()
     server.serve_forever()
 
 
