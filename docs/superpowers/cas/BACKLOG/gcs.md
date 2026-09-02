@@ -53,10 +53,14 @@ Proved on the real bucket with the `gcs_hmac` client, binary of 2026-09-02:
   230 fetch-by-relink confirms across the two replicas all answered yes, with zero occurrences of
   `Relink confirm is unproven` — which the answering peer logs for every non-`Yes` answer, including
   the arms that refuse without incrementing a counter — zero `NO_REPLICA_HAS_PART`, both replication
-  queues empty at the end, no divergence at any checkpoint, and all five refusal counters zero on both
-  nodes throughout. The same stand on the pre-fix binary had answered unproven 2999 times in two hours.
-  The refusal criterion is therefore met on the stronger reading: no confirm was refused for any reason,
-  rather than one refusal class merely dominating the others.
+  queues empty at the end, and no divergence at any checkpoint. The same stand on the pre-fix binary had
+  answered unproven 2999 times in two hours. The refusal criterion is therefore met on the stronger
+  reading: no confirm was refused for any reason, rather than one refusal class merely dominating the
+  others.
+  Read the exercise as four minutes, not as the run. All 230 relinks fall inside a four-minute burst,
+  the only stretch of a two-hour-ten-minute run where the workload ran; there is no relink on either
+  node in the remaining two hours and six minutes. That burst is when a lane is busy, which is the
+  condition the fix narrows, and it ran under real provider back-pressure.
   Why it is not closed: the soak exited non-zero on a checkpoint leak assert that fires on the pool
   prefix's inherited debris rather than on anything the run did (F13), and a checkpoint longer than the
   whole timeline consumed the chaos window, so one of four scheduled faults fired and the fence-losing
