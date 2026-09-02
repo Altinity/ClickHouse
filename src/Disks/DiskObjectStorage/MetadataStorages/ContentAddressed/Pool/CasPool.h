@@ -1037,6 +1037,9 @@ public:
     /// `refQueuePendingForTest`; used to assert the baton is not stranded on a pre-tenure fault.
     bool refLeaderActiveForTest(const RootNamespace & ns) { return ref_ledger.refLeaderActiveForTest(ns); }
 
+    /// Test-only: the carved-item mirror's size for `ns` (see `CasRefLedger::refCarvedForTest`).
+    size_t refCarvedForTest(const RootNamespace & ns) { return ref_ledger.refCarvedForTest(ns); }
+
     /// Test seam: how many concurrent `ensureRefTableRecovered` callers for `ns` are
     /// PARKED right now waiting on the leader's in-flight recovery (see `RefTableRuntime::
     /// recovery_waiters_for_test`) -- lets a test `yield()`-poll for "a second caller actually reached

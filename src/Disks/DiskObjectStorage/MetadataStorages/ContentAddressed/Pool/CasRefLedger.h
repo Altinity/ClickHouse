@@ -481,6 +481,15 @@ public:
         return it != ref_name_slots.end() && it->second.current->leader_active;
     }
 
+    /// Returns the number of items carved by the current tenure and not yet released by its exit guard.
+    /// Under the queue mutex, like `refQueuePendingForTest`.
+    size_t refCarvedForTest(const RootNamespace & ns)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_name_slots.find(ns.string());
+        return it == ref_name_slots.end() ? 0 : it->second.current->carved.size();
+    }
+
     /// Returns the number of callers currently waiting for `ns` recovery under its state mutex.
     uint64_t refRecoveryWaitersForTest(const RootNamespace & ns)
     {
@@ -712,7 +721,7 @@ private:
 
     /// One coherent decoded `RefTableState` and append runtime for a namespace. It is recovered lazily
     /// and evicted only as a whole. `state_mutex` is separate from
-    /// `ref_queue_mutex` (which only ever guards `pending`/`leader_active`) so a reader (resolveRef/
+    /// `ref_queue_mutex` (which only ever guards `pending`/`carved`/`leader_active`) so a reader (resolveRef/
     /// listRefs) can observe `state` without contending with the flush leader's network round trip --
     /// the leader only holds `state_mutex` for the brief copy-out-before-validate and the
     /// apply-after-commit steps, never for the `putIfAbsentControlled` call itself.
@@ -844,6 +853,16 @@ private:
         uint64_t publish_backoff_ms = 0;
 
         std::deque<std::shared_ptr<RefMutationItem>> pending;    /// guarded by ref_queue_mutex
+        /// The current tenure's carved items, from the carve (`flushRefBatch`'s PUBLISH phase) to the
+        /// tenure's exit guard (`completeOwnedItemsAndReleaseLeadership`), both under `ref_queue_mutex`.
+        /// The carve pops an item out of `pending`, so without this mirror a mutation is invisible to
+        /// `confirmExactRef` between carve and install -- the window in which its transaction may be
+        /// durable while the committed row still lags it. An item is completed by its chunk's install or
+        /// earlier by an error, often long before the exit guard; the mirror keeps it regardless.
+        /// Over-inclusive on purpose: an installed item and an item that failed validation before any
+        /// send both stay here until the exit guard; that is one tenure of over-refusal for their refs,
+        /// never an under-refusal.
+        std::vector<std::shared_ptr<RefMutationItem>> carved;     /// guarded by ref_queue_mutex
         bool leader_active = false;                               /// guarded by ref_queue_mutex
         /// Set before the exact `Live -> Removing` catalog CAS and retained until that life is deleted.
         /// New positive mutations check it in the same queue critical section as admission; the one

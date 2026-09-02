@@ -2162,6 +2162,10 @@ void CasRefLedger::completeOwnedItemsAndReleaseLeadership(
         /// no-op for them; it only matters for an item the leader owned but never got to carve.
         std::erase(rt->pending, owned);
     }
+    /// The tenure is over: every carved item is completed (above, or by its chunk's commit) and its
+    /// effect is either installed or recorded by the lane state (a wedge), so the confirm no longer
+    /// needs to see it.
+    rt->carved.clear();
     rt->leader_active = false;
     rt->cv.notify_all();
 }
@@ -2872,7 +2876,8 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     ///   construction), pop the selected front items and append them to `batch` and `owned_items` using
     ///   only non-throwing operations (capacity pre-reserved; `shared_ptr` copies and `deque::pop_front`
     ///   never throw). ProfileEvents increments are deferred past the plan so the plan is literally
-    ///   non-mutating.
+    ///   non-mutating. The same items are appended to `rt->carved`, the confirm-visible mirror the exit
+    ///   guard clears.
     std::vector<std::shared_ptr<RefMutationItem>> batch;
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -2916,6 +2921,9 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         if (carve_hook_for_test)
             carve_hook_for_test(CarvePhaseForTest::PlanReserveOwned);
         owned_items.reserve(owned_items.size() + selected);
+        /// Reserve the confirm-visible mirror too, for the same reason: the publish appends into it and
+        /// must not throw.
+        rt->carved.reserve(rt->carved.size() + selected);
 
         /// --- PUBLISH (no-throw) ---
         if (carve_hook_for_test)
@@ -2924,6 +2932,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         {
             batch.push_back(rt->pending.front());        /// shared_ptr copy, capacity reserved
             owned_items.push_back(rt->pending.front());  /// same item into the responsibility set
+            rt->carved.push_back(rt->pending.front());   /// and into the confirm-visible mirror
             rt->pending.pop_front();
         }
 

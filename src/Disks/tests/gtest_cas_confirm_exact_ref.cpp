@@ -607,6 +607,43 @@ TEST(CASConfirmExactRef, WedgedLaneIsUnknown)
 }
 
 
+/// `carved` bookkeeping: a carved item leaves `pending` at the carve and is completed by its chunk's
+/// install (or earlier, by an error), while the mirror is cleared only at the tenure's exit guard, so
+/// the confirm reads the item from `rt.carved` from carve to tenure end. Sampled at
+/// `PostDurableInstall` -- the transaction is durable, nothing is installed, `pending` is already
+/// empty -- and again after the tenure: the mirror must hold exactly the carved item during, and be
+/// empty after. The hook runs on the leader's own thread with neither lane mutex held, so the seams
+/// (which take `ref_queue_mutex`) are safe to call from it.
+TEST(CASConfirmExactRef, CarvedItemIsVisibleFromCarveToTenureEnd)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_carved"};
+    publishEmptyPart(store, ns, "x");
+
+    std::atomic<int> samples{0};
+    std::atomic<size_t> carved_during{0};
+    std::atomic<size_t> pending_during{0};
+    store->setCarveHookForTest([&](CasRefLedger::CarvePhaseForTest phase)
+    {
+        if (phase != CasRefLedger::CarvePhaseForTest::PostDurableInstall)
+            return;
+        samples.fetch_add(1);
+        carved_during.store(store->refCarvedForTest(ns));
+        pending_during.store(store->refQueuePendingForTest(ns));
+    });
+    store->dropRef(ns, "x");
+    store->setCarveHookForTest(nullptr);
+
+    ASSERT_EQ(samples.load(), 1) << "the drop must commit exactly one chunk";
+    EXPECT_EQ(carved_during.load(), 1u)
+        << "the carved removal must be visible while its transaction is durable but not installed";
+    EXPECT_EQ(pending_during.load(), 0u)
+        << "the carve popped the item out of pending -- carved is the only place it can be seen";
+    EXPECT_EQ(store->refCarvedForTest(ns), 0u) << "the exit guard must release the mirror";
+}
+
+
 /// `NeedsRecovery` is table-scoped, so confirmation refuses even a row that still looks perfect.
 TEST(CASConfirmExactRef, NeedsRecoveryIsUnknown)
 {
