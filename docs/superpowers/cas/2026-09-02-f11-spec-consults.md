@@ -11,7 +11,7 @@ doc_type: 'reference'
 
 Verbatim reports produced while the design in
 [relink confirm liveness](/superpowers/specs/cas-relink-confirm-liveness-design) moved from revision 1
-to revision 4. Kept because the spec cites them and because two of them contain the evidence walks
+to revision 5. Kept because the spec cites them and because two of them contain the evidence walks
 (attempt lifetime, committed-ref mutation inventory) that the spec summarises. Model names and effort:
 codex `gpt-5.6-sol` at high reasoning, read-only sandbox; the Claude consult is an independent `ca-arch`
 agent with no access to the codex transcripts. Line numbers refer to the tree at the time of each round.
@@ -448,3 +448,22 @@ REQUEST CHANGES — specify the model’s ref/attempt-phase extension, update th
    The phase expectations are correct, and `ChunkFaultBackend::Mode::Unresolved` with a single-attempt budget can construct the real wedge sibling. The queued-unsent `Yes` is sound: a sender touching transaction is armed before its first send, while receiver `appendRefOps` returns only after frontier publication, cache install, and waiter completion, so the receiver’s T1 is durable before T2.
 
 REQUEST CHANGES — fully specify and witness the honest non-touching and between-chunks model transitions; update the `CaRefLaneCore`/`CaRelinkLaneComposition` contract and results; add the omitted comment/result files to the documentation inventory.
+
+## Codex round 4, revision 4: REQUEST CHANGES (model plan prose) {#codex-round-4}
+
+1. **PROSE — MAJOR — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:171-188`**  
+   Finding 1 is not fully closed. `NoOp` is a valid abstraction—the model already has edge-neutral records (`CaRelinkConfirmCore.tla:91-101`)—and splitting installation from tenure end matches the implementation (`CasRefLedger.cpp:3855-3859,2165`). However, the proposed transitions remain under-specified: current `SenderApply` requires `sDurableRef # Token` (`CaRelinkConfirmCore.tla:192-199`), which never becomes true for `NoOp`; revision 4 names no replacement durable-phase marker, does not state that `SenderInstall` requires durability and clears `sPending`, and does not distinguish the post-install state from the pre-arm state. The witnesses also need history flags set by `RConfirm`; otherwise a stored earlier answer can later coexist with the desired sender state without that confirm occurring in it.
+
+2. **PROSE — MAJOR — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:164,192-202`**  
+   Finding 2 is only partly closed. The companion modules are now in scope, but the proposed rewrite is incomplete. `CaRefLaneCore::Certify` currently protects not only `Ready`, but also current-runtime authority and cache/durable equality (`CaRefLaneCore.tla:714-722`). Replacing that property solely with “no certification while the armed attempt touches the identity” would discard those checks; retaining global `cache_id = durable_id` would instead reject a legitimately non-touching landed transaction. Preserve `CurrentRuntime` and identity-specific row currency while replacing only the `Ready` restriction. Also rerun `run_reflane.sh`, which owns the `CaRefLaneCore` battery (`run_reflane.sh:16-43`); `run_relinklane.sh` runs only `CaRelinkLaneComposition`. The composition is a separate abstract model, not a TLA component instance (`CaRelinkLaneComposition.tla:3-9,21-38`), so its touch observable must be modeled independently. Line 164 should say three modules, not two models.
+
+3. **CODE — INFO (closed) — `src/Disks/tests/gtest_cas_ref_install_safety.cpp:241-275`; `src/Disks/tests/cas_test_helpers.h:1967-2024`**  
+   `ChunkFaultBackend::Mode::Unresolved` with the single-attempt budget is the correct real-attempt wedge seam.
+
+4. **PROSE — INFO (closed) — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:260-275`**  
+   Finding 3 is closed: the inventory now includes `CasRefLedger.h:616`, the gtest header, both affected `CaRelinkConfirmCore_RESULTS.md` passages, and the companion lane results/README material.
+
+5. **PROSE — INFO (closed) — `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md:12-20`; `docs/superpowers/cas/2026-09-02-f11-spec-consults.md:20,123,420,433`**  
+   The status and committed consult record agree with the history: three Codex rounds and one independent Claude consult. Describing revision 2 as passing “on the design itself” is accurate; the objections were prose/model-plan specification findings.
+
+REQUEST CHANGES — define an explicit durable/install phase for both transaction shapes; make `SenderInstall` require durability, clear `sPending` and `sArmed`, and retain `sLeader`; record all three witnesses at the actual `RConfirm` transition; preserve authority and identity-specific cache correctness in `CaRefLaneCore`; model the composition observable independently; rerun both `run_reflane.sh` and `run_relinklane.sh`; and correct “two models” to three modules.

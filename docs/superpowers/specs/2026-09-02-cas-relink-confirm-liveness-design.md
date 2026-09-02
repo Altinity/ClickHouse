@@ -9,12 +9,12 @@ doc_type: 'design'
 
 # CAS relink confirm liveness design {#cas-relink-confirm-liveness-design}
 
-Status: revision 4 of 2026-09-02, amended after the Claude rev-4 check (model-gate identifiers). Revision 1 relied on the part state machine (gate 0) to carry the
+Status: revision 5 of 2026-09-02. Revision 1 relied on the part state machine (gate 0) to carry the
 removal argument; review found the counterexample of a live repoint that retires a blob edge while the
 part stays `Active`, and revision 1 is withdrawn. Revision 2 (rule 3 scoped to the sent transaction)
-passed two independent consults, one on another model, on the design itself; revisions 3 and 4 fold in
-their prose findings: the model extension is specified transition by transition, the companion lane
-models that encode the old `Ready`-only certification contract are in scope, the existing rule-3 tests
+passed two independent consults, one on another model, on the design itself; revisions 3 to 5 fold in
+their prose findings: the model extension is specified transition by transition, the two companion lane
+modules that encode the old `Ready`-only certification contract are in scope, the existing rule-3 tests
 the design reverses are named with their new expectations, and citations are corrected. The reports are
 kept verbatim in [F11 spec consults](/superpowers/cas/f11-spec-consults-2026-09-02). The TLA+ work and
 the code change remain to be done. Ledger finding F11, backlog item `[relink-confirm-lane-livelock]` in
@@ -161,59 +161,71 @@ refuses. That is the property the design rests on, and it is the property the mo
 
 ### Model {#model}
 
-Two models encode the old contract and both change.
+Three modules encode the old contract and all three change.
 
 **`CaRelinkConfirmCore.tla`.** Today `SenderAdmit` admits only a transaction that retires the sender's
-edge (`Other` or `"none"`), `SenderDurable` always emits that deletion, and `SenderApply` clears
-`sPending` and `sLeader` together; rule 3 is `~sPending /\ ~sLeader`. There is no transaction that
-touches nothing and no state "installed, tenure still open". The extension:
+edge (`sTarget` is `Other` or `"none"`), `SenderDurable` always emits that `del` record and requires
+`sDurableRef = Token`, `SenderApply` requires `sDurableRef # Token` and clears `sPending` and `sLeader`
+together; rule 3 is `~sPending /\ ~sLeader`. There is no transaction that touches nothing, no armed
+state, and no state "installed, tenure still open". The extension, stated as the transitions the model
+task implements:
 
-- Two admitted shapes: `Touching` (today's edge-retiring transaction) and `NoOp` (a transaction of
-  the same namespace that leaves `sDurableRef` and the fold set unchanged, the model's stand-in for a
-  chunk about another ref). `sTouches` is derived from the shape, not chosen freely, except under the
-  sabotage below.
-- `sArmed`, set by an explicit `SenderArm` step that `SenderDurable` requires and that the install
-  step clears. This mirrors "arm before the first send, swap out at install"
-  (`CasRefLedger.cpp:3585-3625`, `:3855-3859`), stated in the model as the code invariant it assumes.
-- Install is split from tenure completion: `SenderInstall` clears `sArmed` and updates `sCacheRef`;
-  a separate `SenderTenureEnd` clears `sLeader` and `sPending` (which today gate `SenderAdmit` and
-  `FenceLoss`). Between the two the lane is Ready with no attempt and the leader still active, the
-  chunk boundary of a chunked flush. `NsNoise`'s existing "noop" op is the natural body of the `NoOp`
-  shape.
-- Rule 3 becomes `~(sArmed /\ sTouches)`; `sPending` and `sLeader` leave the rule.
-- Sabotages: `SabotageStaleCache` drops the rule-3 conjunct entirely and must still violate
-  `ConfirmedRelinkNeverDangles` (the durable `m1 -> m2` repoint with the stale `sCacheRef = m1`);
-  `SabotageTouchBlind` forces `sTouches = FALSE` for a `Touching` transaction and must violate it too.
-- Three reachability witnesses, each a behaviour `_main` must exhibit: a confirm answering `yes`
-  while `sArmed /\ ~sTouches` (a `NoOp` chunk in flight); a confirm answering `yes` after
-  `SenderInstall` and before `SenderTenureEnd` (the chunk boundary); a confirm answering `unknown` while
-  `sArmed /\ sTouches`. Without the first two a green `_main` could be the old behaviour.
-- Run with `MaxHoles = 0`, as `_main` does. The LIST-completeness caveat recorded in
-  `CaRelinkConfirmCore_RESULTS.md` is unchanged and outside this design.
+| Variable | Values | Meaning |
+|---|---|---|
+| `sPhase` | `idle`, `admitted`, `armed`, `durable`, `installed` | where the admitted transaction is; replaces the `sPending` boolean as the phase carrier |
+| `sShape` | `touching`, `noop` | whether the admitted transaction retires the sender's edge (today's transaction) or is edge-neutral (the stand-in for a chunk about another ref; its journal record is `NsNoise`'s existing `noop` op with `src = NoiseSrc`) |
+| `sTouches` | boolean | `sShape = touching`, except that `SabotageTouchBlind` forces `FALSE` |
+| `sLeader` | boolean | unchanged meaning: a tenure is open |
 
-**`CaRefLaneCore.tla` and `CaRelinkLaneComposition.tla`.** Both encode the public seam as
-"certification requires `lane = "Ready"`". In the lane model: the `Certify` step (`CaRefLaneCore.tla:714-722`,
-`bad_certification` hardcodes `lane = "Ready"`), the flag `SabotageCertifyBlocked` (`:26`), the invariant
-`CertifiedViewIsCurrent` (`:1083`), the config `CaRefLaneCore_sab_certifyblocked.cfg`, run by
-`run_reflane.sh`. In the composition: `ConfirmSource` (`CaRelinkLaneComposition.tla:111`),
-`RefuseBlockedConfirmation` (`:120`), `ConfirmWhileBlocked` (`:128`), `ConfirmationRequiresReady`
-(`:209`), run by `run_relinklane.sh`. This design replaces that seam: certification is permitted in
-`Writing` and `Wedged` when the armed attempt does not touch the certified identity. Both models gain
-the attempt's touch scope (the composition treats the lane as a six-state component, so the lane
-exports "armed attempt touches this identity" as one more observable), the `Ready`-only properties are
-rewritten as "no certification while the armed attempt touches the identity", the two blocked-certify
-sabotages become "certify while the touching attempt is armed", and both runners are rerun with
-`CaRefLaneCore_RESULTS.md` (`:43`, `:68-91`) rewritten. A green `CaRelinkConfirmCore` alone is not the
-model gate.
+| Step | Guard | Effect |
+|---|---|---|
+| `SenderAdmit(shape, nb)` | `sPhase = idle`, `sFence`, `~sPoison`, `sDurableRef = Token` | `sPhase' = admitted`, `sShape' = shape`, `sTarget' = nb`, `sLeader' = TRUE` |
+| `SenderArm` | `sPhase = admitted` | `sPhase' = armed` (the code's arm-before-first-send at `CasRefLedger.cpp:3585-3625`) |
+| `SenderDurable` | `sPhase = armed` | `touching`: journal gets the `del` record, `sDurableRef' = sTarget`; `noop`: journal gets a `noop` record, `sDurableRef` unchanged; `sPhase' = durable` |
+| `SenderInstall` | `sPhase = durable` | `sCacheRef' = sDurableRef`, `sPhase' = installed`; `sLeader` unchanged (the code's install-and-swap at `:3855-3859`) |
+| `SenderTenureEnd` | `sPhase = installed` | `sPhase' = idle`, `sLeader' = FALSE` (the code's tenure exit at `:2165`) |
+| `FenceLoss`, poison | as today, with `sPending` read as `sPhase # idle` | unchanged |
 
-Liveness is argued, not model-checked: with rule 3 scoped to the sent transaction's refs, a confirm
-about a ref that is not being mutated reaches rule 5 whenever the lane is resident and not broken, and
-the only lock it needs is a `try_to_lock` against the leader's install.
+`sArmed` is `sPhase \in {armed, durable}`: the attempt is armed from before the first send until install,
+which is exactly the interval in which the store may hold a transaction the row does not reflect. Rule 3
+becomes `~(sArmed /\ sTouches)`. Sabotages: `SabotageStaleCache` drops the rule-3 conjunct entirely and
+must still violate `ConfirmedRelinkNeverDangles` (the durable `m1 -> m2` repoint with the stale
+`sCacheRef = m1`); `SabotageTouchBlind` forces `sTouches = FALSE` for a `touching` transaction and must
+violate it too. Three reachability witnesses, each a history flag set inside `RConfirm` at the moment the
+answer is computed, so the answer and the sender state are the same state: `sawYesArmedNoop` (answer
+`yes` while `sArmed /\ ~sTouches`), `sawYesBetweenChunks` (answer `yes` while `sPhase = installed /\
+sLeader`), `sawUnkArmedTouching` (answer `unknown` while `sArmed /\ sTouches`). `_main` must reach all
+three; without the first two a green run could be the old behaviour. Run with `MaxHoles = 0`, as `_main`
+does. The LIST-completeness caveat recorded in `CaRelinkConfirmCore_RESULTS.md` is unchanged and outside
+this design.
 
-### Consult {#consult}
+**`CaRefLaneCore.tla`.** The lane model's `Certify` step (`:714-722`) protects three things at once:
+`lane = "Ready"`, `CurrentRuntime` (this runtime still holds the namespace's authority), and the row's
+currency (`cache_id = durable_id /\ cache_binding = durable_binding`). Only the first is what this design
+changes. The rewrite keeps `CurrentRuntime` and the identity's currency and replaces the `Ready`
+restriction with "no outstanding attempt touches the certified identity": `Certify` is enabled when
+`CurrentRuntime /\ ~(Outstanding /\ attempt_touches_identity)`, and `bad_certification` records a
+certification whose identity's cache binding differs from its durable binding. Global `cache_id =
+durable_id` is not kept as the currency test, because a landed non-touching transaction legitimately
+advances `durable_id` ahead of the certified identity's row. The flag `SabotageCertifyBlocked` (`:26`)
+becomes "certify while the outstanding attempt touches the identity", the invariant
+`CertifiedViewIsCurrent` (`:1083`) keeps its name and reads the new predicate, the config
+`CaRefLaneCore_sab_certifyblocked.cfg` must still violate it, and `run_reflane.sh` reruns the battery.
+
+**`CaRelinkLaneComposition.tla`.** The composition is a separate abstract model of the seam, not an
+instance of the lane module, so it carries its own observable: a boolean `attempt_touches_source`, set
+when the lane leaves `Ready` with a transaction touching the source identity and cleared with the lane's
+return to `Ready`. `ConfirmSource` (`:111`) is enabled when `source_exists /\ ~(lane # "Ready" /\
+attempt_touches_source)`; `RefuseBlockedConfirmation` (`:120`) refuses exactly when the attempt touches
+the source; `ConfirmWhileBlocked` (`:128`) under `SabotageConfirmBlocked` certifies while it does;
+`ConfirmationRequiresReady` (`:209`) is renamed to say what it now checks. `run_relinklane.sh` reruns
+the battery, and `CaRefLaneCore_RESULTS.md` (`:43`, `:68-91`) is rewritten from both runs. A green
+`CaRelinkConfirmCore` alone is not the model gate; all three modules are.
+
+## Consult {#consult}
 
 Two independent consults on revision 2, one on another model, each asked to refute the design,
-returned no defect in it; their prose findings are folded into revisions 3 and 4, and the reports are
+returned no defect in it; their prose findings are folded into revisions 3 to 5, and the reports are
 kept in [F11 spec consults](/superpowers/cas/f11-spec-consults-2026-09-02). The model diff, once
 written, gets the same treatment before the code task is cut: is `sArmed` set before anything the store
 can observe; does every transaction that changes `sDurableRef` have `sTouches` true; do all three
