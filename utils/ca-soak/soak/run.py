@@ -71,7 +71,7 @@ from soak.checker import (
     compare_aggregates,
     drive_gc_to_fixpoint,
 )
-from soak.fsck import run_fsck, run_dryrun, FsckTimeout, stale_edge_verdict
+from soak.fsck import run_fsck, run_dryrun, FsckTimeout, FsckUnavailable, stale_edge_verdict
 from soak.signals import (
     CAS_SIGNAL_EVENTS,
     LatePutFencing,
@@ -96,7 +96,13 @@ TABLE = "ca_stress"
 # bugs (see the CAS backlog's lazy_load_tables item). The table name stays bare; the workload
 # connection's default database is DB.
 DB = "ca_soak"
-FSCK_CONTAINER = "ca-soak-ch1-1"
+# Container the offline `clickhouse disks cas-fsck` applet runs in. Resolved at CALL time from the same
+# environment convention the scenario framework uses, so a compose project other than `ca-soak` (the
+# live-GCS stand is `ca-live-gcs`) can be checkpointed without editing this file; a module-level constant
+# would silently exec into a container that is not running and report `persistent-dangling`.
+def fsck_container() -> str:
+    return os.environ.get("CA_SOAK_FSCK_CONTAINER", "ca-soak-ch1-1")
+
 
 MAX_CLIFFS = 2
 
@@ -608,13 +614,13 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     try:
         residual = drive_gc_to_fixpoint(
             cluster,
-            lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S, partial=True)["unreachable"],
+            lambda: run_fsck(fsck_container(), detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S, partial=True)["unreachable"],
             pool_bytes_fn=lambda: pool_size()[1],
             drain_interval_s=METRICS_INTERVAL_S,
             log_fn=log,
         )
-    except FsckTimeout as _e:
-        log(f"WARNING [B146/B154] drive_gc_to_fixpoint: summary fsck timed out ({_e}); "
+    except (FsckTimeout, FsckUnavailable) as _e:
+        log(f"WARNING [B146/B154] drive_gc_to_fixpoint: summary fsck did not complete ({_e}); "
             f"skipping fixpoint loop for this checkpoint — soak continues")
         residual = 0
         _detail_fsck_skipped = True
@@ -630,10 +636,10 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # If even the summary fsck times out here (B146/B154), we log a LOUD warning and skip this
     # checkpoint's fsck asserts entirely — a slow fsck must never wedge or fail the soak.
     try:
-        f = run_fsck(FSCK_CONTAINER, detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S, partial=True)
-    except FsckTimeout as _e:
+        f = run_fsck(fsck_container(), detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S, partial=True)
+    except (FsckTimeout, FsckUnavailable) as _e:
         note_skipped_fsck_gate("post-GC summary fsck", _e)
-        log(f"WARNING [B146/B154] post-GC summary fsck timed out ({_e}); "
+        log(f"WARNING [B146/B154] post-GC summary fsck did not complete ({_e}); "
             f"SKIPPING fsck/dryrun asserts for this checkpoint — dangling==0 gate unavailable; "
             f"soak continues (primary purpose: live workload exercise, fsck is best-effort oracle)")
         _detail_fsck_skipped = True
@@ -653,10 +659,10 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     else:
         if not _detail_fsck_skipped and (f.get("dangling", 0) != 0 or f.get("unreachable", 0) != 0):
             try:
-                f = run_fsck(FSCK_CONTAINER, detail=True, timeout_s=600)
+                f = run_fsck(fsck_container(), detail=True, timeout_s=600)
                 _fsck_is_detail = True
-            except FsckTimeout as _e:
-                log(f"WARNING [B146/B154] post-GC fsck --detail timed out ({_e}); "
+            except (FsckTimeout, FsckUnavailable) as _e:
+                log(f"WARNING [B146/B154] post-GC fsck --detail did not complete ({_e}); "
                     f"keeping summary result (dangling={f.get('dangling')} unreachable={f.get('unreachable')}); "
                     f"SKIPPING dryrun-subset assert for this checkpoint (B146/B154; O(pool) scan under load); "
                     f"dangling==0 summary gate remains authoritative")
@@ -683,11 +689,11 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
         if phase == 2:
             try:
                 f = wait_for_pool_consistent(
-                    lambda: run_fsck(FSCK_CONTAINER, timeout_s=FSCK_SUMMARY_TIMEOUT_S)
+                    lambda: run_fsck(fsck_container(), timeout_s=FSCK_SUMMARY_TIMEOUT_S)
                 )
                 _fsck_is_detail = True   # run_fsck defaults to detail=True
-            except FsckTimeout as _e:
-                log(f"WARNING [B146/B154] wait_for_pool_consistent fsck timed out ({_e}); "
+            except (FsckTimeout, FsckUnavailable) as _e:
+                log(f"WARNING [B146/B154] wait_for_pool_consistent fsck did not complete ({_e}); "
                     f"SKIPPING dangling re-confirm for this checkpoint — soak continues")
                 _detail_fsck_skipped = True
         else:
@@ -755,13 +761,14 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # The dryrun is also bounded at 600s; FsckTimeout skips the subset assert (best-effort oracle).
     if _detail_fsck_skipped:
         dr = {"count": 0, "entries": []}
-        note_skipped_fsck_gate("dryrun-subset assert", "fsck timed out above")
-        log("WARNING [B146/B154] dryrun-subset assert SKIPPED this checkpoint (fsck timed out above)")
+        note_skipped_fsck_gate("dryrun-subset assert", "fsck did not complete above")
+        log("WARNING [B146/B154] dryrun-subset assert SKIPPED this checkpoint (fsck did not complete above)")
     else:
         try:
-            dr = run_dryrun(FSCK_CONTAINER, timeout_s=600)
-        except FsckTimeout as _e:
-            log(f"WARNING [B146/B154] dryrun timed out ({_e}); SKIPPING dryrun-subset assert")
+            dr = run_dryrun(fsck_container(), timeout_s=600)
+        except (FsckTimeout, FsckUnavailable) as _e:
+            note_skipped_fsck_gate("dryrun-subset assert", _e)
+            log(f"WARNING [B146/B154] dryrun did not complete ({_e}); SKIPPING dryrun-subset assert")
             dr = {"count": 0, "entries": []}
             _detail_fsck_skipped = True
 
@@ -770,10 +777,10 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # Same container / 600s bound / best-effort-on-timeout pattern as the escalation fsck above.
     if not _detail_fsck_skipped and dr.get("entries") and "detail" not in f:
         try:
-            f = run_fsck(FSCK_CONTAINER, detail=True, timeout_s=600)
+            f = run_fsck(fsck_container(), detail=True, timeout_s=600)
             _fsck_is_detail = True
-        except FsckTimeout as _e:
-            log(f"WARNING [B146/B154] dryrun-subset `--detail` fsck timed out ({_e}); "
+        except (FsckTimeout, FsckUnavailable) as _e:
+            log(f"WARNING [B146/B154] dryrun-subset `--detail` fsck did not complete ({_e}); "
                 f"SKIPPING dryrun-subset assert for this checkpoint (B146/B154; O(pool) scan under load); "
                 f"dangling==0 summary gate remains authoritative")
             _detail_fsck_skipped = True
@@ -920,7 +927,8 @@ def skipped_gate_report_lines() -> list:
     if not SKIPPED_FSCK_GATES:
         return ["FSCK GATES: every checkpoint's fsck/dryrun assertions ran (0 skipped)"]
     lines = [f"FSCK GATES: WARNING — {len(SKIPPED_FSCK_GATES)} checkpoint gate(s) SKIPPED because fsck "
-             f"timed out. The zeros those checkpoints printed are the skip, not a measurement; this run "
+             f"did not complete (timed out or never ran). The zeros those checkpoints printed are the skip, "
+             f"not a measurement; this run "
              f"did NOT assert dangling==0 at them."]
     for label, reason in SKIPPED_FSCK_GATES:
         lines.append(f"FSCK GATES:   {label}: {reason}")
@@ -1579,9 +1587,9 @@ def run_phase3(args):
             # Entry gate only needs dangling/exit_code -> cheap summary fsck (detail=False).
             # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
             try:
-                wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
-            except FsckTimeout as _e:
-                log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
+                wait_for_pool_consistent(lambda: run_fsck(fsck_container(), detail=False, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
+            except (FsckTimeout, FsckUnavailable) as _e:
+                log(f"WARNING [B146/B154] {label}: entry-gate fsck did not complete ({_e}); "
                     f"proceeding to checkpoint without pool-consistent gate — soak continues")
             now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, 2, strict_unreachable=strict_unreachable)
         finally:
@@ -1733,7 +1741,7 @@ def run_phase3(args):
         # Quiesce-before-dump: do NOT record a bare fsck on a still-churning pool (it false-positives
         # transient `dangling` — B141/B144/B145). Settle to a stable `dangling==0` (or label the
         # verdict transient/persistent) before recording it.
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(fsck_container(), timeout_s=FSCK_SUMMARY_TIMEOUT_S))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(
@@ -1945,9 +1953,9 @@ def main(argv=None):
                 # PERSISTENT dangling>0 past the bound is escalated as a REAL durability finding.
                 # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
                 try:
-                    wait_for_pool_consistent(lambda: run_fsck(FSCK_CONTAINER, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
-                except FsckTimeout as _e:
-                    log(f"WARNING [B146/B154] {label}: entry-gate fsck timed out ({_e}); "
+                    wait_for_pool_consistent(lambda: run_fsck(fsck_container(), timeout_s=FSCK_SUMMARY_TIMEOUT_S))
+                except (FsckTimeout, FsckUnavailable) as _e:
+                    log(f"WARNING [B146/B154] {label}: entry-gate fsck did not complete ({_e}); "
                         f"proceeding to checkpoint without pool-consistent gate — soak continues")
             now, exp, n1, n2, f, dr = checkpoint(driver, cluster, model, args.phase)
         finally:
@@ -2039,7 +2047,7 @@ def main(argv=None):
             n1 = n2 = None
         # Quiesce-before-dump: settle the fsck to a stable `dangling==0` (or label it transient/
         # persistent) rather than recording a bare fsck on a churning pool (B141/B144/B145).
-        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(FSCK_CONTAINER, timeout_s=FSCK_SUMMARY_TIMEOUT_S))
+        f, fsck_status = settle_fsck_for_dump(lambda: run_fsck(fsck_container(), timeout_s=FSCK_SUMMARY_TIMEOUT_S))
         op_id = last_op.op_id if last_op is not None else None
         last_op_d = last_op.__dict__ if last_op is not None else None
         payload = write_failure(

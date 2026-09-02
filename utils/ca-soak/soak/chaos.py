@@ -1,3 +1,4 @@
+import os
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
@@ -27,9 +28,18 @@ class Fault:
     action: FaultAction
     duration_s: int      # for PAUSE: how long paused; for KILL: downtime before auto-restart
 
-# container names from docker-compose (project "ca-soak")
-_CONTAINER = {FaultTarget.CH1: "ca-soak-ch1-1", FaultTarget.CH2: "ca-soak-ch2-1",
-              FaultTarget.RUSTFS: "ca-soak-rustfs1-1"}
+# Container names from docker-compose (project "ca-soak"), overridable through the same environment
+# convention the scenario framework and `soak.cluster` use, so a fault aimed at another compose project
+# (the live-GCS stand is `ca-live-gcs`) reaches a running container instead of silently no-op'ing on
+# an exited one. Resolved at call time; `BOTH` is expanded by `_containers` and has no single container.
+_DEFAULT_CONTAINER = {FaultTarget.CH1: "ca-soak-ch1-1", FaultTarget.CH2: "ca-soak-ch2-1",
+                      FaultTarget.RUSTFS: "ca-soak-rustfs1-1"}
+_CONTAINER_ENV = {FaultTarget.CH1: "CA_SOAK_NODE1_CONTAINER", FaultTarget.CH2: "CA_SOAK_NODE2_CONTAINER",
+                  FaultTarget.RUSTFS: "CA_SOAK_RUSTFS_CONTAINER"}
+
+
+def container_for(target: "FaultTarget") -> str:
+    return os.environ.get(_CONTAINER_ENV[target], _DEFAULT_CONTAINER[target])
 
 _TARGETS = [FaultTarget.CH1, FaultTarget.CH2, FaultTarget.BOTH, FaultTarget.RUSTFS]
 # FREEZE_LONG is NOT in the uniform action pick: it is a rarer (~1/6) deterministic UPGRADE applied
@@ -91,8 +101,8 @@ def generate_chaos_schedule(seed: int, duration_s: int, mean_interval_s: int):
 
 def _containers(target: FaultTarget):
     if target == FaultTarget.BOTH:
-        return [_CONTAINER[FaultTarget.CH1], _CONTAINER[FaultTarget.CH2]]
-    return [_CONTAINER[target]]
+        return [container_for(FaultTarget.CH1), container_for(FaultTarget.CH2)]
+    return [container_for(target)]
 
 def _is_running(container: str) -> bool:
     """Return True iff the container is in 'running' state."""

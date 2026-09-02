@@ -23,13 +23,24 @@ fail-open throttle: `compute_throttle(None, ...)` kept the CURRENT (zero) sleep,
 growth that filled the host disk to 100% in ~1.7h (B204).
 """
 
+import os
 import subprocess
 
 # Pool data directory inside the RustFS container. Mirror of configs/storage_conf.xml:
 # the `ca` disk endpoint is http://rustfs1:11121/test/soak_pool/ -> bucket "test",
 # prefix "soak_pool/". RustFS stores bucket data under /data/<bucket>/<prefix>.
-_RUSTFS_CONTAINER = "ca-soak-rustfs1-1"
 _POOL_DIR = "/data/test/soak_pool"
+
+
+def rustfs_container() -> str:
+    """Overridable through `CA_SOAK_RUSTFS_CONTAINER`, like every other container the harness names."""
+    return os.environ.get("CA_SOAK_RUSTFS_CONTAINER", "ca-soak-rustfs1-1")
+
+
+def pool_dir() -> str:
+    """Overridable through `CA_SOAK_POOL_DIR`, so a stand that relocates the pool is measured, not
+    silently reported as unmeasurable."""
+    return os.environ.get("CA_SOAK_POOL_DIR", _POOL_DIR)
 
 
 def pool_size(timeout_s: float = 30.0) -> tuple:
@@ -45,8 +56,8 @@ def pool_size(timeout_s: float = 30.0) -> tuple:
     slow/unavailable container."""
     try:
         cmd = [
-            "docker", "exec", _RUSTFS_CONTAINER,
-            "sh", "-c", f"timeout {int(timeout_s)} du -sb {_POOL_DIR}",
+            "docker", "exec", rustfs_container(),
+            "sh", "-c", f"timeout {int(timeout_s)} du -sb {pool_dir()}",
         ]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 5)
         # `du` exits nonzero (with "cannot access ... No such file or directory" on stderr) whenever

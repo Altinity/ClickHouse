@@ -21,6 +21,13 @@ class FsckTimeout(RuntimeError):
     """The fsck/dryrun subprocess exceeded its timeout (an O(pool) scan crawling under load — B146/B154)."""
 
 
+class FsckUnavailable(RuntimeError):
+    """The fsck/dryrun applet never ran: `docker exec` failed before producing a result (container not
+    running, no such container, applet missing). Distinct from a nonzero exit WITH a summary line, which is
+    the applet reporting findings, and from `FsckTimeout`. A caller must not read durability verdicts out of
+    an unavailable probe."""
+
+
 # ---------------------------------------------------------------------------
 # Pure parsers (unit-tested)
 # ---------------------------------------------------------------------------
@@ -193,7 +200,8 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
     - ``detail`` (when ``detail=True``) — list of per-object dicts
       ``{"class": …, "key": …, "size": …}``
 
-    Raises ``FsckTimeout`` if the subprocess does not complete within ``timeout_s`` seconds
+    Raises ``FsckUnavailable`` if the applet produced no result (``docker exec`` refused, container not
+    running, applet missing) and ``FsckTimeout`` if the subprocess does not complete within ``timeout_s`` seconds
     (an O(pool) scan can take 40+ minutes under load — B146/B154).  ``subprocess.run``
     kills the child process automatically on ``TimeoutExpired`` in Python 3.x.
     """
@@ -220,6 +228,10 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
     summary_line = next(
         (ln for ln in p.stdout.splitlines() if ln.startswith("reachable=")), ""
     )
+    if not summary_line:
+        raise FsckUnavailable(
+            f"cas-fsck (detail={detail}) produced no summary on {container}: exit={p.returncode} "
+            f"stderr={p.stderr.strip()[:300]!r}")
     res = parse_fsck_summary(summary_line) if summary_line else {}
     res["exit_code"] = p.returncode
     res["stdout"] = p.stdout
@@ -269,7 +281,8 @@ def run_dryrun(container: str, disk: str = "ca_ro", timeout_s: float = 600.0) ->
 
     Returns the parsed output of `parse_dryrun`.
 
-    Raises ``FsckTimeout`` if the subprocess does not complete within ``timeout_s`` seconds
+    Raises ``FsckUnavailable`` if the applet produced no result (``docker exec`` refused, container not
+    running, applet missing) and ``FsckTimeout`` if the subprocess does not complete within ``timeout_s`` seconds
     (an O(pool) scan can take 40+ minutes under load — B146/B154).
     """
     cmd = [
@@ -282,6 +295,9 @@ def run_dryrun(container: str, disk: str = "ca_ro", timeout_s: float = 600.0) ->
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         raise FsckTimeout(f"cas-gc-dryrun exceeded {timeout_s}s on {container}")
+    if p.returncode != 0 and not p.stdout.strip():
+        raise FsckUnavailable(
+            f"cas-gc-dryrun did not run on {container}: exit={p.returncode} stderr={p.stderr.strip()[:300]!r}")
     result = parse_dryrun(p.stdout)
     result["exit_code"] = p.returncode
     result["stdout"] = p.stdout

@@ -26,7 +26,12 @@ class _FakeCompleted:
         self.stderr = stderr
 
 
-def _capture_cmd(monkeypatch, stdout=""):
+# The smallest output `run_fsck` accepts as an answer: a run that prints no summary line is an
+# UNAVAILABLE probe and raises, so an argv-only test must still hand back a summary.
+MINIMAL_SUMMARY = "reachable=0 dangling=0 unreachable=0 pending_gc=0 awaiting_gc=0 unaccounted=0 stale_edge=0\n"
+
+
+def _capture_cmd(monkeypatch, stdout=MINIMAL_SUMMARY):
     """Run `run_fsck` against a stubbed subprocess and return the argv it built."""
     seen = {}
 

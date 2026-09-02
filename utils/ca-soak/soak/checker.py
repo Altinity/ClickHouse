@@ -1,5 +1,7 @@
 import time
 
+from soak.fsck import FsckTimeout, FsckUnavailable
+
 from soak.cluster import QueryError, retry_on_transport, is_transport_error
 
 
@@ -575,8 +577,13 @@ def drive_gc_to_fixpoint(cluster, unreachable_fn, timeout_s: int | None = None,
     interval = getattr(cluster, "gc_interval_s", 2)
     # Measure the backlog once up front so the bound scales to it. A zero reading is already a
     # fixpoint (nothing to reclaim).
+    # A probe that timed out or never ran is the caller's decision to make (it degrades the checkpoint
+    # loudly); swallowing it here would report "fixpoint reached, residual 0" for a probe that answered
+    # nothing. Any other failure keeps the old lenient reading.
     try:
         initial = int(unreachable_fn())
+    except (FsckTimeout, FsckUnavailable):
+        raise
     except Exception:
         initial = 0
     if initial == 0:
