@@ -27,7 +27,11 @@ Control surface, reserved under the bucket name ``_control``:
   - ``POST /_control/condemn?bucket=B&key=K`` — rewrite blob ``K``'s existing ``.meta`` sibling from
     ``Clean`` to ``Condemned`` without adding a captured storage request. This is a deterministic
     state seam for the writer retry test, not a model of the GC request sequence;
-  - ``POST /_control/reset`` — drop the capture log and the counters (objects are kept);
+  - ``POST /_control/reset`` — drop the capture log and the counters (objects are kept), and clear the
+    delay knob below;
+  - ``POST /_control/delay?substr=S&ms=N`` — every PUT whose key contains ``S`` sleeps ``N``
+    milliseconds before it is served, outside the store lock so other requests keep flowing.
+    ``substr=&ms=0`` clears it;
   - ``POST /_control/mode?if_match=reject|ignore&omit_generation=0|1`` — select the adversarial
     behaviours below. Global, not per bucket: the client reuses connections across buckets and a
     per-bucket switch would invite a test to believe it had isolated something it had not.
@@ -124,6 +128,11 @@ class Store:
         # Adversarial behaviour, off by default — see the module docstring.
         self.if_match_mode = "reject"
         self.omit_generation = False
+        # `/_control/delay`: every PUT whose key contains `delay_substr` sleeps `delay_ms` before it is
+        # served, outside the store lock so other requests keep flowing. The shape of a provider whose
+        # per-object mutation rate is capped (GCS: about one per second per object).
+        self.delay_substr = ""
+        self.delay_ms = 0
         self._next_generation = _GENERATION_SEED
         self._next_etag_ordinal = 1
         self._next_upload_ordinal = 1
@@ -797,9 +806,19 @@ def handle_control(path, method, query):
             json.dumps({"bucket": bucket, "key": blob_key, "state": "condemned"}).encode(),
             {"Content-Type": "application/json"},
         )
+    if path == "/_control/delay" and method == "POST":
+        STORE.delay_substr = query.get("substr", [""])[0]
+        STORE.delay_ms = int(query.get("ms", ["0"])[0])
+        return Reply(
+            200,
+            json.dumps({"substr": STORE.delay_substr, "ms": STORE.delay_ms}).encode(),
+            {"Content-Type": "application/json"},
+        )
     if path == "/_control/reset" and method == "POST":
         STORE.requests = []
         STORE.counters = {}
+        STORE.delay_substr = ""
+        STORE.delay_ms = 0
         return Reply(200, b"OK")
     return Reply(404, _error_xml("NoSuchControl", "unknown control path " + path))
 
@@ -846,6 +865,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         stripped = path.lstrip("/")
         bucket, _, key = stripped.partition("/")
+
+        if method == "PUT" and STORE.delay_ms and STORE.delay_substr and STORE.delay_substr in key:
+            time.sleep(STORE.delay_ms / 1000.0)
 
         with _LOCK:
             STORE.count("method_" + method)
