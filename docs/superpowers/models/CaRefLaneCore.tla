@@ -24,6 +24,7 @@ CONSTANTS
     SabotageSkipIdentity,
     SabotageNoFence,
     SabotageCertifyBlocked,
+    SabotageCertifyTouching,
     SabotageOldHandleRetarget,
     SabotageLateInvalidation,
     SabotageFenceLossPublication,
@@ -728,12 +729,18 @@ OutstandingTouches ==
    state.  `bad_certification` records a certification whose view is not current for THIS identity:
    the binding disagrees with the durable one, or the runtime is not the current one.  The id may
    legitimately lag in `Writing` (another ref's transaction is durable and not installed), so the
-   currency check is on the binding, not on the id.  The sabotage covers both a touching outstanding
-   mutation and every state that may certify nothing at all. *)
+   currency check is on the binding, not on the id.  Two independent sabotage flags stand in for the
+   two ways the guard can be defeated, kept separate because TLC reports only the first violation it
+   finds and a state where certification is refused everywhere would otherwise always dominate the
+   search: `SabotageCertifyBlocked` certifies from a state that may certify nothing at all (`Wedged`,
+   `NeedsRecovery`, `Closed`, `Faulted`); `SabotageCertifyTouching` certifies in `Writing` while the
+   outstanding mutation touches the identity, proving the touch check itself, not merely the guard's
+   presence, is what keeps the relaxed `Writing` arm safe. *)
 Certify ==
     /\ \/ (lane = "Ready" /\ (CurrentRuntime \/ SabotageNoFence))
-       \/ (lane = "Writing" /\ CurrentRuntime /\ ~OutstandingTouches)
-       \/ (SabotageCertifyBlocked /\ ((lane = "Writing" /\ OutstandingTouches) \/ lane \notin {"Ready", "Writing"}))
+       \/ (lane = "Writing" /\ (CurrentRuntime \/ SabotageNoFence) /\ ~OutstandingTouches)
+       \/ (SabotageCertifyBlocked /\ lane \notin {"Ready", "Writing"})
+       \/ (SabotageCertifyTouching /\ lane = "Writing" /\ OutstandingTouches)
     /\ bad_certification' =
         (bad_certification
          \/ ~(lane \in {"Ready", "Writing"}

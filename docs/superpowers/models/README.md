@@ -378,12 +378,13 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   another ref), a leader tenure, an apply-pending poison state and a mount fence; a receiver
   running publish (durable `+1`) → confirm → promote, or a durable releasing abort; and a GC round
   with a per-namespace fold cursor and condemn → `delete_pending` → delete graduation with sparing
-  on positive in-degree. Proves `ConfirmedRelinkNeverDangles`, with five sabotages each removing one
-  rule: gate 1's exact-`ManifestRef` equality (an ABA via a repoint answers *yes* by name),
-  the ref-scoped refusal (dropping it, `_sab_stalecache`; keeping it but ignoring the mutation's
-  shape, `_sab_touchblind`), the poison state (separately load-bearing — after a poisoned apply the
-  lane looks perfectly quiescent), the mount-fence/current-writer check, and the
-  publish-BEFORE-confirm order. Five `_witness_*` configs pin non-vacuity, including that the
+  on positive in-degree. Proves `ConfirmedRelinkNeverDangles`, with six sabotages against five
+  rules: gate 1's exact-`ManifestRef` equality (an ABA via a repoint answers *yes* by name), the
+  ref-scoped refusal — tested twice, dropping it (`_sab_stalecache`) and keeping it but ignoring the
+  mutation's shape (`_sab_touchblind`) — the poison state (separately load-bearing — after a
+  poisoned apply the lane looks perfectly quiescent), the mount-fence/current-writer check, and the
+  publish-BEFORE-confirm order. A seventh sabotage, `_sab_holeylist`, removes no rule; it is the
+  headline finding below. Five `_witness_*` configs pin non-vacuity, including that the
   theorem's antecedent and physical deletion are both reachable, and that a confirm can answer
   *yes* while a mutation of another ref is in flight (`_witness_yespendingnoop`, the liveness the
   2026-09-02 revision bought).

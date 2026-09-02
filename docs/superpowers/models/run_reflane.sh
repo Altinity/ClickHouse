@@ -21,6 +21,7 @@ CONFIGS=(
   "sab_skipidentity       violation InstallMatchesAttempt"
   "sab_nofence            violation CertifiedViewIsCurrent"
   "sab_certifyblocked     violation CertifiedViewIsCurrent"
+  "sab_certifytouching    violation CertifiedViewIsCurrent"
   "sab_oldhandleretarget  violation NoOldHandleRetarget"
   "sab_observationretarget violation NoOldHandleRetarget"
   "sab_lateinvalidation   violation ExactPredecessorInvalidationPreservesSuccessor"

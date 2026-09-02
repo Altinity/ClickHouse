@@ -9,7 +9,7 @@ doc_type: 'reference'
 
 # CAS reference lane TLA+ results {#cas-reference-lane-tla-results}
 
-**Date:** 2026-08-01. **Verdict:** pass.
+**Date:** 2026-08-01, updated 2026-09-02. **Verdict:** pass.
 
 ## Lane model {#lane-model}
 
@@ -28,21 +28,27 @@ The battery ran with:
 docs/superpowers/models/run_reflane.sh
 ```
 
-All 27 expectations passed:
+All 28 expectations passed:
 
 - one honest exhaustive configuration was green;
-- twelve single-rule sabotages violated their named invariant;
+- thirteen single-rule sabotages violated their named invariant;
 - fourteen reachability witnesses violated their negated witness invariant.
 
 The honest run (re-run 2026-09-02 with `Certify`'s touch-scoped guard) generated 1,309,289 states,
 found 409,361 distinct states, reached depth 26, and exhausted the queue. The retained run summary
-is `build/tlc_reflane_task2_final.log`; detailed TLC output is under
-`build/tlc-runs/reflane/20260902T175742-3397323`.
+is `build/tlc_reflane_task2_fix1_final.log`; detailed TLC output is under
+`build/tlc-runs/reflane/20260902T181501-3413931`.
 
 The sabotage controls cover arming before send, retaining uncertain attempts, blocking later
-appends, complete recovery, exact attempt identity, mount fencing, and touch-scoped certification
-(`Ready`, or `Writing` while the outstanding mutation does not touch the certified identity).
-The new controls independently violate `NoOldHandleRetarget`,
+appends, complete recovery, exact attempt identity, and mount fencing. Two independent controls
+attack the touch-scoped certification guard (`Ready`, or `Writing` while the outstanding mutation
+does not touch the certified identity) rather than one, because TLC stops at the first violation it
+finds and a single flag spanning both arms would always be caught by the broken-state arm first:
+`sab_certifyblocked` certifies from a state that may certify nothing at all (`Wedged` at depth 4, via
+a non-touching write that never lands); `sab_certifytouching` certifies in `Writing` while the
+outstanding mutation touches the identity (a touching write lands at depth 4, so `cache_binding`
+disagrees with `durable_binding`), proving the touch check itself, not merely the guard's presence,
+is load-bearing. The new controls independently violate `NoOldHandleRetarget`,
 `ExactPredecessorInvalidationPreservesSuccessor`, `PublishedRuntimeHasAcceptedIdentity`, and
 `MissingNameConfirmationAllocatesNothing`. Every focused sabotage config checks all non-target
 safety invariants before its expected RED. The new witnesses reach predecessor/successor
@@ -88,8 +94,8 @@ docs/superpowers/models/run_relinklane.sh
 All ten expectations passed: one honest configuration, three named sabotage violations, and six
 reachability witnesses. The honest run (re-run 2026-09-02) generated 797 states, found 196 distinct
 states, reached depth 11, and exhausted the queue. The retained run summary is
-`build/tlc_relinklane_task2_final.log`; detailed TLC output is under
-`build/tlc-runs/relinklane/20260902T175758-3398614`.
+`build/tlc_relinklane_task2_fix1_final.log`; detailed TLC output is under
+`build/tlc-runs/relinklane/20260902T181521-3415520`.
 
 `witness_confirmedoutsideready` reaches a confirmation in `Writing` while the outstanding mutation
 does not touch the identity, violating `W_ConfirmedOutsideReady` after 8 generated / 7 distinct
