@@ -1,3 +1,4 @@
+import os
 import re
 
 from ci.defs.defs import JobNames
@@ -207,6 +208,14 @@ def _is_bugfix_pr():
     return any(lb in _info_cache.pr_labels for lb in _BUGFIX_LABELS)
 
 
+def _is_coverage_family_job(job_name):
+    return (
+        "llvm_coverage" in job_name
+        or "excluded_from_llvm" in job_name
+        or job_name == JobNames.LLVM_COVERAGE
+    )
+
+
 def should_skip_job(job_name):
     global _info_cache
     if _info_cache is None:
@@ -221,6 +230,12 @@ def should_skip_job(job_name):
         or Labels.RELEASE_LTS in _info_cache.pr_labels
     ):
         return True, "Skipped for release PR"
+
+    # Coverage rows are keyed by git branch for PR test selection. A tag push
+    # would store GITHUB_REF_NAME (the tag) in that column. Check before the
+    # empty-changed-files return: MasterCI tag runs have no PR file list.
+    if _is_coverage_family_job(job_name) and os.getenv("GITHUB_REF_TYPE") == "tag":
+        return True, "Skipped: coverage is not collected on tag pushes"
 
     changed_files = _info_cache.get_kv_data("changed_files")
     if not changed_files:
@@ -346,11 +361,7 @@ def should_skip_job(job_name):
     # coverage identical to master - running any part of the family just burns CI time on profdata that
     # the (also-skipped) merge job would never consume. Master itself is unaffected (pr_number gate):
     # its coverage runs must always publish a complete llvm_coverage.info for later PRs to compare against.
-    if (
-        "llvm_coverage" in job_name
-        or "excluded_from_llvm" in job_name
-        or job_name == JobNames.LLVM_COVERAGE
-    ) and (
+    if _is_coverage_family_job(job_name) and (
         Labels.CI_NO_COVERAGE in _info_cache.pr_labels
         or (
             _info_cache.pr_number > 0

@@ -344,6 +344,33 @@ def test_get_changed_tests_issues_no_cidb_query(monkeypatch):
     assert calls == [], f"config-time CIDB requests: {calls}"
 
 
+COVERAGE_BUILD_JOB = "Build (amd_llvm_coverage_per_test)"
+COVERAGE_TEST_JOB = (
+    "Stateless tests (amd_llvm_coverage_per_test, per_test_coverage, 1/8)"
+)
+COVERAGE_SKIP_REASON = "Skipped: coverage is not collected on tag pushes"
+
+
+def test_tag_push_skips_coverage_jobs_without_changed_files(monkeypatch):
+    """MasterCI tag runs have no PR file list, so this skip must not depend on it."""
+    _use_fake_info(monkeypatch, changed_files=())
+    monkeypatch.setenv("GITHUB_REF_TYPE", "tag")
+    calls = _record_cidb_requests(monkeypatch)
+
+    assert fj.should_skip_job(COVERAGE_BUILD_JOB) == (True, COVERAGE_SKIP_REASON)
+    assert fj.should_skip_job(COVERAGE_TEST_JOB) == (True, COVERAGE_SKIP_REASON)
+    assert fj.should_skip_job("Build (amd_release)") == (False, "")
+    assert calls == [], f"config-time CIDB requests: {calls}"
+
+
+def test_non_tag_push_does_not_skip_coverage_when_unfiltered(monkeypatch):
+    _use_fake_info(monkeypatch, changed_files=())
+    monkeypatch.setenv("GITHUB_REF_TYPE", "branch")
+
+    assert fj.should_skip_job(COVERAGE_BUILD_JOB) == (False, "")
+    assert fj.should_skip_job(COVERAGE_TEST_JOB) == (False, "")
+
+
 def test_ci_script_change_keeps_sequential_selected_tests_job(monkeypatch):
     _use_fake_info(monkeypatch, changed_files=("ci/jobs/functional_tests.py",))
 
