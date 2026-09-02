@@ -55,6 +55,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 max_streams_for_files_processing_in_cluster_functions;
+    extern const SettingsBool data_lake_delete_data_on_drop;
 }
 
 namespace ErrorCodes
@@ -849,15 +850,30 @@ void StorageObjectStorage::truncate(
     object_storage->removeObjectsIfExist(objects);
 }
 
+void StorageObjectStorage::prepareForDrop(ContextPtr query_context)
+{
+    /// `drop` is executed in the background, when the query context is already gone, so the setting
+    /// has to be read while the `DROP TABLE` query is still running. A per-query or per-session
+    /// `data_lake_delete_data_on_drop` would be lost otherwise.
+    delete_data_on_drop = query_context->getSettingsRef()[Setting::data_lake_delete_data_on_drop];
+}
+
 void StorageObjectStorage::drop()
 {
+    /// We cannot use query context here, because drop is executed in the background. `prepareForDrop`
+    /// captured it for us if this drop came from a `DROP TABLE` query; otherwise the server-level
+    /// value applies.
+    const bool delete_data = delete_data_on_drop.load().value_or(
+        Context::getGlobalContextInstance()->getSettingsRef()[Setting::data_lake_delete_data_on_drop]);
+
     if (catalog)
     {
         const auto [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        catalog->dropTable(namespace_name, table_name);
+        /// This runs in the background, after the query has finished, so a missing table cannot be
+        /// reported as a no-op to the user anyway: keep reporting it as an error in the log.
+        catalog->dropTable(namespace_name, table_name, delete_data, /* if_exists */ false);
     }
-    /// We cannot use query context here, because drop is executed in the background.
-    configuration->drop(Context::getGlobalContextInstance());
+    configuration->drop(delete_data);
 }
 
 std::unique_ptr<ReadBufferIterator> StorageObjectStorage::createReadBufferIterator(

@@ -214,7 +214,8 @@ ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfiguratio
     };
 }
 
-void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name) const
+void S3TablesCatalog::dropTable(
+    const String & namespace_name, const String & table_name, bool /*delete_data*/, bool /*if_exists*/) const
 {
     const std::string endpoint
         = (base_url / config.prefix / "namespaces" / namespace_name / "tables" / table_name).string()

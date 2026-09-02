@@ -338,7 +338,9 @@ public:
         return true;
     }
 
-    virtual void drop(ContextPtr) {}
+    /// `delete_data` is the effective `data_lake_delete_data_on_drop`, resolved by
+    /// `StorageObjectStorage::drop`. There is no context here: the drop runs in the background.
+    virtual void drop(bool /* delete_data */) {}
 
     virtual bool isBackgroundExecutable() const
     {

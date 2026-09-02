@@ -9,6 +9,7 @@
 #include <aws/glue/GlueClient.h>
 #include <aws/glue/model/GetTablesRequest.h>
 #include <aws/glue/model/GetTableRequest.h>
+#include <aws/glue/model/GetDatabaseRequest.h>
 #include <aws/glue/model/GetDatabasesRequest.h>
 #include <aws/glue/model/CreateTableRequest.h>
 #include <aws/glue/model/DeleteTableRequest.h>
@@ -49,9 +50,12 @@
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Common/FailPoint.h>
+#include <Common/scope_guard_safe.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/ProxyConfigurationResolverProvider.h>
 
@@ -61,6 +65,8 @@ namespace DB::ErrorCodes
     extern const int DATALAKE_DATABASE_ERROR;
     extern const int FAULT_INJECTED;
     extern const int CATALOG_NAMESPACE_DISABLED;
+    extern const int NOT_IMPLEMENTED;
+    extern const int S3_ERROR;
 }
 
 namespace DB::FailPoints
@@ -380,7 +386,7 @@ bool GlueCatalog::tryGetTableMetadata(
         auto setup_specific_properties = [&]
         {
             const auto & table_params = table_outcome.GetParameters();
-            if (table_params.contains("metadata_location"))
+            if (table_params.contains("metadata_location") && !table_params.at("metadata_location").empty())
             {
                 result.setDataLakeSpecificProperties(DataLakeSpecificProperties{.iceberg_metadata_file_location = table_params.at("metadata_location")});
             }
@@ -642,6 +648,23 @@ String GlueCatalog::resolveMetadataPathFromTableLocation(const String & table_lo
 
 void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name) const
 {
+    /// Check existence first: `CreateDatabase` may be denied to a principal that is still allowed to
+    /// create tables in a pre-provisioned namespace, so it must not be called when there is nothing to create.
+    Aws::Glue::Model::GetDatabaseRequest get_request;
+    get_request.SetName(namespace_name);
+
+    auto get_outcome = glue_client->GetDatabase(get_request);
+    if (get_outcome.IsSuccess())
+        return;
+
+    if (get_outcome.GetError().GetErrorType() != Aws::Glue::GlueErrors::ENTITY_NOT_FOUND)
+    {
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+            "Exception calling GetDatabase for namespace {}: {}",
+            namespace_name, get_outcome.GetError().GetMessage());
+    }
+
     Aws::Glue::Model::CreateDatabaseRequest create_request;
     Aws::Glue::Model::DatabaseInput db_input;
     db_input.SetName(namespace_name);
@@ -652,7 +675,13 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name) cons
     glue_client->CreateDatabase(create_request);
 }
 
-void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*metadata_content*/) const
+bool GlueCatalog::createTable(
+    const String & namespace_name,
+    const String & table_name,
+    const String & new_metadata_path,
+    Poco::JSON::Object::Ptr metadata_content,
+    DB::CompressionMethod metadata_compression_method,
+    bool if_not_exists) const
 {
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
@@ -661,6 +690,63 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
 
     createNamespaceIfNotExists(namespace_name);
 
+    String effective_metadata_path = new_metadata_path;
+
+    DB::ObjectStoragePtr written_metadata_storage;
+    String written_metadata_file;
+
+    /// The initial metadata file staged below must not outlive a registration that did not happen: the
+    /// write is guarded by `If-None-Match: *`, so a leftover permanently blocks every retry, and when the
+    /// winner of an `IF NOT EXISTS` name race registered the table at another location (an explicit
+    /// Iceberg engine path, or a different `default_base_location`), the file is left behind in an orphan
+    /// directory the catalog does not point at. Only this call can have created that object - a writer
+    /// that lost the `If-None-Match` race returns before staging anything - so removing it is safe.
+    bool registered = false;
+    SCOPE_EXIT_SAFE({
+        if (!registered && written_metadata_storage)
+            written_metadata_storage->removeObjectIfExists(DB::StoredObject(written_metadata_file));
+    });
+
+    if (effective_metadata_path.empty() && metadata_content && metadata_content->has("location"))
+    {
+        String table_location = metadata_content->getValue<String>("location");
+        while (table_location.ends_with('/'))
+            table_location = table_location.substr(0, table_location.size() - 1);
+
+        TableMetadata dummy_metadata;
+        auto [object_storage, bucket_name, table_path] = createObjectStorageForEarlyTableAccess(table_location, dummy_metadata);
+
+        /// Name the file exactly like `IcebergMetadata::createInitial` does, so other engines can
+        /// locate the metadata file.
+        String compression_suffix = DB::toContentEncodingName(metadata_compression_method);
+        if (!compression_suffix.empty())
+            compression_suffix = "." + compression_suffix;
+
+        String metadata_filename = fmt::format("{}/metadata/v1{}.metadata.json", table_path, compression_suffix);
+
+        std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        Poco::JSON::Stringifier::stringify(metadata_content, oss, 4);
+        String metadata_str = DB::removeEscapedSlashes(oss.str());
+
+        try
+        {
+            DB::Iceberg::writeMessageToFile(metadata_str, metadata_filename, object_storage, getContext(), "*", "", metadata_compression_method);
+        }
+        catch (const DB::Exception & e)
+        {
+            /// The write is guarded by `If-None-Match: *`, so S3 answers `PreconditionFailed` once the
+            /// initial metadata file is there - someone else created this table first.
+            if (if_not_exists && e.code() == DB::ErrorCodes::S3_ERROR && e.message().contains("PreconditionFailed"))
+                return false;
+            throw;
+        }
+
+        written_metadata_storage = object_storage;
+        written_metadata_file = metadata_filename;
+
+        effective_metadata_path = "s3://" + bucket_name + "/" + metadata_filename;
+    }
+
     Aws::Glue::Model::CreateTableRequest request;
     request.SetDatabaseName(namespace_name);
 
@@ -668,18 +754,21 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
     table_input.SetName(table_name);
 
     Aws::Glue::Model::StorageDescriptor sd;
-    fs::path original_path = new_metadata_path;
+    if (!effective_metadata_path.empty())
+    {
+        fs::path original_path = effective_metadata_path;
 
-    fs::path parent = original_path.parent_path();
-    fs::path grandparent = parent.parent_path();
+        fs::path parent = original_path.parent_path();
+        fs::path grandparent = parent.parent_path();
 
-    sd.SetLocation(grandparent.c_str());
+        sd.SetLocation(grandparent.c_str());
+    }
 
     table_input.SetStorageDescriptor(sd);
     table_input.SetTableType("ICEBERG");
 
     Aws::Map<Aws::String, Aws::String> parameters;
-    parameters["metadata_location"] = new_metadata_path;
+    parameters["metadata_location"] = effective_metadata_path;
     parameters["table_type"] = "ICEBERG";
 
     table_input.SetParameters(parameters);
@@ -695,7 +784,17 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
     }
 
     if (!response.IsSuccess())
-        throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not create metadata in glue catalog: {}", response.GetError().GetMessage());
+    {
+        /// `AlreadyExistsException` means someone else registered the table first. The staged metadata
+        /// file is removed by the scope guard, so `IF NOT EXISTS` leaves nothing behind.
+        if (if_not_exists && response.GetError().GetErrorType() == Aws::Glue::GlueErrors::ALREADY_EXISTS)
+            return false;
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not create metadata in glue catalog: {}", response.GetError().GetMessage());
+    }
+
+    registered = true;
+    return true;
 }
 
 bool GlueCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*new_snapshot*/) const
@@ -753,12 +852,28 @@ bool GlueCatalog::updateSchema(
     return updateMetadata(namespace_name, table_name, new_metadata_path, nullptr);
 }
 
-void GlueCatalog::dropTable(const String & namespace_name, const String & table_name) const
+void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const
 {
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to drop table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
+
+    /// We drop only via Glue's `DeleteTable`, which removes the catalog entry but leaves the data files in
+    /// object storage; deleting them (the client-side purge that e.g. Iceberg's own GlueCatalog performs) is
+    /// not implemented here. Reject a requested purge rather than silently ignore it and orphan the data.
+    /// TODO: implement the client-side purge (delete the table's data/manifest/metadata files, then
+    /// `DeleteTable`) in a follow-up PR so `data_lake_delete_data_on_drop` can be honored for Glue.
+    if (purge)
+    {
+        if (if_exists && !existsTable(namespace_name, table_name))
+            return;
+
+        throw DB::Exception(
+            DB::ErrorCodes::NOT_IMPLEMENTED,
+            "data_lake_delete_data_on_drop is not supported for the Glue catalog: dropping only removes the Glue "
+            "catalog entry and does not delete the underlying data files");
+    }
 
     Aws::Glue::Model::DeleteTableRequest request;
     request.SetDatabaseName(namespace_name);
@@ -772,7 +887,9 @@ void GlueCatalog::dropTable(const String & namespace_name, const String & table_
         response = glue_client->DeleteTable(request);
     }
 
-    if (!response.IsSuccess())
+    /// `EntityNotFoundException` means the table is already gone - someone else dropped it first.
+    if (!response.IsSuccess()
+        && !(if_exists && response.GetError().GetErrorType() == Aws::Glue::GlueErrors::ENTITY_NOT_FOUND))
         throw DB::Exception(
             DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
             "Can not delete table from glue catalog: {}",

@@ -189,6 +189,11 @@ public:
 
     virtual bool isDatalakeCatalog() const { return false; }
 
+    /// Reject an explicitly-specified table engine that is incompatible with this database, before the
+    /// table is created. A datalake catalog with a fixed storage backend rejects an Iceberg engine that
+    /// pins a different backend. Default: no-op.
+    virtual void validateCreateTableEngine(const String & /*engine_name*/) const {}
+
     /// True for databases such as `MySQL`/`PostgreSQL` whose table list lives on a remote service.
     /// This is distinct from `isExternal`, which classifies whether the engine supports ClickHouse internal table types.
     virtual bool isRemoteDatabase() const { return false; }
@@ -320,10 +325,12 @@ public:
         const ASTPtr & /*query*/);
 
     /// Delete the table from the database, drop table and delete the metadata.
+    /// `if_exists` is the flag of the originating query.
     virtual void dropTable( /// NOLINT
         ContextPtr /*context*/,
         const String & /*name*/,
-        [[maybe_unused]] bool sync = false);
+        [[maybe_unused]] bool sync = false,
+        [[maybe_unused]] bool if_exists = false);
 
     /// Add a table to the database, but do not add it to the metadata. The database may not support this method.
     ///
