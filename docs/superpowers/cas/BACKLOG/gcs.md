@@ -55,12 +55,18 @@ Proved on the real bucket with the `gcs_hmac` client, binary of 2026-09-02:
   the arms that refuse without incrementing a counter — zero `NO_REPLICA_HAS_PART`, both replication
   queues empty at the end, no divergence at any checkpoint, and all five refusal counters zero on both
   nodes throughout. The same stand on the pre-fix binary had answered unproven 2999 times in two hours.
+  The refusal criterion is therefore met on the stronger reading: no confirm was refused for any reason,
+  rather than one refusal class merely dominating the others.
   Why it is not closed: the soak exited non-zero on a checkpoint leak assert that fires on the pool
   prefix's inherited debris rather than on anything the run did (F13), and a checkpoint longer than the
   whole timeline consumed the chaos window, so one of four scheduled faults fired and the fence-losing
   freeze never ran (F14). No refusal path fired live, so the increment-to-`system.events` step is still
   unproven for all five counters, though all five are registered under their names on both servers. A
   re-run against a fresh pool prefix removes both blockers and is what would close this.
+  A third finding, F15, sits underneath F13 and F14 and explains the checkpoint cost both describe: a
+  single fold round holds the GC lease for hours on this bucket, so a stage that waits for a collection
+  fixpoint cannot converge inside a ten-minute soak. It is pre-existing and unrelated to the relink
+  change; the peer's rounds no-op cleanly as `NotALeader` throughout.
   Gate report: `.superpowers/sdd/2026-09-02-cas-relink-confirm-liveness/task-8-report.md`.
   Design: [relink confirm liveness design](/superpowers/specs/cas-relink-confirm-liveness-design),
   revision 10 (rule 3 refuses while a queued or in-flight mutation names the queried ref, read from
