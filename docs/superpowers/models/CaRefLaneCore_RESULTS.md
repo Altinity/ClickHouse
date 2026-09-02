@@ -28,19 +28,20 @@ The battery ran with:
 docs/superpowers/models/run_reflane.sh
 ```
 
-All 26 expectations passed:
+All 27 expectations passed:
 
 - one honest exhaustive configuration was green;
 - twelve single-rule sabotages violated their named invariant;
-- thirteen reachability witnesses violated their negated witness invariant.
+- fourteen reachability witnesses violated their negated witness invariant.
 
-The honest run generated 952,403 states, found 296,280 distinct states, reached depth 25, and
-exhausted the queue. The retained run summary is
-`build/test_CaRefLaneCore_r2_final2.log`; detailed TLC output is under
-`build/tlc-runs/reflane/r2-final2`.
+The honest run (re-run 2026-09-02 with `Certify`'s touch-scoped guard) generated 1,309,289 states,
+found 409,361 distinct states, reached depth 26, and exhausted the queue. The retained run summary
+is `build/tlc_reflane_task2_final.log`; detailed TLC output is under
+`build/tlc-runs/reflane/20260902T175742-3397323`.
 
 The sabotage controls cover arming before send, retaining uncertain attempts, blocking later
-appends, complete recovery, exact attempt identity, mount fencing, and `Ready`-only certification.
+appends, complete recovery, exact attempt identity, mount fencing, and touch-scoped certification
+(`Ready`, or `Writing` while the outstanding mutation does not touch the certified identity).
 The new controls independently violate `NoOldHandleRetarget`,
 `ExactPredecessorInvalidationPreservesSuccessor`, `PublishedRuntimeHasAcceptedIdentity`, and
 `MissingNameConfirmationAllocatesNothing`. Every focused sabotage config checks all non-target
@@ -63,12 +64,18 @@ distinct states at depth 9.
 With only `NoOldHandleRetarget` omitted, the observation-retarget sabotage exhaustively preserves
 every non-target invariant: 223,716 generated / 62,061 distinct states, empty queue, depth 21.
 
+`witness_certifyoutstanding` reaches a certification in `Writing` with a same-binding attempt
+outstanding and already durable, so the honest run's green `CertifiedViewIsCurrent` covers the
+relaxed guard in the post-`PUT`, pre-install window and not only `Ready`. It violates
+`W_CertifiedWhileOutstanding` after 62 generated / 39 distinct states at depth 4.
+
 ## Relink composition {#relink-composition}
 
 `CaRelinkLaneComposition.tla` consumes the lane as a six-state component. It checks three seam
 properties:
 
-1. confirmation requires `Ready`;
+1. confirmation requires `Ready`, or `Writing` with an outstanding mutation that does not touch
+   the identity (`ConfirmationRequiresUntouchedIdentity`);
 2. promotion uses the exact confirmed identity;
 3. source deletion requires receiver ownership.
 
@@ -78,14 +85,19 @@ The battery ran with:
 docs/superpowers/models/run_relinklane.sh
 ```
 
-All nine expectations passed: one honest configuration, three named sabotage violations, and five
-reachability witnesses. The honest run generated 341 states, found 96 distinct states, and exhausted
-the queue. The retained run summary is
-`build/test_CaRelinkLaneComposition_20260730_r2.log`; detailed TLC output is under
-`build/tlc-runs/relinklane/20260730T084009-609`.
+All ten expectations passed: one honest configuration, three named sabotage violations, and six
+reachability witnesses. The honest run (re-run 2026-09-02) generated 797 states, found 196 distinct
+states, reached depth 11, and exhausted the queue. The retained run summary is
+`build/tlc_relinklane_task2_final.log`; detailed TLC output is under
+`build/tlc-runs/relinklane/20260902T175758-3398614`.
+
+`witness_confirmedoutsideready` reaches a confirmation in `Writing` while the outstanding mutation
+does not touch the identity, violating `W_ConfirmedOutsideReady` after 8 generated / 7 distinct
+states at depth 3.
 
 ## Conclusion {#conclusion}
 
 The reference lane is now modeled from its semantic obligations rather than reconstructed from the
 old implementation's nested decisions. The C++ implementation follows that model, and the relink
-seam depends only on the small `Ready` certification contract.
+seam depends only on the small certification contract: `Ready`, or `Writing` without an outstanding
+mutation of the certified identity.

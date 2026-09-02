@@ -40,6 +40,7 @@ CONFIGS=(
   "witness_lateinvalidation violation W_LateInvalidationPreserved"
   "witness_missingconfirmation violation W_MissingConfirmation"
   "witness_rebirthresolver violation W_RebirthResolverScope"
+  "witness_certifyoutstanding violation W_CertifiedWhileOutstanding"
 )
 
 overall=0

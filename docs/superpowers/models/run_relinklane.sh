@@ -13,7 +13,7 @@ META_ROOT="../../../build/tlc-meta/relinklane/${RUN_ID}"
 mkdir -p "$LOG_ROOT" "$META_ROOT"
 
 CONFIGS=(
-  "sab_confirmblocked violation ConfirmationRequiresReady"
+  "sab_confirmblocked violation ConfirmationRequiresUntouchedIdentity"
   "sab_skipidentity   violation PromotionUsesConfirmedIdentity"
   "sab_deleteunowned  violation DeletedSourceIsOwned"
   "safe               green     -"
@@ -22,6 +22,7 @@ CONFIGS=(
   "witness_recovery       violation W_Recovery"
   "witness_promotion      violation W_Promotion"
   "witness_delete         violation W_Delete"
+  "witness_confirmedoutsideready violation W_ConfirmedOutsideReady"
 )
 
 overall=0

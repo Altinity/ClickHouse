@@ -4,9 +4,10 @@ The relink seam composed with the public contract of `CaRefLaneCore`.
 
 This model intentionally treats the ref lane as a six-state component. Relink
 does not know about PUT outcomes, resolver verdicts, or recovery walk details.
-It may certify a source identity only while the lane is `Ready`; the receiver
-may promote only that exact identity; and source deletion is enabled only after
-the receiver owns it.
+It may certify a source identity while the lane is `Ready`, or while it is `Writing` and the
+outstanding mutation does not touch that identity (the touch is a nondeterministic parameter of
+`StartWrite`, since this model has no transaction content); the receiver may promote only that
+exact identity; and source deletion is enabled only after the receiver owns it.
 *)
 EXTENDS TLC
 
@@ -20,6 +21,7 @@ Bindings == {"none", "blob", "other"}
 
 VARIABLES
     lane,
+    outstanding_touches,
     source_exists,
     confirmed_binding,
     receiver_binding,
@@ -30,15 +32,18 @@ VARIABLES
     saw_blocked_refusal,
     saw_recovery,
     saw_promotion,
-    saw_delete
+    saw_delete,
+    saw_confirmed_outside_ready
 
 vars ==
-    << lane, source_exists, confirmed_binding, receiver_binding, promoted,
+    << lane, outstanding_touches, source_exists, confirmed_binding, receiver_binding, promoted,
        bad_confirmation, bad_promotion, saw_confirmation,
-       saw_blocked_refusal, saw_recovery, saw_promotion, saw_delete >>
+       saw_blocked_refusal, saw_recovery, saw_promotion, saw_delete,
+       saw_confirmed_outside_ready >>
 
 Init ==
     /\ lane = "Ready"
+    /\ outstanding_touches = FALSE
     /\ source_exists = TRUE
     /\ confirmed_binding = "none"
     /\ receiver_binding = "none"
@@ -50,99 +55,109 @@ Init ==
     /\ saw_recovery = FALSE
     /\ saw_promotion = FALSE
     /\ saw_delete = FALSE
+    /\ saw_confirmed_outside_ready = FALSE
 
-StartWrite ==
+StartWrite(touch) ==
     /\ lane = "Ready"
     /\ lane' = "Writing"
+    /\ outstanding_touches' = touch
     /\ UNCHANGED << source_exists, confirmed_binding, receiver_binding,
                     promoted, bad_confirmation, bad_promotion,
                     saw_confirmation, saw_blocked_refusal, saw_recovery,
-                    saw_promotion, saw_delete >>
+                    saw_promotion, saw_delete, saw_confirmed_outside_ready >>
 
 CommitWrite ==
     /\ lane = "Writing"
     /\ lane' = "Ready"
+    /\ outstanding_touches' = FALSE
     /\ UNCHANGED << source_exists, confirmed_binding, receiver_binding,
                     promoted, bad_confirmation, bad_promotion,
                     saw_confirmation, saw_blocked_refusal, saw_recovery,
-                    saw_promotion, saw_delete >>
+                    saw_promotion, saw_delete, saw_confirmed_outside_ready >>
 
 WriteUnresolved ==
     /\ lane = "Writing"
     /\ lane' = "Wedged"
+    /\ outstanding_touches' = FALSE
     /\ UNCHANGED << source_exists, confirmed_binding, receiver_binding,
                     promoted, bad_confirmation, bad_promotion,
                     saw_confirmation, saw_blocked_refusal, saw_recovery,
-                    saw_promotion, saw_delete >>
+                    saw_promotion, saw_delete, saw_confirmed_outside_ready >>
 
 RequireRecovery ==
     /\ lane \in {"Writing", "Wedged"}
     /\ lane' = "NeedsRecovery"
+    /\ outstanding_touches' = FALSE
     /\ UNCHANGED << source_exists, confirmed_binding, receiver_binding,
                     promoted, bad_confirmation, bad_promotion,
                     saw_confirmation, saw_blocked_refusal, saw_recovery,
-                    saw_promotion, saw_delete >>
+                    saw_promotion, saw_delete, saw_confirmed_outside_ready >>
 
 Recover ==
     /\ lane = "NeedsRecovery"
     /\ lane' = "Ready"
     /\ saw_recovery' = TRUE
-    /\ UNCHANGED << source_exists, confirmed_binding, receiver_binding,
+    /\ UNCHANGED << outstanding_touches, source_exists, confirmed_binding, receiver_binding,
                     promoted, bad_confirmation, bad_promotion,
                     saw_confirmation, saw_blocked_refusal,
-                    saw_promotion, saw_delete >>
+                    saw_promotion, saw_delete, saw_confirmed_outside_ready >>
 
 CloseLane ==
     /\ lane = "Wedged"
     /\ lane' = "Closed"
-    /\ UNCHANGED << source_exists, confirmed_binding, receiver_binding,
+    /\ UNCHANGED << outstanding_touches, source_exists, confirmed_binding, receiver_binding,
                     promoted, bad_confirmation, bad_promotion,
                     saw_confirmation, saw_blocked_refusal, saw_recovery,
-                    saw_promotion, saw_delete >>
+                    saw_promotion, saw_delete, saw_confirmed_outside_ready >>
 
 FaultLane ==
     /\ lane = "Wedged"
     /\ lane' = "Faulted"
-    /\ UNCHANGED << source_exists, confirmed_binding, receiver_binding,
+    /\ UNCHANGED << outstanding_touches, source_exists, confirmed_binding, receiver_binding,
                     promoted, bad_confirmation, bad_promotion,
                     saw_confirmation, saw_blocked_refusal, saw_recovery,
-                    saw_promotion, saw_delete >>
+                    saw_promotion, saw_delete, saw_confirmed_outside_ready >>
+
+(* The lane certifies the identity: Ready, or Writing with an outstanding mutation that leaves the
+   identity alone.  Wedged and the broken states never certify. *)
+Confirmable == lane = "Ready" \/ (lane = "Writing" /\ ~outstanding_touches)
 
 ConfirmSource ==
-    /\ lane = "Ready"
+    /\ Confirmable
     /\ source_exists
     /\ confirmed_binding' = "blob"
     /\ saw_confirmation' = TRUE
-    /\ UNCHANGED << lane, source_exists, receiver_binding, promoted,
+    /\ saw_confirmed_outside_ready' = (saw_confirmed_outside_ready \/ lane = "Writing")
+    /\ UNCHANGED << lane, outstanding_touches, source_exists, receiver_binding, promoted,
                     bad_confirmation, bad_promotion, saw_blocked_refusal,
                     saw_recovery, saw_promotion, saw_delete >>
 
 RefuseBlockedConfirmation ==
-    /\ lane # "Ready"
+    /\ ~Confirmable
     /\ saw_blocked_refusal' = TRUE
-    /\ UNCHANGED << lane, source_exists, confirmed_binding,
+    /\ UNCHANGED << lane, outstanding_touches, source_exists, confirmed_binding,
                     receiver_binding, promoted, bad_confirmation,
                     bad_promotion, saw_confirmation, saw_recovery,
-                    saw_promotion, saw_delete >>
+                    saw_promotion, saw_delete, saw_confirmed_outside_ready >>
 
 ConfirmWhileBlocked ==
     /\ SabotageConfirmBlocked
-    /\ lane # "Ready"
+    /\ ~Confirmable
     /\ source_exists
     /\ confirmed_binding' = "blob"
     /\ bad_confirmation' = TRUE
-    /\ UNCHANGED << lane, source_exists, receiver_binding, promoted,
+    /\ UNCHANGED << lane, outstanding_touches, source_exists, receiver_binding, promoted,
                     bad_promotion, saw_confirmation, saw_blocked_refusal,
-                    saw_recovery, saw_promotion, saw_delete >>
+                    saw_recovery, saw_promotion, saw_delete, saw_confirmed_outside_ready >>
 
 PromoteExactIdentity ==
     /\ confirmed_binding = "blob"
     /\ receiver_binding' = confirmed_binding
     /\ promoted' = TRUE
     /\ saw_promotion' = TRUE
-    /\ UNCHANGED << lane, source_exists, confirmed_binding,
+    /\ UNCHANGED << lane, outstanding_touches, source_exists, confirmed_binding,
                     bad_confirmation, bad_promotion, saw_confirmation,
-                    saw_blocked_refusal, saw_recovery, saw_delete >>
+                    saw_blocked_refusal, saw_recovery, saw_delete, saw_confirmed_outside_ready >>
 
 PromoteDifferentIdentity ==
     /\ SabotageSkipIdentity
@@ -150,19 +165,19 @@ PromoteDifferentIdentity ==
     /\ receiver_binding' = "other"
     /\ promoted' = TRUE
     /\ bad_promotion' = TRUE
-    /\ UNCHANGED << lane, source_exists, confirmed_binding,
+    /\ UNCHANGED << lane, outstanding_touches, source_exists, confirmed_binding,
                     bad_confirmation, saw_confirmation,
                     saw_blocked_refusal, saw_recovery, saw_promotion,
-                    saw_delete >>
+                    saw_delete, saw_confirmed_outside_ready >>
 
 DeleteSource ==
     /\ promoted
     /\ receiver_binding = "blob"
     /\ source_exists' = FALSE
     /\ saw_delete' = TRUE
-    /\ UNCHANGED << lane, confirmed_binding, receiver_binding, promoted,
+    /\ UNCHANGED << lane, outstanding_touches, confirmed_binding, receiver_binding, promoted,
                     bad_confirmation, bad_promotion, saw_confirmation,
-                    saw_blocked_refusal, saw_recovery, saw_promotion >>
+                    saw_blocked_refusal, saw_recovery, saw_promotion, saw_confirmed_outside_ready >>
 
 DeleteBeforeOwnership ==
     /\ SabotageDeleteUnowned
@@ -170,12 +185,12 @@ DeleteBeforeOwnership ==
     /\ source_exists
     /\ source_exists' = FALSE
     /\ saw_delete' = TRUE
-    /\ UNCHANGED << lane, confirmed_binding, receiver_binding, promoted,
+    /\ UNCHANGED << lane, outstanding_touches, confirmed_binding, receiver_binding, promoted,
                     bad_confirmation, bad_promotion, saw_confirmation,
-                    saw_blocked_refusal, saw_recovery, saw_promotion >>
+                    saw_blocked_refusal, saw_recovery, saw_promotion, saw_confirmed_outside_ready >>
 
 Next ==
-    \/ StartWrite
+    \/ \E touch \in BOOLEAN : StartWrite(touch)
     \/ CommitWrite
     \/ WriteUnresolved
     \/ RequireRecovery
@@ -194,6 +209,7 @@ Spec == Init /\ [][Next]_vars
 
 TypeOK ==
     /\ lane \in LaneStates
+    /\ outstanding_touches \in BOOLEAN
     /\ source_exists \in BOOLEAN
     /\ confirmed_binding \in Bindings
     /\ receiver_binding \in Bindings
@@ -205,8 +221,9 @@ TypeOK ==
     /\ saw_recovery \in BOOLEAN
     /\ saw_promotion \in BOOLEAN
     /\ saw_delete \in BOOLEAN
+    /\ saw_confirmed_outside_ready \in BOOLEAN
 
-ConfirmationRequiresReady == ~bad_confirmation
+ConfirmationRequiresUntouchedIdentity == ~bad_confirmation
 PromotionUsesConfirmedIdentity == ~bad_promotion
 DeletedSourceIsOwned ==
     ~source_exists => (promoted /\ receiver_binding = "blob")
@@ -216,5 +233,6 @@ W_BlockedRefusal == ~saw_blocked_refusal
 W_Recovery == ~saw_recovery
 W_Promotion == ~saw_promotion
 W_Delete == ~saw_delete
+W_ConfirmedOutsideReady == ~saw_confirmed_outside_ready
 
 =============================================================================
