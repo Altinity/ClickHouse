@@ -223,3 +223,4 @@ Appended by the 20-minute watchdog. Format: time, what is running, progress, ano
 - 04:03 BACKLOG and live-results doc updated with today's results and the three new items; F11 decision options written into the ledger. Waiting for the stand to converge (ch2 fetches to be re-enabled once ch1 < 30) and for the stateless lane.
 - 04:06 Stateless lane over GCS: F12 (pool-wide `ref_catalog` hot key → 429 → failed DDL) established after ~900 tests; stopping the lane. Stand: ch1 queue grew back once ch2 merges/mutations resumed (F11 addendum). Phases 1-3 all executed; ledger and BACKLOG carry the findings.
 - 04:11 Stand converged: queues 2/0, rows 244,024 = 244,024, zero unproven confirms. Campaign closed; watchdog removed; stand left up as the F11 reproduction.
+- 07:51 All GCS findings and fix options consolidated into `docs/superpowers/cas/BACKLOG/gcs.md` (index row in BACKLOG.md; the three items moved out of formats-and-storage.md leave a pointer).
