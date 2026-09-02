@@ -137,6 +137,17 @@ def _refusal_counters(node):
     )
 
 
+def _refusal_counter(node, event):
+    # `system.events` has no row for an event that never fired, so an empty result is a zero, not an
+    # error — which is what lets the caller assert a clean zero rather than having to special-case a
+    # missing row. A misspelled event name reads the same way, so a zero here is never by itself
+    # evidence that the named counter exists.
+    value = node.query(
+        "SELECT value FROM system.events WHERE event = '{}'".format(event)
+    ).strip()
+    return int(value) if value else 0
+
+
 def _log_lines(node, pattern):
     out = node.exec_in_container(
         [
@@ -249,17 +260,32 @@ def test_both_queues_drain_under_slow_checkpoints():
                 "arrived took some route other than fetch-by-relink".format(node.name)
             )
 
-        # The refusal counters are printed above and deliberately NOT asserted on, which is a
-        # decision rather than an omission. A refusal now needs a queued or carved mutation naming
-        # the very ref the peer is asking about, and each node's lane is busy with its own newer
-        # parts rather than with the seconds-old part its peer is fetching — a run that passed both
-        # assertions above left node1 with no `CASRelinkConfirmRefused%` row at all. Requiring a non-zero
-        # counter would demand the symptom the ref-scoped rule removes, so it would pass only while
-        # the livelock is present. The two things such a counter was meant to show are shown better
-        # above: the relink-completion assertion proves confirms were asked and answered `Yes`, and
-        # the delayed-PUT floor proves the checkpoint publications were slowed, which is the
-        # contention itself. The attribution of each refusal to its counter is pinned in the unit
-        # suite, by `CASConfirmExactRef.UntouchedRefConfirmsWhileAnotherRefIsQueued`.
+        # No confirm may be refused by lane STATE on a healthy run. These two counters move only on
+        # `confirmExactRef`'s wedge and broken-lane branches — an unresolved append, or a lane in
+        # NeedsRecovery, Closed, Faulted, or Writing with nothing carved. None of those is reachable
+        # from load alone, so a non-zero value here is a lane defect the drain assertion above can
+        # hide: a confirm refused table-wide costs the receiver only a retry, and enough retries still
+        # finish inside the drain window. This is also the only end-to-end evidence that the ledger's
+        # increments reach `system.events` under these names at all.
+        #
+        # What is NOT asserted, deliberately: `CASRelinkConfirmRefusedRefMutationInFlight` above zero.
+        # A refusal there needs a queued or carved mutation naming the very ref the peer is asking
+        # about, and each node's lane is busy with its own newer parts rather than with the seconds-old
+        # part its peer is fetching — a run that passed both assertions above left node1 with no
+        # `CASRelinkConfirmRefused%` row at all. Requiring it would demand the symptom the ref-scoped
+        # rule removes, so it would pass only while the livelock is present. The two things it was
+        # meant to show are shown better above: the relink-completion assertion proves confirms were
+        # asked and answered `Yes`, and the delayed-PUT floor proves the checkpoint publications were
+        # slowed, which is the contention itself. Its attribution is pinned in the unit suite, by
+        # `CASConfirmExactRef.UntouchedRefConfirmsWhileAnotherRefIsQueued`.
+        for node in (node1, node2):
+            for event in ("CASRelinkConfirmRefusedLaneWedged", "CASRelinkConfirmRefusedLaneBroken"):
+                assert _refusal_counter(node, event) == 0, (
+                    "{} refused a relink confirm by lane state ({}), which no amount of write load can "
+                    "cause. All refusal counters on this node:\n{}".format(
+                        node.name, event, _refusal_counters(node)
+                    )
+                )
     finally:
         try:
             _set_delay("", 0)

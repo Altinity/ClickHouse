@@ -47,9 +47,9 @@
 ///     interserver query must never be able to make this writer do work.
 ///   - The snapshot spans BOTH lane mutexes, so an append admitted concurrently is ordered strictly
 ///     after it: there is no window in which the confirm says `Yes` while a mutation OF THAT REF is
-///     already admitted. A queued or in-flight mutation of another ref does not refuse -- rule 3 reads
-///     each item's `MutationScope`, and refusing for the whole table starved two replicas of each other
-///     under load on a slow control plane.
+///     already admitted. A queued or in-flight mutation of another SINGLE ref does not refuse -- rule 3
+///     reads each item's `MutationScope`, and refusing for the whole table starved two replicas of each
+///     other under load on a slow control plane. A `WholeShard`-scoped mutation still refuses every ref.
 ///
 /// The suite name is prefixed `Cas` so it is covered by the `Cas*` unit-test gate filter.
 
@@ -63,7 +63,9 @@ extern const int LOGICAL_ERROR;
 namespace ProfileEvents
 {
     extern const Event CASRelinkConfirmRefusedRefMutationInFlight;
+    extern const Event CASRelinkConfirmRefusedLaneWedged;
     extern const Event CASRelinkConfirmRefusedLaneBroken;
+    extern const Event CASRelinkConfirmRefusedMountCannotSpeak;
 }
 
 using namespace DB::Cas;
@@ -247,6 +249,16 @@ uint64_t backendRequests(const CountingBackend & b)
     return b.headTotal() + b.getTotal() + b.getStreamTotal() + b.putTotal() + b.listTotal();
 }
 
+/// One refusal counter's current value. `confirmExactRef` attributes every `Unknown` to exactly one of
+/// these, and a live gate reads them to tell load from a fault from a lost mount -- distinctions the
+/// three-value `ConfirmAnswer` cannot carry. A test that checks only the ANSWER passes just as happily
+/// when two of them are swapped, so the tests that reach a refusal deterministically assert the
+/// attribution as a DELTA around the confirm, never an absolute (the suite shares one process).
+uint64_t refusalCount(ProfileEvents::Event event)
+{
+    return ProfileEvents::global_counters[event].load();
+}
+
 /// One-shot throwing probe in the post-durable install region -- the only way to reach `NeedsRecovery`
 /// transition now that §A1 made every install region allocation-free. Copied in shape from
 /// `gtest_cas_ref_install_safety.cpp`: the exception is built OUTSIDE the region (constructing one
@@ -408,7 +420,15 @@ TEST(CASConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
     ASSERT_FALSE(store->refTableCachedForTest(ns)) << "that runtime must be UNRECOVERED";
 
     backend->resetCounts();
+    /// An unrecovered table is not a lane fault and not load: it is this mount being unable to speak
+    /// for the namespace, and the live gate must be able to tell those apart.
+    const uint64_t cannot_speak_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak);
+    const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
     EXPECT_EQ(store->confirmExactRef(ns, "x", ManifestRef{1, 1, 1}), ConfirmAnswer::Unknown);
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak) - cannot_speak_before, 1u)
+        << "an unrecovered view must be reported as this mount being unable to speak for the table";
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before, 0u)
+        << "an unrecovered table is not a lane defect; the live gate asserts LaneBroken is zero";
     EXPECT_EQ(backendRequests(*backend), 0u)
         << "an unrecovered table must answer Unknown without driving recovery";
     EXPECT_FALSE(store->refTableCachedForTest(ns))
@@ -671,10 +691,20 @@ TEST(CASConfirmExactRef, WedgedTransactionRefusesEveryRef)
         << "the wedged item was completed and released; only the lane state records its transaction";
 
     backend->resetCounts();
+    /// A wedge and a broken lane are two DIFFERENT things to a live gate -- one is an unresolved append
+    /// that the next flush or a remount clears, the other is a lane defect. Both refuse here, and
+    /// without these deltas the test would pass just as happily if the wedge branch were deleted and
+    /// the broken-lane branch answered for it.
+    const uint64_t wedged_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneWedged);
+    const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
     EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Unknown) << "x's removal may be durable";
     EXPECT_EQ(store->confirmExactRef(ns, "other", id_other.ref), ConfirmAnswer::Unknown)
         << "a wedge refuses table-wide: no per-ref record of the wedged transaction survives the tenure";
     EXPECT_EQ(backendRequests(*backend), 0u) << "a wedged lane must answer without trying to resolve the wedge";
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneWedged) - wedged_before, 2u)
+        << "both refusals must be reported as a wedge";
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before, 0u)
+        << "a wedge is not a lane defect: reporting it as one would send the live gate hunting a bug";
 }
 
 
@@ -864,8 +894,16 @@ TEST(CASConfirmExactRef, NeedsRecoveryIsUnknown)
     ASSERT_FALSE(store->refLaneWedgedForTest(ns));
     ASSERT_FALSE(store->refLeaderActiveForTest(ns));
 
+    /// The positive side of the wedge case's negative: `NeedsRecovery` is the lane defect
+    /// `LaneBroken` is FOR, so this is the one refusal that must be reported as one.
+    const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
+    const uint64_t wedged_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneWedged);
     EXPECT_EQ(store->confirmExactRef(ns, "keep", keep.ref), ConfirmAnswer::Unknown)
         << "a table that may be missing a durable transaction cannot confirm ANY of its rows";
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before, 1u)
+        << "a NeedsRecovery lane is exactly what LaneBroken reports";
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneWedged) - wedged_before, 0u)
+        << "the lane is not wedged here, and the two counters must not be interchangeable";
 }
 
 
@@ -886,7 +924,12 @@ TEST(CASConfirmExactRef, LostMountFenceIsUnknown)
     ASSERT_TRUE(store->refTableCachedForTest(ns))
         << "the table must still be resident, so it is the FENCE that refuses, not residency";
     backend->resetCounts();
+    /// The other arm of the same counter: rule 6's fence check. Losing the mount is the most
+    /// safety-relevant refusal this function has, so it must not be the silent one.
+    const uint64_t cannot_speak_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak);
     EXPECT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Unknown);
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak) - cannot_speak_before, 1u)
+        << "a refusal for a lost mount fence must be counted, not invisible";
     EXPECT_EQ(backendRequests(*backend), 0u);
 
     /// The fence is checked LAST, so it gates only the `Yes`: a token that does not match the committed
@@ -974,18 +1017,15 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
     /// attribution is pinned here rather than left to the reader of the .cpp: this pair of confirms is
     /// the one place where a `Yes` and a scope-driven `Unknown` are produced back to back from the same
     /// lane state.
-    const auto in_flight_before = ProfileEvents::global_counters[
-        ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight].load();
-    const auto broken_before = ProfileEvents::global_counters[
-        ProfileEvents::CASRelinkConfirmRefusedLaneBroken].load();
+    const uint64_t in_flight_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+    const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
     const ConfirmAnswer untouched = store->confirmExactRef(ns, "x", id_x.ref);
-    const auto in_flight_after_untouched = ProfileEvents::global_counters[
-        ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight].load();
+    const uint64_t in_flight_after_untouched
+        = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
     const ConfirmAnswer touched = store->confirmExactRef(ns, "other", id_other.ref);
-    const auto in_flight_after_touched = ProfileEvents::global_counters[
-        ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight].load();
-    const auto broken_after = ProfileEvents::global_counters[
-        ProfileEvents::CASRelinkConfirmRefusedLaneBroken].load();
+    const uint64_t in_flight_after_touched
+        = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+    const uint64_t broken_after = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
 
     latch.release();
     dropper.join();
@@ -1053,7 +1093,14 @@ TEST(CASConfirmExactRef, SameRefRepointDurableButNotInstalledIsUnknown)
     const size_t pending_now = store->refQueuePendingForTest(ns);
     const size_t carved_now = store->refCarvedForTest(ns);
     const RefLaneState lane_now = store->laneStateForTest(ns);
+    /// `pending` is empty and the mirror holds one, so this refusal provably comes from the carved
+    /// loop -- the only place where its attribution can be pinned.
+    const uint64_t in_flight_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+    const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
     const ConfirmAnswer stale = store->confirmExactRef(ns, "x", m1.ref);
+    const uint64_t in_flight_delta
+        = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight) - in_flight_before;
+    const uint64_t broken_delta = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken) - broken_before;
     {
         std::lock_guard lk(hold->m);
         hold->released = true;
@@ -1068,6 +1115,10 @@ TEST(CASConfirmExactRef, SameRefRepointDurableButNotInstalledIsUnknown)
     EXPECT_EQ(lane_now, RefLaneState::Writing);
     EXPECT_EQ(stale, ConfirmAnswer::Unknown)
         << "x's durable repoint is not installed: its row is stale and must not confirm m1";
+    EXPECT_EQ(in_flight_delta, 1u)
+        << "a refusal read off the carved mirror is a mutation in flight, not a lane fault";
+    EXPECT_EQ(broken_delta, 0u)
+        << "the lane is Writing with a carved item -- the healthy shape, not a broken one";
     EXPECT_EQ(store->confirmExactRef(ns, "x", m1.ref), ConfirmAnswer::No) << "installed: m1 is no longer x's binding";
     EXPECT_EQ(store->confirmExactRef(ns, "x", m2.ref), ConfirmAnswer::Yes);
 }

@@ -38,7 +38,8 @@ enum class ResolveAudit : uint8_t { Emit, Deferred };
 /// implicit state machine.
 ///
 /// `Ready` is the state that admits a new append. A cached row is certified (`confirmExactRef`) in
-/// `Ready`, and in `Writing` when no queued or carved mutation names that row's ref. `Writing` owns the
+/// `Ready` and in `Writing` alike, and in both only while no queued or carved mutation names that row's
+/// ref -- a `Ready` lane with such a mutation queued refuses too. `Writing` owns the
 /// exact attempt before its first possible send. `Wedged` owns that same attempt after an ambiguous
 /// result and certifies nothing. `NeedsRecovery` means a transaction is known durable but cannot be
 /// installed in this cache; it is a hard write and certification fence until replay completes. `Closed`
@@ -59,9 +60,9 @@ enum class RefLaneState : uint8_t
 /// `Yes` is the only answer that AUTHORIZES anything, so it is the only one that must be earned: it is
 /// returned exclusively when every rule of the lane snapshot holds. `Unknown` is the catch-all for
 /// every ambiguity, and it is the answer this primitive is biased towards: a cold, evicted, recovering,
-/// wedged or otherwise broken table answers `Unknown` rather than doing any work to find out, and so
-/// does a table with a queued or in-flight mutation of the asked-about ref; a mutation of another ref
-/// does not refuse.
+/// busy, fenced-out, wedged or otherwise broken table answers `Unknown` rather than doing any work to
+/// find out, and so does a table with a queued or in-flight mutation of the asked-about ref (or of the
+/// whole namespace); a mutation of another ref does not refuse.
 ///
 /// `No` means "this runtime's committed row for that ref is not the manifest you asked about" -- and
 /// nothing more. It is NOT a proof of the negative about the durable table, because the mount fence is

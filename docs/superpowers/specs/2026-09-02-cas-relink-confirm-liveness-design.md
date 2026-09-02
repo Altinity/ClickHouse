@@ -237,9 +237,16 @@ both replication queues drain. This is the liveness reproduction the unit tests 
 
 Observability, the minimum the live gate needs to be read: ProfileEvents
 `CASRelinkConfirmRefusedRefMutationInFlight`, `CASRelinkConfirmRefusedLaneWedged`,
-`CASRelinkConfirmRefusedLaneBroken`, `CASRelinkConfirmRefusedStateLockBusy`, plus a ledger-side
+`CASRelinkConfirmRefusedLaneBroken`, `CASRelinkConfirmRefusedStateLockBusy`,
+`CASRelinkConfirmRefusedMountCannotSpeak`, plus a ledger-side
 `LOG_TRACE` naming the refusing rule. The attribution stays inside the ledger: `ConfirmAnswer` is a
 three-value enum crossing two interfaces, and widening it would be the API change this design avoids.
+The fifth counter covers the refusals that mean this mount cannot speak for the namespace at all —
+unrecovered, mid-recovery, catalog life invalidated, superseded by a remount, or the mount fence lost.
+It is deliberately not folded into `LaneBroken`, which names a lane state: a mid-recovery refusal is not
+a lane defect, and the live gate asserts `LaneBroken` at zero. The only refusals left uncounted are the
+two residency arms, where the table is cold or evicted and there is no runtime to attribute to; every
+other `Unknown` in `confirmExactRef` increments exactly one counter.
 Residual `Unknown` sources this design leaves, all bounded: the `try_to_lock` failing while `listRefs` or
 the snapshot publisher hold `state_mutex` or during an install; a confirm about a ref whose own mutation
 is queued or in flight, one flush; and a wedged lane until its next flush or remount. If any counter

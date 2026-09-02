@@ -61,6 +61,7 @@ namespace ProfileEvents
     extern const Event CASRelinkConfirmRefusedLaneWedged;
     extern const Event CASRelinkConfirmRefusedLaneBroken;
     extern const Event CASRelinkConfirmRefusedStateLockBusy;
+    extern const Event CASRelinkConfirmRefusedMountCannotSpeak;
     extern const Event CASRefNeedsRecovery;
     extern const Event CASRefSweepDeferred;
     extern const Event CASRefSweepRearmed;
@@ -85,6 +86,16 @@ namespace DB::Cas
 
 namespace
 {
+/// The relink confirm's logger, resolved once. `LOG_IMPL` evaluates its logger argument BEFORE testing
+/// the level, so `getLogger` at the call site would take the global logger-registry lock on every
+/// refusal even with tracing off -- and `confirmExactRef` refuses while holding pool-wide append
+/// admission, on a path a remote peer drives.
+const LoggerPtr & confirmLogger()
+{
+    static const LoggerPtr logger = getLogger("CasRefLedger");
+    return logger;
+}
+
 /// Classifies whether an exception thrown out of a ref-table recovery attempt (checkpoint/snapshot/log
 /// GETs, or the seal PUT) is a TRANSIENT object-store transport failure worth retrying,
 /// vs. a terminal condition (corruption, decode failure, logic error, resource limit) that must fail
@@ -449,6 +460,12 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// Rule 2 (residency). Direct slot lookup, never a catalog observation or exact-runtime acquisition:
     /// a read-only query must not let a peer grow this writer's cache or make the next reader pay for a
     /// recovery it invented. A cold or evicted table is simply unknown here.
+    ///
+    /// These two arms are the ONLY refusals in this function that are deliberately not counted: a table
+    /// this mount has never touched, or has dropped under cache-budget pressure, is ordinary cache
+    /// behaviour rather than the lane, mount or load condition each counter below separates. Counting
+    /// it would put a number that moves with cache size next to numbers that describe this writer's
+    /// health. There is also no runtime here to attribute the refusal to.
     const auto it = ref_name_slots.find(ns.string());
     if (it == ref_name_slots.end())
         return ConfirmAnswer::Unknown;
@@ -459,22 +476,25 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// Every refusal below is attributed here, on the node that computed it: `ConfirmAnswer` crosses
     /// two interfaces as a three-value enum and stays that way, so the counters and this trace line are
     /// the only way a live gate can tell load (`RefMutationInFlight`) from a fault (`LaneWedged`,
-    /// `LaneBroken`) or contention (`StateLockBusy`).
+    /// `LaneBroken`), from contention (`StateLockBusy`), or from this mount losing its claim to the
+    /// namespace (`MountCannotSpeak`). The invariant to keep when editing below: every
+    /// `return ConfirmAnswer::Unknown` past this point goes through `refuse`, and the only uncounted
+    /// refusals in this function are the two residency arms above, which say why.
     const auto refuse = [&](ProfileEvents::Event reason, std::string_view why)
     {
         ProfileEvents::increment(reason);
-        LOG_TRACE(getLogger("CasRefLedger"), "Relink confirm for ref '{}' in namespace '{}' is unknown: {}",
+        LOG_TRACE(confirmLogger(), "Relink confirm for ref '{}' in namespace '{}' is unknown: {}",
                   ref_name, ns.string(), why);
         return ConfirmAnswer::Unknown;
     };
 
-    /// `try_to_lock`, not a blocking acquire: `ensureRefTableRecovered` holds `state_mutex` across its
-    /// whole exact replay, so blocking here would make a confirm WAIT on someone else's recovery --
-    /// up to the full retry envelope -- while holding `ref_queue_mutex`, which is pool-wide append
-    /// admission. That is the zero-I/O contract broken by proxy: the query would not issue a request,
-    /// it would merely be paid for by one, and it would stall every table's lane meanwhile. Failing to
-    /// take the lock is just one more ambiguity, so it answers like every other one. (Same technique,
-    /// and same non-blocking rationale, as `enforceRefTableCacheBudget`'s candidate loop.)
+    /// `try_to_lock`, not a blocking acquire: this function already holds `ref_queue_mutex`, which is
+    /// pool-wide append admission, so blocking here would stall EVERY table's lane for as long as
+    /// whoever holds `state_mutex` keeps it. That is the zero-I/O contract broken by proxy: the query
+    /// would not issue a request, it would merely wait on one, and it would hold up admission
+    /// meanwhile. Failing to take the lock is just one more ambiguity, so it answers like every other
+    /// one. (Same technique, and same non-blocking rationale, as `enforceRefTableCacheBudget`'s
+    /// candidate loop.)
     std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
     if (!slock.owns_lock())
         return refuse(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, "the table's state lock is held");
@@ -487,7 +507,8 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     if (!rt.recovered || rt.recovery_in_progress
         || rt.catalog_life_invalidated.load(std::memory_order_acquire)
         || rt.superseded_by_remount.load(std::memory_order_acquire))
-        return ConfirmAnswer::Unknown;
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak,
+                      "the table is unrecovered, recovering, retired or superseded by a remount");
 
     /// Rule 3 (no admitted mutation of THIS ref). The hazard is a committed row that lags a transaction
     /// of the asked-about ref: the leader does not hold `state_mutex` across the `PUT`, so between
@@ -499,9 +520,10 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// admission under `ref_queue_mutex` and validated against its ops at flush), and it is visible in
     /// `pending` from admission to carve and in `carved` from carve to the tenure's exit guard, so "a
     /// change of this ref is queued or in flight" is read from those two. The lane states other than
-    /// `Ready`/`Writing` refuse table-wide: `Wedged` holds a transaction that may be durable and is
-    /// recorded nowhere but in the attempt and the lane state (its items are completed with an error
-    /// before the tenure ends), and `NeedsRecovery`, `Closed`, `Faulted` are fences on the whole view.
+    /// `Ready`/`Writing` refuse table-wide: `Wedged` holds a transaction that may be durable, and once
+    /// its tenure exits nothing but the attempt and the lane state records WHICH ref it touched -- the
+    /// exit guard clears the carved mirror, and the chunk's items were completed with an error before
+    /// that -- and `NeedsRecovery`, `Closed`, `Faulted` are fences on the whole view.
     /// `Writing` with nothing carved cannot happen; it fails closed.
     if (rt.lane_state == RefLaneState::Wedged)
         return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneWedged, "the lane holds an unresolved append");
@@ -543,7 +565,8 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     if (!fence_ok_fn()
         || rt.catalog_life_invalidated.load(std::memory_order_acquire)
         || rt.superseded_by_remount.load(std::memory_order_acquire))
-        return ConfirmAnswer::Unknown;
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak,
+                      "this mount no longer holds the namespace's write fence");
 
     return ConfirmAnswer::Yes;
 }
