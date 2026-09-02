@@ -46,7 +46,7 @@ ncpu = Utils.cpu_count()
 mem_gb = round(Utils.physical_memory() // (1024**3), 1)
 
 MAX_CPUS_PER_WORKER = 5
-MAX_MEM_PER_WORKER = 11
+MAX_MEM_PER_WORKER = 10 # Note (strtgbb): 11 -> 10 to fit an extra worker in 30gb, relying on zram to handle overage.
 # Flaky/targeted checks run with --dist=each, so every worker runs the full set
 # of changed modules concurrently (each with its own Docker cluster) instead of
 # splitting modules across workers. A worker's peak footprint is therefore much
