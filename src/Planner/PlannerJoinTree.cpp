@@ -270,6 +270,10 @@ void tryAddClusterWrapFilter(QueryPlan & query_plan, const TableExpressionData &
         return;
 
     auto filter_dag = filter_actions->clone();
+
+    if (filter_dag.getOutputs().size() != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Filter DAG must have single output");
+
     const auto filter_column_name = filter_dag.getOutputs().at(0)->result_name;
     const auto & header = source->getOutputHeader();
     ActionsDAG rename_dag(header->getColumnsWithTypeAndName());

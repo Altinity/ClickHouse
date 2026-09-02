@@ -7,6 +7,7 @@
 #include <Core/Settings.h>
 #include <Core/QueryProcessingStage.h>
 #include <IO/ConnectionTimeouts.h>
+#include <IO/Operators.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/getHeaderForProcessingStage.h>
@@ -16,6 +17,7 @@
 #include <Interpreters/TranslateQualifiedNamesVisitor.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Planner/Utils.h>
+#include <Processors/QueryPlan/QueryPlanFormat.h>
 #include <Processors/Sources/RemoteSource.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <QueryPipeline/narrowPipe.h>
@@ -82,6 +84,13 @@ IStorageCluster::IStorageCluster(
     , log(log_)
     , cluster_name(cluster_name_)
 {
+}
+
+void ReadFromCluster::describeActions(FormatSettings & format_settings) const
+{
+    SourceStepWithFilter::describeActions(format_settings);
+    if (query_to_send)
+        format_settings.out << format_settings.detail_prefix << "Query: " << query_to_send->formatWithSecretsOneLine() << '\n';
 }
 
 void ReadFromCluster::applyFilters(ActionDAGNodes added_filter_nodes)

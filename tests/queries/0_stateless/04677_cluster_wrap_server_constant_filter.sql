@@ -1,8 +1,11 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-parallel-replicas, no-random-settings
 -- no-fasttest: `fileCluster` is not in the fast test build.
--- `hostName` is `isServerConstant`. Copying it into the `IStorageCluster` wrap
--- would evaluate it on remotes, where it can differ from the initiator, and
--- drop every row. The `n < 2` conjunct must still be copied.
+-- no-parallel-replicas: EXPLAIN of the cluster wrap differs with parallel replicas.
+-- no-random-settings: join / filter EXPLAIN text is randomized otherwise.
+--
+-- `hostName` is `isServerConstant` and must not be copied into the wrap query
+-- sent to remotes (`ReadFromCluster` "Query:" line). `count()` cannot see that:
+-- `hostName() = hostName()` is true on every node.
 
 SET enable_analyzer = 1;
 SET query_plan_filter_push_down = 1;
@@ -31,5 +34,38 @@ FROM fileCluster(
     'n UInt64') AS l
 LEFT JOIN t_04677_right AS r ON l.n = r.n
 WHERE l.n < 2 AND hostName() = hostName();
+
+SELECT throwIf(count() = 0)
+FROM
+(
+    EXPLAIN actions = 1
+    SELECT count()
+    FROM fileCluster(
+        'test_cluster_one_shard_two_replicas',
+        currentDatabase() || '_04677_wrap_left.tsv',
+        'TSV',
+        'n UInt64') AS l
+    LEFT JOIN t_04677_right AS r ON l.n = r.n
+    WHERE l.n < 2 AND hostName() = hostName()
+)
+WHERE explain LIKE '%Query:%'
+    AND (explain LIKE '%n < 2%' OR explain LIKE '%less(%2%')
+FORMAT Null;
+
+SELECT throwIf(count() != 0)
+FROM
+(
+    EXPLAIN actions = 1
+    SELECT count()
+    FROM fileCluster(
+        'test_cluster_one_shard_two_replicas',
+        currentDatabase() || '_04677_wrap_left.tsv',
+        'TSV',
+        'n UInt64') AS l
+    LEFT JOIN t_04677_right AS r ON l.n = r.n
+    WHERE l.n < 2 AND hostName() = hostName()
+)
+WHERE explain LIKE '%Query:%' AND explain ILIKE '%hostName%'
+FORMAT Null;
 
 DROP TABLE t_04677_right;

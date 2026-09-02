@@ -1190,14 +1190,11 @@ bool walkOrdinaryFunctions(const QueryTreeNodePtr & node, KeepFunction && keep_f
 
         if (const auto * function = current->as<FunctionNode>())
         {
-            if (function->isWindowFunction() || function->isAggregateFunction())
+            if (!function->isOrdinaryFunction())
                 return false;
-            if (function->isOrdinaryFunction())
-            {
-                auto function_base = function->getFunction();
-                if (!function_base || !keep_function(function_base))
-                    return false;
-            }
+            auto function_base = function->getFunction();
+            if (!function_base || !keep_function(function_base))
+                return false;
         }
 
         for (const auto & child : current->getChildren())
