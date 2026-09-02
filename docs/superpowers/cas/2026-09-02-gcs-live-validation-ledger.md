@@ -144,7 +144,7 @@ none implemented, all needing the two-model concurrency consult before code:
   623 finished, 0 exceptions), both mount leases held (renewal retried and succeeded), no `Code: 210`
   refusals, no 5xx. The cost was throughput and the 429 count on `_ckpt` climbing to ~1.5k per node.
 
-- **F11 (2026-09-02, soak phase 3, FIXED (pending live gate), product)** Replication between the two GCS replicas wedged
+- **F11 (2026-09-02, soak phase 3, FIXED, live gate run and item still open, product)** Replication between the two GCS replicas wedged
   from 01:12 UTC until the soak died at ~01:53 on `SYSTEM SYNC REPLICA` (Code 159): ch1 queue 1397
   `GET_PART` + 175 `MERGE_PARTS`, ch2 906 `GET_PART` + 830 `MUTATE_PART` + 71 `MERGE_PARTS`, every entry
   failing with `NO_REPLICA_HAS_PART: Source ... did not prove it still holds the manifest it offered ...

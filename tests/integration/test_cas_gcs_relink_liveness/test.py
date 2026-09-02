@@ -262,11 +262,16 @@ def test_both_queues_drain_under_slow_checkpoints():
 
         # No confirm may be refused by lane STATE on a healthy run. These two counters move only on
         # `confirmExactRef`'s wedge and broken-lane branches — an unresolved append, or a lane in
-        # NeedsRecovery, Closed, Faulted, or Writing with nothing carved. None of those is reachable
-        # from load alone, so a non-zero value here is a lane defect the drain assertion above can
-        # hide: a confirm refused table-wide costs the receiver only a retry, and enough retries still
-        # finish inside the drain window. This is also the only end-to-end evidence that the ledger's
-        # increments reach `system.events` under these names at all.
+        # NeedsRecovery, Closed, Faulted, or Writing with nothing carved. This case drives the fake's
+        # control plane with a delay and never with a fault, so none of those is reachable here and a
+        # non-zero value is a lane defect the drain assertion above can hide: a confirm refused
+        # table-wide costs the receiver only a retry, and enough retries still finish inside the drain
+        # window. Against a real bucket a wedge IS reachable from load alone — sustained throttling can
+        # exhaust an append's retry budget and leave its outcome unresolved — so this assertion rests
+        # on the fault-free stand and would have to be rethought before it ran anywhere else.
+        #
+        # A zero here is not evidence that the counter exists: `_refusal_counter` reads a missing row
+        # as a zero, and a misspelled or unregistered name reads the same way.
         #
         # What is NOT asserted, deliberately: `CASRelinkConfirmRefusedRefMutationInFlight` above zero.
         # A refusal there needs a queued or carved mutation naming the very ref the peer is asking
@@ -281,8 +286,8 @@ def test_both_queues_drain_under_slow_checkpoints():
         for node in (node1, node2):
             for event in ("CASRelinkConfirmRefusedLaneWedged", "CASRelinkConfirmRefusedLaneBroken"):
                 assert _refusal_counter(node, event) == 0, (
-                    "{} refused a relink confirm by lane state ({}), which no amount of write load can "
-                    "cause. All refusal counters on this node:\n{}".format(
+                    "{} refused a relink confirm by lane state ({}), which no fault was injected to "
+                    "produce. All refusal counters on this node:\n{}".format(
                         node.name, event, _refusal_counters(node)
                     )
                 )

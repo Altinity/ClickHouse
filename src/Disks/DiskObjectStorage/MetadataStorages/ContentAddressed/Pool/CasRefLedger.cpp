@@ -2750,9 +2750,11 @@ namespace
 {
 /// The first ref name `op` mutates that differs from `scope_ref`, or nullptr when every name it
 /// carries is `scope_ref` or it carries none (`NamespaceBirth`, `RemoveNamespace` and `EpochSeal` are
-/// namespace-level and belong to no ref). Both bindings of an `OwnerTransition` count -- a promotion
-/// names the ref twice -- because this check runs before the transition's shape is validated, so
-/// either binding may still carry any name at this point.
+/// namespace-level and name no ref). Naming no ref is not the same as moving no ref: a
+/// `RemoveNamespace` moves every row of the namespace, so its caller rejects it under a `Ref` scope
+/// on its own rather than reading an answer out of this function. Both bindings of an
+/// `OwnerTransition` count -- a promotion names the ref twice -- because this check runs before the
+/// transition's shape is validated, so either binding may still carry any name at this point.
 const String * refNamedOutsideScope(const RefOp & op, const String & scope_ref)
 {
     if (op.kind == RefOpKind::OwnerTransition)
@@ -3155,11 +3157,22 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             /// about to change. Checked before anything durable and failing only this item: every
             /// production caller names the exact ref its ops mutate, so a mismatch is a programming error.
             if (it->scope.kind == MutationScope::Kind::Ref)
+            {
                 for (const RefOp & op : item_ops)
+                {
+                    /// A namespace removal names no ref and moves every row, so it is outside every
+                    /// `Ref` scope. The confirm's answer about every OTHER ref rests on this scope
+                    /// check alone, so it is rejected here rather than left to any later one.
+                    if (op.kind == RefOpKind::RemoveNamespace)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "ref mutation on namespace '{}' is scoped to ref '{}' but its {} op moves every ref",
+                            ns.string(), it->scope.ref_name, refOpKindToWireWord(op.kind));
                     if (const String * other = refNamedOutsideScope(op, it->scope.ref_name))
                         throw Exception(ErrorCodes::LOGICAL_ERROR,
                             "ref mutation on namespace '{}' is scoped to ref '{}' but its {} op names ref '{}'",
                             ns.string(), it->scope.ref_name, refOpKindToWireWord(op.kind), *other);
+                }
+            }
 
             /// Whole-item shape validation (prerequisite to `dropNamespace`): the
             /// per-op loop below previews each op as its OWN single-op trial transaction, so a

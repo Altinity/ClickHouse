@@ -136,12 +136,14 @@ run (up from a few seconds at the original parameters).
 - `CASRelinkConfirmRefusedStateLockBusy` is exercised by no test. The `state_mutex` acquisition it
   counts is non-blocking (`try_to_lock`), and nothing in the current code gives a test a seam that
   forces a miss; closing this needs a new test hook, not asked for by this plan.
-- Of the five refusal counters, only `CASRelinkConfirmRefusedLaneWedged` and
-  `CASRelinkConfirmRefusedLaneBroken` are proven to reach `system.events` end to end, by the
-  integration case's own assertion. `CASRelinkConfirmRefusedRefMutationInFlight`,
-  `CASRelinkConfirmRefusedMountCannotSpeak` and `CASRelinkConfirmRefusedStateLockBusy` have unit-level
-  fences only, so the live gate (Task 8 of the plan) is the first place a break between the
-  `ProfileEvents::increment` call and the `system.events` row would show for those three.
+- No refusal counter's increment is proven to reach `system.events`. All five are registered under
+  their names on both live servers, which the live gate established from the `system.metric_log`
+  columns, but no refusal path fired live, so the increment step is unproven for every one of them.
+  The integration case asserts that `CASRelinkConfirmRefusedLaneWedged` and
+  `CASRelinkConfirmRefusedLaneBroken` read zero, which is not evidence either way: a missing row reads
+  as a zero, and so does a misspelled or unregistered name. Making that zero non-vacuous costs one
+  query per name — `SELECT count() FROM system.events WHERE event = '<name>'
+  SETTINGS system_events_show_zero_values = 1` must be 1.
 - The liveness case's two escalated constants (the 1000ms checkpoint delay and the 80-insert count)
   were raised together, as one step, once the original parameters failed to reproduce. Nobody has
   measured whether the longer delay alone reproduces the starvation at the original 40-insert count,

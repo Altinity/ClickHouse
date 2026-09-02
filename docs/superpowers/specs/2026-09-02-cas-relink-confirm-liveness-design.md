@@ -252,7 +252,10 @@ two residency arms, where the table is cold or evicted and there is no runtime t
 other `Unknown` in `confirmExactRef` increments exactly one counter.
 Residual `Unknown` sources this design leaves, all bounded: the `try_to_lock` failing while `listRefs` or
 the snapshot publisher hold `state_mutex` or during an install; a confirm about a ref whose own mutation
-is queued or in flight, one flush; and a wedged lane until its next flush or remount. If any counter
+is queued or in flight, one flush; a `WholeShard`-scoped mutation while it is queued or carved, which
+refuses every ref of the namespace — the stale-precommit sweep (`sweepStalePrecommitsNow`) declares that
+scope, so a table-wide refusal is a shape this design keeps; and a wedged lane until its next flush or
+remount. If any counter
 dominates on the live gate, that is a different fix.
 
 ### Live gate {#live-gate}

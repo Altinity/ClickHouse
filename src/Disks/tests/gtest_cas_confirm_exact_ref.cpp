@@ -541,9 +541,10 @@ TEST(CASConfirmExactRef, InFlightAppendIsUnknown)
 /// Rule 3 at a chunk boundary (`CarvePhaseForTest::ChunkReseed`): one leader tenure commits MULTIPLE
 /// durable transactions, so between two chunks the table is PARTIALLY durable -- for the refs those
 /// chunks mutate. The seed ref is touched by neither, so its row is exactly as authoritative as on an
-/// idle lane and it confirms; the carved items' own refs refuse, because their transactions may be
-/// durable and not installed. The confirm is issued on the leader's own thread, which is safe because
-/// the boundary holds neither lane mutex.
+/// idle lane and it confirms; BOTH carved items' own refs refuse, because their transactions may be
+/// durable and not installed -- the second one is what makes a rule that read only the front of the
+/// mirror visible. The confirm is issued on the leader's own thread, which is safe because the
+/// boundary holds neither lane mutex.
 TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -556,6 +557,7 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
     std::atomic<int> boundaries{0};
     std::atomic<int> yes_for_seed_at_boundary{0};
     std::atomic<int> unknown_for_carved_ref_at_boundary{0};
+    std::atomic<int> unknown_for_second_carved_ref_at_boundary{0};
     std::atomic<int> requests_at_boundary{0};
     store->setCarveHookForTest([&](CasRefLedger::CarvePhaseForTest phase)
     {
@@ -569,6 +571,11 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
         /// rule 3 reading the carved item's scope.
         if (store->confirmExactRef(ns, "aaa_", id.ref) == ConfirmAnswer::Unknown)
             unknown_for_carved_ref_at_boundary.fetch_add(1);
+        /// "bbb_" is the mirror's SECOND entry and likewise has no committed row, so this is the same
+        /// assertion made about an entry a rule that stopped at the front of `carved` would never
+        /// reach.
+        if (store->confirmExactRef(ns, "bbb_", id.ref) == ConfirmAnswer::Unknown)
+            unknown_for_second_carved_ref_at_boundary.fetch_add(1);
         requests_at_boundary.fetch_add(static_cast<int>(backendRequests(*backend) - before));
     });
 
@@ -618,6 +625,9 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsMidTenure)
         << "a ref no carved item names must confirm mid-tenure -- that is the liveness this rule exists for";
     EXPECT_EQ(unknown_for_carved_ref_at_boundary.load(), boundaries.load())
         << "a ref a carved item names must not confirm while its transaction may be durable and not installed";
+    EXPECT_EQ(unknown_for_second_carved_ref_at_boundary.load(), boundaries.load())
+        << "rule 3 must scan the whole carved mirror: 'bbb_' is its second entry and has no committed "
+           "row, so a rule that examined only the front entry would answer No here";
     EXPECT_EQ(requests_at_boundary.load(), 0) << "the mid-tenure confirm must still be I/O-free";
 
     /// The tenure is over: the seed ref confirms as before.
@@ -745,8 +755,9 @@ TEST(CASConfirmExactRef, CarvedItemIsVisibleFromCarveToTenureEnd)
 }
 
 /// Scope validation: `MutationScope` is what the confirm reads to decide whether an in-flight mutation
-/// may change the ref it is asked about, so an item scoped to ref X whose ops mutate ref Y must fail,
-/// alone, before anything is durable. It throws `LOGICAL_ERROR`, which aborts the process in debug and
+/// may change the ref it is asked about, so an item scoped to ref X must fail, alone, before anything
+/// is durable, both when its ops mutate ref Y and when they carry a namespace removal, which names no
+/// ref and moves every row. It throws `LOGICAL_ERROR`, which aborts the process in debug and
 /// sanitizer builds instead of behaving like a catchable exception --
 /// `CASConfirmExactRefDeathTest.MisScopedItemAborts` below proves the abort positively in those builds.
 #ifndef DEBUG_OR_SANITIZER_BUILD
@@ -774,6 +785,24 @@ TEST(CASConfirmExactRef, MisScopedItemFailsBeforeAnythingIsDurable)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
+    /// A namespace removal names no ref at all, so a scope check that only compared names would let it
+    /// through -- and it moves every row, which is the one thing a `Ref` scope promises the confirm
+    /// will not happen behind its back.
+    RefOp remove_namespace;
+    remove_namespace.kind = RefOpKind::RemoveNamespace;
+    try
+    {
+        store->appendRefOps(ns, MutationScope::ref("x"),
+                            [remove_namespace](const RefTableState &) { return std::vector<RefOp>{remove_namespace}; },
+                            RootMutationOrigin::Writer, RootMutationKind::Publish);
+        FAIL() << "an item scoped to ref 'x' carrying a namespace removal must be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR)
+            << "the scope check must be what rejects it";
+    }
+
     /// The ref-log transaction object -- the only thing that would make this item durable -- is a
     /// `putIfAbsent`; `putOverwrite` and `casPut` are asserted too so the fence covers every write kind
     /// the backend can observe, not just the one this item would have used.
@@ -802,12 +831,20 @@ TEST(CASConfirmExactRefDeathTest, MisScopedItemAborts)
                             [add](const RefTableState &) { return std::vector<RefOp>{add}; },
                             RootMutationOrigin::Writer, RootMutationKind::Publish);
     }, "");
+
+    RefOp remove_namespace;
+    remove_namespace.kind = RefOpKind::RemoveNamespace;
+    EXPECT_DEATH({
+        store->appendRefOps(ns, MutationScope::ref("x"),
+                            [remove_namespace](const RefTableState &) { return std::vector<RefOp>{remove_namespace}; },
+                            RootMutationOrigin::Writer, RootMutationKind::Publish);
+    }, "");
 }
 #endif
 
 /// The mirror must survive an item's COMPLETION, not just its carve: an item is completed by its own
 /// chunk's commit, often chunks before the tenure ends. Two items whose op counts force a chunk split
-/// (mirrors `MidTenureChunkBoundaryIsUnknown`'s co-batching) are carved together in one tenure: chunk 1
+/// (mirrors `UntouchedRefConfirmsMidTenure`'s co-batching) are carved together in one tenure: chunk 1
 /// = {aaa_} alone, chunk 2 = {bbb_} alone. Sampled at chunk 2's `PostDurableInstall`, the test PROVES --
 /// via `refCarvedItemDoneForTest`, not by inferring from hook order -- that aaa_ is already done, and
 /// that it is still counted in `carved` alongside bbb_ until the tenure's exit guard.
@@ -831,7 +868,7 @@ TEST(CASConfirmExactRef, CarvedItemSurvivesEarlierChunkCompletion)
         carved_at_second_boundary.store(store->refCarvedForTest(ns));
     });
 
-    /// Co-batching setup identical to `MidTenureChunkBoundaryIsUnknown`: the pre-carve hook parks the
+    /// Co-batching setup identical to `UntouchedRefConfirmsMidTenure`: the pre-carve hook parks the
     /// first caller until the second is queued, so both items are carved together deterministically.
     auto sync = std::make_shared<CaseSync>();
     store->setRefPreCarveHookForTest([sync, store, ns]
@@ -995,6 +1032,10 @@ TEST(CASConfirmExactRef, ConcurrentAppendIsOrderedAfterTheSnapshot)
 /// so the lane has a pending item and an active tenure. A confirm about an untouched committed ref must
 /// answer `Yes` -- the queued mutation cannot change this ref's binding or the blobs its manifest
 /// protects -- while the queued ref itself answers `Unknown`.
+///
+/// A SECOND queued mutation, of a third ref, sits behind the leader's own item, so the queue holds two
+/// and the ref asked about last is not at its front: that is what makes a rule reading only
+/// `pending`'s front item visible, which every other test in this file would pass.
 TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -1003,12 +1044,19 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
 
     const ManifestId id_x = publishEmptyPart(store, ns, "x");
     const ManifestId id_other = publishEmptyPart(store, ns, "other");
+    const ManifestId id_third = publishEmptyPart(store, ns, "third");
     ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
 
     LeaderLatch latch;
     latch.arm(store);
     std::thread dropper([&] { store->dropRef(ns, "other"); });
     latch.awaitEntered();
+    /// The leader pushes its own item before it takes the baton, so the queue is [other, third] and
+    /// `third` is reachable only by a scan that goes past the front.
+    std::thread second_dropper([&] { store->dropRef(ns, "third"); });
+    const auto queued_by = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (store->refQueuePendingForTest(ns) < 2 && std::chrono::steady_clock::now() < queued_by)
+        std::this_thread::yield();
 
     /// Sampled while parked, asserted after the join (a failed assertion here would skip the release).
     const bool leader_active = store->refLeaderActiveForTest(ns);
@@ -1025,27 +1073,102 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
     const ConfirmAnswer touched = store->confirmExactRef(ns, "other", id_other.ref);
     const uint64_t in_flight_after_touched
         = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+    const ConfirmAnswer touched_behind_the_front = store->confirmExactRef(ns, "third", id_third.ref);
+    const uint64_t in_flight_after_behind_the_front
+        = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
     const uint64_t broken_after = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
 
     latch.release();
     dropper.join();
+    second_dropper.join();
     store->setRefPreCarveHookForTest(nullptr);
 
     EXPECT_TRUE(leader_active);
-    EXPECT_EQ(pending, 1u);
+    EXPECT_EQ(pending, 2u) << "the second dropper must be queued behind the parked leader's own item";
     EXPECT_EQ(in_flight_after_untouched - in_flight_before, 0u)
         << "a confirm that answers Yes must not be counted as a refusal";
     EXPECT_EQ(in_flight_after_touched - in_flight_after_untouched, 1u)
         << "the refused confirm must be attributed to the ref-scoped mutation, which is what a live "
            "gate reads to tell load from a lane fault";
+    EXPECT_EQ(in_flight_after_behind_the_front - in_flight_after_touched, 1u)
+        << "the second queued item's ref must be refused for the same reason as the first";
     EXPECT_EQ(broken_after - broken_before, 0u)
         << "the lane is Ready here: a refusal attributed to a broken lane would misreport a fault";
     EXPECT_EQ(untouched, ConfirmAnswer::Yes)
         << "a queued mutation of another ref must not refuse this one";
     EXPECT_EQ(touched, ConfirmAnswer::Unknown)
         << "the queued ref's own row is provisional";
+    EXPECT_EQ(touched_behind_the_front, ConfirmAnswer::Unknown)
+        << "rule 3 must scan the whole pending queue, not only its front item";
     EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
     EXPECT_EQ(store->confirmExactRef(ns, "other", id_other.ref), ConfirmAnswer::No);
+    EXPECT_EQ(store->confirmExactRef(ns, "third", id_third.ref), ConfirmAnswer::No);
+}
+
+
+/// Rule 3's `WholeShard` arm. A mutation that declares no ref is one that may move EVERY row, so it
+/// refuses every ref for as long as it is queued or carved -- unlike a `Ref`-scoped neighbour, which
+/// refuses only its own. In production `dropNamespaceImpl` and `sweepStalePrecommitsNow` are the two
+/// appenders that declare `wholeShard()`.
+///
+/// The two confirms of "x" differ in exactly one thing: whether the whole-shard item has been queued.
+/// The first is the liveness answer this rule was narrowed to give, the second the refusal the arm
+/// exists for, so deleting the arm turns the second into the first.
+TEST(CASConfirmExactRef, WholeShardScopedMutationRefusesAnUntouchedRef)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_whole_shard"};
+
+    const ManifestId id_x = publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "other");
+    ASSERT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
+
+    LeaderLatch latch;
+    latch.arm(store);
+    std::thread dropper([&] { store->dropRef(ns, "other"); });
+    latch.awaitEntered();
+
+    /// Sampled while parked, asserted after the join (a failed assertion here would skip the release).
+    const ConfirmAnswer before_whole_shard = store->confirmExactRef(ns, "x", id_x.ref);
+
+    /// Queued BEHIND the parked leader's own `Ref`-scoped item. The ops are an add/remove precommit
+    /// pair on a ref of its own, so the item is ordinary work that happens to declare no ref -- the
+    /// scope, not the ops, is what rule 3 reads.
+    std::thread whole_shard([&]
+    {
+        store->appendRefOps(ns, MutationScope::wholeShard(),
+                            [](const RefTableState &) { return precommitAddRemovePairs("zzz_", 1, 900000004); },
+                            RootMutationOrigin::Writer, RootMutationKind::Publish);
+    });
+    const auto queued_by = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (store->refQueuePendingForTest(ns) < 2 && std::chrono::steady_clock::now() < queued_by)
+        std::this_thread::yield();
+    const size_t pending = store->refQueuePendingForTest(ns);
+
+    const uint64_t in_flight_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+    const uint64_t broken_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
+    const ConfirmAnswer with_whole_shard = store->confirmExactRef(ns, "x", id_x.ref);
+    const uint64_t in_flight_after = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+    const uint64_t broken_after = refusalCount(ProfileEvents::CASRelinkConfirmRefusedLaneBroken);
+
+    latch.release();
+    dropper.join();
+    whole_shard.join();
+    store->setRefPreCarveHookForTest(nullptr);
+
+    EXPECT_EQ(pending, 2u) << "the whole-shard item must be queued behind the parked leader's own item";
+    EXPECT_EQ(before_whole_shard, ConfirmAnswer::Yes)
+        << "with only a Ref-scoped mutation of another ref queued, 'x' must still confirm";
+    EXPECT_EQ(with_whole_shard, ConfirmAnswer::Unknown)
+        << "a queued mutation that declares no ref may move every row, so no ref may confirm";
+    EXPECT_EQ(in_flight_after - in_flight_before, 1u)
+        << "the refusal must be attributed to an in-flight mutation, not to a lane or mount condition";
+    EXPECT_EQ(broken_after - broken_before, 0u)
+        << "the lane is Ready here: a refusal attributed to a broken lane would misreport a fault";
+
+    /// The tenure is over and the whole-shard item is applied: 'x' confirms again.
+    EXPECT_EQ(store->confirmExactRef(ns, "x", id_x.ref), ConfirmAnswer::Yes);
 }
 
 
