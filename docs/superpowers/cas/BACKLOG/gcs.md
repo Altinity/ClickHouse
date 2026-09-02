@@ -77,16 +77,19 @@ them. The hazard is exactly the interval "durable, not yet applied". A `pending`
 and a `PUT` still in flight are not durable and do not break the T1 < T2 argument; today's rule
 refuses far more than the argument requires.
 
-**Options.**
+**Decision (2026-09-02, spec above).** Rule 3 refuses only a broken lane (`Wedged`, `NeedsRecovery`,
+`Closed`, `Faulted`). The removal hazard is carried by gate 0 and the part state machine: the only
+entry to physical removal is `asMutableDeletingPart` (`Deleting`/`DeleteOnDestroy` only), the ref drop
+lives inside `remove()`, and renames go through `republishRef` publish-then-drop. Verified path by
+path in code before the decision; the TLA+ model must carry the part state and the ordering before
+code, and the two-model consult is mandatory.
 
-1. **Narrow rule 3 to the durable-but-unapplied window.** The leader sets a flag when a chunk's `PUT`
-   returns `Committed` or `Unresolved` (possibly durable) and clears it after apply under
-   `state_mutex`; rule 3 checks that flag instead of `pending`/`leader_active`. Pros: fixes liveness at
-   the cause; the window is microseconds instead of a WAN round trip; the linearization argument
-   survives if the model says so. Cons: a change in the ledger's safety core; needs a new TLA variant
-   (the refined predicate, not the sabotage) run against every sabotage flag; chunked flush and
-   `Unresolved` resolution need exact flag semantics; the two-model concurrency consult is mandatory
-   before code. **Preferred structural fix.**
+**Options considered.**
+
+1. **Narrow rule 3 to a "durable-but-unapplied" flag.** Superseded: `RefLaneState::Writing` already
+   spans the `PUT`, the `_ckpt` frontier publication with its 429 backoff, and the apply, so a flag
+   raised before the `PUT` would have kept the same long window on GCS. Kept here as the reasoning
+   trail.
 2. **Bounded wait for quiescence inside the confirm** on `rt.cv` (the leader already notifies).
    Pros: predicate unchanged, tiny. Cons: under continuous load the next tenure starts the instant the
    previous ends, so there is no gap to wait for; holds an interserver handler thread; must not wait
