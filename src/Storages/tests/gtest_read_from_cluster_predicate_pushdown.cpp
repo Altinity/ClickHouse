@@ -116,7 +116,7 @@ TEST(ReadFromCluster, BuildsTaskIteratorFromFinalPredicateNotFirstSnapshot)
         context,
         shared_header,
         storage,
-        std::make_shared<ASTSelectQuery>(),
+        ASTPtr(new ASTSelectQuery),
         QueryProcessingStage::Complete,
         cluster,
         getLogger("test"),
@@ -126,14 +126,14 @@ TEST(ReadFromCluster, BuildsTaskIteratorFromFinalPredicateNotFirstSnapshot)
     /// pass — such as aggregation-in-order for a GROUP BY on the partition column — inserts a
     /// second FilterStep above this source).
     step.addFilter(identityFilterDAG("col_a"), "col_a");
-    step.applyFilters();
+    step.SourceStepWithFilterBase::applyFilters();
 
     /// Round 2: a later pass has made col_b's condition visible above the source too.
     /// optimizePrimaryKeyConditionAndLimit re-walks every FilterStep currently above the
     /// source on each call, so both col_a and col_b are re-added here.
     step.addFilter(identityFilterDAG("col_a"), "col_a");
     step.addFilter(identityFilterDAG("col_b"), "col_b");
-    step.applyFilters();
+    step.SourceStepWithFilterBase::applyFilters();
 
     QueryPipelineBuilder builder;
     BuildQueryPipelineSettings settings(context);
