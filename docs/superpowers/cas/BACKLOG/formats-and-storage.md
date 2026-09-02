@@ -30,10 +30,36 @@ backend validation, the local/emulated backend, and codec/format items.
   bodies is obsolete: body publication is unconditional and ordinary multipart now handles objects
   above `gcs_max_conditional_put_bytes`; the setting applies to every conditional non-blob `PUT`,
   including create-if-absent artifacts and conditional replacements.
-  Still open: execute every credentialed `gcs_hmac`/`gcp_oauth` group and the TLS ambiguity driver in
-  the [live-results gate](/superpowers/cas/unconditional-blob-publication-live-results), validate the
-  ordinary `test_storage_s3` lane once its historical image is available, generation-aware LIST
-  discovery (current re-listing is cost-only), and signed `x-goog-*` `extra_headers` for `gcs_hmac`.
+  2026-09-02: the `gcs_hmac` half of the live gate EXECUTED against the real bucket, 13/13 green
+  (ledger: [2026-09-02 live validation](/superpowers/cas/gcs-live-validation-ledger-2026-09-02)).
+  Still open: the `gcp_oauth` group (needs an ADC triple or a GCE host) and the TLS ambiguity driver
+  (4 cases), validate the ordinary `test_storage_s3` lane once its historical image is available,
+  generation-aware LIST discovery (current re-listing is cost-only), and signed `x-goog-*`
+  `extra_headers` for `gcs_hmac`.
+- **[relink-confirm-lane-livelock] two replicas starve each other's fetch-by-relink confirms** — HARD /
+  RELEASE GATE — Found on the live-GCS soak 2026-09-02 (ledger F11): `CasRefLedger::confirmExactRef`
+  rule 3 answers `Unknown` whenever the namespace lane has any pending append or active leader tenure;
+  each replica's own failing fetches append precommit-removals to its own lane, so under sustained
+  fetch load neither side ever confirms for the other. Replication wedged for 40 min, replicas diverged
+  123k vs 166k rows, `SYNC REPLICA` timed out. Confirmed by experiment: `SYSTEM STOP FETCHES` on one
+  side lets the other drain in two minutes. Options (ref-scoped rule 3, bounded wait, receiver-side
+  pool backoff) are in the ledger's decision section; hard-concurrency change, two-model consult first.
+- **[gcs-hot-control-keys-429] single-key control objects hit GCS's one-mutation-per-second object
+  limit** — HARD / RELEASE GATE for GCS — Two keys measured on 2026-09-02. Per-namespace
+  `cas/ns/state/<ns>/_ckpt`: every commit rewrites it, GCS answers `429 SlowDown` above about one
+  mutation per second per object name (1.5k per node in a 90-minute soak, ledger F3); SDK retries absorb
+  it, but it caps commit rate per namespace and lengthens lane tenures, which feeds
+  `[relink-confirm-lane-livelock]`. Pool-wide `cas/ref_catalog`: every `CREATE`/`DROP TABLE` rewrites
+  it, the parallel stateless lane exceeded the limit at once, and because the conditional control write
+  is not retried on `SlowDown`, about 40% of tests failed at `CREATE TABLE` with `S3_ERROR` (ledger
+  F12). Candidates: rate-aware retry with backoff on `SlowDown` for conditional control writes on the
+  GCS dialect; coalesce checkpoint publications per lane flush; batch or shard the catalog so DDL churn
+  spreads over more than one object name.
+- **[gc-run-connect-failure-propagation] a manual `SYSTEM CAS GC RUN` surfaces a connect-level failure
+  as `S3_ERROR`** — DESIRABLE — Seen during a provider connect-timeout storm (ledger F9): the background
+  scheduler simply retries next round, the synchronous command throws to its caller after one failed
+  control-object `PUT`. Decide whether the manual round should absorb transport-level failures the
+  same way; the live gate's manual-round loop is strict by design and reports such blips as failures.
 - **[LIST consistency on real S3] token-diff discovery under eventual consistency** — {#list-consistency-real-s3} — TEST/GATE — S3's LIST may not reflect a just-PUT key; code handles it conservatively but needs real-S3 testing. Add a LIST-consistency probe in `Cas::Probe` before LIST-derived discovery is trusted on a given store. Also load-bearing for the (moot) registry-removal LIST premise.
 - **[B196] cap `s3_max_connections` to backend permits** — HARD (cheap) — CONFIRMED still open: no CA code caps `s3_max_connections`; prevents 503 + retry storm under high concurrency.
 - **[F2 / rustfs#3231] false-404-under-load + overwrite-leak upstream report + repro** — INFRA — Dominant scale blocker (caps merge-heavy full-scale + 4h chaos soak). Our side is safe (clamp + destruction suppression). Needs a #3231-free/fixed rustfs or the S22 fault-proxy stand; build a repro on the #3231 dir-bloat repro.

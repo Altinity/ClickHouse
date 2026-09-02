@@ -13,6 +13,18 @@ doc_type: 'reference'
 
 Implementation status is `DONE_WITH_CONCERNS`; release readiness is **blocked**.
 
+**Update 2026-09-02.** The `gcs_hmac` half of this gate has now executed against the real bucket: 13
+passed, 0 failed, 14 skipped in four consecutive green runs (one further run lost a single scenario to
+a provider connect timeout). Google accepted every live request shape in the `gcs_hmac` groups,
+including batch `DeleteObjects` without the singular fallback, ordinary multipart, native staged copy
+and the condemned-staged retag; every CAS incarnation token recorded on GCS was a numeric generation.
+Three assumptions in this suite were corrected on the way (build ids in `cas_log.token`, the
+row-count cache answering a second `count()`, the refusal arriving at `CREATE`), and the ordinary
+group now attributes its counters per statement. What still blocks release is unchanged in kind and
+smaller in size: the `gcp_oauth` groups (no ADC triple or GCE host was available) and the four
+TLS-ambiguity arms (no fault driver exists). Details, evidence paths and the soak findings of the same
+day are in the [2026-09-02 live validation ledger](/superpowers/cas/gcs-live-validation-ledger-2026-09-02).
+
 The real Google Cloud Storage gate collected every required live case, but no Google credential
 source was available and all 25 live cases skipped. Two credential-free evidence-safety regressions
 passed. Therefore this run contains no evidence that Google accepted the new live request shapes.
