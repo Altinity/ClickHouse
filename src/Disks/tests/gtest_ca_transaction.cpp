@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
@@ -11,7 +12,6 @@
 namespace ProfileEvents
 {
 extern const Event CASRefRepoint;
-extern const Event CASPartFolderViewHits;
 }
 
 namespace DB::ErrorCodes
@@ -621,13 +621,9 @@ TEST(CASTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
-/// The MergeTree fast-removal shape's per-file part-folder read is memoized per (transaction, ref) in
-/// `unlinkFile`: the first unlink reads the part `ForceFresh`, and the rest of the burst reuse that
-/// read via `CachedForLoad`. `ForceFresh` bypasses the retained view and rebuilds, so a memoized burst
-/// of N unlinks over one ref records exactly N-1 view-cache hits, and dropping the memoization would
-/// record none. This pins the read-amplification side of `UnlinkStormThenDirDropIsOneRefDrop` above,
-/// which already pins the repoint count.
-TEST(CASTransactionRemove, UnlinkStormMemoizesThePartFolderReadPerRef)
+/// Memoizing the per-file `ForceFresh` read per (transaction, ref) saves a ref resolve and a view
+/// rebuild on every file of the burst after the first.
+TEST(CASTransactionRemove, UnlinkStormMemoizesOneForceFreshResolve)
 {
     auto storage = openTxStorage();
 
@@ -643,8 +639,16 @@ TEST(CASTransactionRemove, UnlinkStormMemoizesThePartFolderReadPerRef)
     }
     ASSERT_TRUE(storage->existsDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0"));
 
-    const uint64_t view_hits_before = ProfileEvents::global_counters[ProfileEvents::CASPartFolderViewHits].load();
+    /// A warm view-cache hit deliberately emits no `RefResolve`, so this counts exactly the calls that
+    /// did real resolve work on the part.
+    size_t resolves = 0;
+    storage->store()->setEventSink([&](DB::Cas::CasEvent e)
+    {
+        if (e.type == DB::Cas::CasEventType::RefResolve && e.ref_name == "all_1_1_0")
+            ++resolves;
+    });
 
+    size_t resolves_after_unlinks = 0;
     /// 2. The MergeTree fast-removal shape: unlink every file one-by-one, THEN removeDirectory — all
     /// in ONE transaction (mirrors UnlinkStormThenDirDropIsOneRefDrop above).
     {
@@ -652,18 +656,19 @@ TEST(CASTransactionRemove, UnlinkStormMemoizesThePartFolderReadPerRef)
         tx->unlinkFile("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0/checksums.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
         tx->unlinkFile("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0/data.bin", /*if_exists=*/false, /*should_remove_objects=*/true);
         tx->unlinkFile("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        resolves_after_unlinks = resolves;
         tx->removeDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
 
-    /// 3. The whole part is gone, and the three-file unlink storm rebuilt the part-folder view once
-    /// (the first unlink's ForceFresh read) and reused it twice. removeDirectory clears the staged
-    /// removal marks, so publishStaging's own (unmemoized) ForceFresh getView never fires for this ref
-    /// either (see UnlinkStormThenDirDropIsOneRefDrop's zero-repoints assertion above), and a
-    /// ForceFresh read never records a view-cache hit — so these two hits are the memoized unlinks.
+    storage->store()->setEventSink(nullptr);
+
+    /// 3. The whole part is gone, and the three-file burst resolved it exactly once: the first unlink's
+    /// ForceFresh read, with the other two served from the retained view it left behind. Without the
+    /// memo each unlink would resolve again.
     EXPECT_FALSE(storage->existsDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0"));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASPartFolderViewHits].load(), view_hits_before + 2)
-        << "unlink-storm-then-dir-drop must read the part folder once and reuse it per extra file";
+    EXPECT_EQ(resolves_after_unlinks, 1u)
+        << "an unlink storm over one ref must resolve it once for the whole burst, not once per file";
 }
 
 /// A create-then-remove of a new part in one transaction must discard both the manifest entries
