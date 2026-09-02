@@ -576,6 +576,64 @@ TEST(CASWiringRead, BlobViewPlanRidesTheStandardPipeline)
     }
 }
 
+/// A retained view whose blob the collector has since removed still plans the read (no I/O), and the
+/// read itself throws a typed exception at the first byte; it never returns an empty payload, and
+/// the size it reports comes from the manifest, not from the missing object.
+TEST(CASWiringRead, DeletedBlobUnderStaleViewFailsTypedNotEmpty)
+{
+    auto object_storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_wiring_stale_view");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        object_storage, "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
+
+    const std::string path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
+    auto plan_before = storage->getBlobViewPlan(path);
+    ASSERT_TRUE(plan_before.has_value());   /// warms the view and decode caches
+
+    /// Remove the blob object exactly as GC would once nothing references it.
+    auto pool = storage->store();
+    const String blob_key = pool->layout().blobKey(DB::Cas::tests::idOf("payload-A"));
+    {
+        const DB::Cas::HeadResult h = pool->backend().head(blob_key);
+        ASSERT_TRUE(h.exists);
+        pool->backend().deleteExact(blob_key, h.token);
+    }
+
+    /// Planning still succeeds from the cached manifest and names the same object.
+    auto plan_after = storage->getBlobViewPlan(path);
+    ASSERT_TRUE(plan_after.has_value());
+    EXPECT_EQ(plan_after->object.remote_path, plan_before->object.remote_path);
+
+    const auto objects = storage->getStorageObjects(path);
+    ASSERT_EQ(objects.size(), 1u);
+    EXPECT_EQ(objects[0].bytes_size, String("payload-A").size());   /// size comes from the manifest
+
+    const DB::Cas::BlobLocation location{
+        .key = objects[0].remote_path,
+        .offset = pool->poolMeta().blob_header_len,
+        .length = objects[0].bytes_size};
+    /// The local object storage opens the file eagerly and maps ENOENT to FILE_DOESNT_EXIST
+    /// (ReadBufferFromFile); on S3 the same read raises S3_ERROR at the first byte. Either way the
+    /// failure is a typed exception, never an empty payload.
+    String got;
+    int code = 0;
+    try
+    {
+        auto buf = storage->readBlobPayload(location, path, DB::ReadSettings{});
+        DB::readStringUntilEOF(got, *buf);
+    }
+    catch (const DB::Exception & e)
+    {
+        code = e.code();
+    }
+    EXPECT_EQ(code, DB::ErrorCodes::FILE_DOESNT_EXIST)
+        << "read of a deleted blob returned " << got.size() << " bytes (code " << code << ")";
+    EXPECT_TRUE(got.empty());
+}
+
 TEST(CASWiringRead, ProjectionDirectory)
 {
     auto storage = openWiringStorage();

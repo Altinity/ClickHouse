@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
@@ -2509,6 +2510,106 @@ TEST(CASPool, ReadManifestAbsentBodyEmitsReadMissingWithOneGetAndNoHead)
         EXPECT_EQ(e.detail.at("site"), "readManifest");
     }
     EXPECT_EQ(read_missing, 1u);
+}
+
+/// A reader holding a decode for a manifest the collector has since removed sees a snapshot-consistent
+/// manifest: the second read is the same shared decode with no request, `locate` is pure, and the
+/// missing blob is observed only when its key is read. Nothing here is a fallback: the absence is
+/// surfaced by the blob read, never masked by the cache.
+TEST(CASPool, StaleSnapshotServesCachedManifestAndBlobAbsenceSurfacesOnRead)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    Layout layout("p");
+    const RootNamespace ns{"srv1/tbl"};
+
+    const ManifestId id = publishPart(s, ns.string(), "part_1", "payload-1");
+    auto r = s->resolveRef(ns, "part_1");
+    ASSERT_TRUE(r.has_value());
+    auto m1 = s->readManifestShared(r->manifest_id);
+    const String manifest_key = layout.manifestKey(id);
+    const String blob_key = layout.blobKey(idOf("payload-1"));
+
+    /// What GC does after the owner is removed and the decrement is adopted: exact-token deletes of
+    /// the body and of the now-unreferenced blob.
+    {
+        const HeadResult h = b->head(manifest_key);
+        ASSERT_TRUE(h.exists);
+        b->deleteExact(manifest_key, h.token);
+    }
+    {
+        const HeadResult h = b->head(blob_key);
+        ASSERT_TRUE(h.exists);
+        b->deleteExact(blob_key, h.token);
+    }
+    b->resetCounts();
+
+    auto m2 = s->readManifestShared(r->manifest_id);
+    EXPECT_EQ(m1.get(), m2.get());
+    EXPECT_EQ(b->getCount(manifest_key), 0u);
+    EXPECT_EQ(b->headCount(manifest_key), 0u);
+
+    ASSERT_EQ(m2->entries.size(), 1u);
+    const BlobLocation location = s->locate(m2->entries[0]);
+    EXPECT_EQ(location.key, blob_key);
+    EXPECT_EQ(b->getCount(blob_key), 0u);          /// locate is pure: no I/O until the read
+    EXPECT_FALSE(b->get(location.key).has_value());   /// the read observes the absence
+}
+
+/// The scoped contract for mutation evidence, executable. A carry-forward from a committed source
+/// (what createHardLink, republishRef, repointRef and the relink receiver do) adopts each entry as a
+/// tokenless TrustedManifest dependency and promote issues no probe for it: the live source edge is
+/// what keeps the blob alive, and under protocol-compliant GC the state "cached source decode, blob
+/// gone" cannot be constructed. Out-of-band deletion of BOTH the cached source body and the blob is
+/// outside that contract; the carry-forward then commits a ref to an absent blob and fsck's
+/// reachable-but-absent scan is the detector. This test pins that documented outcome so a later
+/// change that silently alters it is noticed. It is not a defect report.
+TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
+{
+    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    Layout layout("p");
+    const RootNamespace ns{"srv1/tbl"};
+
+    const ManifestId src_id = publishPart(s, ns.string(), "part_src", "payload-src");
+    auto src = s->resolveRef(ns, "part_src");
+    ASSERT_TRUE(src.has_value());
+    const auto src_manifest = s->readManifestShared(src->manifest_id);   /// warms the decode cache
+    const String src_manifest_key = layout.manifestKey(src_id);
+    const String blob_key = layout.blobKey(idOf("payload-src"));
+
+    /// Out of band: both objects gone, the committed source ref untouched.
+    for (const String & key : {src_manifest_key, blob_key})
+    {
+        const HeadResult h = b->head(key);
+        ASSERT_TRUE(h.exists);
+        b->deleteExact(key, h.token);
+    }
+    b->resetCounts();
+
+    /// The carry-forward, in the order prepareEntries runs it for a committed source: adopt, stage,
+    /// precommit, promote. No blob body is written.
+    PartWriteInfo info;
+    info.intended_ref = ns.string() + "/part_dst";
+    info.intended_namespace = ns;
+    auto build = s->beginPartWrite(info);
+    ASSERT_EQ(src_manifest->entries.size(), 1u);
+    build->adoptEvidence(src_manifest->entries[0]);
+    const ManifestId dst_id = build->stageManifest({src_manifest->entries[0]});
+    build->precommitAdd(ns, "part_dst", dst_id);
+    EXPECT_NO_THROW(build->promote(ns, "part_dst", build->buildId(), dst_id));
+    EXPECT_EQ(b->headCount(blob_key), 0u);   /// a TrustedManifest leaf is not probed, by design
+    EXPECT_EQ(b->getCount(blob_key), 0u);
+
+    /// The documented outcome: a committed ref names an absent blob, and fsck reports it.
+    ASSERT_TRUE(s->resolveRef(ns, "part_dst").has_value());
+    const FsckReport rep = runFsck(*s, /*detail=*/true);
+    EXPECT_GE(rep.dangling, 1u);
+    bool blob_reported = false;
+    for (const FsckObject & o : rep.objects)
+        if (o.key == blob_key && o.cls == FsckClass::Dangling)
+            blob_reported = true;
+    EXPECT_TRUE(blob_reported) << "fsck must report the adopted-but-absent blob " << blob_key;
 }
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
