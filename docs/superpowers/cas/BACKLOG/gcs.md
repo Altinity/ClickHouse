@@ -98,13 +98,15 @@ than needed. TLA variant and the two-model consult are mandatory before code.
 parameters (a 250ms `_ckpt` delay, 40 inserts per node: the run passed). Escalated to a 1000ms delay
 and 80 inserts per node, it reproduced cleanly against the table-wide rule 3: both replication queues
 stuck at 79 and 80 entries after the drain deadline, and each node logged the confirm refusal over
-1,500 times in the run. Against the ref-scoped rule 3 the same escalated workload produces zero
-refusals of any kind on node1 — not one of the refusal counters at zero, but no row for any of them in
-`system.events`. That is the intended consequence of the fix, not a wiring gap: a refusal now needs a
-queued or carved mutation naming the exact ref the peer is asking about, and in this workload each
-node's lane stays busy with its own newer parts while its peer asks about a part committed only
-seconds earlier. The escalated case takes about six and a half minutes per run (up from a few seconds
-at the original parameters).
+1,500 times in the run. Against the ref-scoped rule 3 (the final, five-refusal-counter build,
+`tests/integration/test_cas_gcs_relink_liveness`'s own captured stdout in `ci/tmp/pytest_parallel.jsonl`
+for the run underlying `build/itest_cas_gcs_liveness_task6_fix1.log`) the same escalated workload
+produces zero refusals of any kind on BOTH nodes — not one of the five counters at zero on either
+node, but no `system.events` row for any of them. That is the intended consequence of the fix, not a
+wiring gap: a refusal now needs a queued or carved mutation naming the exact ref the peer is asking
+about, and in this workload each node's lane stays busy with its own newer parts while its peer asks
+about a part committed only seconds earlier. The escalated case takes about six and a half minutes per
+run (up from a few seconds at the original parameters).
 
 **Open items carried forward.**
 
