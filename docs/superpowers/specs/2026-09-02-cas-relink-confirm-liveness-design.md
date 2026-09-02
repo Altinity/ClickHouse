@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS relink confirm liveness design {#cas-relink-confirm-liveness-design}
 
-Status: revision 4 of 2026-09-02. Revision 1 relied on the part state machine (gate 0) to carry the
+Status: revision 4 of 2026-09-02, amended after the Claude rev-4 check (model-gate identifiers). Revision 1 relied on the part state machine (gate 0) to carry the
 removal argument; review found the counterexample of a live repoint that retires a blob edge while the
 part stays `Active`, and revision 1 is withdrawn. Revision 2 (rule 3 scoped to the sent transaction)
 passed two independent consults, one on another model, on the design itself; revisions 3 and 4 fold in
@@ -176,8 +176,10 @@ touches nothing and no state "installed, tenure still open". The extension:
   step clears. This mirrors "arm before the first send, swap out at install"
   (`CasRefLedger.cpp:3585-3625`, `:3855-3859`), stated in the model as the code invariant it assumes.
 - Install is split from tenure completion: `SenderInstall` clears `sArmed` and updates `sCacheRef`;
-  a separate `SenderTenureEnd` clears `sLeader`. Between the two the lane is Ready with no attempt and
-  the leader still active, the chunk boundary of a chunked flush.
+  a separate `SenderTenureEnd` clears `sLeader` and `sPending` (which today gate `SenderAdmit` and
+  `FenceLoss`). Between the two the lane is Ready with no attempt and the leader still active, the
+  chunk boundary of a chunked flush. `NsNoise`'s existing "noop" op is the natural body of the `NoOp`
+  shape.
 - Rule 3 becomes `~(sArmed /\ sTouches)`; `sPending` and `sLeader` leave the rule.
 - Sabotages: `SabotageStaleCache` drops the rule-3 conjunct entirely and must still violate
   `ConfirmedRelinkNeverDangles` (the durable `m1 -> m2` repoint with the stale `sCacheRef = m1`);
@@ -189,17 +191,20 @@ touches nothing and no state "installed, tenure still open". The extension:
 - Run with `MaxHoles = 0`, as `_main` does. The LIST-completeness caveat recorded in
   `CaRelinkConfirmCore_RESULTS.md` is unchanged and outside this design.
 
-**`CaRefLaneCore.tla` and `CaRelinkLaneComposition.tla`.** The lane model's `Certify`
-(`CaRefLaneCore.tla:714-722`) and the composition's `ConfirmSource` (`CaRelinkLaneComposition.tla:111`)
-state the public seam as "certification requires `lane = "Ready"`", and `RefuseBlockedConfirmation`,
-`ConfirmWhileBlocked` and `ConfirmationRequiresReady` test that contract. This design replaces that
-seam: certification is permitted in `Writing` and `Wedged` when the armed attempt does not touch the
-certified identity. Both models gain the attempt's touch scope (the composition treats the lane as a
-component, so the lane exports "armed attempt touches this identity" as one more observable), the
-`Ready`-only property is rewritten as "no certification while the armed attempt touches the identity",
-`SabotageConfirmBlocked` becomes "certify while the touching attempt is armed", and
-`run_relinklane.sh` plus `CaRefLaneCore_RESULTS.md` (`:68-91`) and the models README rows for both files
-are rerun and rewritten. A green `CaRelinkConfirmCore` alone is not the model gate.
+**`CaRefLaneCore.tla` and `CaRelinkLaneComposition.tla`.** Both encode the public seam as
+"certification requires `lane = "Ready"`". In the lane model: the `Certify` step (`CaRefLaneCore.tla:714-722`,
+`bad_certification` hardcodes `lane = "Ready"`), the flag `SabotageCertifyBlocked` (`:26`), the invariant
+`CertifiedViewIsCurrent` (`:1083`), the config `CaRefLaneCore_sab_certifyblocked.cfg`, run by
+`run_reflane.sh`. In the composition: `ConfirmSource` (`CaRelinkLaneComposition.tla:111`),
+`RefuseBlockedConfirmation` (`:120`), `ConfirmWhileBlocked` (`:128`), `ConfirmationRequiresReady`
+(`:209`), run by `run_relinklane.sh`. This design replaces that seam: certification is permitted in
+`Writing` and `Wedged` when the armed attempt does not touch the certified identity. Both models gain
+the attempt's touch scope (the composition treats the lane as a six-state component, so the lane
+exports "armed attempt touches this identity" as one more observable), the `Ready`-only properties are
+rewritten as "no certification while the armed attempt touches the identity", the two blocked-certify
+sabotages become "certify while the touching attempt is armed", and both runners are rerun with
+`CaRefLaneCore_RESULTS.md` (`:43`, `:68-91`) rewritten. A green `CaRelinkConfirmCore` alone is not the
+model gate.
 
 Liveness is argued, not model-checked: with rule 3 scoped to the sent transaction's refs, a confirm
 about a ref that is not being mutated reaches rule 5 whenever the lane is resident and not broken, and
@@ -270,9 +275,12 @@ stays on the real bucket.
 - `CasRefLedger.h:616`: the `prepared_attempt` field comment enumerates the attempt's fields as
   "COMPLETE" and gains the two new ones.
 - `src/Disks/tests/gtest_cas_confirm_exact_ref.cpp:40-46`: the file header (see the tests section).
-- `docs/superpowers/models/CaRelinkConfirmCore_RESULTS.md:85-92` and `:126-142`: the "why it holds"
-  paragraph and the `_sab_stalecache` narrative describe rule 3 as tenure-wide; rewritten with the
-  rerun. `CaRefLaneCore_RESULTS.md:68-91` and the two models README rows: the `Ready`-only seam.
+- `docs/superpowers/models/CaRelinkConfirmCore_RESULTS.md:126-142`: the `_sab_stalecache` narrative
+  describes rule 3 as tenure-wide; rewritten with the rerun (`:85-92` states the per-ref effect and
+  stays true). `CaRefLaneCore_RESULTS.md:43` and `:68-91`: the `Ready`-only seam. The models README:
+  the `CaRelinkConfirmCore.tla` row (`:141`, "lane quiescence") and its prose block (`:374-395`); the
+  README has no row for `CaRelinkLaneComposition.tla`, and the `CaRefLaneCore.tla` row does not state
+  the seam.
 - The operator-facing description of the confirm under `docs/en/antalya/cas/`, if it states the
   table-wide refusal.
 
