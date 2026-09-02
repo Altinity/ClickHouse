@@ -431,8 +431,19 @@ class S3:
         )
         if not output:
             return None
-        else:
-            return cls.Object(**json.loads(output))
+        data = json.loads(output)
+        # HeadObject omits optional fields (Expiration) unless a lifecycle Expire
+        # rule applies, and emits extra keys Object does not declare.
+        return cls.Object(
+            AcceptRanges=data.get("AcceptRanges", ""),
+            Expiration=data.get("Expiration", ""),
+            LastModified=data.get("LastModified", ""),
+            ContentLength=data.get("ContentLength", 0),
+            ETag=data.get("ETag", ""),
+            ContentType=data.get("ContentType", ""),
+            ServerSideEncryption=data.get("ServerSideEncryption", ""),
+            Metadata=data.get("Metadata") or {},
+        )
 
     @classmethod
     def assert_read_access(cls, s3_path):
