@@ -5,11 +5,9 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
 #include <Poco/Exception.h>
-#include <Poco/Util/XMLConfiguration.h>
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <latch>
-#include <sstream>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -28,7 +26,6 @@ namespace DB::ErrorCodes
 namespace ProfileEvents
 {
 extern const Event CASRefRollbackBestEffortDropFailed;
-extern const Event CASPartFolderValidateSkipped;
 }
 
 using namespace DB;
@@ -64,17 +61,7 @@ Cas::ManifestId publishPart(const Cas::PoolPtr & store, const Cas::RootNamespace
 Cas::CachedPartFolderAccess::CacheParams cacheOn()
 {
     return {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20,
-            .explain_enabled = true, .validate = {}};
-}
-
-/// Mirrors gtest_cas_s3_staging.cpp's helper of the same shape: the shape a real CAS disk config
-/// has under `storage_configuration.disks.<name>`, so `config_prefix = "disk"` reads exactly like
-/// the disk factory's `config_prefix`. Used to unit-test `parsePartFolderValidate` standalone.
-Poco::AutoPtr<Poco::Util::XMLConfiguration> configWithDiskSection(const std::string & inner_xml)
-{
-    std::istringstream xml_stream( // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-        "<clickhouse><disk>" + inner_xml + "</disk></clickhouse>");
-    return new Poco::Util::XMLConfiguration(xml_stream);
+            .explain_enabled = true};
 }
 
 /// Every mutating backend op throws once armed — models a correlated backend outage during the
@@ -190,7 +177,7 @@ public:
 
 }
 
-TEST(CASPartFolderAccess, RetainedHitSkipsManifestHead)
+TEST(CASPartFolderAccess, RetainedHitCostsNoRequest)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -205,10 +192,9 @@ TEST(CASPartFolderAccess, RetainedHitSkipsManifestHead)
     for (int i = 0; i < 5; ++i)
         ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
 
-    /// ONE body GET (the cold build) and ZERO manifest HEADs: the decode cache is keyed by id, and
-    /// every subsequent CachedForLoad call is a validated hit — zero manifest ops.
+    /// ONE body GET (the cold build): the decode cache is keyed by id, and every subsequent
+    /// CachedForLoad call is a retained hit that costs no request at all.
     EXPECT_EQ(backend->getCount(manifest_key), 1u);
-    EXPECT_EQ(backend->headCount(manifest_key), 0u);
     EXPECT_TRUE(access.explain(key).retained);
     EXPECT_EQ(access.explain(key).last_decision,
               Cas::CachedPartFolderAccess::LastDecision::Hit);
@@ -224,7 +210,7 @@ TEST(CASPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
     /// per-disk explain mutex nor write a journal entry (B2).
     Cas::CachedPartFolderAccess access(store,
         {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20,
-         .explain_enabled = false, .validate = {}});
+         .explain_enabled = false});
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
     const Cas::PartRefKey key{ns, "part_1"};
     const String manifest_key = layout.manifestKey(id);
@@ -233,9 +219,8 @@ TEST(CASPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
     for (int i = 0; i < 5; ++i)
         ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
 
-    /// Same request oracle as RetainedHitSkipsManifestHead — one cold build, then validated hits.
+    /// Same request oracle as RetainedHitCostsNoRequest — one cold build, then retained hits.
     EXPECT_EQ(backend->getCount(manifest_key), 1u);
-    EXPECT_EQ(backend->headCount(manifest_key), 0u);
     /// The journal is never written when disabled.
     EXPECT_EQ(access.explainJournalSizeForTest(), 0u);
     /// explain() still reports live retention truthfully, but the decision defaults to Miss (unwritten).
@@ -678,7 +663,7 @@ TEST(CASPartFolderAccess, ExplainRecordsDecisions)
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
-    Cas::CachedPartFolderAccess access(store, {.explain_enabled = true, .validate = {}});
+    Cas::CachedPartFolderAccess access(store, {.explain_enabled = true});
     publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
     const Cas::PartRefKey key{ns, "part_1"};
 
@@ -828,90 +813,6 @@ TEST(CASPartFolderAccess, DeletedBodyFailsClosedInEveryModeWhenDecodeCacheDisabl
     EXPECT_EQ(backend->getCount(layout.manifestKey(id)), 3u);   /// one GET per attempt, nothing cached
 }
 
-/// ==== §3: `parsePartFolderValidate` config parsing, standalone (mirrors CASS3Staging's
-/// parseStagingBackend coverage) -- review finding: std::stoull silently accepted a leading '-'
-/// (unsigned wraparound), so a malformed `age -5` never hit the parser's own fail-closed throw.
-/// These pin the fixed `std::from_chars`-based parsing directly, with no disk/store needed. ====
-
-TEST(CASPartFolderValidateParse, DefaultConfigParsesToAlways)
-{
-    /// No `part_folder_validate` key at all -- the byte-for-byte-pre-§3-behavior default.
-    auto config = configWithDiskSection("<scratch_path>/tmp/whatever</scratch_path>");
-    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
-    EXPECT_EQ(v.mode, Cas::PartFolderValidate::Mode::Always);
-}
-
-TEST(CASPartFolderValidateParse, ParsesAlways)
-{
-    auto config = configWithDiskSection("<part_folder_validate>always</part_folder_validate>");
-    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
-    EXPECT_EQ(v.mode, Cas::PartFolderValidate::Mode::Always);
-}
-
-TEST(CASPartFolderValidateParse, ParsesNever)
-{
-    auto config = configWithDiskSection("<part_folder_validate>never</part_folder_validate>");
-    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
-    EXPECT_EQ(v.mode, Cas::PartFolderValidate::Mode::Never);
-}
-
-TEST(CASPartFolderValidateParse, ParsesPositiveAge)
-{
-    auto config = configWithDiskSection("<part_folder_validate>age 5</part_folder_validate>");
-    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
-    EXPECT_EQ(v.mode, Cas::PartFolderValidate::Mode::Age);
-    EXPECT_EQ(v.age_seconds, 5u);
-}
-
-TEST(CASPartFolderValidateParse, AcceptsAgeZeroAsADegenerateButValidWindow)
-{
-    /// `age 0` is accepted, not rejected: it is a well-formed (if degenerate -- effectively an
-    /// almost-always-expired window) configuration, not malformed input. Only genuinely malformed
-    /// suffixes (negative, non-digit, empty, trailing garbage) fail closed below.
-    auto config = configWithDiskSection("<part_folder_validate>age 0</part_folder_validate>");
-    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
-    EXPECT_EQ(v.mode, Cas::PartFolderValidate::Mode::Age);
-    EXPECT_EQ(v.age_seconds, 0u);
-}
-
-TEST(CASPartFolderValidateParse, NegativeAgeThrows)
-{
-    /// The bug this regression-guards: std::stoull("-5") used to return 18446744073709551611
-    /// (unsigned wraparound) instead of rejecting the leading '-'.
-    auto config = configWithDiskSection("<part_folder_validate>age -5</part_folder_validate>");
-    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
-        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
-}
-
-TEST(CASPartFolderValidateParse, NonDigitAgeThrows)
-{
-    auto config = configWithDiskSection("<part_folder_validate>age abc</part_folder_validate>");
-    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
-        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
-}
-
-TEST(CASPartFolderValidateParse, TrailingGarbageAfterAgeThrows)
-{
-    auto config = configWithDiskSection("<part_folder_validate>age 5abc</part_folder_validate>");
-    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
-        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
-}
-
-TEST(CASPartFolderValidateParse, EmptyAgeSuffixThrows)
-{
-    auto config = configWithDiskSection("<part_folder_validate>age </part_folder_validate>");
-    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
-        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
-}
-
-TEST(CASPartFolderValidateParse, UnknownValueThrows)
-{
-    /// Fail-closed: an unrecognized value must NEVER silently become `never`/`always`.
-    auto config = configWithDiskSection("<part_folder_validate>sometimes</part_folder_validate>");
-    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
-        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
-}
-
 TEST(CASPartFolderAccess, AbsenceIsNeverRetained)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -947,7 +848,7 @@ TEST(CASPartFolderAccess, GetViewEmitsRefResolveOnlyOnRealResolveWork)
 
     std::vector<Cas::CasEvent> seen;
     store->setEventSink([&](const Cas::CasEvent & e) { seen.push_back(e); });
-    Cas::CachedPartFolderAccess access(store, cacheOn());   /// retention on, validate == Always (default)
+    Cas::CachedPartFolderAccess access(store, cacheOn());   /// retention on
 
     const auto refResolveCount = [&]
     {
@@ -982,7 +883,7 @@ TEST(CASPartFolderAccess, OversizedViewServedNotRetained)
     Cas::CachedPartFolderAccess access(store,
         Cas::CachedPartFolderAccess::CacheParams{
             .cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 1,
-            .explain_enabled = true, .validate = {}});
+            .explain_enabled = true});
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
     const Cas::PartRefKey key{ns, "part_1"};
     const String manifest_key = layout.manifestKey(id);

@@ -40,7 +40,7 @@ _VARIANT_FILE = {
     # S36/S37: local+CA (and local+local+CA) multi-disk storage policies (ca_local / ca_local3)
     # alongside the same shared CA disk, for MOVE PART/PARTITION and policy-driven tiering tests.
     "multidisk": "docker-compose-multidisk.yml",
-    # Soak-matrix config sweeps (`manifest_decode_cache_bytes`, `part_folder_validate`): render_tuned_config
+    # Soak-matrix config sweeps (`manifest_decode_cache_bytes`, `part_folder_cache_bytes`): render_tuned_config
     # writes configs/storage_conf_tuned_ch{1,2}.xml on demand; this compose mounts those instead of the
     # fixed per-variant XML the other entries above use.
     "tuned": "docker-compose-tuned.yml",

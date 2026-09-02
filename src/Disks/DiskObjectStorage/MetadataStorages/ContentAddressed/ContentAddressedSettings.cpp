@@ -74,7 +74,6 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, part_folder_cache_bytes, 64ULL << 20, "Part-folder view cache byte budget (0 disables retention)", 0) \
     DECLARE(UInt64, part_folder_cache_max_entries, 10000, "Part-folder view cache entry cap", 0) \
     DECLARE(UInt64, part_folder_cache_max_entry_bytes, 16ULL << 20, "Oversized part-folder views bypass retention above this size", 0) \
-    DECLARE(String, part_folder_validate, "always", "ForceFresh body re-proof policy (always | never | age <seconds>)", 0) \
     DECLARE(UInt64, manifest_decode_cache_bytes, 128ULL << 20, "Manifest DECODE cache byte budget (0 disables)", 0) \
     DECLARE(UInt64, gc_meta_pool_size, 16, "Bounded pool size for GC per-hash freshness-meta writes", 0) \
     DECLARE(String, staging_backend, "local", "Blob staging backend (local | s3); s3 is opt-in", 0) \
@@ -85,11 +84,10 @@ struct ContentAddressedSettingsImpl : public BaseSettings<ContentAddressedSettin
 {
     /// Parsed by `validate` from the corresponding string setting; cached here (rather than
     /// re-parsed on every access) because the public header only forward-declares
-    /// `Cas::StagingBackend` / `Cas::PartFolderValidate` and cannot store them by value.
+    /// `Cas::StagingBackend` and cannot store it by value.
     Cas::BlobHashAlgo blob_hash_algo_cached = Cas::BlobHashAlgo::CityHash128;
     bool skip_access_check_cached = false;
     Cas::StagingBackend staging_backend_cached = Cas::StagingBackend::Local;
-    Cas::PartFolderValidate part_folder_validate_cached{};
 };
 
 IMPLEMENT_SETTINGS_TRAITS_CUSTOM_IMPL(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, ContentAddressedSettings, ContentAddressedSetting)
@@ -241,7 +239,6 @@ void ContentAddressedSettings::validate()
 
     impl->blob_hash_algo_cached = Cas::parseBlobHashAlgo(settings[ContentAddressedSetting::blob_hash].value);
     impl->staging_backend_cached = ContentAddressedMetadataStorage::parseStagingBackend(settings[ContentAddressedSetting::staging_backend].value);
-    impl->part_folder_validate_cached = ContentAddressedMetadataStorage::parsePartFolderValidate(settings[ContentAddressedSetting::part_folder_validate].value);
 }
 
 Cas::BlobHashAlgo ContentAddressedSettings::blobHashAlgo() const
@@ -257,11 +254,6 @@ bool ContentAddressedSettings::skipAccessCheck() const
 Cas::StagingBackend ContentAddressedSettings::stagingBackend() const
 {
     return impl->staging_backend_cached;
-}
-
-Cas::PartFolderValidate ContentAddressedSettings::partFolderValidate() const
-{
-    return impl->part_folder_validate_cached;
 }
 
 }

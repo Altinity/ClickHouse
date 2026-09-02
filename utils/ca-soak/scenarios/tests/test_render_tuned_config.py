@@ -12,11 +12,11 @@ def _tuned_xml(node):
 
 def test_render_injects_overrides_into_ca_block():
     cluster_boot.render_tuned_config({"cas_manifest_decode_cache_bytes": "268435456",
-                                       "cas_part_folder_validate": "age 5"})
+                                       "cas_part_folder_cache_bytes": "33554432"})
     for node in ("ch1", "ch2"):
         xml = _tuned_xml(node)
         assert "<cas_manifest_decode_cache_bytes>268435456</cas_manifest_decode_cache_bytes>" in xml
-        assert "<cas_part_folder_validate>age 5</cas_part_folder_validate>" in xml
+        assert "<cas_part_folder_cache_bytes>33554432</cas_part_folder_cache_bytes>" in xml
         assert "<metadata_type>cas</metadata_type>" in xml  # base block preserved
 
 

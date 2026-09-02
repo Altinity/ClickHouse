@@ -29,7 +29,6 @@
 #include <Poco/String.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <base/sleep.h>
-#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <ctime>
@@ -137,7 +136,7 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///   serverRootId, scratchPath, stagingBackend, objectStorage, gcHealth,
 ///   lifecycleSnapshot (both non-store()-gated introspection reads for system.cas_mounts --
 ///   readable in EVERY lifecycle state including a not-live/vanished/null pool, spec §7),
-///   parseStagingBackend/parsePartFolderValidate/
+///   parseStagingBackend/
 ///   tryFromDisk (static), checkNotReadOnly, the *ForTest seams, serverPrefix/liveNamespace/
 ///   shadowNamespace/shadowScope/route/classifyDirectory (pure path computation, no pool I/O),
 ///   ownsNamespace (the relink-confirm routing predicate -- a string comparison against
@@ -303,7 +302,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
     , skip_access_check(settings_.skipAccessCheck())
-    , part_folder_validate(settings_.partFolderValidate())
 {
 }
 
@@ -326,35 +324,6 @@ Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
     const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
 {
     return parseStagingBackend(config.getString(config_prefix + ".staging_backend", "local"));
-}
-
-Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(const std::string & value)
-{
-    using PartFolderValidate = Cas::PartFolderValidate;
-    if (value == "always")
-        return {PartFolderValidate::Mode::Always, 0};
-    if (value == "never")
-        return {PartFolderValidate::Mode::Never, 0};
-    if (value.starts_with("age "))
-    {
-        /// `std::from_chars` against an UNSIGNED type never accepts a leading '-' (unlike
-        /// `std::stoull`, which silently negates modulo 2^64) -- a malformed/negative/non-digit/empty
-        /// suffix falls through to the terminal throw below instead of wrapping into an astronomical
-        /// age_seconds that behaves as skip-forever.
-        const std::string age_str = value.substr(4);
-        uint64_t age_seconds = 0;
-        const auto [ptr, ec] = std::from_chars(age_str.data(), age_str.data() + age_str.size(), age_seconds);
-        if (ec == std::errc{} && ptr == age_str.data() + age_str.size())
-            return {PartFolderValidate::Mode::Age, age_seconds};
-    }
-    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "Unknown cas_part_folder_validate value '{}' (expected 'always', 'never', or 'age <non-negative integer seconds>')", value);
-}
-
-Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(
-    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
-{
-    return parsePartFolderValidate(config.getString(config_prefix + ".part_folder_validate", "always"));
 }
 
 ContentAddressedMetadataStorage * ContentAddressedMetadataStorage::tryFromDisk(const DiskPtr & disk)
@@ -849,8 +818,7 @@ void ContentAddressedMetadataStorage::startup()
         Cas::CachedPartFolderAccess::CacheParams{
             .cache_bytes = cas_part_folder_cache_bytes,
             .max_entries = cas_part_folder_cache_max_entries,
-            .max_entry_bytes = cas_part_folder_cache_max_entry_bytes,
-            .validate = part_folder_validate});
+            .max_entry_bytes = cas_part_folder_cache_max_entry_bytes});
 
     /// Reclaim this mount's leaked `staging/<server_root_id>/` debris after an explicit, writable S3
     /// staging mount has passed the native-copy check above. The prefix is keyed by this mount's own

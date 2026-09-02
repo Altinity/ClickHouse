@@ -1,7 +1,7 @@
 # CA soak-test cluster, "tuned" variant: identical to docker-compose.yml except both ch1 and ch2
 # mount configs/storage_conf_tuned_ch{1,2}.xml (rendered on demand by
 # framework.cluster_boot.render_tuned_config) instead of the fixed storage_conf_ch{1,2}.xml. Used by
-# soak-matrix config sweeps (`manifest_decode_cache_bytes`, `part_folder_validate`) that need a per-run
+# soak-matrix config sweeps (`manifest_decode_cache_bytes`, `part_folder_cache_bytes`) that need a per-run
 # <ca> disk override without hand-authoring a storage_conf_<variant>.xml + compose pair per value.
 #
 # reset_cluster(variant="tuned", overrides={...}) renders the tuned XMLs before `up`; call
