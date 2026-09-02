@@ -47,6 +47,8 @@ Proved on the real bucket with the `gcs_hmac` client, binary of 2026-09-02:
 
 - **[relink-confirm-lane-livelock] two replicas starve each other's fetch-by-relink confirms** — HARD /
   RELEASE GATE (data divergence, not data loss).
+  Design approved 2026-09-02: [relink confirm liveness design](/superpowers/specs/cas-relink-confirm-liveness-design)
+  (rule 3 refuses only a broken lane; gate 0 plus the part state machine carry the removal argument).
 
 **What happened.** After the connect storm both replication queues wedged with
 `NO_REPLICA_HAS_PART: Source ... did not prove it still holds the manifest it offered ... by relink`;
