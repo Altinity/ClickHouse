@@ -217,6 +217,51 @@ gate after every fix has landed.
 lifecycle transition per second per pool on GCS. `docs/en/antalya/cas/bucket-requirements.md` does not
 mention it yet.
 
+## Failure class 3: conditional writes that make exactly one attempt (2026-09-02 audit) {#single-attempt-conditional-writes}
+
+- **[cas-uncontrolled-conditional-writes] twenty-three production call sites issue a conditional write
+  with no retry above the single-attempt profile** — HARD for GCS, and the mechanism behind F12.
+
+Full audit, twenty-one object kinds with their coverage and twelve gaps by severity:
+[GCS retry-coverage audit](/superpowers/cas/gcs-retry-coverage-audit-2026-09-02).
+
+**The three states, which must not be conflated.** A CAS request is either driven by
+`CasRequestController` (up to 16 attempts inside a 90 s deadline, capped-exponential backoff, and an
+exact-GET resolve of any ambiguous attempt before it is reissued); or it reaches the object-storage
+client unwrapped, where ClickHouse's S3 retry strategy retries `429`, `408` and the retryable `5xx`
+up to `s3_retry_attempts`, default 500; or it is a Native-mode conditional write, which
+`conditionalWriteSettings` deliberately pins to a single HTTP attempt so that a transparently
+retried conditional write can never cross the mount-lease boundary. Reads, `HEAD`s, `LIST`s, exact
+deletes and blob publication are all in the second state and are retried heavily. The defect is not
+the single-attempt profile; it is the call sites that use it with nothing above them.
+
+**The negative result, which is the audit's most important finding.** A throttling or transport
+error cannot be read as "the object is absent" anywhere in the subsystem: `head` flattens only the
+genuine not-found codes and `get` only `NoSuchKey`, and the definite-failure classifier whitelists
+only malformed-request, entity-too-large and access-denied. No delete, detach, wedge, demotion,
+takeover or lifecycle transition can be triggered by a `429` or a `5xx`. Every gap below is
+availability, not data loss. The `ProbeOutcome` comment in `Backend/CasBackend.h` claims the
+opposite and is wrong; the code is right.
+
+**The gaps worth acting on, in the audit's order.**
+
+- **Critical.** `CasRefCatalog::casUpdateImpl` writes the pool-wide catalog twice per `CREATE TABLE`
+  with one attempt, no controller and no catch, so a single `429` fails the statement. This is the
+  same item as `[gcs-hot-control-keys-429]`'s B1, now with a call-site inventory behind it.
+- **High.** A writable mount issues about twelve single-attempt conditional writes across the
+  capability battery, the writer epoch, the lease claim, the keeper adopt and the disk access check;
+  one `429` refuses the mount.
+- **High.** Loose table files and namespace files go through `CasPlainObjects::casPutObject`, which
+  retries only a precondition failure, so a `429` surfaces as `S3_ERROR` to the user's statement.
+- **High.** `publishCkpt` re-reads before each reissue, which is correct, but runs up to a hundred
+  iterations back-to-back with no sleep against a key whose limit is per-name.
+- **Medium.** Both GC liveness signals are single-attempt, so a throttling episode causes leadership
+  churn; and any single throttled `PUT` discards a whole GC round.
+- **Medium, cross-cutting, and the opposite failure.** A request that IS retried by the S3 client
+  retries up to five hundred times with a five-second cap and no jitter, so a persistently throttled
+  read, fold or resolve blocks its thread for roughly forty minutes rather than failing fast. The
+  CAS operation deadline cannot preempt a request already inside the client's loop.
+
 ## Environment findings, recorded so nobody chases them twice {#environment}
 
 - **[gc-run-connect-failure-propagation] a manual `SYSTEM CAS GC RUN` surfaces a connect-level
