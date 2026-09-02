@@ -225,3 +225,4 @@ Appended by the 20-minute watchdog. Format: time, what is running, progress, ano
 - 04:11 Stand converged: queues 2/0, rows 244,024 = 244,024, zero unproven confirms. Campaign closed; watchdog removed; stand left up as the F11 reproduction.
 - 07:51 All GCS findings and fix options consolidated into `docs/superpowers/cas/BACKLOG/gcs.md` (index row in BACKLOG.md; the three items moved out of formats-and-storage.md leave a pointer).
 - 09:46 F11 design brainstormed and approved: rule 3 keeps only the broken-lane states; safety rests on gate 0 and the `asMutableDeletingPart` ordering. Spec: `docs/superpowers/specs/2026-09-02-cas-relink-confirm-liveness-design.md`. Next: TLA variant, two-model consult, plan.
+- 10:05 User decision: per-task live gate on GCS is a ten-minute phase-3 soak; the two-hour soak runs once after all fixes as the campaign's closing gate. Spec and backlog order updated. Codex (gpt-5.6-sol, high) review of the F11 spec running.

@@ -216,11 +216,12 @@ mention it yet.
 1. **B1 + B2 + the observability items.** Small, safety-neutral, unblocks DDL and gives the counters the
    next two steps are read through. Gates: `CAS*` gtest, a 429 mode in `gcs_mocks/server.py`, a short
    stateless-lane sample on GCS without `S3_ERROR` on `CREATE`.
-2. **F11 option 1.** Start the brainstorming immediately, in parallel with step 1: predicate, TLA
-   variant, two-model consult, TDD, fresh review. Gate: a two-hour phase-3 soak on the GCS stand.
-3. **A1.** After F11, since it shortens tenures but guarantees nothing by itself. Gate: the soak again,
+2. **F11, the approved design.** TLA variant, two-model consult, TDD, fresh review. Gate: a ten-minute
+   phase-3 soak on the GCS stand.
+3. **A1.** After F11, since it shortens tenures but guarantees nothing by itself. Gate: a ten-minute soak
    with 429 counts on `_ckpt` before and after.
-4. **By soak results:** F11 option 3 if abort churn still inflates GC; B3 only if mass DDL on GCS is a
+4. **Closing gate:** one two-hour phase-3 soak on the GCS stand after every fix has landed, not per task.
+5. **By soak results:** F11 option 3 if abort churn still inflates GC; B3 only if mass DDL on GCS is a
    real need; A2 if A1 leaves tenures too long.
 
 Open for brainstorming before code: for A1, which publications stay immediate, the coalescing policy,

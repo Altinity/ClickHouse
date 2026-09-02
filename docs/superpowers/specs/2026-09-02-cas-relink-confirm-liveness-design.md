@@ -163,10 +163,13 @@ does not cover.
 
 ### Live gate {#live-gate}
 
-A two-hour phase-3 soak on the GCS stand (`utils/ca-soak/docker-compose-gcs.yml`) must pass every
-stage including chaos, with both replicas equal to the model at every checkpoint and the refusal
-counters showing `LaneBroken` refusals only around induced faults. This is the only reproduction of
-the defect; the fake cannot reproduce WAN latency and the provider's rate limit together.
+A ten-minute phase-3 soak on the GCS stand (`utils/ca-soak/docker-compose-gcs.yml`,
+`--duration 10m`, both replicas, chaos on) after this change: both replicas equal to the model at every
+checkpoint, no `NO_REPLICA_HAS_PART` storm in `system.replication_queue`, and the refusal counters
+showing broken-lane refusals only around induced faults. The full two-hour soak runs once, after every
+fix of the 2026-09-02 campaign has landed (this design, the catalog write path, the `_ckpt` publication
+change), as the campaign's closing gate rather than per task. The fake cannot reproduce WAN latency and
+the provider's rate limit together, so even the short run stays on the real bucket.
 
 ## Rollout {#rollout}
 
