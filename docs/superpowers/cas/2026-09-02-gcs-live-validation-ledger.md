@@ -182,6 +182,10 @@ none implemented, all needing the two-model concurrency consult before code:
   and ch1's queue grew back from 605 to 1066. Any sustained local write activity on a replica blocks
   confirms for its peer under rule 3; the alternate-STOP-FETCHES workaround only helps while the
   quiesced side is otherwise idle.
+  Once ch2's merges finished (02:08 UTC) ch1 drained to 22, ch2's fetches were re-enabled, and two
+  minutes later both queues were empty (2 and 0), both replicas held exactly 244,024 rows and no confirm
+  answered `Unknown`: the livelock is a liveness defect, not a data-loss one, and the stand converged
+  with no manual repair beyond alternating `STOP FETCHES`.
 
 ## Status reports {#status-reports}
 
@@ -218,3 +222,4 @@ Appended by the 20-minute watchdog. Format: time, what is running, progress, ano
 - 04:02 F11 step 2: with ch2 quiesced, ch1 drained 1582→605 in 3 min (rows 123k→205k); waiting for ch1 < 30 to re-enable ch2 and check both converge. Stateless lane at ~800/11137 tests.
 - 04:03 BACKLOG and live-results doc updated with today's results and the three new items; F11 decision options written into the ledger. Waiting for the stand to converge (ch2 fetches to be re-enabled once ch1 < 30) and for the stateless lane.
 - 04:06 Stateless lane over GCS: F12 (pool-wide `ref_catalog` hot key → 429 → failed DDL) established after ~900 tests; stopping the lane. Stand: ch1 queue grew back once ch2 merges/mutations resumed (F11 addendum). Phases 1-3 all executed; ledger and BACKLOG carry the findings.
+- 04:11 Stand converged: queues 2/0, rows 244,024 = 244,024, zero unproven confirms. Campaign closed; watchdog removed; stand left up as the F11 reproduction.
