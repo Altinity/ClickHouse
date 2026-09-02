@@ -48,8 +48,8 @@ Proved on the real bucket with the `gcs_hmac` client, binary of 2026-09-02:
 - **[relink-confirm-lane-livelock] two replicas starve each other's fetch-by-relink confirms** — HARD /
   RELEASE GATE (data divergence, not data loss).
   Design: [relink confirm liveness design](/superpowers/specs/cas-relink-confirm-liveness-design),
-  revision 2 (rule 3 refuses only the SENT transaction that touches the queried ref, read from
-  `append_attempt`; revision 1's gate-0 argument was refuted in review by the live-repoint trace).
+  revision 7 (rule 3 refuses while a queued or in-flight mutation names the queried ref, read from
+  the `MutationScope` every lane item already carries).
 
 **What happened.** After the connect storm both replication queues wedged with
 `NO_REPLICA_HAS_PART: Source ... did not prove it still holds the manifest it offered ... by relink`;
@@ -78,13 +78,13 @@ them. The hazard is exactly the interval "durable, not yet applied". A `pending`
 and a `PUT` still in flight are not durable and do not break the T1 < T2 argument; today's rule
 refuses far more than the argument requires.
 
-**Decision (2026-09-02, spec revision 2).** Rule 3 refuses on `Writing`/`Wedged` only when the sent
-transaction (`RefTableRuntime::append_attempt`, armed before the first send and swapped out at install)
-touches the queried ref or the whole namespace; `NeedsRecovery`/`Closed`/`Faulted` refuse for all;
-`pending` and `leader_active` no longer refuse. `RefAppendAttempt` gains the touched-ref set, filled
-where the attempt is built. Revision 1 (gate 0 + part state machine) was refuted in review: a live
-repoint through `publishStaging` → `repointRef` retires a blob edge while the part stays `Active`, the
-model's `_sab_stalecache` trace. TLA variant and the two-model consult are mandatory before code.
+**Decision (2026-09-02, spec revision 7).** Rule 3 refuses while a queued or in-flight mutation names
+the queried ref (its `MutationScope`, which every lane item already carries: `Ref{name}` or
+`WholeShard`), plus the broken lane states `NeedsRecovery`/`Closed`/`Faulted`. `Writing`/`Wedged`,
+`leader_active` and a non-empty `pending` no longer refuse by themselves. One bookkeeping change: the
+runtime keeps `carved` items visible until completion. Revision 1 (gate 0 + part state) was refuted by
+the live-repoint trace; revisions 2 to 6 (reading the sent transaction's ops) were correct but heavier
+than needed. TLA variant and the two-model consult are mandatory before code.
 
 **Options considered.**
 
