@@ -50,7 +50,8 @@ void makeRemoving(CasOperation & op, const Layout & layout, const CatalogEntry &
 
 bool slotObjectExists(Backend & backend, const String & leaf)
 {
-    return backend.head("p/gc/server-roots/victim/" + leaf).exists;
+    DB::Cas::tests::OperationForTest op(backend);
+    return (*op).head("p/gc/server-roots/victim/" + leaf, Retry::standard()).has_value();
 }
 
 class AddVictimEntryDuringRootDrainBackend final : public InMemoryBackend
@@ -181,8 +182,8 @@ TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeeps
         life = victim->namespaceLife(ns);
         const CatalogEntry live = catalogEntry(catalog_op, victim->layout(), ns);
         makeRemoving(catalog_op, victim->layout(), live);
-        ASSERT_TRUE(backend->head(victim->layout().refCkptKey(*life)).exists);
-        ASSERT_TRUE(backend->list(victim->layout().namespaceStreamPrefix(*life), "", 100).keys.empty());
+        ASSERT_TRUE(catalog_op.head(victim->layout().refCkptKey(*life), Retry::standard()).has_value());
+        ASSERT_TRUE(catalog_op.list(victim->layout().namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys.empty());
     }
 
     std::atomic<uint64_t> wake_requests{0};
@@ -196,11 +197,11 @@ TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeeps
     EXPECT_FALSE(report.warnings.empty());
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
 
-    const ListPage stream = backend->list(Layout("p").namespaceStreamPrefix(*life), "", 100);
+    const KeyPage stream = catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard());
     ASSERT_EQ(stream.keys.size(), 1u);
     const auto parsed = Layout("p").parseRefObjectKey(stream.keys.front().key);
     ASSERT_TRUE(parsed);
-    const auto body = backend->get(stream.keys.front().key);
+    const auto body = catalog_op.read(stream.keys.front().key, Retry::standard());
     ASSERT_TRUE(body);
     const RefLogTxn terminal = decodeRefLogTxn(
         openObject(FormatId::RefLog, body->bytes), ns.string(), parsed->txn_id);
@@ -230,8 +231,8 @@ TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
         CasRefCatalog::casAdmitEntry(
             catalog_op, victim->layout(), victim->poolConfig().gc_shards, broken_live);
         makeRemoving(catalog_op, victim->layout(), broken_live);
-        ASSERT_FALSE(backend->head(victim->layout().refCkptKey(
-            NamespaceLifeId::fromCatalogEntry(broken_ns, broken_live.incarnation))).exists);
+        ASSERT_FALSE(catalog_op.head(victim->layout().refCkptKey(
+            NamespaceLifeId::fromCatalogEntry(broken_ns, broken_live.incarnation)), Retry::standard()).has_value());
     }
 
     std::atomic<uint64_t> wake_requests{0};
@@ -245,8 +246,8 @@ TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
     EXPECT_EQ(wake_requests.load(), 1u)
         << "progress already made for an earlier life must wake GC even when a later life fails closed";
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
-    const ListPage progressed_stream
-        = backend->list(Layout("p").namespaceStreamPrefix(*progressed_life), "", 100);
+    const KeyPage progressed_stream
+        = catalog_op.list(Layout("p").namespaceStreamPrefix(*progressed_life), "", 100, Retry::standard());
     ASSERT_EQ(progressed_stream.keys.size(), 1u);
 }
 
@@ -312,7 +313,7 @@ TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
         Gc gc(victim, UInt128{811});
         ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
         ASSERT_EQ(catalogEntry(catalog_op, victim->layout(), ns).state, NsState::Removing);
-        for (const ListedKey & key : backend->list(victim->layout().namespaceStreamPrefix(*life), "", 100).keys)
+        for (const KeyEntry & key : catalog_op.list(victim->layout().namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
             stream_before.push_back(key.key);
         ASSERT_FALSE(stream_before.empty());
     }
@@ -327,7 +328,7 @@ TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
     EXPECT_FALSE(report.slot_removed);
     EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), ns).state, NsState::Removing);
     std::vector<String> stream_after;
-    for (const ListedKey & key : backend->list(Layout("p").namespaceStreamPrefix(*life), "", 100).keys)
+    for (const KeyEntry & key : catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
         stream_after.push_back(key.key);
     EXPECT_EQ(stream_after, stream_before)
         << "decommission must not append a second terminal or become a catalog deletion driver";
@@ -343,14 +344,14 @@ TEST(CASDecommissionCatalogDuties, OpaqueLifeDebrisWithoutCatalogOwnershipDoesNo
     const NamespaceLifeId dead_life
         = NamespaceLifeId::fromCatalogEntry(RootNamespace("historical/name"), UInt128{709});
     const String debris_key = layout.refCkptKey(dead_life);
-    ASSERT_EQ(backend->putIfAbsent(debris_key, "debris").outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.create(debris_key, "debris", Retry::standard())));
 
     const DecommissionReport report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
 
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_TRUE(report.slot_removed);
-    EXPECT_TRUE(backend->head(debris_key).exists);
+    EXPECT_TRUE(catalog_op.head(debris_key, Retry::standard()).has_value());
 }
 
 }

@@ -59,14 +59,38 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
     return ManifestRef{.writer_epoch = 1, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
 
+std::optional<DB::Cas::Object> readOf(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).read(key, Retry::standard());
+}
+
+bool headExists(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).head(key, Retry::standard()).has_value();
+}
+
+KeyPage listOf(Backend & backend, const String & prefix, const String & cursor, size_t limit)
+{
+    OperationForTest op(backend);
+    return (*op).list(prefix, cursor, limit, Retry::standard());
+}
+
+void createRaw(Backend & backend, const String & key, const String & bytes)
+{
+    OperationForTest op(backend);
+    (*op).create(key, bytes, Retry::standard());
+}
+
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
 {
-    return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
+    return headExists(b, layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)}));
 }
 
 bool manifestExists(InMemoryBackend & b, const Layout & layout, const ManifestId & id)
 {
-    return b.head(layout.manifestKey(id)).exists;
+    return headExists(b, layout.manifestKey(id));
 }
 
 PoolPtr openTestPool(std::shared_ptr<InMemoryBackend> & out_backend)
@@ -117,7 +141,7 @@ public:
 
 GcState readState(InMemoryBackend & b, const Pool & s)
 {
-    const auto got = b.get(s.layout().gcStateKey());
+    const auto got = readOf(b, s.layout().gcStateKey());
     if (!got)
     {
         ADD_FAILURE() << "gc/state absent";
@@ -548,9 +572,10 @@ TEST(CASGCLease, VanishedStateAfterObservationFailsClosed)
     ASSERT_TRUE(gc1.runRegularRound().acquired_lease);
     EXPECT_FALSE(gc2.runRegularRound().acquired_lease);          /// gc2 records an observation
 
-    const auto head = b->head(s->layout().gcStateKey());         /// out-of-model wipe (raw delete)
-    ASSERT_TRUE(head.exists);
-    ASSERT_EQ(b->deleteExact(s->layout().gcStateKey(), head.token).kind, DeleteOutcome::Kind::Deleted);
+    OperationForTest wipe_op(*b);   /// out-of-model wipe (raw delete)
+    const auto meta = (*wipe_op).head(s->layout().gcStateKey(), Retry::standard());
+    ASSERT_TRUE(meta.has_value());
+    ASSERT_EQ((*wipe_op).remove(s->layout().gcStateKey(), meta->incarnation, Retry::standard()), Removal::Removed);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.runRegularRound(); });
 }
@@ -620,7 +645,7 @@ TEST(CASGCRound, CondemnRoundSealSummaryCountsCondemned)
         store->renewWatermarkOnce();
         const GcState st = readState(*backend, *store);
         seal = decodeFoldSeal(
-            backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+            readOf(*backend, store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
         for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0))
             if (e.ref == DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(DB::UInt128(1))})
                 condemned = true;
@@ -713,7 +738,7 @@ TEST(CASGCRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
     gc.runRegularRound();
     const GcState st1 = readState(*backend, *store);
     const CasFoldSeal seal1 = decodeFoldSeal(
-        backend->get(store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes,
+        readOf(*backend, store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes,
         store->layout(), /*gc_shards=*/2);
 
     /// No state changes after the parent. The zero defer bound forces an actual fold rather than DEFER,
@@ -721,7 +746,7 @@ TEST(CASGCRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
     gc.runRegularRound();
     const GcState st2 = readState(*backend, *store);
     const CasFoldSeal seal2 = decodeFoldSeal(
-        backend->get(store->layout().foldSealKey(st2.snap_generation, st2.snap_attempt))->bytes,
+        readOf(*backend, store->layout().foldSealKey(st2.snap_generation, st2.snap_attempt))->bytes,
         store->layout(), /*gc_shards=*/2);
 
     /// TOTALITY: both seals carry a summary entry for every gc-shard.
@@ -798,7 +823,7 @@ TEST(CASGCRound, NonAdoptedAttemptSealIgnored)
 
     /// Plant a decoy fold seal under a DIFFERENT attempt at the SAME generation (a deposed leader's
     /// unadopted artifact). It must be invisible to the adopted-attempt readers.
-    backend->putIfAbsent(store->layout().foldSealKey(st.snap_generation, st.snap_attempt + 999),
+    createRaw(*backend, store->layout().foldSealKey(st.snap_generation, st.snap_attempt + 999),
                          "decoy-seal-bytes");
 
     /// No reader resolves the non-adopted attempt: no throw, and the preview is unchanged by the decoy.
@@ -1276,14 +1301,14 @@ TEST(CASGCSnapRetention, PrunesOldGenerationsKeepingLastThree)
     /// Every generation at or below the floor is fully gone (fold seal absent).
     for (uint64_t g = 1; g <= floor; ++g)
     {
-        EXPECT_FALSE(backend->head(store->layout().foldSealKey(g, st.snap_attempt)).exists)
+        EXPECT_FALSE(headExists(*backend, store->layout().foldSealKey(g, st.snap_attempt)))
             << "fold seal of pruned generation " << g << " must be gone";
-        EXPECT_FALSE(backend->head(store->layout().blobTargetRunKey(g, st.snap_attempt, /*shard*/0, /*seq*/0)).exists)
+        EXPECT_FALSE(headExists(*backend, store->layout().blobTargetRunKey(g, st.snap_attempt, /*shard*/0, /*seq*/0)))
             << "blob-target run of pruned generation " << g << " must be gone";
     }
 
     /// The fold seal at the current generation survives (the live in-degree view).
-    EXPECT_TRUE(backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists)
+    EXPECT_TRUE(headExists(*backend, store->layout().foldSealKey(st.snap_generation, st.snap_attempt)))
         << "the current generation's seal must NOT be pruned";
 
     /// No-loss: the live blob and owner body are intact throughout retention pruning.
@@ -1325,9 +1350,9 @@ TEST(CASGCSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     const String decoy_outcomes = store->layout().outcomesKey(old_gen, decoy_attempt, /*round*/0, /*shard*/0);
     const String decoy_seal = store->layout().foldSealKey(old_gen, decoy_attempt);
     const String decoy_run = store->layout().blobTargetRunKey(old_gen, decoy_attempt, /*shard*/0, /*seq*/0);
-    backend->putIfAbsent(decoy_outcomes, "decoy-outcomes");
-    backend->putIfAbsent(decoy_seal, "decoy-seal");
-    backend->putIfAbsent(decoy_run, "decoy-run");
+    createRaw(*backend, decoy_outcomes, "decoy-outcomes");
+    createRaw(*backend, decoy_seal, "decoy-seal");
+    createRaw(*backend, decoy_run, "decoy-run");
 
     /// Drop the ref so the next fold writes a FRESH run under a newer generation and the adopted seal's
     /// blob_target ref moves OFF `old_gen`. Under T0 reference-parent carry, a still-referenced generation
@@ -1343,12 +1368,12 @@ TEST(CASGCSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     ASSERT_GT(st.snap_generation, old_gen + 3) << "generation 1 must be below the retention floor";
 
     /// The ENTIRE gc/gen/<old_gen>/ subtree — across ALL attempts — must be reclaimed.
-    EXPECT_FALSE(backend->head(decoy_outcomes).exists) << "non-adopted outcomes log leaked past retention";
-    EXPECT_FALSE(backend->head(decoy_seal).exists) << "non-adopted fold seal leaked past retention";
-    EXPECT_FALSE(backend->head(decoy_run).exists) << "non-adopted blob-target run leaked past retention";
+    EXPECT_FALSE(headExists(*backend, decoy_outcomes)) << "non-adopted outcomes log leaked past retention";
+    EXPECT_FALSE(headExists(*backend, decoy_seal)) << "non-adopted fold seal leaked past retention";
+    EXPECT_FALSE(headExists(*backend, decoy_run)) << "non-adopted blob-target run leaked past retention";
 
     /// Nothing remains under the old generation prefix at all.
-    const ListPage residue = backend->list(store->layout().gcGenPrefix(old_gen), "", 1000);
+    const KeyPage residue = listOf(*backend, store->layout().gcGenPrefix(old_gen), "", 1000);
     EXPECT_TRUE(residue.keys.empty()) << "old generation prefix must be fully reclaimed; left "
                                       << residue.keys.size() << " objects";
 
@@ -1393,21 +1418,21 @@ TEST(CASGCSnapRetention, PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAParti
     /// can wholesale-delete in a single pass, regardless of whatever real fold artifacts already live
     /// there.
     for (int i = 0; i < 10; ++i)
-        backend->putIfAbsent(store->layout().gcGenPrefix(old_gen) + "debris" + std::to_string(i), "x");
+        createRaw(*backend, store->layout().gcGenPrefix(old_gen) + "debris" + std::to_string(i), "x");
 
     /// Move the ref off `old_gen`'s run (as `WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes`
     /// does) so the WHOLESALE RETENTION PRUNE -- not the one-shot post-CAS hand-off -- is what
     /// eventually processes this generation once the cursor reaches it.
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
-    size_t previous_residue = backend->list(store->layout().gcGenPrefix(old_gen), "", 1000).keys.size();
+    size_t previous_residue = listOf(*backend, store->layout().gcGenPrefix(old_gen), "", 1000).keys.size();
     std::optional<int> drain_start_round;   /// first round the residue count actually DROPS
     std::optional<int> drain_done_round;    /// first round the residue reaches zero
     for (int i = 0; i < 40 && !drain_done_round; ++i)
     {
         ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
         const GcState st = readState(*backend, *store);
-        const ListPage residue = backend->list(store->layout().gcGenPrefix(old_gen), "", 1000);
+        const KeyPage residue = listOf(*backend, store->layout().gcGenPrefix(old_gen), "", 1000);
 
         if (st.snap_pruned_through >= old_gen)
             EXPECT_TRUE(residue.keys.empty())
@@ -1465,13 +1490,13 @@ TEST(CASGCSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
     const uint64_t orphan_attempt = st.snap_attempt - 1;
     const String orphan_seal = store->layout().foldSealKey(orphan_gen, orphan_attempt);
     const String orphan_run = store->layout().blobTargetRunKey(orphan_gen, orphan_attempt, 0, 0);
-    backend->putIfAbsent(orphan_seal, "orphan-seal");
-    backend->putIfAbsent(orphan_run, "orphan-run");
+    createRaw(*backend, orphan_seal, "orphan-seal");
+    createRaw(*backend, orphan_run, "orphan-run");
 
     /// One more round folds into `orphan_gen` and completes. The orphan must SURVIVE this round — there
     /// is no current-generation sweep; retention has not yet reached `orphan_gen`.
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
-    EXPECT_TRUE(backend->head(orphan_seal).exists)
+    EXPECT_TRUE(headExists(*backend, orphan_seal))
         << "orphan must survive its own round — there is no per-round current-gen sweep";
 
     /// Age `orphan_gen` well past the retention floor (keep=3): several more quiescent rounds. The
@@ -1483,9 +1508,9 @@ TEST(CASGCSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
     const GcState st_after = readState(*backend, *store);
     ASSERT_GT(st_after.snap_generation, orphan_gen + 3) << "orphan_gen must be below the retention floor";
 
-    EXPECT_FALSE(backend->head(orphan_seal).exists)
+    EXPECT_FALSE(headExists(*backend, orphan_seal))
         << "non-adopted attempt orphan must be reclaimed by wholesale retention once its generation ages out";
-    EXPECT_FALSE(backend->head(orphan_run).exists)
+    EXPECT_FALSE(headExists(*backend, orphan_run))
         << "the whole orphan subtree must be reclaimed by wholesale retention";
 
     /// No-loss: the live data is intact throughout.
@@ -1520,11 +1545,11 @@ TEST(CASGCRetention, PruneRetainsLiveReferencedRun)
     /// The gen-1 seal's ref names gen-1's physical run key — capture it so we can assert the OBJECT
     /// (not just the generation number) survives retention.
     const auto seal1 = decodeFoldSeal(
-        backend->get(store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
+        readOf(*backend, store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
     ASSERT_EQ(seal1.blob_target_runs.size(), 1u);
     const String referenced_run_key = seal1.blob_target_runs.front().key;
     ASSERT_EQ(seal1.blob_target_runs.front().key_generation, ref_gen);
-    ASSERT_TRUE(backend->head(referenced_run_key).exists);
+    ASSERT_TRUE(headExists(*backend, referenced_run_key));
 
     /// Several idle rounds: no delta, no retired => pure ref-carry. Each round advances the generation
     /// and, once adopted_generation > keep, drives the retention prune forward. gen-1 is referenced every
@@ -1539,13 +1564,13 @@ TEST(CASGCRetention, PruneRetainsLiveReferencedRun)
         << "the retention cursor must have advanced past the still-referenced generation";
 
     /// The referenced run object is STILL ALIVE despite the cursor passing its generation.
-    EXPECT_TRUE(backend->head(referenced_run_key).exists)
+    EXPECT_TRUE(headExists(*backend, referenced_run_key))
         << "a run referenced by the live seal must be retained even after the cursor passes its generation";
 
     /// The current seal still references that same physical gen-1 object (carried, not reconstructed),
     /// and in-degree resolution THROUGH the carried ref still works.
     const auto seal_now = decodeFoldSeal(
-        backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+        readOf(*backend, store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
     ASSERT_EQ(seal_now.blob_target_runs.size(), 1u);
     EXPECT_EQ(seal_now.blob_target_runs.front().key, referenced_run_key);
     EXPECT_EQ(seal_now.blob_target_runs.front().key_generation, ref_gen);
@@ -1576,7 +1601,7 @@ TEST(CASGCRetention, HandOffDeletesSupersededRef)
     const GcState st1 = readState(*backend, *store);
     const uint64_t old_gen = st1.snap_generation;
     const String old_prefix = store->layout().gcGenPrefix(old_gen);
-    ASSERT_FALSE(backend->list(old_prefix, "", 1000).keys.empty()) << "gen-1 prefix must be populated";
+    ASSERT_FALSE(listOf(*backend, old_prefix, "", 1000).keys.empty()) << "gen-1 prefix must be populated";
 
     /// Idle-carry the gen-1 ref until the retention cursor has advanced strictly PAST gen-1. Until it
     /// does, a normal prune could still reclaim gen-1 when the ref moves — the hand-off is only load-
@@ -1586,7 +1611,7 @@ TEST(CASGCRetention, HandOffDeletesSupersededRef)
     ASSERT_GT(readState(*backend, *store).snap_pruned_through, old_gen)
         << "gen-1 must be behind the retention cursor before the hand-off is exercised";
     /// gen-1 is retained (referenced) even though the cursor passed it.
-    ASSERT_FALSE(backend->list(old_prefix, "", 1000).keys.empty())
+    ASSERT_FALSE(listOf(*backend, old_prefix, "", 1000).keys.empty())
         << "the referenced gen-1 prefix must still exist before the ref moves off it";
 
     /// A real delta: swap the ref to a new manifest naming a different blob. The next fold writes a FRESH
@@ -1601,14 +1626,14 @@ TEST(CASGCRetention, HandOffDeletesSupersededRef)
     /// The seal no longer references gen-1 ...
     const GcState st_after = readState(*backend, *store);
     const auto seal_after = decodeFoldSeal(
-        backend->get(store->layout().foldSealKey(st_after.snap_generation, st_after.snap_attempt))->bytes);
+        readOf(*backend, store->layout().foldSealKey(st_after.snap_generation, st_after.snap_attempt))->bytes);
     for (const RunRef & rr : seal_after.blob_target_runs)
         EXPECT_NE(rr.key_generation, old_gen) << "the live seal must have moved its ref off gen-1";
 
     /// ... and the post-CAS hand-off delete reclaimed gen-1's WHOLE prefix (not just the single run
     /// object): seal, attempt subtree, run — all gone. The ordinary prune would have leaked it because its
     /// cursor is already past gen-1.
-    const ListPage residue = backend->list(old_prefix, "", 1000);
+    const KeyPage residue = listOf(*backend, old_prefix, "", 1000);
     EXPECT_TRUE(residue.keys.empty())
         << "the superseded gen-1 prefix must be hand-off deleted; left " << residue.keys.size() << " objects";
 
@@ -1661,13 +1686,13 @@ TEST(CASGCRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     const uint64_t handoff_gen = readState(*backend, *store).snap_generation;
     const String handoff_prefix = store->layout().gcGenPrefix(handoff_gen);
-    ASSERT_FALSE(backend->list(handoff_prefix, "", 1000).keys.empty());
+    ASSERT_FALSE(listOf(*backend, handoff_prefix, "", 1000).keys.empty());
 
     for (int i = 0; i < 20; ++i)
         ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_GT(readState(*backend, *store).snap_pruned_through, handoff_gen)
         << "the hand-off generation must be behind the cursor before this test is meaningful";
-    ASSERT_FALSE(backend->list(handoff_prefix, "", 1000).keys.empty())
+    ASSERT_FALSE(listOf(*backend, handoff_prefix, "", 1000).keys.empty())
         << "still referenced -- must survive despite the cursor having passed it";
 
     /// The PRUNE-DEBRIS generation: a second table, on the OTHER shard, unreferenced from the start,
@@ -1684,7 +1709,7 @@ TEST(CASGCRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
         << "the debris generation must still be ahead of the cursor when its drop folds, or the hand-off "
            "(not the prune) would claim it";
     for (int i = 0; i < 10; ++i)
-        backend->putIfAbsent(store->layout().gcGenPrefix(debris_gen) + "debris" + std::to_string(i), "x");
+        createRaw(*backend, store->layout().gcGenPrefix(debris_gen) + "debris" + std::to_string(i), "x");
     dropRefTransition(*backend, store->layout(), ns, "debris", r_debris);
 
     /// Drive rounds until the debris generation is MID-DRAIN (prune has started but not yet finished it --
@@ -1693,11 +1718,11 @@ TEST(CASGCRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
     for (int i = 0; i < 20 && !mid_drain; ++i)
     {
         ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
-        const size_t residue = backend->list(store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
+        const size_t residue = listOf(*backend, store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
         mid_drain = residue > 0 && residue < 10;
     }
     ASSERT_TRUE(mid_drain) << "the debris generation never reached a partially-drained state to test against";
-    ASSERT_FALSE(backend->list(handoff_prefix, "", 1000).keys.empty())
+    ASSERT_FALSE(listOf(*backend, handoff_prefix, "", 1000).keys.empty())
         << "the hand-off generation must still be intact (untouched) going into the contended round";
 
     /// NOW, in a round where the prune is busy mid-drain on the debris generation (spending its entire
@@ -1706,17 +1731,17 @@ TEST(CASGCRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
     writeBlobBody(*backend, store->layout(), blob_keep_2);
     writeManifestRaw(*backend, store->layout(), ns, r_keep_2, {blobEntryFor("a", blob_keep_2)});
     publishCommittedTransition(*backend, store->layout(), ns, "keep", r_keep_1, r_keep_2);
-    const size_t debris_residue_before = backend->list(store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
+    const size_t debris_residue_before = listOf(*backend, store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
     /// THE LOAD-BEARING ASSERTIONS: the prune spent its whole (separate) budget on the debris generation
     /// this very round (proving the two really contended for I/O in the same round) ...
-    const size_t debris_residue_after = backend->list(store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
+    const size_t debris_residue_after = listOf(*backend, store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
     EXPECT_EQ(debris_residue_before - debris_residue_after, 2u)
         << "the prune must have spent its entire per-round budget on the debris generation this round";
     /// ... and the hand-off, drawing from its OWN reserve, still fully reclaimed the generation the ref
     /// just moved off -- zero, not starved to zero by the prune's consumption.
-    EXPECT_TRUE(backend->list(handoff_prefix, "", 1000).keys.empty())
+    EXPECT_TRUE(listOf(*backend, handoff_prefix, "", 1000).keys.empty())
         << "the hand-off must not be starved by a prune-heavy round that exhausted a SEPARATE budget";
 }
 
@@ -1747,11 +1772,11 @@ TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
     const GcState st1 = readState(*backend, *store);
     const uint64_t g_parent = st1.snap_generation;
 
-    const auto seal1 = decodeFoldSeal(backend->get(layout.foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
+    const auto seal1 = decodeFoldSeal(readOf(*backend, layout.foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
     ASSERT_EQ(seal1.blob_target_runs.size(), 1u);
     const String parent_run_key = seal1.blob_target_runs.front().key;
     const String parent_gen_prefix = layout.gcGenPrefix(g_parent);
-    ASSERT_FALSE(backend->list(parent_gen_prefix, "", 1000).keys.empty());
+    ASSERT_FALSE(listOf(*backend, parent_gen_prefix, "", 1000).keys.empty());
 
     /// A real delta: swap the ref to a new manifest naming a different blob. The next fold will move
     /// shard 0's run OFF `g_parent` onto a fresh generation.
@@ -1783,9 +1808,9 @@ TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
 
     /// GREEN evidence: the losing round's pre-CAS prune must NOT have destroyed `g_parent` — it is still
     /// exactly what the (unreplaced, still-adopted) parent seal references.
-    EXPECT_FALSE(backend->list(parent_gen_prefix, "", 1000).keys.empty())
+    EXPECT_FALSE(listOf(*backend, parent_gen_prefix, "", 1000).keys.empty())
         << "a losing round must never destroy the generation the still-adopted parent seal references";
-    EXPECT_TRUE(backend->head(parent_run_key).exists)
+    EXPECT_TRUE(headExists(*backend, parent_run_key))
         << "the parent seal's exact run object must survive a losing round's pre-CAS prune";
 
     /// GC is NOT wedged: gc/state is unchanged (the CAS never committed) and the original blob still
@@ -1801,7 +1826,7 @@ TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
     const uint64_t g_after = readState(*backend, *store).snap_generation;
     ASSERT_GT(g_after, g_parent);
     for (uint64_t g = g_parent + 1; g < g_after; ++g)
-        EXPECT_TRUE(backend->list(layout.gcGenPrefix(g), "", 1000).keys.empty())
+        EXPECT_TRUE(listOf(*backend, layout.gcGenPrefix(g), "", 1000).keys.empty())
             << "generation " << g << " (the losing round's own abandoned attempt debris, referenced by "
                "neither the parent nor the new proposed seal) must still be reclaimed on a successful "
                "round — the fix must not disable pruning";
@@ -1837,7 +1862,7 @@ TEST(CASGCSnapRetention, KeepZeroPrunesNothing)
     {
         bool seal_present = false;
         for (uint64_t a = 0; a <= st.snap_attempt && !seal_present; ++a)
-            seal_present = backend->head(store->layout().foldSealKey(g, a)).exists;
+            seal_present = headExists(*backend, store->layout().foldSealKey(g, a));
         EXPECT_TRUE(seal_present) << "keep==0: seal of generation " << g << " must remain";
     }
 }
@@ -1911,14 +1936,17 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(op, store->layout(), ns);
     ASSERT_TRUE(life.has_value());
     const String ckpt_key = store->layout().refCkptKey(*life);
-    const auto old_ckpt = backend->get(ckpt_key);
+    const auto old_ckpt = readOf(*backend, ckpt_key);
     ASSERT_TRUE(old_ckpt.has_value());
-    ASSERT_EQ(backend->putOverwrite(ckpt_key, encodeRefCkpt(RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{2, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{1, 2},
-    }), old_ckpt->token).outcome, PutOutcome::Done);
+    {
+        OperationForTest ckpt_op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*ckpt_op).replace(ckpt_key, encodeRefCkpt(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{2, 1},
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = RefTxnId{1, 2},
+        }), old_ckpt->incarnation, Retry::standard())));
+    }
 
     /// The list budget is one key per round, so reclaiming both debris bodies takes a circuit.
     for (int round = 0; round < 12; ++round)
@@ -1937,7 +1965,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     {
         const GcState st = readState(*backend, *store);
         const CasFoldSeal seal = decodeFoldSeal(
-            backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+            readOf(*backend, store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
         const auto it = seal.ref_lives.find(catalogLifeIdForTest(*backend, store->layout(), ns));
         ASSERT_NE(it, seal.ref_lives.end()) << "the round must have sealed a coverage row";
         EXPECT_FALSE(it->second.coverage.hold.has_value()) << "a held namespace can never reach the premise";
@@ -1958,7 +1986,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     auto invalid_store = openTestPoolWithConfig(foreign_backend, std::move(foreign_config));
     const String foreign_mount_key = invalid_store->layout().mountKey("test");
     setWatermarkMinActive(*foreign_backend, invalid_store->layout(), "test", r1.writer_epoch, /*min_active_build_sequence*/6);
-    const auto occupant_before = foreign_backend->get(foreign_mount_key);
+    const auto occupant_before = readOf(*foreign_backend, foreign_mount_key);
     ASSERT_TRUE(occupant_before.has_value());
     const uint64_t violations_before
         = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
@@ -1969,7 +1997,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
               violations_before + 1)
         << "a runtime that never observed a deposition must report the foreign occupant as a broken "
            "single-writer guarantee";
-    const auto occupant_after = foreign_backend->get(foreign_mount_key);
+    const auto occupant_after = readOf(*foreign_backend, foreign_mount_key);
     ASSERT_TRUE(occupant_after.has_value()) << "the release must never delete another incarnation's lease";
     EXPECT_EQ(occupant_after->bytes, occupant_before->bytes)
         << "the release must leave the slot byte-for-byte untouched, never stamp our farewell over it";
