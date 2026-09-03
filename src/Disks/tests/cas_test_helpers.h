@@ -16,6 +16,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
@@ -35,6 +36,7 @@
 #include <gtest/gtest.h>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
 /// For `ChunkFaultBackend`'s `DefiniteFailure` mode, which needs a real S3-classified error, and for
 /// the ambiguity it raises otherwise.
 #include <IO/S3Common.h>
@@ -44,6 +46,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -180,12 +183,20 @@ void expectThrowsCode(int expected_code, F && fn)
     }
 }
 
-/// Build a `LocalObjectStorage` rooted at a fresh, unique temporary directory (one per call).
-///
-/// Used by the unit tests that exercise the `Cas::Backend` seam against a real on-disk object storage
-/// (the `EmulatedSingleProcess` adapter mode and the capability probe). For `LocalObjectStorage` the
-/// object key IS the local path verbatim, so the unique root keeps every test instance isolated even
-/// under the parallel gtest runner.
+/// Asserts the object is present before comparing its body: an absent key would otherwise dereference
+/// an empty optional and take the whole binary down instead of failing this one case.
+inline void expectBytes(DB::Cas::Backend & backend, const String & key, const String & expected)
+{
+    const auto got = backend.get(key);
+    ASSERT_TRUE(got.has_value()) << "object '" << key << "' is absent";
+    EXPECT_EQ(got->bytes, expected);
+}
+
+inline void expectBytes(const DB::Cas::BackendPtr & backend, const String & key, const String & expected)
+{
+    expectBytes(*backend, key, expected);
+}
+
 /// A `CasRequests` over an always-open fence, for a fixture that has a backend but no mounted pool.
 /// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
 inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::BackendPtr backend)
@@ -228,6 +239,12 @@ private:
     DB::Cas::CasOperation operation;
 };
 
+/// Build a `LocalObjectStorage` rooted at a fresh, unique temporary directory (one per call).
+///
+/// Used by the unit tests that exercise the `Cas::Backend` seam against a real on-disk object storage
+/// (the `EmulatedSingleProcess` adapter mode and the capability probe). For `LocalObjectStorage` the
+/// object key IS the local path verbatim, so the unique root keeps every test instance isolated even
+/// under the parallel gtest runner.
 inline DB::ObjectStoragePtr makeLocalObjectStorageForTest()
 {
     static std::atomic<uint64_t> counter{0};
@@ -540,12 +557,16 @@ inline String encodeMinimalGcState(uint64_t round)
 }
 
 /// Inject condemned bookkeeping + gc/state directly (bypassing a real GC round) so a test can seed the
-/// GC ledger's condemned state at an arbitrary round. The condemned entries are
-/// seeded the way a real round leaves them — as `RunMarker::Condemned` sentinel rows inside an adopted fold seal's
-/// shard run (there is no separate retired-list object). A synthetic +edge/-edge pair nets each blob to
-/// in-degree 0 and a `seed_head` replays the captured token/size so the fold mints the `RunMarker::Condemned` row.
-/// Also sets {round} on gc/state. Entries carry a `condemn_round` (default 0 → uses `round`); callers
-/// pass fresh (non-pending) condemns. An empty `entries` set just advances {round}.
+/// GC ledger's condemned state at an arbitrary round. The entries are written into the adopted seal's
+/// shard run as `RunMarker::Condemned` sentinel rows at the zero source id -- the shape a real round
+/// leaves, since there is no separate retired-list object. Also sets {round} on gc/state. An entry's
+/// `condemn_round` defaults to `round` when left 0. An empty `entries` set just advances {round}.
+///
+/// The rows are written from the caller's entries VERBATIM rather than folded out of synthetic deltas.
+/// A fold mints each row's incarnation from a live HEAD of the blob, which can express neither of the
+/// two shapes this fixture exists to build: an entry condemning an incarnation NO object carries (a
+/// phantom, for the tests that check a condemnation aimed elsewhere spares the live object), and an
+/// entry for a blob whose body is already gone.
 inline void injectRetire(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     uint64_t round, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
@@ -561,48 +582,59 @@ inline void injectRetire(
     {
         const uint64_t generation = 1;
         const uint64_t attempt = 1;
-        uint64_t condemn_round = round;
-        std::unordered_map<DB::Cas::BlobRef, uint64_t, DB::Cas::BlobRefHash> seeded_size;
-        std::vector<DB::Cas::BlobDelta> synth;
-        synth.reserve(entries.size() * 2);
-        for (const DB::Cas::RetiredEntry & e : entries)
+
+        /// The writer's contract: records arrive in non-decreasing `(ref, source_id)` order, and a
+        /// sentinel row is the only row a blob may have at the zero source id.
+        std::sort(entries.begin(), entries.end(),
+                  [](const DB::Cas::RetiredEntry & a, const DB::Cas::RetiredEntry & b) { return a.ref < b.ref; });
+
+        String run_bytes;
+        /// `UINT64_MAX` is the summary's own "no non-pending entry" value, and round 0 is a real round,
+        /// so a zero initializer here would claim the oldest possible condemnation instead of none.
+        uint64_t oldest_nonpending = UINT64_MAX;
+        uint64_t pending_total = 0;
         {
-            if (e.condemn_round)
-                condemn_round = e.condemn_round;
-            seeded_size.emplace(e.ref, e.size);
-            synth.push_back(DB::Cas::BlobDelta{.ref = e.ref, .source_id = DB::UInt128{1}, .remove = false});
-            synth.push_back(DB::Cas::BlobDelta{.ref = e.ref, .source_id = DB::UInt128{1}, .remove = true});
+            DB::WriteBufferFromString out(run_bytes);
+            DB::Cas::SourceEdgeRunWriter writer(out);
+            for (const DB::Cas::RetiredEntry & e : entries)
+            {
+                const uint64_t condemn_round = e.condemn_round ? e.condemn_round : round;
+                if (e.delete_pending)
+                    ++pending_total;
+                else
+                    oldest_nonpending = std::min(oldest_nonpending, condemn_round);
+                writer.append(DB::Cas::SourceEdgeRecord{
+                    .ref = e.ref,
+                    .source_id = DB::UInt128{0},
+                    .marker = DB::Cas::RunMarker::Condemned,
+                    .delete_pending = e.delete_pending,
+                    .token = e.token,
+                    .size = e.size,
+                    .condemn_round = condemn_round,
+                    .marker_confirmed = e.marker_confirmed});
+            }
+            writer.finish();
+            out.finalize();
         }
-        /// The size the caller declared, but the incarnation as the store reports it now: an entry
-        /// carries a persisted value, and a persisted value never becomes a live one.
-        const auto seed_head = [&](const DB::Cas::BlobRef & h) -> std::optional<DB::Cas::Meta>
-        {
-            const auto it = seeded_size.find(h);
-            if (it == seeded_size.end())
-                return std::nullopt;
-            const std::optional<DB::Cas::Meta> live
-                = (*operation).head(layout.blobKey(h), DB::Cas::Retry::standard());
-            if (!live)
-                return std::nullopt;
-            return DB::Cas::Meta{it->second, live->incarnation};
-        };
-        std::vector<DB::Cas::RunRef> out;
-        DB::Cas::foldDeltasIntoGeneration(*operation, layout, /*prior_runs*/{}, generation, attempt,
-            shard, std::move(synth), out, /*current_round*/0, condemn_round, seed_head,
-            /*peek_head*/{}, /*confirm_condemned_marker*/{},
-            /*out_retired*/nullptr, /*suppress_destructive*/false);
+
+        const String run_key = layout.blobTargetRunKey(generation, attempt, shard, 0);
+        DB::Cas::orThrow((*operation).create(run_key, run_bytes, DB::Cas::Retry::standard()),
+                         "seed the condemned run at " + run_key);
 
         DB::Cas::CasFoldSeal seal;
         seal.generation = generation;
-        for (DB::Cas::RunRef & r : out)
-            seal.blob_target_runs.push_back(std::move(r));
+        seal.blob_target_runs.push_back(DB::Cas::RunRef{.key = run_key,
+                                                       .checksum = DB::Cas::sourceEdgeRunChecksum(run_bytes),
+                                                       .shard = shard,
+                                                       .key_generation = generation});
         /// Totality over gc_shards so a later real round's graduation/carry reads it zero-I/O.
         const uint64_t gc_shards = gc_state.gc_shards ? gc_state.gc_shards : 1;
         for (uint64_t s = 0; s < gc_shards; ++s)
             seal.condemned_summary[s] = DB::Cas::CondemnedSummary{};
         DB::Cas::CondemnedSummary cs;
         cs.condemned_total = entries.size();
-        cs.oldest_nonpending_condemn_round = condemn_round;
+        cs.pending_total = pending_total;
+        cs.oldest_nonpending_condemn_round = oldest_nonpending;
         seal.condemned_summary[shard] = cs;
         backend.putIfAbsent(layout.foldSealKey(generation, attempt), DB::Cas::encodeFoldSeal(seal));
 
@@ -2231,24 +2263,44 @@ private:
 };
 
 /// Fault decorator for the condemn-marker gate tests: while armed, every write against a blob `.meta`
-/// key throws. `Poco::TimeoutException` and not a plain `std::runtime_error`, because the engine
-/// rethrows a non-`Poco::Exception` unchanged instead of settling it by a read -- only a timeout models
-/// the ambiguity that exhausts as `Unresolved`, so `writeCondemnedMeta` reports failure while the round
-/// still commits the unconfirmed retired entry. Every other write passes through. Armed by default;
-/// disarm (`fail_meta_writes = false`) to model the backend healing.
+/// key throws. Every other write passes through. Armed by default; disarm
+/// (`fail_meta_writes = false`) to model the backend healing.
+///
+/// The fault's CLASS is chosen at arming, because the two classes model different failures and the
+/// engine treats them differently. `Propagates` is a local error the write loop rethrows on the first
+/// attempt, so the caller's own handler sees it at once. `Ambiguous` is a timeout the loop cannot
+/// distinguish from a lost response: it resolves by a read and reissues until its policy bound, so a
+/// test arming it against a PERMANENT fault must drive the operation's clock or spend the whole
+/// retry window in real time.
 class MetaWriteFaultBackend : public DB::Cas::InMemoryBackend
 {
 public:
+    enum class FaultKind : uint8_t { Propagates, Ambiguous };
+
+    /// Fault every `.meta` write with `kind`. Construction arms `Propagates`.
+    void armWriteFault(FaultKind kind = FaultKind::Propagates)
+    {
+        fault_kind.store(kind);
+        fail_meta_writes.store(true);
+    }
+
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value,
                                              DB::Cas::TransportAccess & access) override
     {
         if (fail_meta_writes.load() && key.ends_with(".meta"))
-            throw Poco::TimeoutException("injected fault: blob meta write lost");
+        {
+            if (fault_kind.load() == FaultKind::Ambiguous)
+                throw Poco::TimeoutException("injected fault: blob meta write response lost");
+            throw std::runtime_error("injected fault: blob meta write lost");
+        }
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
     std::atomic<bool> fail_meta_writes{true};
+
+private:
+    std::atomic<FaultKind> fault_kind{FaultKind::Propagates};
 };
 
 /// Blocks INSIDE a blob-meta mutation until `release` is called, so a test can hold a real meta job in

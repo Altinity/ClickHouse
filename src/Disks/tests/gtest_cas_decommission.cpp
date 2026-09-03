@@ -154,7 +154,7 @@ public:
     {
         std::optional<Raw> result = InMemoryBackend::read(key, access);
         if (farewell_seen && !successor_injected && (key == mount_key || key == epoch_key))
-            injectSuccessor();
+            injectSuccessor(access);
         return result;
     }
 
@@ -181,10 +181,15 @@ public:
     const String & successorEpochBytes() const { return successor_epoch_bytes; }
 
 private:
-    void injectSuccessor()
+    /// Every request here is issued on a PRIMITIVE. A legacy verb would be re-dispatched through the
+    /// virtual primitive it forwards to -- `get` through `read` -- which is this very hook, so the
+    /// injection would re-enter itself with `successor_injected` still false. The two `Token`s the
+    /// tests compare against are minted through `Backend`'s own minter, the one the legacy forwarders
+    /// use, so they are the values a legacy caller would have received.
+    void injectSuccessor(TransportAccess & access)
     {
-        const auto epoch = InMemoryBackend::get(epoch_key, {});
-        const auto mount = InMemoryBackend::get(mount_key, {});
+        const auto epoch = InMemoryBackend::read(epoch_key, access);
+        const auto mount = InMemoryBackend::read(mount_key, access);
         if (!epoch || !mount)
             throw std::runtime_error("successor-reclaim fixture: control object disappeared before reclaim");
 
@@ -192,11 +197,10 @@ private:
         const uint64_t successor_writer_epoch = epoch_value.next_writer_epoch;
         ++epoch_value.next_writer_epoch;
         successor_epoch_bytes = encodeServerEpoch(epoch_value);
-        const CasResult epoch_put = InMemoryBackend::casPut(
-            epoch_key, successor_epoch_bytes, std::optional<Token>{epoch->token}, {});
-        if (epoch_put.outcome != CasOutcome::Committed)
+        const auto epoch_written = InMemoryBackend::write(epoch_key, successor_epoch_bytes, epoch->value, access);
+        if (!epoch_written)
             throw std::runtime_error("successor-reclaim fixture: epoch bump conflicted");
-        successor_epoch_token = epoch_put.token;
+        successor_epoch_token = legacyMintWritten(epoch_key, *epoch_written);
 
         MountLease mount_value = decodeMountLease(mount->bytes);
         mount_value.writer_epoch = successor_writer_epoch;
@@ -206,11 +210,10 @@ private:
         mount_value.min_active_build_sequence = 0;
         mount_value.gc_fenced = false;
         successor_mount_bytes = encodeMountLease(mount_value);
-        const PutResult mount_put = InMemoryBackend::putOverwrite(
-            mount_key, successor_mount_bytes, mount->token, {});
-        if (mount_put.outcome != PutOutcome::Done)
+        const auto mount_written = InMemoryBackend::write(mount_key, successor_mount_bytes, mount->value, access);
+        if (!mount_written)
             throw std::runtime_error("successor-reclaim fixture: mount reclaim conflicted");
-        successor_mount_token = mount_put.token;
+        successor_mount_token = legacyMintWritten(mount_key, *mount_written);
         successor_injected = true;
     }
 
@@ -239,7 +242,7 @@ public:
     {
         const RawRemoval result = InMemoryBackend::remove(key, expected_value, access);
         if (armed && !successor_injected && key == epoch_key && result == RawRemoval::Removed)
-            injectSuccessor();
+            injectSuccessor(access);
         return result;
     }
 
@@ -265,13 +268,16 @@ private:
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
-    void injectSuccessor()
+    /// On the `write` PRIMITIVE, for the reason the sibling fixture above states: a legacy verb is
+    /// re-dispatched through the virtual primitive it forwards to, so it would re-enter this class's
+    /// own overrides instead of reaching the store directly.
+    void injectSuccessor(TransportAccess & access)
     {
         successor_epoch_bytes = encodeServerEpoch(ServerEpoch{.next_writer_epoch = 102});
-        const PutResult epoch_put = InMemoryBackend::putIfAbsent(epoch_key, successor_epoch_bytes, {});
-        if (epoch_put.outcome != PutOutcome::Done)
+        const auto epoch_written = InMemoryBackend::write(epoch_key, successor_epoch_bytes, std::nullopt, access);
+        if (!epoch_written)
             throw std::runtime_error("late-successor fixture: epoch recreation conflicted");
-        successor_epoch_token = epoch_put.token;
+        successor_epoch_token = legacyMintWritten(epoch_key, *epoch_written);
 
         successor_mount_bytes = encodeMountLease(MountLease{
             .server_uuid = UInt128(0x1234),
@@ -283,10 +289,10 @@ private:
             .expires_at_ms = 31'000,
             .min_active_build_sequence = 0,
         });
-        const PutResult mount_put = InMemoryBackend::putIfAbsent(mount_key, successor_mount_bytes, {});
-        if (mount_put.outcome != PutOutcome::Done)
+        const auto mount_written = InMemoryBackend::write(mount_key, successor_mount_bytes, std::nullopt, access);
+        if (!mount_written)
             throw std::runtime_error("late-successor fixture: mount recreation conflicted");
-        successor_mount_token = mount_put.token;
+        successor_mount_token = legacyMintWritten(mount_key, *mount_written);
         successor_injected = true;
     }
 

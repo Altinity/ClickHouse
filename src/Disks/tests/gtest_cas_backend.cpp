@@ -35,6 +35,8 @@
 
 using namespace DB::Cas;
 
+using DB::Cas::tests::expectBytes;
+
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
@@ -261,11 +263,11 @@ TEST(CASInMemory, OverwriteIsTokenExactAndMintsFreshToken)
     InMemoryBackend b;
     const Token t1 = b.putIfAbsent("k", "v1").token;
     EXPECT_EQ(b.putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}).outcome, PutOutcome::PreconditionFailed);
-    EXPECT_EQ(b.get("k")->bytes, "v1");                       // untouched on mismatch
+    expectBytes(b, "k", "v1");                                // untouched on mismatch
     const auto overwrite = b.putOverwrite("k", "v2", t1);
     EXPECT_EQ(overwrite.outcome, PutOutcome::Done);
     EXPECT_NE(overwrite.token, t1);                           // tokens never repeat
-    EXPECT_EQ(b.get("k")->bytes, "v2");
+    expectBytes(b, "k", "v2");
 }
 
 TEST(CASInMemory, CasPutCreateAndSwap)
@@ -453,7 +455,7 @@ TEST(CASInMemoryFaults, HeldDeleteLandsLater)
     b.putOverwrite("k", "v1'", t1);
     auto landed = b.landPendingDelete(0);             // the zombie lands NOW
     EXPECT_EQ(landed.kind, DeleteOutcome::Kind::TokenMismatch);   // 412 — INV-NO-RETURN in miniature
-    EXPECT_EQ(b.get("k")->bytes, "v1'");
+    expectBytes(b, "k", "v1'");
 }
 
 TEST(CASInMemoryFaults, InjectedCasConflictFiresOnce)
@@ -720,7 +722,7 @@ TEST(CASCountingBackendShape, OneRequestIsCountedOnceWhicheverSurfaceIssuedIt)
     EXPECT_TRUE(op.head("k", Retry::standard()));                         /// admitted head
     EXPECT_EQ(backend->headCount("k"), 2u);
 
-    EXPECT_EQ(backend->get("k")->bytes, "v");                             /// legacy read
+    expectBytes(*backend, "k", "v");                                      /// legacy read
     EXPECT_TRUE(op.read("k", Retry::standard()));                         /// admitted read
     EXPECT_EQ(backend->getCount("k"), 2u);
 

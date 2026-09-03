@@ -13,19 +13,7 @@ namespace DB::ErrorCodes
 extern const int NOT_IMPLEMENTED;
 }
 
-namespace
-{
-
-/// Asserts the object is present before comparing its body: an absent key would otherwise dereference
-/// an empty optional and take the whole binary down instead of failing this one case.
-void expectBytes(const BackendPtr & b, const String & key, const String & expected)
-{
-    const auto got = b->get(key);
-    ASSERT_TRUE(got.has_value()) << "object '" << key << "' is absent";
-    EXPECT_EQ(got->bytes, expected);
-}
-
-}
+using DB::Cas::tests::expectBytes;
 
 /// Parameterized contract suite: every case creates a fresh backend from the factory,
 /// then exercises the Backend seam generically (no InMemoryBackend-specific calls).

@@ -40,6 +40,7 @@ using namespace DB::Cas;
 
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::FakeClock;
+using DB::Cas::tests::expectBytes;
 using DB::Cas::tests::expectThrowsCode;
 
 namespace
@@ -280,7 +281,7 @@ TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotWhicheverSurfaceConsume
     b->refuseNextWrite("k");
     EXPECT_EQ(b->putIfAbsent("k", "v").outcome, PutOutcome::PreconditionFailed);   /// consumed here
     EXPECT_EQ(b->putIfAbsent("k", "v").outcome, PutOutcome::Done);                 /// and only once
-    EXPECT_EQ(b->get("k")->bytes, "v");
+    expectBytes(b, "k", "v");
 
     b->refuseNextWrite("k2");
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k2", "v", Retry::once())));
