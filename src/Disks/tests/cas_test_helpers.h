@@ -2302,6 +2302,37 @@ private:
     bool block_entered = false;
 };
 
+/// `ChunkFaultBackend` COUNTS its faults, and a count can no longer make one conclusive: the write
+/// engine settles every ambiguity by an exact read and then REISSUES, so a fault that runs out
+/// mid-call is answered by the next attempt instead of by the call's own deadline -- which is the
+/// whole difference between a wedge and a commit. This keeps the fault armed until the test clears
+/// the latch, on BOTH legs: the write's, and the lost read that `Mode::LandedThenLost` arms. The read
+/// leg matters just as much, because a readable key proves the commit inside the very same call.
+class LatchedChunkFaultBackend : public ChunkFaultBackend
+{
+public:
+    /// Set after `mode` / `fault_substr` / `fault_skip`; cleared when the scenario is over, so the
+    /// test's own out-of-band writes and reads are not caught by it.
+    bool latched = false;
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (latched && !fail_read_once_key.empty() && key == fail_read_once_key)
+            throw Poco::TimeoutException("LatchedChunkFaultBackend: the lost read stays lost");
+        return ChunkFaultBackend::read(key, access);
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             DB::Cas::TransportAccess & access) override
+    {
+        if (latched && mode != Mode::None && fault_skip == 0 && !expected_value && !fault_substr.empty()
+            && key.find(fault_substr) != String::npos)
+            fault_count = 1;
+        return ChunkFaultBackend::write(key, bytes, expected_value, access);
+    }
+};
+
 /// Fault decorator for the condemn-marker gate tests: while armed, every write against a blob `.meta`
 /// key throws. Every other write passes through. Armed by default; disarm
 /// (`fail_meta_writes = false`) to model the backend healing.

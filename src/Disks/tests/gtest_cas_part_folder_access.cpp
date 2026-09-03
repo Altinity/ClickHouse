@@ -66,33 +66,26 @@ Cas::CachedPartFolderAccess::CacheParams cacheOn()
 
 /// Every mutating backend op throws once armed — models a correlated backend outage during the
 /// transaction's compensating rollback (dropRef must append a removal, which mutates the backend).
+/// While armed, the store is unreachable for every mutation: a transport-class failure, so the request
+/// engine settles it by a read (which fails too) and reissues until the call's own retry window closes.
+/// A test arming it therefore drives the engine's clock, or pays that window in real time.
 class RollbackFaultBackend final : public Cas::InMemoryBackend
 {
 public:
     std::atomic<bool> armed{false};
 
-    Cas::PutResult putIfAbsent(const String & k, const String & b, const Cas::ObjectMeta & m) override
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             Cas::TransportAccess & access) override
     {
         failIfArmed();
-        return InMemoryBackend::putIfAbsent(k, b, m);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
-    Cas::PutResult putOverwrite(const String & k, const String & b, const Cas::Token & e, const Cas::ObjectMeta & m) override
+    RawRemoval remove(const String & key, const String & expected_value, Cas::TransportAccess & access) override
     {
         failIfArmed();
-        return InMemoryBackend::putOverwrite(k, b, e, m);
-    }
-
-    Cas::CasResult casPut(const String & k, const String & b, const std::optional<Cas::Token> & e, const Cas::ObjectMeta & m) override
-    {
-        failIfArmed();
-        return InMemoryBackend::casPut(k, b, e, m);
-    }
-
-    Cas::DeleteOutcome deleteExact(const String & k, const Cas::Token & t) override
-    {
-        failIfArmed();
-        return InMemoryBackend::deleteExact(k, t);
+        return InMemoryBackend::remove(key, expected_value, access);
     }
 
 private:
@@ -1024,6 +1017,9 @@ TEST(CASPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
 {
     auto backend = std::make_shared<RollbackFaultBackend>();
     auto store = openPoolForTest(backend);
+    /// Both drops below give up only when their own retry window closes, so the engine's inter-attempt
+    /// sleeps are paid in virtual time rather than by sleeping out the operation deadline for real.
+    auto clock = Cas::tests::VirtualRetryClock::installOn(store);
     Cas::CachedPartFolderAccess access(store, cacheOn());
 
     const Cas::RootNamespace ns_a{"srv/ta"};
@@ -1041,6 +1037,8 @@ TEST(CASPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
     access.dropRefBestEffort(Cas::PartRefKey{ns_b, "part_b"});
     const auto after = global_counters[ProfileEvents::CASRefRollbackBestEffortDropFailed].load();
     EXPECT_EQ(after, before + 1);
+    EXPECT_GT(clock->pauseCount(), 0u)
+        << "the give-up must be the call's own retry window, reached through the injected sleep";
 
     backend->armed = false;   /// let store teardown release its lease cleanly
 }
@@ -1060,7 +1058,7 @@ TEST(CASPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
 /// whose append never resolved.
 TEST(CASPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitted)
 {
-    auto backend = std::make_shared<Cas::tests::ChunkFaultBackend>();
+    auto backend = std::make_shared<Cas::tests::LatchedChunkFaultBackend>();
     auto store = openPoolForTest(backend);
     auto clock = Cas::tests::VirtualRetryClock::installOn(store);
     const Cas::RootNamespace ns{"srv/t1"};
@@ -1073,14 +1071,13 @@ TEST(CASPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitt
 
     /// The promotion's own ref-log object lands; only the acknowledgement, and the controller's
     /// verifying read, are lost. Scoped to this namespace's ref log so nothing else consumes the fault.
-    /// A ONE-SHOT fault cannot produce an unresolved outcome any more: the request engine's own
-    /// resolve-before-reissue would settle the very next attempt and report Committed cleanly (there is
-    /// no per-pool "one attempt" budget left to prevent that reissue). The fault therefore stays armed
-    /// for the whole call -- `fault_count` outlasts every reissue the call's own retry window can fit --
-    /// and `VirtualRetryClock` pays that window in virtual time instead of real wall-clock.
+    /// A COUNTED fault cannot produce an unresolved outcome: the request engine settles the ambiguity
+    /// by an exact read that would find the landed object and report `Committed` inside the very same
+    /// call. Both legs therefore stay LATCHED for the whole call, and `VirtualRetryClock` pays the
+    /// retry window in virtual time instead of real wall-clock.
     backend->fault_substr = store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)) + "_log/";
     backend->mode = Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
-    backend->fault_count = 1000;
+    backend->latched = true;
     expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { prepared.promote(); });
     ASSERT_GT(clock->pauseCount(), 1u)
         << "one attempt cannot exhaust the retry window: the fault must have outlasted every reissue";
@@ -1090,8 +1087,13 @@ TEST(CASPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitt
            "receiver would fetch the bytes and publish the same part a second time";
 
     /// The hazard itself, stated as an assertion: the promote DID commit. Any further append into this
-    /// table resolves the wedge first, which is what makes the committed row visible.
+    /// table resolves the wedge first, which is what makes the committed row visible. Disarmed
+    /// COMPLETELY, because that flush must reach the store normally: a still-armed lost read would
+    /// fault the wedge's own settling read, and nothing would resolve.
+    backend->latched = false;
     backend->mode = Cas::tests::ChunkFaultBackend::Mode::None;
+    backend->fault_count = 0;
+    backend->fail_read_once_key.clear();
     access.prepareEntries({ns, "flush_driver"}, {inlineEntry("f", "two")}, Cas::ProvenanceOp::Insert).abort();
     EXPECT_TRUE(access.existsRef(key, Cas::Freshness::ForceFresh))
         << "the promotion object landed, so 'the promote failed' says nothing about the ref";
