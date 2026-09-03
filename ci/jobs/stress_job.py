@@ -125,6 +125,18 @@ def _format_malformed_summary(
     )
 
 
+def ensure_ripgrep_installed() -> None:
+    if Shell.check("command -v rg", verbose=False):
+        return
+
+    Shell.check(
+        "sudo apt-get update && "
+        "sudo env DEBIAN_FRONTEND=noninteractive "
+        "apt-get install --yes --no-install-recommends ripgrep",
+        strict=True,
+    )
+
+
 def get_additional_envs(info, check_name: str) -> List[str]:
     from ci.jobs.ci_utils import is_extended_run
 
@@ -278,6 +290,8 @@ def run_stress_test(upgrade_check: bool = False) -> None:
     ), "Check name must be provided as an input arg or in CHECK_NAME env"
 
     packages_path = temp_path
+
+    ensure_ripgrep_installed()
 
     docker_image = DockerImage.get_docker_image("altinityinfra/stress-test").pull_image()
 

@@ -35,6 +35,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from ci.jobs.stress_job import (
+    ensure_ripgrep_installed,
     process_results,
     read_test_results,
     sanitize_test_result_line,
@@ -45,6 +46,42 @@ def _write(tmp_path: Path, content: str) -> Path:
     path = tmp_path / "test_results.tsv"
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def test_ensure_ripgrep_installed_skips_apt_when_rg_exists(monkeypatch):
+    calls = []
+
+    def fake_check(command, **kwargs):
+        calls.append((command, kwargs))
+        return command == "command -v rg"
+
+    monkeypatch.setattr("ci.jobs.stress_job.Shell.check", fake_check)
+
+    ensure_ripgrep_installed()
+
+    assert calls == [("command -v rg", {"verbose": False})]
+
+
+def test_ensure_ripgrep_installed_uses_apt_when_rg_is_missing(monkeypatch):
+    calls = []
+
+    def fake_check(command, **kwargs):
+        calls.append((command, kwargs))
+        return command != "command -v rg"
+
+    monkeypatch.setattr("ci.jobs.stress_job.Shell.check", fake_check)
+
+    ensure_ripgrep_installed()
+
+    assert calls == [
+        ("command -v rg", {"verbose": False}),
+        (
+            "sudo apt-get update && "
+            "sudo env DEBIAN_FRONTEND=noninteractive "
+            "apt-get install --yes --no-install-recommends ripgrep",
+            {"strict": True},
+        ),
+    ]
 
 
 def test_well_formed_single_row(tmp_path):
