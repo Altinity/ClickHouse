@@ -542,7 +542,7 @@ TEST(CASNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     const auto catalog_after_removal = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_after_removal);
     EXPECT_EQ(catalog_after_removal->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after_removal->incarnation, catalog_before->incarnation)
+    EXPECT_EQ(catalog_after_removal->etag, catalog_before->etag)
         << "the mandatory catalog must remain byte-for-byte and token-for-token unchanged";
 
     /// Not vacuous: the SAME operations on the same table after a write do reach the file, so the zeros
@@ -557,5 +557,5 @@ TEST(CASNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     const auto catalog_after_birth = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_after_birth);
     EXPECT_NE(catalog_after_birth->bytes, catalog_after_removal->bytes);
-    EXPECT_NE(catalog_after_birth->incarnation, catalog_after_removal->incarnation);
+    EXPECT_NE(catalog_after_birth->etag, catalog_after_removal->etag);
 }
