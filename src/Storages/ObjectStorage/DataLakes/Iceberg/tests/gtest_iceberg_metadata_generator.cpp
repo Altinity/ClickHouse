@@ -367,6 +367,26 @@ Poco::JSON::Object::Ptr makeMetadataWithField(
     return metadata;
 }
 
+/// Ordered field names from the schema `current-schema-id` points at.
+std::vector<String> getCurrentFieldNames(const Poco::JSON::Object::Ptr & metadata)
+{
+    auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
+    auto schemas = metadata->getArray(f_schemas);
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+    {
+        auto schema = schemas->getObject(i);
+        if (schema->getValue<Int32>(f_schema_id) != current_schema_id)
+            continue;
+        auto fields = schema->getArray(f_fields);
+        std::vector<String> names;
+        names.reserve(fields->size());
+        for (UInt32 j = 0; j < fields->size(); ++j)
+            names.push_back(fields->getObject(j)->getValue<String>(f_name));
+        return names;
+    }
+    return {};
+}
+
 /// The Iceberg type recorded for `name` in the schema `current-schema-id` points at.
 Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata, const String & name)
 {
@@ -409,6 +429,73 @@ void expectModifyRejected(
 }
 
 }
+
+TEST(IcebergMetadataGenerator, AddColumnFirstPlacesFieldAtIndexZero)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    gen.generateAddColumnMetadata("z", makeNullable(std::make_shared<DataTypeInt64>()), /* first */ true);
+
+    auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
+    auto schemas = metadata->getArray(f_schemas);
+    Poco::JSON::Object::Ptr current_schema;
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+    {
+        if (schemas->getObject(i)->getValue<Int32>(f_schema_id) == current_schema_id)
+        {
+            current_schema = schemas->getObject(i);
+            break;
+        }
+    }
+    ASSERT_NE(current_schema.get(), nullptr);
+
+    auto fields = current_schema->getArray(f_fields);
+    ASSERT_GE(fields->size(), 1u);
+    EXPECT_EQ(fields->getObject(0)->getValue<String>(f_name), "z");
+    EXPECT_EQ(fields->getObject(1)->getValue<String>(f_name), "x");
+    EXPECT_EQ(fields->getObject(2)->getValue<String>(f_name), "y");
+}
+
+
+TEST(IcebergMetadataGenerator, AddColumnAfterPlacesFieldAfterNamedColumn)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    gen.generateAddColumnMetadata("z", makeNullable(std::make_shared<DataTypeInt64>()), /* first */ false, /* after_column */ "x");
+
+    auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
+    auto schemas = metadata->getArray(f_schemas);
+    Poco::JSON::Object::Ptr current_schema;
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+    {
+        if (schemas->getObject(i)->getValue<Int32>(f_schema_id) == current_schema_id)
+        {
+            current_schema = schemas->getObject(i);
+            break;
+        }
+    }
+    ASSERT_NE(current_schema.get(), nullptr);
+
+    auto fields = current_schema->getArray(f_fields);
+    ASSERT_EQ(fields->size(), 3u);
+    EXPECT_EQ(fields->getObject(0)->getValue<String>(f_name), "x");
+    EXPECT_EQ(fields->getObject(1)->getValue<String>(f_name), "z");
+    EXPECT_EQ(fields->getObject(2)->getValue<String>(f_name), "y");
+}
+
+
+TEST(IcebergMetadataGenerator, AddColumnAfterNonexistentColumnThrows)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    EXPECT_THROW(
+        gen.generateAddColumnMetadata("z", makeNullable(std::make_shared<DataTypeInt64>()), /* first */ false, /* after_column */ "nonexistent"),
+        DB::Exception);
+}
+
 
 TEST(IcebergMetadataGenerator, ModifyColumnAppliedRecognisesTypeAlreadyInSchema)
 {
@@ -489,6 +576,99 @@ TEST(IcebergMetadataGenerator, ModifyColumnWideningRecordsTheNewTypeInANewSchema
     auto stored_type = findCurrentFieldType(metadata, "x");
     ASSERT_TRUE(stored_type.isString());
     EXPECT_EQ(stored_type.extract<String>(), "long");
+}
+
+
+TEST(IcebergMetadataGenerator, ModifyColumnFirstMovesFieldToIndexZero)
+{
+    auto metadata = makeMetadataWithGap();
+    const auto before = readSchemaState(metadata);
+    MetadataGenerator gen(metadata);
+
+    EXPECT_TRUE(gen.generateModifyColumnMetadata(
+        "y", makeNullable(std::make_shared<DataTypeString>()), getContext().context,
+        /* first */ true));
+
+    const auto after = readSchemaState(metadata);
+    EXPECT_EQ(after.schema_count, before.schema_count + 1);
+
+    auto names = getCurrentFieldNames(metadata);
+    ASSERT_EQ(names.size(), 2u);
+    EXPECT_EQ(names[0], "y");
+    EXPECT_EQ(names[1], "x");
+}
+
+
+TEST(IcebergMetadataGenerator, ModifyColumnAfterMovesFieldAfterNamedColumn)
+{
+    /// Build a 3-column schema: a, b, c.
+    auto metadata = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    metadata->set(f_format_version, 2);
+    metadata->set(f_current_schema_id, 0);
+    metadata->set(f_last_column_id, 3);
+
+    auto schema = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    schema->set(f_schema_id, 0);
+    schema->set(f_type, "struct");
+    auto fields = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+    for (Int32 i = 0; i < 3; ++i)
+    {
+        auto field = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+        field->set(f_id, i + 1);
+        field->set(f_name, String(1, static_cast<char>('a' + i)));
+        field->set(f_required, false);
+        field->set(f_type, "long");
+        fields->add(field);
+    }
+    schema->set(f_fields, fields);
+    auto schemas = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+    schemas->add(schema);
+    metadata->set(f_schemas, schemas);
+
+    MetadataGenerator gen(metadata);
+
+    EXPECT_TRUE(gen.generateModifyColumnMetadata(
+        "a", makeNullable(std::make_shared<DataTypeInt64>()), getContext().context,
+        /* first */ false, /* after_column */ "b"));
+
+    auto names = getCurrentFieldNames(metadata);
+    ASSERT_EQ(names.size(), 3u);
+    EXPECT_EQ(names[0], "b");
+    EXPECT_EQ(names[1], "a");
+    EXPECT_EQ(names[2], "c");
+}
+
+
+TEST(IcebergMetadataGenerator, ModifyColumnTypeAndFirstDoesBoth)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    EXPECT_TRUE(gen.generateModifyColumnMetadata(
+        "x", std::make_shared<DataTypeInt64>(), getContext().context,
+        /* first */ true));
+
+    auto names = getCurrentFieldNames(metadata);
+    ASSERT_EQ(names.size(), 2u);
+    EXPECT_EQ(names[0], "x");
+    EXPECT_EQ(names[1], "y");
+
+    auto stored_type = findCurrentFieldType(metadata, "x");
+    ASSERT_TRUE(stored_type.isString());
+    EXPECT_EQ(stored_type.extract<String>(), "long");
+}
+
+
+TEST(IcebergMetadataGenerator, ModifyColumnAfterNonexistentColumnThrows)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    EXPECT_THROW(
+        gen.generateModifyColumnMetadata(
+            "x", std::make_shared<DataTypeInt32>(), getContext().context,
+            /* first */ false, /* after_column */ "nonexistent"),
+        DB::Exception);
 }
 
 #endif

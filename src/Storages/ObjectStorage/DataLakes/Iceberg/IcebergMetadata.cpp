@@ -790,10 +790,11 @@ void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
                 ErrorCodes::NOT_IMPLEMENTED,
                 "Removing column property '{}' from column '{}' is not supported by Iceberg storage", command.to_remove, command.column_name);
 
-        if (command.type == AlterCommand::Type::MODIFY_COLUMN && !command.data_type)
+        if (command.type == AlterCommand::Type::MODIFY_COLUMN && !command.data_type
+            && !command.first && command.after_column.empty())
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED,
-                "Modifying column '{}' without changing its type is not supported by Iceberg storage", command.column_name);
+                "Modifying column '{}' without changing its type or position is not supported by Iceberg storage", command.column_name);
     }
 }
 
