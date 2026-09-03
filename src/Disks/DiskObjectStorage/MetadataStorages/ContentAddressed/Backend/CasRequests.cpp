@@ -759,16 +759,22 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         if (!state.any_ambiguous)
             return Conflict{state.last_seen};
 
-        /// Our own bytes prove one of this inner write's ambiguous attempts landed.
-        if (const auto * obj = std::get_if<Object>(&state.last_seen); obj && obj->bytes == bytes)
-            return postCommit(obj->incarnation, /*resolved_by_read=*/true, state, bound);
-        /// The precondition no longer holds, so a reissue would be refused too and no ambiguous attempt
-        /// of this inner write produced what is at the key. The conflict is the verdict.
         if (!preconditionStillSatisfiable(state.last_seen, expected))
+        {
+            /// The precondition has MOVED, and THAT is what makes byte equality a proof: an attempt
+            /// that never applied leaves the key exactly as it found it, so under an incarnation that
+            /// did not move our own bytes cannot be told from the bytes already there. A create reaches
+            /// here for every object it sees -- an occupied key never satisfies its precondition.
+            if (const auto * obj = std::get_if<Object>(&state.last_seen); obj && obj->bytes == bytes)
+                return postCommit(obj->incarnation, /*resolved_by_read=*/true, state, bound);
+            /// Nothing of this inner write's is at the key, and a reissue would be refused too.
             return Conflict{state.last_seen};
+        }
 
-        /// Unresolved but repeatable: the precondition would still be met, so a reissue is what settles
-        /// the ambiguity -- and a policy with no reissue has to say it settled nothing.
+        /// Unresolved but repeatable: the precondition would still be met -- or nothing was observed at
+        /// all, which proves neither way and leaves this write's ambiguity alive. A reissue is what
+        /// settles it, and re-sending the same bytes under the same precondition is safe: it ends at
+        /// the store's own answer. A policy with no reissue has to say it settled nothing.
         if (policy.single_attempt)
             return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
         if (auto given_up = pauseAndReissue(state, bound))

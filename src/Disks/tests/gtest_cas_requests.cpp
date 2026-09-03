@@ -1108,6 +1108,53 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsThePreconditionUnchangedIsRei
     EXPECT_EQ(clock.sleeps.size(), 1u);
 }
 
+TEST(CASRequests, AmbiguousReplaceOfIdenticalBytesIsReissuedNotClaimedByByteEquality)
+{
+    /// The key already holds exactly the bytes we are about to write, so byte equality alone can never
+    /// say whether the ambiguous attempt landed. The incarnation can: an attempt that applied would
+    /// have moved it. Under a policy with a reissue that means re-sending; under `once` it means saying
+    /// the write is unresolved rather than claiming somebody else's identical object.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        const Incarnation seen = *orThrow(op.create("k", "B", Retry::standard()), "create");
+        backend->resetCounts();
+
+        backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+        WriteResult result = op.replace("k", "B", seen, Retry::standard());
+        const auto * committed = std::get_if<Committed>(&result);
+        ASSERT_NE(committed, nullptr);
+        /// Claiming the resolve read's object would have reported one attempt and a commit this call
+        /// never made; the reissue is what actually put these bytes there under a new incarnation.
+        EXPECT_EQ(committed->attempts_sent, 2u);
+        EXPECT_FALSE(committed->resolved_by_read);
+        EXPECT_NE(committed->incarnation, seen);
+        EXPECT_EQ(backend->writeRequests(), 2u);
+        EXPECT_EQ(backend->readRequests(), 1u);
+        EXPECT_EQ(clock.sleeps.size(), 1u);
+    }
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        const Incarnation seen = *orThrow(op.create("k", "B", Retry::standard()), "create");
+        backend->resetCounts();
+
+        backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+        WriteResult result = op.replace("k", "B", seen, Retry::once());
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_NE(gave_up, nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
+        EXPECT_TRUE(gave_up->sent_any);
+        EXPECT_EQ(backend->writeRequests(), 1u);
+        EXPECT_EQ(backend->readRequests(), 1u);
+        EXPECT_TRUE(clock.sleeps.empty());
+    }
+}
+
 TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsAnotherIncarnationIsAConflict)
 {
     FakeClock clock;
