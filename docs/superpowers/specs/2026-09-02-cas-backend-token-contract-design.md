@@ -303,8 +303,8 @@ public:
     WriteResult readModifyWrite          (key, DecideOnObject, const Retry &);   // reads the body
     WriteResult readModifyWriteOnPresence(key, DecideOnMeta,   const Retry &);   // HEAD only; one site
 };
-struct Object { String bytes;  Etag incarnation; };
-struct Meta   { uint64_t size; Etag incarnation; };
+struct Object { String bytes;  Etag etag; };
+struct Meta   { uint64_t size; Etag etag; };
 enum class Removal { Removed, Gone, Mismatch };                       // a delete marker throws CAS_DELETE_MARKER, carrying the store's answer
 ```
 
@@ -359,7 +359,7 @@ struct NotObserved {};                 // no read happened: admission was refuse
 struct ProvenAbsent {};                // the resolve read completed and found no object
 using Observation = std::variant<NotObserved, ProvenAbsent, Meta, Object>;   // Meta from a presence-only resolve, Object from a body read
 
-struct Committed { Etag incarnation; uint32_t attempts_sent; bool resolved_by_read; };
+struct Committed { Etag etag; uint32_t attempts_sent; bool resolved_by_read; };
 struct Declined  { Observation seen; };                      // readModifyWrite only: decide returned nullopt; no attempts_sent — a decline is the resolve read's answer, not an attempt's
 struct Conflict  { Observation seen; uint32_t attempts_sent; };
 struct Refused   { int store_error; String message; uint32_t attempts_sent; };      // the store proved this write never applied (the definite-failure whitelist)

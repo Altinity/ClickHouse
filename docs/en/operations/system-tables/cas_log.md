@@ -31,7 +31,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `ref_name` ([String](/sql-reference/data-types/string)) — Part name / ref the event concerns; empty if not applicable.
 - `object_kind` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — One of `none`, `blob`, `manifest`, `root`, `snapshot`.
 - `object_hash` ([String](/sql-reference/data-types/string)) — Content hash (lowercase hex) of the object; empty if not applicable.
-- `token` ([String](/sql-reference/data-types/string)) — The incarnation involved, rendered uniformly as `<dialect>:<value>` (e.g. `etag:"a1b2c3"` on S3-compatible stores, `generation:1234` on GCS) across every event type that carries one; empty if not applicable.
+- `token` ([String](/sql-reference/data-types/string)) — On events about a stored object, the incarnation involved, rendered uniformly as `<dialect>:<value>` (e.g. `etag:"a1b2c3"` on S3-compatible stores, `generation:1234` on GCS); the part-build lifecycle events reuse the column for the 128-bit build id in hex; empty if not applicable.
 - `round` ([UInt64](/sql-reference/data-types/int-uint)) — GC round (`0` if not applicable).
 - `generation` ([UInt64](/sql-reference/data-types/int-uint)) — GC snapshot generation (`0` if not applicable).
 - `at_version` ([UInt64](/sql-reference/data-types/int-uint)) — Manifest `shard_version` of the driving journal record (`0` if not applicable).
