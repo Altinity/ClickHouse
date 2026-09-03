@@ -166,17 +166,38 @@ TEST(CASProbe, ExactDeleteBatteryDetectsMissingGenerationMode)
 namespace
 {
 
-/// `InMemoryBackend`'s enforcing `remove`/`write` primitives compare opaque string values and never
-/// consult a dialect; this decorator claims a different dialect LABEL while delegating everything else
-/// unchanged, so the same enforcing backend can be probed under each dialect a live production backend
-/// mints. `InMemoryBackend`'s minted values (a monotonically increasing decimal starting at "1") are
-/// grammar-valid incarnations under all three: non-empty and comma/`*`-free for ETag, a canonical
-/// positive decimal for Generation, merely non-empty for Emulated.
+/// Rejects, LOCALLY and without touching the store, any conditional write/remove whose precondition
+/// value is not grammar-valid under the claimed dialect — the production shape of the retired
+/// `DialectGatedCountingBackend`, ported to the primitive interface (`write`/`remove` carry a raw
+/// precondition VALUE now, not a typed token, so the gate is `isIncarnationValue` rather than a type-tag
+/// compare). `write_reached`/`remove_reached` count only the calls that got PAST the gate, so a
+/// regression that reintroduces a synthesized (grammar-invalid-somewhere) precondition drops one of
+/// these counts instead of passing silently.
 class DialectOverrideBackend : public InMemoryBackend
 {
 public:
     explicit DialectOverrideBackend(Dialect claimed_dialect_) : claimed_dialect(claimed_dialect_) {}
     Dialect dialect() const override { return claimed_dialect; }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (expected_value && !isIncarnationValue(claimed_dialect, *expected_value))
+            return std::unexpected(RawConflict{});   /// dialect-gated: never reaches the real store
+        ++write_reached;
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        if (!isIncarnationValue(claimed_dialect, expected_value))
+            return RawRemoval::Mismatch;   /// dialect-gated: never reaches the real store
+        ++remove_reached;
+        return InMemoryBackend::remove(key, expected_value, access);
+    }
+
+    int write_reached = 0;
+    int remove_reached = 0;
 
 private:
     Dialect claimed_dialect;
@@ -184,11 +205,15 @@ private:
 
 }
 
-/// The probe's reordered "wrong incarnation" steps (Step 4, 5d, 6) always reuse a REAL, backend-minted
-/// `Incarnation` from the same key rather than a synthesized value — see CasProbe.cpp's step comments —
-/// so there is no dialect-specific construction left to regress. This exercises the whole battery under
-/// each dialect a live production backend can mint, proving the probe's pass/fail verdict does not
-/// depend on which one.
+/// The probe's reordered "wrong incarnation" steps always reuse a REAL, backend-minted `Incarnation`
+/// from the same key rather than a synthesized value — see CasProbe.cpp's step comments — and every
+/// such value is grammar-valid under every dialect by construction (`InMemoryBackend`'s minted values are
+/// a monotonically increasing decimal starting at "1": non-empty and comma/`*`-free for ETag, a canonical
+/// positive decimal for Generation, merely non-empty for Emulated). So under EVERY dialect the battery's
+/// four conditional writes (steps 1-4) and two conditional removes (steps 5, 7) must all reach the real
+/// store — asserting the exact counts is what makes this test able to fail: a regression that
+/// reintroduces a synthesized, foreign-dialect precondition would get gated locally on at least one
+/// dialect, dropping one of these counts below the total instead of merely changing an outcome enum.
 TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
 {
     for (const Dialect dialect : {Dialect::ETag, Dialect::Generation, Dialect::Emulated})
@@ -198,5 +223,7 @@ TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
         auto op = requests.admit();
         EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe")) << "dialect " << static_cast<int>(dialect);
         EXPECT_TRUE(b.list("p/.cas_probe", "", 10).keys.empty()) << "dialect " << static_cast<int>(dialect);
+        EXPECT_EQ(b.write_reached, 4) << "dialect " << static_cast<int>(dialect);
+        EXPECT_EQ(b.remove_reached, 2) << "dialect " << static_cast<int>(dialect);
     }
 }

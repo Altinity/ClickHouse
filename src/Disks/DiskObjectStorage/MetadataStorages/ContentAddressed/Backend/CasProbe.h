@@ -14,14 +14,13 @@ namespace DB::Cas
 /// so this function cannot reach them itself.
 ///
 /// The battery validates the backend preconditions required by a writable content-addressed pool:
-///   1. Conditional-create and conditional-overwrite are enforced (`create` prevents overwrites, and
-///      `replace` rejects a stale incarnation).
-///   2. `create`/`replace` support create-if-absent, conflict-on-existing, conflict-on-stale, and
-///      commit-on-current — the same guarantees the legacy `casPut` chain validated.
-///   3. Conditional-delete is enforced (`remove` with a stale incarnation is rejected and the object
+///   1. `create` and `replace` are conditional and exact: `create` refuses an occupied key
+///      (create-if-absent, conflict-on-existing) and `replace` refuses a stale incarnation
+///      (conflict-on-stale), while a matching incarnation commits (commit-on-current).
+///   2. Conditional-delete is enforced (`remove` with a stale incarnation is rejected and the object
 ///      survives).
-///   4. Listing reflects both creation and deletion of a probe object.
-///   5. Successful deletion does not create a versioning delete marker. A content-addressed pool cannot
+///   3. Listing reflects both creation and deletion of a probe object.
+///   4. Successful deletion does not create a versioning delete marker. A content-addressed pool cannot
 ///      reclaim storage correctly from a versioned bucket: garbage-collection deletes would archive old
 ///      versions instead of removing objects, and repeated ref updates would accumulate versions.
 ///
@@ -29,7 +28,7 @@ namespace DB::Cas
 /// specific failed check. This is fail-closed: a backend that does not pass the battery MUST NOT be
 /// used to coordinate a content-addressed pool.
 ///
-/// Cleanup of probe keys is best-effort and runs unconditionally: after the battery completes, or on
+/// Cleanup of the probe key is best-effort and runs unconditionally: after the battery completes, or on
 /// the failure path immediately before the check-failing exception is rethrown. Cleanup itself suppresses
 /// exceptions so that it cannot hide the capability-check failure.
 void runCapabilityProbe(CasOperation & op, const String & probe_prefix);
