@@ -2109,6 +2109,12 @@ TEST(CASRefRecoveryCasWalk, PutHookBackendComposesHidingListBackendCasPutFaultIn
 {
     auto backend = std::make_shared<PutHookBackend>();
 
+    /// `HidingListBackend::write` only runs `before_cas_put` on the CONDITIONAL branch (an `expected`
+    /// token present) -- a bare create-shaped `casPut(..., std::nullopt)` takes the other branch and
+    /// can never reach it. Seed the key first so the probed call below is a genuine replace.
+    const auto seeded = backend->putIfAbsent("p/probe", "seed");
+    ASSERT_EQ(seeded.outcome, PutOutcome::Done);
+
     bool before_cas_put_fired = false;
     backend->before_cas_put = [&](const String &, const String &, const std::optional<String> &)
     {
@@ -2119,7 +2125,7 @@ TEST(CASRefRecoveryCasWalk, PutHookBackendComposesHidingListBackendCasPutFaultIn
     bool on_key_fired = false;
     backend->on_key = [&] { on_key_fired = true; };
 
-    ASSERT_EQ(backend->casPut("p/probe", "x", std::nullopt).outcome, CasOutcome::Committed);
+    ASSERT_EQ(backend->casPut("p/probe", "x", seeded.token).outcome, CasOutcome::Committed);
 
     EXPECT_TRUE(before_cas_put_fired)
         << "HidingListBackend's before_cas_put hook must still fire for a PutHookBackend instance";
