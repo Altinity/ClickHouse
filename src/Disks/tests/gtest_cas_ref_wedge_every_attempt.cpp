@@ -391,9 +391,9 @@ CatalogEntry replaceCatalogLifeForWedgeRace(
     {
         return entry.ns == predecessor.ns && entry.incarnation == predecessor.incarnation;
     });
-    if (!before_delete.incarnation
+    if (!before_delete.etag
         || !std::holds_alternative<Committed>(op.replace(
-               layout.refCatalogKey(), encodeRefCatalog(without_predecessor), *before_delete.incarnation,
+               layout.refCatalogKey(), encodeRefCatalog(without_predecessor), *before_delete.etag,
                Retry::standard())))
         throw std::runtime_error("test failed to retire exact predecessor catalog life");
 
@@ -405,9 +405,9 @@ CatalogEntry replaceCatalogLifeForWedgeRace(
     const CasRefCatalog::Snapshot after_delete = CasRefCatalog::read(op, layout);
     RefCatalog reborn = after_delete.catalog;
     reborn.entries.push_back(successor);
-    if (!after_delete.incarnation
+    if (!after_delete.etag
         || !std::holds_alternative<Committed>(op.replace(
-               layout.refCatalogKey(), encodeRefCatalog(reborn), *after_delete.incarnation, Retry::standard())))
+               layout.refCatalogKey(), encodeRefCatalog(reborn), *after_delete.etag, Retry::standard())))
         throw std::runtime_error("test failed to publish successor catalog life");
     return successor;
 }
