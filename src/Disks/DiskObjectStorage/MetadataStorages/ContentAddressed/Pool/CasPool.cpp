@@ -229,7 +229,6 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] { return liveWriterEpoch(); },
           [this] { return refAppendFenceOk(); },
           [this] { return mount_runtime.fenceGeneration(); },
-          [this] (uint64_t gen) { mount_runtime.checkFenceOrThrow(gen); },
           [this] { return bootMsNow(); },
           [this] { return mayMutate(); },
           [this] (const String & key, const String & reason, const std::optional<String> & offending_ns)

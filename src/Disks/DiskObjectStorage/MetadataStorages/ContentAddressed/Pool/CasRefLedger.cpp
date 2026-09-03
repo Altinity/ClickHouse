@@ -205,7 +205,6 @@ CasRefLedger::CasRefLedger(
     std::function<uint64_t()> live_epoch_fn_,
     std::function<bool()> fence_ok_fn_,
     std::function<uint64_t()> fence_generation_fn_,
-    std::function<void(uint64_t)> check_fence_or_throw_,
     std::function<uint64_t()> boot_ms_now_fn_,
     std::function<bool()> may_mutate_,
     std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
@@ -222,7 +221,6 @@ CasRefLedger::CasRefLedger(
     , live_epoch_fn(std::move(live_epoch_fn_))
     , fence_ok_fn(std::move(fence_ok_fn_))
     , fence_generation_fn(std::move(fence_generation_fn_))
-    , check_fence_or_throw(std::move(check_fence_or_throw_))
     , boot_ms_now_fn(std::move(boot_ms_now_fn_))
     , may_mutate(std::move(may_mutate_))
     , on_impossible_interference(std::move(on_impossible_interference_))
@@ -270,12 +268,10 @@ WriteResult CasRefLedger::stagingPutIfAbsentMutable(const String & key, const St
     return op.create(key, bytes, Retry::standard());
 }
 
-void CasRefLedger::refuseUnlessAdmitted(const CasOperation & op, uint64_t admitted_generation,
-                                        std::string_view what) const
+void CasRefLedger::refuseUnlessAdmitted(const CasOperation & op, std::string_view what) const
 {
     if (op.admitted())
         return;
-    check_fence_or_throw(admitted_generation);
     throwCasTransientUnavailable(
         fmt::format("content-addressed pool '{}'", server_root_id),
         fmt::format("{}: the operation is no longer admitted -- the mount lease has too little time left "
@@ -585,7 +581,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRunti
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
     const NamespaceLifeId & life, uint64_t admitted_generation)
 {
-    check_fence_or_throw(admitted_generation);
+    refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
 
     std::shared_ptr<RefTableRuntime> result;
     bool generation_moved = false;
@@ -619,7 +615,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
     }
 
     if (generation_moved)
-        check_fence_or_throw(admitted_generation);
+        refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
     if (identity_conflict)
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}': the cached runtime identity changed while publishing catalog life {}; "
@@ -638,7 +634,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     /// runtime.
     if (auto current = lookupRefTableRuntime(ns))
     {
-        check_fence_or_throw(current->admitted_fence_generation);
+        refuseUnlessAdmitted(mount_requests.resume(current->admitted_fence_generation), "resident readable runtime");
         {
             std::lock_guard queue_lock(ref_queue_mutex);
             if (current->removal_admission_closed)
@@ -655,7 +651,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     const uint64_t admitted_generation = fence_generation_fn();
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
-    refuseUnlessAdmitted(op, admitted_generation, "cold readable runtime admission");
+    refuseUnlessAdmitted(op, "cold readable runtime admission");
     first_catalog.life_index.throwIfAmbiguous("CAS cold readable runtime admission");
     const auto it = std::find_if(first_catalog.catalog.entries.begin(), first_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
@@ -675,7 +671,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     /// is deliberately immediately before the queue-locked fence/slot recheck in
     /// `acquireRefTableRuntime`; the held-handle warm path above pays none.
     const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(op, layout);
-    refuseUnlessAdmitted(op, admitted_generation, "cold readable runtime admission");
+    refuseUnlessAdmitted(op, "cold readable runtime admission");
     /// The first read's ambiguity validation does not cover an aliasing incarnation admitted BETWEEN
     /// the reads; physical life-owned keys use only the incarnation, so an ambiguous second cut must
     /// refuse admission even when this namespace's own row is untouched.
@@ -1475,7 +1471,7 @@ void CasRefLedger::ensureRefTableRecovered(
     /// exists for object-store blips, and a generation that moved is not one. The loop refuses to
     /// re-drive under a moved generation (below), so the budget is never burned on a doomed retry.
     const uint64_t admitted_generation = rt.admitted_fence_generation;
-    check_fence_or_throw(admitted_generation);
+    refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery walk admission");
     /// Preserve this runtime's exact writer identity across the unlocked walk. The runtime stays in
     /// `NeedsRecovery` until the same lock installs a result, so no later append can replace it here.
     const std::optional<RefAppendAttempt> retained_attempt = rt.append_attempt;
@@ -1557,7 +1553,7 @@ void CasRefLedger::ensureRefTableRecovered(
                 /// of time to come back, and a recovery whose window straddled a fence bump describes a
                 /// mount incarnation that no longer owns this namespace. It must publish NOTHING: the
                 /// table stays unrecovered and the next touch recovers it properly.
-                check_fence_or_throw(admitted_generation);
+                refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery install");
                 if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
                     throwCasWriteRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
@@ -3387,7 +3383,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             const uint64_t admitted_generation = rt->admitted_fence_generation;
             CasOperation catalog_op = mount_requests.resume(admitted_generation, runtime_live);
             const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
-            refuseUnlessAdmitted(catalog_op, admitted_generation, "terminal removal append");
+            refuseUnlessAdmitted(catalog_op, "terminal removal append");
             catalog.life_index.throwIfAmbiguous("CAS terminal removal append");
             const auto entry_it = std::find_if(
                 catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
@@ -3418,7 +3414,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             const uint64_t admitted_generation = rt->admitted_fence_generation;
             CasOperation catalog_op = mount_requests.resume(admitted_generation, runtime_live);
             const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
-            refuseUnlessAdmitted(catalog_op, admitted_generation, "removal-class append");
+            refuseUnlessAdmitted(catalog_op, "removal-class append");
             const NamespaceLifeId & life = rt->life;
             const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
                 [&](const CatalogEntry & entry)
@@ -3973,16 +3969,6 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// durable. `FencedOut`, contention exhaustion, decode failure, or any other unresolved
         /// publication leaves the log known durable but uninstalled, which is exactly
         /// `NeedsRecovery`; recovery owns resolution of that window.
-        const auto refuse_unless_still_admitted = [&]
-        {
-            if (op.admitted())
-                return;
-            check_fence_or_throw(admitted_fence_generation);
-            throwCasWriteRetryLater(fmt::format(
-                "CAS namespace '{}': its captured runtime was retired, or the mount lease has too "
-                "little time left, before committed-frontier publication",
-                rt->life.ns.string()));
-        };
         CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
         try
         {
@@ -4023,7 +4009,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// frontier durable, but it must neither install nor acknowledge them.
             try
             {
-                refuse_unless_still_admitted();
+                refuseUnlessAdmitted(op, "committed-frontier publication");
             }
             catch (...)
             {
@@ -4917,7 +4903,7 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
     auto rt = lookupRefTableRuntime(ns);
     if (rt)
     {
-        check_fence_or_throw(rt->admitted_fence_generation);
+        refuseUnlessAdmitted(mount_requests.resume(rt->admitted_fence_generation), "resident namespace life");
         bool removal_closed = false;
         {
             std::lock_guard queue_lock(ref_queue_mutex);
@@ -4947,7 +4933,7 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
     const uint64_t admitted_generation = fence_generation_fn();
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
-    refuseUnlessAdmitted(op, admitted_generation, "cold mutable namespace admission");
+    refuseUnlessAdmitted(op, "cold mutable namespace admission");
     const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Removing)
@@ -4959,7 +4945,7 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         = entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Live
         ? NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)
         : resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
-    check_fence_or_throw(admitted_generation);
+    refuseUnlessAdmitted(op, "cold mutable namespace admission, after life resolution");
     rt = acquireRefTableRuntime(life, admitted_generation);
     ensureRefTableRecovered(ns, *rt);
     return rt->life;
@@ -4991,7 +4977,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// short of that falls through to the exact cold-path observation below.
     if (const auto current = lookupRefTableRuntime(ns))
     {
-        check_fence_or_throw(current->admitted_fence_generation);
+        refuseUnlessAdmitted(mount_requests.resume(current->admitted_fence_generation), "resident namespace presence");
         bool closed = false;
         {
             std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
@@ -5014,7 +5000,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     const uint64_t admitted_generation = fence_generation_fn();
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
-    refuseUnlessAdmitted(op, admitted_generation, "namespace presence probe");
+    refuseUnlessAdmitted(op, "namespace presence probe");
     if (namespace_presence_probe_after_first_read_hook_for_test)
         namespace_presence_probe_after_first_read_hook_for_test();
     const auto find_entry = [&ns](const CasRefCatalog::Snapshot & snap) -> const CatalogEntry *
@@ -5035,7 +5021,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
         /// answers present: `true` is always the safe direction, and the caller's next poll runs the
         /// full state dispatch against a fresh observation.
         const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(op, layout);
-        refuseUnlessAdmitted(op, admitted_generation, "namespace presence probe");
+        refuseUnlessAdmitted(op, "namespace presence probe");
         if (find_entry(second_catalog))
             return true;
         return false;   /// no catalog row in two atomic observations: proven absent
@@ -5070,7 +5056,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
         namespace_presence_probe_after_terminal_proven_hook_for_test();
 
     const CasRefCatalog::Snapshot post_terminal_catalog = CasRefCatalog::read(op, layout);
-    refuseUnlessAdmitted(op, admitted_generation, "namespace presence probe");
+    refuseUnlessAdmitted(op, "namespace presence probe");
     const CatalogEntry * post_terminal_entry = find_entry(post_terminal_catalog);
     if (!post_terminal_entry || post_terminal_entry->incarnation == entry->incarnation)
         return false;   /// terminal durably proven and nothing has since occupied `ns` under a new life
@@ -5241,7 +5227,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             }
             else if (observed_live && fresh_it != fresh.catalog.entries.end() && *fresh_it == *observed_live)
             {
-                refuseUnlessAdmitted(removal_op, admitted_generation, "reopening the removal lane");
+                refuseUnlessAdmitted(removal_op, "reopening the removal lane");
                 std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
                 rt->removal_admission_closed = false;
                 rt->cv.notify_all();

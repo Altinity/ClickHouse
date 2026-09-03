@@ -107,17 +107,16 @@ public:
         /// Callbacks into mount and watermark state owned by `Pool`, bound for this ledger's lifetime:
         std::function<uint64_t()> live_epoch_fn_,
         std::function<bool()> fence_ok_fn_,
-        /// The two fence-GENERATION primitives (`CasMountRuntime::fenceGeneration`/`checkFenceOrThrow`),
-        /// injected exactly as `CasPlainObjects` takes them. `fence_ok_fn` above answers "may this mount
-        /// write AT ALL, right now"; these two answer the different question an append lane must ask
-        /// across an I/O window: "is this still the SAME mount incarnation that admitted the transaction
-        /// I am about to act on?" A wedge captures the generation at admission and presents it back on
-        /// every later retry and before every install, so a result that returns after a fence loss or a
-        /// re-arm is inert for the superseded runtime instead of installing a stale view (spec §3,
-        /// "the mount-fence generation is captured at admission and required on every slot-occupy and
-        /// install").
+        /// The fence-GENERATION primitive (`CasMountRuntime::fenceGeneration`), injected exactly as
+        /// `CasPlainObjects` takes it. `fence_ok_fn` above answers "may this mount write AT ALL, right
+        /// now"; this answers the different question an append lane must ask across an I/O window: "is
+        /// this still the SAME mount incarnation that admitted the transaction I am about to act on?" A
+        /// wedge captures the generation at admission and presents it back -- through `mount_requests`,
+        /// by resuming an operation under it -- on every later retry and before every install, so a
+        /// result that returns after a fence loss or a re-arm is inert for the superseded runtime instead
+        /// of installing a stale view (spec §3, "the mount-fence generation is captured at admission and
+        /// required on every slot-occupy and install").
         std::function<uint64_t()> fence_generation_fn_,
-        std::function<void(uint64_t)> check_fence_or_throw_,
         std::function<uint64_t()> boot_ms_now_fn_,
         std::function<bool()> may_mutate_,
         std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
@@ -708,7 +707,6 @@ private:
     std::function<uint64_t()> live_epoch_fn;
     std::function<bool()> fence_ok_fn;
     std::function<uint64_t()> fence_generation_fn;
-    std::function<void(uint64_t)> check_fence_or_throw;
     std::function<uint64_t()> boot_ms_now_fn;
     std::function<bool()> may_mutate;
     std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference;
@@ -1178,8 +1176,8 @@ private:
     /// "absent", which is not a rejection: the earlier ambiguous attempt could still land afterwards.
     ///
     /// Post-I/O recheck: the outcome is adjudicated on an I/O result, so before ANY action follows from
-    /// it (adopt, acknowledge, unwedge, fail the survivors) this re-acquires `state_mutex`, presents
-    /// `admitted_fence_generation` back through `checkFenceOrThrow`, and compares the full wedge
+    /// it (adopt, acknowledge, unwedge, fail the survivors) this re-acquires `state_mutex`, compares
+    /// `admitted_fence_generation` against the fence's CURRENT generation, and compares the full wedge
     /// identity against what is still installed. A result that returns after a fence bump/re-arm, or
     /// after the wedge it belonged to was replaced, is INERT for this runtime.
     WedgeResolutionResult resolveWedgeOnce(
@@ -1254,10 +1252,10 @@ private:
 
     /// The verdict points that guard a DECISION rather than a request: the engine refuses a request on
     /// its own, but a result already in hand must not be acted on once `op` has stopped being admitted.
-    /// `check_fence_or_throw` speaks first so a moved mount incarnation keeps its own message; the
-    /// second throw covers what an operation refuses and a bare generation comparison does not -- a
-    /// lease with too little time left, or a caller-supplied liveness term that has since gone false.
-    void refuseUnlessAdmitted(const CasOperation & op, uint64_t admitted_generation, std::string_view what) const;
+    /// `op.admitted()` folds every reason together -- a moved mount incarnation, a lease with too little
+    /// time left, or a caller-supplied liveness term that has since gone false -- because none of them
+    /// leaves the caller anything more specific to act on than "this admission no longer holds".
+    void refuseUnlessAdmitted(const CasOperation & op, std::string_view what) const;
 
     /// Common candidate predicate for scheduler admission and execution after capture. Caller holds
     /// `rt.state_mutex`; an epoch seal is not state-bearing and cannot be snapshotted.
