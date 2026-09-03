@@ -91,8 +91,12 @@ bool blobPresent(Backend & b, const Layout & layout, const UInt128 & hash)
 class DeposeRoundCommitBackend : public InMemoryBackend
 {
 public:
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    /// The fault sits on the WRITE PRIMITIVE, not the legacy `casPut` verb: `Gc::runRegularRound`
+    /// speaks the primitive directly, and `casPut`'s forwarding is one-way -- overriding it here would
+    /// intercept nothing.
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
     {
         if (arm && key == "p/gc/state")
         {
@@ -105,7 +109,7 @@ public:
                     "test-injected: round-commit gc/state CAS denied (losing leader deposed mid-round)");
             }
         }
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
     bool arm = false;
 };
