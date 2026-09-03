@@ -371,7 +371,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     RoundReport & report = progress ? *progress : local_report;
     report = RoundReport{};
     GcState state;
-    std::optional<Etag> state_incarnation;
+    std::optional<Etag> state_etag;
 
     /// Every exit path waits for this round's meta jobs. The throwing `meta_pool_wait` phase below is
     /// a protocol barrier -- this round's condemns must be durable no later than the ledger they are
@@ -386,7 +386,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// are correlated by `round_id` and not by the round number a follower never learns.
     {
         GcPhaseTimer t(phase_sink, "lease");
-        report.acquired_lease = acquireOrRenewLease(state, state_incarnation, allow_steal);
+        report.acquired_lease = acquireOrRenewLease(state, state_etag, allow_steal);
         t.metric("acquired", report.acquired_lease ? 1 : 0);
         t.metric("steal_allowed", allow_steal ? 1 : 0);
     }
@@ -626,7 +626,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_incarnation, report, new_round, *walk_plan, policy, round_work_budget);
+    FoldResult folded = fold(state, state_etag, report, new_round, *walk_plan, policy, round_work_budget);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -946,12 +946,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
     round_commit_timer->metric("pruned_through", next.snap_pruned_through);
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
-    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_incarnation,
+    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());
     if (std::holds_alternative<Conflict>(commit))
         throw Exception(ErrorCodes::ABORTED,
             "CAS gc round: gc/state moved during the round (another leader advanced it); retry next round");
-    state_incarnation = orThrow(std::move(commit), "CAS gc round commit");
+    state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
     report.round = state.round;
     round_commit_timer->metric("round", report.round);
@@ -1553,7 +1553,7 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
     }
 }
 
-Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_incarnation*/,
+Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                         RoundReport & report,
                         uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy,
                         GcRoundWorkBudget & work_budget)
@@ -3896,8 +3896,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// has_observation==false always takes the non-steal branch on its one and only call), pass it
     /// explicitly rather than rely on that invariant.
     GcState state;
-    std::optional<Etag> state_incarnation;
-    if (!acquireOrRenewLease(state, state_incarnation, /*allow_steal=*/false))
+    std::optional<Etag> state_etag;
+    if (!acquireOrRenewLease(state, state_etag, /*allow_steal=*/false))
     {
         rep.refusal = "another GC leader holds the lease";
         return rep;
@@ -4267,7 +4267,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// family independently of that, and the two reasons are stated apart on purpose — a future reader
     /// must not take this line as evidence that REBUILD still produces condemnations somewhere.
     next.manifest_sweep_cursor = "";
-    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_incarnation,
+    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());
     if (std::holds_alternative<Conflict>(commit))
     {
@@ -4423,7 +4423,7 @@ void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
         op.create(key, body, Retry::once());
 }
 
-bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_incarnation, bool allow_steal)
+bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal)
 {
     CasOperation op = store->openRequests().admit();
     const String key = store->layout().gcStateKey();
@@ -4518,7 +4518,7 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_incarn
 
     rememberObservation(decided.lease);
     state = std::move(decided);
-    state_incarnation = committed;
+    state_etag = committed;
     return true;
 }
 

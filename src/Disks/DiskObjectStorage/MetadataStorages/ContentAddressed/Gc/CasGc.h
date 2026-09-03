@@ -510,10 +510,10 @@ public:
 
 private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds the
-    /// committed gc/state (with our lease) and `state_incarnation` the incarnation that write created.
+    /// committed gc/state (with our lease) and `state_etag` the etag that write created.
     /// `allow_steal=false` suppresses only the steal (see runRegularRound's doc comment) — acquiring a
     /// free lease and renewing our own are unaffected.
-    bool acquireOrRenewLease(GcState & state, std::optional<Etag> & state_incarnation, bool allow_steal);
+    bool acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal);
 
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
@@ -696,7 +696,7 @@ private:
     /// in-memory; the SINGLE round CAS commits them.
     /// `walk_plan` owns the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`) and
     /// its catalog cut; the fold regroups those keys strictly rather than listing the prefix again.
-    FoldResult fold(GcState & state, std::optional<Etag> & state_incarnation,
+    FoldResult fold(GcState & state, std::optional<Etag> & state_etag,
                     RoundReport & report, uint64_t current_round,
                     const RefPlan & walk_plan, UniversePolicy policy,
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
