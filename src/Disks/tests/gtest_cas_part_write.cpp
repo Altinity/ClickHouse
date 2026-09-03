@@ -73,17 +73,33 @@ PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & b)
 /// plane every write below is admitted on. A policy that has to be EXHAUSTED then closes in
 /// microseconds of wall clock instead of ninety real seconds, and a policy that merely reissues costs
 /// no sleep at all, so these tests pin retry semantics and never a schedule.
+/// The clock a test installed on the mount plane, handed back so the test can assert that the pacing
+/// really ran on it. It does not make a LOST injection fast -- each fault double's attempt cap does
+/// that -- but it does say that the reissues this test claims to drive were the injected clock's and
+/// not the wall clock's.
+struct VirtualRequestClock
+{
+    std::shared_ptr<std::atomic<uint64_t>> now;
+    std::shared_ptr<std::atomic<uint64_t>> sleeps;
+};
+
 /// `step_ms` is a FLOOR on how far each sleep moves the clock. A test that must see a policy exhaust
 /// raises it so the window closes after a countable handful of attempts rather than after however many
 /// near-zero jitter draws fit into ninety seconds.
-void useVirtualMountRequestClock(const PoolPtr & store, uint64_t step_ms = 0)
+VirtualRequestClock useVirtualMountRequestClock(const PoolPtr & store, uint64_t step_ms = 0)
 {
-    auto now = std::make_shared<std::atomic<uint64_t>>(0);
-    store->mountRequests().setNowFnForTest([now] { return now->load(); });
+    const VirtualRequestClock clock{std::make_shared<std::atomic<uint64_t>>(0),
+                                    std::make_shared<std::atomic<uint64_t>>(0)};
+    store->mountRequests().setNowFnForTest([now = clock.now] { return now->load(); });
     /// `+ 1` because a jittered draw may be zero, and a clock that can stand still never closes the
     /// window.
     store->mountRequests().setSleepFnForTest(
-        [now, step_ms](uint64_t ms) { now->fetch_add(std::max(ms, step_ms) + 1); });
+        [now = clock.now, sleeps = clock.sleeps, step_ms](uint64_t ms)
+        {
+            sleeps->fetch_add(1);
+            now->fetch_add(std::max(ms, step_ms) + 1);
+        });
+    return clock;
 }
 
 /// Start a build whose owning manifest namespace + final ref name are `ns`/`ref` (promote/stageManifest
@@ -890,7 +906,7 @@ TEST(CASPartWriteTxn, AGiveUpReportsHowManyAttemptsItSent)
 {
     auto b = std::make_shared<AmbiguousMetaWriteBackend>();
     auto s = openPool(b);
-    useVirtualMountRequestClock(s, /*step_ms=*/10'000);
+    const VirtualRequestClock clock = useVirtualMountRequestClock(s, /*step_ms=*/10'000);
     b->attempts = 0;
 
     const BlobRef ref = idOf("give-up-attempt-count");
@@ -903,6 +919,8 @@ TEST(CASPartWriteTxn, AGiveUpReportsHowManyAttemptsItSent)
     EXPECT_GT(gave_up->attempts_sent, 1u) << "the write reissued before it gave up";
     EXPECT_EQ(gave_up->attempts_sent, static_cast<uint32_t>(b->attempts))
         << "every attempt the store saw must be in the count the give-up reports";
+    EXPECT_GT(clock.sleeps->load(), 0u)
+        << "the reissues were paced on the injected clock, so this exhaustion cost no wall time";
 }
 
 /// A persistently-failing freshness-meta write must surface as a controlled retry-later signal, not
@@ -913,7 +931,7 @@ TEST(CASPartWriteTxn, PutBlobFreshMetaExhaustionThrowsRetryLater)
 {
     auto b = std::make_shared<AmbiguousMetaWriteBackend>();
     auto s = openPool(b);
-    useVirtualMountRequestClock(s, /*step_ms=*/10'000);
+    const VirtualRequestClock clock = useVirtualMountRequestClock(s, /*step_ms=*/10'000);
 
     const String payload = "fresh-meta-exhaustion-payload";
     auto build = precommittedBuildForPayload(
@@ -922,6 +940,9 @@ TEST(CASPartWriteTxn, PutBlobFreshMetaExhaustionThrowsRetryLater)
     {
         build->putBlob(idOf(payload), BlobSource::fromString(payload));
     });
+
+    EXPECT_GT(clock.sleeps->load(), 0u)
+        << "the reissues were paced on the injected clock, so this exhaustion cost no wall time";
 
     /// The body itself landed (only .meta writes are faulted) -- confirming the failure is
     /// specifically the freshness marker, not the blob body.
@@ -2541,7 +2562,7 @@ TEST(CASPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
 {
     auto b = std::make_shared<ManifestPutFaultBackend>();
     auto s = openPool(b);
-    useVirtualMountRequestClock(s, /*step_ms=*/10'000);
+    const VirtualRequestClock clock = useVirtualMountRequestClock(s, /*step_ms=*/10'000);
     const RootNamespace ns{"srv/tbl"};
 
     auto build = startBuildFor(s, ns, "part_exhausted");
@@ -2553,6 +2574,8 @@ TEST(CASPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
     });
     EXPECT_GT(b->put_attempts, 1) << "the ambiguous attempt must be reissued before the write gives up";
     EXPECT_LE(b->put_attempts, b->attempt_cap) << "the policy's window, not the double's cap, ended it";
+    EXPECT_GT(clock.sleeps->load(), 0u)
+        << "the reissues were paced on the injected clock, so this exhaustion cost no wall time";
     /// Over the namespace's whole manifest prefix rather than one computed key: the ordinal the build
     /// would have used is arithmetic this assertion should not have to reproduce to stay true.
     EXPECT_TRUE(b->list(s->layout().manifestNamespacePrefix(ns), "", 10).keys.empty())
