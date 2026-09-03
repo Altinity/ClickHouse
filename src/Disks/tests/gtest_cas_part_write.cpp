@@ -2766,12 +2766,13 @@ TEST(CASPartWrite, EveryPhysicalPublicationMintsAFreshIncarnationTag)
         << "a repeated incarnation_tag is a repeated incarnation: GC's condemn would name the live body";
 }
 
-/// "One `Retry::standard()`" is one policy VALUE, not one shared deadline: each verb of the
-/// publication loop binds its own window from it, so a loop that has already spent far more than one
-/// window still publishes. Here each ambiguous publication burns forty seconds of the injected clock,
-/// so three of them exceed the standard ninety-second window; a loop that carried a single bound
-/// across its iterations would refuse the fourth iteration's HEAD instead of committing.
-TEST(CASPartWrite, EnsureBlobPresentSharesOneRetryAcrossItsLoop)
+/// The publication loop captures ONE bound before it starts, and every verb of every iteration shares
+/// it -- so eight iterations cannot spend eight ninety-second windows. Here each ambiguous
+/// publication burns forty seconds of the injected clock, so the third one carries the loop past the
+/// window it captured and the next iteration's HEAD refuses to start. The insert is refused as
+/// retry-later, which is what a caller can act on; the alternative is a single blob upload sitting on
+/// the request for twenty-five minutes. The eight-attempt cap stays as the secondary bound.
+TEST(CASPartWrite, EnsureBlobPresentIsBoundedByTheOneWindowItCaptured)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     auto s = openBlobFaultPool(b);
@@ -2788,11 +2789,13 @@ TEST(CASPartWrite, EnsureBlobPresentSharesOneRetryAcrossItsLoop)
 
     int payload_streams = 0;
     b->fault_count = 3;
-    const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
-    EXPECT_EQ(res.size, payload.size());
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        (void)build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+    });
 
-    EXPECT_EQ(b->publish_stream_attempts, 4) << "three ambiguous publications + the committing fourth";
-    EXPECT_GT(now->load(), 90'000u) << "the loop outlived one standard window, which is the point";
+    EXPECT_EQ(b->publish_stream_attempts, 3) << "the fourth iteration must not start a publication";
+    EXPECT_LT(now->load(), 2 * 90'000u) << "the loop outlived the window it captured";
 }
 
 namespace

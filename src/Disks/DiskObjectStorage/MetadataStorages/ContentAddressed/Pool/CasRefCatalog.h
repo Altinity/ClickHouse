@@ -32,7 +32,9 @@ public:
 
     /// Reads and decodes the mandatory current catalog. Absence is corruption, never an empty
     /// authority set: without the catalog, opaque life keys cannot prove ownership.
-    static Snapshot read(CasOperation & op, const Layout & layout);
+    /// `policy` lets a hand-written loop pass the bound it froze at entry, so its resolution reads end
+    /// with the rest of the loop instead of each starting a fresh window.
+    static Snapshot read(CasOperation & op, const Layout & layout, const Retry & policy = Retry::standard());
 
     /// Materializes the explicit empty catalog for a prefix already proven new by
     /// `probePoolBootstrapResidual`. This is the only absence-tolerant catalog operation: no

@@ -1583,11 +1583,13 @@ TEST(CASRefCatalogRemoval, ACommitTheResolutionReadContradictsFailsRetryLaterIns
         << "the message must name the life still observed: " << message;
 }
 
-/// After the migration this cap is the ONLY bound the hand-written loop has of its own, so it is worth
-/// proving it ends the call rather than letting a permanently contended catalog spin. Every erase is
-/// refused, the injected clock absorbs every paced retry, and the loop stops on its attempt count --
-/// which the message says, and which is what tells it apart from a deadline.
-TEST(CASRefCatalogRemoval, PerpetualConflictEndsAtTheAttemptCapAndSaysSo)
+/// The loop captures ONE bound before it starts and every call it makes shares it, so a permanently
+/// contended catalog gives up "retry later" inside one standard window rather than spending a fresh
+/// window per verb across a hundred paced iterations -- which is hours against a document that
+/// promises ninety seconds. Every erase is refused and the injected clock absorbs every paced retry,
+/// so what ends the call is visible in the virtual time it took. The attempt cap stays as the
+/// secondary bound; it is not what ends this call.
+TEST(CASRefCatalogRemoval, PerpetualConflictGivesUpWithinOneWindowNotAtTheAttemptCap)
 {
     class AlwaysRefusesCatalogWrites final : public WriteCountingBackend
     {
@@ -1637,6 +1639,7 @@ TEST(CASRefCatalogRemoval, PerpetualConflictEndsAtTheAttemptCapAndSaysSo)
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
     backend->refused_key = layout.refCatalogKey();
 
+    const uint64_t start = clock.now;
     String message;
     try
     {
@@ -1648,12 +1651,14 @@ TEST(CASRefCatalogRemoval, PerpetualConflictEndsAtTheAttemptCapAndSaysSo)
         EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
         message = e.message();
     }
-    EXPECT_NE(message.find("did not converge"), String::npos)
-        << "the cap, not a deadline, is what ended this call: " << message;
-    /// One erase per iteration and one pause after each, so these agree exactly -- and both being
-    /// greater than one is what proves the loop iterated rather than failing on its first attempt.
-    EXPECT_EQ(backend->refusedAttempts(), clock.sleeps.size());
-    EXPECT_GT(clock.sleeps.size(), 1u);
+    EXPECT_NE(message.find("deadline"), String::npos)
+        << "the shared bound, not the attempt cap, is what ended this call: " << message;
+    /// Two windows, so the assertion survives the jitter of the paced retries while still failing a
+    /// loop that binds a fresh window per iteration -- that one spends minutes here.
+    EXPECT_LT(clock.now - start, 2 * 90'000u) << "the loop outlived the window it captured";
+    EXPECT_LT(backend->refusedAttempts(), 100u) << "the attempt cap must not be what ends this call";
+    /// Greater than one is what proves the loop iterated rather than failing on its first attempt.
+    EXPECT_GT(backend->refusedAttempts(), 1u);
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
 }
 

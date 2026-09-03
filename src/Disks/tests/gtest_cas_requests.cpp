@@ -117,6 +117,50 @@ TEST(CASRetry, PoliciesAreShapedAsSpecified)
     EXPECT_EQ(Retry::within(1'000).bind(now).deadline_ms, now + 1'000);
 }
 
+/// A frozen policy is ONE absolute deadline: time passing does not buy a later one, freezing again
+/// cannot extend it, and the lease bound still wins when it is the smaller of the two -- which is what
+/// keeps `GaveUp::Source` able to say which bound refused.
+TEST(CASRetry, AFrozenPolicyIsOneDeadlineAndTheLeaseStillWins)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    const uint64_t start = clock.now;
+    const Retry frozen = op.freeze(Retry::standard());
+    ASSERT_TRUE(frozen.policy_deadline_ms.has_value());
+    EXPECT_EQ(frozen.bind(start).deadline_ms, start + 90'000);
+    EXPECT_EQ(frozen.bind(start + 50'000).deadline_ms, start + 90'000);
+    EXPECT_FALSE(frozen.bind(start + 50'000).lease_bound);
+    /// The single-attempt view of a frozen policy keeps the deadline rather than starting a window.
+    EXPECT_EQ(frozen.asSingleAttempt().policy_deadline_ms, frozen.policy_deadline_ms);
+    EXPECT_TRUE(frozen.asSingleAttempt().single_attempt);
+
+    clock.now += 50'000;
+    EXPECT_EQ(op.freeze(frozen).policy_deadline_ms, frozen.policy_deadline_ms);
+
+    const Retry::Bound leashed = op.freeze(Retry::untilLeaseSafe(start + 10'000, 2'000)).bind(clock.now);
+    EXPECT_EQ(leashed.deadline_ms, start + 8'000);
+    EXPECT_TRUE(leashed.lease_bound);
+}
+
+/// Freezing belongs to a loop. A single verb still gets a full window from where it is called, however
+/// long its caller has already been running.
+TEST(CASRequests, ALoneReadUnderTheStandardPolicyStillGetsItsFullWindow)
+{
+    FakeClock clock;
+    auto throttled = std::make_shared<ThrottlingBackend>(
+        std::make_shared<InMemoryBackend>(), ThrottlingBackend::Mode::EveryNth, 1, 429);
+    auto requests = makeRequests(throttled, clock);
+    auto op = requests.admit();
+
+    clock.now += 10 * 90'000;
+    const uint64_t start = clock.now;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)op.read("k", Retry::standard()); });
+    EXPECT_GE(clock.now - start, 85'000u);
+}
+
 TEST(CASWriteResult, OrThrowMapsEveryAlternative)
 {
     /// The two that are not failures: a commit hands back its incarnation, a decline hands back

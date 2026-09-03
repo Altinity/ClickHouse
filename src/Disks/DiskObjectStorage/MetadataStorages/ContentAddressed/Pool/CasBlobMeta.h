@@ -32,7 +32,11 @@ struct LoadedMeta
 ///
 /// Returns the current decoded marker and the incarnation to guard the next write with, or nullopt
 /// when the meta key is absent. Decoding errors propagate as exceptions.
-std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, const BlobRef & ref);
+///
+/// `policy` lets a hand-written loop pass the bound it froze at entry, so this read ends with the rest
+/// of the loop instead of starting a fresh window. Same for `putMetaIfAbsent` below.
+std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,
+                                   const Retry & policy = Retry::standard());
 
 /// Creates the marker only when its key is absent, on the plane `op` belongs to -- like its siblings,
 /// so one caller's decision cannot end up split across two fences. Anything at the key that this call
@@ -41,7 +45,7 @@ std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, con
 /// was observed, never as a throw: this marker is mutable, so a pre-existing different value is an
 /// expected outcome rather than corruption.
 WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const BlobRef & ref,
-                            const BlobMeta & meta);
+                            const BlobMeta & meta, const Retry & policy = Retry::standard());
 
 /// Replaces the marker only when its current incarnation is `expected`, on the plane `op` belongs to.
 /// A competing write is reported as `Conflict` carrying what the resolve read observed, never thrown,

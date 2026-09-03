@@ -19,12 +19,14 @@ uint64_t Retry::backoff(uint32_t attempt)
 
 Retry::Bound Retry::bind(uint64_t now_ms) const
 {
-    const uint64_t policy_deadline_ms = now_ms > std::numeric_limits<uint64_t>::max() - window_ms
-        ? std::numeric_limits<uint64_t>::max()
-        : now_ms + window_ms;
-    if (lease_deadline_ms && *lease_deadline_ms < policy_deadline_ms)
+    const uint64_t own_deadline_ms = policy_deadline_ms
+        ? *policy_deadline_ms
+        : (now_ms > std::numeric_limits<uint64_t>::max() - window_ms
+               ? std::numeric_limits<uint64_t>::max()
+               : now_ms + window_ms);
+    if (lease_deadline_ms && *lease_deadline_ms < own_deadline_ms)
         return {*lease_deadline_ms, true};
-    return {policy_deadline_ms, false};
+    return {own_deadline_ms, false};
 }
 
 }

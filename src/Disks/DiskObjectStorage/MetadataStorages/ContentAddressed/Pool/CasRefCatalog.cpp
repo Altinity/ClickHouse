@@ -43,9 +43,10 @@ namespace
     throw Exception(ErrorCodes::LOGICAL_ERROR, "{}: the write was declined, which this call cannot produce", what);
 }
 
-CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout & layout)
+CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout & layout,
+                                                const Retry & policy = Retry::standard())
 {
-    const std::optional<Object> got = op.read(layout.refCatalogKey(), Retry::standard());
+    const std::optional<Object> got = op.read(layout.refCatalogKey(), policy);
     if (!got)
     {
         RefCatalog empty;
@@ -59,9 +60,9 @@ CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout
 
 }
 
-CasRefCatalog::Snapshot CasRefCatalog::read(CasOperation & op, const Layout & layout)
+CasRefCatalog::Snapshot CasRefCatalog::read(CasOperation & op, const Layout & layout, const Retry & policy)
 {
-    Snapshot snapshot = readOptionalForBootstrap(op, layout);
+    Snapshot snapshot = readOptionalForBootstrap(op, layout, policy);
     if (!snapshot.etag)
         throwMandatoryCatalogAbsent(layout.refCatalogKey());
     return snapshot;
@@ -139,11 +140,9 @@ struct CatalogCreatorStillLiveMarker : std::exception {};
 /// the catalog is a single object mutated by every lifecycle transition of every namespace in the
 /// pool, so persistent contention is a real, not theoretical, exit condition to plan for.
 ///
-/// It bounds ATTEMPTS, not time. Each iteration binds its own window per verb and pauses between
-/// iterations, so the aggregate wall clock of one call is this cap times a backoff plus two verb
-/// windows -- hours in the worst case. That is accepted because the only caller is the GC pre-fold
-/// drain: a background round that may take as long as it takes, and whose next round re-derives
-/// everything anyway. A foreground path must not adopt this loop without a wall-clock bound.
+/// It bounds ATTEMPTS, and is the SECONDARY bound: the loop freezes one `Retry` before it starts and
+/// every verb of every iteration shares that absolute deadline, so wall-clock time is already bounded
+/// by one standard window. This cap exists so a call that somehow converges on neither still ends.
 constexpr size_t kMaxCatalogCasAttempts = 100;
 
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
@@ -447,9 +446,11 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             .catalog_snapshot = std::move(catalog_snapshot)};
     };
 
-    /// ONE policy value for every erase this loop sends. Each call binds its own window when it is
-    /// made; what is shared is the policy, not a deadline.
-    const Retry policy = Retry::standard();
+    /// ONE bound for the whole loop, frozen before the first iteration: every erase, every resolution
+    /// read and every paced retry below shares this deadline, so a permanently contended catalog gives
+    /// up retry-later within one standard window rather than spending a fresh window per verb per
+    /// iteration.
+    const Retry policy = op.freeze(Retry::standard());
 
     for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
     {
@@ -484,7 +485,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         /// The response to a conditional erase is not authority for what became durable. Resolve every
         /// attempted erase through one complete catalog read. This snapshot is also the next
         /// retry/selection cut, so no second read separates them.
-        catalog_snapshot = read(op, layout);
+        catalog_snapshot = read(op, layout, policy);
 
         const auto current_it = findEntry(catalog_snapshot.catalog, observed.ns);
         const bool old_life_still_cataloged = current_it != catalog_snapshot.catalog.entries.end()

@@ -273,9 +273,14 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     /// a dependency under an incarnation the precommit never saw. The build's own facts -- cancellation
     /// and a superseded writer epoch -- stay in `requireAlive`, where each states which one refused.
     CasOperation op = store->mountRequests().resume(txn_generation);
-    /// One policy value, `Retry::standard()`, named here for the requests this function issues
-    /// directly; the shared helpers it calls construct the same value themselves.
-    const Retry policy = Retry::standard();
+    /// ONE bound for the whole publication loop, frozen before it starts: every HEAD, marker write and
+    /// paced retry below shares this deadline, so a body whose publication keeps coming back ambiguous
+    /// is refused as retry-later inside one standard window instead of spending a fresh window per
+    /// verb across eight iterations. The attempt cap below is the secondary bound.
+    const Retry policy = op.freeze(Retry::standard());
+    /// The unrepeatable publication, under the SAME bound: the engine may never reissue an envelope
+    /// (see the publication call below), but the loop's deadline still governs whether one may start.
+    const Retry publication_policy = policy.asSingleAttempt();
 
     const BlobRef & ref = req.ref;
     const BlobSource & source = req.source;
@@ -405,7 +410,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     logical_size,
                     source.size);
 
-            const std::optional<LoadedMeta> loaded = loadMeta(op, store->layout(), ref);
+            const std::optional<LoadedMeta> loaded = loadMeta(op, store->layout(), ref, policy);
             if (loaded)
                 validateMetaSize(loaded->meta);
 
@@ -422,7 +427,8 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                         op,
                         store->layout(),
                         ref,
-                        BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
+                        BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size},
+                        policy);
                 }
                 requireAdmitted("before the body-put-avoided observation is recorded");
                 ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
@@ -476,7 +482,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// Every physical publication therefore mints its own envelope -- each iteration of this
             /// loop builds one -- and the engine may never reissue one. The verbatim staged copy is
             /// additionally a once-only privilege `beginPublication` spends.
-            op.publish(BlobPublishRequest{key, std::move(publication)}, Retry::once());
+            op.publish(BlobPublishRequest{key, std::move(publication)}, publication_policy);
         }
         catch (const std::exception & error)
         {

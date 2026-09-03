@@ -305,6 +305,15 @@ uint64_t CasOperation::reservedFor(uint64_t sleep_ms, uint32_t envelopes) const
     return total;
 }
 
+Retry CasOperation::freeze(const Retry & policy) const
+{
+    if (policy.policy_deadline_ms)
+        return policy;
+    Retry frozen = policy;
+    frozen.policy_deadline_ms = saturatingAdd(owner.now_ms(), policy.window_ms);
+    return frozen;
+}
+
 bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
 {
     /// Strict at the boundary. A backend with no attempt timeout reserves 0 and full jitter can draw a
