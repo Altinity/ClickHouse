@@ -7,7 +7,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
 #include "cas_test_helpers.h"
 
@@ -230,57 +229,24 @@ TEST(CASBackendPrimitives, EveryBackendInstanceHasItsOwnId)
     EXPECT_EQ(a->dialect(), Dialect::Emulated);
 }
 
-namespace
+/// `EveryLegacyVerbReachesAnOverrideOfThePrimitiveItForwardsTo` pinned the legacy verbs
+/// (`putIfAbsent`/`casPut`/`putOverwrite`) forwarding through the primitive `write`. Those verbs are
+/// gone -- `CasOperation` is the only caller of `Backend` now -- so the property is a type-level
+/// guarantee rather than a runtime check; every fault double in this file that overrides `write` (e.g.
+/// `EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite` below) is what proves a double sees every write.
+
+TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite)
 {
-
-/// Counts every call that reaches the primitive `write`, whichever surface it entered through.
-struct WriteCountingBackend : InMemoryBackend
-{
-    size_t writes = 0;
-
-    std::expected<String, RawConflict> write(const String & k, const String & v, const std::optional<String> & e,
-                                             TransportAccess & a) override
-    {
-        ++writes;
-        return InMemoryBackend::write(k, v, e, a);
-    }
-};
-
-}
-
-TEST(CASBackendPrimitives, EveryLegacyVerbReachesAnOverrideOfThePrimitiveItForwardsTo)
-{
-    /// The migration rule: the new methods are the primitives, and a fault injection written against a
-    /// NEW signature intercepts a legacy caller too, because every legacy verb forwards through the
-    /// virtual. No verb is exempt -- an exemption would leave a double blind to whichever surface its
-    /// subject happens to use.
-    auto b = std::make_shared<WriteCountingBackend>();
-    FakeClock clock;
-    auto requests = makeRequests(b, clock);
-    auto op = requests.admit();
-    const std::optional<Etag> first = orThrow(op.create("k", "v", Retry::once()), "create");
-    ASSERT_TRUE(first);
-    b->writes = 0;
-
-    EXPECT_EQ(b->putIfAbsent("k2", "v").outcome, PutOutcome::Done);
-    EXPECT_EQ(b->casPut("k3", "v", std::nullopt).outcome, CasOutcome::Committed);
-    EXPECT_EQ(b->putOverwrite("k", "w", b->head("k").token).outcome, PutOutcome::Done);
-    EXPECT_EQ(b->writes, 3u);
-}
-
-TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotWhicheverSurfaceConsumesIt)
-{
-    /// A knob names a KEY, not a verb: the keyed `write` every surface reaches cannot see which verb
-    /// its caller used, so a knob scoped to one verb would fire or not fire on where the caller
-    /// happened to enter rather than on what it did.
+    /// A knob names a KEY, not a call site: the keyed `write` every write reaches, whichever
+    /// `CasOperation` verb (`create`/`replace`) issued it.
     auto b = std::make_shared<InMemoryBackend>();
     FakeClock clock;
     auto requests = makeRequests(b, clock);
     auto op = requests.admit();
 
     b->refuseNextWrite("k");
-    EXPECT_EQ(b->putIfAbsent("k", "v").outcome, PutOutcome::PreconditionFailed);   /// consumed here
-    EXPECT_EQ(b->putIfAbsent("k", "v").outcome, PutOutcome::Done);                 /// and only once
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k", "v", Retry::once())));   /// consumed here
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k", "v", Retry::once())));  /// and only once
     expectBytes(b, "k", "v");
 
     b->refuseNextWrite("k2");
@@ -288,9 +254,9 @@ TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotWhicheverSurfaceConsume
     EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k2", "v", Retry::once())));
 
     b->injectAmbiguousWrite("k3");
-    EXPECT_THROW(b->casPut("k3", "v", std::nullopt), Poco::TimeoutException);
-    EXPECT_FALSE(b->get("k3").has_value()) << "an ambiguous write leaves the store untouched";
-    EXPECT_EQ(b->casPut("k3", "v", std::nullopt).outcome, CasOutcome::Committed);
+    EXPECT_TRUE(std::holds_alternative<GaveUp>(op.create("k3", "v", Retry::once())));
+    EXPECT_FALSE(op.read("k3", Retry::once()).has_value()) << "an ambiguous write leaves the store untouched";
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k3", "v", Retry::once())));
 
     /// Both knobs on one key, each consumed by the next write in turn.
     b->injectAmbiguousWrite("k4");
@@ -300,48 +266,26 @@ TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotWhicheverSurfaceConsume
     EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k4", "v", Retry::once())));
 }
 
-TEST(CASBackendPrimitives, LegacyGetRefusesAValueThatIsNotAnIncarnation)
+TEST(CASBackendPrimitives, ReadRefusesAValueThatIsNotAnIncarnation)
 {
-    /// `read` hands back whatever the store said, malformed included -- settling that is the caller's.
-    /// The legacy forwarder has no caller to settle it: it would hand the value on as a `Token` that
-    /// the next conditional operation refuses as a caller bug, one layer too late to name the key.
+    /// `read` hands back whatever the store said, malformed included -- `CasRequests::mint` is what
+    /// refuses it, naming the key, before any caller can see it as an `Etag`.
     struct EmptyValueBackend : InMemoryBackend
     {
         std::optional<Raw> read(const String &, TransportAccess &) override { return Raw{"body", ""}; }
     };
     auto b = std::make_shared<EmptyValueBackend>();
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { b->get("k"); });
+    FakeClock clock;
+    auto requests = makeRequests(b, clock);
+    auto op = requests.admit();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { op.read("k", Retry::once()); });
 }
 
-namespace
-{
-
-/// A double whose fault injection is written against the LEGACY surface, the way almost every one in
-/// this suite is. A `Pool` hands its callers a decorator, so a legacy call reaches the decorator
-/// first: if the decorator converted it to a primitive before forwarding, this override would never
-/// run and the injection would be silently dead.
-struct LegacyCasPutFlaggingBackend : DB::Cas::tests::CountingBackend
-{
-    bool legacy_cas_put_ran = false;
-
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
-    {
-        legacy_cas_put_ran = true;
-        return CountingBackend::casPut(key, bytes, expected, meta);
-    }
-};
-
-}
-
-TEST(CASBackendPrimitives, InstrumentedBackendPassesALegacyCallThroughAsLegacy)
-{
-    auto inner = std::make_shared<LegacyCasPutFlaggingBackend>();
-    InstrumentedBackend instrumented(inner);
-    EXPECT_EQ(instrumented.casPut("k", "v", std::nullopt).outcome, CasOutcome::Committed);
-    EXPECT_TRUE(inner->legacy_cas_put_ran);
-    EXPECT_EQ(inner->writeCount("k"), 1u);
-}
+/// `InstrumentedBackendPassesALegacyCallThroughAsLegacy` pinned `InstrumentedBackend` delegating the
+/// legacy `casPut` verb to its inner backend unconverted. `Backend` has no legacy verbs left --
+/// `InstrumentedBackend` is a pure primitive decorator now -- and its primitive delegation (`write` and
+/// every other primitive, classified and counted) is what `CASInstrumentedBackend.ClassifierAndPerNamespaceOpEvents`
+/// (gtest_cas_backend.cpp) pins.
 
 TEST(CASBackendPrimitives, RefreshCredentialsIsOffUntilAskedFor)
 {
@@ -385,15 +329,10 @@ TEST(CASThrottlingBackend, RefusalsAreRetryableUnderBothStatuses)
     }
 }
 
-TEST(CASThrottlingBackend, PassesALegacyCallThroughAsLegacy)
-{
-    auto inner = std::make_shared<LegacyCasPutFlaggingBackend>();
-    /// A period no call here reaches, so nothing is refused: what this pins is the pass-through.
-    auto t = std::make_shared<ThrottlingBackend>(inner, ThrottlingBackend::Mode::EveryNth, 1000, 503);
-    EXPECT_EQ(t->casPut("k", "v", std::nullopt).outcome, CasOutcome::Committed);
-    EXPECT_TRUE(inner->legacy_cas_put_ran);
-    EXPECT_EQ(inner->writeCount("k"), 1u);
-}
+/// `PassesALegacyCallThroughAsLegacy` pinned `ThrottlingBackend` delegating the legacy `casPut` verb
+/// unconverted. `Backend` has no legacy verbs left; `ThrottlingBackend`'s primitive pass-through is
+/// pinned by `FirstPerKeyRefusesOnceAndTheCallStillSucceeds` above and `EveryNthRefusesOnThePeriodAcrossKeys`
+/// below, both of which drive it through `CasOperation`.
 
 TEST(CASThrottlingBackend, EveryNthRefusesOnThePeriodAcrossKeys)
 {
