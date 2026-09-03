@@ -740,6 +740,18 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
 QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr & storage_snapshot, SelectQueryInfo & query_info) const
 {
+    /// EXPERIMENTAL diagnostic (see object_storage_cluster_bypass_join_wrap in PlannerJoinTree.cpp).
+    LOG_WARNING(
+        getLogger("StorageObjectStorageCluster"),
+        "OSC_STAGE table={} original_cluster='{}' resolved_cluster='{}' "
+        "cluster_supported={} query_kind={} to_stage={}",
+        getStorageID().getFullTableName(),
+        getOriginalClusterName(),
+        getClusterName(context),
+        isClusterSupported(),
+        static_cast<int>(context->getClientInfo().query_kind),
+        QueryProcessingStage::toString(to_stage));
+
     if (!isClusterSupported())
         return QueryProcessingStage::Enum::FetchColumns;
 

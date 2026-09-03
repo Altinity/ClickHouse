@@ -2139,6 +2139,22 @@ Possible values:
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.` Right table executes first and is added to the secondary query as temporay table.
 - `allow` — Default value. Allows the use of these types of subqueries.
 )", 0) \
+    DECLARE(Bool, object_storage_cluster_bypass_join_wrap, false, R"(
+Experimental. When enabled, disables the safety guard in the query planner that
+normally wraps a leftmost `IStorageCluster` table expression (e.g. `s3Cluster`,
+`icebergCluster`, or a DataLake table converted to `StorageObjectStorageCluster`
+under parallel replicas) into a subquery whenever the query has multiple table
+expressions (i.e. a JOIN). With this setting enabled, such a source may receive
+the full JOIN query and, together with `object_storage_cluster_join_mode='allow'`,
+execute the JOIN and partial aggregation on the remote workers instead of pulling
+all probe-side rows back to the initiator.
+
+This is only safe when every table expression in the query is resolvable on all
+remote nodes of the cluster (e.g. tables backed by the same shared catalog). It is
+not safe in general for `IStorageCluster` sources whose remote nodes may not have
+access to the other tables referenced by the JOIN, which is why the guard exists
+and is enabled by default (`object_storage_cluster_bypass_join_wrap=false`).
+)", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.

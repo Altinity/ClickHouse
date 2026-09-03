@@ -751,6 +751,22 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     if (cluster_name.empty() && can_use_parallel_replicas && !is_secondary_query)
         cluster_name = parallel_replicas_cluster_name;
 
+    /// EXPERIMENTAL diagnostic (see object_storage_cluster_bypass_join_wrap in PlannerJoinTree.cpp): trace
+    /// why can_use_parallel_replicas may end up false for a DataLake table under a JOIN.
+    LOG_WARNING(
+        log,
+        "DLPR table={} cluster_for_pr='{}' parallel_cluster_engines={} "
+        "can_task_pr={} is_distributed={} query_kind={} "
+        "can_use_pr={} final_cluster='{}'",
+        name,
+        parallel_replicas_cluster_name,
+        static_cast<bool>(query_settings[Setting::parallel_replicas_for_cluster_engines]),
+        context_->canUseTaskBasedParallelReplicas(),
+        context_->isDistributed(),
+        static_cast<int>(context_->getClientInfo().query_kind),
+        can_use_parallel_replicas,
+        cluster_name);
+
     auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,

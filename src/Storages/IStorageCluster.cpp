@@ -64,6 +64,7 @@ namespace Setting
     extern const SettingsBool object_storage_remote_initiator;
     extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
+    extern const SettingsBool object_storage_cluster_bypass_join_wrap;
 }
 
 namespace ErrorCodes
@@ -374,6 +375,16 @@ void IStorageCluster::read(
     auto cluster_name_from_settings = getClusterName(context);
     const auto & settings = context->getSettingsRef();
     ASTPtr query_to_send = query_info.query;
+
+    /// EXPERIMENTAL (see object_storage_cluster_bypass_join_wrap in PlannerJoinTree.cpp): when the JOIN
+    /// leftmost-table wrap is bypassed, query_info.query (built via queryNodeToSelectQuery() with
+    /// set_subquery_cte_name=true) may reference a CTE like `appinfo_d` by name only -- CTEs are only defined at
+    /// the top-level query and are not sent to the remote node, causing "Unknown table expression identifier"
+    /// errors there. queryNodeToDistributedSelectQuery() (already used below by
+    /// updateQueryWithJoinToSendIfNeeded() for the LOCAL/GLOBAL join modes) forces every CTE subquery to be
+    /// serialized by its body instead of by name, which is what the remote node needs.
+    if (settings[Setting::object_storage_cluster_bypass_join_wrap] && query_info.query_tree)
+        query_to_send = queryNodeToDistributedSelectQuery(query_info.query_tree);
 
     if (cluster_name_from_settings.empty())
     {

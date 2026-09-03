@@ -119,6 +119,7 @@ namespace Setting
     extern const SettingsFloat max_streams_to_max_threads_ratio;
     extern const SettingsMaxThreads max_threads;
     extern const SettingsUInt64 max_threads_min_free_memory_per_thread;
+    extern const SettingsBool object_storage_cluster_bypass_join_wrap;
     extern const SettingsBool optimize_sorting_by_input_stream_properties;
     extern const SettingsBool optimize_trivial_count_query;
     extern const SettingsUInt64 parallel_replicas_count;
@@ -2108,7 +2109,15 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     bool should_wrap_left_table = false;
     bool has_multiple_tables = table_expressions_stack.size() > 1;
 
-    if (has_multiple_tables)
+    /// EXPERIMENTAL A/B SETTING (not for production): bypasses the IStorageCluster wrapping guard
+    /// so object-storage-cluster sources (e.g. StorageObjectStorageCluster / Iceberg) can receive
+    /// the full JOIN query and execute JOIN + partial aggregation on the workers instead of the
+    /// initiator. See object_storage_cluster_join_mode in IStorageCluster.cpp for the remote-side
+    /// handling. Off by default; enable per-query with SETTINGS object_storage_cluster_bypass_join_wrap=1.
+    bool experimental_bypass_cluster_join_wrap =
+        planner_context->getQueryContext()->getSettingsRef()[Setting::object_storage_cluster_bypass_join_wrap];
+
+    if (has_multiple_tables && !experimental_bypass_cluster_join_wrap)
     {
         // Get the actual storage to check its type
         auto * table_node = left_table_expression->as<TableNode>();
@@ -2220,6 +2229,14 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
 
             /** If table expression is remote and it is not left most table expression, we wrap read columns from such
               * table expression in subquery.
+              *
+              * REVERTED experimental bypass here (see git history): the wrap turned out to be doing useful
+              * required-column preservation for the RHS lookup table. Bypassing it dropped JOIN-only key
+              * columns (e.g. city_ascii/state_ascii/iso2) once the RHS's read routed through
+              * IStorageCluster::read()'s cluster-forwarding branch (see IStorageCluster.cpp:453 --
+              * unconditional on cluster_name being non-empty, independent of processed_stage). The actual
+              * fix belongs upstream of this wrap decision: make sure the RHS's resolved cluster name stays
+              * empty (readFallBackToPure(), not ReadFromCluster) rather than skipping this wrap.
               */
             bool is_remote = planner_context->getTableExpressionDataOrThrow(table_expression).isRemote();
             query_plans_stack.push_back(buildQueryPlanForTableExpression(

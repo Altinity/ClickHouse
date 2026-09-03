@@ -42,6 +42,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.6.2.20001.altinityantalya",
         {
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"object_storage_cluster_bypass_join_wrap", false, false, "Experimental setting to allow IStorageCluster sources (e.g. Iceberg StorageObjectStorageCluster) to receive the full JOIN query instead of being wrapped in a subquery, so JOIN + partial aggregation can run on parallel-replica workers."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

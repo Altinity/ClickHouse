@@ -27,8 +27,21 @@ public:
 
     bool shouldReplaceWithClusterAlternatives() const
     {
-        return subquery_count <= 1 && !has_join && ((table_count + table_function_count) == 1 || (table_function_count == 0));
+        return !has_join && shouldReplaceWithClusterAlternativesIgnoringJoin();
     }
+
+    /// EXPERIMENTAL (see object_storage_cluster_bypass_join_wrap in PlannerJoinTree.cpp): same restrictions
+    /// as shouldReplaceWithClusterAlternatives() except the has_join prohibition, for the narrow opt-in case
+    /// of a direct DataLake-catalog JOIN where every table expression is resolvable on all cluster nodes.
+    bool shouldReplaceWithClusterAlternativesIgnoringJoin() const
+    {
+        return subquery_count <= 1 && ((table_count + table_function_count) == 1 || (table_function_count == 0));
+    }
+
+    size_t getTableCount() const { return table_count; }
+    size_t getTableFunctionCount() const { return table_function_count; }
+    size_t getSubqueryCount() const { return subquery_count; }
+    bool hasJoin() const { return has_join; }
 
 private:
     size_t table_count = 0;
