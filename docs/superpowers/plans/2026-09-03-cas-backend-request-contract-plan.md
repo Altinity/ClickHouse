@@ -1666,6 +1666,8 @@ A test file not named above is owned by the unit whose production file it exerci
 | `TokenFields::build → PersistedIncarnation`; `writeTokenFields(out, first, const PersistedIncarnation &)`; `RetiredEntry/CondemnedRow/OutcomeEntry` persisted fields → `PersistedIncarnation`; `SourceEdgeRecord::token → PersistedIncarnation` | (U11) |
 | `openRequestsForTest(std::shared_ptr<Backend>) → CasRequests` over `Fence::open()`; `CountingBackend` counts on the primitives | (U12) |
 
+**Verification harnesses:** any script or compile command a unit writes for itself lives under a path named for the unit (e.g. `tmp/units/<unit>/`), never a shared scratch file — two agents overwrote each other's syntax-replay script during Task 5.
+
 **Commit discipline in the shared worktree** (every unit's brief carries it verbatim): commit ONLY with
 pathspecs — `git commit -m "<msg>" -- <own files>` — never `git add -A`, never `git commit -a`, never a
 bare `git commit` (the index is shared: another unit's staged files would ride into your commit); on
