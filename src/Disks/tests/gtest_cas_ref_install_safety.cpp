@@ -135,52 +135,24 @@ private:
     uint64_t longest_pause = 0;
 };
 
-/// `ChunkFaultBackend` COUNTS its faults, and a count can no longer make one conclusive: the write
-/// engine settles every ambiguity by an exact read and then REISSUES, so a fault that runs out
-/// mid-call is answered by the next attempt instead of by the call's own deadline -- which is the
-/// whole difference between a wedge and a commit. This keeps the fault armed until the test clears
-/// the latch, on BOTH legs: the write's, and the lost read that `Mode::LandedThenLost` arms. The read
-/// leg matters just as much, because a readable key proves the commit inside the very same call.
-class LatchedChunkFaultBackend : public DB::Cas::tests::ChunkFaultBackend
-{
-public:
-    /// Set after `mode` / `fault_substr` / `fault_skip`; cleared when the scenario is over, so the
-    /// test's own out-of-band writes and reads are not caught by it.
-    bool latched = false;
-
-    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        if (latched && !fail_read_once_key.empty() && key == fail_read_once_key)
-            throw Poco::TimeoutException("LatchedChunkFaultBackend: the lost read stays lost");
-        return ChunkFaultBackend::read(key, access);
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             DB::Cas::TransportAccess & access) override
-    {
-        if (latched && mode != Mode::None && fault_skip == 0 && !expected_value && !fault_substr.empty()
-            && key.find(fault_substr) != String::npos)
-            fault_count = 1;
-        return ChunkFaultBackend::write(key, bytes, expected_value, access);
-    }
-};
+using DB::Cas::tests::LatchedChunkFaultBackend;
 
 /// The mount-fence deadlines the pre-attempt tests drive, in the FROZEN boot clock of
 /// `openPoolFenceControlled` (which is pinned at 0, so these are also the remaining lease budgets).
 ///
-/// `CasMountRuntime` has TWO fence predicates and they are deliberately not the same:
-///   `mayMutate`         -- `now < deadline`; the top-of-flush gate in `flushRefBatch`.
-///   `refAppendFenceOk`  -- additionally `attempt_timeout_ms + lease_safety_margin_ms < deadline - now`,
-///                          i.e. "there is room for one whole controlled attempt"; the `fence_ok`
-///                          `commitRefChunk` hands to `putIfAbsentControlled`.
-/// A THIRD checkpoint sits strictly between them: every call to `CasOperation::admitted` reached on the
-/// way in (e.g. `namespaceLife`'s "resident namespace life" guard) asks the same fence for
-/// `needed_ms=0`, so it needs only `lease_safety_margin_ms < deadline - now` -- room for the margin
-/// alone, no whole attempt. With `openPoolFenceControlled`'s budget that zero-needed guard already
-/// refuses at `deadline - now <= 100`, and the attempt-sized guard admits at `deadline - now >= 200`; a
-/// "pre-attempt refusal" test wants the flush admitted and the zero-needed guards clear while no whole
-/// attempt fits, which is strictly between those two, e.g. 150 ms.
+/// Three gates stand between "the flush is admitted" and "an attempt may start", and they are
+/// deliberately not the same:
+///   `mayMutate`               -- `now < deadline`; the top-of-flush gate in `flushRefBatch`.
+///   `CasOperation::admitted`  -- every guard reached on the way in (e.g. `namespaceLife`'s "resident
+///                                namespace life" guard) asks the fence for `needed_ms = 0`, so it
+///                                needs only `lease_safety_margin_ms < deadline - now`.
+///   the write engine           -- `writeLoop` reserves TWO attempt envelopes before its first request,
+///                                the attempt and the read that settles it, so it needs
+///                                `2 * attempt_timeout_ms + lease_safety_margin_ms < deadline - now`.
+/// With `openPoolFenceControlled`'s budget the zero-needed guards refuse at `deadline - now <= 100` and
+/// the engine's own gate refuses at `deadline - now <= 300`; a "pre-attempt refusal" test wants the
+/// flush admitted and the zero-needed guards clear while no attempt fits, which is strictly between
+/// those two, e.g. 150 ms.
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
 constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 150;
 
@@ -205,7 +177,7 @@ void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String 
 ///   - lease renewal is parked an hour out, so the runtime-owned renewal worker cannot re-arm the deadline
 ///     underneath a test that just shortened it. Ten seconds (the default) would be enough in practice
 ///     and flaky in principle; this removes the race rather than betting on it.
-PoolPtr openPoolFenceControlled(const BackendPtr & backend)
+PoolPtr openPoolFenceControlled(const std::shared_ptr<DB::Cas::InMemoryBackend> & backend)
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
@@ -216,6 +188,10 @@ PoolPtr openPoolFenceControlled(const BackendPtr & backend)
     budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field; production pairs the two in `ContentAddressedMetadataStorage`, and a fixture that sets
+    /// only the budget leaves the engine reserving nothing and no pre-attempt gate to refuse.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     return Pool::open(backend, cfg);
 }
 

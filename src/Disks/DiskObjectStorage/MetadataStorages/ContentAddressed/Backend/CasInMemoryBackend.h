@@ -67,6 +67,13 @@ public:
     /// This backend mints its own emulated values.
     Dialect dialect() const override { return Dialect::Emulated; }
 
+    /// Zero unless a fixture sets one. The engine reserves this before every attempt it starts, so a
+    /// pool fixture that configures `CasRequestBudget::attempt_timeout_ms` must set the SAME value
+    /// here: production pairs the two (`ContentAddressedMetadataStorage` builds its backend from the
+    /// pool's budget), and a fixture that sets only the budget leaves the engine reserving nothing.
+    uint64_t attemptTimeoutMs() const override { return attempt_timeout_ms; }
+    void setAttemptTimeoutMs(uint64_t ms) { attempt_timeout_ms = ms; }
+
     /// The in-memory backend mints a monotonic value it surfaces through `list` — TRUE.
     bool supportsListTokens() const override { return true; }
 
@@ -190,6 +197,10 @@ private:
     mutable std::mutex mutex_;
     std::map<String, Object> store_;
     uint64_t token_seq_ = 0;
+
+    /// Set before any operation runs, and read without the lock for the same reason the engine reads
+    /// it once at construction: it belongs to setup, not to a request.
+    uint64_t attempt_timeout_ms = 0;
 
     // Fault-injection state. These fields are protected by `mutex_` just like `store_`.
     bool hold_deletes_ = false;

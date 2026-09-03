@@ -69,12 +69,13 @@ PoolPtr openPool(const BackendPtr & backend)
 }
 
 /// The fence-controlled pool of `gtest_cas_ref_install_safety.cpp`, for the pre-attempt refusal: the
-/// boot clock is frozen so `setMountDeadline` alone decides both fence predicates, renewal is parked an
-/// hour out so nothing re-arms the deadline underneath the test, and the budget makes
-/// `attempt_timeout_ms + lease_safety_margin_ms` (200 ms) the window between "the flush is admitted"
-/// and "an attempt may start". No fault is injected here at all -- the refusal comes from the lease
-/// having no room to start a write -- so nothing in this fixture depends on an attempt count.
-PoolPtr openPoolFenceControlled(const BackendPtr & backend)
+/// boot clock is frozen so `setMountDeadline` alone decides every fence predicate, renewal is parked an
+/// hour out so nothing re-arms the deadline underneath the test, and the backend reports the budget's
+/// own `attempt_timeout_ms` because that -- not the budget field -- is what the request engine reserves
+/// per attempt, exactly as `ContentAddressedMetadataStorage` pairs the two in production. No fault is
+/// injected here at all -- the refusal comes from the lease having no room to start a write -- so
+/// nothing in this fixture depends on an attempt count.
+PoolPtr openPoolFenceControlled(const std::shared_ptr<InMemoryBackend> & backend)
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
@@ -85,17 +86,19 @@ PoolPtr openPoolFenceControlled(const BackendPtr & backend)
     budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     return Pool::open(backend, cfg);
 }
 
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
-/// The doc-comment above names the window: `attempt_timeout_ms + lease_safety_margin_ms` (200 ms) is
-/// where "an attempt may start" ends. `CasMountRuntime::admit` refuses a needed-0 admission check only
-/// once the remaining time no longer clears `lease_safety_margin_ms` STRICTLY (100), so 100 ms remaining
-/// refuses admission itself -- one check too early, at the wrong site, with the wrong message. 200 ms
-/// remaining clears that outer admission check (200 > 100) while still refusing the append's own
-/// two-envelope reservation (`2 * attempt_timeout_ms` = 200 ms needed against 200 ms remaining), which
-/// is the specific pre-attempt gate this test is about.
+/// Between "the flush is admitted" and "an attempt may start" sit two gates with different appetites,
+/// both measured against the lease's remaining time (the frozen clock at 0 makes the deadline BE the
+/// remaining time). A `CasOperation::admitted` guard reached on the way in asks the fence for nothing
+/// beyond the margin, so it clears while `lease_safety_margin_ms` (100) is strictly cleared; the write
+/// engine reserves TWO attempt envelopes before its first request -- the attempt and the read that
+/// settles it -- so it refuses until `2 * attempt_timeout_ms + lease_safety_margin_ms` (300) is
+/// strictly cleared. This test wants the first to pass and the second to refuse, which is anything
+/// strictly between.
 constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 200;
 
 /// A bare `Pool::open` with no `_pool_meta` seeded: the path an operator's pool RECREATION takes, and
