@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasTransportAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
@@ -55,9 +55,9 @@ CasRequests makeRequests(BackendPtr backend, FakeClock & clock, Fence fence = Fe
 
 }
 
-static_assert(!std::is_default_constructible_v<Incarnation>);
-static_assert(!std::is_constructible_v<Incarnation, String>);
-static_assert(!std::is_constructible_v<Incarnation, PersistedIncarnation>);
+static_assert(!std::is_default_constructible_v<Etag>);
+static_assert(!std::is_constructible_v<Etag, String>);
+static_assert(!std::is_constructible_v<Etag, PersistedEtag>);
 static_assert(!std::is_default_constructible_v<TransportAccess>);
 static_assert(!std::is_copy_constructible_v<TransportAccess>);
 
@@ -128,7 +128,7 @@ TEST(CASWriteResult, OrThrowMapsEveryAlternative)
     auto op = requests.admit();
     WriteResult committed = op.create("k", "v", Retry::standard());
     ASSERT_TRUE(std::holds_alternative<Committed>(committed));
-    const Incarnation landed = std::get<Committed>(committed).incarnation;
+    const Etag landed = std::get<Committed>(committed).incarnation;
     const auto returned = orThrow(std::move(committed), "create");
     ASSERT_TRUE(returned.has_value());
     EXPECT_EQ(*returned, landed);
@@ -170,7 +170,7 @@ TEST(CASBackendPrimitives, InMemoryWriteReadRemoveRoundTripThroughOneOperation)
     auto requests = makeRequests(b, clock);
     auto op = requests.admit();
 
-    const std::optional<Incarnation> w1 = orThrow(op.create("k", "v1", Retry::once()), "create");
+    const std::optional<Etag> w1 = orThrow(op.create("k", "v1", Retry::once()), "create");
     ASSERT_TRUE(w1);
     const std::optional<Object> r = op.read("k", Retry::once());
     ASSERT_TRUE(r);
@@ -183,7 +183,7 @@ TEST(CASBackendPrimitives, InMemoryWriteReadRemoveRoundTripThroughOneOperation)
     EXPECT_EQ(h->incarnation, *w1);
 
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k", "v2", Retry::once())));   /// must be absent
-    const std::optional<Incarnation> w3 = orThrow(op.replace("k", "v2", *w1, Retry::once()), "replace");
+    const std::optional<Etag> w3 = orThrow(op.replace("k", "v2", *w1, Retry::once()), "replace");
     ASSERT_TRUE(w3);
     EXPECT_NE(*w3, *w1);                                  /// incarnations never repeat
 
@@ -200,7 +200,7 @@ TEST(CASBackendPrimitives, ListSurfacesTheIncarnationAndPaginates)
     auto requests = makeRequests(b, clock);
     auto op = requests.admit();
 
-    const std::optional<Incarnation> a = orThrow(op.create("p/a", "0123456789", Retry::once()), "create");
+    const std::optional<Etag> a = orThrow(op.create("p/a", "0123456789", Retry::once()), "create");
     ASSERT_TRUE(a);
     orThrow(op.create("p/b", "xy", Retry::once()), "create");
     orThrow(op.create("q/c", "z", Retry::once()), "create");
@@ -258,7 +258,7 @@ TEST(CASBackendPrimitives, EveryLegacyVerbReachesAnOverrideOfThePrimitiveItForwa
     FakeClock clock;
     auto requests = makeRequests(b, clock);
     auto op = requests.admit();
-    const std::optional<Incarnation> first = orThrow(op.create("k", "v", Retry::once()), "create");
+    const std::optional<Etag> first = orThrow(op.create("k", "v", Retry::once()), "create");
     ASSERT_TRUE(first);
     b->writes = 0;
 
@@ -516,20 +516,20 @@ TEST(CASIncarnation, RenderAndPersistedCompare)
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
 
-    const Incarnation first = *orThrow(op.create("k", "v", Retry::standard()), "create");
+    const Etag first = *orThrow(op.create("k", "v", Retry::standard()), "create");
     EXPECT_EQ(first.render(), "emulated:1");
     EXPECT_EQ(first.key(), "k");
     EXPECT_EQ(first.dialect(), Dialect::Emulated);
 
-    const PersistedIncarnation persisted = PersistedIncarnation::capture(first);
+    const PersistedEtag persisted = PersistedEtag::capture(first);
     EXPECT_EQ(persisted.dialect, "emulated");
     EXPECT_EQ(persisted.value, "1");
     EXPECT_TRUE(persisted.matches(first));
 
-    const Incarnation second = *orThrow(op.replace("k", "w", first, Retry::standard()), "replace");
+    const Etag second = *orThrow(op.replace("k", "w", first, Retry::standard()), "replace");
     EXPECT_EQ(second.render(), "emulated:2");
     EXPECT_FALSE(persisted.matches(second));   /// a captured record never re-matches a later incarnation
-    EXPECT_TRUE(PersistedIncarnation::capture(second).matches(second));
+    EXPECT_TRUE(PersistedEtag::capture(second).matches(second));
 }
 
 TEST(CASRetry, BindSaturatesAndLeavesAnEqualLeaseOffTheLeaseSource)
@@ -559,13 +559,13 @@ TEST(CASRequests, CreateThenReplaceThenRemove)
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
 
-    const Incarnation first = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+    const Etag first = *orThrow(op.create("k", "v1", Retry::standard()), "create");
     const auto seen = op.read("k", Retry::standard());
     ASSERT_TRUE(seen.has_value());
     EXPECT_EQ(seen->bytes, "v1");
     EXPECT_EQ(seen->incarnation, first);
 
-    const Incarnation second = *orThrow(op.replace("k", "v2", first, Retry::standard()), "replace");
+    const Etag second = *orThrow(op.replace("k", "v2", first, Retry::standard()), "replace");
     EXPECT_NE(second, first);
 
     EXPECT_EQ(op.remove("k", first, Retry::standard()), Removal::Mismatch);    /// the incarnation is stale
@@ -585,7 +585,7 @@ TEST(CASRequests, KeyBindingThrowsBeforeAnyRequest)
     auto backend = std::make_shared<CountingBackend>();
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const Incarnation of_a = *orThrow(op.create("a", "v", Retry::standard()), "create");
+    const Etag of_a = *orThrow(op.create("a", "v", Retry::standard()), "create");
     backend->resetCounts();
 
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { (void)op.replace("b", "w", of_a, Retry::standard()); });
@@ -599,7 +599,7 @@ TEST(CASRequestsDeathTest, KeyBindingThrowsBeforeAnyRequest)
     auto backend = std::make_shared<CountingBackend>();
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const Incarnation of_a = *orThrow(op.create("a", "v", Retry::standard()), "create");
+    const Etag of_a = *orThrow(op.create("a", "v", Retry::standard()), "create");
 
     EXPECT_DEATH({ (void)op.replace("b", "w", of_a, Retry::standard()); }, "");
 }
@@ -768,7 +768,7 @@ TEST(CASRequests, DeleteMarkerIsANamedException)
     auto backend = std::make_shared<InMemoryBackend>();
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const Incarnation inc = *orThrow(op.create("k", "v", Retry::standard()), "create");
+    const Etag inc = *orThrow(op.create("k", "v", Retry::standard()), "create");
 
     backend->setSimulateDeleteMarkers(true);
     expectThrowsCode(DB::ErrorCodes::CAS_DELETE_MARKER, [&] { (void)op.remove("k", inc, Retry::standard()); });
@@ -925,7 +925,7 @@ TEST(CASRequests, AResolveReadRefusedForLeaseBudgetIsReportedAsTheLeaseDeadline)
         [](uint64_t) {}};
     auto requests = makeRequests(backend, clock, fence);
     auto op = requests.admit();
-    const Incarnation seen = *orThrow(op.create("k", "v", Retry::standard()), "create");
+    const Etag seen = *orThrow(op.create("k", "v", Retry::standard()), "create");
 
     /// The store refuses the precondition, and the lease budget is gone by the time the read that
     /// would say WHO holds the key is due. The call learned nothing about the key, so what it reports
@@ -1112,7 +1112,7 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsThePreconditionUnchangedIsRei
     auto backend = std::make_shared<CountingBackend>();
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const Incarnation seen = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+    const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "create");
     backend->resetCounts();
 
     /// The attempt's fate is lost and the store is untouched. The incarnation it named is still the
@@ -1139,7 +1139,7 @@ TEST(CASRequests, AmbiguousReplaceOfIdenticalBytesIsReissuedNotClaimedByByteEqua
         auto backend = std::make_shared<CountingBackend>();
         auto requests = makeRequests(backend, clock);
         auto op = requests.admit();
-        const Incarnation seen = *orThrow(op.create("k", "B", Retry::standard()), "create");
+        const Etag seen = *orThrow(op.create("k", "B", Retry::standard()), "create");
         backend->resetCounts();
 
         backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
@@ -1160,7 +1160,7 @@ TEST(CASRequests, AmbiguousReplaceOfIdenticalBytesIsReissuedNotClaimedByByteEqua
         auto backend = std::make_shared<CountingBackend>();
         auto requests = makeRequests(backend, clock);
         auto op = requests.admit();
-        const Incarnation seen = *orThrow(op.create("k", "B", Retry::standard()), "create");
+        const Etag seen = *orThrow(op.create("k", "B", Retry::standard()), "create");
         backend->resetCounts();
 
         backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
@@ -1181,7 +1181,7 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsAnotherIncarnationIsAConflict
     auto backend = std::make_shared<CountingBackend>();
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const Incarnation stale = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+    const Etag stale = *orThrow(op.create("k", "v1", Retry::standard()), "create");
     orThrow(op.replace("k", "theirs", stale, Retry::standard()), "the competitor's replace");
     backend->resetCounts();
 

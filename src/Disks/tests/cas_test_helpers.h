@@ -79,6 +79,48 @@ namespace DB::ErrorCodes
 namespace DB::Cas::tests
 {
 
+/// A `CasRequests` over an always-open fence, for a fixture that has a backend but no mounted pool.
+/// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
+inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::BackendPtr backend)
+{
+    return DB::Cas::CasRequests(std::move(backend), DB::Cas::Fence::open());
+}
+
+/// The same, for a fixture holding only a reference. The aliasing `shared_ptr` owns nothing, so the
+/// caller keeps the backend alive for as long as the returned object and its operations live.
+inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::Backend & backend)
+{
+    return openRequestsForTest(DB::Cas::BackendPtr(std::shared_ptr<void>(), &backend));
+}
+
+/// An open-fence operation together with the `CasRequests` it refers to, for a fixture that holds a
+/// backend and needs to call a production entry point taking a `CasOperation &`. Neither copyable nor
+/// movable: the operation points at the member beside it.
+class OperationForTest
+{
+public:
+    explicit OperationForTest(DB::Cas::BackendPtr backend)
+        : requests(std::move(backend), DB::Cas::Fence::open()), operation(requests.admit())
+    {
+    }
+
+    /// For a fixture holding only a reference: the aliasing `shared_ptr` owns nothing, so the caller
+    /// keeps the backend alive for as long as this object.
+    explicit OperationForTest(DB::Cas::Backend & backend)
+        : OperationForTest(DB::Cas::BackendPtr(std::shared_ptr<void>(), &backend))
+    {
+    }
+
+    OperationForTest(const OperationForTest &) = delete;
+    OperationForTest & operator=(const OperationForTest &) = delete;
+
+    DB::Cas::CasOperation & operator*() { return operation; }
+
+private:
+    DB::Cas::CasRequests requests;
+    DB::Cas::CasOperation operation;
+};
+
 /// Deterministic two-phase barrier for worker-lifecycle tests. The worker calls `arriveAndWait` at
 /// the exact operation boundary under test; the test waits for that arrival and later calls
 /// `release`. The bounded waits are only hang protection -- correctness never depends on elapsed
@@ -187,7 +229,8 @@ void expectThrowsCode(int expected_code, F && fn)
 /// an empty optional and take the whole binary down instead of failing this one case.
 inline void expectBytes(DB::Cas::Backend & backend, const String & key, const String & expected)
 {
-    const auto got = backend.get(key);
+    OperationForTest op(backend);
+    const auto got = (*op).read(key, DB::Cas::Retry::standard());
     ASSERT_TRUE(got.has_value()) << "object '" << key << "' is absent";
     EXPECT_EQ(got->bytes, expected);
 }
@@ -196,48 +239,6 @@ inline void expectBytes(const DB::Cas::BackendPtr & backend, const String & key,
 {
     expectBytes(*backend, key, expected);
 }
-
-/// A `CasRequests` over an always-open fence, for a fixture that has a backend but no mounted pool.
-/// Every operation admitted from it holds a reference to it, so it must be named and outlive them.
-inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::BackendPtr backend)
-{
-    return DB::Cas::CasRequests(std::move(backend), DB::Cas::Fence::open());
-}
-
-/// The same, for a fixture holding only a reference. The aliasing `shared_ptr` owns nothing, so the
-/// caller keeps the backend alive for as long as the returned object and its operations live.
-inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::Backend & backend)
-{
-    return openRequestsForTest(DB::Cas::BackendPtr(std::shared_ptr<void>(), &backend));
-}
-
-/// An open-fence operation together with the `CasRequests` it refers to, for a fixture that holds a
-/// backend and needs to call a production entry point taking a `CasOperation &`. Neither copyable nor
-/// movable: the operation points at the member beside it.
-class OperationForTest
-{
-public:
-    explicit OperationForTest(DB::Cas::BackendPtr backend)
-        : requests(std::move(backend), DB::Cas::Fence::open()), operation(requests.admit())
-    {
-    }
-
-    /// For a fixture holding only a reference: the aliasing `shared_ptr` owns nothing, so the caller
-    /// keeps the backend alive for as long as this object.
-    explicit OperationForTest(DB::Cas::Backend & backend)
-        : OperationForTest(DB::Cas::BackendPtr(std::shared_ptr<void>(), &backend))
-    {
-    }
-
-    OperationForTest(const OperationForTest &) = delete;
-    OperationForTest & operator=(const OperationForTest &) = delete;
-
-    DB::Cas::CasOperation & operator*() { return operation; }
-
-private:
-    DB::Cas::CasRequests requests;
-    DB::Cas::CasOperation operation;
-};
 
 /// Build a `LocalObjectStorage` rooted at a fresh, unique temporary directory (one per call).
 ///
@@ -333,7 +334,8 @@ inline DB::Cas::BlobRef writeBlobRaw(
     header.build_id = DB::UInt128(0x5678);
 
     const String head = DB::Cas::encodeEnvelopeHeader(header, static_cast<uint32_t>(blob_header_len));
-    backend.putIfAbsent(layout.blobKey(id), head + payload);
+    OperationForTest op(backend);
+    (*op).create(layout.blobKey(id), head + payload, DB::Cas::Retry::standard());
     return id;
 }
 
@@ -355,8 +357,9 @@ inline DB::Cas::ManifestId writeManifestRaw(
     body.root_namespace_id = ns;
     body.entries = entries;
     body.payload_digest = DB::Cas::computePayloadDigest(body);
-    backend.putIfAbsent(layout.manifestKey(id),
-        DB::Cas::sealObject(DB::Cas::FormatId::PartManifest, DB::Cas::encodePartManifest(body)));
+    OperationForTest op(backend);
+    (*op).create(layout.manifestKey(id),
+        DB::Cas::sealObject(DB::Cas::FormatId::PartManifest, DB::Cas::encodePartManifest(body)), DB::Cas::Retry::standard());
     return id;
 }
 
@@ -424,8 +427,8 @@ inline uint64_t appendRefLogSeed(
     String cursor;
     while (true)
     {
-        const DB::Cas::ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
-        for (const DB::Cas::ListedKey & lk : page.keys)
+        const DB::Cas::KeyPage page = (*operation).list(prefix, cursor, /*limit=*/1000, DB::Cas::Retry::standard());
+        for (const DB::Cas::KeyEntry & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
             if (!parsed)
@@ -534,9 +537,9 @@ inline void deleteManifestBody(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::ManifestId & id)
 {
     const String key = layout.manifestKey(id);
-    const DB::Cas::HeadResult h = backend.head(key);
-    if (h.exists)
-        backend.deleteExact(key, h.token);
+    OperationForTest op(backend);
+    if (const auto h = (*op).head(key, DB::Cas::Retry::standard()))
+        (*op).remove(key, h->incarnation, DB::Cas::Retry::standard());
 }
 
 /// Formerly wrote the namespace into `gc/registry`. Real write helpers now admit the authoritative
@@ -573,9 +576,9 @@ inline void injectRetire(
 {
     OperationForTest operation(backend);
     DB::Cas::GcState gc_state;
-    const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
-    if (head.exists)
-        gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
+    const auto existing_state = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
+    if (existing_state)
+        gc_state = DB::Cas::decodeGcState(existing_state->bytes);
     gc_state.round = round;
 
     if (!entries.empty())
@@ -636,17 +639,17 @@ inline void injectRetire(
         cs.pending_total = pending_total;
         cs.oldest_nonpending_condemn_round = oldest_nonpending;
         seal.condemned_summary[shard] = cs;
-        backend.putIfAbsent(layout.foldSealKey(generation, attempt), DB::Cas::encodeFoldSeal(seal));
+        (*operation).create(layout.foldSealKey(generation, attempt), DB::Cas::encodeFoldSeal(seal), DB::Cas::Retry::standard());
 
         gc_state.snap_generation = generation;
         gc_state.snap_attempt = attempt;
     }
 
     const String state = DB::Cas::encodeGcState(gc_state);
-    if (!head.exists)
-        backend.putIfAbsent(layout.gcStateKey(), state);
+    if (!existing_state)
+        (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
-        backend.putOverwrite(layout.gcStateKey(), state, head.token);
+        (*operation).replace(layout.gcStateKey(), state, existing_state->incarnation, DB::Cas::Retry::standard());
 }
 
 /// Adopt a fold seal carrying a given per-gc-shard `condemned_summary` and point
@@ -659,9 +662,10 @@ inline void injectCondemnedSummarySeal(
     uint64_t generation, uint64_t attempt, uint64_t gc_shards,
     const std::map<uint64_t, DB::Cas::CondemnedSummary> & summary)
 {
+    OperationForTest operation(backend);
     const String seal_key = layout.foldSealKey(generation, attempt);
     DB::Cas::CasFoldSeal seal;
-    const auto existing = backend.get(seal_key);
+    const auto existing = (*operation).read(seal_key, DB::Cas::Retry::standard());
     if (existing)
         seal = DB::Cas::decodeFoldSeal(existing->bytes);
     else
@@ -670,28 +674,30 @@ inline void injectCondemnedSummarySeal(
     seal.condemned_summary = summary;
     const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
     if (existing)
-        backend.putOverwrite(seal_key, seal_bytes, existing->token);
+        (*operation).replace(seal_key, seal_bytes, existing->incarnation, DB::Cas::Retry::standard());
     else
-        backend.putIfAbsent(seal_key, seal_bytes);
+        (*operation).create(seal_key, seal_bytes, DB::Cas::Retry::standard());
 
     DB::Cas::GcState gc_state;
-    const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
-    if (head.exists)
-        gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
+    const auto existing_state = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
+    if (existing_state)
+        gc_state = DB::Cas::decodeGcState(existing_state->bytes);
     gc_state.gc_shards = gc_shards;
     gc_state.snap_generation = generation;
     gc_state.snap_attempt = attempt;
     const String state = DB::Cas::encodeGcState(gc_state);
-    if (!head.exists)
-        backend.putIfAbsent(layout.gcStateKey(), state);
+    if (!existing_state)
+        (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
-        backend.putOverwrite(layout.gcStateKey(), state, head.token);
+        (*operation).replace(layout.gcStateKey(), state, existing_state->incarnation, DB::Cas::Retry::standard());
 }
 
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
 inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
-    return !backend.head(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)})).exists;
+    OperationForTest op(backend);
+    return !(*op).head(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}),
+                       DB::Cas::Retry::standard()).has_value();
 }
 
 /// ONE round that is allowed to RECLAIM -- the name is the point, so that grepping for the tests whose
@@ -736,13 +742,13 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard)
 {
     OperationForTest operation(backend);
-    const auto st = backend.get(layout.gcStateKey());
+    const auto st = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
     if (!st)
         return {};
     const DB::Cas::GcState gc_state = DB::Cas::decodeGcState(st->bytes);
     if (gc_state.snap_generation == 0)
         return {};
-    const auto seal_bytes = backend.get(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt));
+    const auto seal_bytes = (*operation).read(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt), DB::Cas::Retry::standard());
     if (!seal_bytes)
         return {};
     const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(seal_bytes->bytes);
@@ -781,7 +787,8 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
 inline bool anyCondemnedInSeal(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t gc_shards = 0)
 {
-    const auto st = backend.get(layout.gcStateKey());
+    OperationForTest operation(backend);
+    const auto st = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
     if (!st)
         return false;
     const DB::Cas::GcState gc_state = DB::Cas::decodeGcState(st->bytes);
@@ -796,7 +803,7 @@ inline bool anyCondemnedInSeal(
 /// incarnation_tag in its envelope header (preserving header_len + payload), putOverwrite against the
 /// current token, and return the NEW token. Used to drive the W-REVALIDATE adopt branch (current token
 /// differs from the writer's stale observation).
-inline DB::Cas::Incarnation displaceObjectToken(
+inline DB::Cas::Etag displaceObjectToken(
     DB::Cas::Backend & backend, const String & key, DB::Cas::ObjectKind kind)
 {
     OperationForTest operation(backend);
@@ -812,7 +819,7 @@ inline DB::Cas::Incarnation displaceObjectToken(
     const String new_head = DB::Cas::encodeEnvelopeHeader(header, header.header_len);
     const String body = new_head + got->bytes.substr(header.header_len);
 
-    const std::optional<DB::Cas::Incarnation> displaced = DB::Cas::orThrow(
+    const std::optional<DB::Cas::Etag> displaced = DB::Cas::orThrow(
         (*operation).replace(key, body, got->incarnation, DB::Cas::Retry::standard()),
         "displace the object at " + key);
     if (!displaced)
@@ -821,7 +828,7 @@ inline DB::Cas::Incarnation displaceObjectToken(
     return *displaced;
 }
 
-inline DB::Cas::Incarnation displaceBlobToken(
+inline DB::Cas::Etag displaceBlobToken(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::BlobRef & id)
 {
     return displaceObjectToken(backend, layout.blobKey(id), DB::Cas::ObjectKind::Blob);
@@ -866,7 +873,7 @@ inline void seedPoolMetaForRestart(
     DB::Cas::PoolMeta::createOrValidate(
         *operation, layout, /*blob_header_len=*/256, gc_shards,
         DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
-    if (!backend.get(layout.refCatalogKey()))
+    if (!(*operation).read(layout.refCatalogKey(), DB::Cas::Retry::standard()))
         DB::Cas::CasRefCatalog::initializeEmptyForNewPool(*operation, layout);
     else
         (void)DB::Cas::CasRefCatalog::read(*operation, layout);
@@ -883,7 +890,9 @@ inline void writeBlobBody(
     header.incarnation_tag = DB::UInt128(0x1234);
     header.build_id = DB::UInt128(0x5678);
     const String head = DB::Cas::encodeEnvelopeHeader(header, static_cast<uint32_t>(blob_header_len));
-    backend.putIfAbsent(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}), head + String("x"));
+    OperationForTest op(backend);
+    (*op).create(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}), head + String("x"),
+                DB::Cas::Retry::standard());
 }
 
 /// Write a raw blob body (payload written verbatim, no envelope) — the raw-body-refinement shape
@@ -891,7 +900,9 @@ inline void writeBlobBody(
 inline void writeRawBlobBody(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                              const DB::UInt128 & hash, const String & payload)
 {
-    backend.casPut(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}), payload, std::nullopt);
+    OperationForTest op(backend);
+    (*op).create(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}), payload,
+                DB::Cas::Retry::standard());
 }
 
 /// These `UInt128`-hash meta-op wrappers are the pre-mixed-algo 128-bit-only test convenience surface:
@@ -909,8 +920,9 @@ inline void writeMetaClean(DB::Cas::Backend & backend, const DB::Cas::Layout & l
                            const DB::UInt128 & hash, uint64_t size)
 {
     const DB::Cas::BlobRef ref = legacyMetaTestRef(hash);
-    backend.putIfAbsent(layout.blobMetaKey(ref), DB::Cas::encodeBlobMeta(
-        DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .condemn_round = 0, .size = size}));
+    OperationForTest op(backend);
+    (*op).create(layout.blobMetaKey(ref), DB::Cas::encodeBlobMeta(
+        DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .condemn_round = 0, .size = size}), DB::Cas::Retry::standard());
 }
 
 /// Transition an existing meta descriptor to Condemned at `condemn_round`, via a read-modify-CAS on
@@ -940,7 +952,8 @@ inline std::optional<DB::Cas::LoadedMeta> loadMetaForTest(DB::Cas::Backend & bac
 /// The latest GC generation (snap_generation pointer in gc/state), or 0 when absent.
 inline uint64_t currentGenerationOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout)
 {
-    const auto got = backend.get(layout.gcStateKey());
+    OperationForTest op(backend);
+    const auto got = (*op).read(layout.gcStateKey(), DB::Cas::Retry::standard());
     if (!got)
         return 0;
     return DB::Cas::decodeGcState(got->bytes).snap_generation;
@@ -949,7 +962,8 @@ inline uint64_t currentGenerationOf(DB::Cas::Backend & backend, const DB::Cas::L
 /// The adopted attempt (snap_attempt pointer in gc/state), or 0 when absent.
 inline uint64_t currentAttemptOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout)
 {
-    const auto got = backend.get(layout.gcStateKey());
+    OperationForTest op(backend);
+    const auto got = (*op).read(layout.gcStateKey(), DB::Cas::Retry::standard());
     if (!got)
         return 0;
     return DB::Cas::decodeGcState(got->bytes).snap_attempt;
@@ -963,9 +977,10 @@ inline std::vector<DB::Cas::RunRef> runsForShard(
 {
     const uint64_t gen = currentGenerationOf(backend, layout);
     const uint64_t attempt = currentAttemptOf(backend, layout);
+    OperationForTest op(backend);
     for (uint64_t g = gen; ; --g)
     {
-        if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
+        if (const auto got = (*op).read(layout.foldSealKey(g, attempt), DB::Cas::Retry::standard()))
         {
             const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
             std::vector<DB::Cas::RunRef> out;
@@ -1103,7 +1118,7 @@ inline void seedFoldCursorForTest(
 
     const String seal_key = layout.foldSealKey(generation, attempt);
     DB::Cas::CasFoldSeal seal;
-    const auto existing = backend.get(seal_key);
+    const auto existing = (*operation).read(seal_key, DB::Cas::Retry::standard());
     if (existing)
         seal = DB::Cas::decodeFoldSeal(existing->bytes);
     seal.generation = generation;
@@ -1115,9 +1130,9 @@ inline void seedFoldCursorForTest(
     seal.ref_lives[life.incarnation].coverage = cov;
 
     DB::Cas::GcState gc_state;
-    const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
-    if (head.exists)
-        gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
+    const auto existing_state = (*operation).read(layout.gcStateKey(), DB::Cas::Retry::standard());
+    if (existing_state)
+        gc_state = DB::Cas::decodeGcState(existing_state->bytes);
 
     /// Totality over `gc_shards` — see the doc comment's SHARP EDGE note for what throws without it.
     const uint64_t gc_shards = gc_state.gc_shards ? gc_state.gc_shards : 1;
@@ -1126,17 +1141,17 @@ inline void seedFoldCursorForTest(
 
     const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
     if (existing)
-        backend.putOverwrite(seal_key, seal_bytes, existing->token);
+        (*operation).replace(seal_key, seal_bytes, existing->incarnation, DB::Cas::Retry::standard());
     else
-        backend.putIfAbsent(seal_key, seal_bytes);
+        (*operation).create(seal_key, seal_bytes, DB::Cas::Retry::standard());
 
     gc_state.snap_generation = generation;
     gc_state.snap_attempt = attempt;
     const String state = DB::Cas::encodeGcState(gc_state);
-    if (!head.exists)
-        backend.putIfAbsent(layout.gcStateKey(), state);
+    if (!existing_state)
+        (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
-        backend.putOverwrite(layout.gcStateKey(), state, head.token);
+        (*operation).replace(layout.gcStateKey(), state, existing_state->incarnation, DB::Cas::Retry::standard());
 }
 
 /// The folded cursor sealed for (ns, shard) by the latest fold seal, or 0 when absent. After a COMPLETE
@@ -1156,7 +1171,7 @@ inline uint64_t foldCursorOf(
     const uint64_t attempt = currentAttemptOf(backend, layout);
     for (uint64_t g = gen; ; --g)
     {
-        if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
+        if (const auto got = (*operation).read(layout.foldSealKey(g, attempt), DB::Cas::Retry::standard()))
         {
             const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
             const auto it = seal.ref_lives.find(life->incarnation);
@@ -1184,11 +1199,12 @@ inline void setWatermarkMinActive(
     m.seq = 1;
     m.write_attempt_id = DB::UInt128{1};
     const String key = layout.mountKey(server_root_id);
-    const DB::Cas::HeadResult h = backend.head(key);
-    if (h.exists)
-        backend.putOverwrite(key, DB::Cas::encodeMountLease(m), h.token);
+    OperationForTest op(backend);
+    const auto h = (*op).head(key, DB::Cas::Retry::standard());
+    if (h)
+        (*op).replace(key, DB::Cas::encodeMountLease(m), h->incarnation, DB::Cas::Retry::standard());
     else
-        backend.putIfAbsent(key, DB::Cas::encodeMountLease(m));
+        (*op).create(key, DB::Cas::encodeMountLease(m), DB::Cas::Retry::standard());
 }
 
 /// ---- Task 10 ref snapshot+log raw fixtures ----
@@ -1211,7 +1227,8 @@ inline void writeRefSnapshotRaw(
     const NamespaceLifeId life
         = CasRefCatalog::lifeIfCataloged(*operation, layout, ns).value_or(fixture::fixtureLife(ns));
     const String key = layout.refSnapshotKey(life, snapshot.snapshot_id);
-    backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(snapshot)));
+    (*operation).create(key, DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(snapshot)),
+                        DB::Cas::Retry::standard());
 }
 
 /// Admits `ns` into the catalog as a `Live` entry, IDEMPOTENTLY (a no-op once `ns` already carries
@@ -1465,7 +1482,7 @@ inline void writeRefLogTxnRaw(
     const NamespaceLifeId life
         = CasRefCatalog::lifeIfCataloged(*operation, layout, ns).value_or(fixture::fixtureLife(ns));
     const String key = layout.refLogKey(life, txn.txn_id);
-    backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, DB::Cas::encodeRefLogTxn(txn)));
+    (*operation).create(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, DB::Cas::encodeRefLogTxn(txn)), DB::Cas::Retry::standard());
 }
 
 namespace fixture
@@ -1627,12 +1644,6 @@ private:
 class CountingBackend : public DB::Cas::InMemoryBackend
 {
 public:
-    /// Unhide the legacy names the primitive overrides below would otherwise shadow, and the
-    /// omitted-`Range` convenience.
-    using DB::Cas::Backend::getStream;
-    using DB::Cas::Backend::head;
-    using DB::Cas::Backend::list;
-
     /// ---- The counters live on the transport primitives, so a request is counted once ----
     ///
     /// Whichever surface a caller used, its request passes through one of the primitives below: a
@@ -1697,18 +1708,14 @@ public:
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
-    /// `InMemoryBackend::stream` opens its reader through this, so both the primitive and the legacy
-    /// stream verb are counted here, once each.
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & key, DB::Cas::Range range) override
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, DB::Cas::TransportAccess & access) override
     {
         tick(get_stream_counts, get_stream_total, key);
-        std::optional<DB::Cas::GetStreamResult> opened = InMemoryBackend::getStream(key, range);
+        std::unique_ptr<DB::ReadBuffer> opened = InMemoryBackend::stream(key, access);
         const size_t chunk = stream_chunk.load();
-        if (!opened || !opened->stream || chunk == 0)
+        if (!opened || chunk == 0)
             return opened;
-        opened->stream = std::make_unique<ChunkedStreamForTest>(
-            std::move(opened->stream), chunk, largestChunkSlot(key));
-        return opened;
+        return std::make_unique<ChunkedStreamForTest>(std::move(opened), chunk, largestChunkSlot(key));
     }
 
     /// Serve every stream opened from now on in windows of at most `bytes`, as a network-backed store

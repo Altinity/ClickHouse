@@ -483,7 +483,7 @@ TEST(CASFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
     /// protocol this fixture is not driving), so inject the post-deletion catalog snapshot directly,
     /// mirroring `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses` below.
     {
-        CasOperation op = store->gcRequests().admit();
+        CasOperation op = store->openRequests().admit();
         CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(op, store->layout());
         const auto it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns == ns; });

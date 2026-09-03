@@ -93,7 +93,7 @@ private:
 };
 
 /// The incarnation currently at `key`, for a fixture that has to name it as a precondition.
-Incarnation currentIncarnation(CasOperation & op, const String & key)
+Etag currentIncarnation(CasOperation & op, const String & key)
 {
     const auto got = op.read(key, Retry::standard());
     if (!got)
@@ -1499,10 +1499,10 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     MountObservationMap obs;
     computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
     ASSERT_TRUE(obs.contains("s1"));
-    const Incarnation first_incarnation = obs.at("s1").incarnation;
+    const Etag first_incarnation = obs.at("s1").incarnation;
 
     renewMount(ops.op, l, "s1");
-    const Incarnation renewed_incarnation = currentIncarnation(ops.op, l.mountKey("s1"));
+    const Etag renewed_incarnation = currentIncarnation(ops.op, l.mountKey("s1"));
     EXPECT_NE(renewed_incarnation, first_incarnation);
 
     const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,

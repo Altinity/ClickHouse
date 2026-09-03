@@ -22,7 +22,7 @@ inline ManifestSweepResult sweepManifestCursorPageForTest(
 {
     ManifestSweepResult result = planManifestCursorPage(
         store, cursor, list_budget, delete_budget, /*catalog_recovery_authoritative=*/true, work_budget);
-    CasOperation op = store.gcRequests().admit();
+    CasOperation op = store.openRequests().admit();
     for (const ManifestSweepResult::Nomination & nomination : result.nominations)
     {
         /// A nomination records the incarnation it was planned against, so the delete re-observes the

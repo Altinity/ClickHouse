@@ -998,7 +998,7 @@ TEST(CASGCFrontierGate, ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndD
     const BlobRef blob_ref = legacyMetaTestRef(blob);
     const std::optional<Meta> blob_observed = op.head(layout.blobKey(blob_ref), Retry::once());
     ASSERT_TRUE(blob_observed) << "the seeded blob body must be present before it is condemned";
-    const PersistedIncarnation blob_token = PersistedIncarnation::capture(blob_observed->incarnation);
+    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->incarnation);
     injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
     store->renewWatermarkOnce();
@@ -1087,7 +1087,7 @@ TEST(CASGCFrontierGate, AZeroWalkableFrontierWithACreatingCatalogRowIsNotProvedE
     const BlobRef blob_ref = legacyMetaTestRef(blob);
     const std::optional<Meta> blob_observed = op.head(layout.blobKey(blob_ref), Retry::once());
     ASSERT_TRUE(blob_observed) << "the seeded blob body must be present before it is condemned";
-    const PersistedIncarnation blob_token = PersistedIncarnation::capture(blob_observed->incarnation);
+    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->incarnation);
     injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
     store->renewWatermarkOnce();
@@ -1244,7 +1244,7 @@ TEST(CASGCFrontierGate, AProvedEmptyCatalogUnderStageASuppressedStaysSuppressed)
     CasOperation op = requests.admit();
     const std::optional<Meta> blob_observed = op.head(layout.blobKey(blob_ref), Retry::once());
     ASSERT_TRUE(blob_observed) << "the seeded blob body must be present before it is condemned";
-    const PersistedIncarnation blob_token = PersistedIncarnation::capture(blob_observed->incarnation);
+    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->incarnation);
     injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
     store->renewWatermarkOnce();

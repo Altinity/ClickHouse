@@ -244,7 +244,7 @@ CasRefCatalog::Snapshot readCatalogForTest(const BackendPtr & backend, const Lay
 
 /// A fixture's own conditional replace, for the races these tests stage by hand.
 bool replaceForTest(const BackendPtr & backend, const String & key, const String & bytes,
-                    const Incarnation & expected)
+                    const Etag & expected)
 {
     CasRequests requests(backend, Fence::open());
     CasOperation op = requests.admit();

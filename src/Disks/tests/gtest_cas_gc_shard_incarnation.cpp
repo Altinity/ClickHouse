@@ -468,7 +468,7 @@ TEST(CASGCShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         const String b1_key = store->layout().blobKey(b1_ref);
         const std::optional<Meta> b1_observed = op.head(b1_key, Retry::once());
         ASSERT_TRUE(b1_observed) << "b1 body must be present after the seed putBlob";
-        const PersistedIncarnation b1_token = PersistedIncarnation::capture(b1_observed->incarnation);
+        const PersistedEtag b1_token = PersistedEtag::capture(b1_observed->incarnation);
 
         /// --- Phase 2: Inject gc/state at round 1 with b1 CONDEMNED (body still present). ---
         /// This simulates GC having advanced to round 1 and retired b1 (condemned token recorded

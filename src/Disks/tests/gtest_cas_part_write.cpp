@@ -1010,7 +1010,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     /// 1. Upload blob Y via a throwaway build; capture the incarnation t0 the way GC persists it, and
     ///    let GC's exact-incarnation delete land before the writer's dedup hit.
     BlobRef id;
-    PersistedIncarnation t0;
+    PersistedEtag t0;
     {
         auto s0 = openPool(b);
         auto build0 = precommittedBuildForPayload(
@@ -1020,7 +1020,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         const String seed_key = s0->layout().blobKey(id);
         const auto seeded = op0.head(seed_key, Retry::standard());
         ASSERT_TRUE(seeded.has_value());
-        t0 = PersistedIncarnation::capture(seeded->incarnation);
+        t0 = PersistedEtag::capture(seeded->incarnation);
         ASSERT_EQ(op0.remove(seed_key, seeded->incarnation, Retry::standard()), Removal::Removed);
         build0->abandon();
     }
@@ -1772,7 +1772,7 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
     /// 1. PartWriteTxn A creates H ("shared-content"), publishes a part referencing it, then drops the ref.
     ///    Capture H's first incarnation token so we can condemn exactly it.
     BlobRef h;
-    PersistedIncarnation h_token0;
+    PersistedEtag h_token0;
     {
         auto s0 = Pool::open(b, cfg);
         publishOneBlobPart(s0, ns, "part_1", "f", content);
@@ -1780,7 +1780,7 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
         CasOperation op0 = s0->mountRequests().admit();
         const auto seeded = op0.head(s0->layout().blobKey(h), Retry::standard());
         ASSERT_TRUE(seeded.has_value());
-        h_token0 = PersistedIncarnation::capture(seeded->incarnation);
+        h_token0 = PersistedEtag::capture(seeded->incarnation);
         s0->dropRef(ns, "part_1");
     }
 

@@ -208,14 +208,14 @@ TEST(CASBackendGeneration, NativeHeadUsesNativeTokenMetadataApi)
     EXPECT_EQ(storage->ordinary_calls, 0);
 }
 
-/// Every token the backend mints carries native_token_type rather than a hardcoded TokenType::ETag.
+/// Every token the backend mints carries native_token_type rather than a hardcoded Dialect::ETag.
 /// The HEAD mint is the site exercised here; the write-response mint has its own tests over the fake
 /// S3 client below, which is the only place a Native write can produce a response incarnation.
 TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
 {
     auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
     auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
-    b->setNativeTokenTypeForTest(TokenType::Generation);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
 
     /// A local file's etag is its mtime in nanoseconds, which is also a valid generation value.
     const String key = DB::Cas::tests::nativeKeyUnder(storage, "p/gen/tok");
@@ -227,8 +227,8 @@ TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
 
     const auto hr = b->head(key);
     ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token.type, TokenType::Generation);
-    EXPECT_EQ(b->dialect(), TokenType::Generation);
+    EXPECT_EQ(hr.token.type, Dialect::Generation);
+    EXPECT_EQ(b->dialect(), Dialect::Generation);
 }
 
 /// A generation-dialect (GCS) mount wants bucket versioning to be verifiably off: a token-exact
@@ -241,7 +241,7 @@ TEST(CASBackendGeneration, CheckPoolPreconditionsWarnsAndContinuesOnUnverifiable
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         makeVersioningObjectStorageForTest(std::nullopt), ObjectStorageBackend::Mode::Native);
-    b->setNativeTokenTypeForTest(TokenType::Generation);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
 
     ScopedBackendLogCapture capture;
     EXPECT_NO_THROW(b->checkPoolPreconditions());
@@ -256,7 +256,7 @@ TEST(CASBackendGeneration, CheckPoolPreconditionsRejectsEnabledVersioning)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         makeVersioningObjectStorageForTest(true), ObjectStorageBackend::Mode::Native);
-    b->setNativeTokenTypeForTest(TokenType::Generation);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
 
     expectThrowsNotImplementedSaying("VERSIONING enabled", [&] { b->checkPoolPreconditions(); });
 }
@@ -266,7 +266,7 @@ TEST(CASBackendGeneration, CheckPoolPreconditionsAcceptsVerifiedDisabledVersioni
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         makeVersioningObjectStorageForTest(false), ObjectStorageBackend::Mode::Native);
-    b->setNativeTokenTypeForTest(TokenType::Generation);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
 
     ScopedBackendLogCapture capture;
     EXPECT_NO_THROW(b->checkPoolPreconditions());
@@ -274,14 +274,14 @@ TEST(CASBackendGeneration, CheckPoolPreconditionsAcceptsVerifiedDisabledVersioni
 }
 
 /// The ETag-dialect (AWS-compatible) backend never consults bucket versioning at all — the check is
-/// a silent no-op for any backend that is not Native + TokenType::Generation. Driven over a storage
+/// a silent no-op for any backend that is not Native + Dialect::Generation. Driven over a storage
 /// whose probe is unverifiable, which is what a generation-dialect backend warns about: dropping the
 /// dialect guard from checkPoolPreconditions would fail the silence assertion.
 TEST(CASBackendGeneration, CheckPoolPreconditionsNoOpOnEtagDialect)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         makeVersioningObjectStorageForTest(std::nullopt), ObjectStorageBackend::Mode::Native);
-    ASSERT_EQ(b->nativeTokenType(), TokenType::ETag);
+    ASSERT_EQ(b->nativeTokenType(), Dialect::ETag);
 
     ScopedBackendLogCapture capture;
     EXPECT_NO_THROW(b->checkPoolPreconditions());
@@ -294,7 +294,7 @@ TEST(CASBackendGeneration, CheckSkipAccessCheckSupportRejectsGenerationDialect)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
-    b->setNativeTokenTypeForTest(TokenType::Generation);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
 
     expectThrowsNotImplementedSaying("skip_access_check=true is not supported", [&] { b->checkSkipAccessCheckSupport(); });
 }
@@ -305,7 +305,7 @@ TEST(CASBackendGeneration, CheckSkipAccessCheckSupportAllowsEtagAndEmulatedBacke
 {
     auto etag = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
-    ASSERT_EQ(etag->nativeTokenType(), TokenType::ETag);
+    ASSERT_EQ(etag->nativeTokenType(), Dialect::ETag);
     EXPECT_NO_THROW(etag->checkSkipAccessCheckSupport());
 
     auto emulated = std::make_shared<ObjectStorageBackend>(
@@ -324,9 +324,9 @@ TEST(CASBackendGeneration, ListTokensDisabledOnGenerationStores)
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
     EXPECT_TRUE(b->supportsListTokens());
-    b->setNativeTokenTypeForTest(TokenType::Generation);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
     EXPECT_FALSE(b->supportsListTokens());
-    b->setNativeTokenTypeForTest(TokenType::ETag);
+    b->setNativeTokenTypeForTest(Dialect::ETag);
     EXPECT_TRUE(b->supportsListTokens());
 }
 
@@ -334,7 +334,7 @@ TEST(CASBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationSto
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
-    b->setNativeTokenTypeForTest(TokenType::Generation);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
     const auto ws = b->conditionalWriteSettingsForTest();
     EXPECT_EQ(ws.object_storage_request_mode, DB::ObjectStorageRequestMode::NativeConditional);
     EXPECT_TRUE(ws.s3_force_single_part_upload);
@@ -343,7 +343,7 @@ TEST(CASBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationSto
     ASSERT_TRUE(ws.s3_check_objects_after_upload_override.has_value());
     EXPECT_FALSE(*ws.s3_check_objects_after_upload_override);
 
-    b->setNativeTokenTypeForTest(TokenType::ETag);
+    b->setNativeTokenTypeForTest(Dialect::ETag);
     const auto ws2 = b->conditionalWriteSettingsForTest();
     EXPECT_EQ(ws2.object_storage_request_mode, DB::ObjectStorageRequestMode::NativeConditional);
     EXPECT_FALSE(ws2.s3_force_single_part_upload);
@@ -362,22 +362,22 @@ TEST(CASBackendGeneration, TokenPolicyHelpersAreConsistentWithDialect)
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
 
     /// ETag dialect: head/put tokens carry ETag; list surfaces the same-typed token for a non-empty etag.
-    ASSERT_EQ(b->nativeTokenType(), TokenType::ETag);
-    EXPECT_EQ(b->tokenForHead("abc").type, TokenType::ETag);
-    EXPECT_EQ(b->tokenForHead("abc"), (Token{"abc", TokenType::ETag}));
+    ASSERT_EQ(b->nativeTokenType(), Dialect::ETag);
+    EXPECT_EQ(b->tokenForHead("abc").type, Dialect::ETag);
+    EXPECT_EQ(b->tokenForHead("abc"), (Token{"abc", Dialect::ETag}));
     ASSERT_TRUE(b->tokenForList("abc").has_value());
     EXPECT_EQ(*b->tokenForList("abc"), b->tokenForHead("abc"));   /// list token == head token (same etag)
     EXPECT_FALSE(b->tokenForList("").has_value());                /// empty etag => no list token
 
     /// Generation dialect (GCS): head token flips to Generation; list tokens are disabled wholesale
     /// (poisoned If-Match), so tokenForList is always nullopt regardless of the etag.
-    b->setNativeTokenTypeForTest(TokenType::Generation);
-    EXPECT_EQ(b->tokenForHead("g1").type, TokenType::Generation);
+    b->setNativeTokenTypeForTest(Dialect::Generation);
+    EXPECT_EQ(b->tokenForHead("g1").type, Dialect::Generation);
     EXPECT_FALSE(b->tokenForList("g1").has_value());
 
     /// tokenMatches is exact identity (value AND type) — a same-value/different-type token never matches.
-    EXPECT_TRUE(ObjectStorageBackend::tokenMatches(Token{"x", TokenType::ETag}, Token{"x", TokenType::ETag}));
-    EXPECT_FALSE(ObjectStorageBackend::tokenMatches(Token{"x", TokenType::ETag}, Token{"x", TokenType::Emulated}));
+    EXPECT_TRUE(ObjectStorageBackend::tokenMatches(Token{"x", Dialect::ETag}, Token{"x", Dialect::ETag}));
+    EXPECT_FALSE(ObjectStorageBackend::tokenMatches(Token{"x", Dialect::ETag}, Token{"x", Dialect::Emulated}));
 }
 
 #if USE_AWS_S3
@@ -619,7 +619,7 @@ protected:
 
     /// A fresh backend, native token type forced to Generation unless overridden (the ETag dialect
     /// is needed to prove the generation-only quote handling does not touch it).
-    std::shared_ptr<ObjectStorageBackend> makeBackend(TokenType token_type = TokenType::Generation)
+    std::shared_ptr<ObjectStorageBackend> makeBackend(Dialect token_type = Dialect::Generation)
     {
         auto storage = makeGenerationS3ObjectStorageForTest(client);
         auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
@@ -635,7 +635,7 @@ TEST(CASBackendGeneration, PublishBlobAboveFormerGenerationCapUsesOrdinaryMultip
     auto storage = makeGenerationS3ObjectStorageForTest(
         client, /*force_multipart=*/true, /*conditional_put_cap=*/16);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-    backend.setNativeTokenTypeForTest(TokenType::Generation);
+    backend.setNativeTokenTypeForTest(Dialect::Generation);
 
     const String payload(1024, 'x');
     backend.publishBlob(BlobPublishRequest{
@@ -664,7 +664,7 @@ TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
     auto storage = makeGenerationS3ObjectStorageForTest(
         client, /*force_multipart=*/false, /*conditional_put_cap=*/1);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-    backend.setNativeTokenTypeForTest(TokenType::Generation);
+    backend.setNativeTokenTypeForTest(Dialect::Generation);
     client->put_returns_no_etag = true;
 
     const String payload = "payload";
@@ -696,7 +696,7 @@ TEST(CASBackendGrammar, NamelessWriteResponseThrowsWriteUnattributed)
     FakeGenerationS3Client * client = nullptr;
     auto storage = makeGenerationS3ObjectStorageForTest(client);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-    ASSERT_EQ(backend.nativeTokenType(), TokenType::ETag);
+    ASSERT_EQ(backend.nativeTokenType(), Dialect::ETag);
     client->put_returns_no_etag = true;
 
     DB::Cas::tests::expectThrowsCode(
@@ -714,7 +714,7 @@ TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPut
     auto storage = makeGenerationS3ObjectStorageForTest(
         client, /*force_multipart=*/false, /*conditional_put_cap=*/64);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-    backend.setNativeTokenTypeForTest(TokenType::Generation);
+    backend.setNativeTokenTypeForTest(Dialect::Generation);
 
     const String small(32, 'a');
     EXPECT_NO_THROW(backend.casPut("p/gen/under-cap", small, std::nullopt, ObjectMeta{}));
@@ -780,7 +780,7 @@ TEST_F(CASBackendGenerationS3, WriteGenerationTokenStripsTransportQuoting)
     client->next_put_etag = "\"1783078552147137\"";
     const auto put = backend->putIfAbsent("p/gen/quoted-write", "v");
     ASSERT_EQ(put.outcome, PutOutcome::Done);
-    EXPECT_EQ(put.token, (Token{"1783078552147137", TokenType::Generation}));
+    EXPECT_EQ(put.token, (Token{"1783078552147137", Dialect::Generation}));
 }
 
 /// The same crossing on the read side: a marked HEAD whose ETag field carries a quoted generation
@@ -794,7 +794,7 @@ TEST_F(CASBackendGenerationS3, HeadGenerationTokenStripsTransportQuoting)
 
     const auto hr = backend->head("p/gen/quoted-head");
     ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token, (Token{"1783078552147137", TokenType::Generation}));
+    EXPECT_EQ(hr.token, (Token{"1783078552147137", Dialect::Generation}));
 }
 
 /// The bound on that stripping. An ETag-dialect token IS the quoted ETag, and the quotes are required
@@ -802,13 +802,13 @@ TEST_F(CASBackendGenerationS3, HeadGenerationTokenStripsTransportQuoting)
 /// This is the test that fails if the quote handling is ever made unconditional.
 TEST_F(CASBackendGenerationS3, EtagDialectKeepsTransportQuotingVerbatim)
 {
-    backend = makeBackend(TokenType::ETag);
+    backend = makeBackend(Dialect::ETag);
     client->objects["p/etag/quoted-head"] = "body";
     client->next_head_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
 
     const auto hr = backend->head("p/etag/quoted-head");
     ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token, (Token{"\"d41d8cd98f00b204e9800998ecf8427e\"", TokenType::ETag}));
+    EXPECT_EQ(hr.token, (Token{"\"d41d8cd98f00b204e9800998ecf8427e\"", Dialect::ETag}));
 }
 
 /// A successful HEAD on a generation-dialect backend whose response carries no ETag/generation at all must not mint a token

@@ -29,7 +29,7 @@ namespace DB::ContentAddressedSetting
 ///
 /// WHAT THIS FILE PINS: the last clause, per key. The counts below were READ OFF this tree before any
 /// key change and pasted as literals, which is the whole point of the file -- expectations re-derived
-/// after a change measure the change against itself. Incarnation qualification changes the KEY a
+/// after a change measure the change against itself. Etag qualification changes the KEY a
 /// namespace file is stored under, so the keys are derived from `Layout` rather than spelled out; what
 /// must not move is the count per key and the set of keys touched.
 ///

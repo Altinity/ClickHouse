@@ -38,7 +38,7 @@ TEST(CASGcMetaWriter, RealCondemnMarkerJobCompletesAcrossOwnerDestruction)
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     const BlobRef ref = DB::Cas::tests::idOf("1");
-    const PersistedIncarnation token{"emulated", "tok-1"};
+    const PersistedEtag token{"emulated", "tok-1"};
 
     auto gc = std::make_unique<Gc>(store, DB::Cas::tests::u128Of(kGcId));
     backend->arm();
@@ -67,7 +67,7 @@ TEST(CASGcMetaWriter, CondemnMarkerConfirmationIsVisibleAfterDrain)
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     const BlobRef ref = DB::Cas::tests::idOf("1");
-    const PersistedIncarnation token{"emulated", "tok-1"};
+    const PersistedEtag token{"emulated", "tok-1"};
 
     Gc gc(store, DB::Cas::tests::u128Of(kGcId));
     EXPECT_FALSE(gc.metaWriterForTest().condemnMarkerConfirmedInProcess(ref, token));

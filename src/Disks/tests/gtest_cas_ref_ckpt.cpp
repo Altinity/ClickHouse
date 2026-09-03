@@ -1036,8 +1036,8 @@ TEST(CASRefCheckpoint, AMissingSampledBaseRestartsOnAnAdvancedIncarnationAndIsCo
     overwriteObject(op, key, "second");
     const auto second = op.read(key, Retry::standard());
     ASSERT_TRUE(second.has_value());
-    const Incarnation sampled = first->incarnation;
-    const Incarnation advanced = second->incarnation;
+    const Etag sampled = first->incarnation;
+    const Etag advanced = second->incarnation;
     ASSERT_FALSE(sampled == advanced) << "the rewrite must mint a different incarnation";
 
     EXPECT_EQ(classifyMissingSampledBase(sampled, advanced), MissingBaseVerdict::RestartRecovery)

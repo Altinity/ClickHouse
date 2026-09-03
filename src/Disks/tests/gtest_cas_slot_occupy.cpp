@@ -133,7 +133,7 @@ TEST(CASSlotOccupy, PreExistingKeyConflictsWithExactBytesAndIncarnationInTwoRequ
     const WriteResult seeded = seeder.create("k", "occupant-bytes", Retry::once());
     const auto * seeded_committed = std::get_if<Committed>(&seeded);
     ASSERT_TRUE(seeded_committed != nullptr);
-    const Incarnation seeded_incarnation = seeded_committed->incarnation;
+    const Etag seeded_incarnation = seeded_committed->incarnation;
     backend->resetCounts();
 
     CasOperation op = requests.admit();
@@ -341,7 +341,7 @@ TEST(CASSlotOccupy, OwnLandedAmbiguousWriteIsObservedOnTheNextAttempt)
     const auto * committed = std::get_if<Committed>(&first);
     ASSERT_TRUE(committed != nullptr) << "the write landed; the settling read proves it";
     EXPECT_TRUE(committed->resolved_by_read);
-    const Incarnation landed_incarnation = committed->incarnation;
+    const Etag landed_incarnation = committed->incarnation;
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getCount("k"), 1u);
 

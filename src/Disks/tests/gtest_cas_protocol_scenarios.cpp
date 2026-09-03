@@ -61,7 +61,7 @@ PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & b)
 
 /// The object's incarnation as the store reports it now -- what these scenarios compare when they
 /// assert an object was, or was not, displaced.
-Incarnation currentIncarnation(Backend & b, const String & key)
+Etag currentIncarnation(Backend & b, const String & key)
 {
     DB::Cas::tests::OperationForTest operation(b);
     const std::optional<Meta> meta = (*operation).head(key, Retry::standard());
@@ -72,7 +72,7 @@ Incarnation currentIncarnation(Backend & b, const String & key)
 
 /// An exact-incarnation delete attempt, for the scenarios whose discriminator is that a displaced
 /// incarnation can never be current again.
-Removal removeAtIncarnation(Backend & b, const String & key, const Incarnation & seen)
+Removal removeAtIncarnation(Backend & b, const String & key, const Etag & seen)
 {
     DB::Cas::tests::OperationForTest operation(b);
     return (*operation).remove(key, seen, Retry::standard());
@@ -165,11 +165,11 @@ TEST(CASProtocol, FenceConflictCondemnedTokenedBlobCommitsWithTokenUnchanged)
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
 
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
-    const Incarnation t0 = currentIncarnation(*b, blob_key);
+    const Etag t0 = currentIncarnation(*b, blob_key);
 
     /// GC condemns X at t0 in round 1 and fences the namespace to round 1.
     injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedIncarnation::capture(t0), .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedEtag::capture(t0), .size = 9}});
 
     /// promote: mutateShard refreshes the view (fence_round 1 > view round 0), but the materialized leaf is
     /// edge-protected — skipped, not re-validated ⇒ commit, token unchanged.
@@ -192,7 +192,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     /// X pre-exists out-of-band; the build dedup-adopts it via putBlob (records the current token t0).
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
-    const Incarnation t0 = currentIncarnation(*b, blob_key);
+    const Etag t0 = currentIncarnation(*b, blob_key);
 
     /// Wiring order: stage + precommit (durable edge) BEFORE the adopting putBlob.
     auto build = startBuildFor(s, ns, "part_1");
@@ -224,7 +224,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
-    const Incarnation t0 = currentIncarnation(*b, blob_key);
+    const Etag t0 = currentIncarnation(*b, blob_key);
 
     auto build = startBuildFor(s, ns, "part_1");
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob.
@@ -233,7 +233,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
 
     /// Another writer displaces X out-of-band ⇒ a new current token t1 (same payload, fresh tag).
-    const Incarnation t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
+    const Etag t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
     EXPECT_NE(t1, t0);
 
     /// GC advanced to round 1 with an EMPTY retired set; fence to 1.
@@ -270,8 +270,8 @@ TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
         writeBlobRaw(*b, s0->layout(), "payload-X", s0->poolMeta().blob_header_len, s0->poolMeta().pool_id);
     }
     const String blob_key = layout.blobKey(idOf("payload-X"));
-    const Incarnation t0 = currentIncarnation(*b, blob_key);
-    const PersistedIncarnation t_other{"emulated", "emulated-phantom"};
+    const Etag t0 = currentIncarnation(*b, blob_key);
+    const PersistedEtag t_other{"emulated", "emulated-phantom"};
     ASSERT_FALSE(t_other.matches(t0)) << "the phantom must name a DIFFERENT incarnation than the live one";
 
     injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
@@ -318,7 +318,7 @@ TEST(CASProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     const BlobRef seeded_ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))};
     seedBlobWithDurablePrecommit(s, seeded_ref, "payload-X");
     const String blob_key = s->layout().blobKey(seeded_ref);
-    const Incarnation t0 = currentIncarnation(*b, blob_key);
+    const Etag t0 = currentIncarnation(*b, blob_key);
 
     auto build = startBuildFor(s, ns, "part_1");
     ManifestEntry entry = blobEntry("data.bin", "payload-X");
@@ -363,11 +363,11 @@ TEST(CASProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
 
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
-    const Incarnation t0 = currentIncarnation(*b, blob_key);
+    const Etag t0 = currentIncarnation(*b, blob_key);
 
     /// Full GC condemned the build's OWN upload.
     injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedIncarnation::capture(t0), .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedEtag::capture(t0), .size = 9}});
 
     /// promote: the materialized leaf is edge-protected — skipped, not revalidated ⇒ commit, token unchanged.
     build->promote(ns, "part_1", build->buildId(), id);
@@ -418,7 +418,7 @@ TEST(CASProtocol, DropReattachThroughDetachedNamespace)
     publishBlobPart(s, ns, "part_1", "data.bin", "payload-X");
 
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
-    const Incarnation blob_tok = currentIncarnation(*b, blob_key);
+    const Etag blob_tok = currentIncarnation(*b, blob_key);
 
     EXPECT_TRUE(s->listRefs(ns).contains("part_1"));
     EXPECT_TRUE(s->listRefs(detached).empty());
@@ -477,7 +477,7 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
-    const Incarnation t0 = currentIncarnation(*b, blob_key);
+    const Etag t0 = currentIncarnation(*b, blob_key);
 
     auto build = startBuildFor(s, ns, "part_1");
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob.
@@ -486,12 +486,12 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
 
     /// Another writer displaces X to t1 (uncondemned) before our gate runs.
-    const Incarnation t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
+    const Etag t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
     ASSERT_NE(t1, t0);
 
     /// The view still condemns the OLD t0 at round 1, fenced.
     injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedIncarnation::capture(t0), .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = PersistedEtag::capture(t0), .size = 9}});
 
     /// promote: revalidate X ⇒ HEAD current t1 (NOT condemned; only the defunct t0 is) ⇒ commit.
     build->promote(ns, "part_1", build->buildId(), id);
@@ -582,7 +582,7 @@ TEST(CASProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
             "payload-fresh-ev");
     }
     const String blob_key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))});
-    const Incarnation t0 = currentIncarnation(*b, blob_key);
+    const Etag t0 = currentIncarnation(*b, blob_key);
     condemnMeta(*b, layout, hexToU128(hex), /*condemn_round*/ 1);
 
     auto s = openPool(b);

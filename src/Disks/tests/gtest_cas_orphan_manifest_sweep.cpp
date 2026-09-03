@@ -421,7 +421,7 @@ TEST(CASOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
     seedConsumedSealCursor(*backend, store->layout(), ns);
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
 
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const CasRefCatalog::Snapshot before = CasRefCatalog::read(op, store->layout());
     RefCatalog damaged = before.catalog;
     CatalogEntry duplicate = damaged.entries.front();
@@ -467,7 +467,7 @@ TEST(CASOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecis
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
     seedConsumedSealCursor(*backend, store->layout(), ns);
 
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     ASSERT_FALSE(readCkpt(op, store->layout(), NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation)));
 
@@ -489,7 +489,7 @@ TEST(CASOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccess
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/seal-cursor-tail@cas@"};
     fixture::admitLive(*backend, store->layout(), ns);
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
@@ -538,7 +538,7 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/missing-next-epoch@cas@"};
     fixture::admitLive(*backend, store->layout(), ns);
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
@@ -599,7 +599,7 @@ TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/exact-next-epoch@cas@"};
     fixture::admitLive(*backend, store->layout(), ns);
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
@@ -646,7 +646,7 @@ TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/frozen-catalog-cut@cas@"};
     fixture::admitLive(*backend, store->layout(), ns);
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const CatalogEntry predecessor = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
 
     const ManifestRef r = ref(5, 0xB1);

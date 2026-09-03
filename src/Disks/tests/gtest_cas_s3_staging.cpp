@@ -941,7 +941,7 @@ namespace
 /// A `LocalObjectStorage` that reports the GCS generation dialect
 /// (`conditionalOpsUseGenerationTokens() == true`) and a non-`Local` `getType()`, so
 /// `ContentAddressedMetadataStorage::openPoolView` builds its backend in `Mode::Native` with
-/// `native_token_type == TokenType::Generation`. The fake also advertises native copy so generation
+/// `native_token_type == Dialect::Generation`. The fake also advertises native copy so generation
 /// token mode can exercise explicit S3 staging without endpoint/provider heuristics.
 ///
 /// Holds every object entirely in memory, keyed by the BARE CAS key exactly as `Backend` hands it to

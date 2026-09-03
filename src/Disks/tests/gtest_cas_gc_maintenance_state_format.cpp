@@ -123,7 +123,7 @@ TEST(CASGCMaintenanceState, ReadsAndCasWithoutAdoptingConflicts)
     const WriteResult advanced = casGcMaintenanceState(op, layout, valid.incarnation,
         GcMaintenanceState{.janitor_cursor = "cas/ns/advanced"}, Retry::standard());
     ASSERT_TRUE(std::holds_alternative<Committed>(advanced));
-    const Incarnation advanced_incarnation = std::get<Committed>(advanced).incarnation;
+    const Etag advanced_incarnation = std::get<Committed>(advanced).incarnation;
 
     ASSERT_TRUE(std::holds_alternative<Committed>(
         op.replace(key, encodeGcMaintenanceState({.janitor_cursor = "winner"}), advanced_incarnation, Retry::standard())));

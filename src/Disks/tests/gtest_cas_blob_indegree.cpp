@@ -235,7 +235,7 @@ CondemnedRow condemnedRowFor(uint64_t condemn_round, const String & tok = "t",
                              bool delete_pending = false, uint64_t size = 1)
 {
     return CondemnedRow{.delete_pending = delete_pending,
-                        .token = PersistedIncarnation{"emulated", tok},
+                        .token = PersistedEtag{"emulated", tok},
                         .size = size, .condemn_round = condemn_round};
 }
 
@@ -785,9 +785,9 @@ TEST(CASCondemnedRow, RoundTripAllTokenTypes)
     for (const auto & entry : DB::Cas::kTokenTypeWords.entries)
     {
         DB::Cas::CondemnedRow row;
-        row.delete_pending = (entry.value == DB::Cas::TokenType::Generation);
-        row.marker_confirmed = (entry.value == DB::Cas::TokenType::Emulated);
-        row.token = DB::Cas::PersistedIncarnation{String(entry.word), "etag-abc-123"};
+        row.delete_pending = (entry.value == DB::Cas::Dialect::Generation);
+        row.marker_confirmed = (entry.value == DB::Cas::Dialect::Emulated);
+        row.token = DB::Cas::PersistedEtag{String(entry.word), "etag-abc-123"};
         row.size = 4096;
         row.condemn_round = 7;
         const auto bytes = DB::Cas::encodeCondemnedRow(row);
@@ -800,7 +800,7 @@ TEST(CASCondemnedRow, UnknownMarkerByteFailsClosedWithCorruptedData)
 {
     /// This pins the condemned-row decoder's own marker validation.
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
+    row.token = DB::Cas::PersistedEtag{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[0] = 0x03;
 
@@ -835,7 +835,7 @@ TEST(CASRecordStream, RunMarkerByteContractFailsClosed)
 TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
+    row.token = DB::Cas::PersistedEtag{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[1] = 4;   // flags byte: only bits 0 (delete_pending) and 1 (marker_confirmed) are defined
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
@@ -844,7 +844,7 @@ TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
 TEST(CASCondemnedRow, UnknownTokenTypeFailsClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
+    row.token = DB::Cas::PersistedEtag{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[2] = 99;   // token_type byte (offset: [0]=0x02 [1]=flags [2]=token_type)
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
@@ -853,7 +853,7 @@ TEST(CASCondemnedRow, UnknownTokenTypeFailsClosed)
 TEST(CASCondemnedRow, TruncatedPayloadFailsClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedIncarnation{"etag", "0123456789"};
+    row.token = DB::Cas::PersistedEtag{"etag", "0123456789"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes.resize(bytes.size() - 3);   // token bytes shorter than declared token_len
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);

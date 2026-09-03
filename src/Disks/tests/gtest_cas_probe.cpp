@@ -205,7 +205,7 @@ private:
 
 }
 
-/// The probe's reordered "wrong incarnation" steps always reuse a REAL, backend-minted `Incarnation`
+/// The probe's reordered "wrong incarnation" steps always reuse a REAL, backend-minted `Etag`
 /// from the same key rather than a synthesized value — see CasProbe.cpp's step comments — and every
 /// such value is grammar-valid under every dialect by construction (`InMemoryBackend`'s minted values are
 /// a monotonically increasing decimal starting at "1": non-empty and comma/`*`-free for ETag, a canonical

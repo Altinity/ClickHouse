@@ -492,7 +492,7 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     CasOperation op = requests.admit();
     const auto condemned_entry = currentEntryFor(*backend, store->layout(), hash);
     ASSERT_TRUE(condemned_entry.has_value());
-    const PersistedIncarnation t1 = condemned_entry->token;
+    const PersistedEtag t1 = condemned_entry->token;
     const std::optional<Meta> at_condemn = op.head(blob_key, Retry::once());
     ASSERT_TRUE(at_condemn);
     ASSERT_TRUE(t1.matches(at_condemn->incarnation));
@@ -1211,8 +1211,8 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
     /// plane's lease-bound policies keep their real clock.
     std::atomic<uint64_t> engine_now_ms{0};
     std::atomic<uint64_t> engine_sleeps{0};
-    store->gcRequests().setNowFnForTest([&] { return engine_now_ms.load(); });
-    store->gcRequests().setSleepFnForTest([&](uint64_t pause_ms)
+    store->openRequests().setNowFnForTest([&] { return engine_now_ms.load(); });
+    store->openRequests().setSleepFnForTest([&](uint64_t pause_ms)
     {
         engine_sleeps.fetch_add(1);
         engine_now_ms.fetch_add(pause_ms + 1);

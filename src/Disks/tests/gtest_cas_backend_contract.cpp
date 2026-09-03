@@ -41,7 +41,7 @@ TEST_P(CASBackendContract, OverwriteIsTokenExactAndMintsFreshToken)
 {
     auto b = GetParam()();
     const Token t1 = b->putIfAbsent("k", "v1").token;
-    EXPECT_EQ(b->putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}).outcome, PutOutcome::PreconditionFailed);
+    EXPECT_EQ(b->putOverwrite("k", "v2", Token{"wrong", Dialect::Emulated}).outcome, PutOutcome::PreconditionFailed);
     expectBytes(b, "k", "v1");                                 // untouched on mismatch
     const auto overwrite = b->putOverwrite("k", "v2", t1);
     EXPECT_EQ(overwrite.outcome, PutOutcome::Done);
@@ -56,7 +56,7 @@ TEST_P(CASBackendContract, CasPutCreateAndSwap)
     const Token t1 = create.token;
     EXPECT_EQ(create.outcome, CasOutcome::Committed);                              // create-if-absent
     EXPECT_EQ(b->casPut("m", "s1x", std::nullopt).outcome, CasOutcome::Conflict);  // exists now
-    EXPECT_EQ(b->casPut("m", "s2", Token{"stale", TokenType::Emulated}).outcome, CasOutcome::Conflict);
+    EXPECT_EQ(b->casPut("m", "s2", Token{"stale", Dialect::Emulated}).outcome, CasOutcome::Conflict);
     expectBytes(b, "m", "s1");
     EXPECT_EQ(b->casPut("m", "s2", t1).outcome, CasOutcome::Committed);
     expectBytes(b, "m", "s2");
@@ -66,7 +66,7 @@ TEST_P(CASBackendContract, DeleteExactnessAndSurvival)
 {
     auto b = GetParam()();
     const Token t1 = b->putIfAbsent("k", "v1").token;
-    auto d1 = b->deleteExact("k", Token{"wrong", TokenType::Emulated});
+    auto d1 = b->deleteExact("k", Token{"wrong", Dialect::Emulated});
     EXPECT_EQ(d1.kind, DeleteOutcome::Kind::TokenMismatch);
     EXPECT_TRUE(b->get("k").has_value());                      // SURVIVES wrong-token delete
     auto d2 = b->deleteExact("k", t1);

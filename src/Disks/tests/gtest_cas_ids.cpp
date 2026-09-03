@@ -31,9 +31,9 @@ TEST(CASIds, HexU128RoundTrip)
 
 TEST(CASToken, Basics)
 {
-    Token a{"etag-1", TokenType::ETag};
-    Token b{"etag-1", TokenType::ETag};
-    Token c{"etag-2", TokenType::ETag};
+    Token a{"etag-1", Dialect::ETag};
+    Token b{"etag-1", Dialect::ETag};
+    Token c{"etag-2", Dialect::ETag};
     EXPECT_EQ(a, b);
     EXPECT_NE(a, c);
     EXPECT_TRUE(Token{}.empty());

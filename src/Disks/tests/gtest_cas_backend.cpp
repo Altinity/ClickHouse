@@ -262,7 +262,7 @@ TEST(CASInMemory, OverwriteIsTokenExactAndMintsFreshToken)
 {
     InMemoryBackend b;
     const Token t1 = b.putIfAbsent("k", "v1").token;
-    EXPECT_EQ(b.putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}).outcome, PutOutcome::PreconditionFailed);
+    EXPECT_EQ(b.putOverwrite("k", "v2", Token{"wrong", Dialect::Emulated}).outcome, PutOutcome::PreconditionFailed);
     expectBytes(b, "k", "v1");                                // untouched on mismatch
     const auto overwrite = b.putOverwrite("k", "v2", t1);
     EXPECT_EQ(overwrite.outcome, PutOutcome::Done);
@@ -277,7 +277,7 @@ TEST(CASInMemory, CasPutCreateAndSwap)
     const Token t1 = create.token;
     EXPECT_EQ(create.outcome, CasOutcome::Committed);                             // create-if-absent
     EXPECT_EQ(b.casPut("m", "s1x", std::nullopt).outcome, CasOutcome::Conflict);  // exists now
-    EXPECT_EQ(b.casPut("m", "s2", Token{"stale", TokenType::Emulated}).outcome, CasOutcome::Conflict);
+    EXPECT_EQ(b.casPut("m", "s2", Token{"stale", Dialect::Emulated}).outcome, CasOutcome::Conflict);
     EXPECT_EQ(b.get("m")->bytes, "s1");
     EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Committed);
     EXPECT_EQ(b.get("m")->bytes, "s2");
@@ -287,7 +287,7 @@ TEST(CASInMemory, DeleteExactEnforced)
 {
     InMemoryBackend b;
     const Token t1 = b.putIfAbsent("k", "v1").token;
-    auto d1 = b.deleteExact("k", Token{"wrong", TokenType::Emulated});
+    auto d1 = b.deleteExact("k", Token{"wrong", Dialect::Emulated});
     EXPECT_EQ(d1.kind, DeleteOutcome::Kind::TokenMismatch);
     EXPECT_TRUE(b.get("k").has_value());                      // SURVIVES wrong-token delete
     auto d2 = b.deleteExact("k", t1);
@@ -473,7 +473,7 @@ TEST(CASInMemoryFaults, NonEnforcingModeMimicsBadBackend)
     InMemoryBackend b;
     b.setEnforceTokens(false);                        // MinIO-OSS-shaped backend
     b.putIfAbsent("k", "v1");
-    auto d = b.deleteExact("k", Token{"totally-wrong", TokenType::Emulated});
+    auto d = b.deleteExact("k", Token{"totally-wrong", Dialect::Emulated});
     EXPECT_EQ(d.kind, DeleteOutcome::Kind::Deleted);  // silently deletes anyway — the dangerous behavior
     EXPECT_FALSE(b.get("k").has_value());
 }
@@ -602,17 +602,17 @@ TEST(CASInstrumentedBackend, PublishBlobDelegatesOnceAndRecordsOnePhysicalBlobWr
 TEST(CASBackendGrammar, GenerationDialectAcceptsOnlyCanonicalPositiveDecimal)
 {
     using DB::Cas::ObjectStorageBackend;
-    using DB::Cas::TokenType;
-    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "123"));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "0"));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "00123"));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "\"123\""));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "12a"));
-    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, "\"abc\""));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, " * "));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, "a,b"));
-    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::Emulated, "7"));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Emulated, ""));
+    using DB::Cas::Dialect;
+    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(Dialect::Generation, "123"));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(Dialect::Generation, "0"));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(Dialect::Generation, "00123"));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(Dialect::Generation, "\"123\""));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(Dialect::Generation, "12a"));
+    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(Dialect::ETag, "\"abc\""));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(Dialect::ETag, " * "));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(Dialect::ETag, "a,b"));
+    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(Dialect::Emulated, "7"));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(Dialect::Emulated, ""));
 }
 
 /// §1 (opt round-B): the fold/point GETs read tiny bodies but a default `ReadBufferFromS3` preallocates
@@ -915,7 +915,7 @@ TEST(CASObjectStorageBackend, PublishBlobStreamingUsesOrdinaryDefaultWriteTransp
 {
     auto storage = makePublicationRecordingStorage();
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-    backend.setNativeTokenTypeForTest(TokenType::Generation);
+    backend.setNativeTokenTypeForTest(Dialect::Generation);
     const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/streaming");
 
     const auto request = streamingPublication(destination, "fresh-envelope", "payload", 7);
@@ -1320,7 +1320,7 @@ TEST(CASObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
 
 /// codex-review-triage §3.18, finding №18: `list`'s `EmulatedSingleProcess` branch minted its per-key
 /// token via `tokenForList`, which always stamps `native_token_type` (ETag) REGARDLESS of `mode` --
-/// while `head`/`get` mint `TokenType::Emulated`. `Token::operator==` compares type AND value, so a
+/// while `head`/`get` mint `Dialect::Emulated`. `Token::operator==` compares type AND value, so a
 /// list-derived token could never satisfy an emulated `deleteExact`/`putOverwrite` expectation: a
 /// fail-safe leak (never a wrong delete), but every consumer of listed tokens (GC namespace cleanup,
 /// `deletePrefixWholesale`, orphan sweep, decommission drain) always saw `TokenMismatch` against a
@@ -1333,7 +1333,7 @@ TEST(CASObjectStorageBackend, EmulatedListTokenMatchesHeadToken)
     ASSERT_EQ(backend->putIfAbsent("k/listed", "body").outcome, PutOutcome::Done);
 
     const Token head_token = backend->head("k/listed").token;
-    ASSERT_EQ(head_token.type, TokenType::Emulated);
+    ASSERT_EQ(head_token.type, Dialect::Emulated);
 
     const ListPage page = backend->list("k/", "", /*limit=*/10);
     ASSERT_EQ(page.keys.size(), 1u);
@@ -1392,8 +1392,8 @@ TEST(CASObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
     ASSERT_EQ(put2.outcome, PutOutcome::Done);
 
     EXPECT_NE(put1.token.value, put2.token.value);
-    EXPECT_EQ(put1.token.type, TokenType::Emulated);
-    EXPECT_EQ(put2.token.type, TokenType::Emulated);
+    EXPECT_EQ(put1.token.type, Dialect::Emulated);
+    EXPECT_EQ(put2.token.type, Dialect::Emulated);
 
     /// A stale delete using the FIRST incarnation's token must not match the live (second) one.
     EXPECT_EQ(backend.deleteExact("k/tick", put1.token).kind, DeleteOutcome::Kind::TokenMismatch);
@@ -1413,7 +1413,7 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedDisambiguatesSameEtagFromStaleD
     const HeadResult published = backend.head(key);
     ASSERT_TRUE(published.exists);
     EXPECT_NE(published.token, stale_token);
-    EXPECT_EQ(published.token.type, TokenType::Emulated);
+    EXPECT_EQ(published.token.type, Dialect::Emulated);
     EXPECT_EQ(backend.deleteExact(key, stale_token).kind, DeleteOutcome::Kind::TokenMismatch);
 
     const auto live = backend.get(key);
@@ -1646,13 +1646,13 @@ TEST(CASObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWir
         out->finalize();
     }
     const Token live = backend.head(key).token;
-    ASSERT_EQ(live.type, TokenType::ETag);
+    ASSERT_EQ(live.type, Dialect::ETag);
 
     storage->write_calls = 0;
     storage->remove_if_matches_calls = 0;
 
     /// Same wire VALUE, wrong dialect TYPE (Emulated instead of this backend's native ETag dialect).
-    const Token wrong_type_token{live.value, TokenType::Emulated};
+    const Token wrong_type_token{live.value, Dialect::Emulated};
 
     EXPECT_EQ(backend.putOverwrite(key, "v2", wrong_type_token).outcome, PutOutcome::PreconditionFailed);
     EXPECT_EQ(backend.casPut(key, "v2", wrong_type_token).outcome, CasOutcome::Conflict);
@@ -1678,9 +1678,9 @@ TEST(CASBackendGrammar, RejectsEmptyStarAndListTokensOnEveryMutation)
     auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    const DB::Cas::Token empty{"", DB::Cas::TokenType::ETag};
-    const DB::Cas::Token star{"*", DB::Cas::TokenType::ETag};
-    const DB::Cas::Token list{"\"a\", \"b\"", DB::Cas::TokenType::ETag};
+    const DB::Cas::Token empty{"", DB::Cas::Dialect::ETag};
+    const DB::Cas::Token star{"*", DB::Cas::Dialect::ETag};
+    const DB::Cas::Token list{"\"a\", \"b\"", DB::Cas::Dialect::ETag};
     for (const auto & bad : {empty, star, list})
     {
         DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { backend.putOverwrite("k", "v", bad); });
@@ -1696,9 +1696,9 @@ TEST(CASBackendGrammarDeathTest, RejectsEmptyStarAndListTokensOnEveryMutation)
     auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    const DB::Cas::Token empty{"", DB::Cas::TokenType::ETag};
-    const DB::Cas::Token star{"*", DB::Cas::TokenType::ETag};
-    const DB::Cas::Token list{"\"a\", \"b\"", DB::Cas::TokenType::ETag};
+    const DB::Cas::Token empty{"", DB::Cas::Dialect::ETag};
+    const DB::Cas::Token star{"*", DB::Cas::Dialect::ETag};
+    const DB::Cas::Token list{"\"a\", \"b\"", DB::Cas::Dialect::ETag};
     for (const auto & bad : {empty, star, list})
     {
         EXPECT_DEATH({ (void)backend.putOverwrite("k", "v", bad); }, "");

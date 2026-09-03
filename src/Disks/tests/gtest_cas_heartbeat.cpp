@@ -981,7 +981,7 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
 
         /// The incarnation the about-to-be-terminal renewal names as its precondition: a late delivery
         /// of that attempt can only ever be replayed against exactly this one.
-        const Incarnation delayed_precondition
+        const Etag delayed_precondition
             = ops.op.read(layout.mountKey("after-successor"), Retry::standard())->incarnation;
 
         backend->actions = {RenewalScriptBackend::Action::ThrowBefore};

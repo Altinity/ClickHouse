@@ -188,7 +188,7 @@ ReadyFixture makeReadyFixture()
     const uint64_t new_attempt = state.snap_attempt + 1000;
     std::vector<RunRef> runs;
     RetiredMergeResult retired;
-    CasOperation seed_op = f.store->gcRequests().admit();
+    CasOperation seed_op = f.store->openRequests().admit();
     foldDeltasIntoGeneration(
         seed_op, f.store->layout(), seal.blob_target_runs,
         new_generation, new_attempt, /*shard=*/0, std::move(seeded_edges), runs,
@@ -229,7 +229,7 @@ TEST(CASOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
     EXPECT_FALSE(manifestExists(*f.backend, f.store->layout(), f.candidate));
     EXPECT_TRUE(f.backend->source_absent_when_delete_started)
         << "the adopted in-degree run must retire the manifest source before exact deletion begins";
-    CasOperation op = f.store->gcRequests().admit();
+    CasOperation op = f.store->openRequests().admit();
     for (size_t i = 0; i < f.blobs.size(); ++i)
     {
         EXPECT_FALSE(activeSourceExists(
