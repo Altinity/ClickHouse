@@ -58,6 +58,12 @@ using namespace DB::Cas;
 namespace
 {
 
+bool manifestKeyExists(const BackendPtr & backend, const String & key)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    return (*op).head(key, Retry::standard()).has_value();
+}
+
 PoolPtr openPool(const BackendPtr & backend)
 {
     /// A fresh pool with no residue, mirroring `gtest_cas_ref_chunked_flush.cpp`'s `openPool`.
@@ -78,7 +84,6 @@ PoolPtr openPoolWedgeBudget(const BackendPtr & backend)
     PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     return Pool::open(backend, cfg);
@@ -180,7 +185,6 @@ PoolPtr openPoolFenceControlled(const std::shared_ptr<DB::Cas::InMemoryBackend> 
     cfg.mount_renew_period = std::chrono::milliseconds{3600000};
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
@@ -899,7 +903,10 @@ TEST(CASRefInstallSafety, WedgeResolutionProvenForeignFaultsTheLane)
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
     const String wedged_key = store->wedgedKeyForTest(ns);
     ASSERT_FALSE(wedged_key.empty());
-    ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
+    {
+        DB::Cas::tests::OperationForTest foreign_op(backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*foreign_op).create(wedged_key, "a-different-object", Retry::once())));
+    }
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
 
@@ -1036,7 +1043,7 @@ TEST(CASRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
     auto build = store->beginPartWrite(info);
     const ManifestId id = build->stageManifest({});
     const String manifest_key = store->layout().manifestKey(id);
-    ASSERT_TRUE(backend->head(manifest_key).exists) << "the staged body must exist before the precommit";
+    ASSERT_TRUE(manifestKeyExists(backend, manifest_key)) << "the staged body must exist before the precommit";
 
     /// Scoped to THIS namespace's ref log so the manifest body's own PUT cannot consume the fault. The
     /// object LANDS and only its acknowledgement is lost, and no settling read can prove otherwise, so
@@ -1053,7 +1060,7 @@ TEST(CASRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
     /// precommit durable) and appends the exact removal in the same flush.
     build->abandon();
 
-    EXPECT_TRUE(backend->head(manifest_key).exists)
+    EXPECT_TRUE(manifestKeyExists(backend, manifest_key))
         << "abandon writer-deleted the body of a precommit that may be live -- GC's fold barrier would "
            "clamp on it forever";
     EXPECT_TRUE(store->livePrecommitsForTest(ns).empty())

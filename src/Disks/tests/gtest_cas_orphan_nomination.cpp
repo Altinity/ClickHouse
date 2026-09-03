@@ -29,7 +29,8 @@ ManifestRef candidateRef()
 
 bool manifestExists(Backend & backend, const Layout & layout, const ManifestId & id)
 {
-    return backend.head(layout.manifestKey(id)).exists;
+    DB::Cas::tests::OperationForTest op(backend);
+    return (*op).head(layout.manifestKey(id), Retry::standard()).has_value();
 }
 
 bool activeSourceExists(CasOperation & op, const Layout & layout, const UInt128 & source_id)
@@ -177,18 +178,18 @@ ReadyFixture makeReadyFixture()
 
     /// Seed the exact S42 precondition: the candidate manifest's `+1` edges are already in the adopted
     /// run, yet the recovered owner view does not name the body. Four blobs also have another source.
-    const auto state_got = f.backend->get(f.store->layout().gcStateKey());
+    CasOperation seed_op = f.store->openRequests().admit();
+    const auto state_got = seed_op.read(f.store->layout().gcStateKey(), Retry::standard());
     EXPECT_TRUE(state_got.has_value());
     GcState state = decodeGcState(state_got->bytes);
-    const auto parent_got = f.backend->get(
-        f.store->layout().foldSealKey(state.snap_generation, state.snap_attempt));
+    const auto parent_got = seed_op.read(
+        f.store->layout().foldSealKey(state.snap_generation, state.snap_attempt), Retry::standard());
     EXPECT_TRUE(parent_got.has_value());
     CasFoldSeal seal = decodeFoldSeal(parent_got->bytes);
     const uint64_t new_generation = state.snap_generation + 1;
     const uint64_t new_attempt = state.snap_attempt + 1000;
     std::vector<RunRef> runs;
     RetiredMergeResult retired;
-    CasOperation seed_op = f.store->openRequests().admit();
     foldDeltasIntoGeneration(
         seed_op, f.store->layout(), seal.blob_target_runs,
         new_generation, new_attempt, /*shard=*/0, std::move(seeded_edges), runs,
@@ -202,7 +203,7 @@ ReadyFixture makeReadyFixture()
         seed_op, f.store->layout().foldSealKey(new_generation, new_attempt), encodeFoldSeal(seal));
     state.snap_generation = new_generation;
     state.snap_attempt = new_attempt;
-    f.backend->putOverwrite(f.store->layout().gcStateKey(), encodeGcState(state), state_got->token);
+    seed_op.replace(f.store->layout().gcStateKey(), encodeGcState(state), state_got->incarnation, Retry::standard());
 
     f.backend->watched_manifest_key = f.store->layout().manifestKey(f.candidate);
     f.backend->watched_source_id = sourceEdgeId(f.candidate, "blob-0");
@@ -252,9 +253,10 @@ TEST(CASOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
 TEST(CASOrphanNomination, CorruptManifestIsRetainedAndSurfaced)
 {
     ReadyFixture f = makeReadyFixture();
-    const auto got = f.backend->get(f.backend->watched_manifest_key);
+    DB::Cas::tests::OperationForTest op(f.backend);
+    const auto got = (*op).read(f.backend->watched_manifest_key, Retry::standard());
     ASSERT_TRUE(got.has_value());
-    f.backend->putOverwrite(f.backend->watched_manifest_key, "not a sealed manifest", got->token);
+    (*op).replace(f.backend->watched_manifest_key, "not a sealed manifest", got->incarnation, Retry::standard());
 
     std::optional<GcPhaseRecord> orphan_sweep;
     f.gc->setPhaseSink([&](const GcPhaseRecord & rec) { if (rec.phase == "orphan_sweep") orphan_sweep = rec; });
@@ -264,7 +266,10 @@ TEST(CASOrphanNomination, CorruptManifestIsRetainedAndSurfaced)
     EXPECT_TRUE(report.acquired_lease);
     ASSERT_TRUE(orphan_sweep.has_value());
     EXPECT_EQ(orphan_sweep->metrics.at("undecodable"), 1u);
-    EXPECT_TRUE(f.backend->head(f.backend->watched_manifest_key).exists);
+    {
+        DB::Cas::tests::OperationForTest head_op(f.backend);
+        EXPECT_TRUE((*head_op).head(f.backend->watched_manifest_key, Retry::standard()).has_value());
+    }
 }
 
 /// Manifest identities are immutable. A changed token at the same key is illegal ABA, not an ordinary
@@ -275,7 +280,10 @@ TEST(CASOrphanNomination, TokenAbaIsRetainedAndSurfaced)
     f.backend->replace_manifest_before_delete = true;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { runRegularRoundReclaiming(*f.gc); });
-    EXPECT_TRUE(f.backend->head(f.backend->watched_manifest_key).exists);
+    {
+        DB::Cas::tests::OperationForTest head_op(f.backend);
+        EXPECT_TRUE((*head_op).head(f.backend->watched_manifest_key, Retry::standard()).has_value());
+    }
 }
 
 /// Nomination PLANNING itself is gated on `!suppress_destructive`

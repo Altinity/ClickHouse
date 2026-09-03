@@ -81,9 +81,8 @@ void writeVerbatimThroughDisk(
 void deleteCatalogLife(
     DB::ContentAddressedMetadataStorage & storage, const NamespaceLifeId & life1)
 {
-    Backend & backend = storage.store()->backend();
     const Layout & layout = storage.store()->layout();
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(storage.store()->poolBackendPtr());
     CasOperation op = requests.admit();
     CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & current)
     {
@@ -126,7 +125,7 @@ NamespaceLifeId admitReplacementLife(
     if (life1.incarnation == kLife2Id)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Fixture life ids unexpectedly collide");
     const NamespaceLifeId life2 = NamespaceLifeId::fromCatalogEntry(life1.ns, kLife2Id);
-    CasRequests requests = DB::Cas::tests::openRequestsForTest(storage.store()->backend());
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(storage.store()->poolBackendPtr());
     CasOperation op = requests.admit();
     CasRefCatalog::casAdmitEntry(
         op, storage.store()->layout(), storage.store()->poolConfig().gc_shards, CatalogEntry{
@@ -186,14 +185,15 @@ TEST(CASNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTok
 
     const NamespaceLifeId life2 = replaceCatalogLife(*fixture.storage, life1);
     fixture.storage->store()->putNamespaceFile(life2, kFile, "life-2-stable\n");
-    Backend & backend = fixture.storage->store()->backend();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(fixture.storage->store()->poolBackendPtr());
+    CasOperation op = requests.admit();
     const Layout & layout = fixture.storage->store()->layout();
     const String life1_key = layout.namespaceFileKey(life1, kFile);
     const String life2_key = layout.namespaceFileKey(life2, kFile);
     ASSERT_TRUE(std::filesystem::exists(nativeKeyUnder(fixture.object_storage, life2_key)));
-    const HeadResult life2_before = backend.head(life2_key);
-    ASSERT_TRUE(life2_before.exists);
-    const auto life2_body_before = backend.get(life2_key);
+    const auto life2_before = op.head(life2_key, Retry::standard());
+    ASSERT_TRUE(life2_before.has_value());
+    const auto life2_body_before = op.read(life2_key, Retry::standard());
     ASSERT_TRUE(life2_body_before.has_value());
     ASSERT_EQ(life2_body_before->bytes, "life-2-stable\n");
 
@@ -209,17 +209,17 @@ TEST(CASNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTok
         EXPECT_NE(e.message().find("retrying later"), String::npos);
     }
 
-    const HeadResult life2_after = backend.head(life2_key);
-    ASSERT_TRUE(life2_after.exists);
-    EXPECT_EQ(life2_after.token, life2_before.token);
-    const auto life2_body_after = backend.get(life2_key);
+    const auto life2_after = op.head(life2_key, Retry::standard());
+    ASSERT_TRUE(life2_after.has_value());
+    EXPECT_EQ(life2_after->incarnation, life2_before->incarnation);
+    const auto life2_body_after = op.read(life2_key, Retry::standard());
     ASSERT_TRUE(life2_body_after.has_value());
     EXPECT_EQ(life2_body_after->bytes, "life-2-stable\n");
 
     if (!stale_failure)
     {
         ASSERT_TRUE(std::filesystem::exists(nativeKeyUnder(fixture.object_storage, life1_key)));
-        const auto life1_body = backend.get(life1_key);
+        const auto life1_body = op.read(life1_key, Retry::standard());
         ASSERT_TRUE(life1_body.has_value());
         EXPECT_EQ(life1_body->bytes, "life-1-delayed\n");
     }

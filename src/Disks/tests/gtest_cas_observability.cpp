@@ -75,15 +75,11 @@ public:
     }
 };
 
-CasRequestBudget renewalCounterBudget(uint32_t max_attempts = 2)
+CasRequestBudget renewalCounterBudget(uint32_t /*max_attempts*/ = 2)
 {
     return CasRequestBudget{
         .attempt_timeout_ms = 10,
-        .operation_deadline_ms = 500,
-        .max_attempts = max_attempts,
         .lease_safety_margin_ms = 20,
-        .retry_initial_backoff_ms = 0,
-        .retry_max_backoff_ms = 0,
     };
 }
 
@@ -306,10 +302,12 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     const RootNamespace ns{"test/tbl"};
     const String P = "republish-payload-audit";
 
+    DB::Cas::tests::OperationForTest head_op(*b);
+
     /// 1. Publish ref r1 -> token A referenced; drop it; ONE GC round condemns A (retired, not deleted).
     publishOneBlobPart(s, ns, "r1", P);
-    const HeadResult hA = b->head(s->layout().blobKey(idOf(P)));
-    ASSERT_TRUE(hA.exists);
+    const auto hA = (*head_op).head(s->layout().blobKey(idOf(P)), Retry::standard());
+    ASSERT_TRUE(hA.has_value());
     s->dropRef(ns, "r1");
     s->renewWatermarkOnce();
 
@@ -326,9 +324,10 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 
     /// 2. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B; drop it too.
     publishOneBlobPart(s, ns, "r2", P);
-    const HeadResult hB = b->head(s->layout().blobKey(idOf(P)));
-    ASSERT_TRUE(hB.exists);
-    ASSERT_NE(hB.token.value, hA.token.value) << "republication must mint a new incarnation token B";
+    const auto hB = (*head_op).head(s->layout().blobKey(idOf(P)), Retry::standard());
+    ASSERT_TRUE(hB.has_value());
+    ASSERT_NE(PersistedEtag::capture(hB->incarnation).value, PersistedEtag::capture(hA->incarnation).value)
+        << "republication must mint a new incarnation token B";
     s->dropRef(ns, "r2");
     s->renewWatermarkOnce();
 
@@ -361,13 +360,12 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
         [&](const CasEvent & e){ return is_this_blob(e) && e.type == CasEventType::BlobRetireReplaced; });
     ASSERT_EQ(replaced_events.size(), 1u) << "exactly one blob_retire_replaced for the supersede";
     /// The event's token text is dialect-qualified ("emulated:<value>", matching `Etag::render`
-    /// and `PersistedEtag`'s wire word) -- `Token::value` alone (from the legacy `head()` this
-    /// test reads hA/hB through) is only the bare value.
-    EXPECT_EQ(replaced_events[0].token, "emulated:" + hB.token.value)
+    /// and `PersistedEtag`'s wire word).
+    EXPECT_EQ(replaced_events[0].token, hB->incarnation.render())
         << "the event's own token is the fresh CURRENT token B";
     ASSERT_TRUE(replaced_events[0].detail.count("superseded_token"));
     EXPECT_FALSE(replaced_events[0].detail.at("superseded_token").empty());
-    EXPECT_EQ(replaced_events[0].detail.at("superseded_token"), "emulated:" + hA.token.value)
+    EXPECT_EQ(replaced_events[0].detail.at("superseded_token"), hA->incarnation.render())
         << "superseded_token must name the stale token (A) that republication replaced";
 
     EXPECT_EQ(replaced_after - replaced_before, 1u) << "CASGCRetireReplaced increments exactly once";
@@ -385,7 +383,7 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     const auto it = std::find_if(retired.begin(), retired.end(),
         [&](const RetiredEntry & e){ return e.kind == ObjectKind::Blob && e.ref == DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(P))}; });
     ASSERT_NE(it, retired.end()) << "the superseded entry must be present in the current retired set";
-    EXPECT_EQ(it->token.value, hB.token.value) << "the persisted entry names the fresh CURRENT token B";
+    EXPECT_EQ(it->token.value, PersistedEtag::capture(hB->incarnation).value) << "the persisted entry names the fresh CURRENT token B";
     EXPECT_EQ(it->size, P.size())
         << "supersede must persist the LOGICAL size (payload length, header stripped), matching what "
            "a fresh condemn of the same blob would carry -- not the raw physical (header-included) size";

@@ -141,9 +141,7 @@ private:
 CasRequestBudget oneAttemptBudget()
 {
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
     return budget;
 }
@@ -286,9 +284,7 @@ PoolPtr openPublishingPool(const std::shared_ptr<DB::Cas::tests::OrderedFaultBac
     config.snapshot_log_bytes_threshold = 1ULL << 40;
     /// One attempt, so a faulted PUT resolves to a definite non-committed outcome with no internal
     /// retry loop and no wall-clock wait -- the same budget the snapshot-ordering suite uses.
-    config.cas_request_budget.max_attempts = 1;
     config.cas_request_budget.attempt_timeout_ms = 100;
-    config.cas_request_budget.operation_deadline_ms = 5000;
     config.cas_request_budget.lease_safety_margin_ms = 100;
     return Pool::open(backend, config);
 }
