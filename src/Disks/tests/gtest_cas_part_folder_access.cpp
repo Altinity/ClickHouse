@@ -108,9 +108,6 @@ private:
 class PromoteConflictOnceBackend final : public Cas::InMemoryBackend
 {
 public:
-    /// Unhide the legacy `putIfAbsent` overloads the primitive override below would otherwise hide.
-    using InMemoryBackend::putIfAbsent;
-
     String fault_key_substr;
     int skip = 0;
     int fault_count = 0;
@@ -118,8 +115,7 @@ public:
     /// cleanup path ran its ref-log append at all, on a table where that append can no longer succeed.
     int matching_put_attempts = 0;
 
-    /// Sabotages the PRIMITIVE, which every legacy forwarder (including `putIfAbsent`) reaches too, so
-    /// the fault fires whichever surface issued the create.
+    /// Sabotages the sole write primitive, so the fault fires whichever verb (`create`/`replace`) issued it.
     std::expected<String, Cas::Backend::RawConflict> write(const String & key, const String & bytes,
                                                             const std::optional<String> & expected_value,
                                                             Cas::TransportAccess & access) override
@@ -152,15 +148,12 @@ public:
 class PromoteDefiniteFailureBackend final : public Cas::InMemoryBackend
 {
 public:
-    /// Unhide the legacy `putIfAbsent` overloads the primitive override below would otherwise hide.
-    using InMemoryBackend::putIfAbsent;
-
     String fault_key_substr;
     int skip = 0;
     int fault_count = 0;
     int matching_put_attempts = 0;
 
-    /// Sabotages the PRIMITIVE, which every legacy forwarder (including `putIfAbsent`) reaches too.
+    /// Sabotages the sole write primitive, so the fault fires whichever verb (`create`/`replace`) issued it.
     std::expected<String, Cas::Backend::RawConflict> write(const String & key, const String & bytes,
                                                             const std::optional<String> & expected_value,
                                                             Cas::TransportAccess & access) override
@@ -419,14 +412,15 @@ TEST(CASPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     /// fresh id to get past the foreign object would sort above it.
     String greatest_key;
     size_t foreign_objects = 0;
+    DB::Cas::tests::OperationForTest scan(*backend);
     for (String cursor;;)
     {
-        const Cas::ListPage page = backend->list(backend->fault_key_substr, cursor, 1000);
+        const Cas::KeyPage page = (*scan).list(backend->fault_key_substr, cursor, 1000, Cas::Retry::standard());
         for (const auto & listed : page.keys)
         {
             if (listed.key > greatest_key)
                 greatest_key = listed.key;
-            const auto body = backend->get(listed.key);
+            const auto body = (*scan).read(listed.key, Cas::Retry::standard());
             if (body && body->bytes.find("_FOREIGN_DIFFERENT") != String::npos)
                 ++foreign_objects;
         }
@@ -436,7 +430,7 @@ TEST(CASPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     }
     EXPECT_EQ(foreign_objects, 1u) << "the foreign object must still own the key it took";
     ASSERT_FALSE(greatest_key.empty());
-    const auto greatest_body = backend->get(greatest_key);
+    const auto greatest_body = (*scan).read(greatest_key, Cas::Retry::standard());
     ASSERT_TRUE(greatest_body.has_value());
     EXPECT_NE(greatest_body->bytes.find("_FOREIGN_DIFFERENT"), String::npos)
         << "the foreign occupant must still be the highest id in this table's stream: a log object above "
@@ -553,7 +547,10 @@ TEST(CASPartFolderAccess, PrepareThenAbortAppendsThePrecommitRemoval)
     /// The precommit BODY survives (delete-after-sealed-decrements) -- the removal queues GC's `-1`,
     /// it does not writer-delete the manifest. Mirrors
     /// `CASPartWriteTxn.AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody`.
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(id)).exists);
+    {
+        DB::Cas::tests::OperationForTest op(*backend);
+        EXPECT_TRUE((*op).head(store->layout().manifestKey(id), Cas::Retry::standard()).has_value());
+    }
 }
 
 /// A forgotten terminal must be impossible, not merely discouraged: `~PartWriteTxn` only retires the
