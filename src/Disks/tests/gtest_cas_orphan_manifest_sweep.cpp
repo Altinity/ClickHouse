@@ -435,9 +435,9 @@ TEST(CASOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
     damaged.entries.push_back(duplicate);
     std::sort(damaged.entries.begin(), damaged.entries.end(),
         [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
-    ASSERT_TRUE(before.incarnation.has_value());
+    ASSERT_TRUE(before.etag.has_value());
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        op.replace(store->layout().refCatalogKey(), encodeRefCatalog(damaged), *before.incarnation, Retry::standard())));
+        op.replace(store->layout().refCatalogKey(), encodeRefCatalog(damaged), *before.etag, Retry::standard())));
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10); });
@@ -552,7 +552,7 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
     writeSealAt(*backend, store->layout(), ns, cursor);
     const auto cursor_head = op.head(store->layout().refLogKey(life, cursor), Retry::standard());
     ASSERT_TRUE(cursor_head.has_value());
-    ASSERT_EQ(op.remove(store->layout().refLogKey(life, cursor), cursor_head->incarnation, Retry::standard()), Removal::Removed);
+    ASSERT_EQ(op.remove(store->layout().refLogKey(life, cursor), cursor_head->etag, Retry::standard()), Removal::Removed);
 
     const ManifestRef phantom{.writer_epoch = 7, .build_sequence = 1, .manifest_ordinal = 1};
     /// The codec refuses this skipped predecessor when a writer tries to create it. Inject the malformed
@@ -611,7 +611,7 @@ TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
     writeSealAt(*backend, store->layout(), ns, cursor);
     const auto cursor_head = op.head(store->layout().refLogKey(life, cursor), Retry::standard());
     ASSERT_TRUE(cursor_head.has_value());
-    ASSERT_EQ(op.remove(store->layout().refLogKey(life, cursor), cursor_head->incarnation, Retry::standard()), Removal::Removed);
+    ASSERT_EQ(op.remove(store->layout().refLogKey(life, cursor), cursor_head->etag, Retry::standard()), Removal::Removed);
 
     const ManifestRef removed{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
     writeTxnAt(*backend, store->layout(), ns, RefTxnId{3, 1},
