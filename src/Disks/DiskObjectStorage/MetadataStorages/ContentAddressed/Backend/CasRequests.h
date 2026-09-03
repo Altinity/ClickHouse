@@ -34,6 +34,12 @@ bool isDefinitelyRefusedWrite(const std::exception & e);
 /// `NOT_IMPLEMENTED`, `BAD_ARGUMENTS` and `CORRUPTED_DATA`.
 bool isDeterministicLocalFailure(int code);
 
+/// The failure class a FRESH CREDENTIAL could fix -- a subset of `isDefinitelyRefusedWrite`, exposed
+/// because a caller whose own loop makes the next physical attempt must not treat it as terminal: the
+/// engine refreshes once before it gives the answer, and the caller's next attempt signs with what the
+/// refresh installed.
+bool isRefreshableCredentialError(const std::exception & e);
+
 /// Facts the fence cannot see, sampled by the caller. Non-throwing; FALSE ends the operation exactly
 /// like a lost fence, because the engine does not need to know which of the two refused.
 using Liveness       = std::function<bool()>;
@@ -99,6 +105,11 @@ public:
 
     /// The capability predicates and `dialect()`.
     Backend & backendForCapabilityPredicates() { return *backend; }
+
+    /// A caller's own inter-iteration wait, paced through the same clock the engine's own sleeps use --
+    /// so a test that replaces the sleep sees no real time pass in either. `CasOperation` carries the
+    /// same call for the loops that hold an operation rather than the plane it was admitted on.
+    void pause(uint64_t ms) { sleep_ms(ms); }
 
     void setNowFnForTest(std::function<uint64_t()> now_ms_);
     void setSleepFnForTest(std::function<void(uint64_t)> sleep_ms_);

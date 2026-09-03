@@ -160,7 +160,9 @@ ManifestId publishOneBlobPart(
 /// A one-shot backend hook (mirrors the WriteCountingBackend delegation pattern in gtest_cas_pool.cpp):
 /// it delegates every op to a wrapped Backend, but the FIRST time the target key is HEADed it fires an
 /// exact-incarnation delete of that key AFTER computing the (present) HEAD result and BEFORE returning
-/// it — simulating GC's content delete landing in the writer's HEAD->GET window.
+/// it — GC emptying the key underneath the writer's observation, so the writer decides from a HEAD
+/// whose object no longer exists. `fired` is public because a test that does not assert it cannot tell
+/// a plumbed fault from an unplumbed one.
 class HeadThenDeleteOnceBackend final : public DB::Cas::Backend
 {
 public:
@@ -204,11 +206,12 @@ public:
     void publish(const BlobPublishRequest & request, TransportAccess & access) override { inner->publish(request, access); }
     Dialect dialect() const override { return inner->dialect(); }
 
+    bool fired = false;
+
 private:
     BackendPtr inner;
     String target_key;
     DB::Cas::Token condemned;
-    bool fired = false;
 };
 
 /// A delegating backend that counts head()/get() calls per key. Lets a test assert the promote gate
@@ -807,8 +810,8 @@ TEST(CASPartWriteTxn, PutBlobRepublishesVanishedBodyFromHeldSource)
     /// meta; t0 stays as the body token the delete-hook below fires with.
     condemnMeta(*b, layout, u128Of("payload-X"), /*condemn_round*/ 1);
 
-    /// 3. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN fires
-    ///    deleteExact(blob_key, t0) exactly once — GC's delete in the HEAD->GET window. Open a FRESH
+    /// 3. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN deletes that
+    ///    exact incarnation once — GC emptying the key underneath the writer's observation. Open a FRESH
     ///    Pool over the hook so its retire view (refreshed at open) sees the condemnation.
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
     auto s = Pool::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -820,6 +823,11 @@ TEST(CASPartWriteTxn, PutBlobRepublishesVanishedBodyFromHeldSource)
     /// Publication then recreates the body under a fresh token without reading the condemned object.
     auto ref = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
     EXPECT_EQ(ref.ref, id);
+
+    /// The republication below reads the same whether or not the key was emptied mid-observation, so
+    /// this is what says the injected delete actually ran: a fault plumbed onto a method the writer no
+    /// longer calls leaves it false. It proves the seam fires, not that the end state depended on it.
+    EXPECT_TRUE(hook->fired) << "the injected delete must have run inside the mandatory HEAD";
 
     /// 5. The blob is present again under a FRESH token, with the same payload; and the condemned token
     ///    never returns (INV-NO-RETURN).
@@ -886,7 +894,8 @@ TEST(CASPartWriteTxn, AGiveUpReportsHowManyAttemptsItSent)
     b->attempts = 0;
 
     const BlobRef ref = idOf("give-up-attempt-count");
-    const WriteResult result = putMetaIfAbsent(*s, ref, BlobMeta{.state = MetaState::Clean, .size = 7});
+    CasOperation op = s->mountRequests().admit();
+    const WriteResult result = putMetaIfAbsent(op, s->layout(), ref, BlobMeta{.state = MetaState::Clean, .size = 7});
 
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_NE(gave_up, nullptr) << "every attempt was ambiguous and none landed";
@@ -2544,7 +2553,9 @@ TEST(CASPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
     });
     EXPECT_GT(b->put_attempts, 1) << "the ambiguous attempt must be reissued before the write gives up";
     EXPECT_LE(b->put_attempts, b->attempt_cap) << "the policy's window, not the double's cap, ended it";
-    EXPECT_FALSE(b->head(s->layout().manifestKey(ManifestId{ns, ManifestRef{s->liveWriterEpoch(), 1, 0}})).exists)
+    /// Over the namespace's whole manifest prefix rather than one computed key: the ordinal the build
+    /// would have used is arithmetic this assertion should not have to reproduce to stay true.
+    EXPECT_TRUE(b->list(s->layout().manifestNamespacePrefix(ns), "", 10).keys.empty())
         << "an exhausted stage names nothing durable";
 }
 
@@ -2619,7 +2630,11 @@ private:
 /// loop's next iteration is what reissues it.
 PoolPtr openBlobFaultPool(const std::shared_ptr<BlobPutFaultBackend> & b)
 {
-    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    PoolPtr store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    /// The publication loop paces its iterations on the engine's clock, so drive that clock virtually:
+    /// eight iterations of real jittered backoff would be seconds of wall time per test.
+    useVirtualMountRequestClock(store);
+    return store;
 }
 
 /// A replayable BlobSource that COUNTS its own re-streams — pins INV-1's "retry = fresh re-stream

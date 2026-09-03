@@ -10,8 +10,6 @@
 namespace DB::Cas
 {
 
-class Pool;
-
 /// A decoded blob meta record together with the incarnation the same read observed. The incarnation
 /// travels with the record because the next conditional update or exact delete must be guarded by the
 /// version that was actually read; comparing encoded meta bytes would not provide that protection.
@@ -36,12 +34,14 @@ struct LoadedMeta
 /// when the meta key is absent. Decoding errors propagate as exceptions.
 std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, const BlobRef & ref);
 
-/// Creates the marker only when its key is absent, on the pool's own staging plane. Anything at the key
-/// that this call did not itself write -- a stale `Condemned` marker still present when a vanished body
-/// is freshly re-uploaded, or a racing writer's byte-identical marker -- comes back as `Conflict`
-/// carrying what was observed, never as a throw: this marker is mutable, so a pre-existing different
-/// value is an expected outcome rather than corruption.
-WriteResult putMetaIfAbsent(Pool & pool, const BlobRef & ref, const BlobMeta & meta);
+/// Creates the marker only when its key is absent, on the plane `op` belongs to -- like its siblings,
+/// so one caller's decision cannot end up split across two fences. Anything at the key that this call
+/// did not itself write -- a stale `Condemned` marker still present when a vanished body is freshly
+/// re-uploaded, or a racing writer's byte-identical marker -- comes back as `Conflict` carrying what
+/// was observed, never as a throw: this marker is mutable, so a pre-existing different value is an
+/// expected outcome rather than corruption.
+WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const BlobRef & ref,
+                            const BlobMeta & meta);
 
 /// Replaces the marker only when its current incarnation is `expected`, on the plane `op` belongs to.
 /// A competing write is reported as `Conflict` carrying what the resolve read observed, never thrown,

@@ -27,11 +27,11 @@ TEST(CASBlobMeta, PutIfAbsentThenCasTransitions)
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("hash-a"))};
     const BlobMeta clean{.state = MetaState::Clean, .size = 10};
 
-    EXPECT_TRUE(std::holds_alternative<Committed>(putMetaIfAbsent(*store, ref, clean)));
+    EXPECT_TRUE(std::holds_alternative<Committed>(putMetaIfAbsent(op, store->layout(), ref, clean)));
 
     /// A create that nothing of its own left unresolved never adopts what is already at the key, even
     /// byte-identical: the marker was somebody else's write, and the conflict carries it.
-    EXPECT_TRUE(std::holds_alternative<Conflict>(putMetaIfAbsent(*store, ref, clean)));
+    EXPECT_TRUE(std::holds_alternative<Conflict>(putMetaIfAbsent(op, store->layout(), ref, clean)));
 
     const auto lm = loadMeta(op, store->layout(), ref);
     ASSERT_TRUE(lm.has_value());
@@ -51,7 +51,7 @@ TEST(CASBlobMeta, DeleteMetaExactMatchesTheObservedIncarnation)
     auto store = openPoolForTest(backend);
     CasOperation op = store->mountRequests().admit();
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("hash-b"))};
-    putMetaIfAbsent(*store, ref, BlobMeta{.state = MetaState::Condemned});
+    putMetaIfAbsent(op, store->layout(), ref, BlobMeta{.state = MetaState::Condemned});
     const auto lm = loadMeta(op, store->layout(), ref);
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(deleteMetaExact(op, store->layout(), ref, lm->incarnation), Removal::Removed);
@@ -78,7 +78,7 @@ TEST(CASBlobMeta, PutLoadCasDeleteRoundTripAtWidth32)
     EXPECT_EQ(hex.size(), 64u) << "a 32-byte digest renders 64 hex chars";
 
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        putMetaIfAbsent(*store, ref, BlobMeta{.state = MetaState::Clean, .size = 555})));
+        putMetaIfAbsent(op, store->layout(), ref, BlobMeta{.state = MetaState::Clean, .size = 555})));
     EXPECT_TRUE(op.head(layout.blobMetaKey(ref), Retry::standard()).has_value())
         << "the meta object must land under the 64-hex key, not a truncated 32-hex one";
 
@@ -153,7 +153,7 @@ TEST(CASBlobMeta, AnAmbiguousMarkerWriteIsResolvedAndReissued)
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("hash-controlled"))};
     backend->throw_next_create = true;
     EXPECT_TRUE(std::holds_alternative<Committed>(
-        putMetaIfAbsent(*store, ref, BlobMeta{.state = MetaState::Clean, .size = 10})));
+        putMetaIfAbsent(op, store->layout(), ref, BlobMeta{.state = MetaState::Clean, .size = 10})));
     EXPECT_EQ(backend->create_attempts, 2u);
 
     const auto clean = loadMeta(op, store->layout(), ref);

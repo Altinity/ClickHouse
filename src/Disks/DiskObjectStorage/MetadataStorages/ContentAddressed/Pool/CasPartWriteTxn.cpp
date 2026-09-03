@@ -75,7 +75,10 @@ uint64_t nowMs()
 
 bool isDeterministicBlobPublicationFailure(const std::exception & error)
 {
-    if (isDefinitelyRefusedWrite(error))
+    /// A refused write, EXCEPT the class a fresh credential fixes: the engine refreshes once before it
+    /// hands the failure back, so this loop's next physical attempt signs with what the refresh
+    /// installed, and `max_publication_attempts` is what bounds it if the refresh did not help.
+    if (isDefinitelyRefusedWrite(error) && !isRefreshableCredentialError(error))
         return true;
 
     if (const auto * db_error = dynamic_cast<const Exception *>(&error))
@@ -128,6 +131,7 @@ BlobSource BlobSource::fromString(String bytes)
 PartWriteTxn::PartWriteTxn(PoolPtr store_, UInt128 build_id_,
              uint64_t build_seq_, uint64_t epoch_, PartWriteInfo info_)
     : store(std::move(store_))
+    , txn_generation(store->mountRequests().admit().generation())
     , build_id(build_id_)
     , build_seq(build_seq_)
     , epoch(epoch_)
@@ -262,14 +266,16 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             ErrorCodes::LOGICAL_ERROR,
             "PartWriteTxn::ensureBlobPresent: durable precommit required before materializing {}",
             blobIdOf(req.ref));
-    /// One operation per upload task, admitted here and never shared: `fanOutBlobUploads` runs these
-    /// concurrently and the handle carries per-call state. Its generation belongs to the whole
-    /// materialization, not to one observation/publication attempt. In particular, an outer retry after
-    /// ambiguous I/O must not adopt a re-armed incarnation, and a trip-and-rearm hidden inside the
-    /// mandatory `HEAD` must still invalidate the original writer.
-    CasOperation op = store->mountRequests().admit();
-    /// One policy value for every request this materialization makes; each verb binds its own window
-    /// from it.
+    /// One operation per upload task, never shared: `fanOutBlobUploads` runs these concurrently and the
+    /// handle carries per-call state. It RESUMES on the generation the build was admitted under rather
+    /// than sampling a fresh one, so an outer retry after ambiguous I/O cannot adopt a re-armed
+    /// incarnation, a trip-and-rearm hidden inside the mandatory `HEAD` still invalidates the original
+    /// writer, and a re-arm between the precommit and this upload refuses the upload instead of proving
+    /// a dependency under an incarnation the precommit never saw. The build's own facts -- cancellation
+    /// and a superseded writer epoch -- stay in `requireAlive`, where each states which one refused.
+    CasOperation op = store->mountRequests().resume(txn_generation);
+    /// One policy value, `Retry::standard()`, named here for the requests this function issues
+    /// directly; the shared helpers it calls construct the same value themselves.
     const Retry policy = Retry::standard();
 
     const BlobRef & ref = req.ref;
@@ -414,7 +420,8 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     /// writer that got there first settles the same question: its outcome is not read.
                     ProfileEvents::increment(ProfileEvents::CASMetaAdoptBackfill);
                     putMetaIfAbsent(
-                        *store,
+                        op,
+                        store->layout(),
                         ref,
                         BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
                 }

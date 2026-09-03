@@ -1,5 +1,4 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 
 #include <Common/ProfileEvents.h>
 
@@ -21,11 +20,11 @@ std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, con
     return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .incarnation = std::move(got->incarnation)};
 }
 
-WriteResult putMetaIfAbsent(Pool & pool, const BlobRef & ref, const BlobMeta & meta)
+WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const BlobRef & ref,
+                            const BlobMeta & meta)
 {
     ProfileEvents::increment(ProfileEvents::CASMetaPut);
-    const String key = pool.layout().blobMetaKey(ref);
-    return pool.stagingPutIfAbsentMutable(key, encodeBlobMeta(meta));
+    return op.create(layout.blobMetaKey(ref), encodeBlobMeta(meta), Retry::standard());
 }
 
 WriteResult casMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,

@@ -72,12 +72,17 @@ uint64_t saturatingAdd(uint64_t lhs, uint64_t rhs)
     return lhs > std::numeric_limits<uint64_t>::max() - rhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
 }
 
+}
+
 /// The failure class a fresh credential could fix, named here rather than taken from
 /// `S3Exception::isAccessTokenExpiredError`, which also fires on `S3Errors::UNKNOWN` -- the SDK's code
 /// for EVERY error it does not model. Borrowing it would put throttling codes an S3-compatible store
 /// reports under a non-AWS name into the credential class, and would carve a real access denial out of
 /// `isDefinitelyRefusedWrite` so the write wedges its caller instead of being refused. `UNKNOWN` is
 /// therefore never matched by code alone; a store that spells the error out by name still matches.
+///
+/// Declared in the header: a caller whose OWN loop makes the next physical attempt has to tell this
+/// class apart from the rest of `isDefinitelyRefusedWrite`.
 bool isRefreshableCredentialError([[maybe_unused]] const std::exception & e)
 {
 #if USE_AWS_S3
@@ -95,6 +100,9 @@ bool isRefreshableCredentialError([[maybe_unused]] const std::exception & e)
     return false;
 #endif
 }
+
+namespace
+{
 
 /// An answer from the store rather than a fault in reaching it: reissuing replays it unchanged.
 bool isDefiniteStoreRefusal([[maybe_unused]] const std::exception & e)
