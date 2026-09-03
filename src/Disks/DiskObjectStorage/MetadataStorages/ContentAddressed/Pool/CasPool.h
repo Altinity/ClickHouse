@@ -708,7 +708,6 @@ public:
     const PoolConfig & poolConfig() const { return config; }
     const PoolMeta & poolMeta() const { return meta; }
     const Layout & layout() const { return pool_layout; }
-    Backend & backend() { return *pool_backend; }
 
     /// ---- the three request planes ----
     /// The mount plane: the durable writes whose right to land IS this node's mount lease. An
@@ -723,22 +722,17 @@ public:
     /// claims. None of them hold a mount lease -- the claims are what ESTABLISHES one, so gating them
     /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
     /// reclaim.
-    CasRequests & gcRequests() { return gc_requests; }
+    CasRequests & openRequests() { return gc_requests; }
     /// The owning `BackendPtr` itself (not just a reference into it): the decommission slot-retirement
     /// decommission step (`CasDecommission.cpp`) must keep the backend alive across `admin.reset()` -- the graceful
     /// close that stamps the mount's farewell -- to physically delete the control objects afterward. A
     /// bare `Backend &` from `backend()` would dangle the instant the owning `Pool` is destroyed.
     BackendPtr poolBackendPtr() const { return pool_backend; }
 
-    /// Staging write surface for `PartWriteTxn`: thin delegates onto the ref ledger, so a staging write
+    /// Staging write surface for `PartWriteTxn`: thin delegate onto the ref ledger, so a staging write
     /// is admitted on the same plane and under the same policy as a ref-lane write and `PartWriteTxn`
-    /// reaches neither directly.
+    /// reaches it neither directly.
     WriteResult stagingPutIfAbsent(const String & key, const String & bytes);
-    /// Same retry/fence policy as `stagingPutIfAbsent`, for a mutable exact-incarnation overwrite.
-    WriteResult stagingConditionalOverwrite(const String & key, const String & bytes, const Incarnation & expected);
-    /// Same retry/fence policy as `stagingPutIfAbsent`, for a mutable marker where an existing
-    /// DIFFERENT value at the key is a normal `Conflict`, not corruption.
-    WriteResult stagingPutIfAbsentMutable(const String & key, const String & bytes);
 
     /// CAS mixed-algo pools:
     /// the NODE-LOCAL algo this Pool mints NEW content with (`PoolConfig::blob_hash_algo` -- never

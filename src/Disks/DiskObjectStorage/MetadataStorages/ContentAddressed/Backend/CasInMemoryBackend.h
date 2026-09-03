@@ -10,10 +10,11 @@
 namespace DB::Cas
 {
 
-/// Thread-safe, token-enforcing in-memory `Backend` implementation used by CAS tests.
+/// Thread-safe, value-enforcing in-memory `Backend` implementation used by CAS tests. Mints its
+/// values in the `Dialect::Emulated` dialect.
 ///
-/// All successful writes mint a monotonically increasing token (`TokenType::Emulated`).
-/// Tokens NEVER repeat across the lifetime of a backend instance.
+/// All successful writes mint a monotonically increasing value. Values NEVER repeat across the
+/// lifetime of a backend instance.
 ///
 /// The backend also exposes fault-injection controls for probe tests and CAS correctness tests:
 ///   - `setHoldDeletes` / `landPendingDelete`: simulate async/delayed conditional deletes
@@ -27,12 +28,6 @@ class InMemoryBackend : public Backend
 {
 public:
     InMemoryBackend() = default;
-
-    /// Unhide the base overloads this class's own declarations would otherwise shadow: the legacy
-    /// `head`/`list`/`getStream` names, and the omitted-`Range` convenience.
-    using Backend::getStream;
-    using Backend::head;
-    using Backend::list;
 
     // ---- Backend interface ----
 
@@ -81,11 +76,6 @@ public:
     /// not opted in models a backend with no refresh mechanism.
     bool refreshCredentials() override;
 
-    /// Returns a forward-only stream over the requested byte window, or `nullopt` when the key is absent.
-    /// The in-memory implementation copies the window into an owning read buffer while holding the
-    /// backend lock, so the returned stream remains independent of later backend mutations.
-    std::optional<GetStreamResult> getStream(const String & key, Range range) override;
-
     // ---- Fault-injection controls ----
 
     /// When true, `remove` validates and enqueues deletes rather than applying them immediately.
@@ -99,7 +89,7 @@ public:
     /// Applies and removes the held delete at index `i`. The expected value is evaluated against the
     /// current object at land time; the queue entry is removed whether the result is `Mismatch` or
     /// `Removed`. An invalid index returns `NotFound`.
-    DeleteOutcome landPendingDelete(size_t i);
+    RawRemoval landPendingDelete(size_t i);
 
     /// Refuses the next write of `key` once, as a clean precondition failure that leaves the store
     /// unchanged -- whatever the write's shape and whichever surface issued it.
@@ -154,11 +144,11 @@ public:
 
 private:
     /// Complete in-memory incarnation state for one key. All fields are read or modified while
-    /// `mutex_` is held; replacing `token` marks a new incarnation even when the bytes are unchanged.
+    /// `mutex_` is held; replacing `value` marks a new incarnation even when the bytes are unchanged.
     struct Object
     {
         String bytes;
-        Token token;
+        String value;
     };
 
     /// Value captured when a held delete is queued. It is intentionally checked again at land time so
@@ -166,16 +156,16 @@ private:
     struct PendingDelete
     {
         String key;
-        Token token;
+        String value;
     };
 
-    /// Mints the next process-local token. Tokens are strictly increasing and never reused by this
-    /// backend instance, which also makes token equality a safe content-cache identity check in tests.
-    Token mintToken();
+    /// Mints the next process-local incarnation value. Strictly increasing and never reused by this
+    /// backend instance, which also makes value equality a safe content-cache identity check in tests.
+    String mintValue();
 
     /// Applies an exact-value delete while `mutex_` is already held. Used by immediate deletes and by
     /// `landPendingDelete` after its queue entry has been removed.
-    DeleteOutcome applyDelete(const String & key, const Token & token);
+    RawRemoval applyDelete(const String & key, const String & expected_value);
 
     using ArmedFailures = std::map<String, std::vector<std::exception_ptr>>;
     using Hooks = std::map<String, std::function<void()>>;

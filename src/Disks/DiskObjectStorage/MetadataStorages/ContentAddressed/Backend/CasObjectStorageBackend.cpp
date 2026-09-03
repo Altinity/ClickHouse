@@ -1,7 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
@@ -18,6 +17,7 @@
 #include <IO/WriteSettings.h>
 
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 
 #include "config.h"
@@ -29,6 +29,14 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+
+namespace ProfileEvents
+{
+    extern const Event CASConditionalWriteAttempts;
+    extern const Event CASConditionalWriteCommitted;
+    extern const Event CASConditionalWriteDefiniteFailure;
+    extern const Event CASConditionalWriteUnresolved;
+}
 
 namespace DB
 {
@@ -45,6 +53,76 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+namespace
+{
+
+/// Outcome of ONE HTTP attempt at a CAS conditional write, for the ProfileEvents below only --
+/// distinct from `detail::ConditionalWriteOutcome`, which the caller (`nativeConditionalPut`) acts on.
+///   - Committed: the attempt's own request completed successfully (2xx).
+///   - DefiniteFailure: a synchronous rejection that PROVES the request was never applied server-side
+///     -- a WHITELISTED malformed-request / entity-too-large / access-denied error ONLY.
+///   - Unresolved: everything else -- a lost precondition, a client-side timeout, a connection loss, a
+///     5xx, or any error this classifier does not recognize.
+enum class CasWriteOutcome : uint8_t
+{
+    Committed,
+    DefiniteFailure,
+    Unresolved,
+};
+
+/// The exception path: classify what `buf.finalize()` threw for ONE CAS conditional-write HTTP
+/// attempt. Never rethrows, never touches counters.
+CasWriteOutcome classifyConditionalWriteResult([[maybe_unused]] const std::exception & e)
+{
+#if USE_AWS_S3
+    /// `PreconditionFailed`/`NoSuchKey` (a lost If-None-Match/If-Match), any 5xx
+    /// (InternalError/ServiceUnavailable/SlowDown/RequestTimeout), and any S3 error this function does
+    /// not recognize all fall through to the fail-safe default below: Unresolved. Only the WHITELIST
+    /// below proves the request was never applied.
+    if (const auto * s3e = dynamic_cast<const S3Exception *>(&e))
+    {
+        if (S3::isMalformedRequestError(*s3e) || S3::isEntityTooLargeError(*s3e) || S3::isAccessDeniedError(*s3e))
+            return CasWriteOutcome::DefiniteFailure;
+    }
+#endif
+    /// Poco::Net::NetException (connection loss) / Poco::TimeoutException (client-side timeout) and
+    /// every other error type: the request's fate is unproven -- fail toward "resolve before
+    /// reissuing", never toward a false DefiniteFailure.
+    return CasWriteOutcome::Unresolved;
+}
+
+/// The success path: `buf.finalize()` returned without throwing. Always Committed -- kept as a named,
+/// counted entry point so both paths of a classify-then-record call site read the same way.
+constexpr CasWriteOutcome classifyConditionalWriteResult()
+{
+    return CasWriteOutcome::Committed;
+}
+
+/// Records the start of one HTTP attempt for a CAS conditional write (the attempts counter).
+void recordConditionalWriteAttemptStarted()
+{
+    ProfileEvents::increment(ProfileEvents::CASConditionalWriteAttempts);
+}
+
+/// Records one attempt's terminal outcome (the per-class outcome counters).
+void recordConditionalWriteOutcome(CasWriteOutcome outcome)
+{
+    switch (outcome)
+    {
+        case CasWriteOutcome::Committed:
+            ProfileEvents::increment(ProfileEvents::CASConditionalWriteCommitted);
+            return;
+        case CasWriteOutcome::DefiniteFailure:
+            ProfileEvents::increment(ProfileEvents::CASConditionalWriteDefiniteFailure);
+            return;
+        case CasWriteOutcome::Unresolved:
+            ProfileEvents::increment(ProfileEvents::CASConditionalWriteUnresolved);
+            return;
+    }
+}
+
+}
+
 ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_,
                                            bool single_attempt_control_plane_, uint64_t attempt_timeout_ms_)
     : object_storage(std::move(object_storage_))
@@ -54,7 +132,7 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
     , emu_root(object_storage->getCommonKeyPrefix())
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
-        native_token_type = TokenType::Generation;
+        native_token_type = Dialect::Generation;
 }
 
 /// See Backend::checkPoolPreconditions. Only the Native, generation-dialect (GCS) combination has
@@ -66,7 +144,7 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 /// mount proceeds with a warning that names what was not verified and how the operator can verify it.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
-    if (mode != Mode::Native || native_token_type != TokenType::Generation)
+    if (mode != Mode::Native || native_token_type != Dialect::Generation)
         return;
 
     const auto versioned = object_storage->isBucketVersioningEnabled();
@@ -97,7 +175,7 @@ void ObjectStorageBackend::checkPoolPreconditions()
 /// DELETE, and nothing else in the mount path proves it.
 void ObjectStorageBackend::checkSkipAccessCheckSupport()
 {
-    if (mode != Mode::Native || native_token_type != TokenType::Generation)
+    if (mode != Mode::Native || native_token_type != Dialect::Generation)
         return;
 
     throw Exception(ErrorCodes::NOT_IMPLEMENTED,
@@ -137,7 +215,7 @@ void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 /// Native helpers
 /// =========================================================================================
 
-bool ObjectStorageBackend::isValidTokenValue(TokenType type, const String & value)
+bool ObjectStorageBackend::isValidTokenValue(Dialect type, const String & value)
 {
     return isIncarnationValue(type, value);
 }
@@ -172,7 +250,7 @@ std::optional<Backend::RawMeta> ObjectStorageBackend::nativeHead(
 /// coverage. Unit tests cover the emulated semantics, the typed exception path, and this classifier
 /// through the test-only `detail` declaration.
 #if USE_AWS_S3
-PutOutcome detail::finalizeConditionalWrite(WriteBuffer & buf)
+detail::ConditionalWriteOutcome detail::finalizeConditionalWrite(WriteBuffer & buf)
 {
     try
     {
@@ -183,38 +261,38 @@ PutOutcome detail::finalizeConditionalWrite(WriteBuffer & buf)
         if (e.isPreconditionFailed()
             || e.getExceptionName() == "NoSuchKey"
             || e.getS3ErrorCode() == Aws::S3::S3Errors::NO_SUCH_KEY)
-            return PutOutcome::PreconditionFailed;
+            return ConditionalWriteOutcome::PreconditionLost;
         throw;
     }
-    return PutOutcome::Done;
+    return ConditionalWriteOutcome::Applied;
 }
 #endif
 
 /// Build-dispatching shim for the write paths below: without the AWS SDK there is no S3Exception
 /// to classify, so the errors of finalize simply propagate.
-static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
+static detail::ConditionalWriteOutcome finalizeConditionalWrite(WriteBuffer & buf)
 {
 #if USE_AWS_S3
     return detail::finalizeConditionalWrite(buf);
 #else
     buf.finalize();
-    return PutOutcome::Done;
+    return detail::ConditionalWriteOutcome::Applied;
 #endif
 }
 
 /// Instrument the same single `finalize` call used by both Native write paths without changing their
-/// `Done`/`PreconditionFailed`-or-rethrow contract. A classified precondition loss is `Unresolved`,
-/// not `Committed` or a definite exception, because the response does not prove who created or
-/// replaced the object; the higher-level request controller may then resolve it with exact-key state.
-static PutOutcome finalizeConditionalWriteInstrumented(WriteBuffer & buf)
+/// Applied/PreconditionLost-or-rethrow contract. A classified precondition loss is `Unresolved`, not
+/// `Committed` or a definite exception, because the response does not prove who created or replaced
+/// the object -- the caller's own retry loop resolves it with exact-key state.
+static detail::ConditionalWriteOutcome finalizeConditionalWriteInstrumented(WriteBuffer & buf)
 {
     recordConditionalWriteAttemptStarted();
     try
     {
-        const PutOutcome legacy = finalizeConditionalWrite(buf);
+        const detail::ConditionalWriteOutcome outcome = finalizeConditionalWrite(buf);
         recordConditionalWriteOutcome(
-            legacy == PutOutcome::Done ? classifyConditionalWriteResult() : CasWriteOutcome::Unresolved);
-        return legacy;
+            outcome == detail::ConditionalWriteOutcome::Applied ? classifyConditionalWriteResult() : CasWriteOutcome::Unresolved);
+        return outcome;
     }
     catch (const std::exception & e)
     {
@@ -232,7 +310,7 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditio
     auto buf = object_storage->writeObject(
         StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
     buf->write(bytes.data(), bytes.size());
-    if (finalizeConditionalWriteInstrumented(*buf) == PutOutcome::PreconditionFailed)
+    if (finalizeConditionalWriteInstrumented(*buf) == detail::ConditionalWriteOutcome::PreconditionLost)
         return std::unexpected(RawConflict{});
 
     /// The response's own value for what it just wrote, normalized and otherwise untouched. An S3
@@ -240,11 +318,6 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditio
     /// no follow-up HEAD is needed -- and when it carries none, an empty value is the honest answer:
     /// the write may have landed, which only the caller can resolve by reading the key back.
     return normalizeTokenValue(buf->getResultObjectETag().value_or(String{}));
-}
-
-namespace
-{
-
 }
 
 /// True when an exception from a read means "the KEY is simply not there".
@@ -283,34 +356,6 @@ static String readWholeObject(IObjectStorage & object_storage, const String & pa
     String content;
     readStringUntilEOF(content, *buf);
     return content;
-}
-
-/// Open a forward-only stream over `range` of the object at `path`, positioned at the window's first
-/// byte and bounded to its last. Nothing is materialized whole: the caller reads at its own pace. An
-/// offset at or past EOF yields an empty stream rather than an error.
-static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & object_storage, const String & path, Range range,
-                                                          uint64_t known_size = 0)
-{
-    auto buf = object_storage.readObject(
-        StoredObject(path), casSizedReadSettings(getReadSettings(), known_size), /*read_hint=*/std::nullopt);
-    if (range.whole())
-        return buf;
-
-    /// `seek` past the object size may throw depending on the storage, so fail-close against the known
-    /// size before touching the buffer position. A caller-supplied size avoids another metadata round
-    /// trip; zero means that the size is unknown and must be fetched.
-    const uint64_t object_size = known_size != 0 ? known_size
-        : object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes;
-    if (range.offset >= object_size)
-        return std::make_unique<ReadBufferFromString>(std::string_view{});
-
-    /// `setReadUntilPosition` is only a hint (LocalObjectStorage does not honor it), but for a returned
-    /// stream it is the only bound available — the caller drains to EOF, so a storage that DOES honor
-    /// the hint stops at the window end, and one that does not over-reads only the trailing bytes.
-    if (range.length.has_value())
-        buf->setReadUntilPosition(range.offset + *range.length);
-    buf->seek(static_cast<off_t>(range.offset), SEEK_SET);
-    return buf;
 }
 
 ReadSettings casSizedReadSettings(const ReadSettings & base, uint64_t known_size)
@@ -428,7 +473,7 @@ String ObjectStorageBackend::emuRead(const String & key) const
     return readWholeObject(*object_storage, emuPath(key));
 }
 
-Token ObjectStorageBackend::emuWrite(const String & key, const String & bytes)
+String ObjectStorageBackend::emuWrite(const String & key, const String & bytes)
 {
     auto buf = object_storage->writeObject(StoredObject(emuPath(key)), WriteMode::Rewrite);
     buf->write(bytes.data(), bytes.size());
@@ -505,13 +550,13 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
         ++existing_token_state->second.second;
 }
 
-Token ObjectStorageBackend::emuObserveToken(const String & key)
+String ObjectStorageBackend::emuObserveToken(const String & key)
 {
     const auto metadata = object_storage->tryGetObjectMetadata(emuPath(key), /*with_tags=*/false);
     return emuMintToken(key, metadata ? metadata->etag : String{}, /*just_wrote=*/false);
 }
 
-Token ObjectStorageBackend::emuMintToken(const String & key, const String & etag, bool just_wrote)
+String ObjectStorageBackend::emuMintToken(const String & key, const String & etag, bool just_wrote)
 {
     emuPruneTokenState(emuNowNs());
 
@@ -540,14 +585,13 @@ Token ObjectStorageBackend::emuMintToken(const String & key, const String & etag
         /// tokens, so bump a small per-key disambiguator (mtime-quantum guard, triage §3.18 19c step 4).
         if (just_wrote)
             ++it->second.second;
-        const String value = it->second.second == 0 ? etag : etag + "#" + std::to_string(it->second.second);
-        return Token{value, TokenType::Emulated};
+        return it->second.second == 0 ? etag : etag + "#" + std::to_string(it->second.second);
     }
 
     /// The etag advanced (or this key is seen for the first time): the bare etag is the token, and any
     /// previous disambiguator is dropped — a genuinely new incarnation starts clean.
     emu_token_state[key] = {etag, 0};
-    return Token{etag, TokenType::Emulated};
+    return etag;
 }
 
 /// =========================================================================================
@@ -614,55 +658,8 @@ std::optional<Backend::Raw> ObjectStorageBackend::readUnder(
             return std::nullopt;
         throw;
     }
-    raw.value = emuObserveToken(key).value;
+    raw.value = emuObserveToken(key);
     return raw;
-}
-
-std::optional<GetStreamResult> ObjectStorageBackend::getStream(const String & key, Range range)
-{
-    if (mode == Mode::Native)
-    {
-        auto hr = nativeHead(key, ObjectStorageRetryProfile::Default, /*timeout_ms=*/0);
-        if (!hr)
-            return std::nullopt;
-
-        /// The object may be deleted between the HEAD above and the stream open below. Honor the
-        /// `optional` contract on a not-found signal; any other error (network, auth, corruption)
-        /// propagates unchanged — fail-closed by construction.
-        GetStreamResult sr;
-        try
-        {
-            sr.stream = openObjectRangedStream(*object_storage, key, range, hr->size);
-        }
-        catch (const std::exception & e)
-        {
-            if (isObjectNotFound(e))
-                return std::nullopt;
-            throw;
-        }
-        sr.token = legacyMintObserved(key, hr->value);
-        return sr;
-    }
-
-    std::lock_guard lock(emu_mutex);
-    if (!emuExists(key))
-        return std::nullopt;
-
-    /// The emulated path holds emu_mutex across the exists-check and the stream open, matching `read`.
-    /// External deletion still converts to nullopt rather than escaping as an unexplained exception.
-    GetStreamResult sr;
-    try
-    {
-        sr.stream = openObjectRangedStream(*object_storage, emuPath(key), range);
-    }
-    catch (const std::exception & e)
-    {
-        if (isObjectNotFound(e))
-            return std::nullopt;
-        throw;
-    }
-    sr.token = emuObserveToken(key);
-    return sr;
 }
 
 std::unique_ptr<ReadBuffer> ObjectStorageBackend::stream(const String & key, TransportAccess &)
@@ -723,18 +720,13 @@ std::optional<Backend::RawMeta> ObjectStorageBackend::headUnder(
     /// traversed by system.remote_data_paths) as a file and a later body read throws EISDIR.
     if (!metadata)
         return std::nullopt;
-    return RawMeta{metadata->size_bytes, emuObserveToken(key).value};
+    return RawMeta{metadata->size_bytes, emuObserveToken(key)};
 }
 
 /// See Backend::probeSentinelRaw / CasBackend.h's ProbeOutcome for the semantics this classifies.
 SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key, TransportAccess &)
 {
     return probeSentinelUnder(key, controlPlaneProfile(), attempt_timeout_ms);
-}
-
-SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
-{
-    return probeSentinelUnder(key, ObjectStorageRetryProfile::Default, /*timeout_ms=*/0);
 }
 
 SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(
@@ -807,7 +799,7 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
 {
     WriteSettings ws;
     ws.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
-    if (native_token_type == TokenType::Generation)
+    if (native_token_type == Dialect::Generation)
         ws.s3_force_single_part_upload = true;
     ws.s3_check_objects_after_upload_override = false;
     /// Exactly one attempt at the WriteBufferFromS3 layer too: makeSinglepartUpload/
@@ -857,11 +849,11 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::write(
     {
         if (!exists)
             return std::unexpected(RawConflict{});
-        if (!tokenMatches(emuObserveToken(key), Token{*expected_value, TokenType::Emulated}))
+        if (emuObserveToken(key) != *expected_value)
             return std::unexpected(RawConflict{});
     }
 
-    return emuWrite(key, bytes).value;
+    return emuWrite(key, bytes);
 }
 
 void ObjectStorageBackend::publish(const BlobPublishRequest & request, TransportAccess &)
@@ -976,7 +968,7 @@ Backend::RawRemoval ObjectStorageBackend::removeUnder(
     std::lock_guard lock(emu_mutex);
     if (!emuExists(key))
         return RawRemoval::Gone;
-    if (!tokenMatches(emuObserveToken(key), Token{expected_value, TokenType::Emulated}))
+    if (emuObserveToken(key) != expected_value)
         return RawRemoval::Mismatch;
 
     object_storage->removeObjectIfExists(StoredObject(emuPath(key)));
@@ -1034,7 +1026,7 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
             lk.key = child->relative_path.substr(strip.size());
             lk.size = child->metadata ? child->metadata->size_bytes : 0;
             if (child->metadata)
-                lk.value = emuMintToken(lk.key, child->metadata->etag, /*just_wrote=*/false).value;
+                lk.value = emuMintToken(lk.key, child->metadata->etag, /*just_wrote=*/false);
             all.push_back(std::move(lk));
         }
         std::sort(all.begin(), all.end(), [](const RawListedKey & a, const RawListedKey & b) { return a.key < b.key; });
@@ -1077,8 +1069,7 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
         /// empty-etag gate lives in tokenForList; whether the value it passes IS an incarnation is
         /// judged where the answer can be acted on, not here.
         if (child->metadata)
-            if (const auto token = tokenForList(child->metadata->etag))
-                lk.value = token->value;
+            lk.value = tokenForList(child->metadata->etag);
 
         if (page.keys.size() == limit)
         {
@@ -1091,61 +1082,5 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
     return page;
 }
 
-/// =========================================================================================
-/// The legacy surface — see the declarations for why these are not the base's forwarders.
-/// Every one of them issues its request under the storage's own retry profile, and mints through
-/// the base's legacy mint so a malformed response is judged in exactly one place.
-/// =========================================================================================
-
-std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range range)
-{
-    if (!range.whole())
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "CAS backend: a ranged get is retired; read the object whole");
-
-    auto raw = readUnder(key, ObjectStorageRetryProfile::Default, /*timeout_ms=*/0);
-    if (!raw)
-        return std::nullopt;
-    return GetResult{std::move(raw->bytes), legacyMintObserved(key, std::move(raw->value)), {}};
-}
-
-HeadResult ObjectStorageBackend::head(const String & key)
-{
-    auto raw = headUnder(key, ObjectStorageRetryProfile::Default, /*timeout_ms=*/0);
-    if (!raw)
-        return {};
-    return HeadResult{true, raw->size, legacyMintObserved(key, std::move(raw->value)), {}};
-}
-
-ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit)
-{
-    auto raw = listUnder(prefix, cursor, limit, ObjectStorageRetryProfile::Default, /*timeout_ms=*/0);
-
-    ListPage page;
-    page.next_cursor = std::move(raw.next_cursor);
-    page.keys.reserve(raw.keys.size());
-    for (auto & k : raw.keys)
-    {
-        std::optional<Token> token;
-        if (k.value)
-            token = legacyMintObserved(k.key, std::move(*k.value));
-        page.keys.push_back(ListedKey{std::move(k.key), k.size, std::move(token)});
-    }
-    return page;
-}
-
-DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token & token)
-{
-    if (legacyTokenIsForeign(key, token))
-        return DeleteOutcome{DeleteOutcome::Kind::TokenMismatch, false};
-
-    switch (removeUnder(key, token.value, ObjectStorageRetryProfile::Default, /*timeout_ms=*/0))
-    {
-        case RawRemoval::Removed:      return {DeleteOutcome::Kind::Deleted, false};
-        case RawRemoval::Gone:         return {DeleteOutcome::Kind::NotFound, false};
-        case RawRemoval::Mismatch:     return {DeleteOutcome::Kind::TokenMismatch, false};
-        case RawRemoval::DeleteMarker: return {DeleteOutcome::Kind::Deleted, true};
-    }
-    UNREACHABLE();
-}
 
 }

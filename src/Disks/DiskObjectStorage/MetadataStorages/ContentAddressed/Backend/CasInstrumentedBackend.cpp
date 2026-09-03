@@ -144,10 +144,4 @@ void InstrumentedBackend::publish(const BlobPublishRequest & request, TransportA
     incrementCasEvent(classifyCasNs(request.destination_key), CasOp::Put);
 }
 
-void InstrumentedBackend::publishBlob(const BlobPublishRequest & request)
-{
-    inner->publishBlob(request);
-    incrementCasEvent(classifyCasNs(request.destination_key), CasOp::Put);
-}
-
 }

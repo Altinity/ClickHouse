@@ -1,8 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
-/// `throwCasWriteRetryLater` / `throwCasTransientUnavailable` are declared here today; the lock moves
-/// them into `CasRequests.h` alongside the rest of this contract.
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
 
@@ -22,8 +19,14 @@ namespace DB::ErrorCodes
 namespace DB::Cas
 {
 
-struct Object { String bytes; Incarnation incarnation; };
-struct Meta   { uint64_t size; Incarnation incarnation; };
+/// Declared (and defined) in `CasRequests.h`/`.cpp`. Forward-declared narrowly here, rather than
+/// including that header, because `CasRequests.h` itself includes this one for `WriteResult` --
+/// including it back would be circular.
+[[noreturn]] void throwCasWriteRetryLater(const String & why);
+[[noreturn]] void throwCasTransientUnavailable(const String & subject, const String & condition);
+
+struct Object { String bytes; Etag incarnation; };
+struct Meta   { uint64_t size; Etag incarnation; };
 enum class Removal : uint8_t { Removed, Gone, Mismatch };
 
 /// What a write attempt observed of the key's current state before giving up, so a caller (or the
@@ -36,7 +39,7 @@ using Observation = std::variant<NotObserved, ProvenAbsent, Meta, Object>;
 /// resolved by a read, the incarnation already present), `attempts_sent` counts the HTTP attempts this
 /// call made, and `resolved_by_read` is true when the commit was proven by a read rather than by the
 /// attempt's own response.
-struct Committed { Incarnation incarnation; uint32_t attempts_sent; bool resolved_by_read; };
+struct Committed { Etag incarnation; uint32_t attempts_sent; bool resolved_by_read; };
 /// The write was never attempted or never needed -- e.g. `putIfAbsent` finding the key already
 /// present under the caller's intended content. `seen` is whatever the resolve read observed.
 struct Declined  { Observation seen; };
@@ -90,22 +93,22 @@ inline String renderObservation(const Observation & seen)
 /// (nothing changed, nothing to report), the committed incarnation otherwise -- or throw, mapping
 /// every non-success alternative to the error class its meaning already implies. `what` names the
 /// call for the thrown message.
-inline std::optional<Incarnation> orThrow(WriteResult && result, std::string_view what)
+inline std::optional<Etag> orThrow(WriteResult && result, std::string_view what)
 {
     using detail::Overload;
     using detail::renderObservation;
     return std::visit(Overload{
-        [](Committed & c) -> std::optional<Incarnation> { return std::move(c.incarnation); },
-        [](Declined &) -> std::optional<Incarnation> { return std::nullopt; },
-        [&](Conflict & c) -> std::optional<Incarnation>
+        [](Committed & c) -> std::optional<Etag> { return std::move(c.incarnation); },
+        [](Declined &) -> std::optional<Etag> { return std::nullopt; },
+        [&](Conflict & c) -> std::optional<Etag>
         {
             throw Exception(ErrorCodes::ABORTED, "{}: conflict, observed {}", what, renderObservation(c.seen));
         },
-        [&](Refused & r) -> std::optional<Incarnation>
+        [&](Refused & r) -> std::optional<Etag>
         {
             throw Exception(r.store_error, "{}: the store refused the write: {}", what, r.message);
         },
-        [&](GaveUp & g) -> std::optional<Incarnation>
+        [&](GaveUp & g) -> std::optional<Etag>
         {
             switch (g.why)
             {

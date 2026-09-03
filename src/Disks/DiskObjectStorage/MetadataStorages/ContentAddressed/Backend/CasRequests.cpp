@@ -1,9 +1,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Common/Exception.h>
+#include <Common/LoggingHelpers.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
+#include <Common/logger_useful.h>
 #include <base/sleep.h>
 
 #include "config.h"
@@ -36,6 +37,7 @@ namespace DB::ErrorCodes
     extern const int CAS_DELETE_MARKER;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
 
@@ -55,6 +57,48 @@ void recordReissue()
     ProfileEvents::increment(ProfileEvents::CASRequestReissue);
 }
 
+}
+
+namespace
+{
+/// Shared by the two entry points below so the log line and the exception's message text can never
+/// drift apart. Rate-limited (not per-distinct-`why` -- `LogSeriesLimiter` keys on the LOGGER NAME
+/// only, so under a sustained outage where `why` keeps changing slightly, only the first message in
+/// each window prints; this is the intended throttle, not a bug). Warning-level visibility is
+/// intentional: this condition is expected to self-heal (the caller retries), but an operator watching
+/// CAS logs directly should see it without having to know to look at system.replication_queue.
+void logCasWriteRetryLater(const String & why)
+{
+    LogSeriesLimiter log(getLogger("CasWriteRetryLater"), /*allowed_count=*/1, /*interval_s=*/30);
+    LOG_WARNING(log, "CAS write could not be committed ({}); retrying later", why);
+}
+}
+
+[[noreturn]] void throwCasWriteRetryLater(const String & why)
+{
+    logCasWriteRetryLater(why);
+    throw Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why);
+}
+
+std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
+{
+    logCasWriteRetryLater(why);
+    return std::make_exception_ptr(
+        Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why));
+}
+
+[[noreturn]] void throwCasTransientUnavailable(const String & subject, const String & condition)
+{
+    /// The code is coarse (it shares a `system.errors` row with socket failures), so the MESSAGE must
+    /// carry the whole truth: which CA condition refused, and that the refusal is a state rather than
+    /// damage. Consumers key on the code; operators read this line.
+    ///
+    /// The shared suffix carries ONLY the classification, because that is the one claim true at every
+    /// site: retry-later is right even where the condition may turn out terminal, since the next attempt
+    /// re-decides against fresh state. Any promise about HOW the condition clears belongs in `condition`,
+    /// where the site that can actually prove it makes it -- `checkFenceOrThrow` provably cannot.
+    throw Exception(ErrorCodes::NETWORK_ERROR,
+        "{} -- {}; TRANSIENT unavailability, not damage", subject, condition);
 }
 
 namespace
@@ -121,7 +165,7 @@ GaveUp::Source sourceFor(const Retry::Bound & bound)
 
 /// Could the precondition this write was built with still be met by what the resolve read saw? A
 /// create needs the key absent; a replace needs the incarnation it named to still be current.
-bool preconditionStillSatisfiable(const Observation & seen, const std::optional<Incarnation> & expected)
+bool preconditionStillSatisfiable(const Observation & seen, const std::optional<Etag> & expected)
 {
     return std::visit(detail::Overload{
         /// The read itself failed, so it proved nothing either way and an ambiguous attempt may still
@@ -206,14 +250,14 @@ CasOperation CasRequests::resume(uint64_t admitted_generation, Liveness liveness
     return CasOperation(*this, admitted_generation, std::move(liveness));
 }
 
-std::optional<Incarnation> CasRequests::tryMint(const String & key, String value) const
+std::optional<Etag> CasRequests::tryMint(const String & key, String value) const
 {
     if (!isIncarnationValue(backend->dialect(), value))
         return std::nullopt;
-    return Incarnation(backend->backendId(), key, backend->dialect(), std::move(value));
+    return Etag(backend->backendId(), key, backend->dialect(), std::move(value));
 }
 
-Incarnation CasRequests::mint(const String & key, String value) const
+Etag CasRequests::mint(const String & key, String value) const
 {
     if (auto minted = tryMint(key, value))
         return std::move(*minted);
@@ -221,7 +265,7 @@ Incarnation CasRequests::mint(const String & key, String value) const
         "CAS: the store answered for '{}' with a value '{}' that is not a valid incarnation", key, value);
 }
 
-const String & CasRequests::valueFor(const String & key, const Incarnation & inc) const
+const String & CasRequests::valueFor(const String & key, const Etag & inc) const
 {
     if (inc.key() != key || inc.backendId() != backend->backendId())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -407,7 +451,7 @@ void CasOperation::forEachListedKey(const String & prefix, const KeyEntryFn & fn
     }
 }
 
-Removal CasOperation::remove(const String & key, const Incarnation & seen, const Retry & policy)
+Removal CasOperation::remove(const String & key, const Etag & seen, const Retry & policy)
 {
     return removeUnder(key, owner.valueFor(key, seen), policy, policy.bind(owner.now_ms()));
 }
@@ -610,7 +654,7 @@ WriteResult CasOperation::gaveUpAfterFailedObservation(std::optional<ReadStop> s
     return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
 }
 
-WriteResult CasOperation::postCommit(Incarnation inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound)
+WriteResult CasOperation::postCommit(Etag inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound)
 {
     /// Admission once more, now that the write is proven durable: a fence lost here means the object
     /// may well exist, but this call must never claim it -- the caller has to resolve the key instead.
@@ -645,7 +689,7 @@ std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, con
     return std::nullopt;
 }
 
-WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Incarnation> & expected,
+WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
                                     const Retry & policy, const Retry::Bound & bound, WriteState & state,
                                     ResolveWith resolve_refusal_with)
 {
@@ -796,7 +840,7 @@ WriteResult CasOperation::create(const String & key, const String & bytes, const
     return writeLoop(key, bytes, std::nullopt, policy, policy.bind(owner.now_ms()), state, ResolveWith::Body);
 }
 
-WriteResult CasOperation::replace(const String & key, const String & bytes, const Incarnation & seen, const Retry & policy)
+WriteResult CasOperation::replace(const String & key, const String & bytes, const Etag & seen, const Retry & policy)
 {
     WriteState state;
     return writeLoop(key, bytes, seen, policy, policy.bind(owner.now_ms()), state, ResolveWith::Body);
@@ -824,7 +868,7 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
             return Declined{state.last_seen};
 
         WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Incarnation>(current->incarnation) : std::nullopt, policy, bound, state,
+            current ? std::optional<Etag>(current->incarnation) : std::nullopt, policy, bound, state,
             ResolveWith::Body);
         if (!std::holds_alternative<Conflict>(result))
             return result;
@@ -877,7 +921,7 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
             return Declined{state.last_seen};
 
         WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Incarnation>(current->incarnation) : std::nullopt, policy, bound, state,
+            current ? std::optional<Etag>(current->incarnation) : std::nullopt, policy, bound, state,
             ResolveWith::Presence);
         /// A refused precondition was settled by a HEAD, but proving an ambiguous attempt landed needs
         /// the bytes; this loop is presence-only by contract, so that body stops here.

@@ -5,7 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <IO/S3/Client.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
@@ -81,6 +81,8 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
+    extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
+    extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
 }
 
@@ -298,6 +300,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
     , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
+    , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
+    , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
     , staging_backend(settings_.stagingBackend())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
@@ -761,6 +765,8 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
     pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
+    pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
+    pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
     pool_config.event_sink = makeCasEventSink();
 
     /// Built here rather than above so it carries the budget the pool was configured with. Only a
@@ -884,7 +890,7 @@ void ContentAddressedMetadataStorage::startup()
     /// that swapped the client under that state would leave persisted tokens uncomparable. The refusal
     /// has to happen in the object storage: only there is the effective `http_client` known, merged from
     /// the storage's current settings, any endpoint-level block and the disk's own section.
-    object_storage->pinConditionalOpsGenerationDialect(native_token_type == Cas::TokenType::Generation);
+    object_storage->pinConditionalOpsGenerationDialect(native_token_type == Cas::Dialect::Generation);
 }
 
 void ContentAddressedMetadataStorage::shutdown()
@@ -1237,7 +1243,7 @@ void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(con
     ++empty_proof_probe_count_for_test;
     /// The open plane: this probe is what authorizes an empty answer, and a mount whose lease has
     /// blipped must still be able to ask it.
-    Cas::CasOperation probe_op = pool->gcRequests().admit();
+    Cas::CasOperation probe_op = pool->openRequests().admit();
     const Cas::SentinelProbeResult probe = empty_proof_probe_override_for_test
         ? empty_proof_probe_override_for_test()
         /// `once`: this probe is the gate that authorises an empty answer, and an inconclusive one is a

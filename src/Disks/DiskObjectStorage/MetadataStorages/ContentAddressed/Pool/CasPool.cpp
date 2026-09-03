@@ -2001,16 +2001,6 @@ WriteResult Pool::stagingPutIfAbsent(const String & key, const String & bytes)
     return ref_ledger.stagingPutIfAbsent(key, bytes);
 }
 
-WriteResult Pool::stagingConditionalOverwrite(const String & key, const String & bytes, const Incarnation & expected)
-{
-    return ref_ledger.stagingConditionalOverwrite(key, bytes, expected);
-}
-
-WriteResult Pool::stagingPutIfAbsentMutable(const String & key, const String & bytes)
-{
-    return ref_ledger.stagingPutIfAbsentMutable(key, bytes);
-}
-
 void Pool::cancelInflightBuildsForNamespace(const RootNamespace & ns)
 {
     /// Delegate to `mount_runtime`. Invoked by

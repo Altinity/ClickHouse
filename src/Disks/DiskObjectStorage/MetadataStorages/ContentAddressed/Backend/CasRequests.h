@@ -1,7 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <IO/ReadBuffer.h>
@@ -34,6 +34,57 @@ bool isDefinitelyRefusedWrite(const std::exception & e);
 /// `NOT_IMPLEMENTED`, `BAD_ARGUMENTS` and `CORRUPTED_DATA`.
 bool isDeterministicLocalFailure(int code);
 
+/// Throw the recoverable "CAS write could not be committed, retry later" condition.
+///
+/// WHY NETWORK_ERROR (this replaces an earlier ABORTED throw):
+/// A content-addressed write can fail for a reason that is neither the caller's fault
+/// nor permanent: the mount-lease / write fence was lost (e.g. a renewal PUT timed out
+/// against a slow or throttling object store), or a conditional PUT exhausted its retry
+/// budget mid-outage. The right response is "abandon this attempt, try again later" --
+/// which is precisely what a transient error means.
+///
+/// It previously threw `ABORTED`, which was actively harmful to background merges:
+/// `ReplicatedMergeMutateTaskBase` treats `ABORTED` as "merge deliberately cancelled
+/// (shutdown / `DROP` / merges-blocker), not an error", so it neither records
+/// `last_exception_time_ms` nor lets `ReplicatedMergeTreeQueue`'s exponential backoff
+/// engage. Under a sustained store outage the queue re-executed the merge roughly every
+/// 2 seconds, recomputing the whole (possibly multi-GiB) output part every time for the
+/// entire outage -- hundreds of full recomputes, and invisible in system.replication_queue.
+///
+/// `NETWORK_ERROR` is the best-fitting EXISTING code:
+///   - it is NOT in the merge "retry silently, no backoff" exemption set (only `ABORTED`
+///     and `PART_IS_TEMPORARILY_LOCKED` are), so the existing backoff -- capped by
+///     `max_postpone_time_for_failed_replicated_merges_ms` -- engages automatically;
+///   - it is already in ClickHouse's transient/retryable taxonomy
+///     (`checkDataPart::isRetryableException` lists it beside `ABORTED`), so a part under
+///     verification is not misread as corrupted;
+///   - nothing on the merge / insert / replication commit path special-cases it in a way
+///     that would misfire (ZooKeeper retriability keys on `Coordination::Exception`, a
+///     different type), and it is not caught specially on the CAS write path.
+///
+/// SCOPE: only the ESCAPING retry-later throws route here (fence lost or a controlled write outcome
+/// remaining uncertain). Startup/decommission and generic live-lock-brake `ABORTED` values keep
+/// their meaning and are not rerouted here.
+[[noreturn]] void throwCasWriteRetryLater(const String & why);
+
+/// Same classification as `throwCasWriteRetryLater`, but returns the exception as a
+/// `std::exception_ptr` for call sites that fail a pending future/promise rather than throw directly.
+/// Both entry points route through the SAME construction internally, so the error code / message shape
+/// has exactly one place that decides it.
+std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
+
+/// Throw the recoverable "this content-addressed disk cannot serve the request right now" condition.
+/// Sibling of `throwCasWriteRetryLater`, same class for the same reasons, differing only in what it
+/// describes: that one names a WRITE whose commit did not land, this one names a DISK STATE that
+/// refused the request before it started -- on either plane.
+///
+/// `subject` names the refusing disk or pool (e.g. "content-addressed disk 'ca'") and `condition` states
+/// the CA condition truthfully, INCLUDING any promise about how it clears -- only the site knows whether
+/// it can make one. What is appended HERE is the classification alone, so it cannot drift between call
+/// sites. Unlike `throwCasWriteRetryLater` this deliberately does not log: these sites can fire
+/// repeatedly per refused operation and every caller already reports the exception it receives.
+[[noreturn]] void throwCasTransientUnavailable(const String & subject, const String & condition);
+
 /// The failure class a FRESH CREDENTIAL could fix -- a subset of `isDefinitelyRefusedWrite`, exposed
 /// because a caller whose own loop makes the next physical attempt must not treat it as terminal: the
 /// engine refreshes once before it gives the answer, and the caller's next attempt signs with what the
@@ -54,7 +105,7 @@ struct KeyEntry
 {
     String key;
     uint64_t size;
-    std::optional<Incarnation> incarnation;
+    std::optional<Etag> incarnation;
 };
 /// One page of an enumeration. `next_cursor` resumes strictly after the last returned key; empty
 /// marks the end.
@@ -77,7 +128,7 @@ class CasOperation;
 
 /// The only caller of `Backend`. It owns the three things a physical request must be measured
 /// against -- the transport, the mount fence, and the clock -- and it is the sole minter of
-/// `Incarnation`, so a caller can hold one only by way of a request this class admitted.
+/// `Etag`, so a caller can hold one only by way of a request this class admitted.
 ///
 /// It is constructed with a fence because a fence is a property of whoever holds the lease, not of a
 /// call: the mount plane passes the mount fence, the GC plane and the offline tools an open one. A
@@ -129,14 +180,14 @@ private:
 
     /// The store's answer for `key`, as an incarnation. Throws `CORRUPTED_DATA` naming the key when
     /// the value fails this backend's dialect grammar.
-    Incarnation mint(const String & key, String value) const;
+    Etag mint(const String & key, String value) const;
     /// `mint` without the verdict, for the one caller that must treat a malformed value as an
     /// ambiguity to settle by reading rather than as corruption: a write's own 2xx response.
-    std::optional<Incarnation> tryMint(const String & key, String value) const;
+    std::optional<Etag> tryMint(const String & key, String value) const;
     /// The transport value to send as a precondition. Throws `LOGICAL_ERROR` when the incarnation
     /// names another key or another backend -- a precondition built from it would silently mean
     /// something else.
-    const String & valueFor(const String & key, const Incarnation & inc) const;
+    const String & valueFor(const String & key, const Etag & inc) const;
 
     BackendPtr backend;
     Fence fence;
@@ -177,7 +228,7 @@ public:
     /// took several reissues still fires once, and `CASRequestAttempt` is the physical count.
     void forEachListedKey(const String & prefix, const KeyEntryFn & fn, const Retry & per_page,
                           size_t page_limit = 1000, const std::function<void()> & on_page_fetched = {});
-    Removal remove(const String & key, const Incarnation & seen, const Retry & policy);
+    Removal remove(const String & key, const Etag & seen, const Retry & policy);
     /// `head` then `remove` of what it saw, repeating on `Mismatch`. `Gone` when the key is already
     /// absent; never returns `Mismatch` -- under `once`, where there is no reissue to resolve one, a
     /// `Mismatch` is the retry-later throw the read verbs use when their policy is exhausted.
@@ -193,7 +244,7 @@ public:
     void publish(const BlobPublishRequest & request, const Retry & policy);
 
     WriteResult create(const String & key, const String & bytes, const Retry & policy);
-    WriteResult replace(const String & key, const String & bytes, const Incarnation & seen, const Retry & policy);
+    WriteResult replace(const String & key, const String & bytes, const Etag & seen, const Retry & policy);
     /// Read, decide, write, and re-decide on conflict against what the write's own resolve read
     /// already observed. `decide` returning nullopt is `Declined`.
     WriteResult readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy);
@@ -269,7 +320,7 @@ private:
 
     /// The write engine: one call, any policy. Settles every refused precondition and every ambiguity
     /// by an exact read before it reports anything.
-    WriteResult writeLoop(const String & key, const String & bytes, const std::optional<Incarnation> & expected,
+    WriteResult writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
                           const Retry & policy, const Retry::Bound & bound, WriteState & state,
                           ResolveWith resolve_refusal_with);
     /// The resolve read: an exact read under the same policy and deadline, reporting what it saw and,
@@ -278,7 +329,7 @@ private:
     /// The presence-only sibling, for the one loop that must not fetch a body.
     Resolved observePresence(const String & key, const Retry & policy, const Retry::Bound & bound);
 
-    WriteResult postCommit(Incarnation inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound);
+    WriteResult postCommit(Etag inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound);
     WriteResult gaveUp(GaveUp::Why why, GaveUp::Source source, WriteState & state) const;
     /// The bound that refused the resolve read, reported as the outcome it actually is.
     WriteResult gaveUpForReadStop(ReadStop stop, WriteState & state, const Retry::Bound & bound) const;

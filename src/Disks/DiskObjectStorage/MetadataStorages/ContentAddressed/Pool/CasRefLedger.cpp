@@ -1,6 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
@@ -251,19 +251,6 @@ WriteResult CasRefLedger::stagingPutIfAbsent(const String & key, const String & 
 {
     /// Admitted under the mount fence's CURRENT generation: a staged write belongs to the caller in
     /// front of it, not to a transaction admitted earlier, so there is nothing to resume under.
-    CasOperation op = mount_requests.admit();
-    return op.create(key, bytes, Retry::standard());
-}
-
-WriteResult CasRefLedger::stagingConditionalOverwrite(const String & key, const String & bytes,
-                                                      const Incarnation & expected)
-{
-    CasOperation op = mount_requests.admit();
-    return op.replace(key, bytes, expected, Retry::standard());
-}
-
-WriteResult CasRefLedger::stagingPutIfAbsentMutable(const String & key, const String & bytes)
-{
     CasOperation op = mount_requests.admit();
     return op.create(key, bytes, Retry::standard());
 }
@@ -885,7 +872,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
             const std::optional<CkptSample> current = readCkpt(op, layout, life);
             if (classifyMissingSampledBase(sampled_ckpt->incarnation,
-                                           current ? std::optional<Incarnation>(current->incarnation) : std::nullopt)
+                                           current ? std::optional<Etag>(current->incarnation) : std::nullopt)
                 == MissingBaseVerdict::RestartRecovery)
                 return std::nullopt;
             throw;
