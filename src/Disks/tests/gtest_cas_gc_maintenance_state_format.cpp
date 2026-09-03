@@ -130,7 +130,7 @@ TEST(CASGCMaintenanceState, ReadsAndCasWithoutAdoptingConflicts)
     const WriteResult conflict = casGcMaintenanceState(op, layout, valid.incarnation,
         GcMaintenanceState{.janitor_cursor = "loser"}, Retry::standard());
     EXPECT_TRUE(std::holds_alternative<Conflict>(conflict));
-    EXPECT_EQ(decodeGcMaintenanceState(backend->get(key)->bytes).janitor_cursor, "winner");
+    EXPECT_EQ(decodeGcMaintenanceState(op.read(key, Retry::standard())->bytes).janitor_cursor, "winner");
 }
 
 TEST(CASGCMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
@@ -141,7 +141,7 @@ TEST(CASGCMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
     const String key = layout.gcMaintenanceStateKey();
     auto op = requests.admit();
 
-    ASSERT_EQ(backend->putIfAbsent(key, "malformed").outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, "malformed", Retry::once())));
     const GcMaintenanceReadResult corrupt = readGcMaintenanceState(op, layout);
     ASSERT_EQ(corrupt.status, GcMaintenanceReadStatus::Corrupt);
     ASSERT_TRUE(corrupt.incarnation);
@@ -149,7 +149,7 @@ TEST(CASGCMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
     EXPECT_FALSE(corrupt.diagnostic.empty());
     ASSERT_TRUE(std::holds_alternative<Committed>(
         casGcMaintenanceState(op, layout, corrupt.incarnation, {}, Retry::standard())));
-    EXPECT_EQ(decodeGcMaintenanceState(backend->get(key)->bytes), GcMaintenanceState{});
+    EXPECT_EQ(decodeGcMaintenanceState(op.read(key, Retry::standard())->bytes), GcMaintenanceState{});
 }
 
 TEST(CASGCMaintenanceState, UsesExactlyOneReadOrCasAttempt)
@@ -189,7 +189,7 @@ TEST(CASGCMaintenanceState, UsesExactlyOneReadOrCasAttempt)
     ASSERT_TRUE(std::holds_alternative<Conflict>(stale_attempt));
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getCount(key), 1u);
-    EXPECT_EQ(decodeGcMaintenanceState(backend->InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
+    EXPECT_EQ(decodeGcMaintenanceState(op.read(key, Retry::standard())->bytes).janitor_cursor, "winner");
 }
 
 TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
@@ -200,9 +200,9 @@ TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
     const String key = layout.gcMaintenanceStateKey();
     auto op = requests.admit();
 
-    ASSERT_EQ(backend->putIfAbsent(key, fmt::format(
-        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"janitor_cursor\":\"\"}}\n", currentCompatibilityVersion() + 1)).outcome,
-        PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, fmt::format(
+        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"janitor_cursor\":\"\"}}\n", currentCompatibilityVersion() + 1),
+        Retry::once())));
 
     /// The seed write above lands through the same `write` primitive `CountingBackend` counts, so
     /// reset before measuring what the read itself does.
@@ -225,7 +225,7 @@ TEST(CASGCMaintenanceState, LosingCorruptResetPreservesConcurrentWinner)
     const String key = layout.gcMaintenanceStateKey();
     auto op = requests.admit();
 
-    ASSERT_EQ(backend->putIfAbsent(key, "corrupt").outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, "corrupt", Retry::once())));
     const GcMaintenanceReadResult corrupt = readGcMaintenanceState(op, layout);
     ASSERT_EQ(corrupt.status, GcMaintenanceReadStatus::Corrupt);
     ASSERT_TRUE(corrupt.incarnation);
@@ -237,5 +237,5 @@ TEST(CASGCMaintenanceState, LosingCorruptResetPreservesConcurrentWinner)
     ASSERT_TRUE(std::holds_alternative<Conflict>(reset_attempt));
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getCount(key), 1u);
-    EXPECT_EQ(decodeGcMaintenanceState(backend->InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
+    EXPECT_EQ(decodeGcMaintenanceState(op.read(key, Retry::standard())->bytes).janitor_cursor, "winner");
 }
