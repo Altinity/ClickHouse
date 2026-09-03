@@ -43,7 +43,7 @@ void markMountGcFenced(CasOperation & op, const Layout & layout, const String & 
     MountLease lease = decodeMountLease(got->bytes);
     lease.gc_fenced = true;
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        op.replace(key, encodeMountLease(lease), got->incarnation, Retry::standard())));
+        op.replace(key, encodeMountLease(lease), got->etag, Retry::standard())));
 }
 
 }
