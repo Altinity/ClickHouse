@@ -1614,6 +1614,70 @@ MSG
 
 ---
 
+## Parallel migration after CP3 {#parallel-migration}
+
+**This section supersedes the sequential batch order of Tasks 8–19 (user decision, 2026-09-03).** The
+per-file requirements, verb mappings and census rows in Tasks 8–18 stay authoritative; the *schedule*
+changes: after CP3 (Task 7) the migration runs as **twelve parallel units in the shared worktree**, each
+owning a disjoint set of production files **and** their tests, followed by one test-reconciliation
+pass and **one** checkpoint (build + gate) instead of four.
+
+**Why it is safe.** The legacy `Backend` methods stay virtual forwarders through the primitives until
+the lock, so a file migrates its calls independently; the only coupling is a *shared signature* (a
+function declared over `Backend &`, a `Token`-carrying struct) — its change belongs to the file's
+owner, and every other owner adapts their call sites to the **target signatures** in the table below,
+not to what they see in the tree. Nothing builds until the checkpoint; the checkpoint reconciles drift.
+
+**Units and owners** (one owner per file; a file listed under a unit is edited by that unit only):
+
+| unit | production files | plan tasks | test files (census §5c) |
+|---|---|---|---|
+| U1 pool wiring | `Pool/CasPool.{h,cpp}` (the three `CasRequests`, `stagingPutIfAbsent` → `WriteResult`, its `get`/`list` sites), `Pool/CasMountRuntime.{h,cpp}` (`admit`, `refAppendFenceOk` over it, budget header move), `ContentAddressedMetadataStorage.cpp` (backend flags in `openPoolView`, settings), `ContentAddressedTransaction.cpp` (`getStream` → `stream`, the staging buffer's fence handle) | 8, 14 (pool part), 15 (mount runtime), 17 (metadata storage) | `gtest_cas_pool.cpp`, `gtest_cas_mount_runtime*.cpp`, `gtest_ca_wiring.cpp` |
+| U2 probes | `Backend/CasSentinelProbe.{h,cpp}`, `Backend/CasProbe.{h,cpp}` | 8 | `gtest_cas_sentinel_probe.cpp`, `gtest_cas_probe.cpp` |
+| U3 pool leaves | `Pool/CasPlainObjects.{h,cpp}`, `Pool/CasPoolMeta.cpp` + `Formats/CasPoolMetaFormat.h`, `Pool/CasManifestReader.{h,cpp}`, `Pool/CasRefProtocol.{h,cpp}` | 8 | `gtest_cas_plain_objects*.cpp`, `gtest_cas_pool_meta*.cpp`, `gtest_cas_manifest_reader*.cpp`, `gtest_cas_ref_protocol*.cpp` |
+| U4 GC leaves | `Gc/CasGcMaintenanceState.{h,cpp}`, `Gc/CasNamespaceJanitor.{h,cpp}` | 9 | `gtest_cas_gc_maintenance*.cpp`, `gtest_cas_namespace_janitor*.cpp` |
+| U5 decommission | `Tools/CasDecommission.{h,cpp}` | 9 | `gtest_cas_decommission.cpp` |
+| U6 catalog + ckpt | `Pool/CasRefCatalog.{h,cpp}`, `Pool/CasRefCkpt.{h,cpp}`, `Gc/CatalogLifecycleReconciler.{h,cpp}`, `Gc/CasGcShardPlan.{h,cpp}` | 11 | `gtest_cas_ref_catalog*.cpp`, `gtest_cas_ref_ckpt*.cpp`, `gtest_cas_catalog_lifecycle*.cpp` |
+| U7 GC core | `Gc/CasGc.{h,cpp}` (live paths AND the retirement/redelete/outcomes paths — one owner for the file), `Gc/CasGcMetaWriter.{h,cpp}` | 12, 18 (GC part) | `gtest_cas_gc_round.cpp`, `gtest_cas_gc_*.cpp` except the persisted ones listed under U11 |
+| U8 ledger | `Pool/CasRefLedger.{h,cpp}` (the ref lane, staging entry points, recovery walk, wedge; its call sites into catalog/ckpt adapt to U6's target signatures) | 14 | `gtest_cas_ref_*.cpp` (ledger family incl. `gtest_cas_slot_occupy.cpp`, `gtest_cas_ref_wedge_every_attempt.cpp`, `gtest_cas_ref_install_safety.cpp`, `gtest_cas_confirm_exact_ref.cpp`, `gtest_cas_ref_contiguous_alloc.cpp`) |
+| U9 blob meta + part write | `Pool/CasBlobMeta.{h,cpp}`, `Pool/CasPartWriteTxn.cpp` | 15 | `gtest_cas_blob_meta*.cpp`, `gtest_cas_part_write.cpp` |
+| U10 server root | `Pool/CasServerRoot.{h,cpp}`, `src/Storages/System/StorageSystemContentAddressedMounts.cpp` | 17 | `gtest_cas_server_root*.cpp`, `gtest_cas_mount.cpp`, `gtest_cas_mount_lease*.cpp` |
+| U11 persisted component | `Formats/CasWireVocab.{h,cpp}`, `Formats/CasRecordStreamFormat.{h,cpp}`, `Formats/CasGcOutcomesFormat.{h,cpp}`, `Gc/CasBlobInDegree.{h,cpp}`, `Gc/CasOrphanManifestSweep.{h,cpp}`, `Tools/CasFsck.cpp`, `Tools/CasInspect.cpp`, `benchmarks/benchmark_cas_ref_protocol.cpp`, `Primitives/CasTypes.h` (the `Dialect` alias only) | 18, 9 (the moved parts) | `gtest_cas_wire_vocab*.cpp`, `gtest_cas_record_stream*.cpp`, `gtest_cas_gc_outcomes*.cpp`, `gtest_cas_blob_indegree*.cpp`, `gtest_cas_orphan*.cpp`, `gtest_cas_fsck*.cpp`, `gtest_cas_inspect*.cpp` |
+| U12 shared helpers | `src/Disks/tests/cas_test_helpers.h` (`CountingBackend` and every shared double: legacy fault-injection overrides → primitives, `openRequestsForTest`), `src/Disks/tests/gtest_cas_requests.cpp` (the `RawDoor` uses → `CasRequests` over `Fence::open()`), `src/Disks/tests/gtest_cas_backend*.cpp`, `gtest_cas_protocol_scenarios.cpp`, `gtest_cas_upstream_slice.cpp` | 7's handoff list, 20's test door | (these are its files) |
+
+A test file not named above is owned by the unit whose production file it exercises first in census §5c; an agent that needs an edit in a test file it does not own writes the exact edit into its report under "**Foreign test edits**" (file, test name, old → new), and the **reconciliation pass** (one Sonnet agent after all twelve report DONE) applies them all in one commit before the checkpoint.
+
+**Target signatures** (every unit codes against these; the owner implements them):
+
+| symbol | after |
+|---|---|
+| `Pool::mountRequests()`, `farewellRequests()`, `gcRequests()` | `CasRequests &` (U1) |
+| `Pool::stagingPutIfAbsent(key, bytes)` | `WriteResult` (U1 declares, U8 implements the ledger side) |
+| `CasMountRuntime::admit(uint64_t admitted_generation, uint64_t needed_ms) const` | `Fence::Admit` (U1) |
+| `runCapabilityProbe(CasOperation &, …)`, `probeSentinel(CasOperation &, …)`, `probePoolBootstrapResidual(CasOperation &, …)` | (U2) |
+| `CasPlainObjects(CasRequests &, …)`; `admitOrValidate(CasOperation &, …)`, `createOrValidate(CasOperation &, …)`; `CasManifestReader(CasRequests &, …)`; `crossEpochFromSeal/readCheckpointSnapshotBase/recoverRefTableDetailedFromAuthority(CasOperation &, …)` | (U3) |
+| `casGcMaintenanceState(CasOperation &, key, state, std::optional<Incarnation> expected) → WriteResult`, `readGcMaintenanceState(CasOperation &, …)`, `NamespaceJanitor(CasRequests &, …)` | (U4) |
+| `decommissionPoolMember(…)` builds its own `CasRequests` over `Fence::open()` | (U5) |
+| `CasRefCatalog::read/readOptionalForBootstrap/initializeEmptyForNewPool/casUpdate/casAdmitEntry/beginRemoving/deleteCompletedRemoving(AtSnapshot)/completeCreation/cancelStalledCreating/reconcileStaleCreator/createNamespace(Step1)/lifeIfCataloged/liveUniverse(CasOperation &, …)`; `Snapshot::incarnation` (`std::optional<Incarnation>`); `publishCkpt(CasOperation & op, …)` and `readCkpt(CasOperation &, …)` with the admission callbacks and `LeaderFenceStatus` parameters deleted | (U6) |
+| `Gc` over `pool.gcRequests()`; `acquireOrRenewLease(GcState &, std::optional<Incarnation> & state_incarnation, bool allow_steal)`; `deleteConfirmedMeta(CasOperation &, …)`; `GcMetaWriter`'s registry over `PersistedIncarnation` | (U7) |
+| `CasRefLedger` entry points return `WriteResult`; `commitRefChunk` etc. on `pool.mountRequests().resume(g, liveness)` | (U8) |
+| `loadMeta/deleteMetaExact/casMeta(CasOperation &, …)` over `Incarnation`; `PartWriteTxn::ensureBlobPresent` on the txn's admitted operation | (U9) |
+| `MountLeaseRenewer` API unchanged in shape (rename is Task 22); `claim`/`renew`/`terminate` over `CasOperation`; `MountRenewResult{outcome, attempts_sent, resolved_by_read, deadline_source, sent_any, failure}`; `listMounts(CasOperation &, …)`, `allocateWriterEpoch(CasOperation &, …)`, `computeHeartbeatFloor(CasOperation &, …)`, `claimMount(CasOperation &, …)`, `claimMountAwaitingExpiry(CasOperation &, …)`, `claimOwnerOrThrow(CasOperation &, …)` | (U10) |
+| `TokenFields::build → PersistedIncarnation`; `writeTokenFields(out, first, const PersistedIncarnation &)`; `RetiredEntry/CondemnedRow/OutcomeEntry` persisted fields → `PersistedIncarnation`; `SourceEdgeRecord::token → PersistedIncarnation` | (U11) |
+| `openRequestsForTest(std::shared_ptr<Backend>) → CasRequests` over `Fence::open()`; `CountingBackend` counts on the primitives | (U12) |
+
+**Commit discipline in the shared worktree** (every unit's brief carries it verbatim): commit ONLY with
+pathspecs — `git commit -m "<msg>" -- <own files>` — never `git add -A`, never `git commit -a`, never a
+bare `git commit` (the index is shared: another unit's staged files would ride into your commit); on
+`index.lock` wait one second and retry, never delete it; after committing, `git show --stat HEAD` must
+list only your files and `git branch --show-current` must be `cas-gc-rebuild`; never rebase, amend,
+stash, checkout or restore anything; never touch a file another unit owns — write the needed edit
+into your report instead. Commit trailers as in Global Constraints. No build, no test run.
+
+**Then:** the reconciliation pass (foreign test edits, one commit) → **CP4′** = Task 19's checkpoint
+(build + gate; one strong fixer, opus) → Task 20 (the lock). Tasks 10, 13 and 16 (the intermediate
+checkpoints) are not executed. Task reviews run in parallel, one per unit, on the unit's own diff.
+
 ## Migration batches {#migration-batches}
 
 Four batches, each two migration tasks (no build) and one checkpoint (build + gate + fix). Every batch follows the same recipe; the recipe is written once here and each task names its files, its census rows and its verb mapping.
