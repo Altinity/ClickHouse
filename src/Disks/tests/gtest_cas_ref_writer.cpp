@@ -72,30 +72,74 @@ using DB::Cas::tests::writeSealAt;
 namespace
 {
 
-/// The operation deadline every SINGLE-ATTEMPT fixture in this file uses, and the reason it is
-/// deliberately NOT `attempt_timeout_ms`.
-///
-/// Those fixtures exist to make one injected ambiguous response conclusive, and `max_attempts = 1`
-/// alone achieves that: with retries allowed the controller would resolve-before-reissue and report a
-/// definite outcome instead. The deadline contributes nothing to that -- but setting it EQUAL to the
-/// attempt timeout collapses the controller's pre-send gate into a race. The deadline is captured as
-/// `now + operation_deadline_ms` and the gate asks `now + attempt_timeout_ms > deadline`
-/// (`CasRequestControl.cpp`), so equal values reduce it to `now_2 > now_1`: ONE elapsed millisecond
-/// between the two clock reads refuses the operation with NOTHING SENT, the injected fault is never
-/// reached, and the product correctly does not wedge -- flipping every wedge expectation downstream.
-///
-/// That is not hypothetical. It took down
-/// `CASRefWriterStalePrecommitSweep.BoundedBatchesAndInterruptionResumeAcrossMounts` on 5 of 6 sanitizer
-/// CI runs (fixed in `8f9e63c7a19`), `CASRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`
-/// under parallel-build load, and `CASRefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`
-/// in a full-binary ASan run -- the last one with the mechanism named verbatim in the thrown message
-/// ("refused BEFORE any request was sent ... the operation deadline rejected before the first request").
-///
-/// A wide deadline keeps the request always actually sent, so what the test observes is the fault it
-/// injected rather than the machine it ran on. A fixture that genuinely wants the pre-send REFUSAL
-/// must drive it deterministically with a frozen clock (see `gtest_cas_ref_install_safety.cpp`'s
-/// `openPoolFenceControlled`), never by racing the wall clock.
+/// The operation deadline every wedge fixture in this file uses, distinct from `attempt_timeout_ms`
+/// because `validateCasRequestBudget` requires the two to differ strictly: `Pool::open` refuses a
+/// budget where `attempt_timeout_ms >= operation_deadline_ms` with `BAD_ARGUMENTS`, so an equal or
+/// smaller value would refuse to open the pool at all rather than exercise any fixture below.
 constexpr uint64_t kSingleAttemptDeadlineMs = 5000;
+
+/// The budget every wedge fixture here uses. It bounds the mount lease's own admission arithmetic and
+/// nothing else: a write's ATTEMPT COUNT is the `Retry` policy's, and the ref lane's is `standard`, so
+/// no budget field can make an injected fault conclusive. What does is `driveToTheWedge` below --
+/// the fault stays armed for the whole call while the injected clock carries it to its own deadline.
+CasRequestBudget wedgeTestBudget()
+{
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
+    budget.lease_safety_margin_ms = 100;
+    return budget;
+}
+
+/// The engine reissues an unresolved write until its OWN retry window closes, and that window is
+/// measured on a clock the engine reads. Both seams here share one counter -- the sleep the engine
+/// performs is what advances the clock -- so a fault that stays armed ends the call at its deadline
+/// with no real time passing. Installed on the whole pool, because the ref-lane write, its settling
+/// read and the recovery retry loop all pace through the same seam. The pool owns the closures and the
+/// closures own the clock, so it outlives everything that can still read it.
+class VirtualRetryClock
+{
+public:
+    static std::shared_ptr<VirtualRetryClock> installOn(const PoolPtr & store)
+    {
+        auto clock = std::make_shared<VirtualRetryClock>();
+        store->setCasRequestNowFnForTest([clock] { return clock->nowMs(); });
+        store->setCasRetrySleepForTest([clock](uint64_t ms) { clock->advance(ms); });
+        return clock;
+    }
+
+    uint64_t nowMs() const
+    {
+        std::lock_guard lock(mutex);
+        return now_ms;
+    }
+    size_t pauseCount() const
+    {
+        std::lock_guard lock(mutex);
+        return pauses;
+    }
+    uint64_t longestPause() const
+    {
+        std::lock_guard lock(mutex);
+        return longest_pause;
+    }
+
+    void advance(uint64_t ms)
+    {
+        std::lock_guard lock(mutex);
+        /// Plus one millisecond, because full jitter can draw a ZERO pause: a clock that does not move
+        /// would leave the loop reissuing for ever against a fault that never clears.
+        now_ms += ms + 1;
+        ++pauses;
+        longest_pause = std::max(longest_pause, ms);
+    }
+
+private:
+    mutable std::mutex mutex;
+    uint64_t now_ms = 0;
+    size_t pauses = 0;
+    uint64_t longest_pause = 0;
+};
 
 /// A `CasEvent` sink safe to hand to `Pool::setEventSink`: the emit runs on whatever thread the pool's
 /// background syncer happens to be on, and the test reads the accumulated events afterward from the
@@ -457,6 +501,13 @@ public:
 
     String fault_key_substr;
     int fault_count = 0;
+    /// LATCHED: a COUNT can no longer make an injected fault conclusive, because the write engine
+    /// settles each ambiguity by an exact read and then REISSUES -- a fault that runs out mid-call is
+    /// answered by the next attempt instead of by the call's own deadline, which is the difference
+    /// between a wedge and a commit. While this is set the count is topped up before every matching
+    /// create, so the fault outlasts the whole call.
+    bool fault_latched = false;
+    bool ckpt_conflict_latched = false;
     /// Let the first `fault_skip` matching PUTs through untouched before `fault_count` starts faulting.
     /// Needed now that recovery's in-band epoch seal (INV-2) shares the `_log/` prefix with every other
     /// write under a namespace: a test that wants to fault something LATER in the same prefix (e.g. the
@@ -540,9 +591,31 @@ public:
         const String & key, const String & bytes, const std::optional<String> & expected_value,
         DB::Cas::TransportAccess & access) override
     {
+        topUpLatchedFaults(key, expected_value);
         if (expected_value)
             return conditionalReplaceForTest(key, bytes, *expected_value, access);
         return createForTest(key, bytes, access);
+    }
+
+    /// Both latches are re-armed HERE rather than inside each seam, so a latched fault reads exactly
+    /// like the counted one it replaces.
+    void topUpLatchedFaults(const String & key, const std::optional<String> & expected_value)
+    {
+        if (ckpt_conflict_latched && key == ckpt_conflict_key)
+            ckpt_conflict_count = 1;
+        if (fault_latched && !expected_value && fault_skip == 0 && !fault_key_substr.empty()
+            && key.find(fault_key_substr) != String::npos)
+            fault_count = 1;
+    }
+
+    void disarmFaults()
+    {
+        fault_latched = false;
+        ckpt_conflict_latched = false;
+        fault_count = 0;
+        fault_skip = 0;
+        ckpt_conflict_count = 0;
+        corrupt_count = 0;
     }
 
     std::expected<String, DB::Cas::Backend::RawConflict> conditionalReplaceForTest(
@@ -632,12 +705,12 @@ public:
                 block_entered = true;
                 block_cv.notify_all();
                 block_cv.wait(lk, [&] { return !block_armed; });
-                /// fix-round F3-1a (CRITICAL, unlock-throw race harness): on release, behave like
-                /// `corrupt_key_substr` above instead of proceeding normally -- a foreign writer landed
-                /// DIFFERENT bytes at this exact key while we were parked, so our own attempt is a
-                /// PROVEN conflict once `putIfAbsentControlled`'s resolve-before-reissue GETs it. Lets a
-                /// test make the recovery seal's PUT throw CORRUPTED_DATA from INSIDE the unlocked
-                /// window, deterministically, instead of merely returning a non-Committed outcome.
+                /// On release, behave like `corrupt_key_substr` above instead of proceeding normally --
+                /// a foreign writer landed DIFFERENT bytes at this exact key while we were parked, so
+                /// our own attempt is a PROVEN conflict once the write engine's own settling read
+                /// observes it. Lets a test make the recovery seal's write throw CORRUPTED_DATA from
+                /// INSIDE the unlocked window, deterministically, instead of merely returning a
+                /// non-Committed outcome.
                 if (block_throw_corrupted_on_release)
                 {
                     lk.unlock();
@@ -778,6 +851,31 @@ private:
     std::set<String> independent_blocked_keys;
     std::set<String> independent_released_keys;
 };
+
+/// Wedge the lane the way the engine reaches that state: EVERY attempt of the ref-log create is
+/// unresolved, the settling read proves the key still absent, and the call gives up at its own retry
+/// window having sent something -- which is the `sent_any` half of the wedge rule. A one-shot fault
+/// cannot produce it: the reissue would settle the key and commit. So the fault is held armed for the
+/// whole call and fully disarmed afterwards, because what every caller does next is a flush that must
+/// reach the store normally.
+///
+/// The pacing assertions are what make a fixture whose sleep seam is not wired FAIL rather than sleep
+/// the whole window out for real.
+void driveToTheWedge(VirtualRetryClock & clock, RefWriterTestBackend & backend,
+                     const std::function<void()> & drive)
+{
+    const size_t pauses_before = clock.pauseCount();
+    const uint64_t clock_before = clock.nowMs();
+    backend.fault_latched = true;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, drive);
+    backend.disarmFaults();
+    EXPECT_GT(clock.pauseCount(), pauses_before + 1)
+        << "the reissues must pace through the injected sleep, never a real one";
+    EXPECT_LE(clock.longestPause(), 5000u) << "each pause is the engine's own capped full jitter";
+    EXPECT_GE(clock.nowMs() - clock_before, 60000u)
+        << "the give-up must be the call's own retry window, not a pre-attempt refusal";
+}
+
 
 }
 
@@ -1448,10 +1546,16 @@ TEST(CASRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWit
                              before->ckpt.committed_through->ref_sequence + 1};
     const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
 
+    /// Latched, not counted: the frontier publication re-reads and reissues on every refusal until ITS
+    /// window closes, so a bounded refusal would be outlived and the checkpoint would advance.
+    auto clock = VirtualRetryClock::installOn(store);
     backend->ckpt_conflict_key = ckpt_key;
-    backend->ckpt_conflict_count = 100;
+    backend->ckpt_conflict_latched = true;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    backend->disarmFaults();
 
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the publication's reissues must pace through the injected sleep, never a real one";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
         << "the durable log was not installed or acknowledged";
@@ -1610,14 +1714,11 @@ TEST(CASRefWriterAppendLane, InvalidBatchEntryGetsOwnExceptionBatchSurvives)
 
 TEST(CASRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"srv1/wedge_a"};
     const RootNamespace ns_b{"srv1/wedge_b"};
@@ -1626,9 +1727,7 @@ TEST(CASRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     publishEmptyPart(store, ns_b, "y");
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_a)) + "_log/";
-    backend->fault_count = 1;
-
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns_a, "x"); });
     EXPECT_TRUE(store->refLaneWedgedForTest(ns_a));
 
     /// A different table proceeds normally while ns_a stays wedged.
@@ -1648,23 +1747,18 @@ TEST(CASRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
 
 TEST(CASRefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_unwedge"};
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->resolveRef(ns, "x").has_value()) << "not yet applied while wedged";
 
@@ -1688,14 +1782,11 @@ TEST(CASRefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
 /// tail counter is a stable running count.
 TEST(CASRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_tail"};
     publishEmptyPart(store, ns, "x");
@@ -1703,10 +1794,10 @@ TEST(CASRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 
     const size_t tail_after_setup = store->tailSinceSnapshotCountForTest(ns);
 
-    /// Wedge the lane: the single-attempt budget turns the ambiguous log PUT into an Unresolved outcome.
+    /// Wedge the lane: every attempt of the log create is unresolved, so the call gives up at its own
+    /// retry window having sent something.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->resolveRef(ns, "x").has_value()) << "not applied while merely wedged";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_setup)
@@ -1732,14 +1823,11 @@ TEST(CASRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 /// it, and it must track the wedge's full lifecycle (0 -> 1 -> 0), not just a one-shot snapshot.
 TEST(CASRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughItsLifecycle)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"srv1/wedge_count_a"};
     const RootNamespace ns_b{"srv1/wedge_count_b"};
@@ -1749,9 +1837,7 @@ TEST(CASRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroug
     ASSERT_EQ(store->wedgedRefLaneCount(), 0u) << "both tables cached and healthy before the fault";
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_a)) + "_log/";
-    backend->fault_count = 1;
-
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns_a, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_a));
     EXPECT_EQ(store->wedgedRefLaneCount(), 1u);
 
@@ -1779,7 +1865,7 @@ TEST(CASRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroug
 /// bookkeeping is restored, proven by a bounded wait on both a same-table and an independent-table
 /// append.
 ///
-/// The reaction is now the mount's, not the table's [review I5]: a foreign object at a key that
+/// The reaction is now the mount's, not the table's: a foreign object at a key that
 /// mount-lease exclusivity says is exclusively ours contradicts the exclusivity itself, so the append
 /// site routes through `reportImpossibleInterference` exactly as the wedge-resolve site does -- fence
 /// closed, remount scheduled. The fence is released only after remount, so there are two separate scopes to keep straight, and this test
@@ -1854,23 +1940,19 @@ TEST(CASRefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemou
 /// occupant for what it is -- corruption -- and one test covers every build.
 TEST(CASRefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/i1_wedge"};
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    /// Wedge the lane with an ambiguous PUT that never landed.
+    /// Wedge the lane: every attempt of the log create is unresolved and nothing lands.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     /// A foreign writer lands a DIFFERENT object at the exact wedged key; the next append's wedge resolve
@@ -1920,15 +2002,12 @@ TEST(CASRefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
 /// used to stand in for debug/sanitizer builds went with it.
 TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/anomaly_wedge"};
     publishEmptyPart(store, ns, "x");
@@ -1936,10 +2015,9 @@ TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 
     store->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
-    /// Wedge the lane with an ambiguous PUT that never landed.
+    /// Wedge the lane: every attempt of the log create is unresolved and nothing lands.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->mayMutate()) << "the fence must not be tripped yet -- only an ordinary Unresolved wedge so far";
     ASSERT_EQ(store->scheduleRemountCallCountForTest(), 0u) << "no remount must have been scheduled yet by the ordinary wedge alone";
@@ -2167,24 +2245,21 @@ TEST(CASRefTableCacheEviction, ZeroBudgetDisablesEviction)
 /// re-recovery must not be allowed to drop and re-materialize it (which could re-allocate an id).
 TEST(CASRefTableCacheEviction, WedgedTableIsNeverEvicted)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPoolWithConfig(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .cas_request_budget = budget, .ref_table_cache_bytes = 1});
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns_w{"srv1/wedged"};
     publishEmptyPart(store, ns_w, "x");
 
-    /// Wedge ns_w's append lane with one ambiguous (Unresolved) PUT that exhausts the single-attempt budget.
+    /// Wedge ns_w's append lane: every attempt of its log create is unresolved, so the call gives up at
+    /// its own retry window having sent something.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_w)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_w, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns_w, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_w));
 
     /// Pressure the cache with other tables. ns_w is idle and over the 1-byte budget, but its wedged lane
@@ -2984,11 +3059,7 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/c4_latch"};
 
-    CasRequestBudget budget;   /// one attempt per publish so a failure is a single PUT
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     uint64_t fake_now = 1'000'000;
     PoolConfig config;
@@ -2999,10 +3070,15 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.cas_request_budget = budget;
     auto store = openPoolWithConfig(backend, config);
+    /// The boot clock above is frozen (it is what keeps the publish backoff armed), so the REQUEST
+    /// engine needs its own advancing clock or a saturated publish never reaches its retry window and
+    /// reissues for ever.
+    VirtualRetryClock::installOn(store);
 
-    /// Every `_snap` PUT throws Unresolved (backend saturated), from the very first publish attempt.
+    /// Every `_snap` create is unresolved (backend saturated) and stays that way for the whole call, so
+    /// the publish gives up at its own window -- which is one dispatch, which is what this test counts.
     backend->fault_key_substr = "_snap/";
-    backend->fault_count = 100000;
+    backend->fault_latched = true;
 
     publishEmptyPart(store, ns, "a");   /// crosses the threshold -> one dispatch -> fails -> backoff armed
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -3116,11 +3192,7 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     const Layout layout("p");
     const RootNamespace ns{"srv1/c4_backoff"};
 
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     uint64_t fake_now = 1'000'000;
     PoolConfig config;
@@ -3131,10 +3203,13 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.cas_request_budget = budget;
     auto store = openPoolWithConfig(backend, config);
+    /// As above: the frozen boot clock drives the backoff decisions, so the request engine gets its own.
+    VirtualRetryClock::installOn(store);
 
-    /// Fail ONLY the first `_snap` PUT (arms the backoff); later PUTs succeed.
+    /// Fail the FIRST dispatch's `_snap` create for the whole call, so it gives up at its own retry
+    /// window and arms the backoff; the fault is cleared before the retry below.
     backend->fault_key_substr = "_snap/";
-    backend->fault_count = 1;
+    backend->fault_latched = true;
 
     publishEmptyPart(store, ns, "a");   /// dispatch -> publish fails -> backoff armed
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -3148,7 +3223,8 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
         << "a read within the backoff window must not re-dispatch";
     EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
 
-    /// Advance past the backoff: exactly one retry is dispatched and it publishes.
+    /// Advance past the backoff, with the fault cleared: exactly one retry is dispatched and it publishes.
+    backend->disarmFaults();
     fake_now += 2000;
     store->resolveRef(ns, "a");
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -3303,32 +3379,29 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
         .last_epoch_seal = std::nullopt,
     });
 
-    /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
-    /// transparently retries away. `8f9e63c7a19` widened `kSingleAttemptDeadlineMs` off a zero-width
-    /// race (equal attempt/operation deadlines), but it still measures the capture-to-gate window --
-    /// encoding the removal chunk (up to `ref_txn_max_ops` ops) -- against the REAL wall clock, so it
-    /// recurred (3 of 3 sanitizer lanes) once that encode step got slow enough on its own, independent
-    /// of scheduler contention: msan in particular. `ref_request_controller` reads its clock through
-    /// the same injectable seam as the mount fence (`CasRefLedger`'s `controller_boot_ms_fn` is the
-    /// pool's `boot_ms_fn`), so freeze it here instead of racing it -- the fault-injecting PUT below
-    /// still reaches the backend synchronously; only the deadline arithmetic stops moving.
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    /// The successor: `fault_latched` below makes ONE simulated ambiguous response wedge the lane
+    /// rather than being resolved by the engine's own reissue. `boot_ms_fn` seeds every plane's own
+    /// clock at construction and drives the mount lease's deadline math, so freezing it here keeps the
+    /// fence alive across the whole retry window; the request engine gets its own separately advancing
+    /// clock below, so its reissues still pace forward.
+    const CasRequestBudget budget = wedgeTestBudget();
     PoolConfig config;
     config.cas_request_budget = budget;
     config.boot_ms_fn = [] { return uint64_t{0}; };
     auto successor = openPoolWithConfig(backend, config);
+    /// The boot clock above is frozen, so the request engine needs its own advancing one: an armed
+    /// fault otherwise reissues for ever instead of ending the call at its retry window.
+    auto clock = VirtualRetryClock::installOn(successor);
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the dead predecessor
     /// epoch `e1` (its durable ids are `{e1,1}` and `{e1,2}`, so the seal lands at `{e1,3}`) -- that PUT
     /// shares this same `_log/` prefix, so it would eat the fault before the sweep ever gets a chance.
-    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended.
+    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended. Latched past
+    /// the skip, because the write engine reissues within a call: a single-shot fault would be answered
+    /// by the next attempt and the chunk would commit.
     backend->fault_skip = 1;
-    backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
+    backend->fault_latched = true;
 
     /// The sweep is piggybacked on this mount's very first touch; its (uncertain) failure is INSULATED
     /// from the read (resolveRef/listRefs call `sweepStalePrecommitsForRead`, not
@@ -3339,6 +3412,9 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
     EXPECT_EQ(deferred_after, deferred_before + 1)
         << "the read-only caller must observe (and count) the deferred sweep failure, not throw";
     EXPECT_TRUE(successor->refLaneWedgedForTest(ns));
+    backend->disarmFaults();
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the reissues must pace through the injected sleep, never a real one";
 
     /// The first chunk's request actually landed server-side; the caller just never saw the ack.
     backend->materializePendingDelayedWrite();
@@ -3429,11 +3505,7 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
     /// transparently retries away (mirrors the wedge-semantics tests in this file exactly).
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
     PoolConfig config;
     config.cas_request_budget = budget;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
@@ -3449,14 +3521,18 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
         << "the unclean predecessor must exercise the injected mount-observation wait";
 
     successor->setEventSink([&](const CasEvent & e) { seen.add(e); });
+    /// The boot clock this test drives the sweep backoff on is its own; the request engine gets a
+    /// separate advancing clock, or an armed fault reissues for ever instead of ending its call.
+    auto clock = VirtualRetryClock::installOn(successor);
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the predecessor's now-dead
     /// epoch (its three precommits are its only durable ids, so the seal takes the very next slot) --
     /// that PUT shares this same `_log/` prefix, so it would eat the fault before the sweep gets a turn.
-    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended.
+    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended. Latched past
+    /// the skip, because the write engine reissues within a call.
     backend->fault_skip = 1;
-    backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
+    backend->fault_latched = true;
 
     /// FIRST trigger (read path): the sweep's removal PUT is uncertain -> the lane wedges; the read
     /// itself still succeeds and counts the deferral (existing contract) -- but the shot must NOT be
@@ -3470,6 +3546,9 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     EXPECT_TRUE(successor->needsStalePrecommitSweepForTest(ns))
         << "a failed sweep must re-arm needs_stale_precommit_sweep, not consume the once-per-mount shot";
     EXPECT_EQ(global_counters[ProfileEvents::CASRefSweepRearmed].load(), rearmed_before + 1);
+    backend->disarmFaults();
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the reissues must pace through the injected sleep, never a real one";
 
     /// Within the backoff window (the injected clock has not advanced) a read must NOT re-attempt --
     /// the bounded-backoff storm latch: no new deferral, flag still armed.
@@ -3741,11 +3820,7 @@ TEST(CASRefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
 /// its slot -- see `quiesceRefTablesForRemount`'s doc comment (`CasPool.h`).
 TEST(CASRefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     /// The self-remount below blocks on nothing (see
@@ -3762,10 +3837,10 @@ TEST(CASRefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    /// Wedge the lane with an ambiguous PUT that never landed server-side.
+    /// Wedge the lane: every attempt of the log create is unresolved and nothing lands server-side.
+    auto clock = VirtualRetryClock::installOn(store);
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     fenceOutRefMount(*backend, layout.mountKey("test"));
@@ -4251,14 +4326,11 @@ TEST(CASRefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThr
 /// remains `Removing`, positive ownership is refused, and a retry of the same removal resolves the wedge.
 TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCompletes)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remove_fault_keeps_build"};
 
@@ -4269,9 +4341,7 @@ TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCom
     build->precommitAdd(ns, "inflight", id);
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropNamespace(ns); });
 
     EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
     EXPECT_FALSE(store->resolveRef(ns, "committed"))
@@ -4294,14 +4364,11 @@ TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCom
 /// `RemovalAppendFailureLeavesRemovingAndRetryCompletes`.
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeStaysTrueThroughRemovingUntilTerminalRetrySucceeds)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/presence_removing_no_terminal"};
 
@@ -4309,8 +4376,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeStaysTrueThroughRemovingUntilTer
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropNamespace(ns); });
 
     ASSERT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns))
@@ -4528,14 +4594,11 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeFenceLossPropagatesRatherThanAns
 /// (absent, immediately, no GC).
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeFacadeConsistencyAcrossRemovalLifecycle)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/presence_facade_consistency"};
 
@@ -4544,8 +4607,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeFacadeConsistencyAcrossRemovalLi
     EXPECT_FALSE(store->listRefs(ns).empty());
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropNamespace(ns); });
 
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns))
         << "present for cleanup, even though content below is about to prove unreadable";
@@ -5200,7 +5262,7 @@ void seedUncleanPredecessorMount(const BackendPtr & backend, const Layout & layo
 CasRequestBudget sealTestTinyBudget()
 {
     return CasRequestBudget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = kSingleAttemptDeadlineMs, .max_attempts = 1,
+        .attempt_timeout_ms = 50, .operation_deadline_ms = kSingleAttemptDeadlineMs,
         .lease_safety_margin_ms = 50};
 }
 
@@ -5257,27 +5319,33 @@ TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
 
-    /// No-op backoff and a frozen clock: retries run until the transient faults are exhausted, and the
-    /// frozen clock keeps the mount fence alive across them (advancing it past the tiny lease TTL would
-    /// drop the fence and abort recovery -- exercising the fence path, which is the budget test's job).
-    store->setCasRetrySleepForTest([](uint64_t) {});
+    /// The engine's own clock advances (its sleep is what moves it), while `fake_now` -- the FENCE's
+    /// clock -- stays frozen, which is what keeps the mount alive across a retry: advancing it past the
+    /// tiny lease TTL would drop the fence and abort recovery, exercising the fence path instead.
+    auto clock = VirtualRetryClock::installOn(store);
 
-    /// Fail the epoch seal's conditional create twice with a transient (timeout) error; the third
-    /// attempt lands. The seal is a LOG transaction at `{2,2}` -- the slot after the dead epoch's last
-    /// durable id -- because INV-2 closes an epoch in-band, at the key a straggler would have taken.
+    /// Fail the epoch seal's conditional create for the whole of ONE recovery attempt, then clear the
+    /// fault from the recovery retry seam -- the only point between two recovery attempts a test can
+    /// reach. A bounded fault count cannot express this: the write engine reissues within a call, so a
+    /// count of two is spent by that one call's own reissues and no recovery retry ever happens. The
+    /// seal is a LOG transaction at `{2,2}` -- the slot after the dead epoch's last durable id --
+    /// because INV-2 closes an epoch in-band, at the key a straggler would have taken.
     const RefTxnId seal_id{2, 2};
     backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
-    backend->fault_count = 2;
+    backend->fault_latched = true;
+    store->setRefRecoveryRetrySleepForTest([&backend](uint64_t, const auto &) { backend->disarmFaults(); });
 
     using ProfileEvents::global_counters;
     const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries].load();
     const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load();
 
-    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must succeed after retrying past the faults";
+    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must succeed after retrying past the fault";
 
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries].load(), retries_before + 2);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries].load(), retries_before + 1);
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the failed attempt's own reissues must pace through the injected sleep, never a real one";
     /// TWO dead epochs (1 and 2) are closed by this walk, and a whole attempt is re-driven per transient
-    /// failure -- so the seals of the epochs a failed attempt already closed are ADOPTED on the retry
+    /// failure -- so the seals of the epochs the failed attempt already closed are ADOPTED on the retry
     /// rather than minted again. Exactly two are minted in total.
     EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load(), sealed_before + 2);
 }
@@ -5460,7 +5528,9 @@ TEST(CASRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
     auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
 
-    /// First touch: the seal PUT fails transiently -> the loop enters backoff -> the sleep THROWS.
+    /// First touch: the seal create fails transiently and the next thing either loop does is sleep on
+    /// this one seam -- the write engine's reissue pause is simply the first to reach it -- so the throw
+    /// lands while `recovery_in_progress` is set, which is the state this test is about.
     bool sleep_should_throw = true;
     store->setCasRetrySleepForTest([&sleep_should_throw](uint64_t)
     {

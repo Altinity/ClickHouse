@@ -47,6 +47,13 @@ ManifestId publishRefThroughPool(const PoolPtr & store, const RootNamespace & ns
     return id;
 }
 
+/// The `refresh_authority` hook `deleteCompletedRemoving` requires every caller to state explicitly.
+/// This fixture's operation carries a direct liveness (`op.admitted()` re-checks the fence itself on
+/// every call), not a cached flag, so there is nothing for a refresh to re-read between attempts.
+void noAuthorityRefresh()
+{
+}
+
 /// Delete the current catalog life through the production exact-removal authority (`casUpdate` to
 /// `Removing`, then `deleteCompletedRemoving` under a held fence), retaining every old physical byte
 /// and any already-resident runtime. Mirrors `gtest_cas_ns_file_read_contract.cpp`'s
@@ -81,10 +88,7 @@ void deleteCatalogLife(const BackendPtr & backend, const Layout & layout, const 
     parent.ref_lives.emplace(life.incarnation, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
-    /// The no-op refresh the API asks a caller to state explicitly: this fixture's operation is
-    /// admitted on an open fence and carries no liveness at all, so there is no cached fact for a
-    /// refresh to re-read between attempts.
-    if (CasRefCatalog::deleteCompletedRemoving(op, layout, *it, parent, [] {}).outcome
+    if (CasRefCatalog::deleteCompletedRemoving(op, layout, *it, parent, noAuthorityRefresh).outcome
         != CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Failed to delete fixture catalog life '{}'", life.ns.string());
 }

@@ -788,8 +788,8 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
         ProfileEvents::increment(ProfileEvents::CASRefRecoveryCancelled);
         throwCasWriteRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}' was cancelled by a self-remount before the mount "
-            "fence was re-armed; nothing was written and nothing installed — the next touch recovers under "
-            "the fresh incarnation", ns.string()));
+            "fence was re-armed; the last attempt's fate is unresolved and nothing is installed — the next "
+            "touch recovers under the fresh incarnation", ns.string()));
     }
 
     if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
@@ -1265,7 +1265,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         if (publishCkptContribution(op, life, contribution) == CkptPublishOutcome::FencedOut)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
-                "checkpoint could record the epoch seal {}-{}; nothing was written and nothing is installed",
+                "checkpoint could record the epoch seal {}-{}; the last attempt's fate is unresolved and "
+                "nothing is installed",
                 ns.string(), last_epoch_seal->writer_epoch, last_epoch_seal->ref_sequence));
 
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
@@ -1341,7 +1342,8 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
-                    "birthing its catalog entry; nothing was written and nothing installed", ns.string()));
+                    "birthing its catalog entry; the last attempt's fate is unresolved and nothing is "
+                    "installed", ns.string()));
             continue;   /// Live or Superseded: re-read (Superseded means a DIFFERENT actor won birth)
         }
 
@@ -1370,7 +1372,8 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
-                    "resuming its own stalled creation; nothing was written and nothing installed",
+                    "resuming its own stalled creation; the last attempt's fate is unresolved and nothing "
+                    "is installed",
                     ns.string()));
             continue;   /// Live or Superseded: re-read either way
         }
@@ -1384,11 +1387,12 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         switch (reconcile_outcome)
         {
             case CasRefCatalog::ReconcileCreatorOutcome::FencedOut:
-                /// Review I6: our OWN mount fence moved before the steal CAS -- nothing was written, and
+                /// Our OWN mount fence moved before the steal CAS -- the CAS's fate is unresolved, and
                 /// this mount is the wrong actor to retry (its incarnation is gone).
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
-                    "reconciling a stalled foreign creator; nothing was written and nothing installed",
+                    "reconciling a stalled foreign creator; the last attempt's fate is unresolved and "
+                    "nothing is installed",
                     ns.string()));
             case CasRefCatalog::ReconcileCreatorOutcome::Reconciled:
             {
@@ -1398,7 +1402,8 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
                 if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                     throwCasWriteRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
-                        "completing a reconciled creation; nothing was written and nothing installed",
+                        "completing a reconciled creation; the last attempt's fate is unresolved and "
+                        "nothing is installed",
                         ns.string()));
                 continue;   /// Live or Superseded: re-read either way
             }
@@ -2113,7 +2118,7 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
             /// Build the responsibility set (its own `item`) BEFORE publishing the baton, so becoming
             /// leader contains NO throwing operation once `leader_active` is set: the only allocation is
             /// this first `push_back`, done here while still holding `lk` and NOT yet leader. If it throws
-            /// (a `bad_alloc` at the pre-tenure point; codex stage-1 review, Important), the baton is never
+            /// (a `bad_alloc` at the pre-tenure point), the baton is never
             /// taken -- but `item` is already in `pending` (pushed above), so it must be un-enqueued before
             /// propagating, else a future leader would carve an item whose `build_ops` closure died with
             /// this unwinding caller (the same use-after-free the exit guard prevents post-publication).
