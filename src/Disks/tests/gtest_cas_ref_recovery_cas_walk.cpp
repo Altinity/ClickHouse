@@ -327,10 +327,66 @@ public:
     }
 };
 
+/// The engine reissues an unresolved write until its OWN retry window closes, and that window is
+/// measured on a clock the engine reads. Both seams here share one counter -- the sleep the engine
+/// performs is what advances the clock -- so a fault that stays armed ends the call at its deadline
+/// with no real time passing. Installed on the whole pool, because the ref-lane write, its settling
+/// read and the recovery retry loop all pace through the same seam. The pool owns the closures and the
+/// closures own the clock, so it outlives everything that can still read it.
+class VirtualRetryClock
+{
+public:
+    static std::shared_ptr<VirtualRetryClock> installOn(const PoolPtr & store)
+    {
+        auto clock = std::make_shared<VirtualRetryClock>();
+        store->setCasRequestNowFnForTest([clock] { return clock->nowMs(); });
+        store->setCasRetrySleepForTest([clock](uint64_t ms) { clock->advance(ms); });
+        return clock;
+    }
+
+    uint64_t nowMs() const
+    {
+        std::lock_guard lock(mutex);
+        return now_ms;
+    }
+    size_t pauseCount() const
+    {
+        std::lock_guard lock(mutex);
+        return pauses;
+    }
+    uint64_t longestPause() const
+    {
+        std::lock_guard lock(mutex);
+        return longest_pause;
+    }
+
+    void advance(uint64_t ms)
+    {
+        std::lock_guard lock(mutex);
+        /// Plus one millisecond, because full jitter can draw a ZERO pause: a clock that does not move
+        /// would leave the loop reissuing for ever against a fault that never clears.
+        now_ms += ms + 1;
+        ++pauses;
+        longest_pause = std::max(longest_pause, ms);
+    }
+
+private:
+    mutable std::mutex mutex;
+    uint64_t now_ms = 0;
+    size_t pauses = 0;
+    uint64_t longest_pause = 0;
+};
+
+/// More injected failures than the engine's own retry window can make attempts, on a clock that
+/// advances at least a millisecond per pause: a call meeting this fault must end at its DEADLINE,
+/// never by outliving the fault. A bounded count would be spent by ONE call's own reissues, because
+/// the engine settles each ambiguity by an exact read and then reissues.
+constexpr int kFaultsBeyondTheRetryWindow = 100'000;
+
 CasRequestBudget tinyBudget()
 {
     return CasRequestBudget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .lease_safety_margin_ms = 50};
 }
 
 PoolConfig walkTestConfig()
@@ -465,9 +521,13 @@ NamespaceLifeId strandOneUnfrontieredSuccessor(
             return ops;
         }, RootMutationOrigin::Writer, RootMutationKind::Publish);
 
+    /// The frontier publication reissues an ambiguous replace until its own retry window closes, so
+    /// the fault has to outlast the call and the clock the window is read from has to move for the call
+    /// to end at all.
+    auto clock = VirtualRetryClock::installOn(store);
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
     backend->ambiguous_cas_substr = layout.refCkptKey(life);
-    backend->ambiguous_cas_count = 200;
+    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         store->appendRefOps(ns, MutationScope::ref("b"),
@@ -475,6 +535,9 @@ NamespaceLifeId strandOneUnfrontieredSuccessor(
             RootMutationOrigin::Writer, RootMutationKind::Publish);
     });
     backend->ambiguous_cas_count = 0;
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the reissues must pace through the injected sleep, never a real one";
+    EXPECT_LE(clock->longestPause(), 5000u) << "each pause is the engine's own capped full jitter";
     return life;
 }
 
@@ -1010,7 +1073,7 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesEveryOccupiedObjectBeforeAdvancingP
         store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
 
         backend->ambiguous_cas_substr = layout.refCkptKey(life);
-        backend->ambiguous_cas_count = 100'000;
+        backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
         expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
 
         EXPECT_TRUE(backend->get(layout.refLogKey(life, test_case.occupant)));
@@ -1087,7 +1150,7 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNex
     store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
 
     backend->ambiguous_cas_substr = layout.refCkptKey(life);
-    backend->ambiguous_cas_count = 100'000;
+    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
 
     EXPECT_TRUE(backend->get(layout.refLogKey(life, first_seal)))
@@ -1139,7 +1202,7 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesAnAdoptedStragglerBeforeCreatingIts
     store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
 
     backend->ambiguous_cas_substr = layout.refCkptKey(life);
-    backend->ambiguous_cas_count = 100'000;
+    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
 
     EXPECT_TRUE(backend->get(layout.refLogKey(life, straggler)))
@@ -1628,8 +1691,9 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsOneExactUnfrontieredSuccessorAnd
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
     const String ckpt_key = layout.refCkptKey(life);
     ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}));
+    auto clock = VirtualRetryClock::installOn(store);
     backend->ambiguous_cas_substr = ckpt_key;
-    backend->ambiguous_cas_count = 200;
+    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
@@ -1637,6 +1701,8 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsOneExactUnfrontieredSuccessorAnd
             [](const RefTableState &) { return publishCommittedOps("b", manifestRef(1, 2, 1)); },
             RootMutationOrigin::Writer, RootMutationKind::Publish);
     });
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the reissues must pace through the injected sleep, never a real one";
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     ASSERT_TRUE(backend->get(layout.refLogKey(life, RefTxnId{1, 2})))
         << "the sole deterministic successor must be durable before recovery";
@@ -1697,8 +1763,9 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochO
     ASSERT_TRUE(readCkptForTest(backend, layout, life)->ckpt.life_epoch);
     ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, std::nullopt);
 
+    auto clock = VirtualRetryClock::installOn(store);
     backend->ambiguous_cas_substr = layout.refCkptKey(life);
-    backend->ambiguous_cas_count = 200;
+    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         store->appendRefOps(ns, MutationScope::ref("a"),
@@ -1752,7 +1819,9 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPriv
                   PutOutcome::Done);
         const auto current = backend->get(key);
         ASSERT_TRUE(current);
-        ASSERT_EQ(current->token, *expected);
+        /// `expected` is the transport value the publisher is presenting; the legacy read hands back
+        /// the same observation wrapped in a `Token`, so its `value` is what compares.
+        ASSERT_EQ(current->token.value, *expected);
         const RefCkpt advanced = mergeCkpt(
             decodeRefCkpt(current->bytes),
             RefCkpt{.life_epoch = std::nullopt,
@@ -1791,14 +1860,17 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsTwoUnfrontieredSuccessorsAfterE
 
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
     const String ckpt_key = layout.refCkptKey(life);
+    auto clock = VirtualRetryClock::installOn(store);
     backend->ambiguous_cas_substr = ckpt_key;
-    backend->ambiguous_cas_count = 200;
+    backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         store->appendRefOps(ns, MutationScope::ref("b"),
             [](const RefTableState &) { return publishCommittedOps("b", manifestRef(1, 2, 1)); },
             RootMutationOrigin::Writer, RootMutationKind::Publish);
     });
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the reissues must pace through the injected sleep, never a real one";
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     const RefLogTxn second_successor = makeOrdinaryTxn(ns, RefTxnId{1, 3}, "c", /*birth=*/false);

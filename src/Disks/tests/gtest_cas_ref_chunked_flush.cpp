@@ -714,28 +714,117 @@ namespace
 /// (the leader's own item), chunk 2 = {item_b}. `mode` faults ONLY chunk 2's `_log/` PUT (skip chunk 1).
 /// In every variant chunk 1 commits and the leader's own call returns chunk 1's real id, while chunk 2's
 /// caller fails. Returns the two callers' results plus chunk 1's id for the per-variant assertions.
+/// The engine reissues an unresolved write until its OWN retry window closes, and that window is
+/// measured on a clock the engine reads. Both seams here share one counter -- the sleep the engine
+/// performs is what advances the clock -- so a fault that stays armed ends the call at its deadline
+/// with no real time passing. Installed on the whole pool, because the ref-lane write, its settling
+/// read and the recovery retry loop all pace through the same seam. The pool owns the closures and the
+/// closures own the clock, so it outlives everything that can still read it.
+class VirtualRetryClock
+{
+public:
+    static std::shared_ptr<VirtualRetryClock> installOn(const PoolPtr & store)
+    {
+        auto clock = std::make_shared<VirtualRetryClock>();
+        store->setCasRequestNowFnForTest([clock] { return clock->nowMs(); });
+        store->setCasRetrySleepForTest([clock](uint64_t ms) { clock->advance(ms); });
+        return clock;
+    }
+
+    uint64_t nowMs() const
+    {
+        std::lock_guard lock(mutex);
+        return now_ms;
+    }
+    size_t pauseCount() const
+    {
+        std::lock_guard lock(mutex);
+        return pauses;
+    }
+    uint64_t longestPause() const
+    {
+        std::lock_guard lock(mutex);
+        return longest_pause;
+    }
+
+    void advance(uint64_t ms)
+    {
+        std::lock_guard lock(mutex);
+        /// Plus one millisecond, because full jitter can draw a ZERO pause: a clock that does not move
+        /// would leave the loop reissuing for ever against a fault that never clears.
+        now_ms += ms + 1;
+        ++pauses;
+        longest_pause = std::max(longest_pause, ms);
+    }
+
+private:
+    mutable std::mutex mutex;
+    uint64_t now_ms = 0;
+    size_t pauses = 0;
+    uint64_t longest_pause = 0;
+};
+
+/// `ChunkFaultBackend` COUNTS its faults, and a count can no longer make one conclusive: the write
+/// engine settles every ambiguity by an exact read and then REISSUES, so a fault that runs out
+/// mid-call is answered by the next attempt instead of by the call's own deadline. This keeps it armed
+/// until the latch is cleared, on both legs -- the write's, and the lost read `Mode::LandedThenLost`
+/// arms, which the read engine would otherwise simply reissue past.
+class LatchedChunkFaultBackend : public ChunkFaultBackend
+{
+public:
+    bool latched = false;
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (latched && !fail_read_once_key.empty() && key == fail_read_once_key)
+            throw Poco::TimeoutException("LatchedChunkFaultBackend: the lost read stays lost");
+        return ChunkFaultBackend::read(key, access);
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             DB::Cas::TransportAccess & access) override
+    {
+        if (latched && mode != Mode::None && fault_skip == 0 && !expected_value && !fault_substr.empty()
+            && key.find(fault_substr) != String::npos)
+            fault_count = 1;
+        return ChunkFaultBackend::write(key, bytes, expected_value, access);
+    }
+
+    void disarm()
+    {
+        latched = false;
+        mode = Mode::None;
+        fault_count = 0;
+        fault_skip = 0;
+        fail_read_once_key.clear();
+    }
+};
+
 struct ChunkFailureOutcome
 {
     AppendResult leader;     /// item_a, chunk 1
     AppendResult follower;   /// item_b, chunk 2
     RefTxnId chunk1_id{};
-    std::shared_ptr<ChunkFaultBackend> backend;
+    std::shared_ptr<LatchedChunkFaultBackend> backend;
     PoolPtr store;
+    std::shared_ptr<VirtualRetryClock> clock;
 };
 
 ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBackend::Mode mode)
 {
-    auto backend = std::make_shared<ChunkFaultBackend>();
+    auto backend = std::make_shared<LatchedChunkFaultBackend>();
     PoolConfig cfg;
-    /// Single-attempt budget: one ambiguous PUT is a conclusive Unresolved (wedge) / DefiniteFailure,
-    /// with no inter-attempt sleep to serve.
+    /// The budget bounds the mount lease's own admission arithmetic and nothing else -- a write's
+    /// attempt count is the `Retry` policy's. What makes the injected fault conclusive is that it
+    /// stays armed for the whole call while the injected clock carries the call to its own deadline.
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
+    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     auto store = openPoolWith(backend, cfg);
+    auto clock = VirtualRetryClock::installOn(store);
     const DB::Cas::Layout & layout = store->layout();
     const RootNamespace ns{String("srv1/") + ns_suffix};
     publishEmptyPart(store, ns, "seed");
@@ -746,6 +835,7 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
     backend->mode = mode;
     backend->fault_skip = 1;
     backend->fault_count = 1;
+    backend->latched = true;
 
     auto sync = std::make_shared<CaseSync>();
     armPreCarveBlock(store, ns, sync, 2);
@@ -764,10 +854,14 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
     out.follower = b.fut.get();
     a.t.join();
     b.t.join();
+    /// Disarmed before anything else touches the store: a topped-up count would fault the pool's own
+    /// teardown writes too.
+    backend->disarm();
     store->setRefPreCarveHookForTest(nullptr);
     out.chunk1_id = out.leader.id;
     out.backend = backend;
     out.store = store;
+    out.clock = clock;
     return out;
 }
 
@@ -805,6 +899,11 @@ TEST(CASRefWriterChunkedFlush, ChunkFailureWedge)
     ChunkFailureOutcome out = runChunkFailureCase("chunk_fail_wedge", ChunkFaultBackend::Mode::Unresolved);
     ASSERT_TRUE(out.leader.err == nullptr) << "chunk-1 caller must observe success even though chunk 2 wedged";
     ASSERT_TRUE(out.follower.err != nullptr) << "chunk-2 caller must observe the append failure";
+    /// The give-up was chunk 2's OWN retry window: the fault outlasted several reissues, and every one
+    /// of them paced through the injected sleep rather than a real one.
+    EXPECT_GT(out.clock->pauseCount(), 1u);
+    EXPECT_LE(out.clock->longestPause(), 5000u) << "each pause is the engine's own capped full jitter";
+    EXPECT_GE(out.clock->nowMs(), 60000u);
 
     EXPECT_TRUE(out.store->refLaneWedgedForTest(ns)) << "chunk 2's unresolved PUT must wedge the lane";
     RefTxnId chunk2_id = out.chunk1_id;

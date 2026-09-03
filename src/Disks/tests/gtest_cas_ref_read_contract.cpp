@@ -81,7 +81,10 @@ void deleteCatalogLife(const BackendPtr & backend, const Layout & layout, const 
     parent.ref_lives.emplace(life.incarnation, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
-    if (CasRefCatalog::deleteCompletedRemoving(op, layout, *it, parent).outcome
+    /// The no-op refresh the API asks a caller to state explicitly: this fixture's operation is
+    /// admitted on an open fence and carries no liveness at all, so there is no cached fact for a
+    /// refresh to re-read between attempts.
+    if (CasRefCatalog::deleteCompletedRemoving(op, layout, *it, parent, [] {}).outcome
         != CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Failed to delete fixture catalog life '{}'", life.ns.string());
 }

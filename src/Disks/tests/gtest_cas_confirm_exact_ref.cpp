@@ -18,6 +18,9 @@
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 
+#include <Poco/Exception.h>
+
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -27,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -80,6 +84,85 @@ namespace
 /// `recovery_in_progress` set). The failure is deliberately `CORRUPTED_DATA`:
 /// `isTransientRecoveryError` does not list it, so recovery fails fast instead of burning its retry
 /// budget.
+/// The engine reissues an unresolved write until its OWN retry window closes, and that window is
+/// measured on a clock the engine reads. Both seams here share one counter -- the sleep the engine
+/// performs is what advances the clock -- so a fault that stays armed ends the call at its deadline
+/// with no real time passing. Installed on the whole pool, because the ref-lane write, its settling
+/// read and the recovery retry loop all pace through the same seam. The pool owns the closures and the
+/// closures own the clock, so it outlives everything that can still read it.
+class VirtualRetryClock
+{
+public:
+    static std::shared_ptr<VirtualRetryClock> installOn(const PoolPtr & store)
+    {
+        auto clock = std::make_shared<VirtualRetryClock>();
+        store->setCasRequestNowFnForTest([clock] { return clock->nowMs(); });
+        store->setCasRetrySleepForTest([clock](uint64_t ms) { clock->advance(ms); });
+        return clock;
+    }
+
+    uint64_t nowMs() const
+    {
+        std::lock_guard lock(mutex);
+        return now_ms;
+    }
+    size_t pauseCount() const
+    {
+        std::lock_guard lock(mutex);
+        return pauses;
+    }
+    uint64_t longestPause() const
+    {
+        std::lock_guard lock(mutex);
+        return longest_pause;
+    }
+
+    void advance(uint64_t ms)
+    {
+        std::lock_guard lock(mutex);
+        /// Plus one millisecond, because full jitter can draw a ZERO pause: a clock that does not move
+        /// would leave the loop reissuing for ever against a fault that never clears.
+        now_ms += ms + 1;
+        ++pauses;
+        longest_pause = std::max(longest_pause, ms);
+    }
+
+private:
+    mutable std::mutex mutex;
+    uint64_t now_ms = 0;
+    size_t pauses = 0;
+    uint64_t longest_pause = 0;
+};
+
+/// `ChunkFaultBackend` COUNTS its faults, and a count can no longer make one conclusive: the write
+/// engine settles every ambiguity by an exact read and then REISSUES, so a fault that runs out
+/// mid-call is answered by the next attempt instead of by the call's own deadline -- which is the
+/// whole difference between a wedge and a commit.
+class LatchedChunkFaultBackend : public DB::Cas::tests::ChunkFaultBackend
+{
+public:
+    bool latched = false;
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             DB::Cas::TransportAccess & access) override
+    {
+        if (latched && mode != Mode::None && fault_skip == 0 && !expected_value && !fault_substr.empty()
+            && key.find(fault_substr) != String::npos)
+            fault_count = 1;
+        return ChunkFaultBackend::write(key, bytes, expected_value, access);
+    }
+
+    void disarm()
+    {
+        latched = false;
+        mode = Mode::None;
+        fault_count = 0;
+        fault_skip = 0;
+        fail_read_once_key.clear();
+    }
+};
+
 class RecoveryLatchBackend : public CountingBackend
 {
 public:
@@ -666,19 +749,18 @@ TEST(CASConfirmExactRef, WedgedLaneIsUnknown)
 /// touched.
 TEST(CASConfirmExactRef, WedgedTransactionRefusesEveryRef)
 {
-    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto backend = std::make_shared<LatchedChunkFaultBackend>();
     PoolConfig cfg;
-    /// Single-attempt budget: one ambiguous PUT is a conclusive wedge, no inter-attempt sleep. The
-    /// operation deadline is deliberately far wider than one attempt, so the pre-send gate never
-    /// refuses before the injected fault is reached and the outcome is decided by the fault, not by
-    /// how loaded the machine is.
+    /// The budget bounds the mount lease's own admission arithmetic and nothing else: a write's attempt
+    /// count is the `Retry` policy's. What makes the injected fault conclusive is that it stays armed
+    /// for the whole call while the injected clock below carries the call to its own deadline.
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
     budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     auto store = openPoolWithConfig(backend, cfg);
+    auto clock = VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/confirm_real_wedge"};
     /// Pins the namespace to the fixture life BEFORE its first real touch, so the fault key computed
     /// from that same life below is the key production actually writes to.
@@ -693,7 +775,14 @@ TEST(CASConfirmExactRef, WedgedTransactionRefusesEveryRef)
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_skip = 0;
     backend->fault_count = 1;
+    backend->latched = true;
     EXPECT_THROW(store->dropRef(ns, "x"), DB::Exception);
+    backend->disarm();
+    /// The give-up was the call's OWN retry window: the fault outlasted several reissues and every one
+    /// of them paced through the injected sleep rather than a real one.
+    EXPECT_GT(clock->pauseCount(), 1u);
+    EXPECT_LE(clock->longestPause(), 5000u) << "each pause is the engine's own capped full jitter";
+    EXPECT_GE(clock->nowMs(), 60000u);
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_EQ(store->refQueuePendingForTest(ns), 0u);
     ASSERT_EQ(store->refCarvedForTest(ns), 0u)

@@ -70,9 +70,10 @@ PoolPtr openPool(const BackendPtr & backend)
 
 /// The fence-controlled pool of `gtest_cas_ref_install_safety.cpp`, for the pre-attempt refusal: the
 /// boot clock is frozen so `setMountDeadline` alone decides both fence predicates, renewal is parked an
-/// hour out so nothing re-arms the deadline underneath the test, and the single-attempt budget makes
+/// hour out so nothing re-arms the deadline underneath the test, and the budget makes
 /// `attempt_timeout_ms + lease_safety_margin_ms` (200 ms) the window between "the flush is admitted"
-/// and "an attempt may start".
+/// and "an attempt may start". No fault is injected here at all -- the refusal comes from the lease
+/// having no room to start a write -- so nothing in this fixture depends on an attempt count.
 PoolPtr openPoolFenceControlled(const BackendPtr & backend)
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
@@ -80,9 +81,8 @@ PoolPtr openPoolFenceControlled(const BackendPtr & backend)
     cfg.boot_ms_fn = [] { return uint64_t{0}; };
     cfg.mount_renew_period = std::chrono::milliseconds{3600000};
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
+    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     return Pool::open(backend, cfg);

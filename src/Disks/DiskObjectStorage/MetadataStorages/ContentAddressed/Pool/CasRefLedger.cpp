@@ -1461,7 +1461,7 @@ void CasRefLedger::ensureRefTableRecovered(
     });
 
     /// ---- Step 1: capture the admitted generation, ONCE ----
-    /// The trio (spec §3, codex finding 7): this ONE value admits the walk's operation, so every
+    /// This ONE value admits the walk's operation, so every
     /// request it makes is measured against it, and the install below presents it one final time. One
     /// capture point, no re-derivation -- a value re-read midway would let a recovery that lost the
     /// mount "recover" its right to write by observing a fresh incarnation it was never admitted under.
@@ -3702,7 +3702,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// append for this table already advanced applied state. That other append can be the birth
         /// itself, whose `_ckpt` a cleanup call here would then delete out from under it -- the same harm
         /// class the ambiguous `Writing -> Wedged` branch is deliberately excluded to avoid, against an
-        /// object with no repair path (BACKLOG `{#ckpt-damage-no-repair-path}`). "the ref-log create
+        /// object that has no repair path. "the ref-log create
         /// was never reached" is true of THIS attempt; it says nothing about whether a DIFFERENT attempt
         /// for this same namespace already made the birth durable. Now that Critical B removed the other
         /// call sites too, `_ckpt` debris from a never-born namespace is reclaimed only by the future
@@ -3739,7 +3739,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
 
     if (const auto * conflict = std::get_if<Conflict>(&*written))
     {
-        /// THREE-WAY ADJUDICATION, the same one the wedge resolution owes [review HIGH-2]. "A different
+        /// THREE-WAY ADJUDICATION, the same one the wedge resolution owes. "A different
         /// object at our derived key" is not one situation but two, and they call for opposite
         /// reactions. One of them is EXPECTED: a successor that sealed our epoch put its epoch-closing
         /// record at exactly the id we keep re-deriving, and INV-2 says we must keep re-deriving it
@@ -3750,34 +3750,57 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// The occupant arrives WITH the conflict: the write's own settling read already observed the
         /// key, so no second request is issued here.
         const auto * occupant_object = std::get_if<Object>(&conflict->seen);
+        if (!occupant_object)
+        {
+            /// The settling read named NO occupant: it either failed, or it proved the key absent after
+            /// the store had already refused our create. Neither observation can be adjudicated, and
+            /// neither is terminal -- `resolveWedgeOnce` meets the identical observation and keeps the
+            /// lane WEDGED, and this site owes the same answer. The wedge is what makes the next flush
+            /// re-create at this exact key and adjudicate whatever it then finds; faulting instead would
+            /// spend the table's write availability until a remount on a read that may well succeed on
+            /// the next attempt.
+            ///
+            /// It must be COUNTED, because this arm is quiet by construction: the loud interference
+            /// report is only reached once the occupant can be NAMED, so a real breach whose occupant
+            /// keeps failing to be read would otherwise show up as nothing but a throttled log line
+            /// under load. Sustained growth on this counter is the signal that the loud path is starved.
+            ProfileEvents::increment(ProfileEvents::CASRefAppendOccupantUnreadable);
+            {
+                std::lock_guard lock(rt->state_mutex);
+                if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
+                    && rt->append_attempt->txn_id == id)
+                    rt->lane_state = RefLaneState::Wedged;
+            }
+            ProfileEvents::increment(ProfileEvents::CASRefAppendWedged);
+            complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': the store refused txn {}-{}'s create and the "
+                "settling read named no occupant (observed {}) — the append lane is wedged until the "
+                "SAME key resolves durable or a conclusive rejection is observed",
+                ns.string(), id.writer_epoch, id.ref_sequence, detail::renderObservation(conflict->seen))));
+            return false;
+        }
+
         Occupant occupant = Occupant::Foreign;
         bool classified = false;
         try
         {
-            if (occupant_object)
-            {
-                occupant = classifyRefLogOccupant(ns, id, occupant_object->bytes, active_attempt.bytes);
-                classified = true;
-            }
+            occupant = classifyRefLogOccupant(ns, id, occupant_object->bytes, active_attempt.bytes);
+            classified = true;
         }
         catch (...)   // NOLINT(bugprone-empty-catch)
         {
             /// Left unclassified deliberately -- see below. The conflict itself is what the survivors
-            /// are told about; the decode's own failure is not their business.
+            /// are told about; the adjudication's own failure is not their business.
         }
         if (!classified)
         {
-            /// We could not learn WHICH of the two this is, so we decide NEITHER. Reporting foreign
-            /// interference would fence the mount on a guess, and reporting a conclusive rejection would
-            /// acknowledge a deposition we did not observe. The id is not consumed and nothing is
-            /// recorded, so the next append re-derives the same id, meets the same conflict, and
-            /// classifies again -- deferring costs one round trip and decides nothing wrongly.
+            /// An occupant WAS observed, and naming it raised something other than the malformed-object
+            /// codes `classifyRefLogOccupant` answers `Foreign` for. We could not learn WHICH of the two
+            /// situations this is, so we decide NEITHER: reporting foreign interference would fence the
+            /// mount on a guess, and reporting a conclusive rejection would acknowledge a deposition we
+            /// did not observe.
             ///
-            /// It must be COUNTED, because deferring is the one arm here that is quiet by construction:
-            /// the loud interference report is only reached once the occupant can be named, so a real
-            /// breach whose occupant keeps failing to decode would otherwise show up as nothing but a
-            /// throttled log line under load. Sustained growth on this counter is the signal that the
-            /// loud path is being starved.
+            /// It must be COUNTED, for the same reason the arm above is.
             ProfileEvents::increment(ProfileEvents::CASRefAppendOccupantUnreadable);
             {
                 std::lock_guard lock(rt->state_mutex);
@@ -3824,7 +3847,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// object and hidden the violation -- and produced the hole INV-1 exists to forbid.
             ///
             /// Route it through the anomaly policy, exactly as the wedge-resolution site does for the
-            /// identical observation [review I5]. Failing closed is right, but failing closed FOREVER is
+            /// identical observation. Failing closed is right, but failing closed FOREVER is
             /// not: without this the mount stays blocked on this table until somebody notices and remounts
             /// by hand. One impossibility, one reaction. The report is deliberately BEFORE the survivors are
             /// completed, so the fence is closed by the time any caller wakes and can retry.
@@ -4097,7 +4120,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         /// The threshold trigger -- off the lane,
         /// dispatched AFTER waking every waiter above so this commit's own callers are never
-        /// delayed by it. Per chunk (spec §3): each committed chunk schedules its own publication,
+        /// delayed by it. Per chunk: each committed chunk schedules its own publication,
         /// and settlement coalesces the triggers so a mid-tenure publisher never suppresses a later
         /// chunk (`settleSnapshotPublish`).
         maybeScheduleSnapshotPublish(ns, rt);
@@ -4546,11 +4569,11 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
     /// know has already recorded -- in either order.
     ///
     /// A checkpoint that does NOT advance leaves the attempt unadopted: the backoff is armed and this
-    /// returns false, so a later trigger re-runs the whole publish. The re-run's body PUT resolves to
-    /// `Committed` against its own identical bytes, so retrying costs one conditional PUT and not a
-    /// second snapshot. Adopting instead would mark this snapshot as the newest -- suppressing every
-    /// later publish for it -- while the checkpoint still pointed below it, leaving recovery replaying
-    /// from an older base with nothing scheduled to fix it.
+    /// returns false, so a later trigger re-runs the whole publish. The re-run's body create meets its
+    /// own identical bytes as a conflict, which the occupant compare above accepts, so retrying costs
+    /// one conditional PUT and not a second snapshot. Adopting instead would mark this snapshot as the
+    /// newest -- suppressing every later publish for it -- while the checkpoint still pointed below it,
+    /// leaving recovery replaying from an older base with nothing scheduled to fix it.
     bool ckpt_advanced = false;
     if (!runtime_still_admitted())
         return false;
