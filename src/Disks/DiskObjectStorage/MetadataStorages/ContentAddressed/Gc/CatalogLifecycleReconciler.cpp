@@ -71,9 +71,6 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
 
     for (;;)
     {
-        if (refresh_authority)
-            refresh_authority();
-
         const std::optional<CatalogEntry> eligible = selectEligible(catalog);
         if (!eligible)
         {

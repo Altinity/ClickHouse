@@ -45,10 +45,10 @@ public:
     CatalogLifecycleReconciler(
         CasOperation & op_, const Layout & layout_, const CasFoldSeal & adopted_parent_);
 
-    /// `refresh_authority` runs at the top of every drain iteration and is forwarded to each erase. It
-    /// is a refresh, not a verdict: the verdict stays `op.admitted()`. A drain erases one row per
-    /// iteration, so without it a leader deposed between two erases would keep erasing, and would
-    /// report the drain complete rather than fenced out.
+    /// `refresh_authority` is forwarded to each erase, which runs it at the top of every attempt --
+    /// one refresh per attempt, and none on a path that sends none. It is a refresh, not a verdict:
+    /// the verdict stays `op.admitted()`. So every erase is authorised by a reading taken in its own
+    /// attempt, while the drain-complete verdict reads whatever the last erase's refresh left.
     CatalogLifecycleReconcileResult reconcile(const std::function<void()> & refresh_authority = {});
 
 private:
