@@ -203,6 +203,10 @@ TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
     ASSERT_EQ(backend->putIfAbsent(key, fmt::format(
         "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"janitor_cursor\":\"\"}}\n", currentCompatibilityVersion() + 1)).outcome,
         PutOutcome::Done);
+
+    /// The seed write above lands through the same `write` primitive `CountingBackend` counts, so
+    /// reset before measuring what the read itself does.
+    backend->resetCounts();
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { (void)readGcMaintenanceState(op, layout); });
     EXPECT_EQ(backend->writeTotal(), 0u);
