@@ -47,5 +47,5 @@ TEST(CASRefProtocol, CrossEpochFromSealShortCircuitsWithoutAnyRequest)
         EXPECT_EQ(r.outcome, EpochCrossOutcome::NotASeal);
     }
 
-    EXPECT_EQ(backend->readRequests(), 0u);
+    EXPECT_EQ(backend->getTotal(), 0u);
 }

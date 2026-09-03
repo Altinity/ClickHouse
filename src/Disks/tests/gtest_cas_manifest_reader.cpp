@@ -45,5 +45,5 @@ TEST(CASManifestReader, MissingManifestThrowsFileDoesntExist)
     /// manifest, always the fail-closed exception -- and this must hold over the migrated
     /// `CasOperation`-based read exactly as it did over the raw backend call.
     expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { (void)reader.readManifest(id); });
-    EXPECT_EQ(backend->readRequestCount(layout.manifestKey(id)), 1u);
+    EXPECT_EQ(backend->getCount(layout.manifestKey(id)), 1u);
 }

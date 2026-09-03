@@ -60,12 +60,12 @@ TEST(CASPlainObjects, CasPutObjectIssuesHeadsOnly)
 
     /// The create.
     objects.putNamespaceFile(life, "f", "hello");
-    EXPECT_GT(backend->headRequestCount(key), 0u);
-    EXPECT_EQ(backend->readRequestCount(key), 0u);
+    EXPECT_GT(backend->headCount(key), 0u);
+    EXPECT_EQ(backend->getCount(key), 0u);
 
     /// A replace over an existing object follows the same protocol: HEAD only, never a body GET.
     objects.putNamespaceFile(life, "f", "world");
-    EXPECT_EQ(backend->readRequestCount(key), 0u);
+    EXPECT_EQ(backend->getCount(key), 0u);
     EXPECT_EQ(objects.getNamespaceFile(life, "f"), "world");
 }
 

@@ -691,7 +691,7 @@ TEST(CASPoolMeta, CasConflictReReadsWinner)
     /// The subtlest branch: the initial GET sees ABSENT, so createOrValidate proceeds to the
     /// create-if-absent casPut — and loses, because a racing creator committed in between. The loser
     /// must then re-read and return the WINNER's pool identity, not LOGICAL_ERROR. A single-threaded
-    /// `failNextCasPut` alone cannot exercise this: it returns Conflict without leaving the object
+    /// `refuseNextWrite` alone cannot exercise this: it returns Conflict without leaving the object
     /// readable, so the re-read would fire the LOGICAL_ERROR guard. We model the real interleaving
     /// with a backend whose casPut commits the winner's object (via the public putIfAbsent) and THEN
     /// reports Conflict — exactly what the loser observes.
