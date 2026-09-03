@@ -286,15 +286,11 @@ size_t countRenewalLogText(const String & haystack, std::string_view needle)
     return count;
 }
 
-CasRequestBudget renewalLogBudget(uint32_t max_attempts = 2)
+CasRequestBudget renewalLogBudget()
 {
     return CasRequestBudget{
         .attempt_timeout_ms = 10,
-        .operation_deadline_ms = 500,
-        .max_attempts = max_attempts,
         .lease_safety_margin_ms = 20,
-        .retry_initial_backoff_ms = 0,
-        .retry_max_backoff_ms = 0,
     };
 }
 
@@ -980,7 +976,6 @@ public:
     explicit AlwaysVanishesBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
     String watched_key;
 
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
     /// The fault is on the read primitive, which is the only way anything now reaches the store.
@@ -1264,7 +1259,7 @@ TEST(CASMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
     /// attempt_timeout_ms + lease_safety_margin_ms == mount_lease_ttl_ms below (30000): not STRICTLY
     /// less, so this must be rejected.
     const CasRequestBudget bad_budget{
-        .attempt_timeout_ms = 25000, .operation_deadline_ms = 30000, .max_attempts = 3, .lease_safety_margin_ms = 5000};
+        .attempt_timeout_ms = 25000, .lease_safety_margin_ms = 5000};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
         Pool::open(b, PoolConfig{
@@ -1286,7 +1281,7 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
     /// lease TTL), so it also scales down cas_request_budget to fit — the budget itself is not
     /// exercised here, only Pool::open's validateCasRequestBudget startup gate.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
     auto a = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
         .mount_lease_ttl_ms = std::chrono::milliseconds(300),
