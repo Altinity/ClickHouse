@@ -110,12 +110,16 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
 
         const auto & manifest = entry.manifest;
         const auto key = entry.getCompositeKey();
-        const auto database = storage.getContext()->resolveDatabase(manifest.destination_database);
+
+        /// Catalog destinations must be resolved with the settings persisted by the initiating query.
+        const auto destination_resolution_context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), manifest);
+
+        const auto database = destination_resolution_context->resolveDatabase(manifest.destination_database);
         const auto & table = manifest.destination_table;
 
         const auto destination_storage_id = StorageID(QualifiedTableName {database, table});
 
-        const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
+        const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, destination_resolution_context);
 
         if (!destination_storage)
         {

@@ -3,6 +3,7 @@
 #include <sstream>
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Storages/MergeTree/MergeTreePartitionExportTask.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
 #include <Poco/JSON/Object.h>
@@ -16,6 +17,8 @@ namespace Setting
 {
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
     extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
+    extern const SettingsBool allow_experimental_aggregate_function_states_in_parquet;
+    extern const SettingsBool allow_experimental_aggregate_function_states_in_iceberg;
 }
 
 namespace ErrorCodes
@@ -48,6 +51,29 @@ namespace
         manifest.file_already_exists_policy = MergeTreePartExportManifest::FileAlreadyExistsPolicy::error;
         manifest.filename_pattern = "{part_name}";
         return manifest;
+    }
+
+    MergeTreePartitionExportTask makeValidPlainTask()
+    {
+        MergeTreePartitionExportTask task;
+        task.transaction_id = "tx1";
+        task.query_id = "query1";
+        task.partition_id = "2020";
+        task.source_database = "db1";
+        task.source_table = "source1";
+        task.destination_database = "db1";
+        task.destination_table = "table1";
+        task.create_time = 1000;
+        task.parts.push_back({"part1", false, {}});
+        task.task_timeout_seconds = 60;
+        task.max_threads = 1;
+        task.parallel_formatting = true;
+        task.parquet_parallel_encoding = true;
+        task.max_bytes_per_file = 1000000;
+        task.max_rows_per_file = 1000;
+        task.file_already_exists_policy = MergeTreePartExportManifest::FileAlreadyExistsPolicy::error;
+        task.filename_pattern = "{part_name}";
+        return task;
     }
 }
 
@@ -226,6 +252,85 @@ TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsAppliedToW
 
         EXPECT_EQ(
             worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
+            value) << "value=" << value;
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, MissingAggregateFunctionStateGatesParseAsDisabled)
+{
+    auto manifest = makeValidManifest();
+    manifest.allow_aggregate_function_states_in_parquet = true;
+    manifest.allow_aggregate_function_states_in_iceberg = true;
+
+    Poco::JSON::Parser parser;
+    auto json = parser.parse(manifest.toJsonString()).extract<Poco::JSON::Object::Ptr>();
+    json->remove("allow_aggregate_function_states_in_parquet");
+    json->remove("allow_aggregate_function_states_in_iceberg");
+    std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+
+    auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(oss.str());
+    EXPECT_FALSE(parsed.allow_aggregate_function_states_in_parquet);
+    EXPECT_FALSE(parsed.allow_aggregate_function_states_in_iceberg);
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, AggregateFunctionStateGatesAppliedToWorkerContextForEveryValue)
+{
+    for (const bool value : {false, true})
+    {
+        auto manifest = makeValidManifest();
+        manifest.allow_aggregate_function_states_in_parquet = value;
+        manifest.allow_aggregate_function_states_in_iceberg = value;
+
+        auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
+
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_parquet].value,
+            value) << "value=" << value;
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_iceberg].value,
+            value) << "value=" << value;
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, PlainTaskMissingAggregateFunctionStateGatesParseAsDisabled)
+{
+    auto task = makeValidPlainTask();
+    task.allow_aggregate_function_states_in_parquet = true;
+    task.allow_aggregate_function_states_in_iceberg = true;
+
+    Poco::JSON::Parser parser;
+    auto json = parser.parse(task.toJsonString()).extract<Poco::JSON::Object::Ptr>();
+    json->remove("allow_aggregate_function_states_in_parquet");
+    json->remove("allow_aggregate_function_states_in_iceberg");
+    std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+
+    auto parsed = MergeTreePartitionExportTask::fromJsonString(oss.str());
+    EXPECT_FALSE(parsed.allow_aggregate_function_states_in_parquet);
+    EXPECT_FALSE(parsed.allow_aggregate_function_states_in_iceberg);
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, PlainTaskAggregateFunctionStateGatesAppliedToWorkerContextForEveryValue)
+{
+    for (const bool value : {false, true})
+    {
+        auto task = makeValidPlainTask();
+        task.allow_aggregate_function_states_in_parquet = value;
+        task.allow_aggregate_function_states_in_iceberg = value;
+
+        auto parsed = MergeTreePartitionExportTask::fromJsonString(task.toJsonString());
+        auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, parsed);
+
+        EXPECT_EQ(parsed.allow_aggregate_function_states_in_parquet, value) << "value=" << value;
+        EXPECT_EQ(parsed.allow_aggregate_function_states_in_iceberg, value) << "value=" << value;
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_parquet].value,
+            value) << "value=" << value;
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_iceberg].value,
             value) << "value=" << value;
     }
 }

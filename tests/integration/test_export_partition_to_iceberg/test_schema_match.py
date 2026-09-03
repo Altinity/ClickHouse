@@ -891,3 +891,48 @@ def test_export_partition_all_iceberg_types_lossy(cluster, source_engine):
         f"SELECT abs(f - 2.718281828459045) < 1e-6, abs(f - 2.718281828459045) > 1e-9 FROM {iceberg_table}"
     ).strip()
     assert f_checks == "1\t1", f"Expected Float32 precision loss within tolerance, got: {f_checks!r}"
+
+
+def test_export_partition_aggregate_function_states(cluster, source_engine):
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_agg_states_{uid}"
+    iceberg_table = f"iceberg_agg_states_{uid}"
+
+    columns = (
+        "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64)"
+    )
+
+    make_source(node, mt_table, columns, "k", engine=source_engine, order_by="k", replica_name="replica1")
+    make_iceberg_s3(
+        node,
+        iceberg_table,
+        columns,
+        partition_by="k",
+        extra_settings="allow_experimental_aggregate_function_states_in_iceberg = 1",
+    )
+
+    node.query(
+        f"INSERT INTO {mt_table} "
+        f"SELECT toInt32(number % 2), uniqState(toUInt64(number % 23)), sumSimpleState(number) "
+        f"FROM numbers(200) GROUP BY number % 2"
+    )
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '0' TO TABLE {iceberg_table}",
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "allow_experimental_aggregate_function_states_in_parquet": 1,
+            "allow_experimental_aggregate_function_states_in_iceberg": 1,
+        },
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "0", "COMPLETED")
+
+    exported = node.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {iceberg_table} GROUP BY k ORDER BY k "
+        f"SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1"
+    )
+    assert exported == node.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {mt_table} WHERE k = 0 GROUP BY k ORDER BY k"
+    ), f"Exported states do not match the source partition:\n{exported}"

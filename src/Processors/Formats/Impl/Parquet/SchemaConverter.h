@@ -44,6 +44,9 @@ struct SchemaConverter
     /// The key is the parquet column name, without ColumnMapper.
     std::unordered_map<String, GeoColumnMetadata> geo_columns;
 
+    /// Type names from the `clickhouse.column_types` footer metadata.
+    std::unordered_map<String, String> clickhouse_column_type_names;
+
     SchemaConverter(const parq::FileMetaData &, const ReadOptions &, const Block *);
 
     void prepareForReading();
@@ -127,6 +130,8 @@ private:
     };
 
     void checkHasColumns();
+
+    DataTypePtr resolveAnnotatedType(const String & column_name, const String & type_name) const;
 
     void processSubtree(TraversalNode & node);
 

@@ -3,6 +3,7 @@
 #include <AggregateFunctions/IAggregateFunction_fwd.h>
 #include <Core/Field.h>
 #include <DataTypes/IDataType.h>
+#include <Parsers/IAST_fwd.h>
 
 
 namespace DB
@@ -24,7 +25,7 @@ private:
     Array parameters;
     mutable std::optional<size_t> version;
 
-    String getNameImpl(bool with_version) const;
+    String getNameImpl(bool with_version, bool always_emit_version) const;
 
 public:
     static constexpr bool is_parametric = true;
@@ -39,6 +40,8 @@ public:
 
     String doGetName() const override;
     String getNameWithoutVersion() const;
+    /// Unlike `getName`, keeps an explicit version 0.
+    String getNameForAnnotation() const;
     const char * getFamilyName() const override { return "AggregateFunction"; }
     TypeIndex getTypeId() const override { return TypeIndex::AggregateFunction; }
 
@@ -93,5 +96,17 @@ void setVersionToAggregateFunctions(DataTypePtr & type, bool if_empty, std::opti
 
 /// Checks type of any nested type is DataTypeAggregateFunction.
 bool hasAggregateFunctionType(const DataTypePtr & type);
+
+/// Checks a parsed type name without resolving aggregate functions through `DataTypeFactory`.
+bool astHasAggregateFunctionType(const ASTPtr & ast);
+
+/// Checks whether a Parquet or Iceberg schema needs a ClickHouse type annotation.
+bool needsClickHouseTypeAnnotation(const DataTypePtr & type);
+
+/// Returns an annotation name that preserves explicit aggregate-state versions.
+String getClickHouseTypeAnnotationName(const DataTypePtr & type);
+
+/// Checks an annotation against the schema-derived type. Strict mode also verifies the Parquet mapping.
+bool annotatedTypeMatchesDerived(const DataTypePtr & annotated, const DataTypePtr & derived, bool strict = false);
 
 }
