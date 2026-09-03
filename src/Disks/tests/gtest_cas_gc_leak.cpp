@@ -342,7 +342,7 @@ TEST(CASGCLeak, ResurrectReplacedIncarnationReclaimed)
     publishOneBlobPart(s, ns, "r2", P);
     const auto hB = (*op).head(s->layout().blobKey(idOf(P)), Retry::once());
     ASSERT_TRUE(hB.has_value());
-    ASSERT_NE(hB->incarnation, hA->incarnation) << "republication must mint a new incarnation token B";
+    ASSERT_NE(hB->etag, hA->etag) << "republication must mint a new incarnation token B";
 
     /// 5. Drop r2 -> B dereferenced.
     s->dropRef(ns, "r2");
@@ -440,7 +440,7 @@ TEST(CASGCLeak, ResurrectReplacedTokenIsCondemnedInMeta)
     publishOneBlobPart(s, ns, "r2", P);
     const auto hB = (*op).head(s->layout().blobKey(idOf(P)), Retry::once());
     ASSERT_TRUE(hB.has_value());
-    ASSERT_NE(hB->incarnation, hA->incarnation) << "republication must mint a distinct incarnation";
+    ASSERT_NE(hB->etag, hA->etag) << "republication must mint a distinct incarnation";
     s->dropRef(ns, "r2");
     s->renewWatermarkOnce();
 
