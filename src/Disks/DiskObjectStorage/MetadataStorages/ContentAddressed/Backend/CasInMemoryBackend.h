@@ -92,9 +92,10 @@ public:
     /// `Removed`. An invalid index returns `NotFound`.
     DeleteOutcome landPendingDelete(size_t i);
 
-    /// Injects a one-shot artificial refusal on the next REPLACING write of `key` (a write carrying
-    /// an expected value). A create is untouched: the store cannot tell a `casPut` create from a
-    /// `putIfAbsent`, and every user of this knob arms it against a replacement.
+    /// Injects a one-shot artificial refusal on the next write of `key`, CREATING OR REPLACING. Both,
+    /// because the store cannot tell a create-if-absent `casPut` from a `putIfAbsent` and the knob is
+    /// armed against conditional writes of both shapes -- a GC lease acquire creates its object, and
+    /// a test that arms this knob for it is testing exactly that create losing its condition.
     void failNextCasPut(const String & key);
 
     /// Injects a one-shot AMBIGUOUS outcome on the next CREATING write of `key` (a write with no

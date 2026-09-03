@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
 #include "cas_test_helpers.h"
 
@@ -194,6 +195,36 @@ TEST(CASBackendPrimitives, LegacyGetRefusesAValueThatIsNotAnIncarnation)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { b->get("k"); });
 }
 
+namespace
+{
+
+/// A double whose fault injection is written against the LEGACY surface, the way almost every one in
+/// this suite is. A `Pool` hands its callers a decorator, so a legacy call reaches the decorator
+/// first: if the decorator converted it to a primitive before forwarding, this override would never
+/// run and the injection would be silently dead.
+struct LegacyCasPutFlaggingBackend : DB::Cas::tests::CountingBackend
+{
+    bool legacy_cas_put_ran = false;
+
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta) override
+    {
+        legacy_cas_put_ran = true;
+        return CountingBackend::casPut(key, bytes, expected, meta);
+    }
+};
+
+}
+
+TEST(CASBackendPrimitives, InstrumentedBackendPassesALegacyCallThroughAsLegacy)
+{
+    auto inner = std::make_shared<LegacyCasPutFlaggingBackend>();
+    InstrumentedBackend instrumented(inner);
+    EXPECT_EQ(instrumented.casPut("k", "v", std::nullopt).outcome, CasOutcome::Committed);
+    EXPECT_TRUE(inner->legacy_cas_put_ran);
+    EXPECT_EQ(inner->casPutCount("k"), 1u);
+}
+
 TEST(CASBackendPrimitives, RefreshCredentialsIsOffUntilAskedFor)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -235,6 +266,16 @@ TEST(CASThrottlingBackend, RefusalsAreRetryableUnderBothStatuses)
             EXPECT_TRUE(e.isRetryableError()) << "status " << status;
         }
     }
+}
+
+TEST(CASThrottlingBackend, PassesALegacyCallThroughAsLegacy)
+{
+    auto inner = std::make_shared<LegacyCasPutFlaggingBackend>();
+    /// A period no call here reaches, so nothing is refused: what this pins is the pass-through.
+    auto t = std::make_shared<ThrottlingBackend>(inner, ThrottlingBackend::Mode::EveryNth, 1000, 503);
+    EXPECT_EQ(t->casPut("k", "v", std::nullopt).outcome, CasOutcome::Committed);
+    EXPECT_TRUE(inner->legacy_cas_put_ran);
+    EXPECT_EQ(inner->casPutCount("k"), 1u);
 }
 
 TEST(CASThrottlingBackend, EveryNthRefusesOnThePeriodAcrossKeys)

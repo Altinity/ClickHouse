@@ -135,7 +135,19 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::write(
             ambiguous_put_keys_.erase(ambiguous_it);
             throw std::runtime_error("InMemoryBackend: injected ambiguous write outcome for '" + key + "'");
         }
+    }
 
+    // One-shot injected conflict, on EITHER form: the knob is armed against a conditional write, and
+    // a create-if-absent is one -- the lease acquire this models creates its object.
+    auto fail_it = fail_next_cas_.find(key);
+    if (fail_it != fail_next_cas_.end())
+    {
+        fail_next_cas_.erase(fail_it);
+        return std::unexpected(RawConflict{});
+    }
+
+    if (!expected_value)
+    {
         if (store_.contains(key))
             return std::unexpected(RawConflict{});
 
@@ -145,14 +157,6 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::write(
         obj.token = t;
         store_[key] = std::move(obj);
         return t.value;
-    }
-
-    // One-shot injected conflict
-    auto fail_it = fail_next_cas_.find(key);
-    if (fail_it != fail_next_cas_.end())
-    {
-        fail_next_cas_.erase(fail_it);
-        return std::unexpected(RawConflict{});
     }
 
     auto it = store_.find(key);
