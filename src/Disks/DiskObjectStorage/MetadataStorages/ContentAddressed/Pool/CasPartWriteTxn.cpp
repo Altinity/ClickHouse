@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
@@ -22,6 +23,8 @@ namespace ProfileEvents
 {
     extern const Event CASBlobBodyPutAvoided;
     extern const Event CASBlobAdoptTrusted;
+    extern const Event CASMetaPut;
+    extern const Event CASMetaCompareSwap;
     extern const Event CASMetaCreateClean;
     extern const Event CASMetaAdoptBackfill;
     extern const Event CASMetaResurrectClean;
@@ -72,7 +75,7 @@ uint64_t nowMs()
 
 bool isDeterministicBlobPublicationFailure(const std::exception & error)
 {
-    if (classifyConditionalWriteResult(error) == CasWriteOutcome::DefiniteFailure)
+    if (isDefinitelyRefusedWrite(error))
         return true;
 
     if (const auto * db_error = dynamic_cast<const Exception *>(&error))
@@ -259,16 +262,36 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             ErrorCodes::LOGICAL_ERROR,
             "PartWriteTxn::ensureBlobPresent: durable precommit required before materializing {}",
             blobIdOf(req.ref));
-    /// This generation belongs to the operation, not to one observation/publication attempt. In
-    /// particular, an outer retry after ambiguous I/O must not adopt a re-armed incarnation, and a
-    /// trip-and-rearm hidden inside the mandatory `HEAD` must still invalidate the original writer.
-    const uint64_t admitted_generation = store->fenceGeneration();
+    /// One operation per upload task, admitted here and never shared: `fanOutBlobUploads` runs these
+    /// concurrently and the handle carries per-call state. Its generation belongs to the whole
+    /// materialization, not to one observation/publication attempt. In particular, an outer retry after
+    /// ambiguous I/O must not adopt a re-armed incarnation, and a trip-and-rearm hidden inside the
+    /// mandatory `HEAD` must still invalidate the original writer.
+    CasOperation op = store->mountRequests().admit();
+    /// One policy value for every request this materialization makes; each verb binds its own window
+    /// from it.
+    const Retry policy = Retry::standard();
 
     const BlobRef & ref = req.ref;
     const BlobSource & source = req.source;
     const String key = store->layout().blobKey(ref);
+    const String meta_key = store->layout().blobMetaKey(ref);
     const PoolMeta & pool_meta = store->poolMeta();
     const PoolConfig & pool_config = store->poolConfig();
+
+    /// The verdict points. A decision that produces durable metadata or dependency readiness is refused
+    /// once the operation is no longer admitted, even where the mount has already re-armed and is
+    /// writable again by the time the request that crossed the boundary returned.
+    auto requireAdmitted = [&](std::string_view verdict)
+    {
+        if (!op.admitted())
+            throwCasTransientUnavailable(
+                fmt::format("PartWriteTxn::ensureBlobPresent of '{}'", key),
+                fmt::format("the mount no longer admits this build {} -- either a lease loss the disk "
+                            "auto-recovers from, or a FORGET decommission / lost identity that does NOT "
+                            "recover; consult system.cas_mounts for the disk's lifecycle before retrying",
+                            verdict));
+    };
 
     auto buildHeader = [&]()
     {
@@ -281,18 +304,21 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
         return encodeEnvelopeHeader(header, static_cast<uint32_t>(pool_meta.blob_header_len));
     };
 
-    auto validateMetaSize = [&](const LoadedMeta & loaded)
+    auto validateMetaSize = [&](const BlobMeta & observed)
     {
-        if (loaded.meta.size != source.size)
+        if (observed.size != source.size)
             throw Exception(
                 ErrorCodes::CORRUPTED_DATA,
                 "PartWriteTxn::ensureBlobPresent: metadata for {} declares logical size {}, expected {}",
                 key,
-                loaded.meta.size,
+                observed.size,
                 source.size);
     };
 
-    auto reconcileMetaClean = [&](std::optional<LoadedMeta> loaded, BlobPublicationReason reason)
+    /// One read-decide-write over the freshness marker: the engine settles every refused precondition
+    /// by an exact read, so the marker's own read-modify-write loop is the engine's and ends at the
+    /// policy's deadline rather than after a fixed count of unpaced attempts.
+    auto reconcileMetaClean = [&](BlobPublicationReason reason)
     {
         if (reason == BlobPublicationReason::Absent)
             ProfileEvents::increment(ProfileEvents::CASMetaCreateClean);
@@ -300,48 +326,47 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             ProfileEvents::increment(ProfileEvents::CASMetaResurrectClean);
 
         const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = source.size};
-        constexpr int max_meta_attempts = 8;
-        for (int attempt = 0; attempt < max_meta_attempts; ++attempt)
-        {
-            if (loaded)
-            {
-                validateMetaSize(*loaded);
-                if (loaded->meta.state == MetaState::Clean)
-                    return;
-                if (casMeta(*store, ref, loaded->etag, clean).outcome == CasOverwriteOutcome::Committed)
-                    return;
-            }
-            else if (putMetaIfAbsent(*store, ref, clean).outcome == CasOverwriteOutcome::Committed)
-            {
-                return;
-            }
-            loaded = loadMeta(store->backend(), store->layout(), ref);
-        }
-        throwCasWriteRetryLater(fmt::format(
-            "PartWriteTxn::ensureBlobPresent: freshness metadata for {} did not reconcile to `Clean` "
-            "within {} attempts after blob publication",
-            key,
-            max_meta_attempts));
+        orThrow(
+            op.readModifyWrite(
+                meta_key,
+                [&](const std::optional<Object> & current) -> std::optional<String>
+                {
+                    if (current)
+                    {
+                        const BlobMeta observed = decodeBlobMeta(current->bytes);
+                        validateMetaSize(observed);
+                        if (observed.state == MetaState::Clean)
+                            return std::nullopt;
+                        /// The same two choke points the standalone marker writes count on, so a
+                        /// reconciliation stays visible as a marker create or a marker compare-swap.
+                        ProfileEvents::increment(ProfileEvents::CASMetaCompareSwap);
+                    }
+                    else
+                        ProfileEvents::increment(ProfileEvents::CASMetaPut);
+                    return encodeBlobMeta(clean);
+                },
+                policy),
+            fmt::format("PartWriteTxn::ensureBlobPresent: reconciling the freshness metadata of '{}' to "
+                        "`Clean` after blob publication", key));
     };
 
     constexpr int max_publication_attempts = 8;
     for (int attempt = 0; attempt < max_publication_attempts; ++attempt)
     {
         requireAlive();
-        const HeadResult head = store->backend().head(key);
-        std::optional<LoadedMeta> loaded;
+        const std::optional<Meta> present = op.head(key, policy);
         BlobPublicationReason reason = BlobPublicationReason::Absent;
 
-        if (head.exists)
+        if (present)
         {
-            if (head.size < pool_meta.blob_header_len)
+            if (present->size < pool_meta.blob_header_len)
                 throw Exception(
                     ErrorCodes::CORRUPTED_DATA,
                     "PartWriteTxn::ensureBlobPresent: blob {} size {} is below envelope length {}",
                     key,
-                    head.size,
+                    present->size,
                     pool_meta.blob_header_len);
-            const uint64_t logical_size = head.size - pool_meta.blob_header_len;
+            const uint64_t logical_size = present->size - pool_meta.blob_header_len;
             if (logical_size != source.size)
                 throw Exception(
                     ErrorCodes::CORRUPTED_DATA,
@@ -350,37 +375,37 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     logical_size,
                     source.size);
 
-            loaded = loadMeta(store->backend(), store->layout(), ref);
+            const std::optional<LoadedMeta> loaded = loadMeta(op, store->layout(), ref);
             if (loaded)
-                validateMetaSize(*loaded);
+                validateMetaSize(loaded->meta);
 
             if (!loaded || loaded->meta.state == MetaState::Clean)
             {
-                /// Observation can produce durable metadata and dependency readiness too. Refuse both
-                /// when the mandatory `HEAD` crossed a fence generation, even if the mount has already
-                /// re-armed and is writable again by the time it returns.
-                store->checkFenceOrThrow(admitted_generation);
+                /// Observation can produce durable metadata and dependency readiness too.
+                requireAdmitted("after the mandatory `HEAD`");
                 if (!loaded)
                 {
+                    /// A backfilled marker is a point-read hint for the next observer, so a competing
+                    /// writer that got there first settles the same question: its outcome is not read.
                     ProfileEvents::increment(ProfileEvents::CASMetaAdoptBackfill);
                     putMetaIfAbsent(
                         *store,
                         ref,
                         BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
                 }
-                store->checkFenceOrThrow(admitted_generation);
+                requireAdmitted("before the body-put-avoided observation is recorded");
                 ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
                 EventEmitter{*store}.emit([&](CasEvent & event)
                 {
                     event.type = CasEventType::BlobReuseAdopt;
                     event.object_kind = CasEventObjectKind::Blob;
                     event.object_hash = blobIdOf(ref);
-                    event.token = head.token.value;
+                    event.token = present->incarnation.render();
                     event.outcome = "observed";
                     event.reason = "a present non-condemned blob was observed after mandatory `HEAD`";
                     event.detail = {{"action", "observed"}, {"size", std::to_string(source.size)}};
                 });
-                store->checkFenceOrThrow(admitted_generation);
+                requireAdmitted("before the observed dependency proof is returned");
                 return BlobUploadResult{
                     ref,
                     BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},
@@ -389,7 +414,6 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             reason = BlobPublicationReason::Condemned;
         }
 
-        store->checkFenceOrThrow(admitted_generation);
         const bool first_publication = source.beginPublication();
 
         BlobPublicationTransport transport;
@@ -414,11 +438,19 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
 
         try
         {
-            store->backend().publishBlob(BlobPublishRequest{key, std::move(publication)});
+            /// A single physical publication per iteration, deliberately not the shared policy: the
+            /// engine would reissue this exact envelope, and a re-publication that repeats an envelope
+            /// repeats its `incarnation_tag`, so the republished body is byte-identical to the one GC
+            /// may have condemned and a content-derived incarnation no longer distinguishes them. Each
+            /// iteration below builds a fresh envelope, which is what keeps them distinguishable; the
+            /// verbatim staged copy is additionally a once-only privilege `beginPublication` spends.
+            op.publish(BlobPublishRequest{key, std::move(publication)}, Retry::once());
         }
         catch (const std::exception & error)
         {
-            if (isDeterministicBlobPublicationFailure(error))
+            /// A publication this build is no longer admitted to make is not an ambiguity to retry:
+            /// every further request of this operation refuses the same way.
+            if (isDeterministicBlobPublicationFailure(error) || !op.admitted())
                 throw;
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
@@ -440,11 +472,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             continue;
         }
 
+        reconcileMetaClean(reason);
         /// A publication may land just as this mount loses its fence. The bytes are harmless debris,
         /// but they cannot become dependency proof for the fenced transaction.
-        store->checkFenceOrThrow(admitted_generation);
-        reconcileMetaClean(loaded, reason);
-        store->checkFenceOrThrow(admitted_generation);
+        requireAdmitted("before the publication is recorded");
         EventEmitter{*store}.emit([&](CasEvent & event)
         {
             event.type = CasEventType::BlobPut;
@@ -461,7 +492,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                 {"size", std::to_string(source.size)},
                 {"build_id", u128ToHex(build_id)}};
         });
-        store->checkFenceOrThrow(admitted_generation);
+        requireAdmitted("before the published dependency proof is returned");
         return BlobUploadResult{
             ref,
             BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},
@@ -562,37 +593,48 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
 
-    /// Body PUT through the Pool's shared request controller:
-    /// budgeted attempts + resolve-before-reissue, replacing the old bare single-attempt write whose
+    /// Body PUT on the Pool's staging plane, under the mount fence a `precommitAdd` would fail anyway:
+    /// budgeted attempts with resolve-before-reissue, replacing the old bare single-attempt write whose
     /// whole S3-blip tolerance was ONE ~3s adaptive-timeout attempt (a 19s object-store pause killed an
     /// INSERT through it while every plain read/write path survived — v3 soak evidence). Reissuing this
-    /// conditional PUT is sound: the body bytes are fixed for the whole operation (`encoded` is built
-    /// once; `encodePartManifest` is canonical/deterministic), so `resolveByExactGet` can prove whether
-    /// an ambiguous attempt landed. Still NO preliminary HEAD. A DIFFERENT object at this key is a
-    /// ManifestId collision — the controller's resolve raises CORRUPTED_DATA (a proven conflict,
-    /// fail-closed before any owner transition can name this id), subsuming the old
-    /// PreconditionFailed->LOGICAL_ERROR mapping.
-    ///
-    /// fence_ok is the ref lane's own mount predicate (`refAppendFenceOk`: fence not lost + enough
-    /// lease left for one more attempt): staging runs on this writable Pool under that same mount
-    /// lease, and a fenced writer must not keep PUTting bodies ahead of a precommitAdd that would fail
-    /// the same fence anyway. There is no ref-table runtime here, so the lane's extra
-    /// `superseded_by_remount` term does not apply.
-    Token manifest_token;
-    const CasWriteOutcome put_outcome = store->stagingPutIfAbsent(key, encoded, &manifest_token);
-    if (put_outcome == CasWriteOutcome::DefiniteFailure)
-        throwCasWriteRetryLater(fmt::format(
-            "stageManifest: part-manifest PUT at '{}' definitively failed (non-retryable rejection); "
-            "nothing was named — the caller re-stages with a fresh ManifestId", key));
-    /// Unresolved = budget exhausted (or fence lost) without a definite outcome. Unlike the ref-log
-    /// lane there is nothing to wedge: this id was never named by any owner transition
-    /// (`next_manifest_ordinal` is already past it, so no re-stage ever reuses the key), and a
-    /// late-landing body is inert unreferenced debris for the orphan-manifest sweep. NETWORK_ERROR =
-    /// the same retryable abort class the ref lane's exhausted budget maps to.
-    if (put_outcome == CasWriteOutcome::Unresolved)
-        throwCasWriteRetryLater(fmt::format(
-            "stageManifest: part-manifest PUT at '{}' is UNCERTAIN (retry budget exhausted) — "
-            "nothing conclusive was named; the caller re-stages with a fresh ManifestId", key));
+    /// conditional PUT is sound: the body bytes are fixed for the whole call (`encoded` is built once;
+    /// `encodePartManifest` is canonical/deterministic), so the engine's resolve read can prove whether
+    /// an ambiguous attempt landed. Still NO preliminary HEAD.
+    WriteResult staged = store->stagingPutIfAbsent(key, encoded);
+    const Incarnation manifest_incarnation = std::visit(detail::Overload{
+        [](Committed & committed) -> Incarnation { return std::move(committed.incarnation); },
+        [&](Conflict & conflict) -> Incarnation
+        {
+            /// Our own bytes under our own `ManifestId` name this same body, whoever wrote them; a
+            /// DIFFERENT object under an id this build minted is a ManifestId collision, fail-closed
+            /// before any owner transition can name it.
+            if (const auto * object = std::get_if<Object>(&conflict.seen); object && object->bytes == encoded)
+                return object->incarnation;
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "stageManifest: part-manifest key '{}' already holds {} that is not this manifest's body "
+                "-- a ManifestId collision", key, detail::renderObservation(conflict.seen));
+        },
+        [&](Declined &) -> Incarnation
+        {
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "stageManifest: the part-manifest create at '{}' declined; a create has nothing to decline", key);
+        },
+        [&](Refused & refused) -> Incarnation
+        {
+            throwCasWriteRetryLater(fmt::format(
+                "stageManifest: part-manifest PUT at '{}' definitively failed ({}); "
+                "nothing was named — the caller re-stages with a fresh ManifestId", key, refused.message));
+        },
+        /// Unlike the ref-log lane there is nothing to wedge: this id was never named by any owner
+        /// transition (`next_manifest_ordinal` is already past it, so no re-stage ever reuses the key),
+        /// and a late-landing body is inert unreferenced debris for the orphan-manifest sweep.
+        [&](GaveUp &) -> Incarnation
+        {
+            throwCasWriteRetryLater(fmt::format(
+                "stageManifest: part-manifest PUT at '{}' is UNCERTAIN (retry budget exhausted) — "
+                "nothing conclusive was named; the caller re-stages with a fresh ManifestId", key));
+        }},
+        staged);
 
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -600,7 +642,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
         e.namespace_ = owning_ns.string();
         e.object_kind = CasEventObjectKind::Manifest;
         e.object_hash = manifestRefDebugString(id.ref);
-        e.token = manifest_token.value;
+        e.token = manifest_incarnation.render();
         e.reason = "stageManifest: part-manifest body written";
     });
 
@@ -734,7 +776,8 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// Read + validate the manifest body ONCE (O(manifest entries), one streaming read). Absent or
     /// invalid ⇒ fail closed: a committed ref must never name a missing/mismatched manifest.
     const String manifest_key = store->layout().manifestKey(id);
-    const auto body_got = store->backend().get(manifest_key);
+    CasOperation op = store->mountRequests().admit();
+    const auto body_got = op.read(manifest_key, Retry::standard());
     if (!body_got)
         throwCasWriteRetryLater(fmt::format(
             "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key));
@@ -1117,8 +1160,8 @@ void PartWriteTxn::abandon()
 void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
 {
     /// Best-effort writer cleanup of THIS build's pre-precommit/staged `_manifests` debris. The common case
-    /// is writer cleanup; a missed object is benign — the namespace-scoped orphan sweep reclaims it. Exact-token delete only; never
-    /// throws. SKIP the manifest that became a live precommit owner: its body is a live precommit input
+    /// is writer cleanup; a missed object is benign — the namespace-scoped orphan sweep reclaims it. Exact-incarnation
+    /// delete only; never throws. SKIP the manifest that became a live precommit owner: its body is a live precommit input
     /// whose deletion is GC's job after the sealed decrement (never writer-delete it).
     ///
     /// "Became a live precommit owner" is decided from the ATTEMPT, not from a confirmed append: any
@@ -1127,6 +1170,7 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
     /// precommit that turns out to be live and whose body is gone clamps GC's fold barrier forever),
     /// while keeping it is not: an unreferenced body is ordinary orphan-sweep debris.
     const bool precommit_attempted = precommit_state != PrecommitState::NotAttempted;
+    CasOperation op = store->mountRequests().admit();
     for (const ManifestId & id : staged_manifests)
     {
         if (precommit_attempted && id.ref == precommit_manifest && id.root_namespace == precommit_target_ns)
@@ -1134,9 +1178,8 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
         try
         {
             const String key = store->layout().manifestKey(id);
-            const HeadResult hr = store->backend().head(key);
-            if (hr.exists)
-                store->backend().deleteExact(key, hr.token);
+            if (const auto observed = op.head(key, Retry::standard()))
+                op.remove(key, observed->incarnation, Retry::standard());
         }
         catch (...) // NOLINT(bugprone-empty-catch)
         {

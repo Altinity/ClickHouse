@@ -13,34 +13,33 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
-std::optional<LoadedMeta> loadMeta(Backend & backend, const Layout & layout, const BlobRef & ref)
+std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, const BlobRef & ref)
 {
-    const String key = layout.blobMetaKey(ref);
-    auto got = backend.get(key);
+    auto got = op.read(layout.blobMetaKey(ref), Retry::standard());
     if (!got)
         return std::nullopt;
-    return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .etag = got->token};
+    return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .incarnation = std::move(got->incarnation)};
 }
 
-CasOverwriteResult putMetaIfAbsent(Pool & pool, const BlobRef & ref, const BlobMeta & meta)
+WriteResult putMetaIfAbsent(Pool & pool, const BlobRef & ref, const BlobMeta & meta)
 {
     ProfileEvents::increment(ProfileEvents::CASMetaPut);
     const String key = pool.layout().blobMetaKey(ref);
     return pool.stagingPutIfAbsentMutable(key, encodeBlobMeta(meta));
 }
 
-CasOverwriteResult casMeta(Pool & pool, const BlobRef & ref, const Token & expected, const BlobMeta & meta)
+WriteResult casMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,
+                    const Incarnation & expected, const BlobMeta & meta)
 {
     ProfileEvents::increment(ProfileEvents::CASMetaCompareSwap);
-    const String key = pool.layout().blobMetaKey(ref);
-    return pool.stagingConditionalOverwrite(key, encodeBlobMeta(meta), expected);
+    return op.replace(layout.blobMetaKey(ref), encodeBlobMeta(meta), expected, Retry::standard());
 }
 
-DeleteOutcome deleteMetaExact(Backend & backend, const Layout & layout, const BlobRef & ref, const Token & expected)
+Removal deleteMetaExact(CasOperation & op, const Layout & layout, const BlobRef & ref,
+                        const Incarnation & expected)
 {
     ProfileEvents::increment(ProfileEvents::CASMetaDelete);
-    const String key = layout.blobMetaKey(ref);
-    return backend.deleteExact(key, expected);
+    return op.remove(layout.blobMetaKey(ref), expected, Retry::standard());
 }
 
 }

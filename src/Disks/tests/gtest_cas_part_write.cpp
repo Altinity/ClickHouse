@@ -69,6 +69,19 @@ PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & b)
     return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
+/// Run the mount plane's request engine on a virtual clock that its own reissue sleep advances -- the
+/// plane every write below is admitted on. A policy that has to be EXHAUSTED then closes in
+/// microseconds of wall clock instead of ninety real seconds, and a policy that merely reissues costs
+/// no sleep at all, so these tests pin retry semantics and never a schedule.
+void useVirtualMountRequestClock(const PoolPtr & store)
+{
+    auto now = std::make_shared<std::atomic<uint64_t>>(0);
+    store->mountRequests().setNowFnForTest([now] { return now->load(); });
+    /// `+ 1` because a jittered draw may be zero, and a clock that can stand still never closes the
+    /// window.
+    store->mountRequests().setSleepFnForTest([now](uint64_t ms) { now->fetch_add(ms + 1); });
+}
+
 /// Start a build whose owning manifest namespace + final ref name are `ns`/`ref` (promote/stageManifest
 /// derive the manifest namespace by splitting PartWriteInfo::intended_ref on the LAST '/').
 PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
@@ -141,26 +154,14 @@ ManifestId publishOneBlobPart(
 }
 
 /// A one-shot backend hook (mirrors the WriteCountingBackend delegation pattern in gtest_cas_pool.cpp):
-/// it delegates every op to a wrapped Backend, but the FIRST time head(target_key) is called it fires a
-/// deleteExact(target_key, condemned_token) AFTER computing the (present) HEAD result and BEFORE returning
-/// it — simulating GC's exact-token content delete landing in the writer's HEAD->GET window (B136).
+/// it delegates every op to a wrapped Backend, but the FIRST time the target key is HEADed it fires an
+/// exact-incarnation delete of that key AFTER computing the (present) HEAD result and BEFORE returning
+/// it — simulating GC's content delete landing in the writer's HEAD->GET window.
 class HeadThenDeleteOnceBackend final : public DB::Cas::Backend
 {
 public:
     HeadThenDeleteOnceBackend(BackendPtr inner_, String target_key_, DB::Cas::Token condemned_)
         : inner(std::move(inner_)), target_key(std::move(target_key_)), condemned(condemned_) {}
-
-    DB::Cas::HeadResult head(const String & k) override
-    {
-        const DB::Cas::HeadResult hr = inner->head(k);
-        if (k == target_key && !fired)
-        {
-            fired = true;
-            /// GC's single content-delete site, landing in the HEAD->GET window.
-            inner->deleteExact(target_key, condemned);
-        }
-        return hr;
-    }
 
     std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
     std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
@@ -175,10 +176,19 @@ public:
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
-    /// The transport primitives forward to `inner`; the legacy overrides above are what this
-    /// double injects through. Declared because `Backend` declares them pure.
+    /// The fault sits on the HEAD primitive, which is the only path a writer's mandatory HEAD takes.
     std::optional<Raw> read(const String & key, TransportAccess & access) override { return inner->read(key, access); }
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        const auto observed = inner->head(key, access);
+        if (key == target_key && !fired)
+        {
+            fired = true;
+            /// GC's single content-delete site, landing in the HEAD->GET window.
+            inner->remove(target_key, condemned.value, access);
+        }
+        return observed;
+    }
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
@@ -255,7 +265,7 @@ private:
 class RacingBlobPublicationBackend final : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the legacy overload the primitive override below would otherwise hide.
     using InMemoryBackend::head;
     void watch(String key_)
     {
@@ -265,12 +275,14 @@ public:
         publish_calls = 0;
     }
 
-    HeadResult head(const String & requested_key) override
+    /// Both faults sit on the transport primitives: a writer's mandatory HEAD and its publication both
+    /// reach the store through them.
+    std::optional<RawMeta> head(const String & requested_key, TransportAccess & access) override
     {
         if (requested_key != key)
-            return InMemoryBackend::head(requested_key);
+            return InMemoryBackend::head(requested_key, access);
 
-        const HeadResult observed = InMemoryBackend::head(requested_key);
+        const std::optional<RawMeta> observed = InMemoryBackend::head(requested_key, access);
         std::unique_lock lock(mutex);
         ++head_calls;
         cv.notify_all();
@@ -278,14 +290,14 @@ public:
         return observed;
     }
 
-    void publishBlob(const BlobPublishRequest & request) override
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override
     {
         if (request.destination_key == key)
         {
             std::lock_guard lock(mutex);
             ++publish_calls;
         }
-        InMemoryBackend::publishBlob(request);
+        InMemoryBackend::publish(request, access);
     }
 
     String key;
@@ -829,21 +841,35 @@ TEST(CASPartWriteTxn, PutBlobRepublishesVanishedBodyFromHeldSource)
         << "a fresh re-upload over a stale Condemned marker must reconcile it back to Clean";
 }
 
-/// A persistently-failing freshness-meta write (every attempt of every outer reload-retry) must
-/// surface as a controlled retry-later signal, not silently succeed with the marker left stale
-/// (S22 RCA). The blob body PUT
-/// itself is unaffected (MetaWriteFaultBackend only faults `.meta` keys) -- only the meta write
-/// exhausts, and that exhaustion must reach putBlob's caller as NETWORK_ERROR.
+namespace
+{
+
+/// Every `.meta` write is ambiguous, forever: the store's answer is lost on each attempt, so the
+/// engine settles each one by a read and reissues, and only the policy's own window ends the call.
+class AmbiguousMetaWriteBackend final : public InMemoryBackend
+{
+public:
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
+    {
+        if (!key.ends_with(".meta"))
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        throw Poco::TimeoutException("AmbiguousMetaWriteBackend: blob meta write response lost");
+    }
+};
+
+}
+
+/// A persistently-failing freshness-meta write must surface as a controlled retry-later signal, not
+/// silently succeed with the marker left stale. The blob body publication itself is unaffected (only
+/// `.meta` keys are faulted) -- only the meta reconciliation exhausts, and that exhaustion must reach
+/// putBlob's caller as NETWORK_ERROR.
 TEST(CASPartWriteTxn, PutBlobFreshMetaExhaustionThrowsRetryLater)
 {
-    /// Short budget + zero backoff: keep the test fast. Each of the metadata reconciliation loop's 8 outer
-    /// attempts calls putMetaIfAbsent, which itself retries up to max_attempts times internally —
-    /// with max_attempts=1 the controller gives up on the first faulted attempt each time.
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.retry_initial_backoff_ms = 0;
-    auto b = std::make_shared<DB::Cas::tests::MetaWriteFaultBackend>();
-    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    auto b = std::make_shared<AmbiguousMetaWriteBackend>();
+    auto s = openPool(b);
+    useVirtualMountRequestClock(s);
 
     const String payload = "fresh-meta-exhaustion-payload";
     auto build = precommittedBuildForPayload(
@@ -916,25 +942,29 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
 
     auto b = std::make_shared<InMemoryBackend>();
 
-    /// 1. Upload blob Y via a throwaway build; capture the token t0.
+    /// 1. Upload blob Y via a throwaway build; capture the incarnation t0 the way GC persists it, and
+    ///    let GC's exact-incarnation delete land before the writer's dedup hit.
     BlobRef id;
-    Token t0;
+    PersistedIncarnation t0;
     {
         auto s0 = openPool(b);
         auto build0 = precommittedBuildForPayload(
             s0, RootNamespace{"srv1/condemned-absent-seed"}, "part", "payload-Y");
         id = build0->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y")).ref;
-        t0 = b->head(s0->layout().blobKey(id)).token;
+        CasOperation op0 = s0->mountRequests().admit();
+        const String seed_key = s0->layout().blobKey(id);
+        const auto seeded = op0.head(seed_key, Retry::standard());
+        ASSERT_TRUE(seeded.has_value());
+        t0 = PersistedIncarnation::capture(seeded->incarnation);
+        ASSERT_EQ(op0.remove(seed_key, seeded->incarnation, Retry::standard()), Removal::Removed);
         build0->abandon();
     }
 
-    /// 2. Condemn (Blob, hash(Y), t0) in the retire view, then GC-delete the object so it is absent
-    ///    (simulates GC completing the delete before the writer's dedup hit).
+    /// 2. Condemn (Blob, hash(Y), t0) in the retire view; the object is already absent.
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(id);
     injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-Y"))}, .token = t0, .size = 9}});
-    b->deleteExact(blob_key, t0);
     ASSERT_FALSE(b->head(blob_key).exists);
 
     /// 3. Open a fresh Pool over a GET-counting wrapper; the retire view sees the condemnation at open.
@@ -950,9 +980,13 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     EXPECT_EQ(ref.ref, id);
     EXPECT_EQ(counting->get_count, 0u) << "INV-1: putBlob must not GET the dying object to revive it";
 
-    const HeadResult hr = b->head(blob_key);
-    ASSERT_TRUE(hr.exists);
-    EXPECT_NE(hr.token, t0) << "a fresh incarnation must have a new token";
+    /// The republished body must NOT read back as the incarnation GC condemned -- that compare is the
+    /// one GC's redelete makes, so it is the one this asserts.
+    CasRequests probe(b, Fence::open());
+    CasOperation probe_op = probe.admit();
+    const auto after = probe_op.head(blob_key, Retry::standard());
+    ASSERT_TRUE(after.has_value());
+    EXPECT_FALSE(t0.matches(after->incarnation)) << "a fresh publication must have a fresh incarnation";
     const auto raw = b->get(blob_key);
     ASSERT_TRUE(raw.has_value());
     const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
@@ -1673,12 +1707,15 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
     /// 1. PartWriteTxn A creates H ("shared-content"), publishes a part referencing it, then drops the ref.
     ///    Capture H's first incarnation token so we can condemn exactly it.
     BlobRef h;
-    Token h_token0;
+    PersistedIncarnation h_token0;
     {
         auto s0 = Pool::open(b, cfg);
         publishOneBlobPart(s0, ns, "part_1", "f", content);
         h = idOf(content);
-        h_token0 = b->head(s0->layout().blobKey(h)).token;
+        CasOperation op0 = s0->mountRequests().admit();
+        const auto seeded = op0.head(s0->layout().blobKey(h), Retry::standard());
+        ASSERT_TRUE(seeded.has_value());
+        h_token0 = PersistedIncarnation::capture(seeded->incarnation);
         s0->dropRef(ns, "part_1");
     }
 
@@ -1710,9 +1747,10 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
     const auto ref_b = build_b->putBlob(h, BlobSource::fromString(content));
     ASSERT_EQ(ref_b.ref, h);
 
-    const HeadResult after_reupload = b->head(blob_key);
-    ASSERT_TRUE(after_reupload.exists);
-    EXPECT_NE(after_reupload.token, h_token0);   /// a genuinely fresh incarnation
+    CasOperation reupload_op = s->mountRequests().admit();
+    const auto after_reupload = reupload_op.head(blob_key, Retry::standard());
+    ASSERT_TRUE(after_reupload.has_value());
+    EXPECT_FALSE(h_token0.matches(after_reupload->incarnation));   /// a genuinely fresh incarnation
 
     /// 4. THE ADVERSARIAL LOOP. A real, productive GC keeps trying to reclaim. It reclaims the now-
     ///    unreferenced part_1 manifest (build A's, UNprotected) but H stays pinned by B's PRECOMMIT edge
@@ -2030,17 +2068,20 @@ public:
     String corrupt_key_substr;
     int corrupt_count = 0;
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    /// The fault sits on the write primitive, which every conditional write reaches the store through.
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
     {
         if (corrupt_count > 0 && !corrupt_key_substr.empty() && key.find(corrupt_key_substr) != String::npos)
         {
             --corrupt_count;
-            /// The 3-arg qualified call bypasses virtual dispatch entirely (unlike the 2-arg
-            /// convenience overload, which would re-enter this very override through the vtable).
-            InMemoryBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"), meta);
+            /// The qualified call bypasses virtual dispatch entirely, so the foreign write does not
+            /// re-enter this very override.
+            (void)InMemoryBackend::write(key, bytes + String("\x01_FOREIGN_DIFFERENT"), expected_value, access);
             throw Poco::TimeoutException("RefLogConflictOnceBackend: a foreign different object landed; response lost");
         }
-        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 };
 
@@ -2328,46 +2369,47 @@ public:
     String plant_different_on_fault;     /// a FOREIGN different body lands at the key before the fault
     int put_attempts = 0;                /// matching body-PUT attempts observed
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    /// The fault sits on the write primitive: a staged part-manifest body is a create, which is a
+    /// `write` with no precondition.
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
     {
         if (!isManifestBodyKey(key))
-            return InMemoryBackend::putIfAbsent(key, bytes, meta);
+            return InMemoryBackend::write(key, bytes, expected_value, access);
         ++put_attempts;
-        maybeFault(key, bytes);
-        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+        maybeFault(key, bytes, access);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
 private:
     static bool isManifestBodyKey(const String & key) { return key.find("/cas/manifests/") != String::npos; }
 
     /// One fault: apply the configured server-side effect, then lose the response.
-    void maybeFault(const String & key, const String & bytes)
+    void maybeFault(const String & key, const String & bytes, TransportAccess & access)
     {
         if (fault_count <= 0)
             return;
         --fault_count;
         if (!plant_different_on_fault.empty())
-            InMemoryBackend::putIfAbsent(key, plant_different_on_fault, {});
+            (void)InMemoryBackend::write(key, plant_different_on_fault, std::nullopt, access);
         else if (land_despite_fault)
-            InMemoryBackend::putIfAbsent(key, bytes, {});
+            (void)InMemoryBackend::write(key, bytes, std::nullopt, access);
         throw Poco::TimeoutException("ManifestPutFaultBackend: simulated ambiguous result (response lost)");
     }
 };
 
 }
 
-/// The Task B core: two consecutive ambiguous timeouts on the part-manifest body PUT (each resolved
-/// to "absent" by the controller's exact-GET), then a clean third attempt. The old single-attempt
+/// The core ride: two consecutive ambiguous timeouts on the part-manifest body PUT (each resolved
+/// to "absent" by the engine's exact read), then a clean third attempt. The old single-attempt
 /// path fails the whole stage on the FIRST timeout (the observed 19s-pause INSERT kill); the
-/// controller path must ride its attempt budget and succeed.
+/// engine's write loop must ride its policy and succeed.
 TEST(CASPartWriteTxnStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithinBudget)
 {
-    /// Zero backoff: the retry semantics are under test here, not the (controller-level-tested)
-    /// inter-attempt sleep schedule — keep the suite free of real sleeps.
-    CasRequestBudget budget;
-    budget.retry_initial_backoff_ms = 0;
     auto b = std::make_shared<ManifestPutFaultBackend>();
-    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    auto s = openPool(b);
+    useVirtualMountRequestClock(s);
     const RootNamespace ns{"srv/tbl"};
 
     auto build = startBuildFor(s, ns, "part_retry");
@@ -2406,8 +2448,12 @@ TEST(CASPartWriteTxnStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedW
     const auto ev = std::find_if(events.begin(), events.end(),
                                  [](const CasEvent & e) { return e.type == CasEventType::ManifestPut; });
     ASSERT_NE(ev, events.end()) << "the stage must still emit its ManifestPut audit event";
-    EXPECT_EQ(ev->token, b->head(key).token.value)
-        << "the audit token must be the landed incarnation's token";
+    CasRequests probe(b, Fence::open());
+    CasOperation probe_op = probe.admit();
+    const auto landed = probe_op.head(key, Retry::standard());
+    ASSERT_TRUE(landed.has_value());
+    EXPECT_EQ(ev->token, landed->incarnation.render())
+        << "the audit token must be the landed incarnation, rendered";
 }
 
 /// A DIFFERENT object at the exact staged key (a foreign body ahead of our ambiguous attempt) is a
@@ -2429,26 +2475,27 @@ TEST(CASPartWriteTxnStageManifestRetry, DifferentObjectAtKeyStaysLoudConflict)
     EXPECT_EQ(b->put_attempts, 1) << "a proven conflict is never retried";
 }
 
-/// Budget exhaustion: EVERY attempt is ambiguous and nothing ever lands. The controller reports
-/// Unresolved after `max_attempts` and stageManifest maps it to NETWORK_ERROR (fix #37 phase 2) —
-/// the same retryable abort class the ref-log lane's exhausted budget maps to. Nothing was durably
-/// named: the caller re-stages with a fresh ManifestId.
+/// Policy exhaustion: EVERY attempt is ambiguous and nothing ever lands. The write gives up, and
+/// stageManifest maps that to NETWORK_ERROR — the same retryable abort class the ref-log lane's
+/// exhausted budget maps to. Nothing was durably named: the caller re-stages with a fresh ManifestId.
+/// The attempt COUNT is the request policy's business and is pinned where that policy lives; what
+/// this fence checks is that the stage reissues at all, and that its give-up is mapped, not leaked.
 TEST(CASPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 3;
-    budget.retry_initial_backoff_ms = 0;   /// no real sleeps; the backoff schedule has its own tests
     auto b = std::make_shared<ManifestPutFaultBackend>();
-    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    auto s = openPool(b);
+    useVirtualMountRequestClock(s);
     const RootNamespace ns{"srv/tbl"};
 
     auto build = startBuildFor(s, ns, "part_exhausted");
-    b->fault_count = 1000;
+    b->fault_count = 1000000;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         build->stageManifest({blobManifestEntry("a.bin", "a")});
     });
-    EXPECT_EQ(b->put_attempts, 3) << "attempts must be bounded by the configured budget";
+    EXPECT_GT(b->put_attempts, 1) << "the ambiguous attempt must be reissued before the write gives up";
+    EXPECT_FALSE(b->head(s->layout().manifestKey(ManifestId{ns, ManifestRef{s->liveWriterEpoch(), 1, 0}})).exists)
+        << "an exhausted stage names nothing durable";
 }
 
 /// =====================================================================================
@@ -2464,38 +2511,43 @@ namespace
 class BlobPutFaultBackend final : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the legacy overload the primitive override below would otherwise hide.
     using InMemoryBackend::head;
     int fault_count = 0;                 /// remaining ambiguous faults on matching create attempts
     bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
     int publish_stream_attempts = 0;     /// unconditional streaming publications observed
     int publish_copy_attempts = 0;       /// unconditional native-copy publications observed
     int blob_head_attempts = 0;          /// transaction-level blob observations
+    std::function<void()> on_publish;    /// runs before each publication, for a test that spends time in one
 
-    HeadResult head(const String & key) override
+    /// Both seams sit on the transport primitives: the writer's mandatory HEAD and its publication
+    /// both reach the store through them.
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (isBlobBodyKey(key))
             ++blob_head_attempts;
-        return InMemoryBackend::head(key);
+        return InMemoryBackend::head(key, access);
     }
 
-    void publishBlob(const BlobPublishRequest & request) override
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override
     {
         if (std::holds_alternative<StreamingBlobPublication>(request.publication))
             ++publish_stream_attempts;
         else
             ++publish_copy_attempts;
+        if (on_publish)
+            on_publish();
 
         if (fault_count > 0)
         {
             --fault_count;
             if (land_despite_fault)
-                InMemoryBackend::publishBlob(request);
+                InMemoryBackend::publish(request, access);
             else if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
                 (void)streaming->open_payload();
             throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous publication (response lost)");
         }
-        InMemoryBackend::publishBlob(request);
+        InMemoryBackend::publish(request, access);
     }
 
 private:
@@ -2506,14 +2558,12 @@ private:
 
 };
 
-/// Zero-backoff store over a BlobPutFaultBackend: the sleep schedule has its own controller-level
-/// tests; these Pool-level tests pin the retry/resolve/abort semantics without real sleeps.
-PoolPtr openBlobFaultPool(const std::shared_ptr<BlobPutFaultBackend> & b, uint32_t max_attempts = CasRequestBudget{}.max_attempts)
+/// A store over a BlobPutFaultBackend. The publication loop's own bound is what these tests pin, so
+/// nothing here configures a request policy: a faulted publication is one physical attempt, and the
+/// loop's next iteration is what reissues it.
+PoolPtr openBlobFaultPool(const std::shared_ptr<BlobPutFaultBackend> & b)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = max_attempts;
-    budget.retry_initial_backoff_ms = 0;
-    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// A replayable BlobSource that COUNTS its own re-streams — pins INV-1's "retry = fresh re-stream
@@ -2592,10 +2642,106 @@ TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
     const auto adopt = std::find_if(events.begin(), events.end(),
                                     [](const CasEvent & e) { return e.type == CasEventType::BlobReuseAdopt; });
     ASSERT_NE(adopt, events.end()) << "the landed occupant must be ADOPTED (the standard dedup leg)";
-    EXPECT_EQ(adopt->token, b->head(key).token.value) << "the adopted token must be the landed incarnation's";
+    CasRequests probe(b, Fence::open());
+    CasOperation probe_op = probe.admit();
+    const auto landed = probe_op.head(key, Retry::standard());
+    ASSERT_TRUE(landed.has_value());
+    EXPECT_EQ(adopt->token, landed->incarnation.render())
+        << "the adopted token must be the landed incarnation, rendered";
     EXPECT_EQ(std::count_if(events.begin(), events.end(),
                             [](const CasEvent & e) { return e.type == CasEventType::BlobPut; }), 0)
         << "no fresh-upload event: the body was never re-uploaded";
+}
+
+/// "One `Retry::standard()`" is one policy VALUE, not one shared deadline: each verb of the
+/// publication loop binds its own window from it, so a loop that has already spent far more than one
+/// window still publishes. Here each ambiguous publication burns forty seconds of the injected clock,
+/// so three of them exceed the standard ninety-second window; a loop that carried a single bound
+/// across its iterations would refuse the fourth iteration's HEAD instead of committing.
+TEST(CASPartWrite, EnsureBlobPresentSharesOneRetryAcrossItsLoop)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultPool(b);
+    auto now = std::make_shared<std::atomic<uint64_t>>(0);
+    s->mountRequests().setNowFnForTest([now] { return now->load(); });
+    s->mountRequests().setSleepFnForTest([now](uint64_t ms) { now->fetch_add(ms + 1); });
+    b->on_publish = [now] { now->fetch_add(40'000); };
+
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-long-loop";
+    auto build = startBuildFor(s, ns, "part_blob_long_loop");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_blob_long_loop", id);
+
+    int payload_streams = 0;
+    b->fault_count = 3;
+    const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+    EXPECT_EQ(res.size, payload.size());
+
+    EXPECT_EQ(b->publish_stream_attempts, 4) << "three ambiguous publications + the committing fourth";
+    EXPECT_GT(now->load(), 90'000u) << "the loop outlived one standard window, which is the point";
+}
+
+namespace
+{
+
+/// Fires an injected side effect once, immediately after the watched key's body read returns -- the
+/// point at which `ensureBlobPresent` has everything it needs and is about to render its verdict.
+class RearmAfterMetaReadBackend final : public InMemoryBackend
+{
+public:
+    /// Unhide the legacy overload the primitive override below would otherwise hide.
+    using InMemoryBackend::get;
+
+    String watched_key;
+    std::function<void()> trigger;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        auto observed = InMemoryBackend::read(key, access);
+        if (key == watched_key && trigger)
+            std::exchange(trigger, {})();
+        return observed;
+    }
+};
+
+}
+
+/// A trip-and-rearm hidden inside the observation leaves the mount writable again, but NOT under the
+/// generation this materialization was admitted under. The verdict points read that admission, so the
+/// dependency proof is refused rather than handed back from an incarnation that has been superseded --
+/// which is what would let a fenced-out build commit a manifest naming blobs it never legally observed.
+TEST(CASPartWrite, DependencyProofIsRefusedAfterARearm)
+{
+    auto b = std::make_shared<RearmAfterMetaReadBackend>();
+    auto s = openPool(b);
+    const String payload = "dependency-proof-after-rearm";
+    const UInt128 hash = u128Of(payload);
+    const BlobRef ref = idOf(payload);
+
+    /// Pre-seed a present body and a Clean marker so the observation takes the ADOPT leg -- the leg
+    /// whose only durable output is the dependency proof itself.
+    const uint64_t header_len = s->poolMeta().blob_header_len;
+    String raw_body(header_len, '\0');
+    raw_body += payload;
+    writeRawBlobBody(*b, s->layout(), hash, raw_body);
+    writeMetaClean(*b, s->layout(), hash, payload.size());
+
+    auto build = precommittedBuildForPayload(s, RootNamespace{"srv1/rearm-proof"}, "part", payload);
+    b->watched_key = s->layout().blobMetaKey(ref);
+    b->trigger = [&]
+    {
+        s->tripMountLost();
+        DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(s);
+    };
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        build->putBlob(ref, BlobSource::fromString(payload));
+    });
+    EXPECT_TRUE(s->mayMutate())
+        << "the mount is writable again: the refusal is about the generation the build was admitted "
+           "under, not about the mount being closed";
 }
 
 /// Budget exhaustion: EVERY attempt is ambiguous and nothing ever lands. The controller reports the
@@ -2607,7 +2753,7 @@ TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
 TEST(CASPartWrite, AmbiguousNonLandingPublicationStopsAtOuterBound)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    auto s = openBlobFaultPool(b, /*max_attempts=*/3);
+    auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "blob-payload-C";
 
