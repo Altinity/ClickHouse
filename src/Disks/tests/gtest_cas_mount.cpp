@@ -136,6 +136,15 @@ class OwnerRaceBackend : public InMemoryBackend
 public:
     explicit OwnerRaceBackend(UInt128 winner_) : winner(winner_) {}
 
+    /// Counts only reads of the owner key, so an extra re-read the conflict decision no longer needs
+    /// is visible even though the resolve read on the same key already counts once.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (key == "p/gc/server-roots/r/owner")
+            ++owner_reads;
+        return InMemoryBackend::read(key, access);
+    }
+
     std::expected<String, RawConflict> write(
         const String & key, const String & bytes,
         const std::optional<String> & expected_value, TransportAccess & access) override
@@ -152,6 +161,7 @@ public:
     }
 
     bool fired = false;
+    size_t owner_reads = 0;
 
 private:
     UInt128 winner;
@@ -2058,8 +2068,10 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
                 throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost");
         }});
     mount_requests.setNowFnForTest([&boot] { return boot; });
+    mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);
     open_requests.setNowFnForTest([&boot] { return boot; });
+    open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasOperation seed = open_requests.admit();
 
     ASSERT_EQ(claimMount(seed, l, "renewing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
@@ -2101,8 +2113,10 @@ TEST(CASMountLease, ClaimIsNotAdmittedUnderTheMountFence)
         [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
         [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
     mount_requests.setNowFnForTest([&boot] { return boot; });
+    mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);
     open_requests.setNowFnForTest([&boot] { return boot; });
+    open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
     MountLeaseKeeper keeper(mount_requests, open_requests, l, "r", UInt128(1), 7,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
@@ -2127,6 +2141,9 @@ TEST(CASServerRootClaim, OwnerLostToARacerIsDecidedFromTheConflictObservation)
         Ops ops(backend);
         EXPECT_NO_THROW(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()));
         EXPECT_TRUE(backend->fired);
+        /// The pre-claim read plus the create's own conflict-resolve read, and no third: a re-read
+        /// added back for the decision itself would raise this to 3.
+        EXPECT_EQ(backend->owner_reads, 2u);
     }
     {
         auto backend = std::make_shared<OwnerRaceBackend>(UInt128(2));
@@ -2136,6 +2153,7 @@ TEST(CASServerRootClaim, OwnerLostToARacerIsDecidedFromTheConflictObservation)
             "claimed by a different server during our claim",
             [&] { claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()); });
         EXPECT_TRUE(backend->fired);
+        EXPECT_EQ(backend->owner_reads, 2u);
     }
 }
 
@@ -2155,8 +2173,10 @@ TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
         [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
         [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
     mount_requests.setNowFnForTest([&boot] { return boot; });
+    mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasRequests open_requests = openRequestsForTest(backend);
     open_requests.setNowFnForTest([&boot] { return boot; });
+    open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
     MountLeaseKeeper keeper(mount_requests, open_requests, l, "r", UInt128(1), 7,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
