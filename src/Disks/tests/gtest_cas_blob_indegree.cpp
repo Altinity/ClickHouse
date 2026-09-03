@@ -90,8 +90,8 @@ TEST(CASBlobInDegree, RunsAreByteDeterministic)
         {{bh(3), s(1), false}, {bh(1), s(1), false}, {bh(2), s(1), false}}, ra);
     foldDeltasIntoGeneration(*b2_req, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(3), s(1), false}}, rb);
-    const auto ga = a.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
-    const auto gb = b2.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
+    const auto ga = (*a_req).read(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0), Retry::standard());
+    const auto gb = (*b2_req).read(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0), Retry::standard());
     ASSERT_TRUE(ga.has_value());
     ASSERT_TRUE(gb.has_value());
     EXPECT_EQ(ga->bytes, gb->bytes);
@@ -143,7 +143,7 @@ TEST(CASBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
     DB::Cas::tests::OperationForTest backend_req(backend);
     Layout layout{"pool"};
     /// Pre-occupy the run key (attempt 7) with junk, then fold => divergent => CORRUPTED_DATA.
-    backend.putIfAbsent(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run");
+    (*backend_req).create(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run", Retry::once());
     std::vector<BlobDelta> deltas{{bh(1), s(1), false}};
     std::vector<RunRef> runs;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
@@ -184,7 +184,7 @@ TEST(CASBlobInDegree, DeterministicArtifactWhoseResolveReadObservedNothingIsNotC
 
     /// Occupy the key so the create's precondition is refused, THEN arm the refusal, so the failure
     /// falls on the resolve read rather than on the setup.
-    ASSERT_EQ(backend.putIfAbsent(key, "someone else's bytes").outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*backend_req).create(key, "someone else's bytes", Retry::once())));
     backend.refuse_key = key;
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED,
@@ -273,7 +273,8 @@ RunRef writeSourceEdgeRun(InMemoryBackend & backend, const Layout & layout,
 
     const String bytes = out.str();
     const String key = layout.blobTargetRunKey(gen, attempt, shard, 0);
-    backend.putIfAbsent(key, bytes);
+    DB::Cas::tests::OperationForTest op(backend);
+    (*op).create(key, bytes, Retry::once());
     return RunRef{.key = key, .checksum = sourceEdgeRunChecksum(bytes), .shard = shard, .key_generation = gen};
 }
 
@@ -607,7 +608,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
         const String bytes = out.str();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0),
                          .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .key_generation = 1};
-        backend.putIfAbsent(bad.key, bytes);
+        (*backend_req).create(bad.key, bytes, Retry::once());
 
         std::vector<RunRef> runs2;
         EXPECT_THROW(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
@@ -628,7 +629,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
         const String bytes = out.str();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0),
                          .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .key_generation = 1};
-        backend.putIfAbsent(bad.key, bytes);
+        (*backend_req).create(bad.key, bytes, Retry::once());
 
         std::vector<RunRef> runs2;
         EXPECT_THROW(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
@@ -667,7 +668,7 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
     foldDeltasIntoGeneration(*oracle_req, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_o);
 
     const String gen1_run_key = layout.blobTargetRunKey(1, 0, 0, 0);
-    const auto gen1_run = backend.get(gen1_run_key);
+    const auto gen1_run = (*backend_req).read(gen1_run_key, Retry::standard());
     ASSERT_TRUE(gen1_run.has_value());
     const String gen1_run_bytes = gen1_run->bytes;
     /// Sanity: the prior run is far larger than one read buffer, so "it was never read whole" is a
@@ -688,8 +689,8 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
 
     /// Byte-reproducibility canary: streaming and materialized folds produce identical output bytes.
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
-    const auto gen2_c = backend.get(gen2_run_key);
-    const auto gen2_o = oracle.get(gen2_run_key);
+    const auto gen2_c = (*backend_req).read(gen2_run_key, Retry::standard());
+    const auto gen2_o = (*oracle_req).read(gen2_run_key, Retry::standard());
     ASSERT_TRUE(gen2_c.has_value());
     ASSERT_TRUE(gen2_o.has_value());
     EXPECT_EQ(gen2_c->bytes, gen2_o->bytes);
@@ -744,7 +745,7 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
     foldDeltasIntoGeneration(*oracle_req, layout, /*prior_runs*/runs1_o, 2, 0, 0, gen2, runs2_o);
 
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
-    const auto gen2_run = backend.get(gen2_run_key);
+    const auto gen2_run = (*backend_req).read(gen2_run_key, Retry::standard());
     ASSERT_TRUE(gen2_run.has_value());
     /// Sanity: the run is far larger than one read buffer, for the same reason as above.
     ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
