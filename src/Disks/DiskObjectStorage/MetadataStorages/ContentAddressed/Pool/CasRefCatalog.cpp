@@ -495,6 +495,12 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             throwCatalogWriteFailure(std::move(erase), fmt::format(
                 "CAS ref catalog erase for namespace '{}'", observed.ns.string()));
         }
+
+        /// Only a refused precondition reaches here, so this pause paces one contended key's retries.
+        /// The argument is the number of reissues so far, which is one more than the zero-based
+        /// iteration: `backoff(0)` is no wait at all, and the first retry is the one most likely to
+        /// collide with the writer that just won.
+        op.pause(Retry::backoff(static_cast<uint32_t>(attempt) + 1));
     }
 
     throwCasWriteRetryLater(fmt::format(

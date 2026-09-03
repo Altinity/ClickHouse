@@ -1390,6 +1390,42 @@ TEST(CASRefCatalogRemoval, ATransientEraseFailureIsResolvedByAReadAndReissued)
         << "the lost attempt was settled by an exact read before anything was concluded from it";
 }
 
+/// A refused precondition is the only thing the erase loop retries, and it PACES that retry on the
+/// engine's own clock. Without the pause a contended catalog would spend its whole conflict budget in
+/// back-to-back requests, which is the shape that turns one hot key into a request storm.
+///
+/// Nothing else on this path sleeps -- the write returns a refused precondition without reissuing, and
+/// no read fails -- so every wait the clock records is the loop's own.
+TEST(CASRefCatalogRemoval, AConflictingEraseBacksOffBeforeItsRetry)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    requests.setSleepFnForTest(clock.sleepFn());
+    CasOperation op = requests.admit();
+    const Layout layout("erase-backoff");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    backend->refuseNextWrite(layout.refCatalogKey());
+
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent),
+        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    ASSERT_EQ(clock.sleeps.size(), 1u) << "one refusal, so exactly one paced retry";
+    EXPECT_LE(clock.sleeps.front(), 200u) << "the first reissue's full-jitter ceiling";
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
+        << "the seed, the refused erase, and the retry that landed";
+}
+
 TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)
 {
     auto backend = std::make_shared<WriteCountingBackend>();
