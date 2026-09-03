@@ -343,18 +343,12 @@ void Gc::runNamespaceJanitorPage(
     try
     {
         CasRequests & requests = store->gcRequests();
-        CasOperation op = requests.admit();
         const Layout & layout = store->layout();
         NamespaceJanitor janitor(requests, layout, 1000);
-        const uint64_t admitted_generation = leased_state.lease.seq;
-        janitor_result = janitor.runOnePage(suppress_destructive, [&]
-        {
-            const auto got = op.read(layout.gcStateKey(), Retry::standard());
-            if (!got)
-                return false;
-            const GcState current = decodeGcState(got->bytes);
-            return current.lease.owner == gc_id && current.lease.seq == admitted_generation;
-        });
+        /// ONE authority read per page, made here rather than from the predicate: the janitor's
+        /// operation samples its liveness before every request, and a page walks up to a thousand keys.
+        refreshAuthority(leased_state.lease.seq);
+        janitor_result = janitor.runOnePage(suppress_destructive, [this] { return authority_held; });
         for (const String & anomaly : janitor_result.anomalies)
             LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
         if (janitor_result.leaked)
@@ -4389,6 +4383,27 @@ void Gc::rememberObservation(const GcLease & lease)
     last_seen_seq = lease.seq;
 }
 
+void Gc::refreshAuthority(uint64_t admitted_generation)
+{
+    /// Fail-closed first, so every early exit below leaves this leader deposed.
+    authority_held = false;
+    try
+    {
+        CasOperation op = store->gcRequests().admit();
+        const auto got = op.read(store->layout().gcStateKey(), Retry::standard());
+        if (!got)
+            return;
+        const GcState current = decodeGcState(got->bytes);
+        authority_held = current.lease.owner == gc_id && current.lease.seq == admitted_generation;
+    }
+    catch (...)
+    {
+        tryLogCurrentException(logger,
+            "CAS gc: the leader-authority probe failed; this round's destructive operations treat the "
+            "lease as lost");
+    }
+}
+
 void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
 {
     CasOperation op = store.gcRequests().admit();
@@ -4524,7 +4539,14 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
             "CAS GC pre-fold drain: adopted parent seal (generation {}, attempt {}) is missing",
             leased_state.snap_generation, leased_state.snap_attempt);
 
-    CasOperation op = store->gcRequests().admit();
+    /// The drain erases catalog rows, so its operation carries this leader's authority as its
+    /// liveness: `CatalogLifecycleReconciler` and `deleteCompletedRemovingAtSnapshot` decide
+    /// `FencedOut` from `op.admitted()`, and the GC plane's fence is open, so without this the verdict
+    /// would be a constant TRUE and a deposed leader would keep erasing. The read that settles it is
+    /// made once here, before the drain begins -- a leader deposed BETWEEN two erases of the same drain
+    /// is not caught, which needs a refresh point inside the reconciler's own loop.
+    refreshAuthority(leased_state.lease.seq);
+    CasOperation op = store->gcRequests().admit([this] { return authority_held; });
     return CatalogLifecycleReconciler(op, store->layout(), *parent).reconcile();
 }
 

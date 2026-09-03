@@ -3063,6 +3063,44 @@ TEST(CASCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut
            "reuses, and the committed erase's resolution -- the catalog takes no cut of its own";
 }
 
+/// THE DRAIN'S AUTHORITY, end to end. `CatalogLifecycleReconciler` and
+/// `deleteCompletedRemovingAtSnapshot` decide `FencedOut` from `CasOperation::admitted()`, and the GC
+/// plane's fence is open -- so the only thing that can make that verdict false in production is the
+/// `Liveness` the round hands its drain operation. Depose the leader in the window the round leaves
+/// between acquiring its lease and the pre-fold drain, and the drain must erase nothing. Without the
+/// predicate the verdict is a constant TRUE, the drain completes, and the completed-removal row is
+/// gone -- which is what this test catches.
+TEST(CASGCFrontierGate, ADeposedLeaderErasesNoCatalogRow)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    const CompletedRemovingFixture fixture = seedCompletedRemoving(*backend, op, store, kGc);
+    const uint64_t catalog_writes_before = backend->putOverwriteCount(layout.refCatalogKey());
+
+    /// Another leader steals `gc/state` after this round's lease renewal and before its drain.
+    const auto depose = [&]
+    {
+        const auto got = op.read(layout.gcStateKey(), Retry::once());
+        ASSERT_TRUE(got);
+        GcState stolen = decodeGcState(got->bytes);
+        stolen.lease.owner = hexToU128("00000000000000000000000000000099");
+        ++stolen.lease.seq;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            op.replace(layout.gcStateKey(), encodeGcState(stolen), got->incarnation, Retry::once())));
+    };
+
+    Gc gc(store, kGc);
+    EXPECT_THROW(gc.runRegularRound(depose), DB::Exception)
+        << "a deposed leader must give up rather than drain the catalog";
+    EXPECT_TRUE(CasRefCatalog::lifeIfCataloged(op, layout, fixture.ns))
+        << "the completed-removal row survives a deposed leader's drain";
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), catalog_writes_before)
+        << "and no catalog write was even attempted";
+}
+
 TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
 {
     auto backend = std::make_shared<DrainRaceBackend>();

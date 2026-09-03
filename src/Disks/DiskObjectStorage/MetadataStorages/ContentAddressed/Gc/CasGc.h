@@ -880,6 +880,10 @@ private:
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 
+    /// Re-read `gc/state` and record whether this leader still holds the lease it was admitted under.
+    /// Fail-closed: an absent, unreadable or undecodable state reads as deposed.
+    void refreshAuthority(uint64_t admitted_generation);
+
     PoolPtr store;
     /// Where `GcPhaseTimer` sends one record per GC phase. Empty unless a `CasGcScheduler` installed one
     /// for the current round, in which case every phase of that round emits a row.
@@ -902,6 +906,18 @@ private:
     /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever
     /// a round folds; incremented on every DEFER. Bounds batching via `gc_fold_max_defer_rounds`.
     uint64_t rounds_since_last_fold_ = 0;
+
+    /// THIS LEADER'S OWN AUTHORITY VERDICT, and the reason it is a cached bool rather than a probe.
+    ///
+    /// It is what the `Liveness` predicates of the round's destructive operations sample -- the pre-fold
+    /// catalog drain and the namespace janitor page, both of which erase objects a deposed leader must
+    /// not touch. The engine samples a `Liveness` before EVERY request and before every sleep, so a
+    /// predicate that read `gc/state` itself would put one `GET` on the hot path of every listed key.
+    /// The read that sets this flag is therefore made by the round, at the granularity the old
+    /// hand-written fence check had (once per drain, once per janitor page), never from inside the
+    /// predicate. The staleness that buys is bounded by that granularity and stated where each caller
+    /// refreshes it.
+    bool authority_held = false;
 
     /// the contender's observation window (steal protocol)
     bool has_observation = false;
