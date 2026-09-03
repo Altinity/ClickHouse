@@ -372,6 +372,9 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
     if (!catalog_impl)
         initialize();
 
+    const auto settings_version = database_settings.get();
+    const DatabaseDataLakeSettings & settings = *settings_version;
+
     catalog_impl->setVendedCredentialsCacheTTL(
         std::chrono::seconds(settings[DatabaseDataLakeSetting::vended_credentials_cache_ttl].value));
 
@@ -388,6 +391,9 @@ StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
     DataLakeStorageSettingsPtr storage_settings) const
 {
     /// TODO: add tests for azure, local storage types.
+
+    const auto settings_version = database_settings.get();
+    const DatabaseDataLakeSettings & settings = *settings_version;
 
     auto catalog = getCatalog();
     switch (catalog->getCatalogType())

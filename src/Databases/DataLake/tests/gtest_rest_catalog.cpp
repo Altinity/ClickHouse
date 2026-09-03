@@ -283,6 +283,7 @@ TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         context);
 
     DB::SettingsChanges changes;
@@ -304,6 +305,7 @@ TEST(RestCatalog, ApplySettingsChangesCredentialMode)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         context);
 
     EXPECT_EQ(catalog.getStateSnapshot()->client_id, "client-1");
@@ -345,6 +347,7 @@ TEST(RestCatalog, ApplySettingsChangesAuthHeaderMode)
         /* auth_header */"Authorization: Bearer token-1",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         context);
 
     DB::SettingsChanges changes;
@@ -376,6 +379,7 @@ TEST(RestCatalog, OneLakeApplySettingsChangesBearerMode)
         /* auth_scope */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         context);
 
     const auto snapshot_before = catalog.getStateSnapshot();
@@ -427,18 +431,19 @@ TEST(RestCatalog, TryGetTableMetadataDistinguishesMissingTableFromOtherErrors)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         context);
 
     TableMetadata existing;
-    EXPECT_TRUE(catalog.tryGetTableMetadata("namespace", "table_a", existing));
+    EXPECT_TRUE(catalog.tryGetTableMetadata("namespace", "table_a", context, existing));
     EXPECT_TRUE(catalog.existsTable("namespace", "table_a"));
 
     TableMetadata missing;
-    EXPECT_FALSE(catalog.tryGetTableMetadata("namespace", "missing_table", missing));
+    EXPECT_FALSE(catalog.tryGetTableMetadata("namespace", "missing_table", context, missing));
     EXPECT_FALSE(catalog.existsTable("namespace", "missing_table"));
 
     TableMetadata unauthorized;
-    EXPECT_THROW(catalog.tryGetTableMetadata("namespace", "unauthorized_table", unauthorized), DB::HTTPException);
+    EXPECT_THROW(catalog.tryGetTableMetadata("namespace", "unauthorized_table", context, unauthorized), DB::HTTPException);
     EXPECT_THROW(catalog.existsTable("namespace", "unauthorized_table"), DB::HTTPException);
 }
 

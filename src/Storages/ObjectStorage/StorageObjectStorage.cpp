@@ -612,7 +612,7 @@ void StorageObjectStorage::read(
             {
                 if (auto rebuilt = configuration->buildStorageMetadataFromState(*state, local_context))
                     pinned = rebuilt->withVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
-                        rebuilt->columns, local_context, format_settings, configuration->partition_strategy_type));
+                        rebuilt->columns, local_context, format_settings, configuration->getPartitionStrategyType()));
             }
 
             storage_snapshot = std::make_shared<StorageSnapshot>(
