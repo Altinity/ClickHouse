@@ -1034,8 +1034,14 @@ public:
 
     /// Test-only: replace the inter-attempt backoff sleep (e.g. with a clock-advancing no-op) on all
     /// three request planes and on ref-table recovery, for tests that drive a persistent write fault to
-    /// exhaustion through a fully wired Pool/disk and must not serve the production capped-exponential
-    /// sleeps for real. Call before driving traffic; empty restores the real sleep.
+    /// exhaustion through a fully wired Pool/disk and must not serve the production sleeps for real.
+    /// Call before driving traffic. On the three request planes an empty function restores each plane's
+    /// own default, the mount plane's interruptible sleep included.
+    ///
+    /// It does NOT bound a reissue the engine refuses to start: the engine's inter-attempt backoff is
+    /// jittered and drawn before the sleep, and admission compares that drawn duration against the
+    /// lease. A test that needs a reissue admitted, or refused, deterministically has to arrange the
+    /// clock, not the sleep.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
 
     /// Test-only: replace the request engine's clock on all three planes. A test driving a PERSISTENT
@@ -1124,6 +1130,14 @@ private:
     {
         drainWriterCleanupDuties(ns);
         return std::forward<Mutation>(mutation)();
+    }
+
+    /// The mount plane's inter-attempt sleep: interruptible, so a parked or stopping renewal is not
+    /// held for a whole capped backoff. Named rather than inlined because the test seam has to be able
+    /// to put it back.
+    std::function<void(uint64_t)> mountPlaneSleepFn()
+    {
+        return [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); };
     }
 
     BackendPtr pool_backend;

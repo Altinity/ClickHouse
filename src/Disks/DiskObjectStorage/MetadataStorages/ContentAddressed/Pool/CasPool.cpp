@@ -194,8 +194,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this](uint64_t g, uint64_t needed) { return mount_runtime.admit(g, needed); },
           [this](uint64_t g) { mount_runtime.checkFenceOrThrow(g); }},
           config.boot_ms_fn,
-          /// Interruptible: a parked or stopping renewal must not be held for a whole capped backoff.
-          [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); })
+          mountPlaneSleepFn())
     , farewell_requests(pool_backend, Fence::open(), config.boot_ms_fn)
     , gc_requests(pool_backend, Fence::open(), config.boot_ms_fn)
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
@@ -1856,7 +1855,11 @@ void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
     /// with a real one on the plane the site under test happens to use.
     farewell_requests.setSleepFnForTest(sleep_fn);
     gc_requests.setSleepFnForTest(sleep_fn);
-    ref_ledger.setCasRetrySleepForTest(std::move(sleep_fn));
+    ref_ledger.setCasRetrySleepForTest(sleep_fn);
+    /// The ledger reaches the mount plane too, and `CasRequests` falls back to the engine's plain
+    /// sleep for an empty argument -- which is not this plane's default. Re-install ours last, so
+    /// clearing the seam cannot leave a parked or stopping renewal held for a whole capped backoff.
+    mount_requests.setSleepFnForTest(sleep_fn ? std::move(sleep_fn) : mountPlaneSleepFn());
 }
 
 void Pool::setCasRequestNowFnForTest(std::function<uint64_t()> now_fn)

@@ -1864,6 +1864,11 @@ public:
     Fault fault = Fault::None;
     DB::Cas::tests::ManualBarrier * barrier = nullptr;
     std::function<void()> after_commit;
+    /// Runs just before an armed fault throws. The engine draws its inter-attempt backoff randomly and
+    /// admits the reissue against that drawn duration, so a test that needs the ambiguity to be refused
+    /// rather than reissued has to move the injected clock here -- from inside the attempt, which is the
+    /// only point between admission and the resolve read a test can reach.
+    std::function<void()> before_throw;
 
     /// The fault sits on the WRITE PRIMITIVE, and only on a CONDITIONAL one: a lease renewal is a
     /// replace, so a create on the same key must not consume the one-shot fault.
@@ -1880,7 +1885,11 @@ public:
             barrier->arriveAndWait();
         }
         if (current == Fault::ThrowBefore || current == Fault::BlockThenThrow)
+        {
+            if (before_throw)
+                before_throw();
             throw Poco::TimeoutException("injected runtime renewal ambiguity before result");
+        }
 
         auto result = DB::Cas::tests::CountingBackend::write(key, bytes, expected_value, access);
         if (after_commit)
@@ -3571,12 +3580,15 @@ TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
                 result_observed.set_value();
         },
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        .mount_renew_period = std::chrono::milliseconds(100),
-        .cas_request_budget = runtimeRenewBudget(2),
+        /// 500 with a 700 ms quiescence, so the redo's window (period + attempt timeout = 510) does not
+        /// fit the 280 ms of safe lease left -- and the reissue the ambiguity needs still does, whatever
+        /// the engine's jittered backoff draws from its first-reissue range of at most 200 ms.
+        .mount_renew_period = std::chrono::milliseconds(500),
+        .cas_request_budget = runtimeRenewBudget(),
         .boot_ms_fn = [&] { return fake_boot; },
         .remount_quiesce_hook_for_test = [&]
         {
-            fake_boot += 900;
+            fake_boot += 700;
             backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
         },
     };
@@ -3592,10 +3604,6 @@ TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
         std::lock_guard lock(events_mutex);
         observed = events;
     }
-    const auto retrying = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::WatermarkRenew && event.outcome == "retrying";
-    });
     const auto recovered = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
     {
         return event.type == CasEventType::WatermarkRenew && event.outcome == "recovered";
@@ -3604,14 +3612,13 @@ TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
     {
         return event.type == CasEventType::MountRemount && event.outcome == "ok";
     });
-    ASSERT_NE(retrying, observed.end());
     ASSERT_NE(recovered, observed.end());
     ASSERT_NE(remounted, observed.end());
-    EXPECT_LT(std::distance(observed.begin(), retrying), std::distance(observed.begin(), recovered));
     EXPECT_LT(std::distance(observed.begin(), recovered), std::distance(observed.begin(), remounted));
-    EXPECT_EQ(retrying->detail.at("remount_attempt_no"), remounted->detail.at("attempt_no"));
     EXPECT_EQ(recovered->detail.at("remount_attempt_no"), remounted->detail.at("attempt_no"));
     EXPECT_EQ(recovered->detail.at("classification"), "committed_after_retry");
+    /// The physical retry itself: the ambiguous attempt and the reissue that committed.
+    EXPECT_EQ(recovered->detail.at("attempts_sent"), "2");
     EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' recovered"), String::npos);
 
     /// `~Pool` stops and joins both persistent runtime workers. Make that quiescence boundary part of
@@ -3645,12 +3652,15 @@ TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
         },
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
         .mount_renew_period = std::chrono::milliseconds(100),
-        .cas_request_budget = runtimeRenewBudget(1),
+        .cas_request_budget = runtimeRenewBudget(),
         .boot_ms_fn = [&] { return fake_boot; },
         .remount_quiesce_hook_for_test = [&]
         {
             fake_boot += 900;
             backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
+            /// The attempt is admitted 80 ms before its lease-safe bound; spending 90 inside it puts the
+            /// resolve read past that bound, so the ambiguity is refused instead of reissued.
+            backend->before_throw = [&] { fake_boot += 90; };
         },
     };
     auto store = Pool::open(backend, config);
@@ -3678,7 +3688,7 @@ TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
     EXPECT_LT(std::distance(observed.begin(), failed_renew), std::distance(observed.begin(), failed_remount));
     EXPECT_EQ(failed_renew->detail.at("remount_attempt_no"), failed_remount->detail.at("attempt_no"));
     EXPECT_EQ(failed_renew->detail.at("attempts_sent"), "1");
-    EXPECT_EQ(failed_renew->detail.at("classification"), "attempts_exhausted");
+    EXPECT_EQ(failed_renew->detail.at("classification"), "external_lease_deadline");
     EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' fenced"), String::npos);
 
     /// A ready final-result future proves publication order; destruction additionally proves the
@@ -3967,10 +3977,10 @@ TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
 /// fence still latched lost. Admitted on the mount plane it could only ever give up, and every remount
 /// that reached the step would fail -- so it renews on the keeper's open plane instead.
 ///
-/// The step is reached only when quiescence has eaten most of the new lease, which no other remount test
-/// arranges: with a fresh anchor the renewal window fits and the step is skipped entirely. So the
-/// quiesce hook advances the injected boot clock to just inside the safety margin, and the paired run
-/// with no quiesce cost is the control that proves the step was reached rather than skipped.
+/// The step is reached only when quiescence has eaten most of the new lease: with a fresh anchor the
+/// renewal window fits and the step is skipped entirely. So the quiesce hook advances the injected boot
+/// clock to just inside the safety margin, and the paired run with no quiesce cost is the control that
+/// proves the step was reached rather than skipped.
 TEST(CASPoolRemount, TheKeeperRedoRenewsOnTheOpenPlane)
 {
     /// One successful remount whose quiescence costs `quiesce_ms`; returns the conditional mount-slot

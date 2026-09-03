@@ -439,7 +439,6 @@ private:
     void tripFenceWithoutOperationalLoss();
     std::unique_lock<std::mutex> lockTerminalPublication();
 
-
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     BackendPtr backend_ptr;
     CasRequests & mount_requests;
