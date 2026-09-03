@@ -197,7 +197,7 @@ TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeeps
     EXPECT_FALSE(report.warnings.empty());
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
 
-    const KeyPage stream = catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard());
+    const ListPage stream = catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard());
     ASSERT_EQ(stream.keys.size(), 1u);
     const auto parsed = Layout("p").parseRefObjectKey(stream.keys.front().key);
     ASSERT_TRUE(parsed);
@@ -246,7 +246,7 @@ TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
     EXPECT_EQ(wake_requests.load(), 1u)
         << "progress already made for an earlier life must wake GC even when a later life fails closed";
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
-    const KeyPage progressed_stream
+    const ListPage progressed_stream
         = catalog_op.list(Layout("p").namespaceStreamPrefix(*progressed_life), "", 100, Retry::standard());
     ASSERT_EQ(progressed_stream.keys.size(), 1u);
 }
@@ -313,7 +313,7 @@ TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
         Gc gc(victim, UInt128{811});
         ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
         ASSERT_EQ(catalogEntry(catalog_op, victim->layout(), ns).state, NsState::Removing);
-        for (const KeyEntry & key : catalog_op.list(victim->layout().namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
+        for (const ListedKey & key : catalog_op.list(victim->layout().namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
             stream_before.push_back(key.key);
         ASSERT_FALSE(stream_before.empty());
     }
@@ -328,7 +328,7 @@ TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
     EXPECT_FALSE(report.slot_removed);
     EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), ns).state, NsState::Removing);
     std::vector<String> stream_after;
-    for (const KeyEntry & key : catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
+    for (const ListedKey & key : catalog_op.list(Layout("p").namespaceStreamPrefix(*life), "", 100, Retry::standard()).keys)
         stream_after.push_back(key.key);
     EXPECT_EQ(stream_after, stream_before)
         << "decommission must not append a second terminal or become a catalog deletion driver";
