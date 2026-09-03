@@ -124,6 +124,9 @@ std::unique_ptr<ReadBuffer> InMemoryBackend::stream(const String & key, Transpor
 
 std::optional<Backend::RawMeta> InMemoryBackend::head(const String & key, TransportAccess &)
 {
+    if (auto armed = takeArmedFailure(head_failures_, key))
+        std::rethrow_exception(armed);
+
     std::lock_guard lock(mutex_);
     auto it = store_.find(key);
     if (it == store_.end())
@@ -423,6 +426,12 @@ void InMemoryBackend::failNextReadWith(const String & key, std::exception_ptr er
 {
     std::lock_guard lock(mutex_);
     read_failures_[key].push_back(std::move(error));
+}
+
+void InMemoryBackend::failNextHeadWith(const String & key, std::exception_ptr error)
+{
+    std::lock_guard lock(mutex_);
+    head_failures_[key].push_back(std::move(error));
 }
 
 void InMemoryBackend::onBeforeWrite(const String & key, std::function<void()> hook)

@@ -445,6 +445,29 @@ struct IndeterminateProbeBackend : InMemoryBackend
     }
 };
 
+/// Refuses the FIRST `list` naming each distinct cursor -- one refusal per page -- and charges every
+/// list a fixed slice of the caller's clock, so what a page costs is a fact rather than a jitter draw.
+/// `always_refuse_cursor` keeps one page refused for good.
+struct PagedThrottleBackend : InMemoryBackend
+{
+    using InMemoryBackend::list;
+
+    std::function<void()> charge_latency;
+    std::set<String> refused_cursors;
+    std::optional<String> always_refuse_cursor;
+    size_t list_calls = 0;
+
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        ++list_calls;
+        if (charge_latency)
+            charge_latency();
+        if ((always_refuse_cursor && *always_refuse_cursor == cursor) || refused_cursors.insert(cursor).second)
+            throw Poco::TimeoutException("the list resuming after '" + cursor + "' timed out");
+        return InMemoryBackend::list(prefix, cursor, limit, access);
+    }
+};
+
 /// Runs `on_read` after every read. The resolve read is where a caller's own facts can change
 /// between an attempt and the pause that would precede the next one.
 struct FlipOnReadBackend : CountingBackend
@@ -891,6 +914,207 @@ TEST(CASRequests, AResolveReadRefusedForLeaseBudgetIsReportedAsTheLeaseDeadline)
     EXPECT_TRUE(clock.sleeps.empty());
     EXPECT_EQ(backend->writeRequests(), 2u);   /// the create and the one refused replace
     EXPECT_EQ(backend->readRequests(), 0u);    /// the resolve read never started
+}
+
+TEST(CASRequests, AFenceWithNoBudgetForTheRequestSendsNothingAndNamesTheLease)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    const uint64_t budget_ms = 500;
+    Fence fence{
+        [] { return uint64_t{0}; },
+        [&](uint64_t, uint64_t needed_ms) { return needed_ms > budget_ms ? Fence::Admit::NoBudget : Fence::Admit::Ok; },
+        [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    /// One attempt reserves more than the lease has left, so nothing may be started under it.
+    requests.setAttemptReservationForTest(1'000);
+    auto op = requests.admit();
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    /// The policy's own window is untouched; what ran out is the fence's budget, which IS the lease.
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+    EXPECT_FALSE(gave_up->sent_any);
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)op.read("k", Retry::standard()); });
+    EXPECT_EQ(backend->writeRequests(), 0u);
+    EXPECT_EQ(backend->readRequests(), 0u);
+    EXPECT_TRUE(clock.sleeps.empty());
+}
+
+TEST(CASRequests, AnRmwWhoseFirstReadFailsGivesUpUnresolvedWithoutWriting)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("the read timed out")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    WriteResult result = op.readModifyWrite("k",
+        [](const std::optional<Object> &) -> std::optional<String> { return String("v"); }, Retry::once());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    /// No BOUND refused this read; the read itself failed. Claiming a deadline the clock never reached
+    /// would send its reader to widen the wrong thing.
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
+    EXPECT_FALSE(gave_up->sent_any);
+    EXPECT_TRUE(std::holds_alternative<NotObserved>(gave_up->last_seen));
+    EXPECT_EQ(backend->writeRequests(), 0u);
+}
+
+TEST(CASRequests, AnOnPresenceRmwWhoseFirstHeadFailsGivesUpUnresolvedWithoutWriting)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextHeadWith("k", std::make_exception_ptr(Poco::TimeoutException("the head timed out")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    WriteResult result = op.readModifyWriteOnPresence("k",
+        [](const std::optional<Meta> &) -> std::optional<String> { return String("v"); }, Retry::once());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
+    EXPECT_FALSE(gave_up->sent_any);
+    EXPECT_EQ(backend->writeRequests(), 0u);
+    EXPECT_EQ(backend->readRequests(), 0u);   /// the presence loop does not fall back to a body read
+}
+
+TEST(CASRequests, AConflictWhoseResolveReadFailsIsReportedWithNothingObserved)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "theirs", Retry::standard()), "create");
+
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("the read timed out")));
+    WriteResult result = op.create("k", "mine", Retry::once());
+    const auto * conflict = std::get_if<Conflict>(&result);
+    ASSERT_NE(conflict, nullptr);
+    /// The precondition was refused, so the key IS taken; the read that would have said by whom failed,
+    /// and the caller is told exactly that rather than handed a guess about the occupant.
+    EXPECT_TRUE(std::holds_alternative<NotObserved>(conflict->seen));
+}
+
+TEST(CASRequests, AFenceLostDuringTheResolveReadIsAFenceLossNotAConflict)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    bool alive = true;
+    /// The fence trips while the ambiguous attempt is in flight: the write's own hook runs before the
+    /// store is touched, so the resolve read is the first request to meet the closed gate.
+    backend->onBeforeWrite("k", [&] { alive = false; });
+    backend->injectAmbiguousPutIfAbsent("k");
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit([&] { return alive; });
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    /// A lost fence is not an observation. Reporting it as an ordinary conflict would tell the caller
+    /// somebody else holds the key, when what happened is that this node stopped being allowed to ask.
+    EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
+    EXPECT_TRUE(gave_up->sent_any);
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->readRequests(), 0u);   /// refused before the resolve read was issued
+    EXPECT_TRUE(clock.sleeps.empty());
+}
+
+TEST(CASRequests, OnPresenceFetchesTheBodyToProveAnAmbiguousAttemptLanded)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->injectAmbiguousLandedWrite("k");
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    WriteResult result = op.readModifyWriteOnPresence("k",
+        [](const std::optional<Meta> & current) -> std::optional<String>
+        {
+            return current ? std::nullopt : std::optional<String>("v");
+        },
+        Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_TRUE(committed->resolved_by_read);
+    /// Presence-only is what this loop REPORTS, not a promise about what it may read: only the bytes
+    /// can prove the ambiguous attempt was this call's own.
+    EXPECT_EQ(backend->readRequests(), 1u);
+}
+
+TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "theirs", Retry::standard()), "create");
+
+    backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+    WriteResult result = op.readModifyWriteOnPresence("k",
+        [](const std::optional<Meta> &) -> std::optional<String> { return String("mine"); }, Retry::once());
+    const auto * conflict = std::get_if<Conflict>(&result);
+    ASSERT_NE(conflict, nullptr);
+    /// The ambiguity forced a body read, and the body stops at this boundary: a caller of the
+    /// presence loop can never come to depend on bytes the loop does not promise.
+    EXPECT_TRUE(std::holds_alternative<Meta>(conflict->seen));
+    EXPECT_FALSE(std::holds_alternative<Object>(conflict->seen));
+    EXPECT_GE(backend->readRequests(), 1u);
+}
+
+TEST(CASRequests, ForEachListedKeyGivesEachPageItsOwnPolicyWindow)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<PagedThrottleBackend>();
+    /// Every list costs the caller 300ms, so a page's cost is a fact and not a jitter draw.
+    backend->charge_latency = [&clock] { clock.now += 300; };
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    for (int i = 0; i < 25; ++i)
+        orThrow(op.create("p/" + std::to_string(i), "v", Retry::standard()), "create");
+
+    size_t seen = 0;
+    size_t pages = 0;
+    const uint64_t start = clock.now;
+    /// A window that comfortably covers ONE page's refusal and its reissue, and could not have covered
+    /// the walk: the policy governs each page, because a walk is an unbounded number of requests.
+    op.forEachListedKey("p/", [&](const KeyEntry &) { ++seen; return true; }, Retry::within(1'000),
+                        /*page_limit=*/10, [&] { ++pages; });
+    EXPECT_EQ(seen, 25u);
+    EXPECT_EQ(pages, 3u);
+    EXPECT_EQ(backend->list_calls, 6u);        /// each page refused once, then delivered
+    EXPECT_GT(clock.now - start, 1'000u);      /// the walk outlived the window every page was given
+}
+
+TEST(CASRequests, ForEachListedKeyThrowsRatherThanTruncateWhenAPageNeverArrives)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<PagedThrottleBackend>();
+    backend->charge_latency = [&clock] { clock.now += 300; };
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    for (int i = 0; i < 25; ++i)
+        orThrow(op.create("p/" + std::to_string(i), "v", Retry::standard()), "create");
+
+    const KeyPage first = op.list("p/", "", 10, Retry::within(1'000));
+    ASSERT_FALSE(first.next_cursor.empty());
+    backend->always_refuse_cursor = first.next_cursor;   /// the second page never arrives
+    backend->refused_cursors.clear();
+
+    size_t seen = 0;
+    size_t pages = 0;
+    /// A silently truncated enumeration is the error a coverage record exists to prevent, so the walk
+    /// reports the page it could not fetch instead of returning what it managed to read.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        op.forEachListedKey("p/", [&](const KeyEntry &) { ++seen; return true; }, Retry::within(1'000),
+                            /*page_limit=*/10, [&] { ++pages; });
+    });
+    EXPECT_EQ(pages, 1u);
+    EXPECT_EQ(seen, 10u);
 }
 
 TEST(CASRequests, LivenessPredicateEndsTheOperationLikeAFenceLoss)

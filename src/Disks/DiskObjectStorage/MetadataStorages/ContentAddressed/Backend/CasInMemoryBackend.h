@@ -151,8 +151,11 @@ public:
     /// classifies a failed attempt by its exception CLASS, and the classes worth exercising span
     /// `S3Exception`, `DB::Exception`, `Poco::Exception` and plain `std::exception`.
     void failNextWriteWith(const String & key, std::exception_ptr error);
-    /// The read-side sibling, for the read loop's own classification.
+    /// The read-side siblings, for the read loop's own classification. `read` and `head` are armed
+    /// separately because the two resolve loops differ in exactly which of them they issue: a
+    /// presence-only caller must be able to fail its HEAD without a body read stealing the arming.
     void failNextReadWith(const String & key, std::exception_ptr error);
+    void failNextHeadWith(const String & key, std::exception_ptr error);
 
     /// Runs before a write of `key` is applied, with no backend lock held -- so a hook may itself read
     /// and write this backend, which is what it exists for: a hook that replaces `key` models a
@@ -230,6 +233,7 @@ private:
     size_t refresh_credentials_calls_ = 0;
     ArmedFailures write_failures_;
     ArmedFailures read_failures_;
+    ArmedFailures head_failures_;
     Hooks before_write_hooks_;
     Hooks write_committed_hooks_;
 };
