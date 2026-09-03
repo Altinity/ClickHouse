@@ -224,7 +224,7 @@ struct ConcurrencyProbe
 class RejectFirstStagedCopyBackend final : public InMemoryBackend
 {
 public:
-    void publishBlob(const BlobPublishRequest & request) override
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override
     {
         if (std::holds_alternative<VerbatimStagedBlobPublication>(request.publication))
         {
@@ -239,7 +239,7 @@ public:
         {
             ++streaming_publications;
         }
-        InMemoryBackend::publishBlob(request);
+        InMemoryBackend::publish(request, access);
     }
 
     bool reject_copy = true;
