@@ -202,8 +202,9 @@ TEST(CASBackendGeneration, NativeHeadUsesNativeTokenMetadataApi)
     storage->ordinary_calls = 0;
     storage->native_calls = 0;
 
-    const auto hr = b->head(key);
-    ASSERT_TRUE(hr.exists);
+    DB::Cas::tests::OperationForTest op(*b);
+    const auto hr = (*op).head(key, Retry::once());
+    ASSERT_TRUE(hr.has_value());
     EXPECT_EQ(storage->native_calls, 1);
     EXPECT_EQ(storage->ordinary_calls, 0);
 }
@@ -225,9 +226,10 @@ TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
         out->finalize();
     }
 
-    const auto hr = b->head(key);
-    ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token.type, Dialect::Generation);
+    DB::Cas::tests::OperationForTest op(*b);
+    const auto hr = (*op).head(key, Retry::once());
+    ASSERT_TRUE(hr.has_value());
+    EXPECT_EQ(hr->incarnation.dialect(), Dialect::Generation);
     EXPECT_EQ(b->dialect(), Dialect::Generation);
 }
 
@@ -353,32 +355,14 @@ TEST(CASBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationSto
     EXPECT_FALSE(*ws2.s3_check_objects_after_upload_override);
 }
 
-/// C1: the three token-policy helpers are the single source of truth for how a Native-mode backend
-/// mints a HEAD/PUT token, gates a LIST token, and compares tokens. Characterizes the behavior the
-/// scattered call sites have today so the consolidation stays byte-for-byte behavior-preserving.
-TEST(CASBackendGeneration, TokenPolicyHelpersAreConsistentWithDialect)
-{
-    auto b = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
-
-    /// ETag dialect: head/put tokens carry ETag; list surfaces the same-typed token for a non-empty etag.
-    ASSERT_EQ(b->nativeTokenType(), Dialect::ETag);
-    EXPECT_EQ(b->tokenForHead("abc").type, Dialect::ETag);
-    EXPECT_EQ(b->tokenForHead("abc"), (Token{"abc", Dialect::ETag}));
-    ASSERT_TRUE(b->tokenForList("abc").has_value());
-    EXPECT_EQ(*b->tokenForList("abc"), b->tokenForHead("abc"));   /// list token == head token (same etag)
-    EXPECT_FALSE(b->tokenForList("").has_value());                /// empty etag => no list token
-
-    /// Generation dialect (GCS): head token flips to Generation; list tokens are disabled wholesale
-    /// (poisoned If-Match), so tokenForList is always nullopt regardless of the etag.
-    b->setNativeTokenTypeForTest(Dialect::Generation);
-    EXPECT_EQ(b->tokenForHead("g1").type, Dialect::Generation);
-    EXPECT_FALSE(b->tokenForList("g1").has_value());
-
-    /// tokenMatches is exact identity (value AND type) — a same-value/different-type token never matches.
-    EXPECT_TRUE(ObjectStorageBackend::tokenMatches(Token{"x", Dialect::ETag}, Token{"x", Dialect::ETag}));
-    EXPECT_FALSE(ObjectStorageBackend::tokenMatches(Token{"x", Dialect::ETag}, Token{"x", Dialect::Emulated}));
-}
+/// `tokenForHead` and `tokenMatches` were deleted with the `Token` type they built: minting an
+/// incarnation and comparing it against a precondition are now `CasRequests::mint`/`tryMint` and
+/// `CasRequests::valueFor`, always stamped with the observing backend's own dialect, so no caller can
+/// construct or compare one by hand any more. The remaining piece, `tokenForList`'s ETag/Generation
+/// gating, stays pinned by `CASBackendGeneration.ListTokensDisabledOnGenerationStores` above;
+/// dialect-aware value validation is `CASBackendGrammar.GenerationDialectAcceptsOnlyCanonicalPositiveDecimal`
+/// and the cross-backend precondition guard `CASObjectStorageBackend.EmuTokenSurvivesProcessRestartAcrossRecreate`,
+/// both in gtest_cas_backend.cpp.
 
 #if USE_AWS_S3
 
@@ -638,7 +622,8 @@ TEST(CASBackendGeneration, PublishBlobAboveFormerGenerationCapUsesOrdinaryMultip
     backend.setNativeTokenTypeForTest(Dialect::Generation);
 
     const String payload(1024, 'x');
-    backend.publishBlob(BlobPublishRequest{
+    DB::Cas::tests::OperationForTest op(backend);
+    (*op).publish(BlobPublishRequest{
         .destination_key = "p/gen/publish-multipart",
         .publication = StreamingBlobPublication{
             .payload_size = payload.size(),
@@ -646,7 +631,7 @@ TEST(CASBackendGeneration, PublishBlobAboveFormerGenerationCapUsesOrdinaryMultip
             .open_payload = [payload]
             {
                 return std::make_unique<DB::ReadBufferFromOwnString>(payload);
-            }}});
+            }}}, Retry::once());
 
     EXPECT_EQ(client->put_object_calls, 0u);
     EXPECT_EQ(client->create_multipart_calls, 1u);
@@ -668,7 +653,8 @@ TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
     client->put_returns_no_etag = true;
 
     const String payload = "payload";
-    EXPECT_NO_THROW(backend.publishBlob(BlobPublishRequest{
+    DB::Cas::tests::OperationForTest op(backend);
+    EXPECT_NO_THROW((*op).publish(BlobPublishRequest{
         .destination_key = "p/gen/publish-no-generation",
         .publication = StreamingBlobPublication{
             .payload_size = payload.size(),
@@ -676,7 +662,7 @@ TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
             .open_payload = [payload]
             {
                 return std::make_unique<DB::ReadBufferFromOwnString>(payload);
-            }}}));
+            }}}, Retry::once()));
 
     EXPECT_EQ(client->put_object_calls, 1u);
     EXPECT_EQ(client->head_object_calls, 0u);
@@ -699,8 +685,9 @@ TEST(CASBackendGrammar, NamelessWriteResponseThrowsWriteUnattributed)
     ASSERT_EQ(backend.nativeTokenType(), Dialect::ETag);
     client->put_returns_no_etag = true;
 
+    DB::Cas::tests::OperationForTest op(backend);
     DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED, [&] { backend.putIfAbsent("p/gen/nameless-write", "v"); });
+        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED, [&] { (*op).create("p/gen/nameless-write", "v", Retry::once()); });
     EXPECT_EQ(client->put_object_calls, 1u);
 }
 
@@ -717,7 +704,8 @@ TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPut
     backend.setNativeTokenTypeForTest(Dialect::Generation);
 
     const String small(32, 'a');
-    EXPECT_NO_THROW(backend.casPut("p/gen/under-cap", small, std::nullopt, ObjectMeta{}));
+    DB::Cas::tests::OperationForTest op(backend);
+    EXPECT_NO_THROW((*op).create("p/gen/under-cap", small, Retry::once()));
     EXPECT_EQ(client->put_object_calls, 1u);
     EXPECT_EQ(client->create_multipart_calls, 0u);
     const auto single_attempt_client = storage->getSingleAttemptClient(/*request_timeout_ms=*/0);
@@ -730,7 +718,7 @@ TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPut
     const String large(4096, 'b');
     try
     {
-        backend.casPut("p/gen/over-cap", large, std::nullopt, ObjectMeta{});
+        (*op).create("p/gen/over-cap", large, Retry::once());
         FAIL() << "a conditional write above the cap must refuse, not go multipart";
     }
     catch (const DB::Exception & e)
@@ -755,9 +743,10 @@ TEST_F(CASBackendGenerationS3, WriteEmptyGenerationIsUnattributed)
     client->next_put_etag = "";
     /// The write may well have landed -- an empty response value says nothing about that -- so this is
     /// the resolve-by-reading class, not the corrupt-response one.
+    DB::Cas::tests::OperationForTest op(*backend);
     DB::Cas::tests::expectThrowsCode(
         DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED,
-        [&] { backend->putIfAbsent("p/gen/no-etag", "v"); });
+        [&] { (*op).create("p/gen/no-etag", "v", Retry::once()); });
 }
 
 TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationIsUnattributed)
@@ -766,9 +755,10 @@ TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationIsUnattributed)
     /// An MD5-shaped ETag where a generation belongs: the store answered, but not with an incarnation
     /// this dialect can use, and no follow-up read can attribute the write on its behalf.
     client->next_put_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+    DB::Cas::tests::OperationForTest op(*backend);
     DB::Cas::tests::expectThrowsCode(
         DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED,
-        [&] { backend->putIfAbsent("p/gen/bad-etag", "v"); });
+        [&] { (*op).create("p/gen/bad-etag", "v", Retry::once()); });
 }
 
 /// A mutable conditional write whose response generation arrives quoted -- exactly what
@@ -778,9 +768,12 @@ TEST_F(CASBackendGenerationS3, WriteGenerationTokenStripsTransportQuoting)
 {
     backend = makeBackend();
     client->next_put_etag = "\"1783078552147137\"";
-    const auto put = backend->putIfAbsent("p/gen/quoted-write", "v");
-    ASSERT_EQ(put.outcome, PutOutcome::Done);
-    EXPECT_EQ(put.token, (Token{"1783078552147137", Dialect::Generation}));
+    DB::Cas::tests::OperationForTest op(*backend);
+    const WriteResult put = (*op).create("p/gen/quoted-write", "v", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(put));
+    const Etag & minted = std::get<Committed>(put).incarnation;
+    EXPECT_EQ(minted.dialect(), Dialect::Generation);
+    EXPECT_EQ(PersistedEtag::capture(minted).value, "1783078552147137");
 }
 
 /// The same crossing on the read side: a marked HEAD whose ETag field carries a quoted generation
@@ -792,9 +785,11 @@ TEST_F(CASBackendGenerationS3, HeadGenerationTokenStripsTransportQuoting)
     client->objects["p/gen/quoted-head"] = "body";
     client->next_head_etag = "\"1783078552147137\"";
 
-    const auto hr = backend->head("p/gen/quoted-head");
-    ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token, (Token{"1783078552147137", Dialect::Generation}));
+    DB::Cas::tests::OperationForTest op(*backend);
+    const auto hr = (*op).head("p/gen/quoted-head", Retry::once());
+    ASSERT_TRUE(hr.has_value());
+    EXPECT_EQ(hr->incarnation.dialect(), Dialect::Generation);
+    EXPECT_EQ(PersistedEtag::capture(hr->incarnation).value, "1783078552147137");
 }
 
 /// The bound on that stripping. An ETag-dialect token IS the quoted ETag, and the quotes are required
@@ -806,9 +801,11 @@ TEST_F(CASBackendGenerationS3, EtagDialectKeepsTransportQuotingVerbatim)
     client->objects["p/etag/quoted-head"] = "body";
     client->next_head_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
 
-    const auto hr = backend->head("p/etag/quoted-head");
-    ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token, (Token{"\"d41d8cd98f00b204e9800998ecf8427e\"", Dialect::ETag}));
+    DB::Cas::tests::OperationForTest op(*backend);
+    const auto hr = (*op).head("p/etag/quoted-head", Retry::once());
+    ASSERT_TRUE(hr.has_value());
+    EXPECT_EQ(hr->incarnation.dialect(), Dialect::ETag);
+    EXPECT_EQ(PersistedEtag::capture(hr->incarnation).value, "\"d41d8cd98f00b204e9800998ecf8427e\"");
 }
 
 /// A successful HEAD on a generation-dialect backend whose response carries no ETag/generation at all must not mint a token
@@ -819,8 +816,9 @@ TEST_F(CASBackendGenerationS3, HeadMissingGenerationThrows)
     client->objects["p/gen/no-generation-head"] = "body";
     /// next_head_etag stays empty: SetETag is never called, so the response carries no ETag field.
 
+    DB::Cas::tests::OperationForTest op(*backend);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { backend->head("p/gen/no-generation-head"); });
+        [&] { (*op).head("p/gen/no-generation-head", Retry::once()); });
 }
 
 /// An ordinary AWS-style ETag reaching a generation-dialect backend through a successful HEAD (a proxy dropping
@@ -831,8 +829,9 @@ TEST_F(CASBackendGenerationS3, HeadNonNumericGenerationThrows)
     client->objects["p/gen/bad-etag-head"] = "body";
     client->next_head_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
 
+    DB::Cas::tests::OperationForTest op(*backend);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { backend->head("p/gen/bad-etag-head"); });
+        [&] { (*op).head("p/gen/bad-etag-head", Retry::once()); });
 }
 
 #endif
