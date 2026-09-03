@@ -166,8 +166,6 @@ public:
 class RecoveryLatchBackend : public CountingBackend
 {
 public:
-    using CountingBackend::getStream;
-
     /// Set before the driving call; consumed by the first matching recovery read.
     String fail_get_once_key;
 
@@ -756,7 +754,6 @@ TEST(CASConfirmExactRef, WedgedTransactionRefusesEveryRef)
     /// for the whole call while the injected clock below carries the call to its own deadline.
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     auto store = openPoolWithConfig(backend, cfg);
