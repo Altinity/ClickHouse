@@ -551,5 +551,3 @@ TEST(CASGCReadAhead, WorkerReadFaultFailsTheRoundAndTheNextRoundRecovers)
     const RoundReport recovered = gc.runRegularRound();
     EXPECT_TRUE(recovered.acquired_lease);
 }
-
-// temporary diagnostic appended to the suite

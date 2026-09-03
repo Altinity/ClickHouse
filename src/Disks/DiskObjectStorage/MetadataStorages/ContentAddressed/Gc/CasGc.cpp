@@ -3970,9 +3970,15 @@ RebuildReport Gc::rebuildBaseline(bool force)
     CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
     /// The rebuild reads through the same seam the fold does, so the two share one implementation of
-    /// "read this key". It HINTS nothing: a rebuild's reads are already driven by a plan it holds in
-    /// memory, and nothing here is on the round-latency path the read-ahead exists for. Every take is
-    /// therefore the inline read this function always performed.
+    /// "read this key" rather than growing a second.
+    ///
+    /// WHAT THAT MEANS HERE, exactly: `readCheckpointWitnesses` hints its own keys and does not ask who
+    /// called it, so the rebuild's checkpoint reads ARE fetched ahead, on the same pool and by the same
+    /// rule as the fold's. That is a gain and not an accident -- a rebuild reads every namespace's
+    /// checkpoint too. Nothing on THIS path hints a manifest key, so `foldManifestEdges` below takes
+    /// them one at a time, exactly as it did before: a rebuild walks a plan it already holds rather
+    /// than discovering its next key from the body it just read, so a lookahead would have nothing to
+    /// hide behind.
     GcReadAhead reads(op, store->openRequests(), *read_pool, store->poolConfig().gc_read_concurrency);
 
     /// Read bookkeeping health before the lease (the lease acquire on an absent state CREATES a
