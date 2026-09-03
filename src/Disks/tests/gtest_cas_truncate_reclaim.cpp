@@ -77,7 +77,7 @@ bool anyRetiredPending(const PoolPtr & s)
 {
     /// Condemned state rides the adopted fold seal's RunMarker::Condemned rows, not a
     /// separate retired list — reconstruct the in-flight set from the seal.
-    return DB::Cas::tests::anyCondemnedInSeal(s->backend(), s->layout());
+    return DB::Cas::tests::anyCondemnedInSeal(*s->poolBackendPtr(), s->layout());
 }
 
 /// Run regular GC rounds until a fixpoint over the ACK-FLOOR round. A condemned blob is deleted only a
@@ -276,7 +276,7 @@ TEST(CASTruncateReclaim, DropNamespaceLeavesSharedBlobDebrisForPerpetualSweep)
             << "an emptied pool must drain instead of standing still; the sweep owned these blobs and "
                "reclaimed them within " << rounds << " GC rounds";
         EXPECT_EQ(after.reachable, 0u);
-        DB::Cas::CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(s->backend());
+        DB::Cas::CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(s->poolBackendPtr());
         DB::Cas::CasOperation catalog_op = catalog_requests.admit();
         EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, s->layout(), ns))
             << "physical debris must not keep the logical namespace life cataloged";
