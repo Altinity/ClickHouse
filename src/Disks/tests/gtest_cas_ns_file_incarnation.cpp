@@ -74,12 +74,14 @@ TEST(CASNsFileIncarnation, ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval)
     const String old_key = layout.namespaceFileKey(*old_life, kFile);
     backend->hide(old_key);
 
-    ASSERT_TRUE(backend->head(old_key).exists) << "the lie must be in LIST only -- the object is durable";
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+
+    ASSERT_TRUE(catalog_op.head(old_key, Retry::standard()).has_value())
+        << "the lie must be in LIST only -- the object is durable";
     ASSERT_TRUE(store->listNamespaceFiles(*old_life).empty())
         << "precondition: enumeration omits the file, so no cleanup pass can ever find it";
     const size_t holes_before_gc = backend->holesServed();
-    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
-    CasOperation catalog_op = catalog_requests.admit();
 
     store->dropNamespace(ns);
     ASSERT_TRUE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns));
@@ -94,9 +96,9 @@ TEST(CASNsFileIncarnation, ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval)
     ASSERT_GT(backend->holesServed(), holes_before_gc)
         << "the GC janitor must observe the injected LIST hole after the explicit precondition LIST";
 
-    const auto old_head = backend->head(old_key);
-    ASSERT_TRUE(old_head.exists) << "logical removal must not depend on physical empty";
-    const auto old_object = backend->get(old_key);
+    const auto old_head = catalog_op.head(old_key, Retry::standard());
+    ASSERT_TRUE(old_head.has_value()) << "logical removal must not depend on physical empty";
+    const auto old_object = catalog_op.read(old_key, Retry::standard());
     ASSERT_TRUE(old_object);
     EXPECT_EQ(old_object->bytes, old_bytes);
 
@@ -211,20 +213,21 @@ TEST(CASNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
         .last_epoch_seal = std::nullopt,
     });
     const String debris_key = layout.namespaceFileKey(life, kFile);
-    backend->putIfAbsent(debris_key, "1\n");
-    backend->putIfAbsent(layout.namespaceFileKey(life, "deduplication_logs/deduplication_log_1.txt"), "records");
+    catalog_op.create(debris_key, "1\n", Retry::once());
+    catalog_op.create(layout.namespaceFileKey(life, "deduplication_logs/deduplication_log_1.txt"), "records", Retry::once());
 
     Gc gc(store, kGcId);
     gc.runRegularRound();
 
     /// Folding the terminal records positive evidence on the same life row even though files remain.
-    const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState state = decodeGcState(catalog_op.read(layout.gcStateKey(), Retry::standard())->bytes);
     ASSERT_GT(state.snap_generation, 0u);
     const CasFoldSeal seal = decodeFoldSeal(
-        backend->get(layout.foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+        catalog_op.read(layout.foldSealKey(state.snap_generation, state.snap_attempt), Retry::standard())->bytes);
     const auto row_it = seal.ref_lives.find(life.incarnation);
     ASSERT_NE(row_it, seal.ref_lives.end());
     ASSERT_TRUE(row_it->second.cleanup_evidence.has_value());
     EXPECT_EQ(row_it->second.cleanup_evidence->remove_txn_id, (RefTxnId{1, 1}));
-    EXPECT_TRUE(backend->head(debris_key).exists) << "cleanup evidence does not gate on physical deletion";
+    EXPECT_TRUE(catalog_op.head(debris_key, Retry::standard()).has_value())
+        << "cleanup evidence does not gate on physical deletion";
 }
