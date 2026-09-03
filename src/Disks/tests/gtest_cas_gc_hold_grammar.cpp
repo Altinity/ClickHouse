@@ -141,9 +141,10 @@ std::optional<CasFoldSeal> newestSeal(Backend & backend, const Layout & layout)
 {
     const uint64_t gen = currentGenerationOf(backend, layout);
     const uint64_t attempt = currentAttemptOf(backend, layout);
+    OperationForTest op(backend);
     for (uint64_t g = gen; ; --g)
     {
-        if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
+        if (const auto got = (*op).read(layout.foldSealKey(g, attempt), Retry::once()))
             return decodeFoldSeal(got->bytes);
         if (g == 0)
             return std::nullopt;
@@ -323,6 +324,53 @@ std::vector<std::pair<const char *, CasFoldSeal>> illFormedSealsTheEncoderMustRe
     out.emplace_back("a hold position with a zero component is not a renderable id", hold_zero_sequence);
 
     return out;
+}
+
+/// ---- Small raw-fixture request-engine wrappers shared by the tests below ----
+/// (`head`/`get`/`putOverwrite`/`putIfAbsent`/`deleteExact` are the legacy `Backend` verbs; every
+/// caller now goes through an admitted `CasOperation`.)
+
+/// The durable object at `key`, or `nullopt`.
+std::optional<Object> readAt(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).read(key, Retry::once());
+}
+
+/// True iff `key` exists.
+bool existsAt(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).head(key, Retry::once()).has_value();
+}
+
+/// Unconditional create of a fresh key (the fixture's own corruption/injection setup, never a
+/// real conflict).
+void createAt(Backend & backend, const String & key, const String & bytes)
+{
+    OperationForTest op(backend);
+    EXPECT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
+}
+
+/// Head, then unconditionally overwrite what was seen -- the raw-fixture corruption idiom this file's
+/// tests use to replace an object's body in place.
+void headThenReplace(Backend & backend, const String & key, const String & bytes)
+{
+    OperationForTest op(backend);
+    const auto current = (*op).head(key, Retry::once());
+    EXPECT_TRUE(current.has_value()) << "expected '" << key << "' to exist before overwrite";
+    if (current)
+        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, bytes, current->incarnation, Retry::once())));
+}
+
+/// Head, then exact-delete what was seen -- the raw-fixture corruption idiom for removing an object
+/// this test just observed present.
+void headThenRemove(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    const auto current = (*op).head(key, Retry::once());
+    ASSERT_TRUE(current.has_value()) << "expected '" << key << "' to exist before removal";
+    ASSERT_EQ((*op).remove(key, current->incarnation, Retry::once()), Removal::Removed);
 }
 
 }
@@ -724,7 +772,10 @@ TEST(CASGCHoldGrammar, UndecodableBodyNamesTheRecordItCouldNotRead)
     fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
-    backend->putIfAbsent(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 2}), "this is not a cas_ref_log object");
+    {
+        OperationForTest op(*backend);
+        (*op).create(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 2}), "this is not a cas_ref_log object", Retry::once());
+    }
     writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 2});
 
     Gc gc(store, kGc);
@@ -971,22 +1022,23 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     /// Corrupt EXACTLY ONE OBJECT: the first namespace's `_ckpt` body. Nothing else in the pool changes,
     /// so everything the next round does differently is attributable to this one object.
     const String bad_ckpt_key = layout.refCkptKey(fixture::fixtureLife(bad));
-    const HeadResult ckpt_head = backend->head(bad_ckpt_key);
-    ASSERT_TRUE(ckpt_head.exists);
-    ASSERT_EQ(backend->putOverwrite(bad_ckpt_key, "this is not a cas_ref_ckpt", ckpt_head.token).outcome,
-              PutOutcome::Done);
+    OperationForTest corrupt_op(*backend);
+    const auto ckpt_head = (*corrupt_op).head(bad_ckpt_key, Retry::once());
+    ASSERT_TRUE(ckpt_head.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*corrupt_op).replace(bad_ckpt_key, "this is not a cas_ref_ckpt", ckpt_head->incarnation, Retry::once())));
 
     /// Work only a round that COMPLETES can fold.
     publishAt(*backend, layout, good, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(12));
     const String good_ckpt_key = layout.refCkptKey(fixture::fixtureLife(good));
-    const HeadResult good_ckpt_head = backend->head(good_ckpt_key);
-    ASSERT_TRUE(good_ckpt_head.exists);
-    ASSERT_EQ(backend->putOverwrite(good_ckpt_key, encodeRefCkpt(RefCkpt{
+    const auto good_ckpt_head = (*corrupt_op).head(good_ckpt_key, Retry::once());
+    ASSERT_TRUE(good_ckpt_head.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>((*corrupt_op).replace(good_ckpt_key, encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
         .last_epoch_seal = std::nullopt,
-    }), good_ckpt_head.token).outcome, PutOutcome::Done);
+    }), good_ckpt_head->incarnation, Retry::once())));
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
@@ -1009,7 +1061,7 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     /// its ref objects — including the ones a cleanup range computed WITHOUT the unreadable checkpoint
     /// would have widened onto — are all still there.
     for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}})
-        EXPECT_TRUE(backend->head(layout.refLogKey(fixture::fixtureLife(bad), id)).exists)
+        EXPECT_TRUE(existsAt(*backend, layout.refLogKey(fixture::fixtureLife(bad), id)))
             << "ref log " << renderRefTxnId(id) << " of the held namespace was deleted";
 }
 
@@ -1051,7 +1103,7 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
     fixture::admitLive(*backend, layout, phantom);
 
     /// A lone `_ckpt` with an undecodable body, and NOTHING else under that namespace.
-    backend->putIfAbsent(layout.refCkptKey(fixture::fixtureLife(phantom)), "this is not a cas_ref_ckpt");
+    createAt(*backend, layout.refCkptKey(fixture::fixtureLife(phantom)), "this is not a cas_ref_ckpt");
     publishAt(*backend, layout, good, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(11), /*birth=*/true);
     writeCommittedCkptAt(*backend, layout, good, RefTxnId{1, 1});
 
@@ -1087,7 +1139,7 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
 
     /// The unreadable object itself is never deleted as debris — repairing it is the operator's move,
     /// and GC removing it would erase the only evidence of what stopped the namespace.
-    EXPECT_TRUE(backend->head(layout.refCkptKey(fixture::fixtureLife(phantom))).exists);
+    EXPECT_TRUE(existsAt(*backend, layout.refCkptKey(fixture::fixtureLife(phantom))));
 }
 
 /// ===================== THE HOLD IS DURABLE =====================
@@ -1202,9 +1254,13 @@ void mutateSealAt(Backend & backend, const Layout & layout, uint64_t generation,
                   const std::function<void(CasFoldSeal &)> & mutate)
 {
     const String key = layout.foldSealKey(generation, attempt);
-    CasFoldSeal seal = decodeFoldSeal(backend.get(key)->bytes);
+    OperationForTest op(backend);
+    CasFoldSeal seal = decodeFoldSeal((*op).read(key, Retry::once())->bytes);
     mutate(seal);
-    backend.putOverwrite(key, encodeFoldSeal(seal), backend.head(key).token);
+    const auto current = (*op).head(key, Retry::once());
+    EXPECT_TRUE(current.has_value());
+    if (current)
+        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, encodeFoldSeal(seal), current->incarnation, Retry::once())));
 }
 
 /// Rewrite the adopted fold seal, applying `mutate` to it. Used to plant a hold that the rebuild must
@@ -1212,11 +1268,15 @@ void mutateSealAt(Backend & backend, const Layout & layout, uint64_t generation,
 /// the carry, not about how the hold arose.
 void mutateAdoptedSeal(Backend & backend, const Layout & layout, const std::function<void(CasFoldSeal &)> & mutate)
 {
-    const GcState st = decodeGcState(backend.get(layout.gcStateKey())->bytes);
+    OperationForTest op(backend);
+    const GcState st = decodeGcState((*op).read(layout.gcStateKey(), Retry::once())->bytes);
     const String key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    CasFoldSeal seal = decodeFoldSeal(backend.get(key)->bytes);
+    CasFoldSeal seal = decodeFoldSeal((*op).read(key, Retry::once())->bytes);
     mutate(seal);
-    backend.putOverwrite(key, encodeFoldSeal(seal), backend.head(key).token);
+    const auto current = (*op).head(key, Retry::once());
+    EXPECT_TRUE(current.has_value());
+    if (current)
+        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, encodeFoldSeal(seal), current->incarnation, Retry::once())));
 }
 
 RefHold plantedHold()
@@ -1290,7 +1350,7 @@ TEST(CASGCHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 1});
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-    const GcState after_first = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState after_first = decodeGcState(readAt(*backend, layout.gcStateKey())->bytes);
     const uint64_t older_generation = after_first.snap_generation;
     const uint64_t older_attempt = after_first.snap_attempt;
     const UInt128 life_id = catalogLifeIdForTest(*backend, layout, ns);
@@ -1298,7 +1358,7 @@ TEST(CASGCHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
     advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, 2});
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-    const GcState after_second = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState after_second = decodeGcState(readAt(*backend, layout.gcStateKey())->bytes);
     ASSERT_GT(after_second.snap_generation, older_generation) << "the fixture needs two generations";
 
     /// The older generation is the one holding the pool's durable hold.
@@ -1312,13 +1372,13 @@ TEST(CASGCHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     /// THE CRASH: the newest generation's run objects are there, its seal never got written. Then
     /// `gc/state` is lost, which is this path's whole premise.
     const String newest_seal = layout.foldSealKey(after_second.snap_generation, after_second.snap_attempt);
-    const HeadResult seal_head = backend->head(newest_seal);
-    ASSERT_TRUE(seal_head.exists);
-    ASSERT_EQ(backend->deleteExact(newest_seal, seal_head.token).kind, DeleteOutcome::Kind::Deleted);
-    ASSERT_FALSE(backend->list(layout.gcGenPrefix(after_second.snap_generation), "", 1).keys.empty())
-        << "the crashed generation must still hold objects, or it is not the shape being modelled";
-    const HeadResult sh = backend->head(layout.gcStateKey());
-    ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
+    headThenRemove(*backend, newest_seal);
+    {
+        OperationForTest op(*backend);
+        ASSERT_FALSE((*op).list(layout.gcGenPrefix(after_second.snap_generation), "", 1, Retry::once()).keys.empty())
+            << "the crashed generation must still hold objects, or it is not the shape being modelled";
+    }
+    headThenRemove(*backend, layout.gcStateKey());
 
     Gc gc2(store, hexToU128("0000000000000000000000000000000c"));
     const RebuildReport rep = gc2.rebuildBaseline(/*force=*/false);
@@ -1352,12 +1412,10 @@ TEST(CASGCHoldGrammar, RebuildRefusesWithAMissingPriorSeal)
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
-    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState st = decodeGcState(readAt(*backend, layout.gcStateKey())->bytes);
     ASSERT_GT(st.snap_generation, 0u);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    const HeadResult sh = backend->head(seal_key);
-    ASSERT_TRUE(sh.exists);
-    ASSERT_EQ(backend->deleteExact(seal_key, sh.token).kind, DeleteOutcome::Kind::Deleted);
+    headThenRemove(*backend, seal_key);
 
     /// FORCE does not buy past it either: force means "rebuild deliberately", never "drop the holds".
     for (const bool force : {false, true})
@@ -1366,7 +1424,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWithAMissingPriorSeal)
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.rebuildBaseline(force); });
     }
 
-    const GcState after = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState after = decodeGcState(readAt(*backend, layout.gcStateKey())->bytes);
     EXPECT_EQ(after.snap_generation, st.snap_generation) << "a refused rebuild adopts nothing";
 }
 
@@ -1381,10 +1439,9 @@ TEST(CASGCHoldGrammar, RebuildRefusesWithAnUndecodablePriorSeal)
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
-    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState st = decodeGcState(readAt(*backend, layout.gcStateKey())->bytes);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":1}\nthis is not a seal body\n",
-                          backend->head(seal_key).token);
+    headThenReplace(*backend, seal_key, "{\"type\":\"cas_fold_seal\",\"v\":1}\nthis is not a seal body\n");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.rebuildBaseline(/*force=*/true); });
 }
@@ -1423,9 +1480,7 @@ TEST(CASGCHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
     });
 
     /// The pointer vanishes; every seal object survives.
-    const HeadResult sh = backend->head(layout.gcStateKey());
-    ASSERT_TRUE(sh.exists);
-    ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
+    headThenRemove(*backend, layout.gcStateKey());
 
     Gc gc2(store, hexToU128("00000000000000000000000000000009"));
     const RebuildReport rep = gc2.rebuildBaseline(/*force=*/false);
@@ -1453,12 +1508,10 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsL
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
-    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState st = decodeGcState(readAt(*backend, layout.gcStateKey())->bytes);
     const String seal_key = layout.foldSealKey(st.snap_generation, st.snap_attempt);
-    backend->putOverwrite(seal_key, "{\"type\":\"cas_fold_seal\",\"v\":1}\nthis is not a seal body\n",
-                          backend->head(seal_key).token);
-    const HeadResult sh = backend->head(layout.gcStateKey());
-    ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
+    headThenReplace(*backend, seal_key, "{\"type\":\"cas_fold_seal\",\"v\":1}\nthis is not a seal body\n");
+    headThenRemove(*backend, layout.gcStateKey());
 
     Gc gc2(store, hexToU128("0000000000000000000000000000000a"));
     for (const bool force : {false, true})
@@ -1520,7 +1573,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
-    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState st = decodeGcState(readAt(*backend, layout.gcStateKey())->bytes);
     ASSERT_GT(st.snap_generation, 1u) << "the fixture needs a newer generation to hide";
     const UInt128 life_id = catalogLifeIdForTest(*backend, layout, ns);
     mutateAdoptedSeal(*backend, layout, [&](CasFoldSeal & seal)
@@ -1534,8 +1587,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
     const String gen_prefix = layout.gcGenPrefix(0);
     backend->hide_under_prefix = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
     backend->hidden_key_infix = layout.gcGenPrefix(st.snap_generation);
-    const HeadResult sh = backend->head(layout.gcStateKey());
-    ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);
+    headThenRemove(*backend, layout.gcStateKey());
 
     Gc gc2(store, hexToU128("0000000000000000000000000000000b"));
     for (const bool force : {false, true})
@@ -1546,7 +1598,7 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
     ASSERT_GT(backend->holes_served, 0u) << "the broad listing never actually lied";
 
     /// Nothing was adopted: the refusal fires before the lease, so the pool is exactly as it was.
-    EXPECT_FALSE(backend->head(layout.gcStateKey()).exists)
+    EXPECT_FALSE(existsAt(*backend, layout.gcStateKey()))
         << "a refused rebuild must not mint a baseline, nor a bootstrap body";
 }
 
@@ -1566,7 +1618,7 @@ TEST(CASGCHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaselineAndCountsTh
     /// No round has run, so there is no `gc/state` and no seal — only owner state to rebuild from.
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 1});
-    ASSERT_FALSE(backend->head(layout.gcStateKey()).exists);
+    ASSERT_FALSE(existsAt(*backend, layout.gcStateKey()));
 
     using ProfileEvents::global_counters;
     const auto virgin_before = global_counters[ProfileEvents::CASGCRebuildVirginByEnumeration].load();
