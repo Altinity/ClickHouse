@@ -75,12 +75,12 @@ namespace
 
 const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 
-/// The `CASCatalogLifecycleReconciler` suites drive the reconciler directly and own the fact its
-/// operation's liveness samples -- `DrainRaceBackend::afterReadOf` moves it at an exact request
-/// boundary -- so there is nothing for a refresh to re-read. Named rather than an inline `{}` because
-/// `reconcile` takes the argument by requirement, precisely so that erasing without a refresh has to
+/// The `CASCatalogLifecycleReconciler` suites hand their operation a liveness that reads a local bool
+/// directly, and `DrainRaceBackend::afterReadOf` moves that bool at an exact request boundary -- so
+/// nothing is cached behind a read and there is nothing for a refresh to re-read. Named rather than an
+/// inline no-op because the argument is mandatory, precisely so that erasing without a refresh has to
 /// be said out loud.
-const std::function<void()> kNoAuthorityRefresh{};
+void noAuthorityRefresh() {}
 
 /// The lying store, shared from `cas_test_helpers.h`: every key is served by exact GET while the
 /// selected ones are HIDDEN from every LIST. That is the only way to build the cross-namespace
@@ -2940,7 +2940,7 @@ TEST(CASCatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
 
     CasFoldSeal parent;
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
@@ -2966,7 +2966,7 @@ TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCut
     backend->resetCounts();
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
@@ -3003,7 +3003,7 @@ TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterRes
     });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowAbsent);
@@ -3033,7 +3033,7 @@ TEST(CASCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPrese
     backend->afterReadOf(layout.refCatalogKey(), [&] { authority_held = false; });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowStillPresent);
@@ -3064,7 +3064,7 @@ TEST(CASCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut
     backend->conflictNextCatalogCas(layout.refCatalogKey());
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(noAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
@@ -3114,12 +3114,13 @@ TEST(CASGCFrontierGate, ADeposedLeaderErasesNoCatalogRow)
         << "and no catalog write was even attempted";
 }
 
-/// THE SAME AUTHORITY, now DURING the drain. A drain erases one row per iteration, so what stops a
-/// leader deposed between two erases is the refresh the reconciler runs at the top of each one: the
-/// first row goes, the second is never attempted, and the drain reports `FencedOut` from the cut it
-/// already holds. One reading taken before the drain would carry across both erases: the erase count
-/// and the surviving-row count below are what catch that, since an unrefreshed drain sends a second
-/// erase and empties the catalog under a lease this leader no longer owns.
+/// THE SAME AUTHORITY, now DURING the drain. A drain erases one row per iteration, and what stops a
+/// leader deposed between two erases is the refresh the ERASE runs at the top of every attempt (the
+/// reconciler only forwards it): the first row goes, the second is never attempted, and the drain
+/// reports `FencedOut` from the cut it already holds. One reading taken before the drain would
+/// authorise both erases: the erase count and the surviving-row count below are what catch that,
+/// since an unrefreshed drain sends a second erase and empties the catalog under a lease this leader
+/// no longer owns.
 TEST(CASGCFrontierGate, ALeaderDeposedBetweenTwoErasesStopsAfterTheFirst)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
