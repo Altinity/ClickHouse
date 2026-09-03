@@ -4542,12 +4542,14 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     /// The drain erases catalog rows, so its operation carries this leader's authority as its
     /// liveness: `CatalogLifecycleReconciler` and `deleteCompletedRemovingAtSnapshot` decide
     /// `FencedOut` from `op.admitted()`, and the GC plane's fence is open, so without this the verdict
-    /// would be a constant TRUE and a deposed leader would keep erasing. The read that settles it is
-    /// made once here, before the drain begins -- a leader deposed BETWEEN two erases of the same drain
-    /// is not caught, which needs a refresh point inside the reconciler's own loop.
-    refreshAuthority(leased_state.lease.seq);
+    /// would be a constant TRUE and a deposed leader would keep erasing. The refresh the reconciler
+    /// calls re-reads it at the top of every erase, so a leader deposed between two erases of one
+    /// drain stops before the second -- one reading taken here would carry across all of them.
+    const uint64_t admitted_generation = leased_state.lease.seq;
+    refreshAuthority(admitted_generation);
     CasOperation op = store->gcRequests().admit([this] { return authority_held; });
-    return CatalogLifecycleReconciler(op, store->layout(), *parent).reconcile();
+    return CatalogLifecycleReconciler(op, store->layout(), *parent)
+        .reconcile([this, admitted_generation] { refreshAuthority(admitted_generation); });
 }
 
 }

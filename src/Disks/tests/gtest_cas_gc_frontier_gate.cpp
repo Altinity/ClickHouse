@@ -3101,6 +3101,56 @@ TEST(CASGCFrontierGate, ADeposedLeaderErasesNoCatalogRow)
         << "and no catalog write was even attempted";
 }
 
+/// THE SAME AUTHORITY, now DURING the drain. A drain erases one row per iteration, so what stops a
+/// leader deposed between two erases is the refresh the reconciler runs at the top of each one: the
+/// first row goes, the second is never attempted, and the drain reports `FencedOut` from the cut it
+/// already holds. One reading taken before the drain would carry across both erases: the erase count
+/// and the surviving-row count below are what catch that, since an unrefreshed drain sends a second
+/// erase and empties the catalog under a lease this leader no longer owns.
+TEST(CASGCFrontierGate, ALeaderDeposedBetweenTwoErasesStopsAfterTheFirst)
+{
+    auto backend = std::make_shared<DrainRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const Layout & layout = store->layout();
+    seedCompletedRemovingBatch(*backend, op, store, kGc, /*count=*/2);
+    const std::vector<RootNamespace> seeded{
+        RootNamespace{"00/drain-batch-0@cas@"}, RootNamespace{"00/drain-batch-1@cas@"}};
+    const uint64_t catalog_writes_before = backend->putOverwriteCount(layout.refCatalogKey());
+
+    /// The hook runs after every catalog read, and the first read it sees with an erase already behind
+    /// it is the resolution read that closed erase one -- exactly the window between the two erases.
+    /// Nothing before the drain reads or writes the catalog, so no earlier read can trip this.
+    bool deposed = false;
+    backend->afterReadOf(layout.refCatalogKey(), [&]
+    {
+        if (deposed || backend->putOverwriteCount(layout.refCatalogKey()) == catalog_writes_before)
+            return;
+        deposed = true;
+        const auto got = op.read(layout.gcStateKey(), Retry::once());
+        ASSERT_TRUE(got);
+        GcState stolen = decodeGcState(got->bytes);
+        stolen.lease.owner = hexToU128("00000000000000000000000000000099");
+        ++stolen.lease.seq;
+        EXPECT_TRUE(std::holds_alternative<Committed>(
+            op.replace(layout.gcStateKey(), encodeGcState(stolen), got->incarnation, Retry::once())));
+    });
+
+    Gc gc(store, kGc);
+    EXPECT_THROW(gc.runRegularRound(), DB::Exception)
+        << "a leader deposed inside its own drain must not finish the round";
+    EXPECT_TRUE(deposed) << "the round must have reached a catalog read after its first erase";
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), catalog_writes_before + 1)
+        << "one erase reached the store; the second was refused before it was sent";
+    size_t still_cataloged = 0;
+    for (const RootNamespace & ns : seeded)
+        if (CasRefCatalog::lifeIfCataloged(op, layout, ns))
+            ++still_cataloged;
+    EXPECT_EQ(still_cataloged, 1u)
+        << "one row was erased before the deposition; the other survives it";
+}
+
 TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
 {
     auto backend = std::make_shared<DrainRaceBackend>();

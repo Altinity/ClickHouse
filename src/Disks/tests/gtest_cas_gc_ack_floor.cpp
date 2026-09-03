@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <optional>
 #include <set>
 #include <vector>
@@ -1182,8 +1183,30 @@ TEST(CASGCAckFloor, AbsentBlobSettlesAsAbsentWithoutASpeculativeConditionalRemov
 TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
 {
     auto backend = std::make_shared<MetaWriteFaultBackend>();
+    /// A SWALLOWED write is the premise: the store may have applied it and said nothing, which is the
+    /// only shape that leaves the round committing an entry whose marker it cannot confirm. The
+    /// propagating kind never reaches the engine's resolve-and-reissue path at all -- the write loop
+    /// rethrows a non-`Poco::Exception` on its first attempt.
+    backend->armWriteFault(MetaWriteFaultBackend::FaultKind::Ambiguous);
     auto store = openPoolForTest(backend);
     store->setCasRetrySleepForTest([](uint64_t) {});
+
+    /// THE FAULT IS PERMANENT, so every condemn-marker write runs the engine's WHOLE retry window, and
+    /// that window has to run on a clock this test advances. A zeroed sleep alone does not do it: the
+    /// deadline is still measured against the real clock, so the loop would spin hot for ninety real
+    /// seconds per marker write. The sleep therefore moves the clock past its own pause -- plus one
+    /// millisecond, because full-jitter backoff may draw zero and a clock that never moves never closes
+    /// the window. Scoped to the GC plane, which is where `writeCondemnedMeta` runs, so the mount
+    /// plane's lease-bound policies keep their real clock.
+    std::atomic<uint64_t> engine_now_ms{0};
+    std::atomic<uint64_t> engine_sleeps{0};
+    store->gcRequests().setNowFnForTest([&] { return engine_now_ms.load(); });
+    store->gcRequests().setSleepFnForTest([&](uint64_t pause_ms)
+    {
+        engine_sleeps.fetch_add(1);
+        engine_now_ms.fetch_add(pause_ms + 1);
+    });
+
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -1194,9 +1217,18 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
 
     runRegularRoundReclaiming(gc);   // +1 folds; blob referenced
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    runRegularRoundReclaiming(gc);   // the condemning round; the controlled marker write exhausts as Unresolved
+    runRegularRoundReclaiming(gc);   // the condemning round; the marker write gives up without committing
     ASSERT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value())
         << "precondition: the injected fault must have lost the condemn-marker write";
+    /// The marker write was resolved and reissued, then gave up at its own policy window. A give-up
+    /// needs the next jittered pause not to fit before the deadline and full jitter draws at most five
+    /// seconds, so it cannot happen before the clock has passed `Retry::standard()`'s window minus
+    /// that draw. Both assertions pin the REISSUING, which is what the ambiguous kind buys; neither
+    /// can tell the injected clock from the real one -- that seam bounds the reissuing in real time.
+    EXPECT_GT(engine_sleeps.load(), 1u)
+        << "an ambiguous marker write must be resolved and reissued, not surfaced on its first attempt";
+    EXPECT_GT(engine_now_ms.load(), 85'000u)
+        << "the marker write must have spent its whole retry window before reporting failure";
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), blob).has_value())
         << "precondition: the retired entry must have been committed despite the lost marker";
 
