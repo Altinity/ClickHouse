@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
@@ -736,7 +736,7 @@ struct EpochCrossResult
 /// site above and simply did not pass it). Every caller must resolve `life` itself, ONCE, and pass the
 /// SAME value here that it uses for every other read in its own walk -- this function no longer
 /// resolves anything on its own, so there is no second resolution left to disagree with the first.
-EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, const RootNamespace & ns,
+EpochCrossResult crossEpochFromSeal(CasOperation & op, const Layout & layout, const RootNamespace & ns,
                                     const RefTxnId & from_seal, std::optional<bool> seal_proven,
                                     const RefTxnId & witness, const NamespaceLifeId & life);
 
@@ -767,8 +767,10 @@ struct RecoveredRefTable
 /// the named predecessor to be an `EpochSeal`, then read the snapshot. This order prevents a forged
 /// snapshot at any historical seal or contextually invalid epoch start from becoming state. Cleanup
 /// retains both the matching log and returned predecessor proof while the checkpoint names this base.
-/// When supplied, `admit_request` runs immediately before each raw backend request so a caller may
-/// refuse later requests without changing their durable order. Its default preserves read-only callers.
+/// Every read below is one of `op`'s own requests, so a caller that needs to refuse a later request
+/// mid-walk (a recovery attempt superseded while it runs) folds that fact into `op`'s `Liveness`
+/// predicate at admission rather than passing a callback here -- the operation already re-checks it
+/// before each request.
 struct CheckpointSnapshotBase
 {
     RefTableSnapshot snapshot;
@@ -779,8 +781,7 @@ struct CheckpointSnapshotBase
 };
 
 CheckpointSnapshotBase readCheckpointSnapshotBase(
-    Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefCkpt & checkpoint,
-    const std::function<void()> & admit_request = {});
+    CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const RefCkpt & checkpoint);
 
 /// Recover a ref table from ONE immutable lifecycle authority cut supplied by the caller. `catalog_entry`
 /// is either the exact row from that caller's frozen catalog cut or absence from that same cut; `ckpt` is
@@ -795,7 +796,7 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
 /// is deliberately no self-resolving compatibility overload: every consumer must pass the row from its
 /// frozen catalog cut explicitly.
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
-    Backend & backend, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
+    CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
     const std::optional<RefCkpt> & ckpt);
 
 }

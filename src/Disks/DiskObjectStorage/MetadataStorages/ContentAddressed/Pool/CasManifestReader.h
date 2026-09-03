@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
@@ -28,17 +28,18 @@ struct BlobLocation
 /// into the cache. A missing body, a decode failure or a failed identity check is surfaced as an
 /// exception, never as an empty or partially trusted manifest.
 ///
-/// The reader receives its backend, immutable layout and pool metadata, and event sink by reference;
-/// it has no `Pool` back-reference and owns no `Pool`-level mutex. The decode cache is a
-/// byte-weighted `CacheBase` LRU whose synchronization is internal to `CacheBase`; a null cache
-/// means caching is disabled (`manifest_decode_cache_bytes == 0`).
+/// The reader receives its `CasRequests`, immutable layout and pool metadata, and event sink by
+/// reference; it has no `Pool` back-reference and owns no `Pool`-level mutex. Each cache-miss read
+/// admits its own operation, so a lost mount lease refuses a miss the same way any other read does.
+/// The decode cache is a byte-weighted `CacheBase` LRU whose synchronization is internal to
+/// `CacheBase`; a null cache means caching is disabled (`manifest_decode_cache_bytes == 0`).
 class CasManifestReader
 {
 public:
     /// Binds the reader to the pool environment. A positive cache budget creates the byte-weighted
     /// LRU; zero disables caching while leaving the one-`GET`-and-validate sequence intact.
     CasManifestReader(
-        Backend & backend_, const Layout & layout_, const PoolMeta & meta_,
+        CasRequests & requests_, const Layout & layout_, const PoolMeta & meta_,
         const CasEventSink & event_sink_, size_t manifest_decode_cache_bytes);
 
     /// Reads a manifest by value using the fail-closed sequence described above. A missing body,
@@ -75,7 +76,7 @@ private:
     };
     using ManifestDecodeCache = CacheBase<ManifestId, PartManifest, std::hash<ManifestId>, PartManifestWeight>;
 
-    Backend & backend;
+    CasRequests & requests;
     const Layout & layout;
     const PoolMeta & meta;
     const CasEventSink & event_sink;
