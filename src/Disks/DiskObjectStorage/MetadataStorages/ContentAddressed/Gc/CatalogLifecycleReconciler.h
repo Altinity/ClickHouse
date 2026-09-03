@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <vector>
 
@@ -43,9 +42,7 @@ class CatalogLifecycleReconciler
 {
 public:
     CatalogLifecycleReconciler(
-        Backend & backend_, const Layout & layout_, const CasFoldSeal & adopted_parent_,
-        uint64_t admitted_generation_,
-        std::function<CasRefCatalog::LeaderFenceStatus(uint64_t)> check_fence_);
+        CasOperation & op_, const Layout & layout_, const CasFoldSeal & adopted_parent_);
 
     CatalogLifecycleReconcileResult reconcile();
 
@@ -54,11 +51,9 @@ private:
     static CatalogResolution resolveExactRow(
         const CasRefCatalog::Snapshot & catalog, const CatalogEntry & observed);
 
-    Backend & backend;
+    CasOperation & op;
     const Layout & layout;
     const CasFoldSeal & adopted_parent;
-    uint64_t admitted_generation;
-    std::function<CasRefCatalog::LeaderFenceStatus(uint64_t)> check_fence;
 };
 
 }

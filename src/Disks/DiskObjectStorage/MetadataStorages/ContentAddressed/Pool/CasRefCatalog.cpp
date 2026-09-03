@@ -2,9 +2,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
+#include <base/defines.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <exception>
+#include <variant>
 
 namespace DB
 {
@@ -22,70 +24,90 @@ namespace
 
 {
 
-CasRefCatalog::Snapshot readOptionalForBootstrap(Backend & backend, const Layout & layout)
+/// The one verdict for an absent mandatory catalog, so the read entry point and the mutation's own
+/// `decide` cannot drift apart on what absence means.
+[[noreturn]] void throwMandatoryCatalogAbsent(const String & key)
 {
-    const auto got = backend.get(layout.refCatalogKey());
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "Mandatory CAS ref catalog '{}' is absent -- refusing to interpret opaque life "
+        "objects as an empty ownership universe",
+        key);
+}
+
+/// Every non-committed alternative of a catalog write, as the exception its meaning already implies.
+/// `Declined` cannot reach here: `create` never declines, and no `decide` in this file returns
+/// nothing to write.
+[[noreturn]] void throwCatalogWriteFailure(WriteResult result, const String & what)
+{
+    orThrow(std::move(result), what);
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "{}: the write was declined, which this call cannot produce", what);
+}
+
+CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout & layout)
+{
+    const std::optional<Object> got = op.read(layout.refCatalogKey(), Retry::standard());
     if (!got)
     {
         RefCatalog empty;
         return CasRefCatalog::Snapshot{
-            .catalog = empty, .token = std::nullopt, .life_index = CatalogLifeIndex(empty)};
+            .catalog = empty, .incarnation = std::nullopt, .life_index = CatalogLifeIndex(empty)};
     }
     RefCatalog catalog = decodeRefCatalog(got->bytes);
     return CasRefCatalog::Snapshot{
-        .catalog = catalog, .token = got->token, .life_index = CatalogLifeIndex(catalog)};
+        .catalog = catalog, .incarnation = got->incarnation, .life_index = CatalogLifeIndex(catalog)};
 }
 
 }
 
-CasRefCatalog::Snapshot CasRefCatalog::read(Backend & backend, const Layout & layout)
+CasRefCatalog::Snapshot CasRefCatalog::read(CasOperation & op, const Layout & layout)
 {
-    Snapshot snapshot = readOptionalForBootstrap(backend, layout);
-    if (!snapshot.token)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "Mandatory CAS ref catalog '{}' is absent -- refusing to interpret opaque life "
-            "objects as an empty ownership universe",
-            layout.refCatalogKey());
+    Snapshot snapshot = readOptionalForBootstrap(op, layout);
+    if (!snapshot.incarnation)
+        throwMandatoryCatalogAbsent(layout.refCatalogKey());
     return snapshot;
 }
 
-CasRefCatalog::Snapshot CasRefCatalog::initializeEmptyForNewPool(Backend & backend, const Layout & layout)
+CasRefCatalog::Snapshot CasRefCatalog::initializeEmptyForNewPool(CasOperation & op, const Layout & layout)
 {
+    const String key = layout.refCatalogKey();
     RefCatalog empty;
     const String canonical_empty = encodeRefCatalog(empty);
-    const PutResult put = backend.putIfAbsent(layout.refCatalogKey(), canonical_empty);
-    if (put.outcome == PutOutcome::Done)
-        return Snapshot{.catalog = empty, .token = put.token, .life_index = CatalogLifeIndex(empty)};
+    WriteResult result = op.create(key, canonical_empty, Retry::standard());
+    if (const auto * committed = std::get_if<Committed>(&result))
+        return Snapshot{.catalog = empty, .incarnation = committed->incarnation, .life_index = CatalogLifeIndex(empty)};
 
-    /// A second opener can win after both proved the prefix empty. Decode its exact object before
-    /// accepting the race; conflict is never a license to continue with an assumed empty catalog or
-    /// arbitrary decoded body.
-    const auto got = backend.get(layout.refCatalogKey());
-    if (!got)
+    /// A second opener can win after both proved the prefix empty. The refused precondition was
+    /// settled by an exact read, so the winner's object is decoded from what that read observed;
+    /// a conflict is never a license to continue with an assumed empty catalog or an arbitrary body.
+    const auto * conflict = std::get_if<Conflict>(&result);
+    if (!conflict)
+        throwCatalogWriteFailure(std::move(result), fmt::format("CAS ref catalog '{}' bootstrap create", key));
+
+    const auto * occupant = std::get_if<Object>(&conflict->seen);
+    if (!occupant)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS ref catalog '{}' disappeared after bootstrap create conflict",
-            layout.refCatalogKey());
-    RefCatalog catalog = decodeRefCatalog(got->bytes);
-    if (!catalog.entries.empty() || got->bytes != canonical_empty)
+            "CAS ref catalog '{}' disappeared after bootstrap create conflict", key);
+    RefCatalog catalog = decodeRefCatalog(occupant->bytes);
+    if (!catalog.entries.empty() || occupant->bytes != canonical_empty)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS ref catalog '{}' conflicts with bootstrap's required canonical empty catalog",
-            layout.refCatalogKey());
-    return Snapshot{.catalog = std::move(catalog), .token = got->token, .life_index = CatalogLifeIndex(empty)};
+            "CAS ref catalog '{}' conflicts with bootstrap's required canonical empty catalog", key);
+    return Snapshot{.catalog = std::move(catalog), .incarnation = occupant->incarnation,
+                    .life_index = CatalogLifeIndex(empty)};
 }
 
 std::optional<NamespaceLifeId> CasRefCatalog::lifeIfCataloged(
-    Backend & backend, const Layout & layout, const RootNamespace & ns)
+    CasOperation & op, const Layout & layout, const RootNamespace & ns)
 {
-    const Snapshot snap = read(backend, layout);
+    const Snapshot snap = read(op, layout);
     for (const CatalogEntry & entry : snap.catalog.entries)
         if (entry.ns.string() == ns.string() && entry.state != NsState::Creating)
             return snap.life_index.resolve(entry.incarnation);
     return std::nullopt;
 }
 
-std::vector<NamespaceLifeId> CasRefCatalog::liveUniverse(Backend & backend, const Layout & layout)
+std::vector<NamespaceLifeId> CasRefCatalog::liveUniverse(CasOperation & op, const Layout & layout)
 {
-    const Snapshot snap = read(backend, layout);
+    const Snapshot snap = read(op, layout);
     snap.life_index.throwIfAmbiguous("CAS live namespace discovery");
     std::vector<NamespaceLifeId> universe;
     universe.reserve(snap.catalog.entries.size());
@@ -101,52 +123,87 @@ std::vector<NamespaceLifeId> CasRefCatalog::liveUniverse(Backend & backend, cons
 namespace
 {
 
-/// Live-lock brake, the same shape and for the same reason as `publishCkpt`'s/`allocateWriterEpoch`'s
-/// on their own contended token-CAS singletons: the catalog is ONE object mutated by every lifecycle
-/// transition of every namespace in the pool, so persistent contention is a real, not theoretical,
-/// exit condition to plan for.
+/// Thrown from inside a `casUpdate` `mutate` closure to signal a refusal that must STOP the attempt
+/// rather than be treated as a refused precondition to retry: `casUpdateImpl` propagates whatever
+/// `mutate` throws straight out, uncaught, which is exactly the behavior these three need. Retrying
+/// any of them against a freshly re-read catalog would just re-decide against an entry that is, by
+/// definition, no longer `observed` -- token-exactness means the FIRST mismatch is final, not a reason
+/// to loop. Each is caught by its own exact type right where it is thrown; deriving from
+/// `std::exception` is only so the throw itself is well-formed, never so a caller catches these by
+/// base class.
+struct CatalogFenceMovedMarker : std::exception {};
+struct CatalogEntryMismatchMarker : std::exception {};
+struct CatalogCreatorStillLiveMarker : std::exception {};
+
+/// Live-lock brake for the ONE loop below that is written by hand rather than driven by the engine:
+/// the catalog is a single object mutated by every lifecycle transition of every namespace in the
+/// pool, so persistent contention is a real, not theoretical, exit condition to plan for.
 constexpr size_t kMaxCatalogCasAttempts = 100;
 
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
 /// bytes to write: the plain path just grammar-checks (`encodeRefCatalog`), the admitting path also
-/// runs both admission predicates (`checkCatalogAdmission`) first. Retries on `Conflict` against a
-/// FRESH read, exactly like `PoolMeta::admitOrValidate` -- never re-encoding the stale candidate.
+/// runs both admission predicates (`checkCatalogAdmission`) first. A refused precondition re-runs
+/// `mutate` against the FRESH body -- never re-encoding the stale candidate.
 RefCatalog casUpdateImpl(
-    Backend & backend, const Layout & layout,
+    CasOperation & op, const Layout & layout,
     const std::function<RefCatalog(const RefCatalog &)> & mutate,
     const std::function<String(const RefCatalog &)> & encode)
 {
     const String key = layout.refCatalogKey();
-    CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
+    /// The candidate the LAST `decide` produced, which is the one the engine wrote: every earlier one
+    /// belongs to an attempt whose precondition was refused.
+    std::optional<RefCatalog> written;
 
-    for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
+    const auto decide = [&](const std::optional<Object> & current) -> std::optional<String>
     {
-        snap.life_index.throwIfAmbiguous("CAS ref catalog mutation");
-        RefCatalog candidate = mutate(snap.catalog);
-        const String bytes = encode(candidate);
-        const CasResult res = backend.casPut(key, bytes, snap.token);
-        if (res.outcome == CasOutcome::Committed)
-            return candidate;
+        /// Absence of the mandatory catalog is corruption, not a fresh bootstrap. Refusing here is
+        /// what stops any mutation from replacing every other namespace with a one-update catalog.
+        if (!current)
+            throwMandatoryCatalogAbsent(key);
+        const RefCatalog durable = decodeRefCatalog(current->bytes);
+        CatalogLifeIndex(durable).throwIfAmbiguous("CAS ref catalog mutation");
+        RefCatalog candidate = mutate(durable);
+        String bytes = encode(candidate);
+        written = std::move(candidate);
+        return bytes;
+    };
 
-        snap = CasRefCatalog::read(backend, layout);
-        /// `read` treats authoritative absence after a conflict as corruption. Therefore no retry
-        /// can turn a vanished mandatory catalog into a one-update replacement authority.
-    }
-
-    throwCasWriteRetryLater(fmt::format(
-        "CAS ref catalog '{}' did not converge after {} attempts", key, kMaxCatalogCasAttempts));
+    WriteResult result = op.readModifyWrite(key, decide, Retry::standard());
+    /// The fence can be lost in two places and both mean the same to a lifecycle caller: inside
+    /// `decide`, which throws the marker itself, and between two attempts, where the engine notices it
+    /// first and no further `decide` runs. Normalising the second onto the first is what keeps "the
+    /// fence moved" a returned outcome rather than an exception.
+    if (const auto * gave_up = std::get_if<GaveUp>(&result); gave_up && gave_up->why == GaveUp::Why::FenceLost)
+        throw CatalogFenceMovedMarker{};
+    if (!std::holds_alternative<Committed>(result))
+        throwCatalogWriteFailure(std::move(result), fmt::format("CAS ref catalog '{}' update", key));
+    return std::move(*written);
 }
 
-/// Thrown from inside a `casUpdate` `mutate` closure to signal a refusal that must STOP the attempt
-/// rather than be treated as a `Conflict` to retry: `casUpdateImpl` propagates whatever `mutate`
-/// throws straight out, uncaught, which is exactly the behavior these three need. Retrying any of them
-/// against a freshly re-read catalog would just re-decide against an entry that is, by definition, no
-/// longer `observed` -- token-exactness means the FIRST mismatch is final, not a reason to loop.
-/// Each is caught by its own exact type right where it is thrown; deriving from `std::exception`
-/// is only so the throw itself is well-formed, never so a caller catches these by base class.
-struct CatalogFenceMovedMarker : std::exception {};
-struct CatalogEntryMismatchMarker : std::exception {};
-struct CatalogCreatorStillLiveMarker : std::exception {};
+/// `casUpdate`'s own guard, shared with the two lifecycle callers that need to catch the fence marker
+/// the public entry point translates away.
+std::function<RefCatalog(const RefCatalog &)> identityPreserving(
+    const std::function<RefCatalog(const RefCatalog &)> & mutate)
+{
+    return [&mutate](const RefCatalog & current) -> RefCatalog
+    {
+        RefCatalog candidate = mutate(current);
+        if (candidate.entries.size() != current.entries.size())
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CasRefCatalog::casUpdate cannot add or delete catalog entries -- use casAdmitEntry, "
+                "deleteCompletedRemoving, or cancelStalledCreating");
+        for (size_t i = 0; i < current.entries.size(); ++i)
+        {
+            if (candidate.entries[i].ns != current.entries[i].ns
+                || candidate.entries[i].incarnation != current.entries[i].incarnation)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CasRefCatalog::casUpdate cannot replace catalog identity at row {} -- namespace "
+                    "and incarnation are immutable outside the narrow admission/deletion APIs",
+                    i);
+        }
+        return candidate;
+    };
+}
 
 /// Two `thread_local_rng` draws composed into a `UInt128`, the same pattern already used throughout
 /// this tree to mint build ids and incarnation tags (`CasPartWriteTxn.cpp`'s `mintU128`,
@@ -198,7 +255,7 @@ std::function<void()> create_namespace_step1_pre_read_hook_for_test;
 /// canonical-order/no-duplicate grammar check abort the process with `LOGICAL_ERROR` for what is, at
 /// this call site only, an ordinary race outcome.
 RefCatalog createNamespaceStep1(
-    Backend & backend, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
+    CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
 {
     /// Moved into a local before invoking, not called on the global directly: a hook that reassigns
     /// `create_namespace_step1_pre_read_hook_for_test` from inside its own body (a test driving a
@@ -222,7 +279,7 @@ RefCatalog createNamespaceStep1(
         next.entries.insert(it, entry);
         return next;
     };
-    return casUpdateImpl(backend, layout, mutate,
+    return casUpdateImpl(op, layout, mutate,
         [&entry, gc_shards, &layout](const RefCatalog & c)
         {
             return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
@@ -232,32 +289,25 @@ RefCatalog createNamespaceStep1(
 }
 
 RefCatalog CasRefCatalog::casUpdate(
-    Backend & backend, const Layout & layout, const std::function<RefCatalog(const RefCatalog &)> & mutate)
+    CasOperation & op, const Layout & layout, const std::function<RefCatalog(const RefCatalog &)> & mutate)
 {
-    const auto identity_preserving_mutate = [&](const RefCatalog & current) -> RefCatalog
+    try
     {
-        RefCatalog candidate = mutate(current);
-        if (candidate.entries.size() != current.entries.size())
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "CasRefCatalog::casUpdate cannot add or delete catalog entries -- use casAdmitEntry, "
-                "deleteCompletedRemoving, or cancelStalledCreating");
-        for (size_t i = 0; i < current.entries.size(); ++i)
-        {
-            if (candidate.entries[i].ns != current.entries[i].ns
-                || candidate.entries[i].incarnation != current.entries[i].incarnation)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "CasRefCatalog::casUpdate cannot replace catalog identity at row {} -- namespace "
-                    "and incarnation are immutable outside the narrow admission/deletion APIs",
-                    i);
-        }
-        return candidate;
-    };
-    return casUpdateImpl(
-        backend, layout, identity_preserving_mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+        return casUpdateImpl(
+            op, layout, identityPreserving(mutate), [](const RefCatalog & c) { return encodeRefCatalog(c); });
+    }
+    catch (const CatalogFenceMovedMarker &)
+    {
+        /// The marker is this file's private signal; a caller outside it gets the exception class every
+        /// other admission refusal raises.
+        throwCasTransientUnavailable(
+            fmt::format("CAS ref catalog '{}' update", layout.refCatalogKey()),
+            "mount fence tripped: the update was admitted under an incarnation this node no longer holds");
+    }
 }
 
 RefCatalog CasRefCatalog::casAdmitEntry(
-    Backend & backend, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
+    CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
 {
     if (entry.state == NsState::Removing)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -279,7 +329,7 @@ RefCatalog CasRefCatalog::casAdmitEntry(
         next.entries.insert(it, entry);
         return next;
     };
-    return casUpdateImpl(backend, layout, mutate,
+    return casUpdateImpl(op, layout, mutate,
         [&entry, gc_shards, &layout](const RefCatalog & c)
         {
             return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
@@ -287,9 +337,8 @@ RefCatalog CasRefCatalog::casAdmitEntry(
 }
 
 CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
-    Backend & backend, const Layout & layout, const CatalogEntry & observed,
-    uint64_t removal_started_round, uint64_t admitted_generation,
-    const std::function<void(uint64_t)> & check_fence_or_throw)
+    CasOperation & op, const Layout & layout, const CatalogEntry & observed,
+    uint64_t removal_started_round)
 {
     if (observed.state != NsState::Live || observed.creator || observed.removal_started_round)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -298,8 +347,8 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
 
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
     {
-        try { check_fence_or_throw(admitted_generation); }
-        catch (...) { throw CatalogFenceMovedMarker{}; }
+        if (!op.admitted())
+            throw CatalogFenceMovedMarker{};
 
         const auto it = findEntry(cur, observed.ns);
         if (it == cur.entries.end() || *it != observed)
@@ -314,7 +363,7 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
 
     try
     {
-        casUpdateImpl(backend, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
     }
     catch (const CatalogFenceMovedMarker &)
     {
@@ -322,7 +371,7 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
     }
     catch (const CatalogEntryMismatchMarker &)
     {
-        const Snapshot current = read(backend, layout);
+        const Snapshot current = read(op, layout);
         const auto it = findEntry(current.catalog, observed.ns);
         if (it != current.catalog.entries.end()
             && it->incarnation == observed.incarnation
@@ -334,9 +383,8 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
 }
 
 CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemoving(
-    Backend & backend, const Layout & layout, const CatalogEntry & observed,
-    const CasFoldSeal & authoritative_parent, uint64_t admitted_generation,
-    const std::function<LeaderFenceStatus(uint64_t)> & check_fence)
+    CasOperation & op, const Layout & layout, const CatalogEntry & observed,
+    const CasFoldSeal & authoritative_parent)
 {
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
@@ -354,15 +402,12 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             .catalog_snapshot = std::nullopt};
 
     return deleteCompletedRemovingAtSnapshot(
-        backend, layout, read(backend, layout), observed, authoritative_parent,
-        admitted_generation, check_fence);
+        op, layout, read(op, layout), observed, authoritative_parent);
 }
 
 CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-    Backend & backend, const Layout & layout, Snapshot catalog_snapshot,
-    const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
-    uint64_t admitted_generation,
-    const std::function<LeaderFenceStatus(uint64_t)> & check_fence)
+    CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
+    const CatalogEntry & observed, const CasFoldSeal & authoritative_parent)
 {
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
@@ -394,41 +439,40 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             .catalog_snapshot = std::move(catalog_snapshot)};
     };
 
+    /// ONE policy value for every erase this loop sends. Each call binds its own window when it is
+    /// made; what is shared is the policy, not a deadline.
+    const Retry policy = Retry::standard();
+
     for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
     {
         catalog_snapshot.life_index.throwIfAmbiguous("CAS completed-removal deletion");
+        /// A caller-supplied cut without an incarnation cannot state a precondition, and an erase that
+        /// fell back to an unconditional write would delete whatever a concurrent writer had put there.
+        if (!catalog_snapshot.incarnation)
+            throwMandatoryCatalogAbsent(layout.refCatalogKey());
         const auto observed_it = findEntry(catalog_snapshot.catalog, observed.ns);
         if (observed_it == catalog_snapshot.catalog.entries.end() || *observed_it != observed)
             return resolved_result(CompletedRemovingDeleteOutcome::EntryChanged);
 
-        bool fence_lost = check_fence(admitted_generation) == LeaderFenceStatus::Moved;
-
-        std::optional<CasResult> cas_result;
-        std::exception_ptr attempt_failure;
-        if (!fence_lost)
-        {
-            RefCatalog candidate = catalog_snapshot.catalog;
-            candidate.entries.erase(candidate.entries.begin() + (observed_it - catalog_snapshot.catalog.entries.begin()));
-            try
-            {
-                cas_result = backend.casPut(
-                    layout.refCatalogKey(), encodeRefCatalog(candidate), catalog_snapshot.token);
-            }
-            catch (...)
-            {
-                attempt_failure = std::current_exception();
-            }
-        }
-
-        /// The response to a conditional erase is not authority for what became durable. Resolve
-        /// every attempted erase, and a pre-CAS fence refusal, through one complete catalog read.
-        /// This snapshot is also the next retry/selection cut, so no second read separates them.
-        catalog_snapshot = read(backend, layout);
-
-        if (!fence_lost)
-            fence_lost = check_fence(admitted_generation) == LeaderFenceStatus::Moved;
-        if (fence_lost)
+        /// Nothing is attempted without admission, and a refusal here has sent nothing.
+        if (!op.admitted())
             return resolved_result(CompletedRemovingDeleteOutcome::FencedOut);
+
+        RefCatalog candidate = catalog_snapshot.catalog;
+        candidate.entries.erase(candidate.entries.begin() + (observed_it - catalog_snapshot.catalog.entries.begin()));
+        WriteResult erase = op.replace(layout.refCatalogKey(), encodeRefCatalog(candidate),
+                                       *catalog_snapshot.incarnation, policy);
+
+        /// An operation whose admission is gone cannot issue the resolution read either, so the call
+        /// ends HERE and reports the cut it was given rather than a fresh one. There is nothing further
+        /// this actor may learn, and nothing further it may do.
+        if (!op.admitted())
+            return resolved_result(CompletedRemovingDeleteOutcome::FencedOut);
+
+        /// The response to a conditional erase is not authority for what became durable. Resolve every
+        /// attempted erase through one complete catalog read. This snapshot is also the next
+        /// retry/selection cut, so no second read separates them.
+        catalog_snapshot = read(op, layout);
 
         const auto current_it = findEntry(catalog_snapshot.catalog, observed.ns);
         const bool old_life_still_cataloged = current_it != catalog_snapshot.catalog.entries.end()
@@ -438,15 +482,19 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
                 ? CompletedRemovingDeleteOutcome::Deleted
                 : CompletedRemovingDeleteOutcome::EntryChanged);
 
-        if (attempt_failure)
-            std::rethrow_exception(attempt_failure);
-        if (cas_result && cas_result->outcome == CasOutcome::Committed)
-            throwCasWriteRetryLater(fmt::format(
-                "CAS ref catalog erase for namespace '{}' reported committed, but a complete resolution read "
-                "still observed incarnation {}",
-                observed.ns.string(), u128ToHex(observed.incarnation)));
-        /// A token conflict that leaves the exact old row present retries from this mandatory
-        /// resolution snapshot. The fence is checked again immediately before the next CAS.
+        /// The row survived the attempt. Only a refused precondition may be tried again against the
+        /// mandatory resolution snapshot above; every other alternative is terminal for this call, and
+        /// a commit the resolution read contradicts is reported rather than believed.
+        if (!std::holds_alternative<Conflict>(erase))
+        {
+            if (std::holds_alternative<Committed>(erase))
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref catalog erase for namespace '{}' reported committed, but a complete resolution read "
+                    "still observed incarnation {}",
+                    observed.ns.string(), u128ToHex(observed.incarnation)));
+            throwCatalogWriteFailure(std::move(erase), fmt::format(
+                "CAS ref catalog erase for namespace '{}'", observed.ns.string()));
+        }
     }
 
     throwCasWriteRetryLater(fmt::format(
@@ -455,9 +503,8 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
 }
 
 CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating(
-    Backend & backend, const Layout & layout, const CatalogEntry & observed,
-    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
-    uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw)
+    CasOperation & op, const Layout & layout, const CatalogEntry & observed,
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -467,8 +514,8 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
 
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
     {
-        try { check_fence_or_throw(admitted_generation); }
-        catch (...) { throw CatalogFenceMovedMarker{}; }
+        if (!op.admitted())
+            throw CatalogFenceMovedMarker{};
 
         const auto it = findEntry(cur, observed.ns);
         if (it == cur.entries.end() || *it != observed)
@@ -483,7 +530,7 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
 
     try
     {
-        casUpdateImpl(backend, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
+        casUpdateImpl(op, layout, mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
     }
     catch (const CatalogFenceMovedMarker &) { return StalledCreatingCancelOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return StalledCreatingCancelOutcome::EntryChanged; }
@@ -492,9 +539,7 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
 }
 
 CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
-    Backend & backend, const Layout & layout, const CatalogEntry & observed,
-    uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw,
-    const CkptDeadline & deadline)
+    CasOperation & op, const Layout & layout, const CatalogEntry & observed)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -507,9 +552,8 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
     const RefCkpt contribution{.life_epoch = std::optional<uint64_t>{observed.creator->writer_epoch},
                                 .committed_through = std::nullopt,
                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
-    if (publishCkpt(backend, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
-                     contribution, admitted_generation, check_fence_or_throw,
-                     deadline) == CkptPublishOutcome::FencedOut)
+    if (publishCkpt(op, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
+                     contribution) == CkptPublishOutcome::FencedOut)
         return NamespaceCreationOutcome::FencedOut;
 
     /// Step 3. `mutate` is the fence re-check point `casUpdate`'s header doc names -- checked FIRST,
@@ -518,8 +562,10 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
     /// (both are truthful refusals of a CAS that was never sent; this is only which one speaks first).
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
     {
-        try { check_fence_or_throw(admitted_generation); }
-        catch (...) { throw CatalogFenceMovedMarker{}; }   /// typed, not propagated -- publishCkpt's own precedent
+        /// Typed, not propagated: the caller asked "did this land", and "the fence moved, so nothing
+        /// was sent" is an answer, not a failure of the operation.
+        if (!op.admitted())
+            throw CatalogFenceMovedMarker{};
 
         const auto it = findEntry(cur, observed.ns);
         if (it == cur.entries.end() || *it != observed)
@@ -533,7 +579,8 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
 
     try
     {
-        casUpdate(backend, layout, mutate);
+        casUpdateImpl(op, layout, identityPreserving(mutate),
+                      [](const RefCatalog & c) { return encodeRefCatalog(c); });
     }
     catch (const CatalogFenceMovedMarker &) { return NamespaceCreationOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return NamespaceCreationOutcome::Superseded; }
@@ -541,10 +588,8 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
 }
 
 CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
-    Backend & backend, const Layout & layout, uint64_t gc_shards,
-    const RootNamespace & ns, const CreatorFence & creator,
-    uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw,
-    const CkptDeadline & deadline)
+    CasOperation & op, const Layout & layout, uint64_t gc_shards,
+    const RootNamespace & ns, const CreatorFence & creator)
 {
     /// Read-first, per the Task 2 review's own note on `casAdmitEntry`: a namespace that already
     /// carries an entry is THIS function's job to reject with a clear message, not `casAdmitEntry`'s
@@ -552,7 +597,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     /// -- true, but useless to a caller trying to understand why its create failed). A concurrent
     /// insert of the SAME namespace between this read and step 1 is still caught -- `casAdmitEntry`'s
     /// own grammar check is the backstop, not the only check.
-    const Snapshot snap = read(backend, layout);
+    const Snapshot snap = read(op, layout);
     const auto existing = findEntry(snap.catalog, ns);
     if (existing != snap.catalog.entries.end())
     {
@@ -587,13 +632,13 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     /// above) and reports the race as `Superseded` instead.
     try
     {
-        createNamespaceStep1(backend, layout, gc_shards, entry);   /// step 1
+        createNamespaceStep1(op, layout, gc_shards, entry);   /// step 1
     }
     catch (const CatalogEntryAlreadyPresentMarker &)
     {
         return NamespaceCreationOutcome::Superseded;
     }
-    return completeCreation(backend, layout, entry, admitted_generation, check_fence_or_throw, deadline);
+    return completeCreation(op, layout, entry);
 }
 
 void CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest(std::function<void()> hook)
@@ -602,24 +647,25 @@ void CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest(std::function<void
 }
 
 CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(
-    Backend & backend, const Layout & layout, const CatalogEntry & observed, const CreatorFence & new_creator,
-    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
-    uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw)
+    CasOperation & op, const Layout & layout, const CatalogEntry & observed, const CreatorFence & new_creator,
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CasRefCatalog::reconcileStaleCreator: namespace '{}' is not a Creating entry with a "
             "creator fence -- nothing to reconcile", observed.ns.string());
 
-    /// Review I6: the fence re-check is checked FIRST, on every fresh read this CAS retries -- the same
-    /// placement `completeCreation` uses for exactly the same reason (see that function's own doc).
-    /// Token-exactness (the catalog's own entry, by full value) comes next: it is the cheaper, purely
+    /// The admission check comes FIRST, on every fresh read this retries -- the same placement
+    /// `completeCreation` uses for exactly the same reason (see that function's own doc).
+    /// Entry-exactness (the catalog's own entry, by full value) comes next: it is the cheaper, purely
     /// local comparison, and a mismatch here means the question "is the OLD creator's fence terminal" is
     /// moot -- `observed` no longer describes anything live to reconcile.
     const auto mutate = [&](const RefCatalog & cur) -> RefCatalog
     {
-        try { check_fence_or_throw(admitted_generation); }
-        catch (...) { throw CatalogFenceMovedMarker{}; }   /// typed, not propagated -- completeCreation's own precedent
+        /// Typed, not propagated: the caller asked "did this land", and "the fence moved, so nothing
+        /// was sent" is an answer, not a failure of the operation.
+        if (!op.admitted())
+            throw CatalogFenceMovedMarker{};
 
         const auto it = findEntry(cur, observed.ns);
         if (it == cur.entries.end() || *it != observed)
@@ -634,7 +680,8 @@ CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(
 
     try
     {
-        casUpdate(backend, layout, mutate);
+        casUpdateImpl(op, layout, identityPreserving(mutate),
+                      [](const RefCatalog & c) { return encodeRefCatalog(c); });
     }
     catch (const CatalogFenceMovedMarker &) { return ReconcileCreatorOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return ReconcileCreatorOutcome::EntryChanged; }
