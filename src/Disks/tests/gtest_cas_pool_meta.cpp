@@ -55,8 +55,10 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
         if (inside_hook)
             return;
         inside_hook = true;
-        if (auto cur = backend->get(key))
-            (void)backend->putOverwrite(key, cur->bytes, cur->token);
+        auto hook_requests = DB::Cas::tests::openRequestsForTest(BackendPtr(backend));
+        auto hook_op = hook_requests.admit();
+        if (auto cur = hook_op.read(key, Retry::once()))
+            (void)hook_op.replace(key, cur->bytes, cur->incarnation, Retry::once());
         inside_hook = false;
     });
 
