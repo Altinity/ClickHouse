@@ -183,28 +183,29 @@ namespace
 class ThrowingBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the names the primitive overrides below would otherwise shadow.
     using InMemoryBackend::head;
     using InMemoryBackend::list;
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (arm)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected backend list failure");
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (arm)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected backend get failure");
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 
-    HeadResult head(const String & key) override
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (arm)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected backend head failure");
-        return InMemoryBackend::head(key);
+        return InMemoryBackend::head(key, access);
     }
 
     /// Armed only after Pool::open, so opening (which reads/initialises gc state) succeeds.
@@ -315,13 +316,14 @@ TEST(CASGCLog, AbortedFinishOnThrowingRound)
 class NetworkThrowingBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the names the primitive overrides below would otherwise shadow.
     using InMemoryBackend::list;
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (arm)
             throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected backend outage");
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
     std::atomic<bool> arm{false};
 };
@@ -330,6 +332,11 @@ TEST(CASGCLog, TransientThrowIsClassifiedAborted)
 {
     auto backend = std::make_shared<NetworkThrowingBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    /// A PERSISTENT transient fault is reissued for the whole retry window, so the window has to run
+    /// on a clock this test advances -- otherwise one read spends ninety real seconds.
+    std::atomic<uint64_t> engine_now_ms{0};
+    store->setCasRequestNowFnForTest([&] { return engine_now_ms.fetch_add(10'000) + 10'000; });
+    store->setCasRetrySleepForTest([](uint64_t) {});
 
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(
@@ -363,12 +370,13 @@ TEST(CASGCLog, TransientErrorClassifierFailsClosed)
 class StateCommitThrowingBackend : public InMemoryBackend
 {
 public:
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
-        if (arm && key.ends_with("gc/state") && ++state_puts_since_arm >= 2)
-            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected outage on the round-closing CAS");
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
+        if (arm && expected_value && key.ends_with("gc/state") && ++state_puts_since_arm >= 2)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected outage on the round-closing write");
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
     std::atomic<bool> arm{false};
     std::atomic<int> state_puts_since_arm{0};
@@ -401,8 +409,10 @@ TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
     ASSERT_EQ(round_rows.size(), 2u);
     const Rec & fin = round_rows[1];
     EXPECT_EQ(fin.outcome, Rec::Outcome::Aborted);
-    EXPECT_EQ(fin.error_code, DB::ErrorCodes::NETWORK_ERROR);
-    EXPECT_EQ(fin.round, 0u) << "the commit CAS never landed, so the round number must stay unstamped";
+    /// The outage on the round-closing write is settled by the engine's own resolving read, which
+    /// proves the write did not land: the round sees a conflict, not a transport error.
+    EXPECT_EQ(fin.error_code, DB::ErrorCodes::ABORTED);
+    EXPECT_EQ(fin.round, 0u) << "the commit never landed, so the round number must stay unstamped";
     EXPECT_GT(fin.candidates_marked + fin.entries_condemned + fin.entries_graduated
               + fin.entries_redeleted + fin.objects_deleted + fin.fence_outs, 0u)
         << "the pre-CAS work the round performed must survive into its failure row";
@@ -417,24 +427,26 @@ TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
 class ModalThrowingBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the names the primitive overrides below would otherwise shadow.
     using InMemoryBackend::list;
+
     enum Mode : int { Off = 0, Transient = 1, Logic = 2 };
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         const int m = mode.load();
         if (m == Transient)
             throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected backend outage");
         if (m == Logic)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected logic failure");
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
         if (key.ends_with("gc/hb"))
             ++hb_puts;
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
     std::atomic<int> mode{Off};
     std::atomic<uint64_t> hb_puts{0};
@@ -444,6 +456,11 @@ TEST(CASGCScheduler, TransientRoundFailureKeepsLeadershipAndHeartbeat)
 {
     auto backend = std::make_shared<ModalThrowingBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    /// See `TransientThrowIsClassifiedAborted`: the transient mode is persistent while it is armed, so
+    /// the retry window runs on a clock this test advances.
+    std::atomic<uint64_t> engine_now_ms{0};
+    store->setCasRequestNowFnForTest([&] { return engine_now_ms.fetch_add(10'000) + 10'000; });
+    store->setCasRetrySleepForTest([](uint64_t) {});
 
     std::mutex rows_mutex;
     std::condition_variable rows_cv;

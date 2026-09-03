@@ -87,12 +87,13 @@ class InterruptRoundCasBackend : public InMemoryBackend
 public:
     explicit InterruptRoundCasBackend(String gc_state_key_) : gc_state_key(std::move(gc_state_key_)) {}
 
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
         if (arm_interrupt && key == gc_state_key)
         {
-            const auto stored = get(key);
+            const auto stored = InMemoryBackend::read(key, access);
             const uint64_t stored_gen = stored ? decodeGcState(stored->bytes).snap_generation : 0;
             const uint64_t next_gen = decodeGcState(bytes).snap_generation;
             if (next_gen > stored_gen)
@@ -102,7 +103,7 @@ public:
                     "test-injected: round-commit gc/state CAS denied (leader deposed mid-round; lease lost)");
             }
         }
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
     bool arm_interrupt = false;

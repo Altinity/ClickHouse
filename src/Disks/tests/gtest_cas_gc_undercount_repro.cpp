@@ -155,12 +155,13 @@ TEST(CASGCUndercount, H2DuplicateCommittedRemovalIsIdempotentNoUnderflow)
 class InterruptRoundCasBackend : public InMemoryBackend
 {
 public:
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
         if (arm_interrupt && key == gc_state_key)
         {
-            const auto stored = get(key);
+            const auto stored = InMemoryBackend::read(key, access);
             const uint64_t stored_gen = stored ? decodeGcState(stored->bytes).snap_generation : 0;
             const uint64_t next_gen = decodeGcState(bytes).snap_generation;
             if (next_gen > stored_gen)
@@ -170,7 +171,7 @@ public:
                     "test-injected: round-commit gc/state CAS denied (leader deposed mid-round; lease lost)");
             }
         }
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
     bool arm_interrupt = false;
@@ -252,14 +253,15 @@ TEST(CASGCUndercount, H1DrainAfterDeposedRemovalFoldDoesNotUnderflow)
 class DropAtCommitBackend : public InMemoryBackend
 {
 public:
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
         /// The one-pass round has a SINGLE gc/state CAS that advances snap_generation. Fire the injected
         /// drop ONCE, just before that CAS commits — so the drop event is above this round's sealed cursor.
         if (arm_drop && key == gc_state_key)
         {
-            const auto stored = get(key);
+            const auto stored = InMemoryBackend::read(key, access);
             if (stored)
             {
                 const GcState prev = decodeGcState(stored->bytes);
@@ -272,7 +274,7 @@ public:
                 }
             }
         }
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
     bool arm_drop = false;

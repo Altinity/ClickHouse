@@ -65,45 +65,43 @@ std::optional<RetiredEntry> currentEntryFor(Backend & backend, const Layout & la
     return std::nullopt;
 }
 
-/// Decorator reproducing the rustfs quirk (observed 2026-07-11): a conditional exact-token delete against
-/// an object that is ALREADY absent can answer HTTP 412 (precondition failed), which this backend layer
-/// maps to `TokenMismatch` -- not the 404-shaped `NotFound` an in-memory backend naturally returns. For
-/// keys marked via `quirkOnAbsent`, `deleteExact` forces exactly that answer whenever the underlying
-/// object is gone, letting a test drive the GC redelete site through the disambiguation path
-/// backend-agnostically (without guessing at real rustfs HTTP mappings).
-class TokenMismatchOnAbsentBackend : public InMemoryBackend
+/// Counts every conditional removal sent against `watched_key` while that key is ALREADY absent.
+/// A store may answer such a removal with a precondition failure rather than a clean miss (rustfs does,
+/// observed 2026-07-11), so a caller that sends one cannot tell "somebody replaced it" from "it is
+/// gone". The GC redelete site is not allowed to send one: it observes the blob first and compares the
+/// condemned incarnation against what it saw.
+class AbsentRemovalWatchBackend : public InMemoryBackend
 {
 public:
-    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    void watch(const String & key) { watched_key = key; }
+    size_t removalsAgainstAbsent() const { return removals_against_absent; }
+
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
-        if (quirk_keys.contains(key) && !InMemoryBackend::head(key).exists)
-        {
-            DeleteOutcome d;
-            d.kind = DeleteOutcome::Kind::TokenMismatch;
-            return d;
-        }
-        return InMemoryBackend::deleteExact(key, token);
+        if (key == watched_key && !InMemoryBackend::head(key, access))
+            ++removals_against_absent;
+        return InMemoryBackend::remove(key, expected_value, access);
     }
 
-    void quirkOnAbsent(const String & key) { quirk_keys.insert(key); }
-
 private:
-    std::set<String> quirk_keys;
+    String watched_key;
+    size_t removals_against_absent = 0;
 };
 
 class CkptReplacementConflictBackend : public InMemoryBackend
 {
 public:
-    CasResult casPut(
-        const String & key, const String & bytes, const std::optional<Token> & expected,
-        const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
-        if (conflict_once && key == watched_key)
+        /// Only the CONDITIONAL shape is refused: the fixture's own creation of the object must land.
+        if (conflict_once && expected_value && key == watched_key)
         {
             conflict_once = false;
-            return CasResult{CasOutcome::Conflict, {}};
+            return std::unexpected(RawConflict{});
         }
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
     String watched_key;
@@ -115,13 +113,15 @@ TEST(CASSemanticRefFixture, WrapperCreatesInitialRecoverableCheckpoint)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const RootNamespace ns{"00/semantic-create@cas@"};
     const ManifestRef manifest = ref("srv-a:1", 1, 0xAB);
 
     const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, manifest);
     const RefTxnId expected_id{manifest.writer_epoch, sequence};
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
-    const auto ckpt = readCkpt(*backend, store->layout(), life);
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, store->layout(), ns);
+    const auto ckpt = readCkpt(op, store->layout(), life);
 
     ASSERT_TRUE(ckpt.has_value());
     EXPECT_EQ(ckpt->ckpt.life_epoch, 1);
@@ -134,24 +134,26 @@ TEST(CASSemanticRefFixture, WrapperAdvancesCheckpointWithoutDiscardingSnapshot)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const RootNamespace ns{"00/semantic-advance@cas@"};
     const ManifestRef manifest = ref("srv-a:1", 1, 0xAC);
 
     const uint64_t publish_sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, manifest);
     const RefTxnId publish_id{manifest.writer_epoch, publish_sequence};
     writeRefSnapshotRaw(*backend, store->layout(), minimalLiveSnapshot(ns.string(), publish_id, {committedRow("tbl", manifest)}));
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
-    const auto before_drop = readCkpt(*backend, store->layout(), life);
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, store->layout(), ns);
+    const auto before_drop = readCkpt(op, store->layout(), life);
     ASSERT_TRUE(before_drop.has_value());
     RefCkpt with_snapshot = before_drop->ckpt;
     with_snapshot.checkpoint_snapshot_id = publish_id;
-    ASSERT_EQ(backend->casPut(
-        store->layout().refCkptKey(life), encodeRefCkpt(with_snapshot), before_drop->token).outcome,
-        CasOutcome::Committed);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
+        store->layout().refCkptKey(life), encodeRefCkpt(with_snapshot), before_drop->incarnation,
+        Retry::once())));
 
     const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", manifest);
     const RefTxnId drop_id{manifest.writer_epoch, drop_sequence};
-    const auto ckpt = readCkpt(*backend, store->layout(), life);
+    const auto ckpt = readCkpt(op, store->layout(), life);
 
     ASSERT_TRUE(ckpt.has_value());
     EXPECT_EQ(ckpt->ckpt.committed_through, drop_id);
@@ -163,6 +165,8 @@ TEST(CASSemanticRefFixture, CheckpointAdvanceRejectsNonMonotoneAndInvalidState)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const RootNamespace ns{"00/semantic-refusal@cas@"};
     const ManifestRef manifest = ref("srv-a:1", 1, 0xAD);
 
@@ -172,7 +176,7 @@ TEST(CASSemanticRefFixture, CheckpointAdvanceRejectsNonMonotoneAndInvalidState)
 
     const RootNamespace invalid_ns{"00/semantic-invalid@cas@"};
     fixture::admitLive(*backend, store->layout(), invalid_ns);
-    const NamespaceLifeId invalid_life = *CasRefCatalog::lifeIfCataloged(*backend, store->layout(), invalid_ns);
+    const NamespaceLifeId invalid_life = *CasRefCatalog::lifeIfCataloged(op, store->layout(), invalid_ns);
     const String invalid_key = store->layout().refCkptKey(invalid_life);
     ASSERT_EQ(backend->putIfAbsent(invalid_key, "not a checkpoint").outcome, PutOutcome::Done);
     EXPECT_THROW(advanceRecoverableCkptForRawFixture(*backend, store->layout(), invalid_ns, id), DB::Exception);
@@ -183,6 +187,8 @@ TEST(CASRawRefFixture, RawLogWriteDoesNotCreateCheckpoint)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const RootNamespace ns{"00/raw-no-ckpt@cas@"};
     const RefTxnId id{1, 1};
 
@@ -193,14 +199,16 @@ TEST(CASRawRefFixture, RawLogWriteDoesNotCreateCheckpoint)
         .prev_epoch_seal = std::nullopt,
     });
 
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
-    EXPECT_FALSE(readCkpt(*backend, store->layout(), life).has_value());
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, store->layout(), ns);
+    EXPECT_FALSE(readCkpt(op, store->layout(), life).has_value());
 }
 
 TEST(CASRawRefFixture, ReplaceRecoverableCheckpointWritesTheSuppliedFullState)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const RootNamespace ns{"00/replace-ckpt@cas@"};
     const ManifestRef manifest = ref("srv-a:1", 1, 0xAE);
     const RefTxnId first_id{manifest.writer_epoch,
@@ -217,8 +225,8 @@ TEST(CASRawRefFixture, ReplaceRecoverableCheckpointWritesTheSuppliedFullState)
     };
     replaceRecoverableCkptForRawFixture(*backend, store->layout(), ns, next);
 
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
-    const auto replaced = readCkpt(*backend, store->layout(), life);
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, store->layout(), ns);
+    const auto replaced = readCkpt(op, store->layout(), life);
     ASSERT_TRUE(replaced.has_value());
     EXPECT_EQ(replaced->ckpt.life_epoch, next.life_epoch);
     EXPECT_EQ(replaced->ckpt.committed_through, next.committed_through);
@@ -230,12 +238,14 @@ TEST(CASRawRefFixture, ReplaceRecoverableCheckpointRejectsStaleRegressiveAndWron
 {
     auto backend = std::make_shared<CkptReplacementConflictBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const RootNamespace ns{"00/replace-ckpt-refusal@cas@"};
     const ManifestRef manifest = ref("srv-a:1", 1, 0xAF);
     const RefTxnId id{manifest.writer_epoch,
         publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, manifest)};
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
-    const auto existing = readCkpt(*backend, store->layout(), life);
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, store->layout(), ns);
+    const auto existing = readCkpt(op, store->layout(), life);
     ASSERT_TRUE(existing.has_value());
 
     RefCkpt wrong_life = existing->ckpt;
@@ -250,7 +260,7 @@ TEST(CASRawRefFixture, ReplaceRecoverableCheckpointRejectsStaleRegressiveAndWron
     backend->watched_key = store->layout().refCkptKey(life);
     backend->conflict_once = true;
     EXPECT_THROW(replaceRecoverableCkptForRawFixture(*backend, store->layout(), ns, existing->ckpt), DB::Exception);
-    EXPECT_EQ(readCkpt(*backend, store->layout(), life)->ckpt.committed_through, id);
+    EXPECT_EQ(readCkpt(op, store->layout(), life)->ckpt.committed_through, id);
 }
 
 /// The owner-removed manifest body is deleted only after a full round (its decrement is sealed — #11).
@@ -438,16 +448,16 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
 }
 
 /// Two-leader stale-redelete regression — the executable form of the deposed-leader spec §2. A stale
-/// leader's pre-CAS exact-token redelete `deleteExact(h, t1)` must never delete a live reuse. With the
-/// buggy clear-on-spare, a spare publishes `Clean`; a writer reads `Clean` and REUSES `t1`; the stale
-/// `deleteExact(t1)` then deletes the LIVE body (INV_NO_LOSS). Add-only meta closes it: the spare leaves
-/// `Condemned`, the writer resurrects to `t2`, and the stale `deleteExact(t1)` is a `TokenMismatch` no-op.
+/// leader's pre-CAS redelete of the incarnation `t1` must never delete a live reuse. With the buggy
+/// clear-on-spare, a spare publishes `Clean`; a writer reads `Clean` and REUSES `t1`; the stale redelete
+/// then deletes the LIVE body (INV_NO_LOSS). Add-only meta closes it: the spare leaves `Condemned`, the
+/// writer resurrects to `t2`, and the stale redelete finds a different incarnation and sends nothing.
 ///
 /// Interleaving fidelity (APPROXIMATED): the deposed leader's destructive side effect is its pre-CAS
-/// exact-token `deleteExact(h, t1)`. We reproduce it deterministically by CAPTURING `t1` at condemn time
-/// (exactly the token a paused leader's `delete_pending` snapshot holds) and firing that exact
-/// `deleteExact` AFTER the surviving leader's spare and the writer's republication — the faithful destructive
-/// op, without a mid-round CAS-interrupt seam on the delete path (which the backend does not expose).
+/// redelete of `t1`. We reproduce it deterministically by CAPTURING `t1` at condemn time (exactly the
+/// incarnation a paused leader's `delete_pending` snapshot holds) and replaying the round's own
+/// observe-compare-remove sequence AFTER the surviving leader's spare and the writer's republication --
+/// the faithful destructive step, without a mid-round interrupt seam on the delete path.
 TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -472,10 +482,14 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     gc.runRegularRound();   /// -1 => in-degree 0 => condemned at t1
 
     /// The OLD leader L1's planned pre-CAS delete uses the EXACT token it observed at condemn: capture t1.
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const auto condemned_entry = currentEntryFor(*backend, store->layout(), hash);
     ASSERT_TRUE(condemned_entry.has_value());
-    const Token t1 = condemned_entry->token;
-    ASSERT_EQ(backend->head(blob_key).token, t1);
+    const PersistedIncarnation t1 = condemned_entry->token;
+    const std::optional<Meta> at_condemn = op.head(blob_key, Retry::once());
+    ASSERT_TRUE(at_condemn);
+    ASSERT_TRUE(t1.matches(at_condemn->incarnation));
 
     /// A NEW leader L2 folds a +1 that recovered h's in-degree and adopts a SPARE for h.
     const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
@@ -495,19 +509,23 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     /// from the writer's own source — it never reuses t1.
     const RootNamespace writer_ns{"00/redelete-writer@cas@"};
     publishBlobWithDurablePrecommit(store, writer_ns, "writer", id, payload);
-    const Token t2 = backend->head(blob_key).token;
-    EXPECT_NE(t2, t1) << "the writer resurrected to a fresh incarnation, not a reuse of t1";
+    const std::optional<Meta> t2 = op.head(blob_key, Retry::once());
+    ASSERT_TRUE(t2);
+    EXPECT_FALSE(t1.matches(t2->incarnation))
+        << "the writer resurrected to a fresh incarnation, not a reuse of t1";
 
-    /// L1 resumes and executes its stale pre-CAS exact-token redelete `deleteExact(h, t1)`: it must be a
-    /// TokenMismatch no-op (the live body is now t2), NEVER a Deleted of the live reuse.
-    const DeleteOutcome stale = backend->deleteExact(blob_key, t1);
-    EXPECT_EQ(stale.kind, DeleteOutcome::Kind::TokenMismatch)
-        << "the stale exact-token redelete must miss the live reuse (add-only closes INV_NO_LOSS)";
+    /// L1 resumes and replays its stale pre-CAS redelete exactly as the round performs one: observe the
+    /// key, compare the condemned incarnation against what is there, and only then remove. The
+    /// comparison fails against t2, so no removal is sent at all -- the live reuse is untouchable.
+    const std::optional<Meta> stale = op.head(blob_key, Retry::once());
+    ASSERT_TRUE(stale);
+    EXPECT_FALSE(t1.matches(stale->incarnation))
+        << "the stale redelete must miss the live reuse (add-only closes INV_NO_LOSS)";
 
     /// The live body under t2 survives, stays reachable via the committed r2, and fsck sees no dangle.
-    const HeadResult hr = backend->head(blob_key);
-    ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token, t2);
+    const std::optional<Meta> survivor = op.head(blob_key, Retry::once());
+    ASSERT_TRUE(survivor);
+    EXPECT_EQ(survivor->incarnation, t2->incarnation);
     replaceRecoverableCkptForRawFixture(
         *backend, store->layout(), ns,
         RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 3},
@@ -853,7 +871,9 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     // crashed process: a body that is live-shaped (not terminated, not fenced) but whose write token
     // never changes again.
     const String srid2 = "stale-server";
-    MountLeaseKeeper srid2_keeper(backend, layout, srid2, DB::UInt128(0x2222), /*writer_epoch=*/1,
+    CasRequests keeper_requests = openRequestsForTest(backend);
+    MountLeaseKeeper srid2_keeper(keeper_requests, keeper_requests, layout, srid2, DB::UInt128(0x2222),
+        /*writer_epoch=*/1,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
     srid2_keeper.start();
@@ -912,10 +932,7 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     // srid2's writer comes back and tries to renew: its held token was invalidated by the fence rewrite,
     // so synchronous renewal returns a terminal failure. (It renews on its own clock; liveness is irrelevant — the token guard
     // trips regardless.)
-    const MountRenewResult renewed = srid2_keeper.renew(
-        CasRequestBudget{.attempt_timeout_ms = 1, .operation_deadline_ms = 10, .max_attempts = 1,
-                         .lease_safety_margin_ms = 0, .retry_initial_backoff_ms = 0, .retry_max_backoff_ms = 0},
-        MountRenewOperationEnvironment{});
+    const MountRenewResult renewed = srid2_keeper.renew(MountRenewOperationEnvironment{});
     ASSERT_EQ(renewed.outcome, MountRenewOutcome::Terminal);
     ASSERT_NE(renewed.failure, nullptr);
     EXPECT_THROW(std::rethrow_exception(renewed.failure), DB::Exception);
@@ -944,7 +961,9 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
 
     // A stale mount, exactly as `ExpiredMountFencedOutAndExcluded`: one claim, never renewed again.
     const String srid2 = "stale-server";
-    MountLeaseKeeper srid2_keeper(backend, layout, srid2, DB::UInt128(0x2222), /*writer_epoch=*/1,
+    CasRequests keeper_requests = openRequestsForTest(backend);
+    MountLeaseKeeper srid2_keeper(keeper_requests, keeper_requests, layout, srid2, DB::UInt128(0x2222),
+        /*writer_epoch=*/1,
         std::chrono::milliseconds(100), [] { return 1000u; }, [&] { return fake_boot; });
     srid2_keeper.start();
     ASSERT_FALSE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
@@ -968,9 +987,9 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
     EXPECT_TRUE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
 }
 
-/// deleteExact against a blob the writer RECREATED (fresh incarnation, different token) between the pending
-/// publish and the deleting pass lands TokenMismatch — a terminal-OK outcome recorded as a replace: the
-/// fresh incarnation is a live object and survives. report.replaced counts it.
+/// A redelete of a blob the writer RECREATED (fresh incarnation) between the pending publish and the
+/// deleting pass finds a different incarnation — a terminal-OK outcome recorded as a replace: the fresh
+/// incarnation is a live object and survives. report.replaced counts it.
 TEST(CASGCAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -1005,8 +1024,8 @@ TEST(CASGCAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
     // longer matches the pending entry's captured token.
     displaceBlobToken(*backend, store->layout(), blob_id);
 
-    // The deleting pass issues deleteExact(entry.token) → TokenMismatch → Replaced. The fresh incarnation
-    // survives; the entry is dropped.
+    // The deleting pass observes the key, finds an incarnation the entry does not name → Replaced. The
+    // fresh incarnation survives; the entry is dropped.
     const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
     EXPECT_EQ(rep.replaced, 1u);
@@ -1059,8 +1078,13 @@ TEST(CASGCAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
     // Simulate a crashed deleting pass that DID land the exact-token delete but crashed before the gc/state
     // CAS. The next (fresh-attempt) pass replays the delete → the object is already gone → NotFound → the
     // pass records Absent and completes.
-    ASSERT_EQ(backend->deleteExact(store->layout().blobKey(blob_id), pending_entry.token).kind,
-              DeleteOutcome::Kind::Deleted);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const String pending_key = store->layout().blobKey(blob_id);
+    const std::optional<Meta> doomed = op.head(pending_key, Retry::once());
+    ASSERT_TRUE(doomed);
+    ASSERT_TRUE(pending_entry.token.matches(doomed->incarnation));
+    ASSERT_EQ(op.remove(pending_key, doomed->incarnation, Retry::once()), Removal::Removed);
 
     const uint64_t round_before = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
     Gc gc2(store, kGc);
@@ -1072,14 +1096,14 @@ TEST(CASGCAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
 }
 
-/// Backend-agnostic regression for the rustfs 412-on-absent quirk: a conditional exact-token delete
-/// against an object that is ALREADY absent answers `TokenMismatch`, not `NotFound`, on this backend
-/// (`TokenMismatchOnAbsentBackend` reproduces it deterministically). The redelete site must disambiguate
-/// via a follow-up HEAD: the object is truly gone, so the outcome must settle as Absent (never Replaced)
-/// and the `.meta` cleanup (gated on Deleted/NotFound) must still run.
-TEST(CASGCAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
+/// A blob whose body a crashed pass already deleted must settle as Absent (never Replaced), its `.meta`
+/// cleanup must still run, and -- the part a store can punish -- the round must not send a conditional
+/// removal against the absent key at all. A store may answer such a removal with a precondition failure
+/// instead of a clean miss (rustfs does), which is indistinguishable from "somebody replaced it"; the
+/// round observes first, so it never has to tell the two apart.
+TEST(CASGCAckFloor, AbsentBlobSettlesAsAbsentWithoutASpeculativeConditionalRemoval)
 {
-    auto backend = std::make_shared<TokenMismatchOnAbsentBackend>();
+    auto backend = std::make_shared<AbsentRemovalWatchBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
@@ -1117,32 +1141,37 @@ TEST(CASGCAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
         ASSERT_EQ(lm->meta.state, MetaState::Condemned);
     }
 
-    // The object is genuinely gone already (as if a prior crashed pass landed the delete); confirm that,
-    // then arm the quirk so the NEXT conditional delete against this now-absent key answers TokenMismatch
-    // instead of NotFound (the rustfs 412-on-absent behavior).
+    // The object is genuinely gone already (as if a prior crashed pass landed the delete), and from here
+    // every removal the round sends against this key would be sent against an absent object.
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String blob_key = store->layout().blobKey(blob_id);
-    ASSERT_EQ(backend->deleteExact(blob_key, pending_entry.token).kind, DeleteOutcome::Kind::Deleted);
-    ASSERT_FALSE(backend->head(blob_key).exists);
-    backend->quirkOnAbsent(blob_key);
+    const std::optional<Meta> doomed = op.head(blob_key, Retry::once());
+    ASSERT_TRUE(doomed);
+    ASSERT_TRUE(pending_entry.token.matches(doomed->incarnation));
+    ASSERT_EQ(op.remove(blob_key, doomed->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_FALSE(op.head(blob_key, Retry::once()));
+    backend->watch(blob_key);
 
-    // The deleting pass replays deleteExact(entry.token): the backend answers TokenMismatch (quirk), but
-    // the follow-up HEAD shows the object absent, so the fix disambiguates the outcome to Absent and still
-    // runs the `.meta` cleanup.
+    // The deleting pass replays the redelete: it observes the absent key and settles Absent without a
+    // request the store could answer ambiguously, and the `.meta` cleanup still runs.
     const RoundReport rep = runRegularRoundReclaiming(gc);
     store->renewWatermarkOnce();
-    EXPECT_EQ(rep.absent, 1u) << "the 412-on-absent quirk must settle as Absent, not Replaced";
+    EXPECT_EQ(rep.absent, 1u) << "an already-absent blob settles as Absent, not Replaced";
     EXPECT_EQ(rep.replaced, 0u);
+    EXPECT_EQ(backend->removalsAgainstAbsent(), 0u)
+        << "the redelete observed the key first, so it sent no conditional removal against an absent object";
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
     EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value())
-        << ".meta cleanup (gated on Deleted/NotFound) must still run on the disambiguated Absent outcome";
+        << ".meta cleanup (gated on a removal or a proven absence) must still run on the Absent outcome";
 }
 
 /// ---- condemn-marker gate suite ----
 ///
 /// The per-hash condemn marker is LOAD-BEARING for the delete edge: the writer's adopt gate point-reads
 /// the meta and an ABSENT meta reads as Clean, so a blob whose condemn-marker write was swallowed can be
-/// same-token adopted by a writer landing in the [discovery-LIST, deleteExact] window — invisible to the
-/// graduating fold — and the exact-token redelete then deletes a body under a live committed edge
+/// same-token adopted by a writer landing in the [discovery-LIST, redelete] window — invisible to the
+/// graduating fold — and the redelete then deletes a body under a live committed edge
 /// (dangling manifest). Graduation to `delete_pending` therefore requires CONFIRMED durable `Condemned`
 /// evidence for the entry; absent evidence CARRIES the entry to the next round (fail-safe delay, never a
 /// fail-open delete) and retries the marker so a healed backend restores liveness.

@@ -52,6 +52,8 @@ TEST(CASGCShardIncarnation, DiscoveryEqualsPresentShards)
     {
         std::shared_ptr<InMemoryBackend> backend;
         auto store = makePoolWithShards(backend, gc_shards);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
         Gc gc(store, hexToU128("0000000000000000000000000000000a"));
         const Layout & layout = store->layout();
 
@@ -63,7 +65,7 @@ TEST(CASGCShardIncarnation, DiscoveryEqualsPresentShards)
         fixture::admitLive(*backend, layout, ns_live_empty);
 
         /// (b) A genuinely Creating entry, admitted directly (step 1 alone -- never completed to Live).
-        CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns_creating, .state = NsState::Creating,
+        CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns_creating, .state = NsState::Creating,
             .incarnation = UInt128(1), .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1}});
 
         /// (c) Ref objects present, but the catalog was never told (or has since forgotten): write
@@ -72,7 +74,7 @@ TEST(CASGCShardIncarnation, DiscoveryEqualsPresentShards)
         writeManifestRaw(*backend, layout, ns_uncataloged, testRef(1), {});
         publishCommittedTransition(*backend, layout, ns_uncataloged, "part_1", std::nullopt, testRef(1), /*shard=*/0);
         {
-            CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+            CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
             std::erase_if(snap.catalog.entries, [&](const CatalogEntry & e) { return e.ns.string() == ns_uncataloged.string(); });
             const HeadResult h = backend->head(layout.refCatalogKey());
             ASSERT_TRUE(h.exists);
@@ -97,7 +99,7 @@ TEST(CASGCShardIncarnation, DiscoveryEqualsPresentShards)
         EXPECT_TRUE(found_live_empty) << "a Live catalog entry with zero ref objects must still be discovered";
 
         /// Confirm (b) really is still Creating (not merely absent from a differently-shaped universe).
-        const CasRefCatalog::Snapshot final_snap = CasRefCatalog::read(*backend, layout);
+        const CasRefCatalog::Snapshot final_snap = CasRefCatalog::read(op, layout);
         const auto creating_it = std::find_if(final_snap.catalog.entries.begin(), final_snap.catalog.entries.end(),
             [&](const CatalogEntry & e) { return e.ns.string() == ns_creating.string(); });
         ASSERT_NE(creating_it, final_snap.catalog.entries.end());
@@ -141,11 +143,13 @@ TEST(CASGCShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/tblIncarnationSwap"};
 
-    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns, .state = NsState::Live,
+    CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns, .state = NsState::Live,
         .incarnation = UInt128(11), .creator = std::nullopt});   // Live forbids a creator fence
     const ManifestRef dead_ref = testRef(1);
     writeBlobBody(*backend, layout, UInt128(11));
@@ -157,7 +161,7 @@ TEST(CASGCShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
     const NamespaceLifeId dead_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(11));
 
     {
-        CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+        CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
         const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
             [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
         ASSERT_NE(it, snap.catalog.entries.end());
@@ -203,16 +207,18 @@ TEST(CASGCShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test", .gc_shards = 1,
         .gc_fold_max_defer_rounds = 0});
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/tblOrdinaryRebirth"};
 
-    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns, .state = NsState::Live,
+    CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns, .state = NsState::Live,
         .incarnation = UInt128(11), .creator = std::nullopt});
 
     CatalogEntry after_rebirth{.ns = ns, .state = NsState::Live, .incarnation = UInt128(22), .creator = std::nullopt};
     {
-        CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+        CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
         const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
             [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
         ASSERT_NE(it, snap.catalog.entries.end());
@@ -269,6 +275,8 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/tblForgotten"};
@@ -278,7 +286,7 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
     const NamespaceLifeId forgotten_life = store->namespaceLife(ns);
 
     {
-        CasRefCatalog::Snapshot snap = CasRefCatalog::read(*backend, layout);
+        CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
         std::erase_if(snap.catalog.entries, [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
         const HeadResult h = backend->head(layout.refCatalogKey());
         ASSERT_TRUE(h.exists);
@@ -298,13 +306,15 @@ TEST(CASGCShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 1});
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
     const Layout & layout = store->layout();
     const RootNamespace creating_ns{"srv1/tblStalledBirth"};
     const RootNamespace unrelated_gone_ns{"srv1/tblGenuinelyGone"};
 
     /// Step 1 of createNamespace: insert the Creating entry with a live creator fence.
-    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = creating_ns, .state = NsState::Creating,
+    CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = creating_ns, .state = NsState::Creating,
         .incarnation = UInt128(33),
         .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1}});
     /// Step 2, without step 3: publish the genesis `_ckpt` directly, at the SAME incarnation the
@@ -428,6 +438,8 @@ TEST(CASGCShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
     {
         std::shared_ptr<InMemoryBackend> backend;
         auto store = makePoolWithShards(backend, gc_shards);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
         const RootNamespace ns_b{"srv1/tblB"};
 
         /// --- Phase 1: Write b1's body before any GC. ---
@@ -454,9 +466,9 @@ TEST(CASGCShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
             store->renewWatermarkOnce();
         }
         const String b1_key = store->layout().blobKey(b1_ref);
-        ASSERT_TRUE(backend->head(b1_key).exists)
-            << "b1 body must be present after the seed putBlob";
-        const Token b1_token = backend->head(b1_key).token;
+        const std::optional<Meta> b1_observed = op.head(b1_key, Retry::once());
+        ASSERT_TRUE(b1_observed) << "b1 body must be present after the seed putBlob";
+        const PersistedIncarnation b1_token = PersistedIncarnation::capture(b1_observed->incarnation);
 
         /// --- Phase 2: Inject gc/state at round 1 with b1 CONDEMNED (body still present). ---
         /// This simulates GC having advanced to round 1 and retired b1 (condemned token recorded
@@ -507,9 +519,12 @@ TEST(CASGCShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         EXPECT_TRUE(store->resolveRef(ns_b, "part_b1").has_value())
             << "gc_shards=" << gc_shards << ": the ref must commit";
         /// The condemned token is bound UNCHANGED — no displacement happens (and none is needed).
-        EXPECT_EQ(backend->head(b1_key).token, b1_token)
-            << "gc_shards=" << gc_shards << ": no copy-forward under the Phase-A contract — the token "
-               "stays; the folded edge will spare it at the next fold (no round runs here to delete it)";
+        const std::optional<Meta> b1_after = op.head(b1_key, Retry::once());
+        ASSERT_TRUE(b1_after);
+        EXPECT_TRUE(b1_token.matches(b1_after->incarnation))
+            << "gc_shards=" << gc_shards << ": no copy-forward under the Phase-A contract — the "
+               "incarnation stays; the folded edge will spare it at the next fold (no round runs "
+               "here to delete it)";
 
         /// INV-NO-DANGLE: the body is present and no GC round ever runs in this test to fold the
         /// precommit/committed edge; a real deployment's next fold would see net in-degree >= 1 and

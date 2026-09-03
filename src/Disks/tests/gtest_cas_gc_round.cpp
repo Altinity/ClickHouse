@@ -15,6 +15,7 @@ namespace DB::ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
 extern const int ABORTED;
+extern const int NETWORK_ERROR;
 }
 
 namespace ProfileEvents
@@ -95,27 +96,23 @@ PoolPtr openTestPoolWithConfig(std::shared_ptr<InMemoryBackend> & out_backend, P
 class GcStateCasFaultBackend : public InMemoryBackend
 {
 public:
-    using Backend::get;
-    using Backend::getStream;
-    using Backend::putIfAbsent;
-    using Backend::putOverwrite;
-    using Backend::casPut;
-
-    CasResult casPut(const String & key, const String & bytes,
-                     const std::optional<Token> & expected, const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
-        if (key == faulted_key)
+        if (expected_value && key == faulted_key)
         {
             ++calls_to_faulted_key;
             if (fail_at_call != 0 && calls_to_faulted_key == fail_at_call)
-                return CasResult{CasOutcome::Conflict, {}};
+                return std::unexpected(RawConflict{});
         }
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
     String faulted_key;
     size_t calls_to_faulted_key = 0;
-    size_t fail_at_call = 0;   /// 0 = never fault; else fault exactly the Nth casPut to `faulted_key`
+    /// 0 = never fault; else refuse exactly the Nth conditional write to `faulted_key`.
+    size_t fail_at_call = 0;
 };
 
 GcState readState(InMemoryBackend & b, const Pool & s)
@@ -162,18 +159,18 @@ size_t driveToFixpoint(InMemoryBackend & backend, const PoolPtr & store, Gc & gc
     return working_rounds;
 }
 
-/// A full key -> token snapshot of the backend, for the previewDeletes write-free invariant: any
-/// put/casPut/overwrite mints a fresh token (or adds a key) and any delete removes one, so an unchanged
-/// map across a call proves it performed NO writes.
-std::map<String, String> snapshotKeyTokens(InMemoryBackend & b)
+/// A full key -> incarnation snapshot of the backend, for the previewDeletes write-free invariant: any
+/// write mints a fresh incarnation (or adds a key) and any removal drops one, so an unchanged map
+/// across a call proves it performed NO writes.
+std::map<String, String> snapshotKeyTokens(CasOperation & op)
 {
     std::map<String, String> out;
     String cursor;
     while (true)
     {
-        const ListPage page = b.list("", cursor, 100000);
-        for (const ListedKey & k : page.keys)
-            out[k.key] = k.token ? k.token->value : String{};
+        const KeyPage page = op.list("", cursor, 100000, Retry::once());
+        for (const KeyEntry & k : page.keys)
+            out[k.key] = k.incarnation ? k.incarnation->render() : String{};
         if (page.next_cursor.empty())
             break;
         cursor = page.next_cursor;
@@ -431,7 +428,7 @@ TEST(CASGCLease, ConcurrentStealLosesCas)
     ASSERT_TRUE(gc1.runRegularRound().acquired_lease);
     const GcState st0 = readState(*b, *s);
     EXPECT_FALSE(gc2.runRegularRound().acquired_lease);          /// obs #1; gc1 stalls now
-    b->failNextCasPut(s->layout().gcStateKey());                 /// inject: gc2's steal CAS conflicts
+    b->refuseNextWrite(s->layout().gcStateKey());                 /// inject: gc2's steal CAS conflicts
     EXPECT_FALSE(gc2.runRegularRound().acquired_lease);          /// steal attempt loses the CAS => back off
     const GcState st1 = readState(*b, *s);
     EXPECT_EQ(st1.lease.owner, kGcA);                            /// unchanged
@@ -449,7 +446,7 @@ TEST(CASGCLease, CreateConflictReReadsWithinTheBound)
     auto s = openTestPool(b);
     Gc gc(s, hexToU128("0000000000000000000000000000000c"));
 
-    b->failNextCasPut(s->layout().gcStateKey());
+    b->refuseNextWrite(s->layout().gcStateKey());
     EXPECT_TRUE(gc.runRegularRound().acquired_lease);
     const GcState st = readState(*b, *s);
     EXPECT_EQ(st.lease.owner, hexToU128("0000000000000000000000000000000c"));
@@ -475,7 +472,7 @@ TEST(CASGCLease, IncumbentRenewConflictRetriesOnceAndAcquires)
     Gc gc(s, hexToU128("0000000000000000000000000000000d"));
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);            /// create: seq 1
-    b->failNextCasPut(s->layout().gcStateKey());                 /// inject: the renew CAS conflicts
+    b->refuseNextWrite(s->layout().gcStateKey());                 /// inject: the renew CAS conflicts
     EXPECT_TRUE(gc.runRegularRound().acquired_lease);            /// re-read (still us) => retried once
     const GcState st = readState(*b, *s);
     EXPECT_EQ(st.lease.owner, hexToU128("0000000000000000000000000000000d"));
@@ -604,17 +601,19 @@ TEST(CASGCRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     runRegularRoundReclaiming(gc);                 /// condemning round: -1 => in-degree 0 => RunMarker::Condemned row (not pending)
 
-    /// Write-free contract: a full key->token snapshot must be identical across the previewDeletes call.
-    const auto before = snapshotKeyTokens(*backend);
+    /// Write-free contract: a full key->incarnation snapshot must be identical across the call.
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const auto before = snapshotKeyTokens(op);
     const std::vector<Gc::PreviewEntry> awaiting = gc.previewDeletes();
-    const auto after = snapshotKeyTokens(*backend);
-    EXPECT_EQ(before, after) << "previewDeletes must perform NO writes (put/casPut/overwrite/delete)";
+    const auto after = snapshotKeyTokens(op);
+    EXPECT_EQ(before, after) << "previewDeletes must perform NO writes";
 
     ASSERT_EQ(awaiting.size(), 1u) << "exactly the one condemned blob is previewed";
     EXPECT_EQ(awaiting[0].ref, (DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)}));
     EXPECT_EQ(awaiting[0].key, store->layout().blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)}));
     EXPECT_EQ(awaiting[0].reason, "awaiting_graduation");
-    EXPECT_FALSE(awaiting[0].token.value.empty()) << "must carry the stored condemn-time token";
+    EXPECT_FALSE(awaiting[0].token.value.empty()) << "must carry the stored condemn-time incarnation";
     EXPECT_GT(awaiting[0].condemn_round, 0u) << "must carry the stored condemn round";
 
     runRegularRoundReclaiming(gc);                 /// graduation round: entry becomes delete_pending (blob still present)
@@ -1801,6 +1800,8 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     /// fold-every-round (Phase-4 Lever A would otherwise defer once the pool quiesces).
     config.gc_fold_max_defer_rounds = 0;
     auto store = openTestPoolWithConfig(backend, config);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
 
     const RootNamespace ns{"test/aa@cas@"};
     registerNamespaceRaw(*backend, store->layout(), ns);
@@ -1851,7 +1852,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     writeSealAt(*backend, store->layout(), ns, RefTxnId{1, 2});
     publishAt(*backend, store->layout(), ns, RefTxnId{2, 1}, "tbl2", /*build_sequence=*/7,
               DB::UInt128(0xB10B2), /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
-    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
+    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(op, store->layout(), ns);
     ASSERT_TRUE(life.has_value());
     const String ckpt_key = store->layout().refCkptKey(*life);
     const auto old_ckpt = backend->get(ckpt_key);
@@ -1996,4 +1997,164 @@ TEST(CASGCRound, TwoManifestsTwoSourceEdgesDropOneSpares)
         << "after dropping one of two references the in-degree must be 1";
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)))
         << "the blob must survive — the second reference still pins it";
+}
+
+/// ===================== THE REQUEST CONTRACT AT THE ROUND'S OWN WRITES =====================
+
+/// The advisory pulse sends AT MOST ONE write, and neither of the two ways it can fail reaches the
+/// caller: the next pulse comes on cadence, so a deposed leader must never spend a retry budget
+/// fighting for this key. Both halves are asserted by the write COUNT, because a policy that reissued
+/// would be invisible in the outcome.
+TEST(CASGc, HeartbeatPulseIsOnceAndAConflictIsIgnored)
+{
+    class HeartbeatFaultBackend : public InMemoryBackend
+    {
+    public:
+        std::expected<String, RawConflict> write(
+            const String & key, const String & bytes, const std::optional<String> & expected_value,
+            TransportAccess & access) override
+        {
+            if (key == hb_key)
+            {
+                ++hb_writes;
+                if (throw_next)
+                {
+                    throw_next = false;
+                    throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected heartbeat write outage");
+                }
+                if (refuse_next)
+                {
+                    refuse_next = false;
+                    return std::unexpected(RawConflict{});
+                }
+            }
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        }
+
+        String hb_key;
+        size_t hb_writes = 0;
+        bool throw_next = false;
+        bool refuse_next = false;
+    };
+
+    auto backend = std::make_shared<HeartbeatFaultBackend>();
+    auto store = openPoolForTest(backend);
+    backend->hb_key = store->layout().gcHbKey();
+
+    Gc::pulseHeartbeat(*store, kGcA);
+    ASSERT_EQ(backend->hb_writes, 1u) << "one pulse is one write";
+
+    /// AN UNRESOLVED ATTEMPT IS NOT REISSUED. The key is removed first so the write's own resolving
+    /// read finds nothing: with nothing at the key the attempt's fate is genuinely unknown, which is
+    /// the only state a reissuing policy would act on. Under `once` the pulse ends there.
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    ASSERT_EQ(op.removeCurrent(backend->hb_key, Retry::once()), Removal::Removed);
+    backend->throw_next = true;
+    const size_t before_unresolved = backend->hb_writes;
+    EXPECT_NO_THROW(Gc::pulseHeartbeat(*store, kGcA));
+    EXPECT_EQ(backend->hb_writes, before_unresolved + 1)
+        << "an unresolved pulse is abandoned, never reissued";
+
+    /// A REFUSED PRECONDITION is the ordinary race with another pulser: ignored, never thrown.
+    Gc::pulseHeartbeat(*store, kGcA);
+    backend->refuse_next = true;
+    const size_t before_refused = backend->hb_writes;
+    EXPECT_NO_THROW(Gc::pulseHeartbeat(*store, kGcA));
+    EXPECT_EQ(backend->hb_writes, before_refused + 1);
+}
+
+/// The steal is the one destructive decision the lease machine makes, and it is a CONJUNCTION: the
+/// lease tuple unchanged across two of this contender's own observations, the heartbeat pair unchanged
+/// across the same window, and a caller allowed to steal. Each conjunct is falsified on its own here,
+/// against the same frozen incumbent, so a build that dropped any one of them fails exactly one line.
+TEST(CASGc, LeaseDecideStealsOnlyWithAllThreeConjuncts)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+
+    Gc incumbent(store, kGcA);
+    ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
+
+    Gc contender(store, kGcB);
+    EXPECT_FALSE(contender.runRegularRound({}, /*allow_steal=*/true).acquired_lease)
+        << "the first tick has no earlier observation to freeze against";
+
+    Gc::pulseHeartbeat(*store, kGcA);
+    EXPECT_FALSE(contender.runRegularRound({}, /*allow_steal=*/true).acquired_lease)
+        << "a moved heartbeat pair is proof of life even with the lease tuple frozen";
+
+    ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
+    EXPECT_FALSE(contender.runRegularRound({}, /*allow_steal=*/true).acquired_lease)
+        << "a moved lease tuple is proof of life even with the heartbeat frozen";
+
+    EXPECT_FALSE(contender.runRegularRound({}, /*allow_steal=*/false).acquired_lease)
+        << "both observations are frozen, but this caller may not steal";
+
+    EXPECT_TRUE(contender.runRegularRound({}, /*allow_steal=*/true).acquired_lease)
+        << "frozen tuple, frozen heartbeat and a caller allowed to steal";
+}
+
+/// The round commits everything it did in ONE conditional write of `gc/state`. A refused precondition
+/// there means another leader advanced the key, so the round is dropped whole: it throws `ABORTED` and
+/// adopts no generation. The lease renewal that OPENED the round is a separate, earlier write and
+/// stays committed.
+TEST(CASGc, RoundCommitConflictDropsTheRound)
+{
+    class RoundCommitConflictBackend : public InMemoryBackend
+    {
+    public:
+        std::expected<String, RawConflict> write(
+            const String & key, const String & bytes, const std::optional<String> & expected_value,
+            TransportAccess & access) override
+        {
+            if (arm && expected_value && key == gc_state_key)
+            {
+                const auto stored = InMemoryBackend::read(key, access);
+                if (stored
+                    && decodeGcState(bytes).snap_generation > decodeGcState(stored->bytes).snap_generation)
+                {
+                    arm = false;
+                    return std::unexpected(RawConflict{});
+                }
+            }
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        }
+
+        String gc_state_key;
+        bool arm = false;
+    };
+
+    auto backend = std::make_shared<RoundCommitConflictBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    backend->gc_state_key = store->layout().gcStateKey();
+
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const auto readState = [&] { return decodeGcState(op.read(backend->gc_state_key, Retry::once())->bytes); };
+
+    Gc gc(store, kGc);
+    const GcState before = readState();
+    backend->arm = true;
+    try
+    {
+        gc.runRegularRound();
+        FAIL() << "a refused round commit must end the round";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+    }
+
+    const GcState after = readState();
+    EXPECT_EQ(after.snap_generation, before.snap_generation)
+        << "a refused commit adopts no generation";
+    EXPECT_GT(after.lease.seq, before.lease.seq)
+        << "the lease renewal that opened the round is a separate, earlier write and stays committed";
 }

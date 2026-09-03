@@ -74,6 +74,9 @@ const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 class HintHoleCountingBackend : public CountingBackend
 {
 public:
+    /// Unhide the names the primitive overrides below would otherwise shadow.
+    using CountingBackend::list;
+
     void hide(const String & key)
     {
         std::lock_guard lock(m);
@@ -86,14 +89,14 @@ public:
         return served;
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
-        ListPage page = CountingBackend::list(prefix, cursor, limit);
+        RawListPage page = CountingBackend::list(prefix, cursor, limit, access);
         std::lock_guard lock(m);
         if (hidden.empty())
             return page;
         const size_t before = page.keys.size();
-        std::erase_if(page.keys, [&](const ListedKey & k) { return hidden.contains(k.key); });
+        std::erase_if(page.keys, [&](const RawListedKey & k) { return hidden.contains(k.key); });
         if (page.keys.size() != before)
             ++served;
         return page;
@@ -769,15 +772,14 @@ TEST(CASGCHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
     class AlternatingGetBackend : public InMemoryBackend
     {
     public:
-        using DB::Cas::Backend::get;
         String flaky;
         size_t reads = 0;
 
-        std::optional<GetResult> get(const String & key, Range range) override
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
         {
             if (key == flaky && ++reads % 2 == 0)
                 return std::nullopt;
-            return InMemoryBackend::get(key, range);
+            return InMemoryBackend::read(key, access);
         }
     };
 
@@ -1485,20 +1487,22 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
     class BroadListHoleBackend : public InMemoryBackend
     {
     public:
-        /// Unhide the primitive overload that the legacy override below would otherwise hide.
+        /// Unhide the name the primitive override below would otherwise shadow.
         using InMemoryBackend::list;
+
         String hide_under_prefix;
         String hidden_key_infix;
         size_t holes_served = 0;
 
-        ListPage list(const String & prefix, const String & cursor, size_t limit) override
+        RawListPage list(const String & prefix, const String & cursor, size_t limit,
+                         TransportAccess & access) override
         {
-            ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+            RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
             if (prefix != hide_under_prefix)
                 return page;
             const size_t before = page.keys.size();
             std::erase_if(page.keys,
-                          [&](const ListedKey & k) { return k.key.find(hidden_key_infix) != String::npos; });
+                          [&](const RawListedKey & k) { return k.key.find(hidden_key_infix) != String::npos; });
             if (page.keys.size() != before)
                 ++holes_served;
             return page;

@@ -237,11 +237,13 @@ TEST(CASGCRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/rebuild-frozen-frontier@cas@"};
     const UInt128 life_id{0xF001};
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, life_id);
-    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards,
+    CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards,
         CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = life_id});
 
     const ManifestRef admitted = ref(1, 0xA1);
@@ -280,10 +282,12 @@ TEST(CASGCRebuild, LiveCatalogLifeWithoutCheckpointFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/rebuild-missing-checkpoint@cas@"};
     const UInt128 life_id{0xF002};
-    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards,
+    CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards,
         CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = life_id});
 
     const ManifestRef admitted = ref(1, 0xA2);
@@ -311,10 +315,12 @@ TEST(CASGCRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/rebuild-checkpoint-base-seal@cas@"};
     const UInt128 life_id{0xF003};
-    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards,
+    CasRefCatalog::casAdmitEntry(op, layout, store->poolConfig().gc_shards,
         CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = life_id});
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, life_id);
 
@@ -357,12 +363,14 @@ TEST(CASGCRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/removing-without-parent@cas@"};
     const UInt128 life_id{91};
-    CasRefCatalog::casAdmitEntry(*backend, layout, 1, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(op, layout, 1, CatalogEntry{
         .ns = ns, .state = NsState::Live, .incarnation = life_id});
-    CasRefCatalog::casUpdate(*backend, layout, [](const RefCatalog & current)
+    CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current)
     {
         RefCatalog next = current;
         next.entries[0].state = NsState::Removing;
@@ -374,7 +382,7 @@ TEST(CASGCRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
-    const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
+    const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
     const uint64_t plans_before
         = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
 
@@ -382,8 +390,8 @@ TEST(CASGCRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
     const RebuildReport report = gc.rebuildBaseline(/*force*/ false);
     ASSERT_TRUE(report.performed) << report.refusal;
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 1u);
-    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before);
-    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(*backend, layout);
+    EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), catalog_cas_before);
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
     ASSERT_EQ(catalog.catalog.entries.size(), 1u);
     EXPECT_EQ(catalog.catalog.entries[0].state, NsState::Removing);
     EXPECT_EQ(catalog.catalog.entries[0].incarnation, life_id);
