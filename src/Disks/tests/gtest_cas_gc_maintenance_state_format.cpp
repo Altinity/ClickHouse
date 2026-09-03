@@ -161,22 +161,22 @@ TEST(CASGCMaintenanceState, UsesExactlyOneReadOrCasAttempt)
     auto op = requests.admit();
 
     EXPECT_EQ(readGcMaintenanceState(op, layout).status, GcMaintenanceReadStatus::Absent);
-    EXPECT_EQ(backend->readRequestCount(key), 1u);
+    EXPECT_EQ(backend->getCount(key), 1u);
 
     backend->resetCounts();
     ASSERT_TRUE(std::holds_alternative<Committed>(
         casGcMaintenanceState(op, layout, std::nullopt, {}, Retry::standard())));
-    EXPECT_EQ(backend->writeRequests(), 1u);
-    EXPECT_EQ(backend->readRequestCount(key), 0u);
+    EXPECT_EQ(backend->writeTotal(), 1u);
+    EXPECT_EQ(backend->getCount(key), 0u);
 
     backend->resetCounts();
     const WriteResult loser_attempt = casGcMaintenanceState(op, layout, std::nullopt,
         GcMaintenanceState{.janitor_cursor = "loser"}, Retry::standard());
     ASSERT_TRUE(std::holds_alternative<Conflict>(loser_attempt));
-    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->writeTotal(), 1u);
     /// Unlike the legacy CAS, a refused precondition is settled by ONE exact read before the write
     /// reports the conflict -- `Conflict`'s observation needs to know what is actually there.
-    EXPECT_EQ(backend->readRequestCount(key), 1u);
+    EXPECT_EQ(backend->getCount(key), 1u);
 
     const std::optional<Object> current = op.read(key, Retry::standard());
     ASSERT_TRUE(current);
@@ -187,8 +187,8 @@ TEST(CASGCMaintenanceState, UsesExactlyOneReadOrCasAttempt)
     const WriteResult stale_attempt = casGcMaintenanceState(op, layout, current->incarnation,
         GcMaintenanceState{.janitor_cursor = "stale"}, Retry::standard());
     ASSERT_TRUE(std::holds_alternative<Conflict>(stale_attempt));
-    EXPECT_EQ(backend->writeRequests(), 1u);
-    EXPECT_EQ(backend->readRequestCount(key), 1u);
+    EXPECT_EQ(backend->writeTotal(), 1u);
+    EXPECT_EQ(backend->getCount(key), 1u);
     EXPECT_EQ(decodeGcMaintenanceState(backend->InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
 }
 
@@ -205,7 +205,7 @@ TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
         PutOutcome::Done);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { (void)readGcMaintenanceState(op, layout); });
-    EXPECT_EQ(backend->writeRequests(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 0u);
 
     auto failing = std::make_shared<FailingMaintenanceReadBackend>();
     CasRequests failing_requests(failing, Fence::open());
@@ -231,7 +231,7 @@ TEST(CASGCMaintenanceState, LosingCorruptResetPreservesConcurrentWinner)
     backend->resetCounts();
     const WriteResult reset_attempt = casGcMaintenanceState(op, layout, corrupt.incarnation, {}, Retry::standard());
     ASSERT_TRUE(std::holds_alternative<Conflict>(reset_attempt));
-    EXPECT_EQ(backend->writeRequests(), 1u);
-    EXPECT_EQ(backend->readRequestCount(key), 1u);
+    EXPECT_EQ(backend->writeTotal(), 1u);
+    EXPECT_EQ(backend->getCount(key), 1u);
     EXPECT_EQ(decodeGcMaintenanceState(backend->InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
 }

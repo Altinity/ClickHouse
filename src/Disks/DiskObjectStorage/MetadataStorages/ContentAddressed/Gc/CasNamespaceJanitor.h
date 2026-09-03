@@ -25,7 +25,12 @@ public:
 
     /// `liveness` is admitted once for the whole page (one `CasOperation` covers the read, the list,
     /// every delete and the cursor publication): a fact the fence cannot see, such as "this tenure
-    /// still holds the GC round's own lease" -- see `CasRequests::admit`.
+    /// still holds the GC round's own lease" -- see `CasRequests::admit`. It is SAMPLED BEFORE EVERY
+    /// REQUEST the page makes (and before every reissue of one), not just at the two points this
+    /// function itself checks `op.admitted()` -- so it must be cheap and must never throw. A sample
+    /// that returns false ends whichever request was about to be sent: a read verb (the maintenance
+    /// read, the list, a HEAD) throws out of this call, and a write verb (a delete, the cursor
+    /// publication) reports it as `GaveUp` rather than sending anything.
     NamespaceJanitorResult runOnePage(bool suppress_deletes, Liveness liveness);
 
 private:

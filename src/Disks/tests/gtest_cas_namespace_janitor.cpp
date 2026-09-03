@@ -5,6 +5,11 @@
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
+namespace DB::ErrorCodes
+{
+    extern const int NETWORK_ERROR;
+}
+
 namespace
 {
 
@@ -54,25 +59,22 @@ private:
     bool omit = true;
 };
 
-/// Adds per-key REMOVE counting on top of `CountingBackend`, which only totals it: no test here needs
-/// more than one key distinguished, but `TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacement`
-/// needs that one.
-class RemoveCountingBackend : public CountingBackend
+/// Flips `delete_done` right after its one REMOVE returns, so a liveness predicate closing over it stays
+/// true through every request up to and including that delete -- whatever their number or order -- and
+/// only refuses the very next one. `liveness` is sampled before every request now, so driving a fence
+/// loss at an exact point robustly (rather than by counting samples, which would couple this test to how
+/// many reads the catalog snapshot happens to take) means keying it to an observable EVENT instead.
+class FlipAfterFirstDeleteBackend : public CountingBackend
 {
 public:
     DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
                                         DB::Cas::TransportAccess & access) override
     {
-        ++remove_counts[key];
-        return CountingBackend::remove(key, expected_value, access);
+        DB::Cas::Backend::RawRemoval outcome = CountingBackend::remove(key, expected_value, access);
+        delete_done = true;
+        return outcome;
     }
-    uint64_t removeCount(const String & key) const
-    {
-        const auto it = remove_counts.find(key);
-        return it == remove_counts.end() ? 0 : it->second;
-    }
-private:
-    std::map<String, uint64_t> remove_counts;
+    bool delete_done = false;
 };
 
 class ReplaceBeforeJanitorDeleteBackend : public CountingBackend
@@ -94,13 +96,13 @@ private:
     bool replaced = false;
 };
 
-class TokenlessListBackend : public RemoveCountingBackend
+class TokenlessListBackend : public CountingBackend
 {
 public:
     DB::Cas::Backend::RawListPage list(const String & prefix, const String & cursor, size_t limit,
                                        DB::Cas::TransportAccess & access) override
     {
-        DB::Cas::Backend::RawListPage page = RemoveCountingBackend::list(prefix, cursor, limit, access);
+        DB::Cas::Backend::RawListPage page = CountingBackend::list(prefix, cursor, limit, access);
         for (auto & key : page.keys)
             key.value.reset();
         return page;
@@ -110,13 +112,15 @@ public:
 
     std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
     {
-        std::optional<DB::Cas::Backend::RawMeta> result = RemoveCountingBackend::head(key, access);
+        std::optional<DB::Cas::Backend::RawMeta> result = CountingBackend::head(key, access);
         if (!replaced && result && key == replace_on_head)
         {
             replaced = true;
-            const HeadResult current = InMemoryBackend::head(key);
-            if (current.exists)
-                (void)InMemoryBackend::casPut(key, "winner", current.token);
+            /// The qualified primitive `write` -- not the legacy `head`/`casPut` convenience pair -- so
+            /// this simulated concurrent actor neither re-enters the counted `head` override (the legacy
+            /// forwarder calls back through the virtual primitive) nor is itself counted as a write the
+            /// janitor made.
+            (void)InMemoryBackend::write(key, "winner", result->value, access);
         }
         return result;
     }
@@ -153,16 +157,18 @@ public:
         {
             published = true;
             const String catalog_key = "p/cas/ref_catalog";
-            /// This models a CONCURRENT actor's read, not the janitor's own -- counting it here would
-            /// make `PostListCatalogCutProtectsConcurrentCreationWithOneGet`'s "exactly one get" assertion
-            /// count this simulated actor's read as the janitor's, defeating the point of that assertion.
-            const auto current = InMemoryBackend::get(catalog_key, {}); // NOLINT(bugprone-parent-virtual-call)
+            /// This models a CONCURRENT actor's read, not the janitor's own. It must go through the
+            /// qualified PRIMITIVE, not the virtual `read`/`write` this class's base counts: the janitor's
+            /// own catalog read reaches the store through that same virtual dispatch, and a call routed
+            /// through it here would be indistinguishable from the janitor's -- doubling the count
+            /// `PostListCatalogCutProtectsConcurrentCreationWithOneGet` asserts is exactly one.
+            const auto current = InMemoryBackend::read(catalog_key, access); // NOLINT(bugprone-parent-virtual-call)
             if (current)
             {
                 RefCatalog catalog;
                 catalog.entries.push_back(CatalogEntry{.ns = protected_life.ns, .state = NsState::Live,
                     .incarnation = protected_life.incarnation});
-                (void)InMemoryBackend::casPut(catalog_key, encodeRefCatalog(catalog), current->token);
+                (void)InMemoryBackend::write(catalog_key, encodeRefCatalog(catalog), current->value, access);
             }
         }
         return page;
@@ -198,23 +204,29 @@ public:
     bool fail_publication = false;
 };
 
-/// The catch-path reset in `NamespaceJanitor::runOnePage` fires on any LIST failure; this backend
-/// additionally makes its own write unresolvable (an unmodeled exception, then a resolve read that
-/// proves nothing), so `once` vs `standard` is actually distinguishable by attempt count.
+/// The catch-path reset in `NamespaceJanitor::runOnePage` fires on any LIST failure. Both faults here
+/// throw a `DB::Exception` classified `NETWORK_ERROR`: a `std::runtime_error` is not a `Poco::Exception`,
+/// so `CasOperation`'s engine treats it as an unmodeled local bug and surfaces it immediately on every
+/// path (read or write) without ever reaching the ambiguity-resolving machinery this test needs -- a
+/// `NETWORK_ERROR` is a genuine transient-looking store answer instead. The write additionally counts
+/// its own attempts (`CountingBackend::writeTotal()` stays 0 here: this override throws before ever
+/// delegating to the base `write`).
 class ThrowingListAndAmbiguousWriteBackend : public CountingBackend
 {
 public:
     DB::Cas::Backend::RawListPage list(const String &, const String &, size_t,
                                        DB::Cas::TransportAccess &) override
     {
-        throw std::runtime_error("list failed");
+        throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "list failed");
     }
     std::expected<String, DB::Cas::Backend::RawConflict> write(const String &, const String &,
                                                                const std::optional<String> &,
                                                                DB::Cas::TransportAccess &) override
     {
-        throw std::runtime_error("ambiguous write");
+        ++write_attempts;
+        throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "ambiguous write");
     }
+    uint64_t write_attempts = 0;
 };
 
 void seedCatalog(CountingBackend & backend, const Layout & layout, RefCatalog catalog = {})
@@ -251,8 +263,8 @@ TEST(CASNamespaceJanitor, DeletesDeadFilesAndCheckpointFromOnePostListCatalogCut
     EXPECT_EQ(result.deleted, 2u);
     EXPECT_FALSE(backend->get(file));
     EXPECT_FALSE(backend->get(ckpt));
-    EXPECT_EQ(backend->listRequestCount(layout.namespaceRootPrefix()), 1u);
-    EXPECT_EQ(backend->readRequestCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
     EXPECT_EQ(readState(requests, layout).state, GcMaintenanceState{});
 }
 
@@ -276,7 +288,7 @@ TEST(CASNamespaceJanitor, RetainsEveryCurrentLifecycleAndSuppressesAmbiguousCut)
     NamespaceJanitor janitor(requests, layout, 100);
     const auto result = janitor.runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
 TEST(CASNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
@@ -304,8 +316,8 @@ TEST(CASNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
         = NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
 
     EXPECT_EQ(result.deleted, 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
-    EXPECT_EQ(backend->readRequestCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
     EXPECT_TRUE(backend->get(ckpt));
     EXPECT_TRUE(backend->get(file));
 }
@@ -353,13 +365,18 @@ TEST(CASNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
     EXPECT_EQ(janitor.runOnePage(true, [] { return true; }).deleted, 0u);
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
         << "a globally suppressed page is undecided and must not mint cleanup progress";
-    EXPECT_EQ(backend->writeRequests(), 0u);
-    EXPECT_EQ(janitor.runOnePage(false, [] { return false; }).deleted, 0u);
+    EXPECT_EQ(backend->writeTotal(), 0u);
+
+    /// `liveness` is sampled before every request the page makes, starting with the maintenance read
+    /// itself -- a sample false from the start therefore ends the call by exception rather than by a
+    /// quiet no-op result.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
+        [&] { (void)janitor.runOnePage(false, [] { return false; }); });
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
         << "fence loss must not mint progress past a page whose deletion was not authorized";
     EXPECT_TRUE(backend->get(first));
     EXPECT_TRUE(backend->get(second));
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
 TEST(CASNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
@@ -377,11 +394,12 @@ TEST(CASNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
     ASSERT_EQ(backend->putIfAbsent(ckpt, "checkpoint").outcome, PutOutcome::Done);
     ASSERT_EQ(backend->putIfAbsent(file, "file").outcome, PutOutcome::Done);
 
-    const NamespaceJanitorResult result
-        = NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return false; });
+    /// A liveness sample false from the start is refused at the maintenance read, before the page ever
+    /// gets to examine an object -- retained-only or not; the page ends by exception.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
+        [&] { (void)NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return false; }); });
 
-    EXPECT_EQ(result.deleted, 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_TRUE(backend->get(ckpt));
     EXPECT_TRUE(backend->get(file));
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
@@ -390,22 +408,19 @@ TEST(CASNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
 
 TEST(CASNamespaceJanitor, FenceLossAfterLastDeleteRetainsCursorWithoutRollingBackDelete)
 {
-    auto backend = std::make_shared<CountingBackend>();
+    auto backend = std::make_shared<FlipAfterFirstDeleteBackend>();
     CasRequests requests(backend, Fence::open());
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead-after-delete", 64));
     ASSERT_EQ(backend->putIfAbsent(dead, "dead").outcome, PutOutcome::Done);
-    uint64_t fence_checks = 0;
 
-    const NamespaceJanitorResult result
-        = NamespaceJanitor(requests, layout, 1).runOnePage(false, [&] { return fence_checks++ == 0; });
+    const NamespaceJanitorResult result = NamespaceJanitor(requests, layout, 1).runOnePage(
+        false, [&] { return !backend->delete_done; });
 
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_FALSE(backend->get(dead))
         << "the exact delete completed under the fence and is never rolled back";
-    EXPECT_EQ(fence_checks, 2u)
-        << "the fence must be checked before deletion and again immediately before cursor publication";
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
         << "losing the fence after the delete keeps this page selected for an idempotent retry";
 }
@@ -455,7 +470,7 @@ TEST(CASNamespaceJanitor, TakesOneCatalogCutAfterListingAndContinuesPastMalforme
     ASSERT_EQ(backend->events.size(), 2u);
     EXPECT_EQ(backend->events[0], "list");
     EXPECT_EQ(backend->events[1], "catalog");
-    EXPECT_EQ(backend->readRequestCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
 }
 
 TEST(CASNamespaceJanitor, MalformedKeyIsFinalAndAdvancesCursor)
@@ -499,7 +514,7 @@ TEST(CASNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
     ASSERT_EQ(backend->putIfAbsent(dead_b, "b").outcome, PutOutcome::Done);
     const auto result = NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_TRUE(backend->get(dead_a));
     EXPECT_TRUE(backend->get(dead_b));
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
@@ -571,11 +586,11 @@ TEST(CASNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacem
     EXPECT_FALSE(backend->get(dead_key));
     ASSERT_TRUE(backend->get(raced_key));
     EXPECT_EQ(backend->get(raced_key)->bytes, "winner");
-    EXPECT_EQ(backend->headRequestCount(live_key), 0u);
-    EXPECT_EQ(backend->headRequestCount(dead_key), 1u);
-    EXPECT_EQ(backend->headRequestCount(raced_key), 1u);
-    EXPECT_EQ(backend->removeCount(dead_key), 1u);
-    EXPECT_EQ(backend->removeCount(raced_key), 1u);
+    EXPECT_EQ(backend->headCount(live_key), 0u);
+    EXPECT_EQ(backend->headCount(dead_key), 1u);
+    EXPECT_EQ(backend->headCount(raced_key), 1u);
+    EXPECT_EQ(backend->deleteCount(dead_key), 1u);
+    EXPECT_EQ(backend->deleteCount(raced_key), 1u);
 }
 
 TEST(CASNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
@@ -592,8 +607,8 @@ TEST(CASNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
         false, [&] { return backend->fence_held; });
 
     EXPECT_EQ(result.deleted, 0u);
-    EXPECT_EQ(backend->headRequestCount(dead_key), 1u);
-    EXPECT_EQ(backend->removeCount(dead_key), 0u);
+    EXPECT_EQ(backend->headCount(dead_key), 1u);
+    EXPECT_EQ(backend->deleteCount(dead_key), 0u);
     EXPECT_TRUE(backend->get(dead_key));
 }
 
@@ -611,8 +626,8 @@ TEST(CASNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet
     backend->resetCounts();
     const auto result = NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
-    EXPECT_EQ(backend->readRequestCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
     EXPECT_TRUE(backend->get(first));
     EXPECT_TRUE(backend->get(second));
 }
@@ -628,7 +643,7 @@ TEST(CASNamespaceJanitor, BackendRejectedCursorResetsExactlyAndDeletesNothing)
     ASSERT_EQ(backend->putIfAbsent(layout.gcMaintenanceStateKey(),
         encodeGcMaintenanceState({.janitor_cursor = "rejected"})).outcome, PutOutcome::Done);
     EXPECT_THROW(NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }), std::runtime_error);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_TRUE(backend->get(dead));
     EXPECT_TRUE(readState(requests, layout).state->janitor_cursor.empty());
 }
@@ -650,8 +665,12 @@ TEST(CASNamespaceJanitor, CursorPublicationFailureIsLeakOnly)
 
 /// The write inside `catch (...)` (the reset after a LIST failure) is admitted `once`: an unmodeled,
 /// unresolvable write attempt must give up after its one exact resolve read rather than looping through
-/// `Retry::standard()`'s backoff -- proven here by both the physical write count and that no sleep, real
-/// or fake, was ever asked for.
+/// `Retry::standard()`'s backoff. `write_attempts == 1` is the discriminator: under `standard`, the same
+/// unresolvable write would keep reissuing until the ninety-second policy window (the LIST failure is
+/// itself a genuine `NETWORK_ERROR`, which the read engine retries to its OWN deadline before this catch
+/// path is even entered -- so a raw sleep count is not a usable signal here, it is dirtied by the LIST's
+/// unrelated retries regardless of which policy the catch-path write uses; the injected clock exists only
+/// to keep both retry loops instant rather than to prove anything by its own emptiness).
 TEST(CASGcMaintenanceState, CatchPathWriteIsOnce)
 {
     auto backend = std::make_shared<ThrowingListAndAmbiguousWriteBackend>();
@@ -659,13 +678,10 @@ TEST(CASGcMaintenanceState, CatchPathWriteIsOnce)
     CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn());
     const Layout layout("p");
 
-    EXPECT_THROW(
-        (void)NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }),
-        std::runtime_error);
-    EXPECT_EQ(backend->writeRequests(), 1u)
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
+        [&] { (void)NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }); });
+    EXPECT_EQ(backend->write_attempts, 1u)
         << "the catch-path reset settles by its one resolve read and gives up rather than reissuing";
-    EXPECT_TRUE(clock.sleeps.empty())
-        << "Retry::once() never sleeps to reissue; Retry::standard() would have";
 }
 
 TEST(CASNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)

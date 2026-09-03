@@ -6,6 +6,21 @@
 namespace DB::Cas
 {
 
+namespace
+{
+
+/// The legacy `casPut` this write replaces reported a definite conflict as a value (never a failure to
+/// this caller) and reported a store failure -- a refusal, an exhausted policy -- by throwing. Only
+/// `Refused`/`GaveUp` are the alternatives a thrown exception used to carry, so only those propagate;
+/// `Committed`/`Declined`/`Conflict` stay silent exactly as they did before.
+void throwOnRefusedOrGaveUp(WriteResult && result, std::string_view what)
+{
+    if (std::holds_alternative<Refused>(result) || std::holds_alternative<GaveUp>(result))
+        (void)orThrow(std::move(result), what);
+}
+
+}
+
 NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liveness liveness)
 {
     NamespaceJanitorResult result;
@@ -14,7 +29,9 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     if (progress.status == GcMaintenanceReadStatus::Corrupt)
     {
         result.anomalies.push_back(progress.diagnostic);
-        (void)casGcMaintenanceState(op, layout, progress.incarnation, GcMaintenanceState{}, Retry::standard());
+        throwOnRefusedOrGaveUp(
+            casGcMaintenanceState(op, layout, progress.incarnation, GcMaintenanceState{}, Retry::standard()),
+            "CAS namespace janitor: corrupt maintenance-state reset");
         return result;
     }
 
@@ -45,10 +62,13 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     }
     /// A valid page is complete only when the round had deletion authority for every dead-life
     /// candidate on it. Advancing while the global gate is closed can phase-lock a dead page onto
-    /// every suppressed round and a different page onto every bounded forced fold. Ambiguous cuts and
-    /// observed fence loss have the same shape: retain the old cursor so an authoritative round
-    /// retries the exact page. Malformed keys, absent objects and token mismatches are final per-key
-    /// outcomes and therefore do not by themselves prevent progress.
+    /// every suppressed round and a different page onto every bounded forced fold. An ambiguous cut
+    /// retains the old cursor so an authoritative round retries the exact page; a lost liveness sample
+    /// only reaches this retained-cursor path when it is caught between the two `op.admitted()` checks
+    /// below -- a sample lost earlier throws out of a read verb (the maintenance read, the list, or a
+    /// HEAD) before this line is ever reached, ending the page by exception instead. Malformed keys,
+    /// absent objects and token mismatches are final per-key outcomes and therefore do not by
+    /// themselves prevent progress.
     bool page_decided = !ambiguous && !suppress_deletes;
 
     for (const KeyEntry & listed : page.keys)
@@ -130,7 +150,9 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
         const GcMaintenanceState next{.janitor_cursor = page.next_cursor};
         try
         {
-            (void)casGcMaintenanceState(op, layout, progress.incarnation, next, Retry::standard());
+            const WriteResult published = casGcMaintenanceState(op, layout, progress.incarnation, next, Retry::standard());
+            if (std::holds_alternative<Refused>(published) || std::holds_alternative<GaveUp>(published))
+                result.anomalies.push_back("cursor publication did not commit");
         }
         catch (const std::exception & e)
         {
