@@ -133,7 +133,7 @@ TEST(CASSlotOccupy, PreExistingKeyConflictsWithExactBytesAndIncarnationInTwoRequ
     const WriteResult seeded = seeder.create("k", "occupant-bytes", Retry::once());
     const auto * seeded_committed = std::get_if<Committed>(&seeded);
     ASSERT_TRUE(seeded_committed != nullptr);
-    const Etag seeded_incarnation = seeded_committed->incarnation;
+    const Etag seeded_incarnation = seeded_committed->etag;
     backend->resetCounts();
 
     CasOperation op = requests.admit();
@@ -141,7 +141,7 @@ TEST(CASSlotOccupy, PreExistingKeyConflictsWithExactBytesAndIncarnationInTwoRequ
     const Object * occupant = conflictObject(result);
     ASSERT_TRUE(occupant != nullptr) << "the settling read must have named the occupant";
     EXPECT_EQ(occupant->bytes, "occupant-bytes");
-    EXPECT_EQ(occupant->incarnation, seeded_incarnation);
+    EXPECT_EQ(occupant->etag, seeded_incarnation);
 
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getCount("k"), 1u);
@@ -341,7 +341,7 @@ TEST(CASSlotOccupy, OwnLandedAmbiguousWriteIsObservedOnTheNextAttempt)
     const auto * committed = std::get_if<Committed>(&first);
     ASSERT_TRUE(committed != nullptr) << "the write landed; the settling read proves it";
     EXPECT_TRUE(committed->resolved_by_read);
-    const Etag landed_incarnation = committed->incarnation;
+    const Etag landed_incarnation = committed->etag;
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getCount("k"), 1u);
 
@@ -350,7 +350,7 @@ TEST(CASSlotOccupy, OwnLandedAmbiguousWriteIsObservedOnTheNextAttempt)
     const Object * occupant = conflictObject(second);
     ASSERT_TRUE(occupant != nullptr);
     EXPECT_EQ(occupant->bytes, "my-bytes");
-    EXPECT_EQ(occupant->incarnation, landed_incarnation) << "both calls must observe the SAME landed incarnation";
+    EXPECT_EQ(occupant->etag, landed_incarnation) << "both calls must observe the SAME landed incarnation";
     EXPECT_EQ(backend->writeTotal(), 2u);
     EXPECT_EQ(backend->getCount("k"), 2u);
 }
