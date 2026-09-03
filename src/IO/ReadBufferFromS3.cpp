@@ -545,6 +545,14 @@ std::unique_ptr<S3::ReadBufferFromGetObjectResult> ReadBufferFromS3::initialize(
     Stopwatch watch{CLOCK_MONOTONIC};
     auto read_result = sendRequest(attempt, offset, right_offset);
 
+    /// Compared per reissue rather than only against the first response, so an A -> B -> A' sequence
+    /// is caught at B: a later response equal to the first is not evidence that nothing changed.
+    const String etag = read_result.GetETag();
+    if (!first_response_etag)
+        first_response_etag = etag;
+    else if (*first_response_etag != etag)
+        response_identity_changed = true;
+
     size_t buffer_size = use_external_buffer ? 0 : read_settings.remote_fs_settings.buffer_size;
     return std::make_unique<S3::ReadBufferFromGetObjectResult>(std::move(read_result), buffer_size, std::move(watch));
 }
@@ -558,6 +566,9 @@ Aws::S3::Model::GetObjectResult ReadBufferFromS3::sendRequest(size_t attempt, si
         req.SetVersionId(version_id);
 
     S3::setClickhouseAttemptNumber(req, attempt);
+
+    if (read_settings.object_storage_request_mode == ObjectStorageRequestMode::NativeConditional)
+        req.setNativeConditional();
 
     if (range_end_incl)
     {

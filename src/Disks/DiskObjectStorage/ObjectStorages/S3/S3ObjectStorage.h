@@ -104,6 +104,13 @@ public:
         bool with_tags,
         const std::optional<std::string> & start_after) const override;
 
+    ObjectStorageIteratorPtr iterate(
+        const std::string & path_prefix,
+        size_t max_keys,
+        bool with_tags,
+        const std::optional<std::string> & start_after,
+        ObjectStorageRetryProfile profile) const override;
+
     /// Uses `DeleteObjectRequest`.
     void removeObjectIfExists(const StoredObject & object) override;
 
@@ -114,6 +121,9 @@ public:
     /// Uses `DeleteObjectRequest` with `If-Match` (token-exact removal for content-addressed disks).
     ConditionalRemoveResult removeObjectIfTokenMatches(const StoredObject & object, const std::string & etag) override;
 
+    ConditionalRemoveResult removeObjectIfTokenMatches(
+        const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile) override;
+
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
@@ -123,6 +133,9 @@ public:
     /// Marks the HEAD request eligible for the typed NativeConditional mode, so the CAS backend's
     /// `nativeHead` can read a GCS generation token where the client's HTTP layer supports one.
     std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override;
+
+    std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(
+        const std::string & path, bool with_tags, ObjectStorageRetryProfile profile) const override;
 
     void copyObject( /// NOLINT
         const StoredObject & object_from,
@@ -181,14 +194,30 @@ public:
     /// (SingleAttemptRetryStrategy, max_retries=0, Expect:100-continue floor). Rebuilt whenever the
     /// disk client rotates (applyNewSettings/credentials refresh) — the cached clone is keyed by the
     /// base client's identity, so a stale clone can never outlive a rotation.
-    std::shared_ptr<const S3::Client> getSingleAttemptClient() const;
+    /// `request_timeout_ms` overrides the clone's send/receive inactivity bound; 0 keeps the disk's.
+    std::shared_ptr<const S3::Client> getSingleAttemptClient(uint64_t request_timeout_ms = 0) const;
 private:
     void removeObjectImpl(const StoredObject & object, bool if_exists);
     void removeObjectsImpl(const StoredObjects & objects, bool if_exists);
 
     /// Shared by tryGetObjectMetadata/tryGetObjectMetadataWithNativeToken: the only difference between
     /// the two public overrides is which ObjectStorageRequestMode the HEAD wrapper carries.
-    std::optional<ObjectMetadata> tryGetObjectMetadataImpl(const std::string & path, bool with_tags, ObjectStorageRequestMode request_mode) const;
+    std::optional<ObjectMetadata> tryGetObjectMetadataImpl(
+        const std::string & path,
+        bool with_tags,
+        ObjectStorageRequestMode request_mode,
+        const std::shared_ptr<const S3::Client> & used_client) const;
+
+    ConditionalRemoveResult removeObjectIfTokenMatchesImpl(
+        const StoredObject & object, const std::string & etag, const std::shared_ptr<const S3::Client> & used_client);
+
+    std::shared_ptr<const S3::Client> clientForRetryProfile(ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) const;
+
+    /// Runs `fn` and, if it failed because the vended credentials expired, refreshes this disk's
+    /// client and runs it once more. `fn` must re-read the client itself, so the second run signs
+    /// with the refreshed one.
+    template <typename Fn>
+    auto refreshAndRetryOnExpiredCredentials(Fn && fn) const;
 
     const S3::URI uri;
 
@@ -212,6 +241,8 @@ private:
 
     mutable std::mutex single_attempt_client_mutex;
     mutable std::shared_ptr<const S3::Client> single_attempt_client;
+    /// Part of the cache key: a clone built for one request timeout must not be served for another.
+    mutable uint64_t single_attempt_client_timeout_ms = 0;
     /// The base client the cached clone above was built from. Deliberately held as a shared_ptr (not
     /// a raw pointer): a raw pointer would be compared for identity AFTER the object it once pointed
     /// to could have been freed and a new client reallocated at the same address by an unrelated

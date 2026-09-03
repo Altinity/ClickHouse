@@ -67,6 +67,34 @@ ObjectStorageIteratorPtr IObjectStorage::iterate(
     return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
 }
 
+ObjectStorageIteratorPtr IObjectStorage::iterate(
+    const std::string & path_prefix,
+    size_t max_keys,
+    bool with_tags,
+    const std::optional<std::string> & start_after,
+    ObjectStorageRetryProfile profile) const
+{
+    if (profile == ObjectStorageRetryProfile::SingleAttempt)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt listing requests", getName());
+    return iterate(path_prefix, max_keys, with_tags, start_after);
+}
+
+std::optional<ObjectMetadata> IObjectStorage::tryGetObjectMetadataWithNativeToken(
+    const std::string & path, bool with_tags, ObjectStorageRetryProfile profile) const
+{
+    if (profile == ObjectStorageRetryProfile::SingleAttempt)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt metadata requests", getName());
+    return tryGetObjectMetadataWithNativeToken(path, with_tags);
+}
+
+ConditionalRemoveResult IObjectStorage::removeObjectIfTokenMatches(
+    const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile)
+{
+    if (profile == ObjectStorageRetryProfile::SingleAttempt)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt removal requests", getName());
+    return removeObjectIfTokenMatches(object, etag);
+}
+
 ThreadPool & IObjectStorage::getThreadPoolWriter()
 {
     auto context = Context::getGlobalContextInstance();

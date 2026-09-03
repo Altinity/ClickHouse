@@ -272,6 +272,16 @@ public:
         bool with_tags,
         const std::optional<std::string> & start_after) const;
 
+    /// Same, under a chosen retry profile. A storage that cannot execute the profile must refuse:
+    /// a caller that asked for one attempt has its own deadline, and a transparently retried request
+    /// would outlive it.
+    virtual ObjectStorageIteratorPtr iterate(
+        const std::string & path_prefix,
+        size_t max_keys,
+        bool with_tags,
+        const std::optional<std::string> & start_after,
+        ObjectStorageRetryProfile profile) const;
+
     /// Get object metadata if supported. It should be possible to receive at least size of object
     virtual ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const = 0;
 
@@ -285,6 +295,10 @@ public:
     {
         return tryGetObjectMetadata(path, with_tags);
     }
+
+    /// Same, under a chosen retry profile; see the note on `iterate`.
+    virtual std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(
+        const std::string & path, bool with_tags, ObjectStorageRetryProfile profile) const;
 
     /// Read single object
     virtual std::unique_ptr<ReadBufferFromFileBase> readObject( /// NOLINT
@@ -351,6 +365,10 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "Conditional (token-exact) object removal is not implemented for {} object storage", getName());
     }
+
+    /// Same, under a chosen retry profile; see the note on `iterate`.
+    virtual ConditionalRemoveResult removeObjectIfTokenMatches(
+        const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile);
 
     /// Copy object with different attributes if required
     virtual void copyObject( /// NOLINT
