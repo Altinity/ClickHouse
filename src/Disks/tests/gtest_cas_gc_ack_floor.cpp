@@ -170,7 +170,7 @@ TEST(CASSemanticRefFixture, WrapperAdvancesCheckpointWithoutDiscardingSnapshot)
     RefCkpt with_snapshot = before_drop->ckpt;
     with_snapshot.checkpoint_snapshot_id = publish_id;
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-        store->layout().refCkptKey(life), encodeRefCkpt(with_snapshot), before_drop->incarnation,
+        store->layout().refCkptKey(life), encodeRefCkpt(with_snapshot), before_drop->etag,
         Retry::once())));
 
     const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", manifest);
@@ -417,7 +417,7 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
     publishBlobWithDurablePrecommit(store, seed_ns, "seed", id, payload);
     store->dropRef(seed_ns, "seed");
     store->renewWatermarkOnce();
-    const Etag t_seed = headObj(*backend, store->layout().blobKey(id))->incarnation;
+    const Etag t_seed = headObj(*backend, store->layout().blobKey(id))->etag;
 
     const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", hash)});
@@ -444,7 +444,7 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), hash).has_value())
         << "the spared entry drops from the retired set";
     EXPECT_TRUE(blobExists(*backend, store->layout(), hash));
-    EXPECT_EQ(headObj(*backend, store->layout().blobKey(id))->incarnation, t_seed)
+    EXPECT_EQ(headObj(*backend, store->layout().blobKey(id))->etag, t_seed)
         << "spare does not touch the body — the incarnation token is unchanged";
 
     /// ADD-ONLY: the spare must NOT clear the meta back to Clean (that is the deposed-leader hole).
@@ -461,7 +461,7 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
     const RootNamespace writer_ns{"00/spare-writer@cas@"};
     auto ref_w = publishBlobWithDurablePrecommit(store, writer_ns, "writer", id, payload);
     EXPECT_EQ(ref_w.ref, id);
-    const Etag t_resurrect = headObj(*backend, store->layout().blobKey(id))->incarnation;
+    const Etag t_resurrect = headObj(*backend, store->layout().blobKey(id))->etag;
     EXPECT_NE(t_resurrect, t_seed) << "republication displaces the body with a fresh incarnation token";
     const auto lm_after = loadMetaForTest(*backend, store->layout(), hash);
     ASSERT_TRUE(lm_after.has_value());
@@ -516,7 +516,7 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     const PersistedEtag t1 = condemned_entry->token;
     const std::optional<Meta> at_condemn = op.head(blob_key, Retry::once());
     ASSERT_TRUE(at_condemn);
-    ASSERT_TRUE(t1.matches(at_condemn->incarnation));
+    ASSERT_TRUE(t1.matches(at_condemn->etag));
 
     /// A NEW leader L2 folds a +1 that recovered h's in-degree and adopts a SPARE for h.
     const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
@@ -538,7 +538,7 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     publishBlobWithDurablePrecommit(store, writer_ns, "writer", id, payload);
     const std::optional<Meta> t2 = op.head(blob_key, Retry::once());
     ASSERT_TRUE(t2);
-    EXPECT_FALSE(t1.matches(t2->incarnation))
+    EXPECT_FALSE(t1.matches(t2->etag))
         << "the writer resurrected to a fresh incarnation, not a reuse of t1";
 
     /// L1 resumes and replays its stale pre-CAS redelete exactly as the round performs one: observe the
@@ -548,17 +548,17 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     const uint64_t removals_before = backend->deleteCount(blob_key);
     const std::optional<Meta> stale = op.head(blob_key, Retry::once());
     ASSERT_TRUE(stale);
-    EXPECT_FALSE(t1.matches(stale->incarnation))
+    EXPECT_FALSE(t1.matches(stale->etag))
         << "the stale redelete must miss the live reuse (add-only closes INV_NO_LOSS)";
-    if (t1.matches(stale->incarnation))
-        (void)op.remove(blob_key, stale->incarnation, Retry::once());
+    if (t1.matches(stale->etag))
+        (void)op.remove(blob_key, stale->etag, Retry::once());
     EXPECT_EQ(backend->deleteCount(blob_key), removals_before)
         << "the comparison failed, so the redelete sent no removal at all against the live body";
 
     /// The live body under t2 survives, stays reachable via the committed r2, and fsck sees no dangle.
     const std::optional<Meta> survivor = op.head(blob_key, Retry::once());
     ASSERT_TRUE(survivor);
-    EXPECT_EQ(survivor->incarnation, t2->incarnation);
+    EXPECT_EQ(survivor->etag, t2->etag);
     replaceRecoverableCkptForRawFixture(
         *backend, store->layout(), ns,
         RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 3},
@@ -591,10 +591,10 @@ TEST(CASGCRetire, CopyForwardedBlobSurvivesWhenRepublished)
     /// promoted dst ref of a republishRef move).
     const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
     OperationForTest displace(*backend);
-    const Etag t0 = (*displace).head(blob_key, Retry::standard())->incarnation;
+    const Etag t0 = (*displace).head(blob_key, Retry::standard())->etag;
     const WriteResult res = (*displace).replace(blob_key, readObj(*backend, blob_key)->bytes, t0, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(res));
-    const Etag res_incarnation = std::get<Committed>(res).incarnation;
+    const Etag res_etag = std::get<Committed>(res).etag;
     const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl_detached", std::nullopt, r2);
@@ -605,7 +605,7 @@ TEST(CASGCRetire, CopyForwardedBlobSurvivesWhenRepublished)
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
     const auto hr = (*displace).head(blob_key, Retry::standard());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_EQ(hr->incarnation, res_incarnation);
+    EXPECT_EQ(hr->etag, res_etag);
 }
 
 /// Copy-forward aftermath, stale-entry arm: a listed (hash, t0) entry whose incarnation was
@@ -633,10 +633,10 @@ TEST(CASGCRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
 
     const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
     OperationForTest displace(*backend);
-    const Etag t0 = (*displace).head(blob_key, Retry::standard())->incarnation;
+    const Etag t0 = (*displace).head(blob_key, Retry::standard())->etag;
     const WriteResult res = (*displace).replace(blob_key, readObj(*backend, blob_key)->bytes, t0, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(res));
-    const Etag res_incarnation = std::get<Committed>(res).incarnation;
+    const Etag res_etag = std::get<Committed>(res).etag;
 
     /// No events land at all (raw displacement). Drive rounds with the store's ack kept current so
     /// the (1, t0) entry graduates; its exact-token delete mismatches t1 and the entry drops.
@@ -649,7 +649,7 @@ TEST(CASGCRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
         << "the stale (hash, t0) entry must settle (mismatch redelete drops it), not wedge the list";
     const auto hr = (*displace).head(blob_key, Retry::standard());
     ASSERT_TRUE(hr.has_value()) << "the fresh incarnation must never be deleted under the stale token";
-    EXPECT_EQ(hr->incarnation, res_incarnation);
+    EXPECT_EQ(hr->etag, res_etag);
 }
 
 /// A completed round adopts the SAME attempt its fold minted (the round's single gc/state CAS commits the
@@ -708,8 +708,8 @@ TEST(CASGCAckFloor, NoOpRoundDoesNotMutateRefShards)
         OperationForTest op(*backend);
         for (;;)
         {
-            const KeyPage page = (*op).list(store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
-            for (const KeyEntry & lk : page.keys)
+            const ListPage page = (*op).list(store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
+            for (const ListedKey & lk : page.keys)
                 keys.insert(lk.key);
             if (page.next_cursor.empty())
                 break;
@@ -1121,8 +1121,8 @@ TEST(CASGCAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
     const String pending_key = store->layout().blobKey(blob_id);
     const std::optional<Meta> doomed = op.head(pending_key, Retry::once());
     ASSERT_TRUE(doomed);
-    ASSERT_TRUE(pending_entry.token.matches(doomed->incarnation));
-    ASSERT_EQ(op.remove(pending_key, doomed->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_TRUE(pending_entry.token.matches(doomed->etag));
+    ASSERT_EQ(op.remove(pending_key, doomed->etag, Retry::once()), Removal::Removed);
 
     const uint64_t round_before = decodeGcState(readObj(*backend, store->layout().gcStateKey())->bytes).round;
     Gc gc2(store, kGc);
@@ -1186,8 +1186,8 @@ TEST(CASGCAckFloor, AbsentBlobSettlesAsAbsentWithoutASpeculativeConditionalRemov
     const String blob_key = store->layout().blobKey(blob_id);
     const std::optional<Meta> doomed = op.head(blob_key, Retry::once());
     ASSERT_TRUE(doomed);
-    ASSERT_TRUE(pending_entry.token.matches(doomed->incarnation));
-    ASSERT_EQ(op.remove(blob_key, doomed->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_TRUE(pending_entry.token.matches(doomed->etag));
+    ASSERT_EQ(op.remove(blob_key, doomed->etag, Retry::once()), Removal::Removed);
     ASSERT_FALSE(op.head(blob_key, Retry::once()));
     backend->watch(blob_key);
 
