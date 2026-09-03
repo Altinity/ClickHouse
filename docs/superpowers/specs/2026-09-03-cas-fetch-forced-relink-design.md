@@ -98,11 +98,13 @@ with no dependency on disks, storages or HTTP — a gtest drives them directly, 
 - `String encodeCasPoolAdvertise(Strings pool_uuids)` — sort, unique, join with `", "`; empty in,
   empty out. `Strings decodeCasPoolAdvertise(const String &)` — the inverse, the same `", "`
   splitter the zero-copy capability list uses; an empty string decodes to no pools.
+- `String resolveOfferedCasPool(const Strings & advertised_pools, const String & offered_pool_cookie)`
+  — which pool an offer is for: the cookie, or the single advertised pool when the cookie is absent,
+  or nothing. Used on its own by the receiver's post-check and inside the next helper.
 - `struct CasRelinkCandidate { String disk_name; String pool_uuid; bool read_only; }` and
   `std::optional<size_t> resolveForcedCaCandidate(const std::vector<CasRelinkCandidate> & candidates,
   const Strings & advertised_pools, const String & offered_pool_cookie)` — the receiver's placement:
-  the offered pool is the cookie, or the single advertised pool when the cookie is absent, or nothing;
-  the result is the index of the first candidate on that pool that is not read-only and has a pool id.
+  the index of the first candidate on the offered pool that is not read-only and has a pool id.
 - `struct CasConfirmRoutingCandidate { const void * exchange_identity; String pool_uuid; bool owns_namespace; }`
   and `std::optional<size_t> resolveConfirmRoutingCandidate(const std::vector<CasConfirmRoutingCandidate> &,
   const String & pool_uuid)` — the sender's confirm routing: among candidates on `pool_uuid` that own
