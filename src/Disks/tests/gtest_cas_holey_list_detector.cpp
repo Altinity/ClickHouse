@@ -56,8 +56,8 @@ namespace
 class HoleyListBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::list;
+    /// Unhide the legacy `list` overloads the primitive override below would otherwise hide.
+    using Backend::list;
     /// Omit `key` from the `nth` (0-based) subsequent qualifying `list` call. Resets the counter.
     void omitFromNthListCall(const String & key, size_t nth)
     {
@@ -76,14 +76,16 @@ public:
         return served;
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    /// Sabotages the PRIMITIVE, which every legacy forwarder reaches too, so the hole is served
+    /// whichever surface issued the enumeration.
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
-        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
         std::lock_guard lock(m);
         if (omitted.empty())
             return page;
         auto it = std::find_if(page.keys.begin(), page.keys.end(),
-                               [&](const ListedKey & k) { return k.key == omitted; });
+                               [&](const RawListedKey & k) { return k.key == omitted; });
         if (it == page.keys.end())
             return page;              /// not a qualifying call — do not count it
         if (seen_calls++ != target_call)

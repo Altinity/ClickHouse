@@ -1917,6 +1917,27 @@ public:
         , farewell(backend, DB::Cas::Fence::open())
         , runtime(backend, mount, farewell, std::forward<Args>(args)...)
     {
+        /// The runtime arms its lease deadline on ITS boot clock, and the engine measures that deadline
+        /// against the clock it reads. Production runs both on `CLOCK_BOOTTIME`, so they agree; a test
+        /// that injects one MUST inject the other, or `Retry::untilLeaseSafe` compares a synthetic
+        /// deadline against real boottime, finds it long past, and refuses every request unsent.
+        mount.setNowFnForTest([this] { return runtime.bootMsNow(); });
+        farewell.setNowFnForTest([this] { return runtime.bootMsNow(); });
+    }
+
+    /// The workers are joined HERE, not only by the tests that assert on teardown: `CasMountRuntime`
+    /// aborts the process when it is destroyed with a worker still joinable, so an exception on any
+    /// path out of a test body -- a barrier that timed out, an assertion that threw -- would take the
+    /// whole binary down and hide every test after it.
+    ~RuntimeUnderTest()
+    {
+        try
+        {
+            runtime.stopBackgroundWorkers();
+        }
+        catch (...)   // NOLINT(bugprone-empty-catch)
+        {
+        }
     }
 
     CasMountRuntime & operator*() { return runtime; }
