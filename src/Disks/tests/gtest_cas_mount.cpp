@@ -93,12 +93,12 @@ private:
 };
 
 /// The incarnation currently at `key`, for a fixture that has to name it as a precondition.
-Etag currentIncarnation(CasOperation & op, const String & key)
+Etag currentEtag(CasOperation & op, const String & key)
 {
     const auto got = op.read(key, Retry::standard());
     if (!got)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "test fixture read of '{}' found nothing", key);
-    return got->incarnation;
+    return got->etag;
 }
 
 /// A fixture write that must land, so a mis-seeded fixture fails where it is written rather than in
@@ -736,7 +736,7 @@ TEST(CASMountLease, HolderBodiesMintFreshAttemptIdsAndFenceCopiesIt)
     MountLease fenced = decodeMountLease(observed->bytes);
     fenced.gc_fenced = true;
     ++fenced.seq;
-    mustCommit(ops.op.replace(key, encodeMountLease(fenced), observed->incarnation, Retry::standard()), "fence-out");
+    mustCommit(ops.op.replace(key, encodeMountLease(fenced), observed->etag, Retry::standard()), "fence-out");
     EXPECT_EQ(decodeMountLease(ops.op.read(key, Retry::standard())->bytes).write_attempt_id, renewed.write_attempt_id);
 }
 
@@ -754,7 +754,7 @@ TEST(CASMountLease, ReclaimAndSuccessorBodiesMintNewAttemptIds)
     MountLease fenced = decodeMountLease(observed->bytes);
     fenced.gc_fenced = true;
     ++fenced.seq;
-    mustCommit(ops.op.replace(key, encodeMountLease(fenced), observed->incarnation, Retry::standard()), "fence-out");
+    mustCommit(ops.op.replace(key, encodeMountLease(fenced), observed->etag, Retry::standard()), "fence-out");
     const MountLease fence = decodeMountLease(ops.op.read(key, Retry::standard())->bytes);
     EXPECT_EQ(fence.write_attempt_id, first.write_attempt_id);
 
@@ -966,7 +966,7 @@ namespace
 /// fix-round F5 harness: makes the mount key vanish to EVERY read, unconditionally, while the real
 /// underlying object stays put -- forcing `claimMount`'s own read to take the absent-slot race
 /// branch every call (its create then conflicts against the real, still-present object, returning
-/// `LiveDoubleStart` with no incarnation -- that branch deliberately leaves `.incarnation` unset,
+/// `LiveDoubleStart` with no incarnation -- that branch deliberately leaves `.etag` unset,
 /// since no re-read was done). That in turn forces `claimMountAwaitingExpiry`'s fallback re-read,
 /// which ALSO sees the slot as vanished -- deterministically reproducing "the slot vanished between
 /// claimMount's own read and ours" on EVERY loop iteration, not just a lucky one-shot race.
@@ -1196,11 +1196,11 @@ TEST(CASMountStartup, ExistingPoolWithoutCatalogFailsBeforeSlotMutation)
     ASSERT_TRUE(epoch_after.has_value());
     ASSERT_TRUE(mount_after.has_value());
     EXPECT_EQ(owner_after->bytes, owner_before->bytes);
-    EXPECT_EQ(owner_after->incarnation, owner_before->incarnation);
+    EXPECT_EQ(owner_after->etag, owner_before->etag);
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
-    EXPECT_EQ(epoch_after->incarnation, epoch_before->incarnation);
+    EXPECT_EQ(epoch_after->etag, epoch_before->etag);
     EXPECT_EQ(mount_after->bytes, mount_before->bytes);
-    EXPECT_EQ(mount_after->incarnation, mount_before->incarnation);
+    EXPECT_EQ(mount_after->etag, mount_before->etag);
 }
 
 TEST(CASMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
@@ -1300,7 +1300,7 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
     a.reset();
     const auto farewell = ops.op.read(mount_key, Retry::standard());
     ASSERT_TRUE(farewell.has_value());
-    mustCommit(ops.op.replace(mount_key, stale_mount->bytes, farewell->incarnation, Retry::standard()),
+    mustCommit(ops.op.replace(mount_key, stale_mount->bytes, farewell->etag, Retry::standard()),
                "replayed stale lease");
 
     /// A restart of the SAME server (same uuid) must NOT abort: it waits out the stale lease (<= ~300ms)
@@ -1434,7 +1434,7 @@ void renewMount(CasOperation & op, const Layout & l, const String & srid)
     ASSERT_TRUE(got.has_value());
     MountLease m = decodeMountLease(got->bytes);
     m.seq += 1;
-    mustCommit(op.replace(l.mountKey(srid), encodeMountLease(m), got->incarnation, Retry::standard()),
+    mustCommit(op.replace(l.mountKey(srid), encodeMountLease(m), got->etag, Retry::standard()),
                "renewed mount " + srid);
 }
 }
@@ -1494,18 +1494,18 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     MountObservationMap obs;
     computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
     ASSERT_TRUE(obs.contains("s1"));
-    const Etag first_incarnation = obs.at("s1").incarnation;
+    const Etag first_etag = obs.at("s1").etag;
 
     renewMount(ops.op, l, "s1");
-    const Etag renewed_incarnation = currentIncarnation(ops.op, l.mountKey("s1"));
-    EXPECT_NE(renewed_incarnation, first_incarnation);
+    const Etag renewed_etag = currentEtag(ops.op, l.mountKey("s1"));
+    EXPECT_NE(renewed_etag, first_etag);
 
     const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
     ASSERT_TRUE(obs.contains("s1"));
-    EXPECT_EQ(obs.at("s1").incarnation, renewed_incarnation);
+    EXPECT_EQ(obs.at("s1").etag, renewed_etag);
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
 }
 
@@ -1766,7 +1766,7 @@ TEST(CASClaimMount, SameEpochFencedIsNotRefreshable)
         MountLease fenced = decodeMountLease(got->bytes);
         fenced.gc_fenced = true;
         fenced.seq += 1;
-        mustCommit(ops.op.replace(layout.mountKey("a"), encodeMountLease(fenced), got->incarnation, Retry::standard()),
+        mustCommit(ops.op.replace(layout.mountKey("a"), encodeMountLease(fenced), got->etag, Retry::standard()),
                    "fence-out");
     }
     /// Same (uuid, epoch) re-claim must NOT refresh a fenced body — a fence costs an epoch:
@@ -1888,7 +1888,7 @@ TEST(CASMountObservation, GcFencedIsReclaimedInstantlyWithPriorFenced)
         MountLease fenced = decodeMountLease(got->bytes);
         fenced.gc_fenced = true;
         fenced.seq += 1;
-        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(fenced), got->incarnation, Retry::standard()),
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(fenced), got->etag, Retry::standard()),
                    "fence-out");
     }
 
@@ -1935,7 +1935,7 @@ TEST(CASFenceTerminal, GcFencedIsTerminal)
     ASSERT_TRUE(got.has_value());
     MountLease fenced = decodeMountLease(got->bytes);
     fenced.gc_fenced = true;
-    mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(fenced), got->incarnation, Retry::standard()),
+    mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(fenced), got->etag, Retry::standard()),
                "fence-out");
 
     EXPECT_TRUE(isCreatorFenceTerminal(ops.op, l, "r", 7));
@@ -1950,7 +1950,7 @@ TEST(CASFenceTerminal, CleanFarewellIsTerminal)
     ASSERT_TRUE(got.has_value());
     MountLease retired = decodeMountLease(got->bytes);
     retired.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
-    mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(retired), got->incarnation, Retry::standard()),
+    mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(retired), got->etag, Retry::standard()),
                "farewell");
 
     EXPECT_TRUE(isCreatorFenceTerminal(ops.op, l, "r", 7));
