@@ -58,6 +58,29 @@ using namespace DB::Cas::tests;
 namespace
 {
 
+/// ---- Small raw-fixture request-engine wrappers shared by the tests below ----
+
+/// True iff `key` exists.
+bool existsAt(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).head(key, Retry::once()).has_value();
+}
+
+/// The durable object at `key`, or `nullopt`.
+std::optional<Object> readAt(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).read(key, Retry::once());
+}
+
+/// Unconditional create of a fresh key (the fixture's own setup, never a real conflict).
+void createAt(Backend & backend, const String & key, const String & bytes)
+{
+    OperationForTest op(backend);
+    EXPECT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
+}
+
 /// A deterministic, non-repeating-byte payload spanning several `DBMS_DEFAULT_HASHING_BLOCK_SIZE`
 /// (2048 B) blocks, so a chunked-vs-one-shot divergence (the CityHash128 pitfall documented on
 /// `poolContentHash`) would not accidentally go unnoticed.
@@ -99,7 +122,10 @@ SeededBlob seedReferencedBlob(Pool & store, Backend & backend, const RootNamespa
     header.kind = ObjectKind::Blob;
     header.incarnation_tag = UInt128(0x1234);
     header.build_id = UInt128(0x5678);
-    backend.putIfAbsent(key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store.poolMeta().blob_header_len)) + payload);
+    {
+        OperationForTest op(backend);
+        (*op).create(key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store.poolMeta().blob_header_len)) + payload, Retry::once());
+    }
 
     ManifestEntry entry;
     entry.path = "data_" + std::to_string(build_sequence) + ".bin";
@@ -328,7 +354,7 @@ TEST(CASPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
     const String blob_key = store->layout().blobKey(id);
     EXPECT_NE(blob_key.find("/blobs/xxh3/"), String::npos) << blob_key;
     EXPECT_EQ(blob_key.find("/blobs/ch128/"), String::npos) << blob_key;
-    EXPECT_TRUE(backend->head(blob_key).exists);
+    EXPECT_TRUE(existsAt(*backend, blob_key));
 
     build->promote(ns, "rb", build->buildId(), mid);
     store->renewWatermarkOnce();
@@ -395,7 +421,7 @@ TEST(CASPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     const BlobRef id = seeded.ref;
     const String blob_key = seeded.key;
     EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
-    ASSERT_TRUE(backend->head(blob_key).exists) << "the sha256 blob body must be present before the fold";
+    ASSERT_TRUE(existsAt(*backend, blob_key)) << "the sha256 blob body must be present before the fold";
     ASSERT_EQ(codecFor(store->writeAlgo()).fromHex(hex), digest) << "fixture sanity: the seeded digest is ours";
 
     /// ---- Site 1: the fold's condemn path ----
@@ -403,11 +429,11 @@ TEST(CASPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     dropSeededRef(*store, *backend, ns, /*build_sequence=*/1, "tbl_sha");
     runRegularRoundReclaiming(gc);   /// folds the -1: transition to zero => condemned
 
-    const auto state_bytes = backend->get(store->layout().gcStateKey());
+    const auto state_bytes = readAt(*backend, store->layout().gcStateKey());
     ASSERT_TRUE(state_bytes.has_value());
     const GcState state = decodeGcState(state_bytes->bytes);
     ASSERT_GT(state.snap_generation, 0u);
-    const auto seal_bytes = backend->get(store->layout().foldSealKey(state.snap_generation, state.snap_attempt));
+    const auto seal_bytes = readAt(*backend, store->layout().foldSealKey(state.snap_generation, state.snap_attempt));
     ASSERT_TRUE(seal_bytes.has_value());
     const CasFoldSeal seal = decodeFoldSeal(seal_bytes->bytes);
     ASSERT_TRUE(seal.condemned_summary.contains(0)) << "the seal's condemned_summary must be total over gc_shards";
@@ -512,14 +538,14 @@ TEST(CASPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     /// to a 32-hex (128-bit) key.
     const String blob_key = store->layout().blobKey(id);
     EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
-    ASSERT_TRUE(backend->head(blob_key).exists);
+    ASSERT_TRUE(existsAt(*backend, blob_key));
 
     build->promote(ns, "part1", build->buildId(), mid);
     store->renewWatermarkOnce();
 
     /// Read the committed manifest back -- the on-disk `blob_hash` must be the FULL 32-byte digest, not
     /// truncated by the manifest codec or by anything upstream of `stageManifest`.
-    const auto manifest_bytes = backend->get(store->layout().manifestKey(mid));
+    const auto manifest_bytes = readAt(*backend, store->layout().manifestKey(mid));
     ASSERT_TRUE(manifest_bytes.has_value());
     const PartManifest read_back = decodePartManifest(openObject(FormatId::PartManifest, manifest_bytes->bytes));
     ASSERT_EQ(read_back.entries.size(), 2u);
@@ -637,7 +663,7 @@ TEST(CASPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
     /// A FOREIGN object under an algo segment `blobHashAlgoName` never renders ("md5") -- not one of
     /// ours under any circumstance.
     const String foreign_key = store->layout().blobsPrefix() + "md5/aa/" + std::string(32, 'a');
-    backend->putIfAbsent(foreign_key, std::string("not a real envelope"));
+    createAt(*backend, foreign_key, std::string("not a real envelope"));
 
     runRegularRoundReclaiming(gc);   /// folds both +1s
     dropSeededRef(*store, *backend, ns, /*build_sequence=*/1, "tbl_ch");
@@ -655,7 +681,7 @@ TEST(CASPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
     }
     EXPECT_TRUE(condemned_refs.count(ch_ref));
     EXPECT_TRUE(condemned_refs.count(sh_ref));
-    EXPECT_TRUE(backend->head(foreign_key).exists) << "the foreign object must never be touched by the fold";
+    EXPECT_TRUE(existsAt(*backend, foreign_key)) << "the foreign object must never be touched by the fold";
 
     const FsckReport frep = runFsck(*store, /*detail=*/true);
     /// The physical listing counts all THREE unreferenced objects (two ours + one foreign).
@@ -695,7 +721,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
         auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
         EXPECT_EQ(store->poolMeta().min_reader_generation, G_BUILD);
 
-        const auto meta_bytes = backend->get(store->layout().poolMetaKey());
+        const auto meta_bytes = readAt(*backend, store->layout().poolMetaKey());
         ASSERT_TRUE(meta_bytes.has_value());
         EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_BUILD);
     }
@@ -708,7 +734,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
         OperationForTest meta_op(*backend);
         PoolMeta pm = PoolMeta::createOrValidate(*meta_op, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
         pm.min_reader_generation = G_BUILD + 1;
-        ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), encodePoolMeta(pm), backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), encodePoolMeta(pm), (*meta_op).head(layout.poolMetaKey(), Retry::once())->incarnation, Retry::once())));
 
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
         { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
@@ -730,7 +756,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
         ASSERT_NE(pos, String::npos);   // sanity: a fresh pool stamps the header at the floor
         String downgraded = fresh_bytes;
         downgraded.replace(pos, from.size(), to);
-        ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), downgraded, backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), downgraded, (*meta_op).head(layout.poolMetaKey(), Retry::once())->incarnation, Retry::once())));
 
         /// `decodePoolMeta`'s backward floor rejects the downgraded bytes directly...
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(downgraded); });
@@ -781,8 +807,8 @@ TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
                                              /*build_sequence=*/2, /*payload_size=*/5002, "tbl_sh");
     const String ch_key = ch.key;
     const String sh_key = sh.key;
-    ASSERT_TRUE(backend->head(ch_key).exists);
-    ASSERT_TRUE(backend->head(sh_key).exists);
+    ASSERT_TRUE(existsAt(*backend, ch_key));
+    ASSERT_TRUE(existsAt(*backend, sh_key));
 
     runRegularRoundReclaiming(gc);   /// folds both +1s
     dropSeededRef(*store, *backend, ns, /*build_sequence=*/1, "tbl_ch");
@@ -806,8 +832,8 @@ TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
     {
         const RoundReport rep1 = runRegularRoundReclaiming(gc);
         EXPECT_EQ(rep1.graduated, 2u) << "both algos' blobs must graduate together in one round";
-        EXPECT_TRUE(backend->head(ch_key).exists);   // pending: still present this pass
-        EXPECT_TRUE(backend->head(sh_key).exists);
+        EXPECT_TRUE(existsAt(*backend, ch_key));   // pending: still present this pass
+        EXPECT_TRUE(existsAt(*backend, sh_key));
     }
     {
         const RoundReport rep2 = runRegularRoundReclaiming(gc);
@@ -815,8 +841,8 @@ TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
     }
 
     /// THE CRUX: after graduation the backend holds ZERO blob bodies of EITHER algo.
-    EXPECT_FALSE(backend->head(ch_key).exists) << "the ch128 blob must be physically reclaimed";
-    EXPECT_FALSE(backend->head(sh_key).exists) << "the sha256 blob must be physically reclaimed";
+    EXPECT_FALSE(existsAt(*backend, ch_key)) << "the ch128 blob must be physically reclaimed";
+    EXPECT_FALSE(existsAt(*backend, sh_key)) << "the sha256 blob must be physically reclaimed";
 
     const FsckReport frep = runFsck(*store, /*detail=*/true);
     EXPECT_TRUE(frep.clean());
@@ -885,8 +911,8 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     const String key_ch = store->layout().blobKey(ref_ch);
     const String key_xx = store->layout().blobKey(ref_xx);
     EXPECT_NE(key_ch, key_xx);
-    const auto raw_ch = backend->get(key_ch);
-    const auto raw_xx = backend->get(key_xx);
+    const auto raw_ch = readAt(*backend, key_ch);
+    const auto raw_xx = readAt(*backend, key_xx);
     ASSERT_TRUE(raw_ch.has_value());
     ASSERT_TRUE(raw_xx.has_value());
     EXPECT_NE(raw_ch->bytes.find(body_ch), String::npos);
@@ -898,17 +924,17 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     const String meta_ch = store->layout().blobMetaKey(ref_ch);
     const String meta_xx = store->layout().blobMetaKey(ref_xx);
     EXPECT_NE(meta_ch, meta_xx);
-    EXPECT_TRUE(backend->head(meta_ch).exists);
-    EXPECT_TRUE(backend->head(meta_xx).exists);
+    EXPECT_TRUE(existsAt(*backend, meta_ch));
+    EXPECT_TRUE(existsAt(*backend, meta_xx));
 
     /// Distinct settlement (in-degree per ref, keyed on the FULL `BlobRef` pair -- never the shared
     /// bare digest, which would alias the two rows into one).
     Gc gc(store, UInt128(1));
     runRegularRoundReclaiming(gc);
     {
-        const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+        const GcState st = decodeGcState(readAt(*backend, store->layout().gcStateKey())->bytes);
         const CasFoldSeal seal = decodeFoldSeal(
-            backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+            readAt(*backend, store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
         EXPECT_EQ(inDegreeInRuns(*backend, seal.blob_target_runs, ref_ch), 1);
         EXPECT_EQ(inDegreeInRuns(*backend, seal.blob_target_runs, ref_xx), 1);
     }
@@ -920,11 +946,11 @@ TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     runRegularRoundReclaiming(gc);   // graduates ch128:X
     runRegularRoundReclaiming(gc);   // executes the exact-token delete for ch128:X
 
-    EXPECT_FALSE(backend->head(key_ch).exists) << "ch128:X must be reclaimed once its ref is dropped";
-    EXPECT_TRUE(backend->head(key_xx).exists)
+    EXPECT_FALSE(existsAt(*backend, key_ch)) << "ch128:X must be reclaimed once its ref is dropped";
+    EXPECT_TRUE(existsAt(*backend, key_xx))
         << "THE CRUX: xxh3:X (same digest value, different algo) must remain readable after ch128:X "
            "is reclaimed -- a digest-only settlement would have condemned/deleted both together";
-    const auto still_readable = backend->get(key_xx);
+    const auto still_readable = readAt(*backend, key_xx);
     ASSERT_TRUE(still_readable.has_value());
     EXPECT_NE(still_readable->bytes.find(body_xx), String::npos);
 
