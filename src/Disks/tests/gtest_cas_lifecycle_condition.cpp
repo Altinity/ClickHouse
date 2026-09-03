@@ -36,11 +36,12 @@ const String kSrid = "test";
 /// so a test can restore it verbatim later (scenario d).
 String deleteKeyReturningBody(Backend & backend, const String & key)
 {
-    const auto got = backend.get(key);
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto got = (*op).read(key, Retry::once());
     EXPECT_TRUE(got.has_value()) << "expected '" << key << "' to exist before deletion";
     if (!got)
         return {};
-    backend.deleteExact(key, got->token);
+    (*op).remove(key, got->incarnation, Retry::once());
     return got->bytes;
 }
 
@@ -49,12 +50,14 @@ String deleteKeyReturningBody(Backend & backend, const String & key)
 /// fresh incarnation and returns true. Mirrors gtest_cas_pool.cpp's `fenceOutMount`.
 void fenceOutMount(Backend & backend, const String & mount_key)
 {
-    const auto got = backend.get(mount_key);
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto got = (*op).read(mount_key, Retry::once());
     ASSERT_TRUE(got.has_value());
     MountLease m = decodeMountLease(got->bytes);
     m.gc_fenced = true;
     m.seq += 1;
-    ASSERT_EQ(backend.putOverwrite(mount_key, encodeMountLease(m), got->token).outcome, PutOutcome::Done);
+    const auto put = (*op).replace(mount_key, encodeMountLease(m), got->incarnation, Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(put));
 }
 
 /// A Backend decorator whose reads, heads and lists throw an untyped transport error while `fail` is
@@ -166,11 +169,12 @@ TEST(CASLifecycleCondition, PoolMetaForeignPoolIdEntersVanishedReplacedImmediate
 
     /// Overwrite `_pool_meta` with a FOREIGN pool_id (identity replaced); the object stays present.
     const String meta_key = store->layout().poolMetaKey();
-    const auto got = backend->get(meta_key);
+    DB::Cas::tests::OperationForTest op(*backend);
+    const auto got = (*op).read(meta_key, Retry::once());
     ASSERT_TRUE(got.has_value());
     PoolMeta foreign = decodePoolMeta(got->bytes);
     foreign.pool_id = foreign.pool_id + DB::UInt128(1);
-    ASSERT_EQ(backend->putOverwrite(meta_key, encodePoolMeta(foreign), got->token).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(meta_key, encodePoolMeta(foreign), got->incarnation, Retry::once())));
 
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedReplaced);
@@ -187,7 +191,8 @@ TEST(CASLifecycleCondition, PoolMetaAlgosUsedDifferIsNotReplacementRecoveryProce
     auto store = DB::Cas::tests::openPoolForTest(backend);
 
     const String meta_key = store->layout().poolMetaKey();
-    const auto got = backend->get(meta_key);
+    DB::Cas::tests::OperationForTest op(*backend);
+    const auto got = (*op).read(meta_key, Retry::once());
     ASSERT_TRUE(got.has_value());
     PoolMeta mutated = decodePoolMeta(got->bytes);
     /// pool_id + blob_header_len UNCHANGED; only `algos_used` gains a member (a mutable field, [B6]).
@@ -195,7 +200,7 @@ TEST(CASLifecycleCondition, PoolMetaAlgosUsedDifferIsNotReplacementRecoveryProce
     ASSERT_FALSE(std::binary_search(mutated.algos_used.begin(), mutated.algos_used.end(), extra));
     mutated.algos_used.push_back(extra);
     std::sort(mutated.algos_used.begin(), mutated.algos_used.end());
-    ASSERT_EQ(backend->putOverwrite(meta_key, encodePoolMeta(mutated), got->token).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(meta_key, encodePoolMeta(mutated), got->incarnation, Retry::once())));
 
     /// Fence out the mount so the (correctly non-replacement) recovery cleanly reclaims a fresh incarnation.
     fenceOutMount(*backend, store->layout().mountKey(kSrid));
@@ -224,8 +229,9 @@ TEST(CASLifecycleCondition, IdentityLostDoesNotAutoReviveWhenSentinelsRestored)
     ASSERT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
 
     /// Restore both sentinels verbatim (a backup restore with matching identity).
-    ASSERT_EQ(backend->putIfAbsent(meta_key, meta_body).outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(owner_key, owner_body).outcome, PutOutcome::Done);
+    DB::Cas::tests::OperationForTest op(*backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(meta_key, meta_body, Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(owner_key, owner_body, Retry::once())));
 
     /// The gate now sees Present+match, but the state is `IdentityLost`, so it stays fail-loud.
     EXPECT_FALSE(store->tryRemountOnce());
