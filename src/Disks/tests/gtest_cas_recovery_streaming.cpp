@@ -310,9 +310,10 @@ TEST(CASRecoveryStreaming, MaterializingControlExceedsMemoryBound)
     /// tail has been applied -- exactly the memory profile streaming recovery replaced.
     std::vector<RefLogTxn> resident_txns;
     int64_t held = 0;
+    OperationForTest tail_op(*backend);
     for (size_t t = 1; t <= kTxns; ++t)
     {
-        const auto got = backend->get(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, t}));
+        const auto got = (*tail_op).read(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, t}), Retry::once());
         ASSERT_TRUE(got.has_value());
         RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), RefTxnId{1, t});
         const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
@@ -578,7 +579,8 @@ TEST(CASRecoveryStreaming, RecoveryResultInventoryComplete)
     base_txn.ops = publishCommittedOps("c_two", mref(12));
     fixture::writeRefLogRaw(*backend, layout, base_txn);
     writeRefSnapshotRaw(*backend, layout, base);
-    const auto base_got = backend->get(layout.refSnapshotKey(fixture::fixtureLife(ns), base.snapshot_id));
+    OperationForTest inv_op(*backend);
+    const auto base_got = (*inv_op).read(layout.refSnapshotKey(fixture::fixtureLife(ns), base.snapshot_id), Retry::once());
     ASSERT_TRUE(base_got.has_value());
     const uint64_t base_stored_bytes = base_got->bytes.size();
 
@@ -599,8 +601,8 @@ TEST(CASRecoveryStreaming, RecoveryResultInventoryComplete)
                                        .checkpoint_snapshot_id = RefTxnId{1, 5},
                                        .last_epoch_seal = std::nullopt});
 
-    const uint64_t tail6 = backend->get(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 6}))->bytes.size();
-    const uint64_t tail7 = backend->get(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 7}))->bytes.size();
+    const uint64_t tail6 = (*inv_op).read(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 6}), Retry::once())->bytes.size();
+    const uint64_t tail7 = (*inv_op).read(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 7}), Retry::once())->bytes.size();
 
     backend->resetCounts();
     auto store = openPoolForTest(backend);
