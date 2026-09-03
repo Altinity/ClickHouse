@@ -75,7 +75,7 @@ size_t runToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
         s->renewWatermarkOnce();
         const bool no_work = rep.candidates == 0 && rep.deleted == 0 && rep.absent == 0
             && rep.replaced == 0 && rep.spared == 0;
-        if (no_work && !anyCondemnedInSeal(s->backend(), s->layout()))
+        if (no_work && !anyCondemnedInSeal(*s->poolBackendPtr(), s->layout()))
             break;
     }
     return rounds;
@@ -83,7 +83,8 @@ size_t runToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
 
 bool blobPresent(Backend & b, const Layout & layout, const UInt128 & hash)
 {
-    return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
+    OperationForTest op(b);
+    return (*op).head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)}), Retry::once()).has_value();
 }
 
 /// Denies ONCE the single round-commit `gc/state` CAS that advances `snap_generation` (the losing
@@ -100,7 +101,7 @@ public:
     {
         if (arm && key == "p/gc/state")
         {
-            const auto stored = get(key);
+            const auto stored = read(key, access);
             const uint64_t stored_gen = stored ? decodeGcState(stored->bytes).snap_generation : 0;
             if (decodeGcState(bytes).snap_generation > stored_gen)
             {
@@ -152,7 +153,7 @@ public:
     {
         auto result = CountingBackend::head(key, access);
         if (armed && timing == Timing::BeforeFirstDelete && key == first_cleanup_key)
-            moveAuthority();
+            moveAuthority(access);
         return result;
     }
 
@@ -161,16 +162,20 @@ public:
     {
         auto result = CountingBackend::remove(key, expected_value, access);
         if (armed && timing == Timing::AfterFirstDelete && key == first_cleanup_key)
-            moveAuthority();
+            moveAuthority(access);
         return result;
     }
 
 private:
-    void moveAuthority()
+    /// `access` is the token the caller's own primitive override already holds for its in-flight
+    /// request; reused here for this method's extra read+write rather than minting a new CasRequests,
+    /// exactly as `Backend::probeSentinelRaw`'s default implementation reuses one `access` across its
+    /// own head-then-more sequence.
+    void moveAuthority(TransportAccess & access)
     {
         armed = false;
         const String & key = authority == Authority::Catalog ? catalog_key : gc_state_key;
-        const auto got = CountingBackend::get(key);
+        const auto got = read(key, access);
         if (!got)
             throw std::runtime_error("test-injected cleanup authority object is absent");
 
@@ -181,7 +186,7 @@ private:
             ++moved.lease.seq;
             bytes = encodeGcState(moved);
         }
-        if (CountingBackend::casPut(key, bytes, got->token).outcome != CasOutcome::Committed)
+        if (!write(key, bytes, got->value, access).has_value())
             throw std::runtime_error("test-injected cleanup authority move lost its CAS");
     }
 
@@ -368,7 +373,8 @@ TEST(CASRefGc, LosingGenerationCommitAdoptsNothingDeletesNothing)
     Gc gc(store, kGc);
     gc.runRegularRound();   /// round 1: folds the +1 and adopts it cleanly
     store->renewWatermarkOnce();
-    const auto adopted = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    OperationForTest raw_op(*backend);
+    const auto adopted = decodeGcState((*raw_op).read(layout.gcStateKey(), Retry::once())->bytes);
     ASSERT_GT(adopted.snap_generation, 0u);
 
     /// Drop the ref, then run the round whose commit is DENIED (losing leader).
@@ -378,7 +384,7 @@ TEST(CASRefGc, LosingGenerationCommitAdoptsNothingDeletesNothing)
     backend->arm = false;
 
     /// The deposed round adopted NOTHING: the durable pointers are unchanged...
-    const auto after = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const auto after = decodeGcState((*raw_op).read(layout.gcStateKey(), Retry::once())->bytes);
     EXPECT_EQ(after.snap_generation, adopted.snap_generation)
         << "a denied round-commit CAS must not advance the adopted generation";
     EXPECT_EQ(after.snap_attempt, adopted.snap_attempt);
@@ -424,22 +430,23 @@ TEST(CASRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
     const String log_v2_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, v2});
     const String old_snap_key = layout.refSnapshotKey(fixture::fixtureLife(ns), RefTxnId{1, v1});
     const String new_snap_key = layout.refSnapshotKey(fixture::fixtureLife(ns), RefTxnId{1, v2});
-    ASSERT_TRUE(backend->head(log_v1_key).exists);
-    ASSERT_TRUE(backend->head(log_v2_key).exists);
-    ASSERT_TRUE(backend->head(old_snap_key).exists);
+    OperationForTest raw_op(*backend);
+    ASSERT_TRUE((*raw_op).head(log_v1_key, Retry::once()).has_value());
+    ASSERT_TRUE((*raw_op).head(log_v2_key, Retry::once()).has_value());
+    ASSERT_TRUE((*raw_op).head(old_snap_key, Retry::once()).has_value());
 
     Gc gc(store, kGc);
     runToFixpoint(store, gc);   /// folds v1,v2 (cursor -> v2) then cleans covered ref objects post-CAS
 
     /// The old log lies below both the durable cursor and the validated checkpoint base => DELETED.
-    EXPECT_FALSE(backend->head(log_v1_key).exists)
+    EXPECT_FALSE((*raw_op).head(log_v1_key, Retry::once()).has_value())
         << "a log below the checkpoint-named snapshot base and durable cursor must be deleted";
     /// The same-id ordinary log is part of recovery's triple and must survive.
-    EXPECT_TRUE(backend->head(log_v2_key).exists)
+    EXPECT_TRUE((*raw_op).head(log_v2_key, Retry::once()).has_value())
         << "the checkpoint-named non-seal log must survive with its snapshot";
     /// The older snapshot is deleted; the checkpoint-named snapshot is retained.
-    EXPECT_FALSE(backend->head(old_snap_key).exists) << "an older snapshot must be deleted";
-    EXPECT_TRUE(backend->head(new_snap_key).exists) << "the checkpoint-named snapshot must be retained";
+    EXPECT_FALSE((*raw_op).head(old_snap_key, Retry::once()).has_value()) << "an older snapshot must be deleted";
+    EXPECT_TRUE((*raw_op).head(new_snap_key, Retry::once()).has_value()) << "the checkpoint-named snapshot must be retained";
 }
 
 /// `cleanupRefObjects`'s per-round cap. Five deletable logs share one
@@ -487,11 +494,12 @@ TEST(CASRefGc, RefObjectCleanupRespectsRoundBudgetAndConvergesAcrossRounds)
         deletable_log_keys.push_back(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, static_cast<uint64_t>(i)}));
 
     Gc gc(store, kGc);
+    OperationForTest raw_op(*backend);
     auto countSurviving = [&]
     {
         size_t n = 0;
         for (const String & k : deletable_log_keys)
-            if (backend->head(k).exists)
+            if ((*raw_op).head(k, Retry::once()).has_value())
                 ++n;
         return n;
     };
@@ -559,10 +567,10 @@ TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
     Gc gc(store, kGc);
     runToFixpoint(store, gc);
 
-    EXPECT_TRUE(backend->head(layout.refLogKey(life, seal_id)).exists)
-        << "cleanup must retain the predecessor seal that proves the checkpoint base's epoch transition";
     CasRequests requests(backend, Fence::open());
     CasOperation op = requests.admit();
+    EXPECT_TRUE(op.head(layout.refLogKey(life, seal_id), Retry::once()).has_value())
+        << "cleanup must retain the predecessor seal that proves the checkpoint base's epoch transition";
     const CasRefCatalog::Snapshot cut = CasRefCatalog::read(op, layout);
     const auto entry = std::find_if(cut.catalog.entries.begin(), cut.catalog.entries.end(),
         [&](const CatalogEntry & candidate) { return candidate.ns == ns; });
@@ -585,8 +593,9 @@ TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefO
     Gc gc(store, kGc);
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
-    EXPECT_TRUE(backend->head(keys.first_log_key).exists);
-    EXPECT_TRUE(backend->head(keys.second_log_key).exists);
+    OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
+    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
     EXPECT_EQ(backend->deleteCount(keys.first_log_key), 0u);
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
@@ -604,8 +613,9 @@ TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenKeysAllowsFirstAndRefusesS
     Gc gc(store, kGc);
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
-    EXPECT_FALSE(backend->head(keys.first_log_key).exists);
-    EXPECT_TRUE(backend->head(keys.second_log_key).exists);
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
+    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
     EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
@@ -623,8 +633,9 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObject
     Gc gc(store, kGc);
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
-    EXPECT_TRUE(backend->head(keys.first_log_key).exists);
-    EXPECT_TRUE(backend->head(keys.second_log_key).exists);
+    OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
+    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
     EXPECT_EQ(backend->deleteCount(keys.first_log_key), 0u);
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
@@ -642,8 +653,9 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveBetweenKeysAllowsFirstAndRefusesSecond
     Gc gc(store, kGc);
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
-    EXPECT_FALSE(backend->head(keys.first_log_key).exists);
-    EXPECT_TRUE(backend->head(keys.second_log_key).exists);
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
+    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
     EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
@@ -743,9 +755,9 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
 
     /// Snapshot lifecycle: the covering snapshot is retained; the covered logs (folded + snapshot-covered)
     /// are cleaned; the replaced manifest's blob is reclaimed while the live blobs survive.
-    EXPECT_TRUE(backend->head(layout.refSnapshotKey(fixture::fixtureLife(ns_a), RefTxnId{1, va2})).exists)
+    EXPECT_TRUE(op.head(layout.refSnapshotKey(fixture::fixtureLife(ns_a), RefTxnId{1, va2}), Retry::once()).has_value())
         << "covering snapshot retained";
-    EXPECT_FALSE(backend->head(layout.refLogKey(fixture::fixtureLife(ns_a), RefTxnId{1, va1})).exists) << "covered log cleaned";
+    EXPECT_FALSE(op.head(layout.refLogKey(fixture::fixtureLife(ns_a), RefTxnId{1, va1}), Retry::once()).has_value()) << "covered log cleaned";
     EXPECT_FALSE(blobPresent(*backend, layout, DB::UInt128(1))) << "replaced blob reclaimed";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2))) << "live blob survives";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(3))) << "other table's blob survives";
@@ -774,7 +786,10 @@ TEST(CASRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
 
     /// Plant a malformed ref key under the ref prefix (a `_log` with a non-canonical id render).
     const NamespaceLifeId life = store->namespaceLife(ns);
-    backend->putIfAbsent(layout.namespaceStreamPrefix(life) + "_log/not-a-valid-txn-id", "garbage");
+    {
+        OperationForTest seed_op(*backend);
+        (*seed_op).create(layout.namespaceStreamPrefix(life) + "_log/not-a-valid-txn-id", "garbage", Retry::once());
+    }
 
     Gc gc(store, kGc);
     /// The fold's `groupRefKeys` rejects the unrecognized key and ABORTS ref folding for the round (spec
@@ -815,7 +830,8 @@ TEST(CASRefGc, NonCanonicalLifeKeyAbortsRefFoldingWithoutWedgingTheRound)
     /// opaque id. Only a foreign or corrupt writer can put this key here, and the pool must survive it.
     const String noncanonical_life =
         layout.casRefsPrefix() + ns.string() + "/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
-    ASSERT_EQ(backend->putIfAbsent(noncanonical_life, "garbage").outcome, PutOutcome::Done);
+    OperationForTest raw_op(*backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).create(noncanonical_life, "garbage", Retry::once())));
 
     Gc gc(store, kGc);
     RoundReport rep;
@@ -834,7 +850,7 @@ TEST(CASRefGc, NonCanonicalLifeKeyAbortsRefFoldingWithoutWedgingTheRound)
 
     /// The wedge is only visible over time: the key is still there (nothing deletes it), so a second
     /// round meets it again. It must survive that one too.
-    ASSERT_TRUE(backend->head(noncanonical_life).exists) << "precondition: nothing removed the key";
+    ASSERT_TRUE((*raw_op).head(noncanonical_life, Retry::once()).has_value()) << "precondition: nothing removed the key";
     ASSERT_NO_THROW(gc.runRegularRound()) << "a round that dies on this key would die on it forever";
 }
 
@@ -874,7 +890,10 @@ TEST(CASRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     /// A canonical `_log` key (groupRefKeys accepts it) whose body cannot be decoded: the fold GETs it
     /// and `decodeRefLogTxn` throws.
     const String garbage_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, dropped + 1});
-    backend->putIfAbsent(garbage_key, "garbage-not-a-valid-reflog-body");
+    {
+        OperationForTest seed_op(*backend);
+        (*seed_op).create(garbage_key, "garbage-not-a-valid-reflog-body", Retry::once());
+    }
     /// The corruption claims the next committed position. Advance only the durable frontier, not the
     /// log body, so recovery must exact-GET and hold this malformed object instead of ignoring F+1.
     advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, dropped + 1});
@@ -902,9 +921,10 @@ TEST(CASRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     /// precisely what made the hold necessary; if an absent could clear it, the whole mechanism would
     /// be defeated by the corruption it exists to survive. (Before durable holds this delete DID
     /// release the namespace, which is the hole Task 8 closed.)
-    const HeadResult h = backend->head(garbage_key);
-    ASSERT_TRUE(h.exists);
-    ASSERT_EQ(backend->deleteExact(garbage_key, h.token).kind, DeleteOutcome::Kind::Deleted);
+    OperationForTest evidence_op(*backend);
+    const auto h = (*evidence_op).head(garbage_key, Retry::once());
+    ASSERT_TRUE(h.has_value());
+    ASSERT_EQ((*evidence_op).remove(garbage_key, h->incarnation, Retry::once()), Removal::Removed);
 
     for (int i = 0; i < 4; ++i)
     {
@@ -996,8 +1016,8 @@ TEST(CASRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
     Gc gc(store, kGc);
     ASSERT_NO_THROW(gc.runRegularRound());
 
-    const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState state = decodeGcState(op.read(layout.gcStateKey(), Retry::once())->bytes);
     const CasFoldSeal seal = decodeFoldSeal(
-        backend->get(layout.foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+        op.read(layout.foldSealKey(state.snap_generation, state.snap_attempt), Retry::once())->bytes);
     EXPECT_TRUE(seal.ref_lives.contains(life_id));
 }
