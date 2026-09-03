@@ -59,6 +59,30 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### Codex production review (2026-09-03, adjudicated) — residue {#codex-prod-review-2026-09-03-residue}
+
+Adjudication of the external reviewer's 10 findings against spec revision 13: 3 confirmed defects (fixed in
+the plan's fix round: read classification narrowed to authoritative absence; one absolute bound per
+hand-written loop in `deleteCompletedRemovingAtSnapshot` and `ensureBlobPresent`; `claimMount`'s raced
+branches return the observed body), 3 design-accepted, 2 rejected, 2 prose. What remains here:
+
+- **Spec drift.** The spec's retry section names `S3Exception::isAccessTokenExpiredError` as the
+  refreshability predicate; the landed `isRefreshableCredentialError` is deliberately narrower (named codes
+  only, never `S3Errors::UNKNOWN`), because the general predicate would turn every unmodelled store answer
+  into a refusal. The spec sentence is stale; the ruling is recorded in
+  `docs/superpowers/cas/2026-09-03-request-contract-rulings.md`. Fix: reword the spec sentence to name the
+  CAS-local predicate and its reason.
+- **Accepted request costs, recorded so nobody re-argues them without new evidence:** one extra `GET` per
+  conflicting iteration of the catalog erase loop (the post-write read is also what convicts a false
+  `Committed`; `Conflict::seen` may be `NotObserved`); one extra `GET` on the pool-meta union path and on its
+  lost-create path (the steady-state open stays one `GET`); one extra `GET` on the lost marker-create path of
+  blob publication.
+- **Comments to rewrite** (code-comment half of Task 25): the `Backend/` bullet of
+  `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md` names the deleted
+  `CasRequestControl` and the deleted token-aware verbs; `CasBackend.h`'s `ProbeOutcome` comment claims
+  ordinary reads flatten container, permission and transport faults into absence, which `isObjectNotFound`
+  does not do (only an authoritative key miss becomes absence; everything else propagates to the engine).
+
 Append new items here — quick adds and concurrent-agent findings land in this section, unformatted
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
 from here without triaging; do not hand-sort into a topic file without checking the item's anchor
