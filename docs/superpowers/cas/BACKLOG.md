@@ -1651,3 +1651,33 @@ as their own fix rounds. Each item names its file, line, the current text, and t
   "resolved" while the identifiers still say proven/validated — the memo now saves a fresh RESOLVE, not
   a proof. Rename `force_fresh_validated_refs` to `force_fresh_resolved_refs` and `already_proven` to
   `already_resolved` (or fold into the memo's removal, if that happens first).
+
+## `[cas-unit-test-mutation-battery]` Proposed: a dynamic mutation battery over the CAS unit tests (2026-09-03, deferred by the user) {#cas-unit-test-mutation-battery}
+
+**Context.** The backend request-contract migration (spec
+`docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md`, revision 13) rewrote most of
+the 142 CAS unit-test files: doubles moved from the legacy verbs to `CasRequests`, one-shot faults were
+re-modelled for an engine that retries, counts pinned to the old controller were re-derived. The user
+asked whether the tests still test something useful or degenerated into `2 + 2 = 4`. The static half of
+that audit (two reviewers, per-test "killing mutation" + verdict DISCRIMINATING / WEAK / TAUTOLOGICAL)
+is recorded in `docs/superpowers/cas/2026-09-03-test-vacuity-audit.md`; its ranked mutant lists are the
+input to this item. The dynamic half was NOT run — other priorities (user, 2026-09-03).
+
+**Proposal (dynamic half).** Execute the mutants: a mutant nobody kills is a hole in the suite.
+
+1. Merge the auditors' mutant lists into at most 20 distinct one-line production mutants (never a test
+   line); one patch file each, with the tests the audit expects to go red.
+2. Per mutant, in order: apply → `ninja unit_tests_dbms` in `build_debug` → run
+   `build_debug/src/unit_tests_dbms --gtest_filter='CAS*'` (the gate filter is exactly `CAS*`) → record
+   ran / passed / failed and the FAILED names → revert and verify `git status --porcelain -- src` is
+   empty before the next mutant.
+3. Verdict per mutant: KILLED (an expected test is red), KILLED-BY-OTHERS (red, but none of the expected
+   tests — name what killed it), SURVIVED (zero reds: name the property no test pins). An abort in the
+   debug build counts as killed by an assertion; say so.
+4. Commit nothing from the mutants; finish with one clean `CAS*` gate to prove the tree is restored.
+5. Output: the mutant table (patch, expected tests, actual reds, verdict), the SURVIVED list with the
+   property each exposes, and for every test the static audit called TAUTOLOGICAL or WEAK whether the
+   battery confirms or refutes it. Each SURVIVED mutant becomes a test to write, not a note.
+
+**Cost.** ~20 incremental debug builds + ~20 `CAS*` runs, sequential (one builder); roughly 3–4 hours
+of a cheap agent's time. Zero risk to the tree if step 2's revert check is honoured.
