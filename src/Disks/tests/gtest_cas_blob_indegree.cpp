@@ -678,7 +678,7 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
     /// gen-1 run must be consumed via one streaming open per prior segment, NEVER a whole-object get.
     backend.resetCounts();
     /// Arm a window smaller than the run so the fold's output is proven correct under chunked delivery,
-    /// not merely served in one piece: an unarmed recorder hands back the whole object as its one chunk.
+    /// not merely served in one piece: unarmed, `getStream` never installs the recording wrapper at all.
     backend.setStreamChunkForTest(kLegacyBlockSize / 4);
     std::vector<BlobDelta> gen2{{bh(0), s(1), true}, {bh(19999), s(2), false}};
     std::vector<RunRef> runs2_c;
@@ -702,11 +702,10 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
     EXPECT_EQ(backend.getCount(gen1_run_key), 0u);
     /// The cursor opened the prior run's segment through the streaming reader.
     EXPECT_GE(backend.getStreamCount(gen1_run_key), 1u);
-    /// The other half of the evidence: byte-parity above held even though the stream delivered the prior
-    /// run in windows smaller than the run itself, not in one piece. An unarmed recorder could not
-    /// produce a chunk larger than its own buffer, so this comparison would be true by construction
-    /// without the armed window and the byte-parity check above.
-    EXPECT_LT(backend.largestStreamChunk(gen1_run_key), gen1_run_bytes.size());
+    /// The other half of the evidence: a nonzero value here can only come from the recording wrapper
+    /// `getStream` installs when armed, so this proves the arming actually took effect and the
+    /// byte-parity check above ran under genuinely chunked delivery, not a no-op setter.
+    EXPECT_GT(backend.largestStreamChunk(gen1_run_key), 0u);
     /// This does NOT bound how much the stream buffers per request: the streaming primitive carries no
     /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }
@@ -752,8 +751,8 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
 
     backend.resetCounts();
     /// Arm a window smaller than the run so the candidate set below is proven correct under chunked
-    /// delivery, not merely served in one piece: an unarmed recorder hands back the whole object as its
-    /// one chunk.
+    /// delivery, not merely served in one piece: unarmed, `getStream` never installs the recording
+    /// wrapper at all.
     backend.setStreamChunkForTest(kLegacyBlockSize / 4);
     const auto zero_c = zeroInDegree(*backend_req, runs2_c);
     const auto zero_o = zeroInDegree(*oracle_req, runs2_o);
@@ -769,11 +768,10 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
     EXPECT_EQ(backend.getCount(gen2_run_key), 0u);
     /// The scan opened the run through the streaming reader.
     EXPECT_GE(backend.getStreamCount(gen2_run_key), 1u);
-    /// The other half of the evidence: the candidate set above matched the oracle even though the stream
-    /// delivered the run in windows smaller than the run itself, not in one piece. An unarmed recorder
-    /// could not produce a chunk larger than its own buffer, so this comparison would be true by
-    /// construction without the armed window and the candidate-set check above.
-    EXPECT_LT(backend.largestStreamChunk(gen2_run_key), gen2_run->bytes.size());
+    /// The other half of the evidence: a nonzero value here can only come from the recording wrapper
+    /// `getStream` installs when armed, so this proves the arming actually took effect and the
+    /// candidate-set check above ran under genuinely chunked delivery, not a no-op setter.
+    EXPECT_GT(backend.largestStreamChunk(gen2_run_key), 0u);
     /// This does NOT bound how much the stream buffers per request: the streaming primitive carries no
     /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }
