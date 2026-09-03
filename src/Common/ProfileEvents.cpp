@@ -932,6 +932,12 @@ The server successfully detected this situation and will download merged part fr
     M(CASConditionalWriteDefiniteFailure, "Number of CAS conditional writes rejected with certainty before applying. A non-zero value indicates invalid requests, oversized entities, or access denial.", ValueType::Number) \
     M(CASConditionalWriteUnresolved, "Number of CAS conditional writes with an unknown outcome after conflict, timeout, connection loss, or server error. A non-zero value indicates backend instability or state requiring resolution.", ValueType::Number) \
     M(CASConditionalWriteFenceLostPostWrite, "Number of CAS writes that succeeded but lost the final mount-fence check. A non-zero value indicates late responses after the mount lifecycle changed.", ValueType::Number) \
+    M(CASRequestAttempt, "Number of physical requests the CAS request contract started. Each one was admitted by the mount fence and reserved against the call's deadline before it was sent.", ValueType::Number) \
+    M(CASRequestReissue, "Number of CAS requests re-sent after a jittered backoff sleep. Growth means the object store is throttling, failing, or contended.", ValueType::Number) \
+    M(CASRequestResolveRead, "Number of exact reads the CAS request contract made to settle a refused precondition or an ambiguous write. Every conflict and every ambiguity costs one.", ValueType::Number) \
+    M(CASRequestGaveUp, "Number of CAS writes that ended without a proven outcome, at a deadline, on a lost mount fence, or unresolved. A non-zero value means callers are being asked to retry later.", ValueType::Number) \
+    M(CASRequestRefused, "Number of CAS writes the store itself refused, proving they never applied: a malformed request, an entity too large, or an access denial that no credential refresh can fix.", ValueType::Number) \
+    M(CASRequestFenceLostPostWrite, "Number of CAS writes that were proven durable but lost the mount fence before the call could claim them. A non-zero value indicates late responses after the mount lifecycle changed.", ValueType::Number) \
     M(CASMountRenewalAttempts, "Number of physical conditional renewal PUTs sent for CAS mount leases. This counts transport attempts, not logical renewals.", ValueType::Number) \
     M(CASMountRenewalRetries, "Number of physical conditional renewal PUTs sent after the first attempt of one logical CAS mount-lease renewal.", ValueType::Number) \
     M(CASMountRenewalResolved, "Number of CAS mount-lease renewals whose committed outcome was proved by an exact resolving GET.", ValueType::Number) \
