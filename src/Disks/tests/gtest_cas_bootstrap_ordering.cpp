@@ -443,7 +443,7 @@ TEST(CASBootstrapOrdering, DecommissionWithAbsentMetaFailsClosedNoMint)
         DB::Cas::tests::OperationForTest op(*backend);
         const auto h = (*op).head(kPoolMetaKey, Retry::standard());
         ASSERT_TRUE(h.has_value());
-        ASSERT_EQ((*op).remove(kPoolMetaKey, h->incarnation, Retry::once()), Removal::Removed);
+        ASSERT_EQ((*op).remove(kPoolMetaKey, h->etag, Retry::once()), Removal::Removed);
     }
     backend->clearLog();
 
