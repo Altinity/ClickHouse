@@ -114,13 +114,28 @@ bool replaceForTest(const BackendPtr & backend, const String & key, const String
 /// generation can drive the production remount boundary without paying a live-lease expiry wait.
 void fenceOutMountForRemount(Backend & backend, const String & mount_key)
 {
-    const auto got = backend.get(mount_key);
+    OperationForTest op(backend);
+    const auto got = (*op).read(mount_key, Retry::once());
     ASSERT_TRUE(got.has_value());
     MountLease mount = decodeMountLease(got->bytes);
     mount.gc_fenced = true;
     mount.seq += 1;
-    ASSERT_EQ(backend.putOverwrite(mount_key, encodeMountLease(mount), got->token).outcome,
-        PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(mount_key, encodeMountLease(mount), got->incarnation, Retry::once())));
+}
+
+/// The durable object at `key`, or `nullopt`.
+std::optional<Object> readAt(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).read(key, Retry::once());
+}
+
+/// Unconditional create of a fresh key (the fixture's own setup, never a real conflict).
+void createAt(Backend & backend, const String & key, const String & bytes)
+{
+    OperationForTest op(backend);
+    EXPECT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
 }
 
 /// A backend whose `LIST` can lie by omission. `hidden_keys` remain readable by exact key, so these
@@ -338,7 +353,7 @@ constexpr int kFaultsBeyondTheRetryWindow = 100'000;
 CasRequestBudget tinyBudget()
 {
     return CasRequestBudget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
 }
 
 PoolConfig walkTestConfig()
@@ -423,7 +438,7 @@ void seedTxn(Backend & backend, const Layout & layout, const RootNamespace & ns,
 /// never run a birth through the append lane.
 void seedCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
-    backend.putIfAbsent(layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(ckpt));
+    createAt(backend, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(ckpt));
 }
 
 RefCkpt lifeEpochCkpt(uint64_t life_epoch, std::optional<RefTxnId> committed_through = std::nullopt)
@@ -438,7 +453,7 @@ RefCkpt lifeEpochCkpt(uint64_t life_epoch, std::optional<RefTxnId> committed_thr
 /// disengaged optional: an aborted binary would take every later suite's result with it.
 std::optional<RefLogTxn> readLogTxn(Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId id)
 {
-    const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id));
+    const auto got = readAt(backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id));
     if (!got)
         return std::nullopt;
     return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
@@ -618,11 +633,11 @@ TEST(CASRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
     DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
         .committed_through = frontier,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt}));
     const auto ckpt_before = readCkptForTest(backend, layout, life);
     ASSERT_TRUE(ckpt_before);
 
@@ -649,11 +664,11 @@ TEST(CASRefRecoveryCasWalk, UncommittedSnapshotIsUnobservedWithoutStreamList)
     writeRefSnapshotRaw(*backend, layout,
         minimalLiveSnapshot(ns.string(), uncommitted_snapshot_id,
             {committedRow("laundered", manifestRef(1, 2, 1))}));
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
         .committed_through = frontier,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt}));
 
     auto store = openWalkPool(backend);
     backend->resetCounts();
@@ -698,17 +713,21 @@ TEST(CASRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
             const KeyPage page = seed_op.list("", cursor, 1000, Retry::standard());
             for (const KeyEntry & listed : page.keys)
             {
-                const auto object = seed->get(listed.key);
+                const auto object = seed_op.read(listed.key, Retry::standard());
                 if (!object)
                     throw std::runtime_error("seed LIST returned a key that exact GET could not read");
-                const auto existing = backend->get(listed.key);
+                const auto existing = readAt(*backend, listed.key);
                 if (existing)
                 {
-                    if (existing->bytes != object->bytes || existing->attributes != object->attributes)
+                    if (existing->bytes != object->bytes)
                         throw std::runtime_error("clone backend constructor disagreed with seeded object");
                 }
-                else if (backend->putIfAbsent(listed.key, object->bytes, object->attributes).outcome != PutOutcome::Done)
-                    throw std::runtime_error("clone backend failed to copy seeded object");
+                else
+                {
+                    OperationForTest clone_op(*backend);
+                    if (!std::holds_alternative<Committed>((*clone_op).create(listed.key, object->bytes, Retry::once())))
+                        throw std::runtime_error("clone backend failed to copy seeded object");
+                }
             }
             cursor = page.next_cursor;
         } while (!cursor.empty());
@@ -1028,8 +1047,8 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesEveryOccupiedObjectBeforeAdvancingP
         backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
         expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
 
-        EXPECT_TRUE(backend->get(layout.refLogKey(life, test_case.occupant)));
-        EXPECT_FALSE(backend->get(layout.refLogKey(life, test_case.forbidden_successor)))
+        EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, test_case.occupant)));
+        EXPECT_FALSE(readAt(*backend, layout.refLogKey(life, test_case.forbidden_successor)))
             << "recovery advanced before exact _ckpt certified the occupied object";
         EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, initial_frontier);
         EXPECT_FALSE(store->refTableRecoveredForTest(ns));
@@ -1105,9 +1124,9 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNex
     backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
 
-    EXPECT_TRUE(backend->get(layout.refLogKey(life, first_seal)))
+    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, first_seal)))
         << "the first recovery seal became durable before its frontier attempt";
-    EXPECT_FALSE(backend->get(layout.refLogKey(life, second_seal)))
+    EXPECT_FALSE(readAt(*backend, layout.refLogKey(life, second_seal)))
         << "recovery may not create a second object while the first is still above exact _ckpt";
     EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, initial_frontier);
     EXPECT_FALSE(store->refTableRecoveredForTest(ns));
@@ -1119,8 +1138,8 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNex
     auto cold_store = openWalkPool(backend);
     ASSERT_EQ(cold_store->liveWriterEpoch(), 4u);
     ASSERT_EQ(cold_store->listRefs(ns).size(), 1u);
-    EXPECT_TRUE(backend->get(layout.refLogKey(life, second_seal)));
-    EXPECT_TRUE(backend->get(layout.refLogKey(life, cold_remount_frontier)));
+    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, second_seal)));
+    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, cold_remount_frontier)));
     EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, cold_remount_frontier);
 }
 
@@ -1157,16 +1176,16 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesAnAdoptedStragglerBeforeCreatingIts
     backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
 
-    EXPECT_TRUE(backend->get(layout.refLogKey(life, straggler)))
+    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, straggler)))
         << "the straggler occupied the recovery seal slot";
-    EXPECT_FALSE(backend->get(layout.refLogKey(life, following_seal)))
+    EXPECT_FALSE(readAt(*backend, layout.refLogKey(life, following_seal)))
         << "recovery may not create a seal after an adopted straggler above exact _ckpt";
     EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, initial_frontier);
     EXPECT_FALSE(store->refTableRecoveredForTest(ns));
 
     backend->ambiguous_cas_count = 0;
     ASSERT_EQ(store->listRefs(ns).size(), 2u);
-    EXPECT_TRUE(backend->get(layout.refLogKey(life, following_seal)));
+    EXPECT_TRUE(readAt(*backend, layout.refLogKey(life, following_seal)));
     EXPECT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, following_seal);
 }
 
@@ -1248,7 +1267,7 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
     const CatalogEntry predecessor = readCatalogForTest(backend, layout).catalog.entries.front();
     const NamespaceLifeId predecessor_life
         = NamespaceLifeId::fromCatalogEntry(predecessor.ns, predecessor.incarnation);
-    const auto predecessor_ckpt_before = backend->get(layout.refCkptKey(predecessor_life));
+    const auto predecessor_ckpt_before = readAt(*backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_before);
 
     auto store = openWalkPool(backend);
@@ -1288,9 +1307,8 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
     const CatalogEntry successor = replaceCatalogLifeForTest(backend, layout, predecessor, UInt128{0x5152});
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(successor_life), encodeRefCkpt(lifeEpochCkpt(2))).outcome,
-        PutOutcome::Done);
-    const auto successor_ckpt_before = backend->get(layout.refCkptKey(successor_life));
+    createAt(*backend, layout.refCkptKey(successor_life), encodeRefCkpt(lifeEpochCkpt(2)));
+    const auto successor_ckpt_before = readAt(*backend, layout.refCkptKey(successor_life));
     ASSERT_TRUE(successor_ckpt_before);
     store->invalidateRemovedCatalogLife(predecessor_life);
     backend->resetCounts();
@@ -1307,9 +1325,9 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
         << "no predecessor seal retry may be sent after exact retirement";
     EXPECT_EQ(backend->writeCount(layout.refCkptKey(predecessor_life)), 0u)
         << "no predecessor checkpoint CAS may be sent after exact retirement";
-    const auto predecessor_ckpt_after = backend->get(layout.refCkptKey(predecessor_life));
+    const auto predecessor_ckpt_after = readAt(*backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after);
-    EXPECT_EQ(predecessor_ckpt_after->token, predecessor_ckpt_before->token);
+    EXPECT_EQ(predecessor_ckpt_after->incarnation, predecessor_ckpt_before->incarnation);
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "the detached predecessor result was installed";
     EXPECT_EQ(store->recoveryInstallCountForTest(), recovery_installs_before)
         << "the detached predecessor reached the recovery publication point";
@@ -1317,9 +1335,9 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
     for (const String & key : backend->touchedKeys())
         EXPECT_EQ(key.find(successor_prefix), String::npos)
             << "predecessor recovery retargeted storage I/O into successor key " << key;
-    const auto successor_ckpt_after = backend->get(layout.refCkptKey(successor_life));
+    const auto successor_ckpt_after = readAt(*backend, layout.refCkptKey(successor_life));
     ASSERT_TRUE(successor_ckpt_after);
-    EXPECT_EQ(successor_ckpt_after->token, successor_ckpt_before->token);
+    EXPECT_EQ(successor_ckpt_after->incarnation, successor_ckpt_before->incarnation);
     EXPECT_EQ(successor_ckpt_after->bytes, successor_ckpt_before->bytes);
 }
 
@@ -1610,7 +1628,7 @@ TEST(CASRefRecoveryCasWalk, NeedsRecoveryReplaysTheStrandedTxn)
                 entry = &e;
         ASSERT_NE(entry, nullptr) << "the birth above must have minted a catalog entry for " << ns.string();
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-        ASSERT_TRUE(backend->get(layout.refLogKey(life, RefTxnId{1, 2})).has_value())
+        ASSERT_TRUE(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 2})).has_value())
             << "the stranded transaction must be durable -- otherwise recovery is not owed";
     }
 
@@ -1656,7 +1674,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsOneExactUnfrontieredSuccessorAnd
     EXPECT_GT(clock->pauseCount(), 1u)
         << "the reissues must pace through the injected sleep, never a real one";
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    ASSERT_TRUE(backend->get(layout.refLogKey(life, RefTxnId{1, 2})))
+    ASSERT_TRUE(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 2})))
         << "the sole deterministic successor must be durable before recovery";
     ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}));
 
@@ -1710,8 +1728,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochO
     /// readable checkpoint whose `committed_through` is absent.
     DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(lifeEpochCkpt(1))).outcome,
-              PutOutcome::Done);
+    createAt(*backend, layout.refCkptKey(life), encodeRefCkpt(lifeEpochCkpt(1)));
     ASSERT_TRUE(readCkptForTest(backend, layout, life)->ckpt.life_epoch);
     ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, std::nullopt);
 
@@ -1732,9 +1749,9 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochO
             }, RootMutationOrigin::Writer, RootMutationKind::Publish);
     });
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
-    ASSERT_TRUE(backend->get(layout.refLogKey(life, RefTxnId{1, 1})));
+    ASSERT_TRUE(readAt(*backend, layout.refLogKey(life, RefTxnId{1, 1})));
     ASSERT_EQ(readCkptForTest(backend, layout, life)->ckpt.committed_through, std::nullopt);
-    ASSERT_FALSE(backend->get(layout.refSnapshotKey(life, RefTxnId{1, 1})))
+    ASSERT_FALSE(readAt(*backend, layout.refSnapshotKey(life, RefTxnId{1, 1})))
         << "the grounding test must exercise the exact log successor, not a hinted snapshot";
 
     backend->ambiguous_cas_count = 0;
@@ -1766,21 +1783,22 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPriv
             return;
         injected = true;
         ASSERT_TRUE(expected);
-        ASSERT_EQ(backend->putIfAbsent(layout.refLogKey(life, later.txn_id),
-                                      sealObject(FormatId::RefLog, encodeRefLogTxn(later))).outcome,
-                  PutOutcome::Done);
-        const auto current = backend->get(key);
+        createAt(*backend, layout.refLogKey(life, later.txn_id),
+                 sealObject(FormatId::RefLog, encodeRefLogTxn(later)));
+        OperationForTest op(*backend);
+        const auto current = (*op).read(key, Retry::once());
         ASSERT_TRUE(current);
-        /// `expected` is the transport value the publisher is presenting; the legacy read hands back
-        /// the same observation wrapped in a `Token`, so its `value` is what compares.
-        ASSERT_EQ(current->token.value, *expected);
+        /// `expected` is the raw transport value the publisher is presenting; `PersistedEtag::capture`
+        /// re-derives the same raw value from the minted incarnation, so the two compare.
+        ASSERT_EQ(PersistedEtag::capture(current->incarnation).value, *expected);
         const RefCkpt advanced = mergeCkpt(
             decodeRefCkpt(current->bytes),
             RefCkpt{.life_epoch = std::nullopt,
                     .committed_through = later.txn_id,
                     .checkpoint_snapshot_id = std::nullopt,
                     .last_epoch_seal = std::nullopt});
-        ASSERT_EQ(backend->putOverwrite(key, encodeRefCkpt(advanced), current->token).outcome, PutOutcome::Done);
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(key, encodeRefCkpt(advanced), current->incarnation, Retry::once())));
     };
 
     const auto refs = store->listRefs(ns);
@@ -1826,9 +1844,8 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsTwoUnfrontieredSuccessorsAfterE
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     const RefLogTxn second_successor = makeOrdinaryTxn(ns, RefTxnId{1, 3}, "c", /*birth=*/false);
-    ASSERT_EQ(backend->putIfAbsent(layout.refLogKey(life, second_successor.txn_id),
-                                  sealObject(FormatId::RefLog, encodeRefLogTxn(second_successor))).outcome,
-              PutOutcome::Done);
+    createAt(*backend, layout.refLogKey(life, second_successor.txn_id),
+             sealObject(FormatId::RefLog, encodeRefLogTxn(second_successor)));
     backend->ambiguous_cas_count = 0;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
@@ -1847,13 +1864,15 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheReta
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     const String successor_key = layout.refLogKey(life, RefTxnId{1, 2});
-    const auto original = backend->get(successor_key);
+    const auto original = readAt(*backend, successor_key);
     ASSERT_TRUE(original);
     const RefLogTxn different = makeOrdinaryTxn(ns, RefTxnId{1, 2}, "different", /*birth=*/false);
-    ASSERT_EQ(backend->putOverwrite(successor_key,
-                                   sealObject(FormatId::RefLog, encodeRefLogTxn(different)),
-                                   original->token).outcome,
-              PutOutcome::Done);
+    {
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(successor_key,
+            sealObject(FormatId::RefLog, encodeRefLogTxn(different)),
+            original->incarnation, Retry::once())));
+    }
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
@@ -1871,13 +1890,15 @@ TEST(CASRefRecoveryCasWalk, RetainedOldWriterAttemptLosesConclusiveToASuccessorS
 
     const RefTxnId successor_id{1, 2};
     const String successor_key = layout.refLogKey(life, successor_id);
-    const auto original = backend->get(successor_key);
+    const auto original = readAt(*backend, successor_key);
     ASSERT_TRUE(original);
     const RefLogTxn successor_seal = makeSealTxn(ns, successor_id);
-    ASSERT_EQ(backend->putOverwrite(successor_key,
-                                   sealObject(FormatId::RefLog, encodeRefLogTxn(successor_seal)),
-                                   original->token).outcome,
-              PutOutcome::Done);
+    {
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(successor_key,
+            sealObject(FormatId::RefLog, encodeRefLogTxn(successor_seal)),
+            original->incarnation, Retry::once())));
+    }
 
     const auto refs = store->listRefs(ns);
 
@@ -1953,8 +1974,10 @@ TEST(CASRefRecoveryCasWalk, ALatePredecessorPutAtTheSealedSlotIsRefusedByTheStor
     const RefTxnId ghost_id{1, 2};
     const String ghost_bytes = sealObject(FormatId::RefLog,
         encodeRefLogTxn(makeOrdinaryTxn(ns, ghost_id, "ghost", /*birth=*/false)));
-    const PutResult put = backend->putIfAbsent(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), ghost_id), ghost_bytes);
-    EXPECT_EQ(put.outcome, PutOutcome::PreconditionFailed)
+    OperationForTest ghost_op(*backend);
+    const WriteResult put = (*ghost_op).create(
+        layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), ghost_id), ghost_bytes, Retry::once());
+    EXPECT_TRUE(std::holds_alternative<Conflict>(put))
         << "the seal occupies the ghost's own key, so the store itself is the fence";
 
     /// And the object at that key is still the seal, byte for byte -- nothing adopted the ghost.
@@ -2112,8 +2135,9 @@ TEST(CASRefRecoveryCasWalk, PutHookBackendComposesHidingListBackendCasPutFaultIn
     /// `HidingListBackend::write` only runs `before_cas_put` on the CONDITIONAL branch (an `expected`
     /// token present) -- a bare create-shaped `casPut(..., std::nullopt)` takes the other branch and
     /// can never reach it. Seed the key first so the probed call below is a genuine replace.
-    const auto seeded = backend->putIfAbsent("p/probe", "seed");
-    ASSERT_EQ(seeded.outcome, PutOutcome::Done);
+    OperationForTest op(*backend);
+    const WriteResult seeded = (*op).create("p/probe", "seed", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(seeded));
 
     bool before_cas_put_fired = false;
     backend->before_cas_put = [&](const String &, const String &, const std::optional<String> &)
@@ -2125,7 +2149,8 @@ TEST(CASRefRecoveryCasWalk, PutHookBackendComposesHidingListBackendCasPutFaultIn
     bool on_key_fired = false;
     backend->on_key = [&] { on_key_fired = true; };
 
-    ASSERT_EQ(backend->casPut("p/probe", "x", seeded.token).outcome, CasOutcome::Committed);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace("p/probe", "x", std::get<Committed>(seeded).incarnation, Retry::once())));
 
     EXPECT_TRUE(before_cas_put_fired)
         << "HidingListBackend's before_cas_put hook must still fire for a PutHookBackend instance";
