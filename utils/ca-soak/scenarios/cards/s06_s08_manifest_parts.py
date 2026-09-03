@@ -23,7 +23,7 @@ small parts fast and checks per-life ref-object CAS contention stays bounded (re
 
 import time
 
-from ..framework import observe, sql
+from ..framework import cluster_boot, observe, sql
 from ..framework.base import Scenario, register
 from ..framework.report import Verdict
 from . import _common
@@ -242,6 +242,40 @@ class S06(Scenario):
             # column ratio of 0.027), while both CAS counters stayed at zero.
             subset_gets = sub_delta.get("DiskS3GetObject", 0)
 
+            # The write phase already warmed ch1's retained part-folder view cache, and any `getView`
+            # call inside a query re-warms it for the rest of that SAME query too — the retained-hit
+            # counter cannot tell "warm from the write phase" from "warm from earlier in this scan".
+            # Measured directly: a bare `docker restart` of ch1 (data preserved, in-process state
+            # cleared) still left the tagged scan's own `CASPartFolderViewHits` nonzero, because the
+            # scan's own first column access re-populates the cache for the following 999. Retention
+            # is gated by `cas_part_folder_cache_bytes`, a disk construction-time setting
+            # (`CachedPartFolderAccess::CacheParams`) that `SYSTEM RELOAD CONFIG` does not apply to a
+            # running CAS disk (`docs/superpowers/cas/BACKLOG/operability-and-introspection.md`
+            # {#cas-settings-not-reloadable-silently}), so disabling it needs a fresh disk object built
+            # from a different config, not just a fresh process. `render_tuned_config` renders that
+            # config (gitignored, not the tracked `storage_conf_ch1.xml`) and `docker compose -f
+            # docker-compose-tuned.yml up -d ch1` recreates ONLY ch1 with it — never `down`/`down -v`,
+            # so RustFS, ch2 and the pool are untouched and the wide part written above survives.
+            # `CASPartFolderViewHits == 0` on the scan's own query_log row is then a real fence: no
+            # `getView` call, first column or last, can be served from a retained view. The manifest
+            # reads this forces still pay no HEAD (the decode cache is keyed by id and a hit is served
+            # without a request) — that is the verdict this swap makes meaningful. Measured this swap
+            # does not perturb `DiskS3GetObject` (2002 for 1000 columns both with and without
+            # retention): disabling view retention changes how a column's layout is resolved, not how
+            # its blob is read. ch1 swaps back to the untuned config right after the scan so the
+            # fsck/GC checks below run under the same configuration as the rest of the suite. Both
+            # counters are attributed to the scan through its own query_log row rather than a
+            # wall-clock counter window, because the orphan sweep and fsck legitimately HEAD manifest
+            # keys and a background GC round may overlap the window. A missing row is a harness
+            # failure, not a pass.
+            ctx.log("S06: swapping ch1 to cas_part_folder_cache_bytes=0 (RustFS/ch2 untouched) so no "
+                    "getView call in the tagged scan can be served from a retained view")
+            cluster_boot.render_tuned_config({"cas_part_folder_cache_bytes": "0"})
+            swap_rc = cluster_boot.compose_run("tuned", "up", "-d", "ch1", log_fn=ctx.log)
+            swapped_healthy = cluster_boot.wait_healthy(cl, timeout_s=90, log_fn=ctx.log)
+            if swap_rc != 0 or not swapped_healthy:
+                raise RuntimeError(f"S06: ch1 did not come back healthy under the tuned config (rc={swap_rc})")
+
             cl.node1.command("SYSTEM DROP MARK CACHE")
             cl.node1.command("SYSTEM DROP UNCOMPRESSED CACHE")
             scan_comment = f"s06_allcol_scan_{ctx.timestamp}"
@@ -255,20 +289,35 @@ class S06(Scenario):
             all_delta = cw2().get("_total", {})
             all_gets = all_delta.get("DiskS3GetObject", 0)
 
-            # Manifest reads on a scan pay no HEAD: the decode cache is keyed by id and a hit is served
-            # without a request. Attributed to the scan through its own query_log row rather than a
-            # wall-clock counter window, because the orphan sweep and fsck legitimately HEAD manifest
-            # keys and a background GC round may overlap the window. A missing row is a harness
-            # failure, not a pass.
             cl.node1.command("SYSTEM FLUSH LOGS")
-            scan_heads_txt = cl.node1.query(
-                "SELECT ProfileEvents['CASManifestHead'] FROM system.query_log "
+            scan_row = cl.node1.query(
+                "SELECT ProfileEvents['CASManifestHead'], ProfileEvents['CASPartFolderViewHits'] "
+                "FROM system.query_log "
                 f"WHERE log_comment = '{scan_comment}' AND type = 'QueryFinish' "
                 "ORDER BY event_time_microseconds DESC LIMIT 1 FORMAT TabSeparated").strip()
-            if scan_heads_txt == "":
+            if scan_row == "":
                 raise RuntimeError(f"S06: no QueryFinish row for log_comment={scan_comment!r} in system.query_log")
+            scan_heads_txt, scan_view_hits_txt = scan_row.split("\t")
             scan_manifest_heads = int(scan_heads_txt)
+            scan_view_hits = int(scan_view_hits_txt)
+
+            ctx.log("S06: swapping ch1 back to the untuned config")
+            revert_rc = cluster_boot.compose_run(self.compose_variant, "up", "-d", "ch1", log_fn=ctx.log)
+            reverted_healthy = cluster_boot.wait_healthy(cl, timeout_s=90, log_fn=ctx.log)
+            if revert_rc != 0 or not reverted_healthy:
+                raise RuntimeError(
+                    f"S06: ch1 did not come back healthy after reverting the tuned config (rc={revert_rc})")
+
             result.observations["s06_allcol_CASManifestHead"] = scan_manifest_heads
+            result.observations["s06_allcol_CASPartFolderViewHits"] = scan_view_hits
+            result.add(Verdict.check(
+                "scan rebuilds views (path fence)",
+                "CASPartFolderViewHits == 0 for the all-column scan (no warm view served)",
+                f"CASPartFolderViewHits={scan_view_hits}", scan_view_hits == 0,
+                "" if scan_view_hits == 0
+                else "the tagged scan served a warm retained view — it never reached readManifestShared, "
+                     "so the manifest-HEAD verdict below cannot distinguish the id-keyed reader from the "
+                     "old one"))
             result.add(Verdict.check(
                 "scan issues no manifest HEAD",
                 "CASManifestHead == 0 for the all-column scan",
