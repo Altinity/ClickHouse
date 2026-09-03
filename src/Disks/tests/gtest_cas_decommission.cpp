@@ -1,5 +1,6 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <algorithm>
@@ -39,13 +40,13 @@ void drainCompletedNamespaceRemovals(const std::shared_ptr<InMemoryBackend> & ba
     ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
 }
 
-/// Fails `deleteExact` for one or two designated keys -- either by throwing (a transient backend
-/// hiccup) or by returning a synthetic `TokenMismatch` (a "listed but raced" outcome) -- delegating
-/// every other key to the base `InMemoryBackend` untouched. Drives the drain phases' per-object
-/// fail-close path (`deleteListedPrefix`/`sweepNamespace`, `CasDecommission.cpp`/
-/// `CasOrphanManifestSweep.cpp`): a failure on one listed object must record a warning and let the rest
-/// of the sweep proceed, never abort the whole phase.
-///
+/// Fails a delete for one or two designated keys -- either by throwing (a transient backend hiccup) or
+/// by returning a synthetic `Mismatch` (a "listed but raced" outcome) -- delegating every other key to
+/// the base `InMemoryBackend` untouched. Drives the drain phases' per-object fail-close path
+/// (`deleteListedPrefix`/`sweepNamespace`, `CasDecommission.cpp`/`CasOrphanManifestSweep.cpp`): a
+/// failure on one listed object must record a warning and let the rest of the sweep proceed, never
+/// abort the whole phase. Injects on the `remove` PRIMITIVE, not the legacy `deleteExact`, so it
+/// intercepts a caller on either surface.
 class FailingDeleteBackend : public InMemoryBackend
 {
 public:
@@ -54,13 +55,13 @@ public:
     /// Clears every injected failure -- the resume half of a fail-then-retry test (Task 4).
     void disarm() { throw_key.clear(); mismatch_key.clear(); }
 
-    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
         if (key == throw_key)
             throw std::runtime_error("injected transient delete failure for " + key);
         if (key == mismatch_key)
-            return DeleteOutcome{.kind = DeleteOutcome::Kind::TokenMismatch};
-        return InMemoryBackend::deleteExact(key, token);
+            return RawRemoval::Mismatch;
+        return InMemoryBackend::remove(key, expected_value, access);
     }
 
 private:
@@ -74,8 +75,6 @@ private:
 class CatalogChangesAfterFirstReadBackend : public InMemoryBackend
 {
 public:
-    using Backend::get;
-
     void armCatalogReplacement(
         const String & key, RefCatalog replacement_, size_t completed_reads_before_replacement = 0)
     {
@@ -87,9 +86,11 @@ public:
 
     bool fired() const { return replacement_fired; }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    /// Injects on the `read` PRIMITIVE rather than the legacy `get`: whichever caller reaches this
+    /// key -- through the legacy forwarder or through `CasOperation::read` -- funnels through here.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        auto got = InMemoryBackend::get(key, range);
+        auto got = InMemoryBackend::read(key, access);
         if (!armed || replacement_fired || key != catalog_key)
             return got;
         if (reads_to_skip > 0)
@@ -101,9 +102,8 @@ public:
             throw std::runtime_error("catalog replacement fixture: catalog is absent");
 
         replacement_fired = true;
-        const PutResult put = InMemoryBackend::putOverwrite(
-            key, encodeRefCatalog(replacement), got->token, {});
-        if (put.outcome != PutOutcome::Done)
+        const auto put = InMemoryBackend::write(key, encodeRefCatalog(replacement), got->value, access);
+        if (!put.has_value())
             throw std::runtime_error("catalog replacement fixture: rewrite conflicted");
         return got;
     }
@@ -146,24 +146,26 @@ std::vector<std::tuple<String, String, Token>> snapshotPrefixObjects(
 class SuccessorReclaimAfterFarewellBackend : public InMemoryBackend
 {
 public:
-    using Backend::get;
-    using Backend::putOverwrite;
-
     void armForSuccessorReclaim() { armed = true; }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    /// Injects on the `read` PRIMITIVE: the retirement tail's own reads of `mount_key`/`epoch_key`
+    /// (`CasDecommission.cpp`) go through `CasOperation::read`, not the legacy `get`.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        std::optional<GetResult> result = InMemoryBackend::get(key, range);
+        std::optional<Raw> result = InMemoryBackend::read(key, access);
         if (farewell_seen && !successor_injected && (key == mount_key || key == epoch_key))
             injectSuccessor();
         return result;
     }
 
-    PutResult putOverwrite(
-        const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
+    /// Injects on the `write` PRIMITIVE: `putOverwrite` is not one of the two verb-identity
+    /// exceptions (`putIfAbsent`/`casPut`), so both the legacy caller and `CasOperation::replace`
+    /// reach it here.
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
     {
-        const PutResult result = InMemoryBackend::putOverwrite(key, bytes, expected, meta);
-        if (armed && key == mount_key && result.outcome == PutOutcome::Done)
+        const auto result = InMemoryBackend::write(key, bytes, expected_value, access);
+        if (armed && result.has_value() && key == mount_key)
         {
             const MountLease mount = decodeMountLease(bytes);
             if (mount.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
@@ -229,19 +231,15 @@ private:
 class SuccessorReclaimAfterEpochDeleteBackend : public InMemoryBackend
 {
 public:
-    using Backend::get;
-    using Backend::putOverwrite;
-
     void armForSuccessorReclaim() { armed = true; }
 
-    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    /// Injects on the `remove` PRIMITIVE: `deleteSlotObject`'s epoch delete (`CasDecommission.cpp`)
+    /// goes through `CasOperation::remove`, not the legacy `deleteExact`.
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
-        const DeleteOutcome result = InMemoryBackend::deleteExact(key, token);
-        if (armed && !successor_injected && key == epoch_key
-            && classifyDeleteOutcome(result) == DeleteClass::Deleted)
-        {
+        const RawRemoval result = InMemoryBackend::remove(key, expected_value, access);
+        if (armed && !successor_injected && key == epoch_key && result == RawRemoval::Removed)
             injectSuccessor();
-        }
         return result;
     }
 
@@ -253,12 +251,15 @@ public:
     const String & successorEpochBytes() const { return successor_epoch_bytes; }
 
 private:
-    PutResult putOverwrite(
-        const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
+    /// Counts on the `write` PRIMITIVE: the owner tombstone write this test asserts is never
+    /// attempted (`CasDecommission.cpp`'s `op.replace`) reaches the store through here, not through
+    /// the legacy `putOverwrite`.
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
     {
         if (key == owner_key)
             ++owner_rewrite_attempts;
-        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
     void injectSuccessor()
@@ -304,33 +305,34 @@ private:
 class SuccessorOwnerRewriteBeforeTombstoneBackend : public InMemoryBackend
 {
 public:
-    using Backend::get;
-
     void armForSuccessorRewrite() { armed = true; }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    /// Injects on the `read` PRIMITIVE: the tombstone tail's owner read (`CasDecommission.cpp`)
+    /// goes through `CasOperation::read`, not the legacy `get`.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        std::optional<GetResult> result = InMemoryBackend::get(key, range);
+        std::optional<Raw> result = InMemoryBackend::read(key, access);
         if (armed && epoch_deleted && !successor_injected && key == owner_key && result)
         {
             successor_owner_bytes = encodeOwner(OwnerObject{
                 .server_uuid = decodeOwner(result->bytes).server_uuid,
                 .retired_at_ms = std::nullopt,
             });
-            const PutResult put = InMemoryBackend::putOverwrite(
-                owner_key, successor_owner_bytes, result->token, {});
-            if (put.outcome != PutOutcome::Done)
+            const auto put = InMemoryBackend::write(owner_key, successor_owner_bytes, result->value, access);
+            if (!put.has_value())
                 throw std::runtime_error("owner-successor fixture: owner rewrite conflicted");
-            successor_owner_token = put.token;
+            successor_owner_token = legacyMintWritten(owner_key, *put);
             successor_injected = true;
         }
         return result;
     }
 
-    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    /// Injects on the `remove` PRIMITIVE: `deleteSlotObject`'s epoch delete (`CasDecommission.cpp`)
+    /// goes through `CasOperation::remove`, not the legacy `deleteExact`.
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
-        const DeleteOutcome result = InMemoryBackend::deleteExact(key, token);
-        if (armed && key == epoch_key && classifyDeleteOutcome(result) == DeleteClass::Deleted)
+        const RawRemoval result = InMemoryBackend::remove(key, expected_value, access);
+        if (armed && key == epoch_key && result == RawRemoval::Removed)
             epoch_deleted = true;
         return result;
     }
@@ -358,14 +360,15 @@ private:
 class AmbiguousOwnerTombstoneBackend : public InMemoryBackend
 {
 public:
-    using Backend::putOverwrite;
-
     void armForAmbiguousTombstone() { armed = true; }
 
-    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
+    /// Injects on the `write` PRIMITIVE: the owner tombstone write (`CasDecommission.cpp`'s
+    /// `op.replace`) goes through `CasOperation::replace`, not the legacy `putOverwrite`.
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
     {
-        const PutResult result = InMemoryBackend::putOverwrite(key, bytes, expected, meta);
-        if (armed && !fired && key == owner_key && result.outcome == PutOutcome::Done)
+        const auto result = InMemoryBackend::write(key, bytes, expected_value, access);
+        if (armed && !fired && key == owner_key && result.has_value())
         {
             fired = true;
             throw std::runtime_error("ambiguous-tombstone fixture: response lost after the write landed");
@@ -392,10 +395,16 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
     Backend & backend = victim.backend();
     const Layout & layout = victim.layout();
 
+    /// A throwaway open-fence operation, for the two `CasRefCatalog` calls below only: this fixture
+    /// writes everything else directly against `backend` via the raw-write helpers, unrelated to any
+    /// mount fence.
+    CasRequests requests(victim.poolBackendPtr(), Fence::open());
+    CasOperation op = requests.admit();
+
     /// Final physical ids are pool-wide. The generic raw-write helper intentionally uses one shared
     /// transition sentinel, so this multi-namespace fixture admits a distinct deterministic test life
     /// before invoking it; the helper then resolves and preserves that existing catalog identity.
-    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
     const auto existing = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns.string() == ns.string(); });
     if (existing == catalog.catalog.entries.end())
@@ -405,7 +414,7 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
         entry.ns = ns;
         entry.state = NsState::Live;
         entry.incarnation = UInt128{next_test_life.fetch_add(1)};
-        CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
+        CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
     }
 
     uint64_t last_ref_sequence = 0;
@@ -1104,6 +1113,36 @@ TEST(CASDecommission, FencedSlotRetirementTailRetiresUncontendedSlot)
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
 
+/// Decommission builds its own always-admitted engine over an open fence rather than routing through
+/// any of `Pool`'s fenced planes: unlike the mount and GC planes, which only exist while their `Pool`
+/// does, this engine must serve requests spanning the WHOLE operation -- the pre-impersonation catalog
+/// cut, taken before any `Pool` exists, through the final owner tombstone, taken after `admin.reset()`
+/// destroys the `Pool`. A namespace-bearing victim exercises both a namespace drop's own request and
+/// the full retirement tail across that boundary in one run, on the same engine instance throughout.
+TEST(CASDecommission, RunsOnAnOpenFence)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = openVictim(backend);
+        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+    }
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_EQ(report.namespaces_removed, 1u);
+    EXPECT_TRUE(report.slot_removed)
+        << "the retirement tail's reads, deletes and the final owner tombstone all landed after "
+           "admin.reset() destroyed the Pool -- proof the engine does not depend on the Pool's own "
+           "fenced planes";
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
+    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
+}
+
 TEST(CASDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -1168,11 +1207,12 @@ TEST(CASDecommission, OwnerTombstoneAmbiguousSuccessResolvesToCommitted)
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
 
-/// Delegates every op to `inner`, except `deleteExact`: while `armed`, any key starting with
-/// `fail_prefix` throws an injected transient failure instead of deleting -- models a real backend
-/// transiently failing to delete under one whole prefix. `disarm()` clears the failure (the resume
-/// half of `FailedDrainKeepsSlotThenResumes`). Forwards every pure-virtual `Backend` member (the
-/// `CasBackend.h` list) to `inner` untouched.
+/// Delegates every op to `inner`, except `remove`: while `armed`, any key starting with `fail_prefix`
+/// throws an injected transient failure instead of deleting -- models a real backend transiently
+/// failing to delete under one whole prefix. `disarm()` clears the failure (the resume half of
+/// `FailedDrainKeepsSlotThenResumes`). Forwards every pure-virtual `Backend` member (the `CasBackend.h`
+/// list) to `inner` untouched. Injects on the `remove` PRIMITIVE, not the legacy `deleteExact`:
+/// `deleteListedPrefix`'s mountpoint drain (`CasDecommission.cpp`) goes through `CasOperation::remove`.
 class FailDeletesUnderPrefixBackend : public Backend
 {
 public:
@@ -1208,21 +1248,21 @@ public:
     {
         return inner->casPut(key, bytes, expected, meta);
     }
-    DeleteOutcome deleteExact(const String & key, const Token & token) override
-    {
-        if (armed && key.starts_with(fail_prefix))
-            throw Exception(ErrorCodes::S3_ERROR, "injected transient delete failure for {}", key);
-        return inner->deleteExact(key, token);
-    }
+    DeleteOutcome deleteExact(const String & key, const Token & token) override { return inner->deleteExact(key, token); }
     ListPage list(const String & prefix, const String & cursor, size_t limit) override { return inner->list(prefix, cursor, limit); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
-    /// The transport primitives forward to `inner`; the legacy overrides above are what this
-    /// double injects through. Declared because `Backend` declares them pure.
+    /// The transport primitives forward to `inner`, except `remove`, which is what this double
+    /// injects through. Declared because `Backend` declares them pure.
     std::optional<Raw> read(const String & key, TransportAccess & access) override { return inner->read(key, access); }
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
-    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        if (armed && key.starts_with(fail_prefix))
+            throw Exception(ErrorCodes::S3_ERROR, "injected transient delete failure for {}", key);
+        return inner->remove(key, expected_value, access);
+    }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {

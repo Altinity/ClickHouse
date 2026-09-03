@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
@@ -7,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <base/defines.h>
 #include <base/scope_guard.h>
 #include <algorithm>
 #include <chrono>
@@ -34,68 +36,76 @@ uint64_t nowMs()
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-/// Delete every object listed under `prefix` by its listed (or, absent a list-token backend, HEAD'd)
-/// token. This backs the staging and roots drain phases below: the victim's writers are fenced by the
-/// decommission claim (`Pool::openForDecommission`), so nothing should be racing these deletes, and a
-/// plain exact-token delete of every listed object is race-free.
+std::string_view removalName(Removal r)
+{
+    switch (r)
+    {
+        case Removal::Removed:  return "removed";
+        case Removal::Gone:     return "gone";
+        case Removal::Mismatch: return "mismatch";
+    }
+    UNREACHABLE();
+}
+
+/// Delete every object listed under `prefix` by its listed (or, absent a list-incarnation backend,
+/// HEAD'd) incarnation. This backs the staging and roots drain phases below: the victim's writers are
+/// fenced by the decommission claim (`Pool::openForDecommission`), so nothing should be racing these
+/// deletes, and a plain exact-incarnation delete of every listed object is race-free.
 ///
-/// A per-object failure — a backend exception, a `TokenMismatch` or `NotFound` outcome, or an object
+/// A per-object failure — a backend exception, a `Mismatch` or `Gone` outcome, or an object
 /// disappearing between `LIST` and `HEAD` — is recorded as a warning and does not prevent the remaining
 /// objects from being attempted. The caller keeps the pool slot whenever warnings are present, so the
 /// terminated slot remains available as a resume anchor instead of being deleted after an unconfirmed
-/// drain. Returns only the objects whose exact-token delete was reported as `Deleted`.
-uint64_t deleteListedPrefix(Backend & backend, const String & prefix, std::vector<String> & warnings)
+/// drain. Returns only the objects whose exact-incarnation delete was reported as `Removed`.
+uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vector<String> & warnings)
 {
     uint64_t deleted = 0;
-    forEachListedKey(backend, prefix, [&](const ListedKey & listed)
+    op.forEachListedKey(prefix, [&](const KeyEntry & listed)
     {
         try
         {
-            Token token;
-            if (listed.token)
-                token = *listed.token;
-            else
+            std::optional<Incarnation> incarnation = listed.incarnation;
+            if (!incarnation)
             {
-                const HeadResult head = backend.head(listed.key);
-                if (!head.exists)
+                const std::optional<Meta> head = op.head(listed.key, Retry::standard());
+                if (!head)
                 {
                     warnings.push_back("decommission drain: " + listed.key + " vanished before delete");
-                    return;
+                    return true;
                 }
-                token = head.token;
+                incarnation = head->incarnation;
             }
 
-            const DeleteOutcome outcome = backend.deleteExact(listed.key, token);
-            const DeleteClass outcome_class = classifyDeleteOutcome(outcome);
-            if (outcome_class == DeleteClass::Deleted)
+            const Removal outcome = op.remove(listed.key, *incarnation, Retry::standard());
+            if (outcome == Removal::Removed)
                 ++deleted;
             else
                 warnings.push_back("decommission drain: " + listed.key + " delete outcome "
-                                    + String(deleteClassName(outcome_class)));
+                                    + String(removalName(outcome)));
         }
         catch (...)
         {
             warnings.push_back("decommission drain: " + listed.key + " delete failed: "
                                 + getCurrentExceptionMessage(/*with_stacktrace=*/false));
         }
-    });
+        return true;
+    }, Retry::standard());
     return deleted;
 }
 
-/// Delete one slot control object by a token captured at the protocol-defined fence point. Slot
-/// retirement is fail-closed: unlike the debris drains above, any non-`Deleted` outcome or exception
+/// Delete one slot control object by an incarnation captured at the protocol-defined fence point. Slot
+/// retirement is fail-closed: unlike the debris drains above, any non-`Removed` outcome or exception
 /// stops the tail before it can touch the next control object.
-bool deleteSlotObject(Backend & backend, const String & key, const Token & token, std::vector<String> & warnings)
+bool deleteSlotObject(CasOperation & op, const String & key, const Incarnation & incarnation, std::vector<String> & warnings)
 {
     try
     {
-        const DeleteOutcome outcome = backend.deleteExact(key, token);
-        const DeleteClass outcome_class = classifyDeleteOutcome(outcome);
-        if (outcome_class == DeleteClass::Deleted)
+        const Removal outcome = op.remove(key, incarnation, Retry::standard());
+        if (outcome == Removal::Removed)
             return true;
 
         warnings.push_back("slot delete failed: " + key + ": delete outcome "
-                           + String(deleteClassName(outcome_class)));
+                           + String(removalName(outcome)));
     }
     catch (...)
     {
@@ -122,15 +132,28 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             request_gc_round();
     });
 
+    /// Decommission is administrative and non-hot-path: it has no mount-lease fence of its own -- the
+    /// exact-incarnation compare on every write is the safety mechanism -- so it opens its own
+    /// always-admitted request engine rather than one of `Pool`'s fenced planes. The pre-impersonation
+    /// cut below runs against the raw backend passed in, because `Pool::openForDecommission` has not
+    /// yet wrapped it for instrumentation and no `Pool` exists yet to route through.
+    CasRequests preflight_requests(backend, Fence::open());
+    CasOperation preflight_op = preflight_requests.admit();
+
     /// Validate one required immutable ownership cut before impersonating the victim. The admin open
     /// performs its own fresh catalog observation for mount safety, but namespace selection below
     /// must reuse this exact pre-mutation decision rather than read a later authority set.
     const Layout catalog_layout(config.pool_prefix);
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, catalog_layout);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(preflight_op, catalog_layout);
     catalog_cut.life_index.throwIfAmbiguous("CAS decommission");
 
     config.event_sink = sink;
     PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
+
+    /// A second engine over the pool's own (now instrumented) backend: `CasRequests` keeps its own
+    /// shared_ptr to it, so `op` stays usable after `admin.reset()` retires the `Pool` below.
+    CasRequests requests(admin->poolBackendPtr(), Fence::open());
+    CasOperation op = requests.admit();
 
     EventEmitter{*admin}.emit([&](CasEvent & e)
     {
@@ -164,7 +187,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         /// Refuse a same-name lifecycle move that landed after the immutable selection cut. The
         /// exact-life overloads below also pin recovery to `life`, closing the race after this check:
         /// a later replacement can never redirect a removal to its new incarnation.
-        const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(admin->backend(), admin->layout());
+        const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(op, admin->layout());
         const auto current_entry = std::find_if(
             current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns.string() == ns_str; });
@@ -176,7 +199,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
         if (selected_entry.state == NsState::Removing)
         {
-            if (!admin->backend().head(admin->layout().refCkptKey(life)).exists)
+            if (!op.head(admin->layout().refCkptKey(life), Retry::standard()).has_value())
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "ca-decommission: namespace '{}' is Removing but its exact checkpoint is absent; "
                     "the catalog row remains owned and the victim slot cannot be retired",
@@ -219,11 +242,12 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     {
         const String debris_prefix = admin->layout().casManifestsServerPrefix(victim_srid);
         std::set<std::tuple<String, uint64_t, uint64_t>> groups;   /// (namespace, writer epoch, build sequence)
-        forEachListedKey(admin->backend(), debris_prefix, [&](const ListedKey & listed)
+        op.forEachListedKey(debris_prefix, [&](const KeyEntry & listed)
         {
             if (const auto parsed = admin->layout().parseManifestKey(listed.key))
                 groups.emplace(parsed->root_namespace.string(), parsed->ref.writer_epoch, parsed->ref.build_sequence);
-        });
+            return true;
+        }, Retry::standard());
         for (const auto & [ns_str, writer_epoch, build_sequence] : groups)
             report.manifest_debris_removed += sweepNamespace(
                 *admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, &report.warnings);
@@ -233,23 +257,23 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     /// an `IObjectStorage`, while this command intentionally works at the `Backend` layer, so the same
     /// prefix is listed and deleted directly. The claim fences the victim's writers during this sweep.
     report.staging_objects_removed += deleteListedPrefix(
-        admin->backend(), admin->poolConfig().pool_prefix + "/staging/" + victim_srid + "/", report.warnings);
+        op, admin->poolConfig().pool_prefix + "/staging/" + victim_srid + "/", report.warnings);
 
     /// Drain the victim's mountpoint objects. These are loose, non-content-addressed files under
     /// `Layout::serverRootDataPrefix`; they have no writer epoch of their own, so the claim is what
     /// prevents a returning victim from racing this deletion.
     report.mountpoint_objects_removed += deleteListedPrefix(
-        admin->backend(), admin->layout().serverRootDataPrefix(victim_srid), report.warnings);
+        op, admin->layout().serverRootDataPrefix(victim_srid), report.warnings);
 
     /// The catalog, not physical debris, owns the slot-retirement decision. A terminal append only
     /// moves a row to `Removing`; GC must fold/prune/delete it before the member's ownership anchor can
-    /// disappear. Capture one exact whole-catalog cut after every drain, then revalidate its token and
-    /// canonical value immediately before entering the retirement tail. The administrative claim fences
-    /// the victim writer between those observations.
+    /// disappear. Capture one exact whole-catalog cut after every drain, then revalidate its incarnation
+    /// and canonical value immediately before entering the retirement tail. The administrative claim
+    /// fences the victim writer between those observations.
     std::optional<CasRefCatalog::Snapshot> retirement_catalog_cut;
     if (report.warnings.empty())
     {
-        retirement_catalog_cut = CasRefCatalog::read(admin->backend(), admin->layout());
+        retirement_catalog_cut = CasRefCatalog::read(op, admin->layout());
         const uint64_t victim_owned_count = std::count_if(
             retirement_catalog_cut->catalog.entries.begin(), retirement_catalog_cut->catalog.entries.end(),
             [&](const CatalogEntry & entry)
@@ -264,17 +288,15 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                   "cleanup — re-run this command afterwards to retire the slot");
     }
 
-    /// Retire the slot strictly last and only after a clean drain. Copy the layout and shared backend
-    /// before `admin.reset()`: graceful close destroys the `Pool`, while the backend must remain alive to
-    /// retire the slot objects afterwards.
+    /// Retire the slot strictly last and only after a clean drain. Copy the layout before
+    /// `admin.reset()`: graceful close destroys the `Pool`, while `op` (holding its own shared_ptr to
+    /// the backend) remains usable to retire the slot objects afterwards.
     const Layout layout = admin->layout();
-    const BackendPtr pool_backend = admin->poolBackendPtr();
     if (report.warnings.empty())
     {
-        const CasRefCatalog::Snapshot fresh_retirement_catalog
-            = CasRefCatalog::read(admin->backend(), admin->layout());
+        const CasRefCatalog::Snapshot fresh_retirement_catalog = CasRefCatalog::read(op, admin->layout());
         if (!retirement_catalog_cut
-            || fresh_retirement_catalog.token != retirement_catalog_cut->token
+            || fresh_retirement_catalog.incarnation != retirement_catalog_cut->incarnation
             || fresh_retirement_catalog.catalog != retirement_catalog_cut->catalog)
         {
             report.warnings.push_back(
@@ -287,13 +309,13 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         const String epoch_key = layout.epochKey(victim_srid);
         const String owner_key = layout.ownerKey(victim_srid);
 
-        /// Capture both the epoch value and its exact token while the decommission claim still fences
-        /// the victim. A successor can only bump this object after the farewell below releases the
-        /// claim, so this token is the epoch-side successor fence for the retirement tail.
-        std::optional<GetResult> claimed_epoch;
+        /// Capture both the epoch value and its exact incarnation while the decommission claim still
+        /// fences the victim. A successor can only bump this object after the farewell below releases
+        /// the claim, so this incarnation is the epoch-side successor fence for the retirement tail.
+        std::optional<Object> claimed_epoch;
         try
         {
-            claimed_epoch = pool_backend->get(epoch_key);
+            claimed_epoch = op.read(epoch_key, Retry::standard());
             if (!claimed_epoch)
                 report.warnings.push_back("slot capture failed: " + epoch_key + " is absent under the admin claim");
         }
@@ -308,14 +330,14 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         /// are removed and its owner anchor is tombstoned.
         admin.reset();
 
-        /// Read the farewell immediately after `finishTeardown` wrote it. Its exact token is the
-        /// mount-side fence: deleting by this token can remove only THIS decommission's farewell, not
-        /// a successor reclaim. Validate the body against the epoch value captured under the claim so
-        /// a successor that completed before this GET is also recognized and left untouched.
-        std::optional<GetResult> farewell_mount;
+        /// Read the farewell immediately after `finishTeardown` wrote it. Its exact incarnation is the
+        /// mount-side fence: deleting by this incarnation can remove only THIS decommission's farewell,
+        /// not a successor reclaim. Validate the body against the epoch value captured under the claim
+        /// so a successor that completed before this read is also recognized and left untouched.
+        std::optional<Object> farewell_mount;
         try
         {
-            farewell_mount = pool_backend->get(mount_key);
+            farewell_mount = op.read(mount_key, Retry::standard());
             if (!farewell_mount)
                 report.warnings.push_back("slot capture failed: " + mount_key + " farewell is absent");
         }
@@ -352,16 +374,16 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         }
 
         /// Mount first: if a successor reclaimed it after the farewell capture, the stale farewell
-        /// token yields `TokenMismatch` and the tail stops before touching epoch or owner. Epoch second:
-        /// its under-claim token similarly detects a successor allocation. Before touching owner, re-read
-        /// both mutable objects: a same-UUID successor can recreate them after both deletes without
-        /// rewriting the owner identity anchor. Mere presence proves that the slot is live again. Every
-        /// delete must be explicitly confirmed as `Deleted`, and the final owner tombstone rewrite must
-        /// succeed against the exact token read immediately before it.
+        /// incarnation yields `Mismatch` and the tail stops before touching epoch or owner. Epoch
+        /// second: its under-claim incarnation similarly detects a successor allocation. Before
+        /// touching owner, re-read both mutable objects: a same-UUID successor can recreate them after
+        /// both deletes without rewriting the owner identity anchor. Mere presence proves that the slot
+        /// is live again. Every delete must be explicitly confirmed as `Removed`, and the final owner
+        /// tombstone rewrite must succeed against the exact incarnation read immediately before it.
         ///
         /// ACCEPTED RESIDUAL WINDOW (final review, not closed by this recheck): a same-UUID successor
         /// can still recreate epoch/mount in the narrow gap strictly AFTER this liveness recheck but
-        /// BEFORE the owner CAS below reads its own token -- the successor's owner anchor (same
+        /// BEFORE the owner CAS below reads its own incarnation -- the successor's owner anchor (same
         /// server_uuid, not yet retired) then gets tombstoned by this decommission run. The successor's
         /// live process is not deleted (only its owner anchor is marked retired), but a LATER restart of
         /// that same identity would refuse to reclaim it (claimOwnerOrThrow's tombstone guard). This is
@@ -369,15 +391,15 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         /// (finding #9) intentionally stopped short of making concurrent decommission-vs-recreate
         /// airtight to the microsecond, since that was explicitly not the priority for this fix.
         report.slot_removed = false;
-        if (captures_match && deleteSlotObject(*pool_backend, mount_key, farewell_mount->token, report.warnings)
-            && deleteSlotObject(*pool_backend, epoch_key, claimed_epoch->token, report.warnings))
+        if (captures_match && deleteSlotObject(op, mount_key, farewell_mount->incarnation, report.warnings)
+            && deleteSlotObject(op, epoch_key, claimed_epoch->incarnation, report.warnings))
         {
-            std::optional<GetResult> current_mount;
-            std::optional<GetResult> current_epoch;
+            std::optional<Object> current_mount;
+            std::optional<Object> current_epoch;
             bool liveness_recheck_succeeded = true;
             try
             {
-                current_mount = pool_backend->get(mount_key);
+                current_mount = op.read(mount_key, Retry::standard());
             }
             catch (...)
             {
@@ -387,7 +409,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             }
             try
             {
-                current_epoch = pool_backend->get(epoch_key);
+                current_epoch = op.read(epoch_key, Retry::standard());
             }
             catch (...)
             {
@@ -405,25 +427,21 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             {
                 try
                 {
-                    if (const auto owner = pool_backend->get(owner_key))
+                    if (const auto owner = op.read(owner_key, Retry::standard()))
                     {
                         OwnerObject tombstoned = decodeOwner(owner->bytes);
                         tombstoned.retired_at_ms = nowMs();
-                        /// Controlled, not a bare putOverwrite: a transient transport error here (or
-                        /// one whose response was simply lost) must not be reported as a hard failure
-                        /// when the write actually landed. A standalone controller (decommission is an
-                        /// administrative, non-hot-path operation; no mount-lease fence applies to it
-                        /// -- the exact-token CAS itself is the safety mechanism, same as the mount/
-                        /// epoch deletes above) resolves an ambiguous attempt with one GET: unchanged
-                        /// token means the write never applied (legitimately retryable within budget);
-                        /// matching bytes means this exact tombstone already landed (Committed, not a
-                        /// failure); anything else is a genuine successor reclaim (Conflict).
-                        CasRequestController controller(pool_backend, CasRequestBudget{});
-                        const CasOverwriteResult result = controller.putOverwriteControlled(
-                            owner_key, encodeOwner(tombstoned), owner->token, [] { return true; });
-                        if (result.outcome == CasOverwriteOutcome::Committed)
+                        /// `op.replace` resolves an ambiguous attempt with a resolve read on its own:
+                        /// a transient transport error here (or one whose response was simply lost)
+                        /// must not be reported as a hard failure when the write actually landed.
+                        /// Unchanged incarnation means the write never applied (legitimately retryable
+                        /// within budget); matching bytes means this exact tombstone already landed
+                        /// (`Committed`, not a failure); anything else is a genuine successor reclaim
+                        /// (`Conflict`).
+                        WriteResult result = op.replace(owner_key, encodeOwner(tombstoned), owner->incarnation, Retry::standard());
+                        if (std::holds_alternative<Committed>(result))
                             report.slot_removed = true;
-                        else if (result.outcome == CasOverwriteOutcome::Conflict)
+                        else if (std::holds_alternative<Conflict>(result))
                             report.warnings.push_back(
                                 "slot tombstone failed: " + owner_key
                                 + ": successor reclaimed the owner anchor before this decommission's tombstone write");
@@ -431,7 +449,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                             report.warnings.push_back(
                                 "slot tombstone failed: " + owner_key
                                 + ": tombstone write outcome could not be resolved (retry budget exhausted "
-                                  "or the resolve GET itself failed) -- rerun the command to retry");
+                                  "or the resolve read itself failed) -- rerun the command to retry");
                     }
                     else
                         report.warnings.push_back(
