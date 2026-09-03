@@ -86,9 +86,11 @@ public:
         if (!replaced)
         {
             replaced = true;
-            const auto current = InMemoryBackend::get(key);
+            /// The qualified primitive, exactly as the sibling concurrent-actor doubles in this file: a
+            /// simulated concurrent write must not be counted as the janitor's own.
+            const auto current = InMemoryBackend::read(key, access);
             if (current)
-                (void)InMemoryBackend::casPut(key, "winner", current->token);
+                (void)InMemoryBackend::write(key, "winner", current->value, access);
         }
         return CountingBackend::remove(key, expected_value, access);
     }
@@ -229,9 +231,23 @@ public:
     uint64_t write_attempts = 0;
 };
 
-void seedCatalog(CountingBackend & backend, const Layout & layout, RefCatalog catalog = {})
+/// A one-shot `create`, asserting it committed (mirrors the retired `backend->putIfAbsent(key, bytes)`).
+void createObj(Backend & backend, const String & key, const String & bytes)
 {
-    ASSERT_EQ(backend.putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(catalog)).outcome, PutOutcome::Done);
+    OperationForTest op(backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
+}
+
+/// An exact read (mirrors the retired `backend->get(key)`).
+std::optional<Object> readObj(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).read(key, Retry::standard());
+}
+
+void seedCatalog(Backend & backend, const Layout & layout, RefCatalog catalog = {})
+{
+    createObj(backend, layout.refCatalogKey(), encodeRefCatalog(catalog));
 }
 
 NamespaceLifeId life(const char * name, uint64_t id)
@@ -251,8 +267,8 @@ TEST(CASNamespaceJanitor, DeletesDeadFilesAndCheckpointFromOnePostListCatalogCut
     const auto dead = life("dead", 41);
     const String file = layout.namespaceFilesPrefix(dead) + "part/data.bin";
     const String ckpt = layout.refCkptKey(dead);
-    ASSERT_EQ(backend->putIfAbsent(file, "file-bytes").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(ckpt, "ckpt-bytes").outcome, PutOutcome::Done);
+    createObj(*backend, file, "file-bytes");
+    createObj(*backend, ckpt, "ckpt-bytes");
     backend->resetCounts();
 
     NamespaceJanitor janitor(requests, layout, 100);
@@ -261,8 +277,8 @@ TEST(CASNamespaceJanitor, DeletesDeadFilesAndCheckpointFromOnePostListCatalogCut
     EXPECT_EQ(result.pages, 1u);
     EXPECT_EQ(result.keys, 2u);
     EXPECT_EQ(result.deleted, 2u);
-    EXPECT_FALSE(backend->get(file));
-    EXPECT_FALSE(backend->get(ckpt));
+    EXPECT_FALSE(readObj(*backend, file).has_value());
+    EXPECT_FALSE(readObj(*backend, ckpt).has_value());
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u);
     EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
     EXPECT_EQ(readState(requests, layout).state, GcMaintenanceState{});
@@ -282,8 +298,8 @@ TEST(CASNamespaceJanitor, RetainsEveryCurrentLifecycleAndSuppressesAmbiguousCut)
     catalog.entries = {creating, live, removing};
     seedCatalog(*backend, layout, catalog);
     for (const auto & entry : catalog.entries)
-        ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(
-            NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation)), "keep").outcome, PutOutcome::Done);
+        createObj(*backend, layout.refCkptKey(
+            NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation)), "keep");
 
     NamespaceJanitor janitor(requests, layout, 100);
     const auto result = janitor.runOnePage(false, [] { return true; });
@@ -308,8 +324,8 @@ TEST(CASNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
         = NamespaceLifeId::fromCatalogEntry(creating.ns, creating.incarnation);
     const String ckpt = layout.refCkptKey(creating_life);
     const String file = layout.namespaceFilesPrefix(creating_life) + "data";
-    ASSERT_EQ(backend->putIfAbsent(ckpt, "checkpoint").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(file, "file").outcome, PutOutcome::Done);
+    createObj(*backend, ckpt, "checkpoint");
+    createObj(*backend, file, "file");
     backend->resetCounts();
 
     const NamespaceJanitorResult result
@@ -318,8 +334,8 @@ TEST(CASNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
-    EXPECT_TRUE(backend->get(ckpt));
-    EXPECT_TRUE(backend->get(file));
+    EXPECT_TRUE(readObj(*backend, ckpt).has_value());
+    EXPECT_TRUE(readObj(*backend, file).has_value());
 }
 
 TEST(CASNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLifecycle)
@@ -335,7 +351,7 @@ TEST(CASNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLif
     seedCatalog(*backend, layout, RefCatalog{.entries = {creating}});
     const String ckpt = layout.refCkptKey(
         NamespaceLifeId::fromCatalogEntry(creating.ns, creating.incarnation));
-    ASSERT_EQ(backend->putIfAbsent(ckpt, "cancelled-checkpoint").outcome, PutOutcome::Done);
+    createObj(*backend, ckpt, "cancelled-checkpoint");
 
     auto cancel_op = requests.admit();
     ASSERT_EQ(CasRefCatalog::cancelStalledCreating(
@@ -347,7 +363,7 @@ TEST(CASNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLif
     const NamespaceJanitorResult result
         = NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 1u);
-    EXPECT_FALSE(backend->get(ckpt));
+    EXPECT_FALSE(readObj(*backend, ckpt).has_value());
 }
 
 TEST(CASNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
@@ -358,8 +374,8 @@ TEST(CASNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
     seedCatalog(*backend, layout);
     const String first = layout.refCkptKey(life("dead-a", 61));
     const String second = layout.refCkptKey(life("dead-b", 62));
-    ASSERT_EQ(backend->putIfAbsent(first, "first").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(second, "second").outcome, PutOutcome::Done);
+    createObj(*backend, first, "first");
+    createObj(*backend, second, "second");
 
     /// The seeding above (the catalog + the two checkpoints) lands through the same write primitive
     /// CountingBackend counts, so reset before measuring what the suppressed page itself does.
@@ -378,8 +394,8 @@ TEST(CASNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
         [&] { (void)janitor.runOnePage(false, [] { return false; }); });
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
         << "fence loss must not mint progress past a page whose deletion was not authorized";
-    EXPECT_TRUE(backend->get(first));
-    EXPECT_TRUE(backend->get(second));
+    EXPECT_TRUE(readObj(*backend, first).has_value());
+    EXPECT_TRUE(readObj(*backend, second).has_value());
     EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
@@ -395,8 +411,8 @@ TEST(CASNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
         = NamespaceLifeId::fromCatalogEntry(current.ns, current.incarnation);
     const String ckpt = layout.refCkptKey(current_life);
     const String file = layout.namespaceFilesPrefix(current_life) + "data";
-    ASSERT_EQ(backend->putIfAbsent(ckpt, "checkpoint").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(file, "file").outcome, PutOutcome::Done);
+    createObj(*backend, ckpt, "checkpoint");
+    createObj(*backend, file, "file");
 
     /// A liveness sample false from the start is refused at the maintenance read, before the page ever
     /// gets to examine an object -- retained-only or not; the page ends by exception.
@@ -404,8 +420,8 @@ TEST(CASNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
         [&] { (void)NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return false; }); });
 
     EXPECT_EQ(backend->deleteTotal(), 0u);
-    EXPECT_TRUE(backend->get(ckpt));
-    EXPECT_TRUE(backend->get(file));
+    EXPECT_TRUE(readObj(*backend, ckpt).has_value());
+    EXPECT_TRUE(readObj(*backend, file).has_value());
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
         << "a tenure that observes fence loss cannot publish progress even when every object was retained";
 }
@@ -417,13 +433,13 @@ TEST(CASNamespaceJanitor, FenceLossAfterLastDeleteRetainsCursorWithoutRollingBac
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead-after-delete", 64));
-    ASSERT_EQ(backend->putIfAbsent(dead, "dead").outcome, PutOutcome::Done);
+    createObj(*backend, dead, "dead");
 
     const NamespaceJanitorResult result = NamespaceJanitor(requests, layout, 1).runOnePage(
         false, [&] { return !backend->delete_done; });
 
     EXPECT_EQ(result.deleted, 1u);
-    EXPECT_FALSE(backend->get(dead))
+    EXPECT_FALSE(readObj(*backend, dead).has_value())
         << "the exact delete completed under the fence and is never rolled back";
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
         << "losing the fence after the delete keeps this page selected for an idempotent retry";
@@ -436,8 +452,8 @@ TEST(CASNamespaceJanitor, CursorResumesThenResetsAtEnd)
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const auto dead = life("dead", 71);
-    ASSERT_EQ(backend->putIfAbsent(layout.namespaceFilesPrefix(dead) + "a", "a").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(layout.namespaceFilesPrefix(dead) + "b", "b").outcome, PutOutcome::Done);
+    createObj(*backend, layout.namespaceFilesPrefix(dead) + "a", "a");
+    createObj(*backend, layout.namespaceFilesPrefix(dead) + "b", "b");
 
     NamespaceJanitor first_process(requests, layout, 1);
     EXPECT_EQ(first_process.runOnePage(false, [] { return true; }).deleted, 1u);
@@ -460,17 +476,17 @@ TEST(CASNamespaceJanitor, TakesOneCatalogCutAfterListingAndContinuesPastMalforme
     const String valid = layout.namespaceFilesPrefix(dead) + "data";
     const String malformed = layout.namespaceStreamRootPrefix() + "not-a-life/_log/1-1.zst";
     const String malformed_state = layout.namespaceStateRootPrefix() + "not-a-life/_ckpt";
-    ASSERT_EQ(backend->putIfAbsent(valid, "v").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(malformed, "bad").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(malformed_state, "bad-state").outcome, PutOutcome::Done);
+    createObj(*backend, valid, "v");
+    createObj(*backend, malformed, "bad");
+    createObj(*backend, malformed_state, "bad-state");
     backend->resetCounts();
     backend->events.clear();
 
     const auto result = NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_FALSE(result.anomalies.empty());
-    EXPECT_TRUE(backend->get(malformed));
-    EXPECT_TRUE(backend->get(malformed_state));
+    EXPECT_TRUE(readObj(*backend, malformed).has_value());
+    EXPECT_TRUE(readObj(*backend, malformed_state).has_value());
     ASSERT_EQ(backend->events.size(), 2u);
     EXPECT_EQ(backend->events[0], "list");
     EXPECT_EQ(backend->events[1], "catalog");
@@ -485,16 +501,16 @@ TEST(CASNamespaceJanitor, MalformedKeyIsFinalAndAdvancesCursor)
     seedCatalog(*backend, layout);
     const String first = layout.namespaceStreamRootPrefix() + "bad-a/_log/1-1.zst";
     const String second = layout.namespaceStreamRootPrefix() + "bad-b/_log/1-1.zst";
-    ASSERT_EQ(backend->putIfAbsent(first, "first").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(second, "second").outcome, PutOutcome::Done);
+    createObj(*backend, first, "first");
+    createObj(*backend, second, "second");
 
     const NamespaceJanitorResult result
         = NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return true; });
 
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_FALSE(result.anomalies.empty());
-    EXPECT_TRUE(backend->get(first));
-    EXPECT_TRUE(backend->get(second));
+    EXPECT_TRUE(readObj(*backend, first).has_value());
+    EXPECT_TRUE(readObj(*backend, second).has_value());
     const GcMaintenanceReadResult progress = readState(requests, layout);
     ASSERT_EQ(progress.status, GcMaintenanceReadStatus::Valid);
     ASSERT_TRUE(progress.state);
@@ -514,13 +530,13 @@ TEST(CASNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
     seedCatalog(*backend, layout, catalog);
     const String dead_a = layout.refCkptKey(life("dead-a", 92));
     const String dead_b = layout.refCkptKey(life("dead-b", 93));
-    ASSERT_EQ(backend->putIfAbsent(dead_a, "a").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(dead_b, "b").outcome, PutOutcome::Done);
+    createObj(*backend, dead_a, "a");
+    createObj(*backend, dead_b, "b");
     const auto result = NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
-    EXPECT_TRUE(backend->get(dead_a));
-    EXPECT_TRUE(backend->get(dead_b));
+    EXPECT_TRUE(readObj(*backend, dead_a).has_value());
+    EXPECT_TRUE(readObj(*backend, dead_b).has_value());
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
         << "an ambiguous catalog cut leaves the selected page undecided for an authoritative retry";
 }
@@ -532,15 +548,15 @@ TEST(CASNamespaceJanitor, CorruptProgressResetsWithoutDeletingAndFilesOnlyOmitte
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.namespaceFilesPrefix(life("dead", 101)) + "only-residue";
-    ASSERT_EQ(backend->putIfAbsent(dead, "bytes").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(layout.gcMaintenanceStateKey(), "corrupt").outcome, PutOutcome::Done);
+    createObj(*backend, dead, "bytes");
+    createObj(*backend, layout.gcMaintenanceStateKey(), "corrupt");
     EXPECT_EQ(NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }).deleted, 0u);
-    EXPECT_TRUE(backend->get(dead));
+    EXPECT_TRUE(readObj(*backend, dead).has_value());
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Valid);
     EXPECT_EQ(NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }).deleted, 0u);
-    EXPECT_TRUE(backend->get(dead));
+    EXPECT_TRUE(readObj(*backend, dead).has_value());
     EXPECT_EQ(NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }).deleted, 1u);
-    EXPECT_FALSE(backend->get(dead));
+    EXPECT_FALSE(readObj(*backend, dead).has_value());
 }
 
 TEST(CASNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
@@ -551,13 +567,13 @@ TEST(CASNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead-a", 111));
     const String later = layout.refCkptKey(life("dead-b", 112));
-    ASSERT_EQ(backend->putIfAbsent(dead, "old").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(later, "later").outcome, PutOutcome::Done);
+    createObj(*backend, dead, "old");
+    createObj(*backend, later, "later");
     const auto result = NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 0u);
-    ASSERT_TRUE(backend->get(dead));
-    EXPECT_EQ(backend->get(dead)->bytes, "winner");
-    EXPECT_TRUE(backend->get(later));
+    ASSERT_TRUE(readObj(*backend, dead).has_value());
+    EXPECT_EQ(readObj(*backend, dead)->bytes, "winner");
+    EXPECT_TRUE(readObj(*backend, later).has_value());
     const GcMaintenanceReadResult progress = readState(requests, layout);
     ASSERT_EQ(progress.status, GcMaintenanceReadStatus::Valid);
     ASSERT_TRUE(progress.state);
@@ -576,9 +592,9 @@ TEST(CASNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacem
     const String live_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(current.ns, current.incarnation));
     const String dead_key = layout.refCkptKey(life("dead", 162));
     const String raced_key = layout.namespaceFilesPrefix(life("raced", 163)) + "data";
-    ASSERT_EQ(backend->putIfAbsent(live_key, "live").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(dead_key, "dead").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(raced_key, "old").outcome, PutOutcome::Done);
+    createObj(*backend, live_key, "live");
+    createObj(*backend, dead_key, "dead");
+    createObj(*backend, raced_key, "old");
     backend->replace_on_head = raced_key;
     backend->resetCounts();
 
@@ -586,10 +602,10 @@ TEST(CASNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacem
 
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_TRUE(result.anomalies.empty());
-    EXPECT_TRUE(backend->get(live_key));
-    EXPECT_FALSE(backend->get(dead_key));
-    ASSERT_TRUE(backend->get(raced_key));
-    EXPECT_EQ(backend->get(raced_key)->bytes, "winner");
+    EXPECT_TRUE(readObj(*backend, live_key).has_value());
+    EXPECT_FALSE(readObj(*backend, dead_key).has_value());
+    ASSERT_TRUE(readObj(*backend, raced_key).has_value());
+    EXPECT_EQ(readObj(*backend, raced_key)->bytes, "winner");
     EXPECT_EQ(backend->headCount(live_key), 0u);
     EXPECT_EQ(backend->headCount(dead_key), 1u);
     EXPECT_EQ(backend->headCount(raced_key), 1u);
@@ -604,7 +620,7 @@ TEST(CASNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead_key = layout.refCkptKey(life("dead", 164));
-    ASSERT_EQ(backend->putIfAbsent(dead_key, "dead").outcome, PutOutcome::Done);
+    createObj(*backend, dead_key, "dead");
     backend->resetCounts();
 
     const auto result = NamespaceJanitor(requests, layout, 100).runOnePage(
@@ -613,7 +629,7 @@ TEST(CASNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_EQ(backend->headCount(dead_key), 1u);
     EXPECT_EQ(backend->deleteCount(dead_key), 0u);
-    EXPECT_TRUE(backend->get(dead_key));
+    EXPECT_TRUE(readObj(*backend, dead_key).has_value());
 }
 
 TEST(CASNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet)
@@ -625,15 +641,15 @@ TEST(CASNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet
     seedCatalog(*backend, layout);
     const String first = layout.refCkptKey(created);
     const String second = layout.namespaceFilesPrefix(created) + "data";
-    ASSERT_EQ(backend->putIfAbsent(first, "ckpt").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(second, "file").outcome, PutOutcome::Done);
+    createObj(*backend, first, "ckpt");
+    createObj(*backend, second, "file");
     backend->resetCounts();
     const auto result = NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
-    EXPECT_TRUE(backend->get(first));
-    EXPECT_TRUE(backend->get(second));
+    EXPECT_TRUE(readObj(*backend, first).has_value());
+    EXPECT_TRUE(readObj(*backend, second).has_value());
 }
 
 TEST(CASNamespaceJanitor, BackendRejectedCursorResetsExactlyAndDeletesNothing)
@@ -643,12 +659,12 @@ TEST(CASNamespaceJanitor, BackendRejectedCursorResetsExactlyAndDeletesNothing)
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead", 131));
-    ASSERT_EQ(backend->putIfAbsent(dead, "bytes").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend->putIfAbsent(layout.gcMaintenanceStateKey(),
-        encodeGcMaintenanceState({.janitor_cursor = "rejected"})).outcome, PutOutcome::Done);
+    createObj(*backend, dead, "bytes");
+    createObj(*backend, layout.gcMaintenanceStateKey(),
+        encodeGcMaintenanceState({.janitor_cursor = "rejected"}));
     EXPECT_THROW(NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; }), std::runtime_error);
     EXPECT_EQ(backend->deleteTotal(), 0u);
-    EXPECT_TRUE(backend->get(dead));
+    EXPECT_TRUE(readObj(*backend, dead).has_value());
     EXPECT_TRUE(readState(requests, layout).state->janitor_cursor.empty());
 }
 
@@ -659,12 +675,12 @@ TEST(CASNamespaceJanitor, CursorPublicationFailureIsLeakOnly)
     const Layout layout("p");
     seedCatalog(*backend, layout);
     const String dead = layout.refCkptKey(life("dead", 141));
-    ASSERT_EQ(backend->putIfAbsent(dead, "bytes").outcome, PutOutcome::Done);
+    createObj(*backend, dead, "bytes");
     backend->fail_publication = true;
     const auto result = NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_FALSE(result.anomalies.empty());
-    EXPECT_FALSE(backend->get(dead));
+    EXPECT_FALSE(readObj(*backend, dead).has_value());
 }
 
 /// The write inside `catch (...)` (the reset after a LIST failure) is admitted `once`: an unmodeled,
@@ -695,12 +711,11 @@ TEST(CASNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)
     const Layout & layout = store->layout();
     const RootNamespace live_namespace{"00/live@cas@"};
     fixture::admitLive(*backend, layout, live_namespace);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(fixture::fixtureLife(live_namespace)),
+    createObj(*backend, layout.refCkptKey(fixture::fixtureLife(live_namespace)),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
-                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt})).outcome,
-        PutOutcome::Done);
+                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
     const String dead = layout.refCkptKey(life("dead", 151));
-    ASSERT_EQ(backend->putIfAbsent(dead, "checkpoint").outcome, PutOutcome::Done);
+    createObj(*backend, dead, "checkpoint");
 
     std::map<String, UInt64> namespace_cleanup;
     Gc gc(store, UInt128{152});
@@ -713,7 +728,7 @@ TEST(CASNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)
     gc.setPhaseSink({});
 
     ASSERT_TRUE(report.acquired_lease);
-    EXPECT_FALSE(backend->get(dead));
+    EXPECT_FALSE(readObj(*backend, dead).has_value());
     ASSERT_FALSE(namespace_cleanup.empty());
     EXPECT_EQ(namespace_cleanup["janitor_pages"], 1u);
     EXPECT_GE(namespace_cleanup["janitor_keys"], 1u);
