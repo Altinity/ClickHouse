@@ -16,6 +16,7 @@
 #include <Interpreters/AddDefaultDatabaseVisitor.h>
 #include <Interpreters/TranslateQualifiedNamesVisitor.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
+#include <Interpreters/formatWithPossiblyHidingSecrets.h>
 #include <Planner/Utils.h>
 #include <Processors/QueryPlan/QueryPlanFormat.h>
 #include <Processors/Sources/RemoteSource.h>
@@ -91,7 +92,8 @@ void ReadFromCluster::describeActions(FormatSettings & format_settings) const
 {
     SourceStepWithFilter::describeActions(format_settings);
     if (query_to_send)
-        format_settings.out << format_settings.detail_prefix << "Query: " << query_to_send->formatWithSecretsOneLine() << '\n';
+        format_settings.out << format_settings.detail_prefix << "Query: "
+                            << format({.ctx = getContext(), .query = *query_to_send}) << '\n';
 }
 
 void ReadFromCluster::applyFilters(ActionDAGNodes added_filter_nodes)
