@@ -1253,7 +1253,7 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 constexpr uint64_t kFarewellBudgetMs = 10'000;
 
 MountLeaseKeeper::MountLeaseKeeper(
-    CasRequests & mount_requests_, CasRequests & farewell_requests_, const Layout & layout_,
+    CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
     std::function<uint64_t()> min_active_build_sequence_fn_,
@@ -1261,7 +1261,7 @@ MountLeaseKeeper::MountLeaseKeeper(
     std::chrono::milliseconds lease_safety_margin_,
     std::function<uint64_t()> boot_ms_fn_)
     : mount_requests(mount_requests_)
-    , farewell_requests(farewell_requests_)
+    , open_requests(open_requests_)
     , key(layout_.mountKey(srid_))
     , srid(srid_)
     , server_uuid(server_uuid_)
@@ -1385,7 +1385,7 @@ Incarnation MountLeaseKeeper::claim(CasOperation & op, const String & body)
     return *incarnation;
 }
 
-uint64_t MountLeaseKeeper::start()
+uint64_t MountLeaseKeeper::start(Liveness liveness)
 {
     if (keeper_state != MountLeaseKeeperState::New)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount-lease: start is allowed only in New state for key '{}'", key);
@@ -1393,7 +1393,10 @@ uint64_t MountLeaseKeeper::start()
     const uint64_t wall_ms = now_ms_fn();
     const uint64_t attempt_start_boot_ms = boot_ms_fn();
     const String body = encodeBody(/*seq_=*/1, wall_ms, min_active_build_sequence_fn(), newMountWriteAttemptId());
-    CasOperation op = mount_requests.admit();
+    /// Off the mount fence: a self-remount claims with the fence already latched lost, and a claim
+    /// admitted under it would be refused on every request. What makes the claim safe is that every
+    /// write below is conditional.
+    CasOperation op = open_requests.admit(std::move(liveness));
     const Incarnation incarnation = claim(op, body);
 
     seq = 1;
@@ -1698,10 +1701,10 @@ void MountLeaseKeeper::release()
     if (keeper_state != MountLeaseKeeperState::Active)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount-lease: release is allowed only in Active state for key '{}'", key);
     keeper_state = MountLeaseKeeperState::Released;
-    /// The farewell runs on the open fence: a departing mount whose lease has already run down still
-    /// has to hand the slot back, and refusing the write there would leave it looking live until GC
-    /// fences it out.
-    CasOperation op = farewell_requests.admit();
+    /// Off the mount fence, for the same reason the claim is: a departing mount whose lease has already
+    /// run down still has to hand the slot back, and refusing the write there would leave the slot
+    /// looking live until GC fences it out.
+    CasOperation op = open_requests.admit();
     terminate(op);
 }
 

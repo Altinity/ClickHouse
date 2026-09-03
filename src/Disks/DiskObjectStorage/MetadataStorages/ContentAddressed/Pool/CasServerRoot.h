@@ -492,14 +492,17 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 ///   - foreign uuid → fail closed;
 ///   - absent → `create`; expired-our-uuid (any epoch) → `replace` reclaim.
 ///
-/// The farewell runs on its OWN plane: releasing the lease is the last thing a departing mount does,
-/// and refusing it because the mount fence has already run down would leave the slot looking live
-/// until GC fences it out. Renewals stay on the mount plane, where a lost fence must stop them.
+/// PLANES. Only the RENEWAL is admitted under the mount fence, because only a renewal writes under
+/// authority the fence is tracking. The claim and the farewell are admitted off it: a self-remount
+/// claims with the fence already latched lost, so a claim gated on the fence could never reclaim, and
+/// a farewell refused because the fence has run down would leave the slot looking live until GC
+/// fences it out. Neither is unguarded -- a claim's safety is its own conditional write, and both
+/// carry whatever `Liveness` the caller supplies for shutdown.
 class MountLeaseKeeper
 {
 public:
     MountLeaseKeeper(
-        CasRequests & mount_requests_, CasRequests & farewell_requests_, const Layout & layout_,
+        CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
         const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
         std::function<uint64_t()> min_active_build_sequence_fn_,
@@ -509,8 +512,9 @@ public:
         /// tests and wired by CasMountRuntime::installKeeper.
         std::function<uint64_t()> boot_ms_fn_ = {});
 
-    /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor.
-    uint64_t start();
+    /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
+    /// the caller's shutdown terms; the mount fence is deliberately not consulted here.
+    uint64_t start(Liveness liveness = {});
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
     void release();
 
@@ -529,7 +533,7 @@ private:
     void terminate(CasOperation & op);
 
     CasRequests & mount_requests;
-    CasRequests & farewell_requests;
+    CasRequests & open_requests;
     String key;
 
     String srid;

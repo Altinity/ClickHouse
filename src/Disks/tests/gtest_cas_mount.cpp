@@ -2019,17 +2019,17 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
                 throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost");
         }});
     mount_requests.setNowFnForTest([&boot] { return boot; });
-    CasRequests farewell_requests = openRequestsForTest(backend);
-    farewell_requests.setNowFnForTest([&boot] { return boot; });
-    CasOperation seed = farewell_requests.admit();
+    CasRequests open_requests = openRequestsForTest(backend);
+    open_requests.setNowFnForTest([&boot] { return boot; });
+    CasOperation seed = open_requests.admit();
 
     ASSERT_EQ(claimMount(seed, l, "renewing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
     ASSERT_EQ(claimMount(seed, l, "departing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
 
-    MountLeaseKeeper renewing(mount_requests, farewell_requests, l, "renewing", UInt128(1), 7,
+    MountLeaseKeeper renewing(mount_requests, open_requests, l, "renewing", UInt128(1), 7,
                               std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                               {}, std::chrono::milliseconds(0), [&] { return boot; });
-    MountLeaseKeeper departing(mount_requests, farewell_requests, l, "departing", UInt128(1), 7,
+    MountLeaseKeeper departing(mount_requests, open_requests, l, "departing", UInt128(1), 7,
                                std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                                {}, std::chrono::milliseconds(0), [&] { return boot; });
     renewing.start();
@@ -2045,4 +2045,33 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
     EXPECT_NO_THROW(departing.release());
     const MountLease farewell = decodeMountLease(seed.read(l.mountKey("departing"), Retry::standard())->bytes);
     EXPECT_EQ(farewell.min_active_build_sequence, std::numeric_limits<uint64_t>::max());
+}
+
+/// The claim is admitted off the mount fence, and it has to be: a self-remount runs with the fence
+/// already latched lost, so a claim gated on it could never reclaim the slot. What keeps the claim
+/// safe is the conditional write it makes, not the fence.
+TEST(CASMountLease, ClaimIsNotAdmittedUnderTheMountFence)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    uint64_t boot = 0;
+
+    CasRequests mount_requests(backend, Fence{
+        [] { return uint64_t{0}; },
+        [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
+        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
+    mount_requests.setNowFnForTest([&boot] { return boot; });
+    CasRequests open_requests = openRequestsForTest(backend);
+    open_requests.setNowFnForTest([&boot] { return boot; });
+
+    MountLeaseKeeper keeper(mount_requests, open_requests, l, "r", UInt128(1), 7,
+                            std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
+                            {}, std::chrono::milliseconds(0), [&] { return boot; });
+    EXPECT_NO_THROW(keeper.start());
+
+    CasOperation reader = open_requests.admit();
+    const MountLease claimed = decodeMountLease(reader.read(l.mountKey("r"), Retry::standard())->bytes);
+    EXPECT_EQ(claimed.writer_epoch, 7u);
+    EXPECT_EQ(claimed.seq, 1u);
 }
