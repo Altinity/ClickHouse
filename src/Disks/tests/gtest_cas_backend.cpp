@@ -167,14 +167,16 @@ TEST(CASInMemory, OverwriteIsTokenExactAndMintsFreshToken)
     CasOperation op = requests.admit();
 
     const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
-    const WriteResult wrong_token = op.create("k2", "v2", Retry::once());   /// a fresh key to mint a foreign token
-    const Etag foreign = std::get<Committed>(wrong_token).incarnation;
-    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("k", "v2", foreign, Retry::once())));
-    expectBytes(b, "k", "v1");                                // untouched on mismatch
+    /// A stale precondition for the SAME key: an Etag is bound to the key it was minted for, so a
+    /// cross-key Etag is a caller bug (LOGICAL_ERROR), not "the wrong token" any more -- a stale
+    /// same-key incarnation is the real-world shape a precondition mismatch has to cover instead.
+    const Etag t2 = std::get<Committed>(op.replace("k", "v1.5", t1, Retry::once())).incarnation;
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("k", "v2", t1, Retry::once())));
+    expectBytes(b, "k", "v1.5");                              // untouched on mismatch
 
-    const WriteResult overwrite = op.replace("k", "v2", t1, Retry::once());
+    const WriteResult overwrite = op.replace("k", "v2", t2, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(overwrite));
-    EXPECT_NE(std::get<Committed>(overwrite).incarnation, t1);   // tokens never repeat
+    EXPECT_NE(std::get<Committed>(overwrite).incarnation, t2);   // tokens never repeat
     expectBytes(b, "k", "v2");
 }
 
@@ -189,11 +191,12 @@ TEST(CASInMemory, CasPutCreateAndSwap)
     const Etag t1 = std::get<Committed>(create).incarnation;
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("m", "s1x", Retry::once())));   // exists now
 
-    const WriteResult foreign_write = op.create("other", "stale", Retry::once());
-    const Etag foreign = std::get<Committed>(foreign_write).incarnation;
-    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("m", "s2", foreign, Retry::once())));
-    EXPECT_EQ(op.read("m", Retry::once())->bytes, "s1");
-    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("m", "s2", t1, Retry::once())));
+    /// A stale, same-key precondition -- see OverwriteIsTokenExactAndMintsFreshToken for why a
+    /// cross-key Etag can no longer stand in for "the wrong token".
+    const Etag t2 = std::get<Committed>(op.replace("m", "s1.5", t1, Retry::once())).incarnation;
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("m", "s2", t1, Retry::once())));
+    EXPECT_EQ(op.read("m", Retry::once())->bytes, "s1.5");
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("m", "s2", t2, Retry::once())));
     EXPECT_EQ(op.read("m", Retry::once())->bytes, "s2");
 }
 
@@ -203,9 +206,11 @@ TEST(CASInMemory, DeleteExactEnforced)
     CasRequests requests = openRequestsForTest(b);
     CasOperation op = requests.admit();
 
-    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
-    const Etag foreign = std::get<Committed>(op.create("k2", "v2", Retry::once())).incarnation;
-    EXPECT_EQ(op.remove("k", foreign, Retry::once()), Removal::Mismatch);
+    const Etag t0 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    const Etag t1 = std::get<Committed>(op.replace("k", "v1b", t0, Retry::once())).incarnation;
+    /// t0 is now stale for this SAME key -- see OverwriteIsTokenExactAndMintsFreshToken for why a
+    /// cross-key Etag can no longer stand in for "the wrong token".
+    EXPECT_EQ(op.remove("k", t0, Retry::once()), Removal::Mismatch);
     EXPECT_TRUE(op.read("k", Retry::once()).has_value());     // SURVIVES wrong-token delete
     EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Removed);
     EXPECT_FALSE(op.read("k", Retry::once()).has_value());
@@ -408,9 +413,9 @@ TEST(CASInMemoryFaults, NonEnforcingModeMimicsBadBackend)
     CasRequests requests = openRequestsForTest(b);
     CasOperation op = requests.admit();
     b.setEnforceTokens(false);                        // MinIO-OSS-shaped backend
-    op.create("k", "v1", Retry::once());
-    const Etag foreign = std::get<Committed>(op.create("k2", "totally-wrong", Retry::once())).incarnation;
-    EXPECT_EQ(op.remove("k", foreign, Retry::once()), Removal::Removed);   // silently deletes anyway — the dangerous behavior
+    const Etag t0 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace("k", "v2", t0, Retry::once())));   // mints a later incarnation
+    EXPECT_EQ(op.remove("k", t0, Retry::once()), Removal::Removed);   // stale-but-same-key precondition silently deletes anyway — the dangerous behavior
     EXPECT_FALSE(op.read("k", Retry::once()).has_value());
 }
 
@@ -1257,6 +1262,7 @@ TEST(CASObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
 /// value that TEXTUALLY collides with a token persisted before the restart (e.g. a GC condemned-delete
 /// token queued for replay), even though the two values name completely different incarnations of the
 /// key. `deleteExact` must never let a stale, pre-restart token match a freshly recreated object.
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CASObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
 {
     auto storage = tests::makeLocalObjectStorageForTest();
@@ -1293,12 +1299,49 @@ TEST(CASObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
     /// STRONGER guarantee than the old bare-value comparison this test used to pin. The underlying
     /// same-instance mtime-quantum disambiguation this fixture was ALSO probing is covered directly by
     /// `EmuTokenDisambiguatesSameEtagRewrite`, within one backend instance where the engine's own
-    /// cross-backend check cannot pre-empt it.
-    EXPECT_THROW(op2.remove("k/restart", stale_token, Retry::once()), DB::Exception);
+    /// cross-backend check cannot pre-empt it. A LOGICAL_ERROR aborts under
+    /// DEBUG_OR_SANITIZER_BUILD before it can ever be thrown and caught here; the debug/sanitizer arm
+    /// of this split (below) pins the same refusal via EXPECT_DEATH instead.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
+    {
+        op2.remove("k/restart", stale_token, Retry::once());
+    });
 
     /// The live (post-restart) incarnation must be untouched by the rejected stale delete.
     EXPECT_TRUE(op2.head("k/restart", Retry::once()).has_value());
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASObjectStorageBackendDeathTest, EmuTokenSurvivesProcessRestartAcrossRecreateAborts)
+{
+    auto storage = tests::makeLocalObjectStorageForTest();
+
+    auto backend1 = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests1 = openRequestsForTest(backend1);
+    CasOperation op1 = requests1.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op1.create("k/other", "junk", Retry::once())));
+    const WriteResult restart_create = op1.create("k/restart", "v1", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(restart_create));
+    const Etag stale_token = std::get<Committed>(restart_create).incarnation;
+
+    auto backend2 = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests2 = openRequestsForTest(backend2);
+    CasOperation op2 = requests2.admit();
+
+    const auto current = op2.head("k/restart", Retry::once());
+    ASSERT_TRUE(current.has_value());
+    ASSERT_EQ(op2.remove("k/restart", current->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op2.create("k/restart", "v2-after-restart", Retry::once())));
+
+    /// See EmuTokenSurvivesProcessRestartAcrossRecreate above for the property under test; a
+    /// LOGICAL_ERROR aborts the process under DEBUG_OR_SANITIZER_BUILD, so this arm pins the refusal
+    /// via EXPECT_DEATH instead of an exception.
+    EXPECT_DEATH(
+        { op2.remove("k/restart", stale_token, Retry::once()); },
+        "cannot be the precondition for");
+}
+#endif
 
 /// `list`'s `EmulatedSingleProcess` branch must surface the SAME incarnation value `head` would for the
 /// same key. An earlier defect minted the listed value under the wrong dialect regardless of `mode`,
