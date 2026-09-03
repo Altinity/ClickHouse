@@ -119,8 +119,8 @@ size_t eraseKeysContaining(Backend & backend, const String & substr)
     OperationForTest op(backend);
     while (true)
     {
-        const KeyPage page = (*op).list("", cursor, 1000, Retry::standard());
-        for (const KeyEntry & listed : page.keys)
+        const ListPage page = (*op).list("", cursor, 1000, Retry::standard());
+        for (const ListedKey & listed : page.keys)
             if (substr.empty() || listed.key.find(substr) != String::npos)
                 keys.push_back(listed.key);
         if (page.next_cursor.empty())
@@ -130,7 +130,7 @@ size_t eraseKeysContaining(Backend & backend, const String & substr)
     for (const String & key : keys)
     {
         const auto h = (*op).head(key, Retry::standard());
-        if (h && (*op).remove(key, h->incarnation, Retry::standard()) == Removal::Removed)
+        if (h && (*op).remove(key, h->etag, Retry::standard()) == Removal::Removed)
             ++removed;
     }
     return removed;
