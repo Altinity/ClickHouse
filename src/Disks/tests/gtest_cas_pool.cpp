@@ -1581,7 +1581,7 @@ void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
     m.gc_fenced = true;
     m.seq += 1;
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*op).replace(mount_key, encodeMountLease(m), got->incarnation, Retry::standard())));
+        (*op).replace(mount_key, encodeMountLease(m), got->etag, Retry::standard())));
 }
 
 }
@@ -1649,7 +1649,7 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
     foreign.server_uuid = foreign.server_uuid + DB::UInt128(1);
     foreign.seq += 1;
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*overwrite_op).replace(mount_key, encodeMountLease(foreign), got->incarnation, Retry::standard())));
+        (*overwrite_op).replace(mount_key, encodeMountLease(foreign), got->etag, Retry::standard())));
 
     EXPECT_FALSE(store->tryRemountOnce());
     /// The foreign body is untouched (no takeover, ever).
@@ -1675,7 +1675,7 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
     foreign_lease.server_uuid = foreign_lease.server_uuid + DB::UInt128(1);
     foreign_lease.seq += 1;
     ASSERT_TRUE(std::holds_alternative<Committed>((*foreign_overwrite_op).replace(
-        foreign_mount_key, encodeMountLease(foreign_lease), foreign_got->incarnation, Retry::standard())));
+        foreign_mount_key, encodeMountLease(foreign_lease), foreign_got->etag, Retry::standard())));
     const auto occupant_before = readObj(*foreign_backend, foreign_mount_key);
     ASSERT_TRUE(occupant_before.has_value());
 
@@ -1990,7 +1990,7 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     successor.writer_epoch = 9;
     successor.seq += 1;
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*successor_op).replace(key, encodeMountLease(successor), ours->incarnation, Retry::standard())));
+        (*successor_op).replace(key, encodeMountLease(successor), ours->etag, Retry::standard())));
     const uint64_t skipped_before
         = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
     const uint64_t violations_before
@@ -2747,13 +2747,13 @@ TEST(CASPool, StaleSnapshotServesCachedManifestAndBlobAbsenceSurfacesOnRead)
         DB::Cas::tests::OperationForTest op(*b);
         const auto h = (*op).head(manifest_key, Retry::standard());
         ASSERT_TRUE(h.has_value());
-        (*op).remove(manifest_key, h->incarnation, Retry::once());
+        (*op).remove(manifest_key, h->etag, Retry::once());
     }
     {
         DB::Cas::tests::OperationForTest op(*b);
         const auto h = (*op).head(blob_key, Retry::standard());
         ASSERT_TRUE(h.has_value());
-        (*op).remove(blob_key, h->incarnation, Retry::once());
+        (*op).remove(blob_key, h->etag, Retry::once());
     }
     b->resetCounts();
 
@@ -2797,7 +2797,7 @@ TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
         DB::Cas::tests::OperationForTest op(*b);
         const auto h = (*op).head(key, Retry::standard());
         ASSERT_TRUE(h.has_value());
-        (*op).remove(key, h->incarnation, Retry::once());
+        (*op).remove(key, h->etag, Retry::once());
     }
     b->resetCounts();
 
