@@ -29,8 +29,8 @@ inline ManifestSweepResult sweepManifestCursorPageForTest(
         /// key and refuses unless what is there now is still that one: a key a fresh owner has since
         /// replaced must survive.
         const std::optional<Meta> seen = op.head(nomination.key, Retry::standard());
-        if (seen && nomination.token.matches(seen->incarnation)
-            && op.remove(nomination.key, seen->incarnation, Retry::standard()) == Removal::Removed)
+        if (seen && nomination.token.matches(seen->etag)
+            && op.remove(nomination.key, seen->etag, Retry::standard()) == Removal::Removed)
             ++result.deleted;
         else
             ++result.skipped;

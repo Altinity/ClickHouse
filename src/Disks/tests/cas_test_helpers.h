@@ -427,8 +427,8 @@ inline uint64_t appendRefLogSeed(
     String cursor;
     while (true)
     {
-        const DB::Cas::KeyPage page = (*operation).list(prefix, cursor, /*limit=*/1000, DB::Cas::Retry::standard());
-        for (const DB::Cas::KeyEntry & lk : page.keys)
+        const DB::Cas::ListPage page = (*operation).list(prefix, cursor, /*limit=*/1000, DB::Cas::Retry::standard());
+        for (const DB::Cas::ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
             if (!parsed)
@@ -539,7 +539,7 @@ inline void deleteManifestBody(
     const String key = layout.manifestKey(id);
     OperationForTest op(backend);
     if (const auto h = (*op).head(key, DB::Cas::Retry::standard()))
-        (*op).remove(key, h->incarnation, DB::Cas::Retry::standard());
+        (*op).remove(key, h->etag, DB::Cas::Retry::standard());
 }
 
 /// Formerly wrote the namespace into `gc/registry`. Real write helpers now admit the authoritative
@@ -649,7 +649,7 @@ inline void injectRetire(
     if (!existing_state)
         (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
-        (*operation).replace(layout.gcStateKey(), state, existing_state->incarnation, DB::Cas::Retry::standard());
+        (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
 }
 
 /// Adopt a fold seal carrying a given per-gc-shard `condemned_summary` and point
@@ -674,7 +674,7 @@ inline void injectCondemnedSummarySeal(
     seal.condemned_summary = summary;
     const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
     if (existing)
-        (*operation).replace(seal_key, seal_bytes, existing->incarnation, DB::Cas::Retry::standard());
+        (*operation).replace(seal_key, seal_bytes, existing->etag, DB::Cas::Retry::standard());
     else
         (*operation).create(seal_key, seal_bytes, DB::Cas::Retry::standard());
 
@@ -689,7 +689,7 @@ inline void injectCondemnedSummarySeal(
     if (!existing_state)
         (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
-        (*operation).replace(layout.gcStateKey(), state, existing_state->incarnation, DB::Cas::Retry::standard());
+        (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
 }
 
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
@@ -820,7 +820,7 @@ inline DB::Cas::Etag displaceObjectToken(
     const String body = new_head + got->bytes.substr(header.header_len);
 
     const std::optional<DB::Cas::Etag> displaced = DB::Cas::orThrow(
-        (*operation).replace(key, body, got->incarnation, DB::Cas::Retry::standard()),
+        (*operation).replace(key, body, got->etag, DB::Cas::Retry::standard()),
         "displace the object at " + key);
     if (!displaced)
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
@@ -938,7 +938,7 @@ inline void condemnMeta(DB::Cas::Backend & backend, const DB::Cas::Layout & layo
     c.state = DB::Cas::MetaState::Condemned;
     c.condemn_round = condemn_round;
     ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(
-        DB::Cas::casMeta(*operation, layout, ref, lm->incarnation, c)));
+        DB::Cas::casMeta(*operation, layout, ref, lm->etag, c)));
 }
 
 /// Load the meta descriptor for `hash` via the shared ops layer (nullopt = absent).
@@ -1141,7 +1141,7 @@ inline void seedFoldCursorForTest(
 
     const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
     if (existing)
-        (*operation).replace(seal_key, seal_bytes, existing->incarnation, DB::Cas::Retry::standard());
+        (*operation).replace(seal_key, seal_bytes, existing->etag, DB::Cas::Retry::standard());
     else
         (*operation).create(seal_key, seal_bytes, DB::Cas::Retry::standard());
 
@@ -1151,7 +1151,7 @@ inline void seedFoldCursorForTest(
     if (!existing_state)
         (*operation).create(layout.gcStateKey(), state, DB::Cas::Retry::standard());
     else
-        (*operation).replace(layout.gcStateKey(), state, existing_state->incarnation, DB::Cas::Retry::standard());
+        (*operation).replace(layout.gcStateKey(), state, existing_state->etag, DB::Cas::Retry::standard());
 }
 
 /// The folded cursor sealed for (ns, shard) by the latest fold seal, or 0 when absent. After a COMPLETE
@@ -1202,7 +1202,7 @@ inline void setWatermarkMinActive(
     OperationForTest op(backend);
     const auto h = (*op).head(key, DB::Cas::Retry::standard());
     if (h)
-        (*op).replace(key, DB::Cas::encodeMountLease(m), h->incarnation, DB::Cas::Retry::standard());
+        (*op).replace(key, DB::Cas::encodeMountLease(m), h->etag, DB::Cas::Retry::standard());
     else
         (*op).create(key, DB::Cas::encodeMountLease(m), DB::Cas::Retry::standard());
 }
@@ -1328,7 +1328,7 @@ inline void advanceRecoverableCkptForRawFixture(
     RefCkpt advanced = sample->ckpt;
     advanced.committed_through = through;
     if (!std::holds_alternative<DB::Cas::Committed>(
-            (*operation).replace(layout.refCkptKey(life), encodeRefCkpt(advanced), sample->incarnation,
+            (*operation).replace(layout.refCkptKey(life), encodeRefCkpt(advanced), sample->etag,
                                  DB::Cas::Retry::standard())))
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "raw recovery fixture for namespace '{}' could not advance its checkpoint", ns.string());
@@ -1368,7 +1368,7 @@ inline void replaceRecoverableCkptForRawFixture(
             "raw recovery fixture for namespace '{}' cannot regress its checkpoint frontier", ns.string());
 
     if (!std::holds_alternative<DB::Cas::Committed>(
-            (*operation).replace(layout.refCkptKey(life), encodeRefCkpt(next), existing->incarnation,
+            (*operation).replace(layout.refCkptKey(life), encodeRefCkpt(next), existing->etag,
                                  DB::Cas::Retry::standard())))
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
             "raw recovery fixture for namespace '{}' could not replace its checkpoint", ns.string());
