@@ -238,11 +238,14 @@ ManifestId publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const S
     return id;
 }
 
-/// Every request class `CountingBackend` observes, summed. The zero-I/O contract is asserted against
-/// this total, so a confirm that quietly grew a HEAD or a GET fails the test rather than the review.
+/// The reads, heads, stream opens, writes and lists `CountingBackend` observes, summed. The zero-I/O
+/// contract is asserted against this total, so a confirm that quietly grew a HEAD or a GET fails the
+/// test rather than the review. `writeTotal` and not `putTotal`: a write that carried a precondition
+/// is still a write, and counting only the create-shaped ones left the replace path unwatched.
+/// Deletes are NOT in this sum.
 uint64_t backendRequests(const CountingBackend & b)
 {
-    return b.headTotal() + b.getTotal() + b.getStreamTotal() + b.putTotal() + b.listTotal();
+    return b.headTotal() + b.getTotal() + b.getStreamTotal() + b.writeTotal() + b.listTotal();
 }
 
 /// One refusal counter's current value. `confirmExactRef` attributes every `Unknown` to exactly one of
@@ -764,9 +767,7 @@ TEST(CASConfirmExactRef, MisScopedItemFailsBeforeAnythingIsDurable)
     const RootNamespace ns{"srv1/confirm_misscoped"};
     const ManifestId seed = publishEmptyPart(store, ns, "seed");   /// the namespace is born already
 
-    const uint64_t puts_before = backend->putTotal();
-    const uint64_t overwrites_before = backend->putOverwriteTotal();
-    const uint64_t cas_puts_before = backend->casPutTotal();
+    const uint64_t writes_before = backend->writeTotal();
     RefOp add;
     add.kind = RefOpKind::OwnerTransition;
     add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "y", ManifestRef{900000003, 1, 1}};
@@ -800,11 +801,9 @@ TEST(CASConfirmExactRef, MisScopedItemFailsBeforeAnythingIsDurable)
     }
 
     /// The ref-log transaction object -- the only thing that would make this item durable -- is a
-    /// `putIfAbsent`; `putOverwrite` and `casPut` are asserted too so the fence covers every write kind
-    /// the backend can observe, not just the one this item would have used.
-    EXPECT_EQ(backend->putTotal(), puts_before) << "the refusal must happen before any object is written";
-    EXPECT_EQ(backend->putOverwriteTotal(), overwrites_before) << "the refusal must happen before any object is written";
-    EXPECT_EQ(backend->casPutTotal(), cas_puts_before) << "the refusal must happen before any object is written";
+    /// create, and this counts every write the backend can observe rather than that one shape, so the
+    /// fence still holds if the durable step ever changes shape.
+    EXPECT_EQ(backend->writeTotal(), writes_before) << "the refusal must happen before any object is written";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready) << "a validation failure is not a lane fault";
     EXPECT_EQ(store->confirmExactRef(ns, "seed", seed.ref), ConfirmAnswer::Yes)
         << "the failed item must leave the table exactly as it was";

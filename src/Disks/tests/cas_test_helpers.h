@@ -1554,6 +1554,43 @@ inline std::vector<DB::Cas::RefOp> publishCommittedOps(const String & ref_name, 
     return {add, promote};
 }
 
+/// Serves an inner stream in windows of at most `chunk` bytes, and records the largest window it ever
+/// handed out. `InMemoryBackend` materializes the whole object behind its stream, so without this a
+/// consumer receives every byte as one contiguous window -- it can hold the object entire and still
+/// look like a streaming reader, and nothing at the seam can tell the two apart.
+///
+/// What arming this proves is what the consumer then DOES: a reader that assumed one contiguous window
+/// fails against a chunked source, so the test's own success is the evidence. The recorded window is
+/// the bound it succeeded under, not a measurement of the reader's resident memory -- a consumer that
+/// copies every window into a buffer of its own is invisible here, as it is to any `ReadBuffer`.
+class ChunkedStreamForTest : public DB::ReadBuffer
+{
+public:
+    ChunkedStreamForTest(std::unique_ptr<DB::ReadBuffer> inner_, size_t chunk,
+                         std::shared_ptr<std::atomic<uint64_t>> largest_)
+        : DB::ReadBuffer(nullptr, 0), inner(std::move(inner_)), storage(chunk), largest(std::move(largest_))
+    {
+    }
+
+private:
+    bool nextImpl() override
+    {
+        const size_t got = inner->read(storage.data(), storage.size());
+        if (got == 0)
+            return false;
+        BufferBase::set(storage.data(), got, 0);
+        uint64_t seen = largest->load();
+        while (seen < got && !largest->compare_exchange_weak(seen, got))
+        {
+        }
+        return true;
+    }
+
+    std::unique_ptr<DB::ReadBuffer> inner;
+    std::vector<char> storage;
+    std::shared_ptr<std::atomic<uint64_t>> largest;
+};
+
 /// Counts every request per key, for the op-count assertions (Pillar B / A1 tests).
 class CountingBackend : public DB::Cas::InMemoryBackend
 {
@@ -1633,7 +1670,28 @@ public:
     std::optional<DB::Cas::GetStreamResult> getStream(const String & key, DB::Cas::Range range) override
     {
         tick(get_stream_counts, get_stream_total, key);
-        return InMemoryBackend::getStream(key, range);
+        std::optional<DB::Cas::GetStreamResult> opened = InMemoryBackend::getStream(key, range);
+        const size_t chunk = stream_chunk.load();
+        if (!opened || !opened->stream || chunk == 0)
+            return opened;
+        opened->stream = std::make_unique<ChunkedStreamForTest>(
+            std::move(opened->stream), chunk, largestChunkSlot(key));
+        return opened;
+    }
+
+    /// Serve every stream opened from now on in windows of at most `bytes`, as a network-backed store
+    /// does. Zero (the default) hands the consumer the whole object at once, which is what this
+    /// backend's own materialization makes of any stream. A mode rather than a count: `resetCounts`
+    /// leaves it alone.
+    void setStreamChunkForTest(size_t bytes) { stream_chunk.store(bytes); }
+
+    /// The largest contiguous window any consumer of `key`'s stream was handed. Zero when the key was
+    /// never streamed.
+    uint64_t largestStreamChunk(const String & key) const
+    {
+        std::lock_guard lock(count_mutex);
+        const auto it = largest_stream_chunk.find(key);
+        return it == largest_stream_chunk.end() ? 0 : it->second->load();
     }
 
     uint64_t getCount(const String & key) const { return lookup(get_counts, key); }
@@ -1707,11 +1765,21 @@ public:
         put_overwrite_counts.clear();
         delete_counts.clear();
         get_stream_counts.clear();
+        largest_stream_chunk.clear();
         get_total = head_total = list_total = write_total = put_total = put_overwrite_total
             = delete_total = get_stream_total = 0;
     }
 
 private:
+    std::shared_ptr<std::atomic<uint64_t>> largestChunkSlot(const String & key)
+    {
+        std::lock_guard lock(count_mutex);
+        auto & slot = largest_stream_chunk[key];
+        if (!slot)
+            slot = std::make_shared<std::atomic<uint64_t>>(0);
+        return slot;
+    }
+
     void tick(std::map<String, uint64_t> & per_key, uint64_t & total, const String & key)
     {
         std::lock_guard lock(count_mutex);
@@ -1739,6 +1807,9 @@ private:
     }
 
     mutable std::mutex count_mutex;
+    /// Held by `shared_ptr` so a stream outliving the map entry's rehash still records into its own slot.
+    std::map<String, std::shared_ptr<std::atomic<uint64_t>>> largest_stream_chunk;
+    std::atomic<size_t> stream_chunk{0};
     std::map<String, uint64_t> get_counts;
     std::map<String, uint64_t> head_counts;
     std::map<String, uint64_t> list_counts;

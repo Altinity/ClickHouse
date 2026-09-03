@@ -655,6 +655,49 @@ TEST(CASCountingBackendShape, RecordsStreamOpensPerKeyAndInTotal)
     EXPECT_EQ(backend.getStreamTotal(), 0u);
 }
 
+/// Armed chunking makes this backend serve a stream the way a network-backed store does, in bounded
+/// windows, instead of handing over the materialized object in one piece. The bytes a consumer reads
+/// are the same either way; what changes is that a consumer which assumed one contiguous window can no
+/// longer get one.
+TEST(CASCountingBackendShape, AnArmedChunkBoundsTheWindowAStreamHandsOut)
+{
+    const String body(10'000, 'x');
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    ASSERT_EQ(backend->putIfAbsent("run", body).outcome, PutOutcome::Done);
+
+    /// Unarmed: the whole object arrives as one window, which is what this backend's materialization
+    /// makes of any stream and exactly what the bound exists to remove.
+    {
+        auto opened = backend->getStream("run");
+        ASSERT_TRUE(opened);
+        String drained;
+        readStringUntilEOF(drained, *opened->stream);
+        EXPECT_EQ(drained, body);
+        EXPECT_EQ(backend->largestStreamChunk("run"), 0u) << "nothing records a window while chunking is off";
+    }
+
+    backend->setStreamChunkForTest(4096);
+    {
+        auto opened = backend->getStream("run");
+        ASSERT_TRUE(opened);
+        String drained;
+        readStringUntilEOF(drained, *opened->stream);
+        EXPECT_EQ(drained, body) << "chunking changes the window, never the bytes";
+        EXPECT_EQ(backend->largestStreamChunk("run"), 4096u);
+        EXPECT_LT(backend->largestStreamChunk("run"), body.size())
+            << "the consumer never held the object entire";
+    }
+
+    /// The mode outlives a counter reset, and the recorded window does not.
+    backend->resetCounts();
+    EXPECT_EQ(backend->largestStreamChunk("run"), 0u);
+    auto reopened = backend->getStream("run");
+    ASSERT_TRUE(reopened);
+    String again;
+    readStringUntilEOF(again, *reopened->stream);
+    EXPECT_EQ(backend->largestStreamChunk("run"), 4096u);
+}
+
 /// What makes every request-profile gate in this tree trustworthy: a counter names a PHYSICAL request,
 /// so the same request counts once whichever surface issued it. Before the counters moved onto the
 /// transport primitives a legacy call and a `CasOperation` call landed on different counters, and a

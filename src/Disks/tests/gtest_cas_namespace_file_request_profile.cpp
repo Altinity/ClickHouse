@@ -98,24 +98,25 @@ TEST(CASNamespaceFileRequestProfile, CreateThenRewrite)
     store->putNamespaceFile(life, kFile, "1\n");
 
     EXPECT_EQ(backend->headCount(key), 1u);
-    EXPECT_EQ(backend->putCount(key), 1u);            /// putIfAbsent -- the key was absent
+    EXPECT_EQ(backend->putCount(key), 1u);            /// create-shaped -- the key was absent
     EXPECT_EQ(backend->putOverwriteCount(key), 0u);
     EXPECT_EQ(backend->getCount(key), 0u);
     EXPECT_EQ(backend->deleteCount(key), 0u);
     EXPECT_EQ(backend->listTotal(), 0u);
-    EXPECT_EQ(backend->casPutTotal(), 0u);
+    /// And no write beyond the one accounted for above, anywhere.
+    EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->touchedKeys(), std::vector<String>{key});
 
     backend->resetCounts();
     store->putNamespaceFile(life, kFile, "2\n");
 
     EXPECT_EQ(backend->headCount(key), 1u);
-    EXPECT_EQ(backend->putOverwriteCount(key), 1u);   /// token-conditioned replacement -- it existed
+    EXPECT_EQ(backend->putOverwriteCount(key), 1u);   /// replace-shaped -- it existed
     EXPECT_EQ(backend->putCount(key), 0u);
     EXPECT_EQ(backend->getCount(key), 0u);
     EXPECT_EQ(backend->deleteCount(key), 0u);
     EXPECT_EQ(backend->listTotal(), 0u);
-    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->touchedKeys(), std::vector<String>{key});
 }
 
@@ -132,8 +133,9 @@ TEST(CASNamespaceFileRequestProfile, Read)
 
     EXPECT_EQ(store->getNamespaceFile(life, kFile), String("1\n"));
 
+    /// One GET, and it is necessarily a whole-object one: `Backend::get` refuses a non-whole window
+    /// outright, so there is no partial read left for a separate counter to tell apart.
     EXPECT_EQ(backend->getCount(key), 1u);
-    EXPECT_EQ(backend->wholeGetCount(key), 1u);
     EXPECT_EQ(backend->headCount(key), 0u);
     EXPECT_EQ(backend->putCount(key), 0u);
     EXPECT_EQ(backend->putOverwriteCount(key), 0u);
@@ -218,7 +220,7 @@ TEST(CASNamespaceFileRequestProfile, DedupLogRotation)
     EXPECT_EQ(backend->headCount(old_key), 1u);
     EXPECT_EQ(backend->deleteCount(old_key), 1u);
     EXPECT_EQ(backend->getTotal(), 0u);              /// rotation reads no body
-    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 1u);            /// and writes only the new segment
     /// Sorted, and the files prefix is a proper prefix of both segment keys, so it comes first.
     EXPECT_EQ(backend->touchedKeys(), (std::vector<String>{prefix, old_key, new_key}));
 
