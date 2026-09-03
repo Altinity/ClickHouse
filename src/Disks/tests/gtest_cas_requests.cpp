@@ -19,6 +19,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
@@ -40,6 +41,18 @@ using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::FakeClock;
 using DB::Cas::tests::expectThrowsCode;
 
+namespace
+{
+
+/// Every engine test drives `CasRequests` on an injected clock, so a ninety-second policy is exercised
+/// in no wall-clock time and the retry schedule itself becomes an assertion.
+CasRequests makeRequests(BackendPtr backend, FakeClock & clock, Fence fence = Fence::open())
+{
+    return CasRequests(std::move(backend), std::move(fence), clock.nowFn(), clock.sleepFn());
+}
+
+}
+
 static_assert(!std::is_default_constructible_v<Incarnation>);
 static_assert(!std::is_constructible_v<Incarnation, String>);
 static_assert(!std::is_constructible_v<Incarnation, PersistedIncarnation>);
@@ -56,6 +69,7 @@ TEST(CASIncarnation, GrammarRefusesTheNineWays)
     EXPECT_FALSE(isIncarnationValue(Dialect::Generation, "0"));
     EXPECT_FALSE(isIncarnationValue(Dialect::Generation, "00123"));
     EXPECT_FALSE(isIncarnationValue(Dialect::Generation, "\"123\""));
+    EXPECT_FALSE(isIncarnationValue(Dialect::Generation, "123 "));   /// the ninth: decimal is not "decimal, trimmed"
     EXPECT_TRUE(isIncarnationValue(Dialect::Generation, "123"));
     EXPECT_FALSE(isIncarnationValue(Dialect::Emulated, ""));
 }
@@ -66,15 +80,26 @@ TEST(CASRetry, BackoffIsFullJitterUnderTheCap)
     {
         const uint64_t ceiling = std::min<uint64_t>(5000, 200ull << (attempt - 1));
         uint64_t sum = 0;
+        std::set<uint64_t> seen;
+        bool low = false;
+        bool high = false;
         for (int i = 0; i < 1000; ++i)
         {
             const uint64_t s = Retry::backoff(attempt);
             ASSERT_LE(s, ceiling);
             sum += s;
+            seen.insert(s);
+            low = low || s < ceiling / 4;
+            high = high || s > ceiling * 3 / 4;
         }
         const double mean = static_cast<double>(sum) / 1000.0;
-        EXPECT_GT(mean, static_cast<double>(ceiling) * 0.35) << "attempt " << attempt;   /// a mean near half the ceiling: jitter is real
+        EXPECT_GT(mean, static_cast<double>(ceiling) * 0.35) << "attempt " << attempt;
         EXPECT_LT(mean, static_cast<double>(ceiling) * 0.65) << "attempt " << attempt;
+        /// The mean alone cannot tell full jitter from a constant half the ceiling, so the SPREAD is
+        /// asserted too: many distinct values, reaching into both the bottom and the top quarter.
+        EXPECT_GE(seen.size(), 3u) << "attempt " << attempt;
+        EXPECT_TRUE(low) << "attempt " << attempt;
+        EXPECT_TRUE(high) << "attempt " << attempt;
     }
 }
 
@@ -93,11 +118,25 @@ TEST(CASRetry, PoliciesAreShapedAsSpecified)
 
 TEST(CASWriteResult, OrThrowMapsEveryAlternative)
 {
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { orThrow(WriteResult{Conflict{ProvenAbsent{}}}, "t"); });
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { orThrow(WriteResult{Refused{DB::ErrorCodes::S3_ERROR, "denied"}}, "t"); });
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::Deadline, GaveUp::Source::Policy, true, NotObserved{}}}, "t"); });
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::Unresolved, GaveUp::Source::Policy, true, ProvenAbsent{}}}, "t"); });
-    EXPECT_ANY_THROW(orThrow(WriteResult{GaveUp{GaveUp::Why::FenceLost, GaveUp::Source::Lease, false, NotObserved{}}}, "t"));   /// throwCasTransientUnavailable's code
+    /// The two that are not failures: a commit hands back its incarnation, a decline hands back
+    /// nothing, and neither throws. Minting one needs a real write, since nothing else may mint.
+    FakeClock clock;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    WriteResult committed = op.create("k", "v", Retry::standard());
+    ASSERT_TRUE(std::holds_alternative<Committed>(committed));
+    const Incarnation landed = std::get<Committed>(committed).incarnation;
+    const auto returned = orThrow(std::move(committed), "create");
+    ASSERT_TRUE(returned.has_value());
+    EXPECT_EQ(*returned, landed);
+    EXPECT_FALSE(orThrow(WriteResult{Declined{ProvenAbsent{}}}, "declined").has_value());
+
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { orThrow(WriteResult{Conflict{ProvenAbsent{}}}, "t"); });
+    expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { orThrow(WriteResult{Refused{DB::ErrorCodes::S3_ERROR, "denied"}}, "t"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::Deadline, GaveUp::Source::Policy, true, NotObserved{}}}, "t"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::Unresolved, GaveUp::Source::Policy, true, ProvenAbsent{}}}, "t"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::FenceLost, GaveUp::Source::Lease, false, NotObserved{}}}, "t"); });
 }
 
 TEST(CASFence, OpenFenceAdmitsEverythingAndNeverMoves)
@@ -180,22 +219,64 @@ TEST(CASBackendPrimitives, EveryBackendInstanceHasItsOwnId)
     EXPECT_EQ(a->dialect(), Dialect::Emulated);
 }
 
-TEST(CASBackendPrimitives, LegacyOverridesStillFireWhenTheNewPrimitiveIsCalled)
+namespace
 {
-    /// The migration rule: new methods are the primitives; a fault-injection override written against
-    /// the NEW signature intercepts a legacy caller too, because legacy forwards through the virtual.
-    struct Counting : InMemoryBackend
+
+/// Counts every call that reaches the primitive `write`, whichever surface it entered through.
+struct WriteCountingBackend : InMemoryBackend
+{
+    size_t writes = 0;
+
+    std::expected<String, RawConflict> write(const String & k, const String & v, const std::optional<String> & e,
+                                             TransportAccess & a) override
     {
-        size_t writes = 0;
-        std::expected<String, RawConflict> write(const String & k, const String & v, const std::optional<String> & e, TransportAccess & a) override
-        {
-            ++writes;
-            return InMemoryBackend::write(k, v, e, a);
-        }
-    };
-    auto b = std::make_shared<Counting>();
-    b->putIfAbsent("k", "v");                 /// legacy call
+        ++writes;
+        return InMemoryBackend::write(k, v, e, a);
+    }
+};
+
+}
+
+TEST(CASBackendPrimitives, ALegacyCallReachesAnOverrideOfThePrimitiveItForwardsTo)
+{
+    /// The migration rule: the new methods are the primitives, and a fault injection written against a
+    /// NEW signature intercepts a legacy caller too, because the legacy verb forwards through the
+    /// virtual. `putIfAbsent` and `casPut` are this backend's two documented exceptions -- they route
+    /// around the primitive to keep their knobs' verb identity -- so the rule is asserted on a verb
+    /// that does forward.
+    auto b = std::make_shared<WriteCountingBackend>();
+    auto door = RawDoor::key();
+    const String first = *b->write("k", "v", std::nullopt, door);
+    b->writes = 0;
+
+    b->putOverwrite("k", "w", Token{first, Dialect::Emulated});     /// legacy call
     EXPECT_EQ(b->writes, 1u);
+}
+
+TEST(CASBackendPrimitives, EachWriteKnobFiresOnlyForTheVerbItNames)
+{
+    /// A knob is armed against a VERB. The keyed `write` cannot see which verb its caller used, so
+    /// consuming both knobs there is right and consuming the other one from a legacy verb is not: a
+    /// test that arms an ambiguity for `putIfAbsent` must not have it fire on a `casPut`.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto door = RawDoor::key();
+
+    b->failNextCasPut("k");
+    EXPECT_EQ(b->putIfAbsent("k", "v").outcome, PutOutcome::Done);   /// not casPut's knob to consume
+    const Token present = b->head("k").token;
+    EXPECT_EQ(b->casPut("k", "w", present).outcome, CasOutcome::Conflict);
+    EXPECT_EQ(b->get("k")->bytes, "v");                              /// the refusal changed nothing
+
+    b->injectAmbiguousPutIfAbsent("k2");
+    EXPECT_EQ(b->casPut("k2", "v", std::nullopt).outcome, CasOutcome::Committed);   /// not casPut's knob either
+    EXPECT_THROW(b->putIfAbsent("k2", "w"), std::runtime_error);
+
+    /// The keyed primitive is the one caller every knob is armed against, and each is still one-shot.
+    b->injectAmbiguousPutIfAbsent("k3");
+    b->failNextCasPut("k3");
+    EXPECT_THROW((void)b->write("k3", "v", std::nullopt, door), std::runtime_error);
+    EXPECT_FALSE(b->write("k3", "v", std::nullopt, door).has_value());
+    EXPECT_TRUE(b->write("k3", "v", std::nullopt, door).has_value());
 }
 
 TEST(CASBackendPrimitives, LegacyGetRefusesAValueThatIsNotAnIncarnation)
@@ -316,11 +397,6 @@ TEST(CASThrottlingBackend, EveryNthRefusesOnThePeriodAcrossKeys)
 namespace
 {
 
-CasRequests makeRequests(BackendPtr backend, FakeClock & clock, Fence fence = Fence::open())
-{
-    return CasRequests(std::move(backend), std::move(fence), clock.nowFn(), clock.sleepFn());
-}
-
 /// A type nothing in the engine catches, so a `decide` that throws it can only reach the caller by
 /// propagating unchanged.
 struct DecideMarker
@@ -407,24 +483,6 @@ TEST(CASIncarnation, RenderAndPersistedCompare)
     EXPECT_EQ(second.render(), "emulated:2");
     EXPECT_FALSE(persisted.matches(second));   /// a captured record never re-matches a later incarnation
     EXPECT_TRUE(PersistedIncarnation::capture(second).matches(second));
-}
-
-TEST(CASWriteResult, OrThrowReturnsForCommittedAndDeclined)
-{
-    FakeClock clock;
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto requests = makeRequests(backend, clock);
-    auto op = requests.admit();
-
-    WriteResult committed = op.create("k", "v", Retry::standard());
-    ASSERT_TRUE(std::holds_alternative<Committed>(committed));
-    const Incarnation landed = std::get<Committed>(committed).incarnation;
-    const auto returned = orThrow(std::move(committed), "create");
-    ASSERT_TRUE(returned.has_value());
-    EXPECT_EQ(*returned, landed);
-
-    /// Nothing to do is not a failure: the one non-throwing alternative that yields no incarnation.
-    EXPECT_FALSE(orThrow(WriteResult{Declined{ProvenAbsent{}}}, "declined").has_value());
 }
 
 TEST(CASRetry, BindSaturatesAndLeavesAnEqualLeaseOffTheLeaseSource)
@@ -525,15 +583,9 @@ TEST(CASRequests, AmbiguousCreateThatLandedIsCommittedByTheResolveRead)
 {
     FakeClock clock;
     auto backend = std::make_shared<CountingBackend>();
-    /// The object becomes durable and then the response is lost: the hook runs after the write is
-    /// applied, so the store holds the bytes the caller never learned it wrote.
-    bool response_already_lost = false;
-    backend->onWriteCommitted("k", [&]
-    {
-        if (std::exchange(response_already_lost, true))
-            return;
-        throw std::runtime_error("the response never came back");
-    });
+    /// The object becomes durable and THEN the response is lost, so the store holds bytes the caller
+    /// never learned it wrote -- the only ambiguity a resolve read can settle as a commit.
+    backend->injectAmbiguousLandedWrite("k");
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
 
@@ -810,6 +862,37 @@ TEST(CASRequests, TheGateBeforeTheSleepEndsTheCallWithoutASecondWrite)
     EXPECT_EQ(backend->readRequests(), 1u);
 }
 
+TEST(CASRequests, AResolveReadRefusedForLeaseBudgetIsReportedAsTheLeaseDeadline)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    bool lease_spent = false;
+    Fence fence{
+        [] { return uint64_t{0}; },
+        [&](uint64_t, uint64_t) { return lease_spent ? Fence::Admit::NoBudget : Fence::Admit::Ok; },
+        [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto op = requests.admit();
+    const Incarnation seen = *orThrow(op.create("k", "v", Retry::standard()), "create");
+
+    /// The store refuses the precondition, and the lease budget is gone by the time the read that
+    /// would say WHO holds the key is due. The call learned nothing about the key, so what it reports
+    /// is the bound that stopped it -- not a conflict it never observed.
+    backend->failNextCasPut("k");
+    backend->onBeforeWrite("k", [&] { lease_spent = true; });
+    const uint64_t lease_deadline = clock.now + 10'000;
+    WriteResult result = op.replace("k", "w", seen, Retry::untilLeaseSafe(lease_deadline, 2'000));
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+    EXPECT_TRUE(gave_up->sent_any);
+    EXPECT_TRUE(std::holds_alternative<NotObserved>(gave_up->last_seen));
+    EXPECT_TRUE(clock.sleeps.empty());
+    EXPECT_EQ(backend->writeRequests(), 2u);   /// the create and the one refused replace
+    EXPECT_EQ(backend->readRequests(), 0u);    /// the resolve read never started
+}
+
 TEST(CASRequests, LivenessPredicateEndsTheOperationLikeAFenceLoss)
 {
     FakeClock clock;
@@ -1083,6 +1166,25 @@ TEST(CASRequests, AnExpiredTokenNoRefreshCanFixIsRefusedRatherThanRiddenToTheDea
     ASSERT_TRUE(std::holds_alternative<Refused>(result));
     EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
     EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_TRUE(clock.sleeps.empty());
+}
+
+TEST(CASRequests, ANameOnlyAccessDenialOnAReadPropagatesWhenNoRefreshIsAvailable)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->setRefreshCredentialsResult(false);
+    /// Matched by NAME alone: the SDK reports this store's denial under its catch-all code, so the
+    /// name is the only thing that says a credential could explain it.
+    backend->failNextReadWith("k", s3Error(Aws::S3::S3Errors::UNKNOWN, "AccessDenied"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    /// One refresh is asked for and installs nothing, so nothing would sign differently: the read
+    /// propagates instead of spending its policy on a request that cannot start succeeding.
+    expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { (void)op.read("k", Retry::standard()); });
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+    EXPECT_EQ(backend->readRequests(), 1u);
     EXPECT_TRUE(clock.sleeps.empty());
 }
 

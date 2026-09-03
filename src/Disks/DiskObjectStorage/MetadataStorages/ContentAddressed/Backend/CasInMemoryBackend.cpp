@@ -135,6 +135,32 @@ std::optional<Backend::RawMeta> InMemoryBackend::head(const String & key, Transp
 std::expected<String, Backend::RawConflict> InMemoryBackend::write(
     const String & key, const String & bytes, const std::optional<String> & expected_value, TransportAccess &)
 {
+    return applyWrite(key, bytes, expected_value, WriteKnobs::All);
+}
+
+PutResult InMemoryBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta &)
+{
+    auto r = applyWrite(key, bytes, std::nullopt, WriteKnobs::AmbiguousPutIfAbsent);
+    if (!r)
+        return PutResult{PutOutcome::PreconditionFailed, {}};
+    return PutResult{PutOutcome::Done, legacyMintWritten(key, std::move(*r))};
+}
+
+CasResult InMemoryBackend::casPut(const String & key, const String & bytes,
+                                  const std::optional<Token> & expected, const ObjectMeta &)
+{
+    if (expected && legacyTokenIsForeign(key, *expected))
+        return CasResult{CasOutcome::Conflict, {}};
+    auto r = applyWrite(key, bytes, expected ? std::optional<String>(expected->value) : std::nullopt,
+                        WriteKnobs::FailNextCasPut);
+    if (!r)
+        return CasResult{CasOutcome::Conflict, {}};
+    return CasResult{CasOutcome::Committed, legacyMintWritten(key, std::move(*r))};
+}
+
+std::expected<String, Backend::RawConflict> InMemoryBackend::applyWrite(
+    const String & key, const String & bytes, const std::optional<String> & expected_value, WriteKnobs knobs)
+{
     if (expected_value)
         checkExpectedValue(key, *expected_value);
 
@@ -146,20 +172,26 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::write(
     if (auto hook = hookFor(before_write_hooks_, key))
         hook();
 
-    auto result = writeUnderLock(key, bytes, expected_value);
+    auto result = writeUnderLock(key, bytes, expected_value, knobs);
+    if (!result.has_value())
+        return result;
 
-    if (result.has_value())
-        if (auto hook = hookFor(write_committed_hooks_, key))
-            hook();
+    if (auto hook = hookFor(write_committed_hooks_, key))
+        hook();
+
+    /// Last, so the object is durable and every observer has run before the response goes missing.
+    if (knobs == WriteKnobs::All && takeAmbiguousLandedWrite(key))
+        throw std::runtime_error("InMemoryBackend: the write of '" + key + "' landed and its response was lost");
+
     return result;
 }
 
 std::expected<String, Backend::RawConflict> InMemoryBackend::writeUnderLock(
-    const String & key, const String & bytes, const std::optional<String> & expected_value)
+    const String & key, const String & bytes, const std::optional<String> & expected_value, WriteKnobs knobs)
 {
     std::lock_guard lock(mutex_);
 
-    if (!expected_value)
+    if (!expected_value && (knobs == WriteKnobs::All || knobs == WriteKnobs::AmbiguousPutIfAbsent))
     {
         // One-shot injected ambiguous outcome: throw WITHOUT touching the store, modeling a request
         // whose own attempt outcome never reached the caller (see the header doc for the
@@ -179,11 +211,14 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::writeUnderLock(
 
     // One-shot injected conflict, on EITHER form: the knob is armed against a conditional write, and
     // a create-if-absent is one -- the lease acquire this models creates its object.
-    auto fail_it = fail_next_cas_.find(key);
-    if (fail_it != fail_next_cas_.end())
+    if (knobs == WriteKnobs::All || knobs == WriteKnobs::FailNextCasPut)
     {
-        fail_next_cas_.erase(fail_it);
-        return std::unexpected(RawConflict{});
+        auto fail_it = fail_next_cas_.find(key);
+        if (fail_it != fail_next_cas_.end())
+        {
+            fail_next_cas_.erase(fail_it);
+            return std::unexpected(RawConflict{});
+        }
     }
 
     if (!expected_value)
@@ -441,6 +476,18 @@ void InMemoryBackend::injectAmbiguousPutIfAbsent(const String & key)
 {
     std::lock_guard lock(mutex_);
     ambiguous_put_keys_.insert(key);
+}
+
+void InMemoryBackend::injectAmbiguousLandedWrite(const String & key)
+{
+    std::lock_guard lock(mutex_);
+    ambiguous_landed_keys_.insert(key);
+}
+
+bool InMemoryBackend::takeAmbiguousLandedWrite(const String & key)
+{
+    std::lock_guard lock(mutex_);
+    return ambiguous_landed_keys_.erase(key) != 0;
 }
 
 void InMemoryBackend::setEnforceTokens(bool enforce)

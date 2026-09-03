@@ -1483,10 +1483,13 @@ public:
     /// ---- The transport primitives: every PHYSICAL request, whichever surface it entered through ----
     ///
     /// Counted apart from the legacy counters below, which split by the surface the CALLER used. A
-    /// legacy call reaches the store through its primitive and is therefore counted on both; a
     /// `CasRequests` call speaks only these, so an engine test asserting `putTotal` would assert on a
     /// surface the engine never touches. Each counter ticks BEFORE the request is served, so an
     /// injected failure still counts as a request issued.
+    ///
+    /// A legacy call is counted here TOO, because it reaches the store through its primitive -- with
+    /// the two exceptions `InMemoryBackend` documents, `putIfAbsent` and `casPut`, which route around
+    /// the primitive to keep their write knobs' verb identity and so land only on the legacy counters.
     std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         {
