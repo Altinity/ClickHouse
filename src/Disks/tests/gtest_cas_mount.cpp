@@ -493,9 +493,12 @@ TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     EXPECT_GE(e1, 1u);                                             // 0 is a reserved sentinel
     EXPECT_GT(e2, e1);                                             // strictly increasing
 
-    /// Deleting the (separate) mount object must NOT reset the epoch. No mount has been written in
-    /// Task 4, so deleteExact of a non-existent mount is a NotFound no-op that touches nothing.
-    const auto del = b->deleteExact(l.mountKey("r"), b->head(l.mountKey("r")).token);
+    /// Deleting the (separate) mount object must NOT reset the epoch. No mount has been written yet,
+    /// so deleteExact of it is a NotFound no-op that touches nothing -- exercised with a well-formed
+    /// placeholder token, not the absent HeadResult's empty one: InMemoryBackend refuses a malformed
+    /// token as a caller bug before it ever looks the key up, exactly like the production backend.
+    ASSERT_FALSE(b->head(l.mountKey("r")).exists);
+    const auto del = b->deleteExact(l.mountKey("r"), Token{"absent", TokenType::Emulated});
     EXPECT_EQ(del.kind, DeleteOutcome::Kind::NotFound);
     EXPECT_GT(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), e2);
 }

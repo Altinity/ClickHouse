@@ -894,7 +894,12 @@ Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::
             "have committed and must be resolved by reading back", key);
 
     auto hr = nativeHead(key);
-    return hr ? hr->token : Token{};
+    if (!hr)
+        throw Exception(ErrorCodes::CAS_WRITE_UNATTRIBUTED,
+            "CAS backend: a write of '{}' reported no incarnation and the follow-up HEAD found "
+            "nothing either; the write may have committed and must be resolved by reading back",
+            key);
+    return hr->token;
 }
 
 PutResult ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
@@ -989,19 +994,22 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
 
 PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
 {
-    /// §3.18 №19: reject a wrong-dialect expected token before it ever reaches the wire (Native) or
-    /// the emu compare (Emulated) — see mintingTypeMatches. A caller-visible mismatch, answered like
-    /// any other non-matching token, not a backend malfunction.
-    if (!mintingTypeMatches(expected.type))
-        return {PutOutcome::PreconditionFailed, {}};
-
     /// An empty, wildcard or list token would turn the precondition into an unconditional write --
-    /// refuse it as a caller bug, before it ever reaches the wire or the emu compare.
+    /// refuse it as a caller bug before anything else runs. Validated under the token's OWN declared
+    /// dialect (expected.type), not this backend's, so a malformed-AND-foreign-dialect token (e.g.
+    /// Token{} = empty value, ETag type, arriving at a Generation-dialect or EmulatedSingleProcess
+    /// backend) is still caught here rather than silently absorbed by the dialect check below.
     if (!isValidTokenValue(expected.type, expected.value))
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
             "an empty, wildcard or list token would turn the precondition into an unconditional write",
             key, expected.value, static_cast<int>(expected.type));
+
+    /// §3.18 №19: reject a wrong-dialect (but well-formed) expected token before it ever reaches the
+    /// wire (Native) or the emu compare (Emulated) — see mintingTypeMatches. A caller-visible
+    /// mismatch, answered like any other non-matching token, not a backend malfunction.
+    if (!mintingTypeMatches(expected.type))
+        return {PutOutcome::PreconditionFailed, {}};
 
     if (mode == Mode::Native)
     {
@@ -1021,19 +1029,19 @@ PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & 
 
 CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta)
 {
-    /// §3.18 №19: a create-if-absent CAS (expected == nullopt) has no token to validate; only the
-    /// swap form carries one, and it must match this backend's own minting dialect before anything
-    /// else runs.
-    if (expected.has_value() && !mintingTypeMatches(expected->type))
-        return {CasOutcome::Conflict, {}};
-
-    /// Same grammar guard as putOverwrite: an empty, wildcard or list expected token would turn the
-    /// compare into an unconditional write.
+    /// Same grammar guard as putOverwrite, and in the same order (see there for why): a create-if-
+    /// absent CAS (expected == nullopt) has no token to validate; only the swap form carries one, and
+    /// its VALUE is checked under its own declared dialect before the dialect-match check below.
     if (expected.has_value() && !isValidTokenValue(expected->type, expected->value))
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
             "an empty, wildcard or list token would turn the precondition into an unconditional write",
             key, expected->value, static_cast<int>(expected->type));
+
+    /// §3.18 №19: the swap form's token must match this backend's own minting dialect before anything
+    /// else runs.
+    if (expected.has_value() && !mintingTypeMatches(expected->type))
+        return {CasOutcome::Conflict, {}};
 
     if (mode == Mode::Native)
     {
@@ -1072,6 +1080,14 @@ CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes,
 
 DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token & token)
 {
+    /// Same grammar guard as putOverwrite/casPut, and in the same order (see there for why): the
+    /// token's VALUE is checked under its own declared dialect before the dialect-match check below.
+    if (!isValidTokenValue(token.type, token.value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, token.value, static_cast<int>(token.type));
+
     /// §3.18 №19: same local dialect guard as putOverwrite/casPut — never forward a foreign-dialect
     /// value as the removeObjectIfTokenMatches argument.
     if (!mintingTypeMatches(token.type))
@@ -1080,14 +1096,6 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
         d.kind = DeleteOutcome::Kind::TokenMismatch;
         return d;
     }
-
-    /// Same grammar guard as putOverwrite/casPut: an empty, wildcard or list token would turn the
-    /// precondition into an unconditional delete.
-    if (!isValidTokenValue(token.type, token.value))
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
-            "an empty, wildcard or list token would turn the precondition into an unconditional write",
-            key, token.value, static_cast<int>(token.type));
 
     if (mode == Mode::Native)
     {

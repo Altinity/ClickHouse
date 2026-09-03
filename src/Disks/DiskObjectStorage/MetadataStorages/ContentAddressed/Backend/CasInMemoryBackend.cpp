@@ -35,8 +35,10 @@ String sliceWindow(const String & data, Range range)
 }
 
 /// A CALLER bug, refused before it ever reaches the store: an empty, wildcard or list token would
-/// turn a conditional mutation into an unconditional one. Mirrors the grammar
-/// `ObjectStorageBackend::isValidTokenValue` enforces for its own Emulated-dialect tokens.
+/// turn a conditional mutation into an unconditional one. Stricter than
+/// `ObjectStorageBackend::isValidTokenValue(Emulated, ...)` (non-empty only): this backend is a test
+/// double reused across the whole CAS gtest suite, so it also refuses `*` and a comma even though no
+/// value it currently mints can contain either.
 bool isValidEmulatedTokenValue(const String & value)
 {
     return !value.empty() && value != "*" && value.find(',') == String::npos;
@@ -185,21 +187,22 @@ void InMemoryBackend::publishBlob(const BlobPublishRequest & request)
 
 PutResult InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
 {
-    std::lock_guard lock(mutex_);
-    auto it = store_.find(key);
-    if (it == store_.end())
-        return {PutOutcome::PreconditionFailed, {}};
-
     /// An empty, wildcard or list token would turn the precondition into an unconditional write --
-    /// refuse it as a caller bug. Checked only once there is a REAL object the malformed token could
-    /// clobber: a delete/overwrite of an absent key is already a no-op regardless of token shape (see
-    /// gtest_cas_mount.cpp's `AllocatorIsMonotoneAndSurvivesMountConcept`, which deletes an absent
-    /// mount with a HEAD-derived, necessarily empty token and expects a graceful NotFound/PreconditionFailed).
+    /// refuse it as a caller bug, unconditionally, matching ObjectStorageBackend's own guard: this is
+    /// the test backend for that production contract, and must not accept anything production
+    /// refuses. A caller that only has a HEAD-derived token for a key it has not confirmed exists
+    /// must gate on `.exists` itself before calling, exactly as every production call site already
+    /// does (see CasProbe.cpp's cleanup, CasPlainObjects.cpp, CasOrphanManifestSweep.cpp, etc.).
     if (!isValidEmulatedTokenValue(expected.value))
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
             "an empty, wildcard or list token would turn the precondition into an unconditional write",
             key, expected.value);
+
+    std::lock_guard lock(mutex_);
+    auto it = store_.find(key);
+    if (it == store_.end())
+        return {PutOutcome::PreconditionFailed, {}};
 
     if (enforce_tokens_ && it->second.token != expected)
         return {PutOutcome::PreconditionFailed, {}};
@@ -213,6 +216,14 @@ PutResult InMemoryBackend::putOverwrite(const String & key, const String & bytes
 
 CasResult InMemoryBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta)
 {
+    /// See putOverwrite: refuse a malformed expected token as a caller bug, unconditionally. A
+    /// create-if-absent CAS (expected == nullopt) has no token to validate.
+    if (expected.has_value() && !isValidEmulatedTokenValue(expected->value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, expected->value);
+
     std::lock_guard lock(mutex_);
 
     // One-shot injected conflict
@@ -245,14 +256,6 @@ CasResult InMemoryBackend::casPut(const String & key, const String & bytes, cons
         if (!exists)
             return {CasOutcome::Conflict, {}};
 
-        /// See putOverwrite: refuse a malformed expected token as a caller bug, but only once there is
-        /// a real object it could turn into an unconditional overwrite of.
-        if (!isValidEmulatedTokenValue(expected->value))
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
-                "an empty, wildcard or list token would turn the precondition into an unconditional write",
-                key, expected->value);
-
         if (enforce_tokens_ && it->second.token != *expected)
             return {CasOutcome::Conflict, {}};
         Token t = mintToken();
@@ -274,15 +277,6 @@ DeleteOutcome InMemoryBackend::applyDelete(const String & key, const Token & tok
         return d;
     }
 
-    /// See putOverwrite: refuse a malformed token as a caller bug, but only once there is a real
-    /// object it could turn an unconditional delete of -- deleting an absent key is already a
-    /// harmless NotFound no-op regardless of token shape.
-    if (!isValidEmulatedTokenValue(token.value))
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
-            "an empty, wildcard or list token would turn the precondition into an unconditional write",
-            key, token.value);
-
     if (enforce_tokens_ && it->second.token != token)
     {
         DeleteOutcome d;
@@ -299,6 +293,15 @@ DeleteOutcome InMemoryBackend::applyDelete(const String & key, const Token & tok
 
 DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & token)
 {
+    /// See putOverwrite: refuse a malformed token as a caller bug, unconditionally -- covers both the
+    /// immediate delete below and the hold_deletes_ enqueue path, so a queued PendingDelete can never
+    /// carry a malformed token either.
+    if (!isValidEmulatedTokenValue(token.value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, token.value);
+
     std::lock_guard lock(mutex_);
 
     if (hold_deletes_)
@@ -312,15 +315,6 @@ DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & tok
             d.kind = DeleteOutcome::Kind::NotFound;
             return d;
         }
-
-        /// See applyDelete: refuse a malformed token only once there is a real object it could turn
-        /// an unconditional delete of.
-        if (!isValidEmulatedTokenValue(token.value))
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
-                "an empty, wildcard or list token would turn the precondition into an unconditional write",
-                key, token.value);
-
         if (enforce_tokens_ && it->second.token != token)
         {
             DeleteOutcome d;
