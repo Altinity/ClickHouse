@@ -414,12 +414,13 @@ TEST(CASGCLease, DeadIncumbentThenRevivedIncumbentWinsRace)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);
 }
 
-TEST(CASGCLease, ConcurrentStealLosesCas)
+/// The steal's refused precondition, case one of two: the re-decide sees the SAME frozen incumbent.
+/// `readModifyWrite` does not treat a refusal as terminal -- it re-decides against what the refused
+/// write's own resolve read observed and sends another attempt -- so a contender that was steal-eligible
+/// still is, and the steal lands inside the SAME round. The two cases are separate tests because they
+/// differ only in what the store holds at the re-decide, and that is the whole decision.
+TEST(CASGCLease, RefusedStealAgainstAFrozenIncumbentRetriesAndLands)
 {
-    /// The CAS-race horn: gc2 is steal-eligible and goes for the CAS, but gc/state moved under it
-    /// (injected one-shot conflict). It must back off (never acquired=true off a lost CAS) and the
-    /// owner on storage must be unperturbed. The injected conflict left the object unchanged, so gc2's
-    /// NEXT round is steal-eligible again and succeeds.
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
     Gc gc1(s, kGcA);
@@ -428,20 +429,75 @@ TEST(CASGCLease, ConcurrentStealLosesCas)
     ASSERT_TRUE(gc1.runRegularRound().acquired_lease);
     const GcState st0 = readState(*b, *s);
     EXPECT_FALSE(gc2.runRegularRound().acquired_lease);          /// obs #1; gc1 stalls now
-    b->refuseNextWrite(s->layout().gcStateKey());                 /// inject: gc2's steal CAS conflicts
-    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);          /// steal attempt loses the CAS => back off
+    /// `refuseNextWrite` refuses without touching the object, which is what "the incumbent is still
+    /// frozen" looks like to the re-decide.
+    b->refuseNextWrite(s->layout().gcStateKey());
+    EXPECT_TRUE(gc2.runRegularRound().acquired_lease)
+        << "a refused steal against an unmoved tuple is retried inside the same call and lands";
     const GcState st1 = readState(*b, *s);
-    EXPECT_EQ(st1.lease.owner, kGcA);                            /// unchanged
-    EXPECT_EQ(st1.lease.seq, st0.lease.seq);                     /// nothing clobbered
-    EXPECT_TRUE(gc2.runRegularRound().acquired_lease);           /// still steal-eligible => succeeds now
-    EXPECT_EQ(readState(*b, *s).lease.owner, kGcB);
+    EXPECT_EQ(st1.lease.owner, kGcB);
+    EXPECT_GT(st1.lease.seq, st0.lease.seq);
+}
+
+/// Case two: the re-decide sees a MOVED tuple. This is what a real refused precondition means -- a
+/// store refuses only what changed -- and the incumbent's own renewal is the change. The contender must
+/// then decline rather than steal, because a moved tuple is proof of life, and it must leave the
+/// incumbent's lease exactly as the incumbent wrote it.
+TEST(CASGCLease, RefusedStealWhoseRedecideSeesAMovedTupleDeclines)
+{
+    class StealRaceBackend : public InMemoryBackend
+    {
+    public:
+        std::expected<String, RawConflict> write(
+            const String & key, const String & bytes, const std::optional<String> & expected_value,
+            TransportAccess & access) override
+        {
+            if (arm && expected_value && key == gc_state_key)
+            {
+                const auto stored = InMemoryBackend::read(key, access);
+                if (stored)
+                {
+                    arm = false;
+                    /// The incumbent renews while this contender is deciding: bump its own `seq` under
+                    /// its own owner, then refuse. Written before the refusal is returned, so the
+                    /// resolve read the engine makes next observes the moved tuple.
+                    GcState renewed = decodeGcState(stored->bytes);
+                    ++renewed.lease.seq;
+                    (void)InMemoryBackend::write(key, encodeGcState(renewed), stored->value, access);
+                    return std::unexpected(RawConflict{});
+                }
+            }
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        }
+
+        String gc_state_key;
+        bool arm = false;
+    };
+
+    auto b = std::make_shared<StealRaceBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    b->gc_state_key = s->layout().gcStateKey();
+    Gc gc1(s, kGcA);
+    Gc gc2(s, kGcB);
+
+    ASSERT_TRUE(gc1.runRegularRound().acquired_lease);
+    const GcState st0 = readState(*b, *s);
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);          /// obs #1; gc1 stalls now
+    b->arm = true;
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease)
+        << "the re-decide sees a renewed incumbent, which is proof of life: decline, never steal";
+    const GcState st1 = readState(*b, *s);
+    EXPECT_EQ(st1.lease.owner, kGcA)
+        << "gc2 wrote nothing that landed: a steal would have put kGcB here";
+    EXPECT_EQ(st1.lease.seq, st0.lease.seq + 1)
+        << "the only write that landed is the incumbent's injected renewal";
 }
 
 TEST(CASGCLease, CreateConflictReReadsWithinTheBound)
 {
-    /// The create-Conflict branch: a fresh pool where the create-if-absent CAS conflicts (one-shot).
-    /// The contender re-reads and falls through within its bounded (2) CAS attempts — the re-read still
-    /// finds the key absent, so the second attempt creates and acquires.
+    /// The create-Conflict branch: a fresh pool where the create-if-absent write is refused (one-shot).
+    /// `readModifyWrite` re-decides against the refused write's own resolve read, which still finds the
+    /// key absent, so the second attempt creates and acquires. The retry policy's deadline is the bound.
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
     Gc gc(s, hexToU128("0000000000000000000000000000000c"));
@@ -464,9 +520,9 @@ TEST(CASGCLease, CtorFailsClosedOnBadArguments)
 
 TEST(CASGCLease, IncumbentRenewConflictRetriesOnceAndAcquires)
 {
-    /// The incumbent's own renew CAS conflicts (one-shot). Re-read sees our own ownership => the renew
-    /// is retried ONCE within the bounded (2) CAS attempts => acquired. Never acquired=true without a
-    /// Committed CAS — storage must carry the seq the SECOND (committed) attempt wrote.
+    /// The incumbent's own renew write is refused (one-shot). The re-decide sees our own ownership, so
+    /// the renew is retried and acquires; the retry policy's deadline is the bound. Never
+    /// acquired=true without a committed write — storage must carry the seq the SECOND attempt wrote.
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
     Gc gc(s, hexToU128("0000000000000000000000000000000d"));
@@ -2137,9 +2193,19 @@ TEST(CASGc, RoundCommitConflictDropsTheRound)
 
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
-    const auto readState = [&] { return decodeGcState(op.read(backend->gc_state_key, Retry::once())->bytes); };
+    /// Asserts presence rather than dereferencing: `gc/state` does not exist until a round's own lease
+    /// acquire creates it, and an empty optional here is undefined behaviour, not a failing assertion.
+    const auto readState = [&]
+    {
+        const auto got = op.read(backend->gc_state_key, Retry::once());
+        EXPECT_TRUE(got) << "gc/state must exist once a round has acquired the lease";
+        return got ? decodeGcState(got->bytes) : GcState{};
+    };
 
     Gc gc(store, kGc);
+    /// One honest round first, so the comparison below is against a committed round rather than
+    /// against a bootstrap: the double is disarmed, so this round's own commit lands.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     const GcState before = readState();
     backend->arm = true;
     try

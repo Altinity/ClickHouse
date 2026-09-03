@@ -79,9 +79,9 @@ size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
     return rounds;
 }
 
-/// A backend that throws ONCE on the SINGLE round-commit `gc/state` CAS — the casPut that advances
-/// snap_generation (the one-pass round has exactly one such CAS; the lease-acquire CAS does not advance
-/// snap_generation, so "advances snap_generation" uniquely picks the round commit).
+/// A backend that refuses ONCE the SINGLE round-commit `gc/state` write — the conditional write that
+/// advances snap_generation (the one-pass round has exactly one such write; the lease acquire/renew does
+/// not advance snap_generation, so "advances snap_generation" uniquely picks the round commit).
 class InterruptRoundCasBackend : public InMemoryBackend
 {
 public:
@@ -91,16 +91,21 @@ public:
         const String & key, const String & bytes, const std::optional<String> & expected_value,
         TransportAccess & access) override
     {
-        if (arm_interrupt && key == gc_state_key)
+        if (arm_interrupt && expected_value && key == gc_state_key)
         {
             const auto stored = InMemoryBackend::read(key, access);
-            const uint64_t stored_gen = stored ? decodeGcState(stored->bytes).snap_generation : 0;
-            const uint64_t next_gen = decodeGcState(bytes).snap_generation;
-            if (next_gen > stored_gen)
+            if (stored
+                && decodeGcState(bytes).snap_generation > decodeGcState(stored->bytes).snap_generation)
             {
-                arm_interrupt = false;   /// one-shot: only depose the first round-commit CAS
-                throw DB::Exception(DB::ErrorCodes::ABORTED,
-                    "test-injected: round-commit gc/state CAS denied (leader deposed mid-round; lease lost)");
+                arm_interrupt = false;   /// one-shot: only depose the first round-commit write
+                /// A REFUSAL, not a throw: a thrown transport error is an ambiguity the engine settles
+                /// by an exact read and then reissues while the precondition it named is unmoved, so
+                /// the round would commit on the reissue. A refused precondition ends the write at
+                /// once. The object is moved too -- the same bytes under a fresh incarnation -- because
+                /// a store refuses only what changed; the CONTENT is deliberately left alone, so this
+                /// round's own lease and cursor are exactly what a deposed round leaves behind.
+                (void)InMemoryBackend::write(key, stored->bytes, stored->value, access);
+                return std::unexpected(RawConflict{});
             }
         }
         return InMemoryBackend::write(key, bytes, expected_value, access);

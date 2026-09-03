@@ -364,22 +364,40 @@ TEST(CASGCLog, TransientErrorClassifierFailsClosed)
     EXPECT_FALSE(DB::Cas::isTransientGcRoundError(-1));
 }
 
-/// A backend that lets the round's FIRST `gc/state` CAS (the lease acquire/renew) through and throws
-/// a transient error on the SECOND (the round-closing commit). The round therefore does all of its
-/// pre-CAS work -- including condemning the dropped part -- and dies at `round_commit`.
-class StateCommitThrowingBackend : public InMemoryBackend
+/// A backend that REFUSES the round-closing `gc/state` write -- the one that advances
+/// `snap_generation` -- and lets every other write through, the lease acquire/renew included. The round
+/// therefore does all of its pre-CAS work, condemning the dropped part included, and dies at
+/// `round_commit`.
+///
+/// A refusal and not a throw, for two reasons. A thrown transport error is an ambiguity the engine
+/// settles by an exact read and, while the precondition it named is unmoved, reissues to the policy
+/// deadline -- so an armed fault would spend the whole retry window and end as a transport give-up. And
+/// the arm is keyed on the generation rather than on a call count, because the acquire on a fresh pool
+/// is an UNCONDITIONAL create that no count of conditional writes can see.
+class StateCommitRefusingBackend : public InMemoryBackend
 {
 public:
     std::expected<String, RawConflict> write(
         const String & key, const String & bytes, const std::optional<String> & expected_value,
         TransportAccess & access) override
     {
-        if (arm && expected_value && key.ends_with("gc/state") && ++state_puts_since_arm >= 2)
-            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected outage on the round-closing write");
+        if (arm.load() && expected_value && key.ends_with("gc/state"))
+        {
+            const auto stored = InMemoryBackend::read(key, access);
+            if (stored
+                && decodeGcState(bytes).snap_generation > decodeGcState(stored->bytes).snap_generation)
+            {
+                arm.store(false);
+                /// A store refuses a precondition only when the object moved, so move it: the same
+                /// bytes under a fresh incarnation is the smallest faithful move, and it leaves the
+                /// content alone so the assertions below stay about this round.
+                (void)InMemoryBackend::write(key, stored->bytes, stored->value, access);
+                return std::unexpected(RawConflict{});
+            }
+        }
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
     std::atomic<bool> arm{false};
-    std::atomic<int> state_puts_since_arm{0};
 };
 
 /// The Finish row of a THROWING round must still carry the counters of everything the round did
@@ -388,7 +406,7 @@ public:
 /// indistinguishable from a round that never got past the lease.
 TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
 {
-    auto backend = std::make_shared<StateCommitThrowingBackend>();
+    auto backend = std::make_shared<StateCommitRefusingBackend>();
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"srv1/tbl"};
@@ -409,8 +427,8 @@ TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
     ASSERT_EQ(round_rows.size(), 2u);
     const Rec & fin = round_rows[1];
     EXPECT_EQ(fin.outcome, Rec::Outcome::Aborted);
-    /// The outage on the round-closing write is settled by the engine's own resolving read, which
-    /// proves the write did not land: the round sees a conflict, not a transport error.
+    /// A refused precondition is settled by one exact read and reported as a conflict, so the round
+    /// is dropped whole and names the conflict rather than a transport error.
     EXPECT_EQ(fin.error_code, DB::ErrorCodes::ABORTED);
     EXPECT_EQ(fin.round, 0u) << "the commit never landed, so the round number must stay unstamped";
     EXPECT_GT(fin.candidates_marked + fin.entries_condemned + fin.entries_graduated

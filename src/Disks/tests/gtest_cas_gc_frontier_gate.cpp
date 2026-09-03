@@ -12,10 +12,12 @@
 #include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
 
+#include <Poco/Exception.h>
 #include <Poco/StreamChannel.h>
 
 #include <algorithm>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -72,6 +74,13 @@ namespace
 {
 
 const UInt128 kGc = hexToU128("00000000000000000000000000000001");
+
+/// The `CASCatalogLifecycleReconciler` suites drive the reconciler directly and own the fact its
+/// operation's liveness samples -- `DrainRaceBackend::afterReadOf` moves it at an exact request
+/// boundary -- so there is nothing for a refresh to re-read. Named rather than an inline `{}` because
+/// `reconcile` takes the argument by requirement, precisely so that erasing without a refresh has to
+/// be said out loud.
+const std::function<void()> kNoAuthorityRefresh{};
 
 /// The lying store, shared from `cas_test_helpers.h`: every key is served by exact GET while the
 /// selected ones are HIDDEN from every LIST. That is the only way to build the cross-namespace
@@ -202,7 +211,11 @@ public:
         if (lose_response && result.has_value())
         {
             record("cas_response_lost " + key);
-            throw std::runtime_error("injected lost catalog CAS response");
+            /// `Poco::TimeoutException`, because that is the class the write loop cannot distinguish
+            /// from a lost response: it settles the attempt by an exact read, finds these bytes under a
+            /// moved incarnation, and reports the write committed. A non-`Poco` exception is rethrown
+            /// unchanged instead, which would propagate a landed write as a failure.
+            throw Poco::TimeoutException("injected lost catalog CAS response");
         }
         return result;
     }
@@ -2927,7 +2940,7 @@ TEST(CASCatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
 
     CasFoldSeal parent;
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
@@ -2953,7 +2966,7 @@ TEST(CASCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCut
     backend->resetCounts();
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);
@@ -2990,7 +3003,7 @@ TEST(CASCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterRes
     });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowAbsent);
@@ -3020,7 +3033,7 @@ TEST(CASCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPrese
     backend->afterReadOf(layout.refCatalogKey(), [&] { authority_held = false; });
 
     CatalogLifecycleReconciler reconciler(fenced_op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::FencedOut);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::ExactRowStillPresent);
@@ -3051,7 +3064,7 @@ TEST(CASCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut
     backend->conflictNextCatalogCas(layout.refCatalogKey());
 
     CatalogLifecycleReconciler reconciler(op, layout, parent);
-    const CatalogLifecycleReconcileResult result = reconciler.reconcile();
+    const CatalogLifecycleReconcileResult result = reconciler.reconcile(kNoAuthorityRefresh);
 
     EXPECT_EQ(result.authority_status, AuthorityStatus::Authoritative);
     EXPECT_EQ(result.catalog_resolution, CatalogResolution::DrainComplete);

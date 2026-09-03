@@ -459,9 +459,14 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
 /// incarnation a paused leader's `delete_pending` snapshot holds) and replaying the round's own
 /// observe-compare-remove sequence AFTER the surviving leader's spare and the writer's republication --
 /// the faithful destructive step, without a mid-round interrupt seam on the delete path.
+///
+/// The replay really SENDS its removal when the comparison passes, and the removal counter below is
+/// what makes the closing fsck mean something: on the clear-on-spare regression the spare publishes
+/// `Clean`, the writer's dedup hit keeps `t1`, the comparison passes, the live body is removed and
+/// both the counter and the fsck dangle count move.
 TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -516,12 +521,18 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
         << "the writer resurrected to a fresh incarnation, not a reuse of t1";
 
     /// L1 resumes and replays its stale pre-CAS redelete exactly as the round performs one: observe the
-    /// key, compare the condemned incarnation against what is there, and only then remove. The
-    /// comparison fails against t2, so no removal is sent at all -- the live reuse is untouchable.
+    /// key, compare the condemned incarnation against what is there, and remove ONLY on a match. The
+    /// removal is genuinely attempted on a match, so this step is destructive whenever the writer
+    /// reused `t1`.
+    const uint64_t removals_before = backend->deleteCount(blob_key);
     const std::optional<Meta> stale = op.head(blob_key, Retry::once());
     ASSERT_TRUE(stale);
     EXPECT_FALSE(t1.matches(stale->incarnation))
         << "the stale redelete must miss the live reuse (add-only closes INV_NO_LOSS)";
+    if (t1.matches(stale->incarnation))
+        (void)op.remove(blob_key, stale->incarnation, Retry::once());
+    EXPECT_EQ(backend->deleteCount(blob_key), removals_before)
+        << "the comparison failed, so the redelete sent no removal at all against the live body";
 
     /// The live body under t2 survives, stays reachable via the committed r2, and fsck sees no dangle.
     const std::optional<Meta> survivor = op.head(blob_key, Retry::once());
