@@ -31,9 +31,7 @@ PoolConfig singleAttemptConfig()
         .server_root_id = "test",
         .background_watermark = false,
     };
-    config.cas_request_budget.max_attempts = 1;
     config.cas_request_budget.attempt_timeout_ms = 100;
-    config.cas_request_budget.operation_deadline_ms = 5000;
     config.cas_request_budget.lease_safety_margin_ms = 100;
     return config;
 }
@@ -182,8 +180,11 @@ TEST(CASWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemove
     EXPECT_EQ(
         store->livePrecommitsForTest(ns),
         (std::set<std::pair<String, ManifestRef>>{{"successor", successor_id.ref}}));
-    EXPECT_TRUE(backend->head(abandoned_manifest_key).exists)
-        << "the removed precommit body remains GC-owned until its decrement is sealed";
+    {
+        DB::Cas::tests::OperationForTest verify_op(*backend);
+        EXPECT_TRUE((*verify_op).head(abandoned_manifest_key, Retry::once()).has_value())
+            << "the removed precommit body remains GC-owned until its decrement is sealed";
+    }
 
     successor->abandon();
     EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
@@ -374,8 +375,6 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     const CasRequestBudget budget{
         .attempt_timeout_ms = 50,
-        .operation_deadline_ms = 500,
-        .max_attempts = 1,
         .lease_safety_margin_ms = 50,
     };
     const RootNamespace ns{"srv1/writer_duty_crash"};
@@ -402,7 +401,8 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
     abandoned.reset();
     predecessor.reset();
 
-    const auto mount = backend->get(mount_key);
+    DB::Cas::tests::OperationForTest mount_op(*backend);
+    const auto mount = (*mount_op).read(mount_key, Retry::once());
     ASSERT_TRUE(mount.has_value());
     EXPECT_NE(decodeMountLease(mount->bytes).min_active_build_sequence, std::numeric_limits<uint64_t>::max())
         << "a live writer-cleanup duty forbids the clean-release certificate";
@@ -450,8 +450,6 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     const CasRequestBudget budget{
         .attempt_timeout_ms = 50,
-        .operation_deadline_ms = 500,
-        .max_attempts = 1,
         .lease_safety_margin_ms = 50,
     };
     /// Rooted under the POOL's OWN `server_root_id` ("test", unlike this file's other fixtures, which
@@ -484,8 +482,11 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     ManifestId rejected_id;
     auto rejected = stageEmptyManifest(predecessor, ns, "rejected", rejected_id);
     const String rejected_manifest_key = predecessor->layout().manifestKey(rejected_id);
-    ASSERT_TRUE(backend->head(rejected_manifest_key).exists)
-        << "stageManifest's body write is unconditional; only the owner grant is refused below";
+    {
+        DB::Cas::tests::OperationForTest verify_op(*backend);
+        ASSERT_TRUE((*verify_op).head(rejected_manifest_key, Retry::once()).has_value())
+            << "stageManifest's body write is unconditional; only the owner grant is refused below";
+    }
 
     /// `Unresolved` lands nothing, so the wedge it leaves resolves as a conclusive REJECT once the
     /// successor's own recovery walks past it -- unlike the ADOPT-arm crash-remnant test, this
@@ -537,10 +538,11 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     EXPECT_EQ(seal->writer_epoch, predecessor_epoch);
 
     Gc gc(successor_store, hexToU128("000000000000000000000000000000e1"));
-    for (int round = 0; round < 16 && backend->head(rejected_manifest_key).exists; ++round)
+    DB::Cas::tests::OperationForTest sweep_op(*backend);
+    for (int round = 0; round < 16 && (*sweep_op).head(rejected_manifest_key, Retry::once()).has_value(); ++round)
         DB::Cas::tests::runRegularRoundReclaiming(gc);
 
-    EXPECT_FALSE(backend->head(rejected_manifest_key).exists)
+    EXPECT_FALSE((*sweep_op).head(rejected_manifest_key, Retry::once()).has_value())
         << "the rejected attempt's orphan manifest must eventually be nominated and swept once its "
            "build epoch is durably closed";
 
