@@ -415,7 +415,7 @@ TEST(CASPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
     DB::Cas::tests::OperationForTest scan(*backend);
     for (String cursor;;)
     {
-        const Cas::KeyPage page = (*scan).list(backend->fault_key_substr, cursor, 1000, Cas::Retry::standard());
+        const Cas::ListPage page = (*scan).list(backend->fault_key_substr, cursor, 1000, Cas::Retry::standard());
         for (const auto & listed : page.keys)
         {
             if (listed.key > greatest_key)
