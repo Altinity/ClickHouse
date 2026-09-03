@@ -773,10 +773,10 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
 
 }
 
-/// Test 9 (chunk-failure variant a -- definite failure): chunk 2's PUT is conclusively rejected
-/// (`CasWriteOutcome::DefiniteFailure`). Chunk 1's caller (the leader's own item) observes SUCCESS with
-/// chunk 1's real id; chunk 2's caller fails; the lane does NOT wedge (a definite rejection is a safe
-/// gap, not an uncertain PUT).
+/// Test 9 (chunk-failure variant a -- definite failure): chunk 2's create is conclusively rejected by
+/// the store. Chunk 1's caller (the leader's own item) observes SUCCESS with chunk 1's real id; chunk
+/// 2's caller fails; the lane does NOT wedge (a proven refusal is a safe gap, not an uncertain
+/// write).
 TEST(CASRefWriterChunkedFlush, ChunkFailureDefinite)
 {
 #if !USE_AWS_S3

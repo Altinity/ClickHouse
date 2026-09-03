@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
@@ -149,9 +150,9 @@ PoolPtr openPoolFenceControlled(const BackendPtr & backend)
 }
 
 /// Runs `f`, requires it to throw the ref lane's retry-later condition, and returns the message so a
-/// caller can assert WHICH condition it was. The message is the only place the `CasUnresolvedReason`
-/// surfaces -- there is no accessor for it, by design (it is a diagnostic, not state) -- so this is how
-/// a test proves the reason actually reached the decision site instead of defaulting.
+/// caller can assert WHICH condition it was. The message is the only place the lane's own reading of a
+/// give-up surfaces -- there is no accessor for it, by design (it is a diagnostic, not state) -- so
+/// this is how a test proves the verdict reached the decision site instead of defaulting.
 String retryLaterMessageOf(const std::function<void()> & f)
 {
     try
@@ -446,39 +447,88 @@ TEST(CASRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
         << "a wedged lane may hold a durable transaction the runtime has not recorded";
 }
 
-/// Task 18's regression guard, asserted on the mapping itself rather than through six pieces of fault
-/// choreography. `unresolvedProvesNothingWasSent` is the whole decision: the ledger wedges unless it
-/// answers true, so this table IS the protocol.
+/// The whole wedge decision, as one table. `GaveUp::sent_any` is what the ledger branches on -- it
+/// returns the attempt to `Ready` when nothing was sent and wedges otherwise -- so this table IS the
+/// protocol. Each row is DRIVEN rather than asserted about a mapping: the point of the old enum-shaped
+/// version was that a value could be listed without any way to reach it.
 ///
-/// What protects a future contributor who adds a `CasUnresolvedReason` member and forgets this file:
-/// the predicate is a switch with NO `default`, so the addition is a `-Wswitch` build error (a forced
-/// decision, not a silent one), and its trailing `return false` makes the runtime answer "wedge" even
-/// if that diagnostic is ever suppressed. Both directions fail closed; neither can widen the allow-list
-/// by omission. The `static_assert`s make the mapping a compile-time fact, and the `EXPECT`s repeat it
-/// so a break names the offending value in the test report.
-TEST(CASRefInstallSafety, OnlyNoAttemptSentMaySkipTheWedge)
+/// `sent_any` is set on the line before the attempt goes out, so exactly one shape can report it false:
+/// every gate refused before the first request. The four rows below it are the ways a call can end
+/// AFTER something reached the network, and each leaves an object that may be durable.
+TEST(CASRefInstallSafety, OnlySendingNothingMaySkipTheWedge)
 {
-    static_assert(unresolvedProvesNothingWasSent(CasUnresolvedReason::NoAttemptSent));
-    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::NotUnresolved));
-    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::FenceLostMidWay));
-    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::DeadlineMidWay));
-    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::FenceLostPostWrite));
-    static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::AttemptsExhausted));
+    /// Row 1: the caller's own facts refuse before the attempt. Nothing reaches the store.
+    {
+        auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+        CasRequests requests(backend, Fence::open());
+        CasOperation op = requests.admit([] { return false; });
+        const WriteResult result = op.create("k", "v", Retry::standard());
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_TRUE(gave_up != nullptr);
+        EXPECT_FALSE(gave_up->sent_any)
+            << "the pre-attempt gates rejected before the first request: the key is provably unwritten";
+        EXPECT_EQ(backend->writeTotal(), 0u);
+    }
 
-    EXPECT_TRUE(unresolvedProvesNothingWasSent(CasUnresolvedReason::NoAttemptSent))
-        << "the pre-attempt gates rejected before the first request: the key is provably unwritten";
-    /// `NotUnresolved` is reachable at the decision site if any path ever returns `Unresolved` without
-    /// recording a reason, so it is listed here as a real case, not as enum hygiene.
-    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::NotUnresolved))
-        << "an unrecorded reason proves nothing and must keep wedging";
-    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::FenceLostMidWay))
-        << "an attempt was already sent: its object may be durable";
-    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::DeadlineMidWay))
-        << "an attempt was already sent: its object may be durable";
-    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::FenceLostPostWrite))
-        << "the attempt COMMITTED and only the fence was lost afterwards -- the most durable case of all";
-    EXPECT_FALSE(unresolvedProvesNothingWasSent(CasUnresolvedReason::AttemptsExhausted))
-        << "every attempt is a candidate for having landed";
+    /// Row 2: the OTHER pre-attempt refusal. Same verdict, a different bound.
+    {
+        auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+        uint64_t clock = 0;
+        CasRequests requests(backend, Fence::open(),
+                             [&clock]() -> uint64_t { const uint64_t t = clock; clock += 1000; return t; });
+        CasOperation op = requests.admit();
+        const WriteResult result = op.create("k", "v", Retry::within(500));
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_TRUE(gave_up != nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+        EXPECT_FALSE(gave_up->sent_any);
+        EXPECT_EQ(backend->writeTotal(), 0u);
+    }
+
+    /// Row 3: an attempt was sent and its outcome never settled.
+    {
+        auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+        backend->injectAmbiguousWrite("k");
+        CasRequests requests(backend, Fence::open());
+        CasOperation op = requests.admit();
+        const WriteResult result = op.create("k", "v", Retry::once());
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_TRUE(gave_up != nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
+        EXPECT_TRUE(gave_up->sent_any) << "an attempt was already sent: its object may be durable";
+    }
+
+    /// Row 4: the attempt COMMITTED and only the admission was lost afterwards -- the most durable case
+    /// of all, and the one a caller is most tempted to report as success.
+    {
+        auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+        bool live = true;
+        backend->onWriteCommitted("k", [&live] { live = false; });
+        CasRequests requests(backend, Fence::open());
+        CasOperation op = requests.admit([&live] { return live; });
+        const WriteResult result = op.create("k", "v", Retry::standard());
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_TRUE(gave_up != nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
+        EXPECT_TRUE(gave_up->sent_any);
+        EXPECT_EQ(backend->writeTotal(), 1u) << "and the object IS there";
+    }
+
+    /// Row 5: the deadline arrives AFTER an attempt rather than before one. The clock is moved by a
+    /// hook that runs inside the write, so the first attempt is admitted and the settling read is not.
+    {
+        auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+        uint64_t clock = 0;
+        backend->onBeforeWrite("k", [&clock] { clock = 100'000; });
+        backend->injectAmbiguousWrite("k");
+        CasRequests requests(backend, Fence::open(), [&clock]() -> uint64_t { return clock; });
+        CasOperation op = requests.admit();
+        const WriteResult result = op.create("k", "v", Retry::within(1000));
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_TRUE(gave_up != nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+        EXPECT_TRUE(gave_up->sent_any) << "an attempt was already sent: its object may be durable";
+    }
 }
 
 /// Task 5 (spec §A1, site 2). Resolving a wedge is a post-durable install too: the resolving GET PROVES
