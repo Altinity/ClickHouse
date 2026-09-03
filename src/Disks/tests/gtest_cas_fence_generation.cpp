@@ -43,6 +43,8 @@ namespace
 class TripOnHeadBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
     HeadResult head(const String & key) override
     {
         if (trigger)
@@ -59,6 +61,8 @@ public:
 class TripOnSecondHeadBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
     using Backend::putIfAbsent;
 
     HeadResult head(const String & key) override
@@ -148,6 +152,8 @@ PartWriteTxnPtr precommittedBuildForBlob(
 class BlobPublicationFenceBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
     enum class TripPoint : uint8_t
     {
         OnHead,

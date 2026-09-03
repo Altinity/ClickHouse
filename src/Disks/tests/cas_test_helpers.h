@@ -1903,6 +1903,8 @@ template <typename Base>
 class HintHoleBackendOn : public Base
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using Base::list;
     /// Hide every key under `prefix` from LIST -- a whole namespace, including objects a later publish
     /// adds.
     void hidePrefix(const String & prefix)

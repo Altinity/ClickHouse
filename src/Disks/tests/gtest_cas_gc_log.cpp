@@ -183,6 +183,9 @@ namespace
 class ThrowingBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
+    using InMemoryBackend::list;
     ListPage list(const String & prefix, const String & cursor, size_t limit) override
     {
         if (arm)
@@ -312,6 +315,8 @@ TEST(CASGCLog, AbortedFinishOnThrowingRound)
 class NetworkThrowingBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     ListPage list(const String & prefix, const String & cursor, size_t limit) override
     {
         if (arm)
@@ -412,6 +417,8 @@ TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
 class ModalThrowingBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     enum Mode : int { Off = 0, Transient = 1, Logic = 2 };
     ListPage list(const String & prefix, const String & cursor, size_t limit) override
     {

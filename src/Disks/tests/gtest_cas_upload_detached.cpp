@@ -106,6 +106,8 @@ std::optional<MetaState> metaStateAt(InMemoryBackend & b, const Layout & layout,
 class ProtocolRecordingBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
     void watch(String blob_key_, String meta_key_)
     {
         blob_key = std::move(blob_key_);

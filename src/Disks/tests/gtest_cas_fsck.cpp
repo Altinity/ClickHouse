@@ -45,6 +45,8 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 class RepublishOnListBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     void armOnFirstList(String prefix, std::function<void()> mutation)
     {
         std::lock_guard<std::mutex> lock(arm_mutex);
@@ -125,6 +127,8 @@ enum class FsckListingMode : uint8_t
 class FsckListingBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     void distort(String prefix_, FsckListingMode mode_)
     {
         prefix = std::move(prefix_);
@@ -500,6 +504,8 @@ namespace
 class AdmitLifeAfterNamespaceListingBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     explicit AdmitLifeAfterNamespaceListingBackend(NamespaceLifeId life_) : protected_life(std::move(life_)) {}
 
     ListPage list(const String & prefix, const String & cursor, size_t limit) override

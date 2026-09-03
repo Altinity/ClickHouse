@@ -110,6 +110,8 @@ private:
 class ReplacingManifestAfterObservationBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     using Backend::get;
 
     void arm(const Layout & layout, String manifest_key_)

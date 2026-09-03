@@ -175,6 +175,21 @@ public:
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
+    /// The transport primitives forward to `inner`; the legacy overrides above are what this
+    /// double injects through. Declared because `Backend` declares them pure.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override { return inner->read(key, access); }
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        return inner->write(key, bytes, expected_value, access);
+    }
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override { return inner->stream(key, access); }
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override { inner->publish(request, access); }
+    Dialect dialect() const override { return inner->dialect(); }
+
 private:
     BackendPtr inner;
     String target_key;
@@ -207,6 +222,29 @@ public:
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
+    /// The primitives count too: `Backend::probeSentinelRaw` reaches the store through them, so a
+    /// per-key observation on the primitive path would otherwise go uncounted.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        ++get_counts[key];
+        return inner->read(key, access);
+    }
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        ++head_counts[key];
+        return inner->head(key, access);
+    }
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        return inner->write(key, bytes, expected_value, access);
+    }
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override { return inner->stream(key, access); }
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override { inner->publish(request, access); }
+    Dialect dialect() const override { return inner->dialect(); }
+
 private:
     BackendPtr inner;
     std::map<String, size_t> head_counts;
@@ -217,6 +255,8 @@ private:
 class RacingBlobPublicationBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
     void watch(String key_)
     {
         std::lock_guard lock(mutex);
@@ -849,6 +889,26 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+        /// `read` is a GET, so it counts on the watched key too -- otherwise the INV-1 fence below
+        /// would stop seeing a revival read the moment its caller takes the primitive path.
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
+        {
+            if (key == watched_key)
+                ++get_count;
+            return inner->read(key, access);
+        }
+        std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
+        RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
+        RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+        std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                                 const std::optional<String> & expected_value, TransportAccess & access) override
+        {
+            return inner->write(key, bytes, expected_value, access);
+        }
+        std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override { return inner->stream(key, access); }
+        void publish(const BlobPublishRequest & request, TransportAccess & access) override { inner->publish(request, access); }
+        Dialect dialect() const override { return inner->dialect(); }
     private:
         BackendPtr inner;
         String watched_key;
@@ -927,6 +987,26 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+        /// `read` is a GET, so it counts on the watched key too -- otherwise the INV-1 fence below
+        /// would stop seeing a revival read the moment its caller takes the primitive path.
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
+        {
+            if (key == watched_key)
+                ++get_count;
+            return inner->read(key, access);
+        }
+        std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
+        RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
+        RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+        std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                                 const std::optional<String> & expected_value, TransportAccess & access) override
+        {
+            return inner->write(key, bytes, expected_value, access);
+        }
+        std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override { return inner->stream(key, access); }
+        void publish(const BlobPublishRequest & request, TransportAccess & access) override { inner->publish(request, access); }
+        Dialect dialect() const override { return inner->dialect(); }
     private:
         BackendPtr inner;
         String watched_key;
@@ -1496,6 +1576,34 @@ TEST(CASPartWriteTxn, AdoptEvidenceRecordsTrustedManifestDependencyProofWithoutI
         CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DeleteOutcome deleteExact(const String & k, const Token & t) override { return inner->deleteExact(k, t); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+        /// The primitives count on the same three counters, so "no backend op" stays a total claim
+        /// whichever path a caller takes.
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
+        {
+            ++gets;
+            return inner->read(key, access);
+        }
+        std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+        {
+            ++heads;
+            return inner->head(key, access);
+        }
+        RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
+        RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+        std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                                 const std::optional<String> & expected_value, TransportAccess & access) override
+        {
+            ++puts;
+            return inner->write(key, bytes, expected_value, access);
+        }
+        std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override { return inner->stream(key, access); }
+        void publish(const BlobPublishRequest & request, TransportAccess & access) override
+        {
+            ++puts;
+            inner->publish(request, access);
+        }
+        Dialect dialect() const override { return inner->dialect(); }
     private:
         BackendPtr inner;
     };
@@ -2356,6 +2464,8 @@ namespace
 class BlobPutFaultBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
     int fault_count = 0;                 /// remaining ambiguous faults on matching create attempts
     bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
     int publish_stream_attempts = 0;     /// unconditional streaming publications observed

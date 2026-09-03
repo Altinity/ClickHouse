@@ -63,6 +63,9 @@ void fenceOutMount(Backend & backend, const String & mount_key)
 class ToggleableTransportFaultBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
+    using InMemoryBackend::list;
     /// Unhide the base convenience overloads, matching every other Backend subclass in this suite.
     using Backend::get;
     using Backend::getStream;
