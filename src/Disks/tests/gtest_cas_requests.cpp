@@ -1112,7 +1112,7 @@ TEST(CASRequests, AnAccessDenialNoRefreshCanFixIsRefusedOnTheFirstAttempt)
     EXPECT_TRUE(clock.sleeps.empty());
 }
 
-TEST(CASRequests, OneCredentialRefreshPerCallEvenWhenTheDenialRepeats)
+TEST(CASRequests, ASecondCredentialAnswerAfterTheOneRefreshIsRefused)
 {
     FakeClock clock;
     auto backend = std::make_shared<CountingBackend>();
@@ -1123,16 +1123,55 @@ TEST(CASRequests, OneCredentialRefreshPerCallEvenWhenTheDenialRepeats)
     auto op = requests.admit();
 
     WriteResult result = op.create("k", "v", Retry::standard());
+    /// The store answers a denial BEFORE it applies anything, so neither attempt landed and no read
+    /// has anything to settle. A call gets one refresh, so the denial that survives it is the answer.
+    ASSERT_TRUE(std::holds_alternative<Refused>(result));
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+    EXPECT_EQ(backend->writeRequests(), 2u);
+    EXPECT_EQ(backend->readRequests(), 0u);
+    EXPECT_EQ(clock.sleeps.size(), 1u);   /// the one paced re-send under the credentials it installed
+}
+
+TEST(CASRequests, UnderOnceTheStoreAnswerStandsEvenWhenTheRefreshSucceeded)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->setRefreshCredentialsResult(true);
+    backend->failNextWriteWith("k", s3Error(Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    /// Fresh credentials only help a reissue, and `once` has none to sign. Reporting the attempt as
+    /// unresolved instead would turn a policy that sends one request into one that sleeps.
+    WriteResult result = op.create("k", "v", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Refused>(result));
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->readRequests(), 0u);
+    EXPECT_TRUE(clock.sleeps.empty());
+}
+
+TEST(CASRequests, ACredentialAnswerAfterAnAmbiguousAttemptStillOwesTheResolveRead)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->setRefreshCredentialsResult(true);
+    /// The first attempt's fate is unknown and it may yet land; the second is a proven non-application.
+    backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+    backend->failNextWriteWith("k", s3Error(Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    WriteResult result = op.create("k", "v", Retry::standard());
     const auto * committed = std::get_if<Committed>(&result);
     ASSERT_NE(committed, nullptr);
     EXPECT_EQ(committed->attempts_sent, 3u);
-    /// The storage hands back a fresh client every time it is asked, so refreshing per attempt would
-    /// ride a permanent denial to the deadline. The second denial also cannot be REFUSED: an earlier
-    /// attempt of this call is still ambiguous, and a later refusal proves nothing about it.
+    /// The refresh does not license a direct re-send here: the OTHER attempt is still unresolved, so
+    /// the read that settles it is still owed.
+    EXPECT_EQ(backend->readRequests(), 2u);
     EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
 }
 
-TEST(CASRequests, AnExpiredTokenARefreshFixesIsAmbiguousAndReissuedOnce)
+TEST(CASRequests, AnExpiredTokenARefreshFixesIsResentWithoutAResolveRead)
 {
     FakeClock clock;
     auto backend = std::make_shared<CountingBackend>();
@@ -1144,12 +1183,13 @@ TEST(CASRequests, AnExpiredTokenARefreshFixesIsAmbiguousAndReissuedOnce)
     WriteResult result = op.create("k", "v", Retry::standard());
     const auto * committed = std::get_if<Committed>(&result);
     ASSERT_NE(committed, nullptr);
-    /// Fresh credentials make the attempt AMBIGUOUS rather than refused: it may have been signed
-    /// correctly and landed, so a resolve read comes before the reissue.
     EXPECT_EQ(committed->attempts_sent, 2u);
     EXPECT_FALSE(committed->resolved_by_read);
-    EXPECT_EQ(backend->readRequests(), 1u);
+    /// The credential answer proves its OWN attempt never applied, and no earlier attempt of this call
+    /// is unresolved, so the re-send under the fresh credentials owes no read.
+    EXPECT_EQ(backend->readRequests(), 0u);
     EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+    EXPECT_EQ(clock.sleeps.size(), 1u);
 }
 
 TEST(CASRequests, AnExpiredTokenNoRefreshCanFixIsRefusedRatherThanRiddenToTheDeadline)
