@@ -38,6 +38,11 @@ const String kFile = "format_version.txt";
 const String kFilePath = kTablePath + "/" + kFile;
 const UInt128 kLife2Id = hexToU128("22222222222222222222222222222222");
 
+/// The erase entry point requires a liveness refresh because a real drain's liveness is a cached flag
+/// its owner re-reads from the store. This fixture's operation carries no liveness at all, so there is
+/// nothing cached for a refresh to update.
+void noAuthorityRefresh() {}
+
 struct DiskFixture
 {
     DB::ObjectStoragePtr object_storage;
@@ -108,7 +113,7 @@ void deleteCatalogLife(
     parent.ref_lives.emplace(life1.incarnation, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
-    if (CasRefCatalog::deleteCompletedRemoving(op, layout, *it, parent)
+    if (CasRefCatalog::deleteCompletedRemoving(op, layout, *it, parent, noAuthorityRefresh)
         != CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted)
         throw DB::Exception(
             DB::ErrorCodes::LOGICAL_ERROR, "Failed to delete fixture catalog life '{}'", life1.ns.string());

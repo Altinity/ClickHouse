@@ -186,6 +186,12 @@ private:
     bool fence_moved = false;
 };
 
+/// The erase entry points require a liveness refresh because a real drain's liveness is a cached flag
+/// its owner re-reads from the store. These fixtures' operations carry either no liveness or a direct
+/// read of the fixture, so there is nothing cached for a refresh to update. Named rather than repeated
+/// inline, so a site that DOES need a refresh cannot hide among the ones that do not.
+void noAuthorityRefresh() {}
+
 /// Seeds one object, failing the current test rather than returning a value nobody checks.
 void seedObject(CasOperation & op, const String & key, const String & bytes)
 {
@@ -1206,14 +1212,14 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndAd
             .last_folded_ref_id = RefTxnId{1, 2},
             .hold = RefHold{.offending_position = RefTxnId{1, 3}}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, held_parent),
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, held_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
 
     CasFoldSeal mismatched_parent;
     mismatched_parent.ref_lives.emplace(UInt128{8}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, mismatched_parent),
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, mismatched_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
 
     CasFoldSeal ready_parent;
@@ -1224,12 +1230,12 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndAd
     CatalogEntry live = removing;
     live.state = NsState::Live;
     live.removal_started_round.reset();
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, live, ready_parent),
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, live, ready_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
     CatalogEntry creating = live;
     creating.state = NsState::Creating;
     creating.creator = CreatorFence{.server_root_id = "server", .writer_epoch = 3, .fence_generation = 4};
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, creating, ready_parent),
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, creating, ready_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::ProofRefused);
 
     /// An operation whose admission is gone erases nothing and sends nothing. It is driven at a cut an
@@ -1237,11 +1243,12 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndAd
     /// take one.
     CasOperation withdrawn = requests.admit([] { return false; });
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-                  withdrawn, layout, CasRefCatalog::read(op, layout), removing, ready_parent),
+                  withdrawn, layout, CasRefCatalog::read(op, layout), removing, ready_parent,
+                  noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
     const uint64_t writes_before_erase = backend->writes(layout.refCatalogKey());
 
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent),
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_before_erase + 1);
@@ -1280,7 +1287,7 @@ TEST(CASRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent),
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::EntryChanged);
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{current});
 }
@@ -1344,7 +1351,8 @@ TEST(CASRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrRepl
 
         const CasRefCatalog::CompletedRemovingDeleteResult result
             = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-                op, layout, CasRefCatalog::read(reader, layout), removing, ready_parent);
+                op, layout, CasRefCatalog::read(reader, layout), removing, ready_parent,
+                noAuthorityRefresh);
 
         EXPECT_EQ(result.outcome, CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
         const RefCatalog current = CasRefCatalog::read(reader, layout).catalog;
@@ -1382,7 +1390,7 @@ TEST(CASRefCatalogRemoval, ATransientEraseFailureIsResolvedByAReadAndReissued)
     backend->failNextWriteWith(layout.refCatalogKey(), std::make_exception_ptr(
         Poco::TimeoutException("injected erase failure whose outcome never reached the caller")));
 
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent),
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
@@ -1419,7 +1427,7 @@ TEST(CASRefCatalogRemoval, AConflictingEraseBacksOffBeforeItsRetry)
 
     backend->refuseNextWrite(layout.refCatalogKey());
 
-    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent),
+    EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
     ASSERT_EQ(clock.sleeps.size(), 1u) << "one refusal, so exactly one paced retry";
     EXPECT_LE(clock.sleeps.front(), 200u) << "the first reissue's full-jitter ceiling";
@@ -1512,7 +1520,7 @@ TEST(CASRefCatalogRemoval, AStoreRefusalEndsTheEraseLoopInsteadOfRetryingIt)
     /// under the code the store gave, so an operator sees what the store actually said.
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&]
     {
-        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent);
+        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh);
     });
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed + 1)
         << "a refusal is terminal: the loop must not send a second erase";
@@ -1561,7 +1569,7 @@ TEST(CASRefCatalogRemoval, ACommitTheResolutionReadContradictsFailsRetryLaterIns
     String message;
     try
     {
-        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent);
+        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh);
         ADD_FAILURE() << "a commit the resolution read contradicts must not be reported as a deletion";
     }
     catch (const DB::Exception & e)
@@ -1623,7 +1631,7 @@ TEST(CASRefCatalogRemoval, PerpetualConflictEndsAtTheAttemptCapAndSaysSo)
     String message;
     try
     {
-        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent);
+        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh);
         ADD_FAILURE() << "a permanently refused erase must not return an outcome";
     }
     catch (const DB::Exception & e)

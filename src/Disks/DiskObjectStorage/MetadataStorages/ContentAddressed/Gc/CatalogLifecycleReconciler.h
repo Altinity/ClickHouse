@@ -45,11 +45,11 @@ public:
     CatalogLifecycleReconciler(
         CasOperation & op_, const Layout & layout_, const CasFoldSeal & adopted_parent_);
 
-    /// `refresh_authority` is forwarded to each erase, which runs it at the top of every attempt --
-    /// one refresh per attempt, and none on a path that sends none. It is a refresh, not a verdict:
-    /// the verdict stays `op.admitted()`. So every erase is authorised by a reading taken in its own
-    /// attempt, while the drain-complete verdict reads whatever the last erase's refresh left.
-    CatalogLifecycleReconcileResult reconcile(const std::function<void()> & refresh_authority = {});
+    /// `refresh_authority` is forwarded to each erase, which runs it at the top of every attempt, so
+    /// every erase is authorised by a reading taken in its own attempt. It is a refresh, not a
+    /// verdict: the verdict stays `op.admitted()`. The drain-complete exit is not refreshed and needs
+    /// no refresh: it sends nothing, and reports from the reading its last erase left.
+    CatalogLifecycleReconcileResult reconcile(const std::function<void()> & refresh_authority);
 
 private:
     std::optional<CatalogEntry> selectEligible(const CasRefCatalog::Snapshot & catalog) const;
