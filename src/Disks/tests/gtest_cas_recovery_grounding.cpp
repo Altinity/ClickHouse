@@ -571,7 +571,7 @@ TEST(CASRecoveryGrounding, CheckpointSnapshotEqualToLastEpochSealIsRejectedBefor
         .checkpoint_snapshot_id = RefTxnId{1, 2},
         .last_epoch_seal = RefTxnId{1, 2}};
     ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.replace(
-        layout.refCkptKey(life), encodeRefCkpt(with_sealed_base), before.incarnation, Retry::standard())));
+        layout.refCkptKey(life), encodeRefCkpt(with_sealed_base), before.etag, Retry::standard())));
 
     backend->resetCounts();
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
@@ -645,7 +645,7 @@ TEST(CASRecoveryGrounding, OlderCheckpointSnapshotAtSealIsCorruption)
         .checkpoint_snapshot_id = RefTxnId{1, 2},
         .last_epoch_seal = RefTxnId{2, 2}};
     ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.replace(
-        layout.refCkptKey(life), encodeRefCkpt(with_old_sealed_base), before.incarnation, Retry::standard())));
+        layout.refCkptKey(life), encodeRefCkpt(with_old_sealed_base), before.etag, Retry::standard())));
 
     backend->resetCounts();
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
