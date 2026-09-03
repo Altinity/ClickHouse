@@ -21,10 +21,10 @@ namespace DB::Cas
 {
 
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
-/// too large, or an access denial that is NOT an expired credential. The carve-out is the complement
-/// of the credential-refresh predicate by construction rather than a list of error names, so every
-/// failure a refresh could fix stays ambiguous and is reissued instead of being reported as a refusal.
-/// A non-S3 exception is never a refusal: an unmodeled error may have landed.
+/// too large, or an access denial. Whether a STALE CREDENTIAL explains the denial is not asked here --
+/// the engine asks the backend for fresh credentials first, and an answer that survives a successful
+/// refresh is the refusal this predicate names. A non-S3 exception is never a refusal: an unmodeled
+/// error may have landed.
 bool isDefinitelyRefusedWrite(const std::exception & e);
 
 /// Deterministic caller/local bugs, surfaced unchanged by every loop here: reissuing only replays the

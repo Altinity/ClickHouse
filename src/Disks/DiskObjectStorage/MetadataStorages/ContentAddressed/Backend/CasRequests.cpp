@@ -144,8 +144,7 @@ bool isDefinitelyRefusedWrite([[maybe_unused]] const std::exception & e)
 {
 #if USE_AWS_S3
     if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
-        return S3::isMalformedRequestError(*s3) || S3::isEntityTooLargeError(*s3)
-            || (S3::isAccessDeniedError(*s3) && !isRefreshableCredentialError(e));
+        return S3::isMalformedRequestError(*s3) || S3::isEntityTooLargeError(*s3) || S3::isAccessDeniedError(*s3);
 #endif
     return false;
 }
@@ -608,19 +607,19 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         {
             if (isDeterministicLocalFailure(e.code()))
                 throw;
-            /// The refusal is decided BEFORE any refresh, so an oversized entity or a malformed
-            /// request -- neither of which a credential can fix -- never triggers a re-acquisition.
-            /// The refusal predicate carves the refresh class out by construction, so a stale
-            /// credential cannot reach here: it stays ambiguous and the reissue signs with whatever the
-            /// refresh installed. A refusal that FOLLOWS an ambiguous attempt of this call proves
-            /// nothing about that attempt, so it is settled by the read below instead.
-            if (isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
+            /// One refresh, and only for the class a credential could explain -- so an oversized entity
+            /// or a malformed request never triggers a re-acquisition. Fresh credentials make the
+            /// attempt ambiguous rather than refused: it may have been signed correctly and landed, and
+            /// the reissue signs with the new client. Nothing installed means nothing would sign
+            /// differently, so the store's answer stands.
+            const bool refreshed = isRefreshableCredentialError(e) && owner.backend->refreshCredentials();
+            /// A refusal that FOLLOWS an ambiguous attempt of this call proves nothing about that
+            /// attempt, so it is settled by the read below instead of ending the call here.
+            if (!refreshed && isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
             {
                 ProfileEvents::increment(ProfileEvents::CASRequestRefused);
                 return Refused{e.code(), e.message()};
             }
-            if (isRefreshableCredentialError(e))
-                owner.backend->refreshCredentials();
         }
         catch (const std::exception &)
         {
