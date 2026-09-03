@@ -31,24 +31,6 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
-
-#include <aws/core/Aws.h>
-#include <aws/core/auth/AWSCredentials.h>
-#include <aws/core/auth/AWSCredentialsProvider.h>
-#include <aws/s3/model/PutObjectRequest.h>
-#include <aws/s3/model/CreateMultipartUploadRequest.h>
-#include <aws/s3/model/CompleteMultipartUploadRequest.h>
-#include <aws/s3/model/AbortMultipartUploadRequest.h>
-#include <aws/s3/model/UploadPartRequest.h>
-#include <aws/s3/model/HeadObjectRequest.h>
-#include <aws/s3/S3Client.h>
-#include <aws/s3/S3Errors.h>
-
-#include <IO/S3/Client.h>
-#include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
-#include <Common/tests/gtest_global_context.h>
-
-#include <sstream>
 #endif
 
 using namespace DB::Cas;
@@ -58,7 +40,6 @@ namespace DB::ErrorCodes
 extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
 extern const int LOGICAL_ERROR;
-extern const int CAS_WRITE_UNATTRIBUTED;
 }
 
 namespace
@@ -1645,123 +1626,6 @@ TEST(CASObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWir
 
     /// The live incarnation must be untouched by all three rejected attempts.
     EXPECT_EQ(backend.head("k/dialect").token, live);
-}
-
-namespace
-{
-
-/// A minimal S3 double, scoped to this file, whose PutObject can answer with NO ETag at all (SetETag
-/// never called) -- the "the store accepted the write but its response carried no incarnation" case
-/// tokenFromWriteResult's CAS_WRITE_UNATTRIBUTED guard exists for. Mirrors the shape of
-/// FakeGenerationS3Client in gtest_cas_backend_generation.cpp (that class is file-local to its own
-/// translation unit, not reusable from here); trimmed to just PutObject, since putIfAbsent on a tiny
-/// payload never reaches multipart or HEAD.
-class FakeNoEtagS3Client : public DB::S3::Client
-{
-private:
-    struct State
-    {
-        bool put_returns_no_etag = false;
-        size_t put_object_calls = 0;
-        std::mutex mutex;
-    };
-
-    const std::shared_ptr<State> state;
-
-public:
-    FakeNoEtagS3Client()
-        : FakeNoEtagS3Client(std::make_shared<State>(), GetClientConfiguration())
-    {
-    }
-
-    static DB::S3::PocoHTTPClientConfiguration GetClientConfiguration()
-    {
-        DB::RemoteHostFilter remote_host_filter;
-        return DB::S3::ClientFactory::instance().createClientConfiguration(
-            "some-region",
-            remote_host_filter,
-            /* s3_max_redirects = */ 100,
-            DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 0},
-            /* s3_slow_all_threads_after_network_error = */ true,
-            /* s3_slow_all_threads_after_retryable_error = */ true,
-            /* enable_s3_requests_logging = */ true,
-            /* for_disk_s3 = */ false,
-            /* opt_disk_name = */ {},
-            /* request_throttler = */ {});
-    }
-
-    bool & put_returns_no_etag;
-    size_t & put_object_calls;
-
-    std::unique_ptr<DB::S3::Client> cloneWithConfigurationOverride(
-        const DB::S3::PocoHTTPClientConfiguration & client_configuration_override) const override
-    {
-        return std::unique_ptr<DB::S3::Client>(new FakeNoEtagS3Client(state, client_configuration_override));
-    }
-
-    Aws::S3::Model::PutObjectOutcome PutObject(const Aws::S3::Model::PutObjectRequest & request) const override
-    {
-        std::lock_guard lock(state->mutex);
-        ++put_object_calls;
-        Aws::S3::Model::PutObjectResult result;
-        if (!put_returns_no_etag)
-            result.SetETag("\"deadbeef\"");
-        (void)request;
-        return result;
-    }
-
-private:
-    FakeNoEtagS3Client(std::shared_ptr<State> state_, const DB::S3::PocoHTTPClientConfiguration & client_configuration)
-        : DB::S3::Client(
-            100,
-            DB::S3::ServerSideEncryptionKMSConfig(),
-            std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>("", ""),
-            client_configuration,
-            Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-            DB::S3::ClientSettings{
-                .use_virtual_addressing = true,
-                .disable_checksum = false,
-                .gcs_issue_compose_request = false,
-                .is_s3express_bucket = false,
-            })
-        , state(std::move(state_))
-        , put_returns_no_etag(state->put_returns_no_etag)
-        , put_object_calls(state->put_object_calls)
-    {
-    }
-};
-
-std::shared_ptr<DB::S3ObjectStorage> makeNoEtagS3ObjectStorageForTest(FakeNoEtagS3Client *& out_client)
-{
-    auto owned_client = std::make_unique<FakeNoEtagS3Client>();
-    out_client = owned_client.get();
-
-    DB::S3::URI uri;
-    uri.bucket = "cas-no-etag-bucket";
-    DB::S3Capabilities capabilities;
-    DB::ObjectStorageKeyGeneratorPtr key_generator;
-    auto settings = std::make_unique<DB::S3Settings>();
-
-    return std::make_shared<DB::S3ObjectStorage>(
-        std::move(owned_client), std::move(settings), std::move(uri), capabilities, key_generator, "cas-no-etag-disk");
-}
-
-}
-
-/// The write-response half of the grammar: a real S3-style write response (see the class comment on
-/// tokenFromWriteResult) that carries no ETag at all must not fall back to a HEAD -- there is no HEAD
-/// that can attribute the write with certainty, since the object it would read back might not even be
-/// the one this call just wrote.
-TEST(CASBackendGrammar, NamelessWriteResponseThrowsWriteUnattributed)
-{
-    (void)getContext();
-    FakeNoEtagS3Client * client = nullptr;
-    auto storage = makeNoEtagS3ObjectStorageForTest(client);
-    client->put_returns_no_etag = true;
-
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED, [&] { backend.putIfAbsent("k", "v"); });
-    EXPECT_EQ(client->put_object_calls, 1u);
 }
 
 /// The incarnation grammar: an empty, wildcard or list token would turn a conditional mutation into

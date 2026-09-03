@@ -36,6 +36,7 @@ using namespace DB::Cas;
 namespace DB::ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
+    extern const int CAS_WRITE_UNATTRIBUTED;
 }
 
 #if USE_AWS_S3
@@ -664,6 +665,29 @@ TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
     EXPECT_EQ(client->put_object_calls, 1u);
     EXPECT_EQ(client->head_object_calls, 0u);
     EXPECT_EQ(client->objects.at("p/gen/publish-no-generation"), "freshpayload");
+}
+
+/// The write-response half of the incarnation grammar: a real S3-style write response (see the class
+/// comment on tokenFromWriteResult) that carries no ETag at all must not fall back to a HEAD -- there
+/// is no HEAD that can attribute the write with certainty, since the object it would read back might
+/// not even be the one this call just wrote. This is the ETag-dialect sibling of
+/// PublishBlobSucceedsWithoutResponseGeneration above: that test's publishBlob call never reaches
+/// tokenFromWriteResult, so it is unaffected by this guard. Default (ETag) dialect here, deliberately
+/// NOT stamped Generation: the Generation branch of tokenFromWriteResult has its own, already-covered
+/// CORRUPTED_DATA path (CASBackendGenerationS3.WriteEmptyGenerationThrows and
+/// WriteNonNumericGenerationThrows, above).
+TEST(CASBackendGrammar, NamelessWriteResponseThrowsWriteUnattributed)
+{
+    (void)getContext();
+    FakeGenerationS3Client * client = nullptr;
+    auto storage = makeGenerationS3ObjectStorageForTest(client);
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    ASSERT_EQ(backend.nativeTokenType(), TokenType::ETag);
+    client->put_returns_no_etag = true;
+
+    DB::Cas::tests::expectThrowsCode(
+        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED, [&] { backend.putIfAbsent("p/gen/nameless-write", "v"); });
+    EXPECT_EQ(client->put_object_calls, 1u);
 }
 
 /// The moved cap, end to end: a conditional write on a generation store stays in ONE PUT up to the
