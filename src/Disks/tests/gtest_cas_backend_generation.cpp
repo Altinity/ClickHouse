@@ -228,7 +228,7 @@ TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
     DB::Cas::tests::OperationForTest op(*b);
     const auto hr = (*op).head(key, Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_EQ(hr->incarnation.dialect(), Dialect::Generation);
+    EXPECT_EQ(hr->etag.dialect(), Dialect::Generation);
     EXPECT_EQ(b->dialect(), Dialect::Generation);
 }
 
@@ -782,7 +782,7 @@ TEST_F(CASBackendGenerationS3, WriteGenerationTokenStripsTransportQuoting)
     DB::Cas::tests::OperationForTest op(*backend);
     const WriteResult put = (*op).create("p/gen/quoted-write", "v", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(put));
-    const Etag & minted = std::get<Committed>(put).incarnation;
+    const Etag & minted = std::get<Committed>(put).etag;
     EXPECT_EQ(minted.dialect(), Dialect::Generation);
     EXPECT_EQ(PersistedEtag::capture(minted).value, "1783078552147137");
 }
@@ -799,8 +799,8 @@ TEST_F(CASBackendGenerationS3, HeadGenerationTokenStripsTransportQuoting)
     DB::Cas::tests::OperationForTest op(*backend);
     const auto hr = (*op).head("p/gen/quoted-head", Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_EQ(hr->incarnation.dialect(), Dialect::Generation);
-    EXPECT_EQ(PersistedEtag::capture(hr->incarnation).value, "1783078552147137");
+    EXPECT_EQ(hr->etag.dialect(), Dialect::Generation);
+    EXPECT_EQ(PersistedEtag::capture(hr->etag).value, "1783078552147137");
 }
 
 /// The bound on that stripping. An ETag-dialect token IS the quoted ETag, and the quotes are required
@@ -815,8 +815,8 @@ TEST_F(CASBackendGenerationS3, EtagDialectKeepsTransportQuotingVerbatim)
     DB::Cas::tests::OperationForTest op(*backend);
     const auto hr = (*op).head("p/etag/quoted-head", Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_EQ(hr->incarnation.dialect(), Dialect::ETag);
-    EXPECT_EQ(PersistedEtag::capture(hr->incarnation).value, "\"d41d8cd98f00b204e9800998ecf8427e\"");
+    EXPECT_EQ(hr->etag.dialect(), Dialect::ETag);
+    EXPECT_EQ(PersistedEtag::capture(hr->etag).value, "\"d41d8cd98f00b204e9800998ecf8427e\"");
 }
 
 /// A successful HEAD on a generation-dialect backend whose response carries no ETag/generation at all must not mint a token
