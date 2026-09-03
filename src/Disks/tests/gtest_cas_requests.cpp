@@ -1406,6 +1406,24 @@ std::exception_ptr s3Error(Aws::S3::S3Errors code, const String & name)
     return std::make_exception_ptr(DB::S3Exception("the store answered " + name, code, name));
 }
 
+/// Answers EVERY read with the same store error. A classification that terminates on an error is then
+/// visible as a single attempt, and one that keeps the error ambiguous as a policy spent to its
+/// deadline -- which a one-shot arming could never tell apart.
+class AlwaysFailingReadBackend final : public CountingBackend
+{
+public:
+    explicit AlwaysFailingReadBackend(std::exception_ptr error_) : error(std::move(error_)) {}
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        (void)CountingBackend::read(key, access);
+        std::rethrow_exception(error);
+    }
+
+private:
+    std::exception_ptr error;
+};
+
 }
 
 TEST(CASRequests, DeadlineIsTheOnlyBoundUnderZeroLatencyThrottling)
@@ -1648,6 +1666,39 @@ TEST(CASRequests, ReadModifyWriteWhoseResolveAndFreshObservationBothFailGivesUpU
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getTotal(), 3u);
     EXPECT_EQ(clock.sleeps.size(), 1u);
+}
+
+/// A missing bucket is an ANSWER the store gave, but not an answer about the object: an S3-compatible
+/// store that transiently misroutes a bucket says exactly this, and a read that ended on it would turn
+/// an availability blip into a hard failure. It stays in the ambiguous class -- reissued until the
+/// policy's deadline -- like a throttle or a 5xx.
+TEST(CASRequests, AMissingBucketOnAReadIsReissuedToTheDeadline)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<AlwaysFailingReadBackend>(
+        s3Error(Aws::S3::S3Errors::NO_SUCH_BUCKET, "NoSuchBucket"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    const uint64_t start = clock.now;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)op.read("k", Retry::standard()); });
+    EXPECT_GT(backend->getTotal(), 1u) << "the read ended on its first attempt instead of reissuing";
+    EXPECT_GE(clock.now - start, 85'000u) << "the policy's own deadline is what must end this read";
+}
+
+/// The kept half of the same classification: a key miss IS an answer about the object, so reissuing it
+/// only replays the same authoritative absence until the deadline. One attempt, no pause.
+TEST(CASRequests, AnAuthoritativeKeyMissOnAReadEndsTheCallAtOnce)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<AlwaysFailingReadBackend>(
+        s3Error(Aws::S3::S3Errors::NO_SUCH_KEY, "NoSuchKey"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { (void)op.read("k", Retry::standard()); });
+    EXPECT_EQ(backend->getTotal(), 1u);
+    EXPECT_TRUE(clock.sleeps.empty());
 }
 
 TEST(CASRequests, AnUnmodeledStoreErrorOnAReadIsReissuedNotSurfaced)
