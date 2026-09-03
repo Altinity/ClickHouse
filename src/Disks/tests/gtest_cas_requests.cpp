@@ -5,7 +5,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include "cas_test_helpers.h"
 
 #include <type_traits>
@@ -17,23 +16,11 @@ extern const int S3_ERROR;
 extern const int NETWORK_ERROR;
 }
 
-namespace DB::Cas
-{
-/// Test-only minter: the one door for a test to hold an Incarnation without a backend.
-class CasIncarnationTestAccess
-{
-public:
-    static Incarnation mint(uint64_t backend_id, String key, Dialect d, String value)
-    {
-        return Incarnation(backend_id, std::move(key), d, std::move(value));
-    }
-};
-}
-
 using namespace DB::Cas;
 
 static_assert(!std::is_default_constructible_v<Incarnation>);
 static_assert(!std::is_constructible_v<Incarnation, String>);
+static_assert(!std::is_constructible_v<Incarnation, PersistedIncarnation>);
 static_assert(!std::is_default_constructible_v<TransportAccess>);
 static_assert(!std::is_copy_constructible_v<TransportAccess>);
 
@@ -49,15 +36,6 @@ TEST(CASIncarnation, GrammarRefusesTheNineWays)
     EXPECT_FALSE(isIncarnationValue(Dialect::Generation, "\"123\""));
     EXPECT_TRUE(isIncarnationValue(Dialect::Generation, "123"));
     EXPECT_FALSE(isIncarnationValue(Dialect::Emulated, ""));
-}
-
-TEST(CASIncarnation, RenderAndPersistedCompare)
-{
-    auto inc = CasIncarnationTestAccess::mint(7, "k", Dialect::Generation, "42");
-    EXPECT_EQ(inc.render(), "generation:42");
-    EXPECT_TRUE((PersistedIncarnation{"generation", "42"}).matches(inc));
-    EXPECT_FALSE((PersistedIncarnation{"etag", "42"}).matches(inc));
-    EXPECT_FALSE((PersistedIncarnation{"generation", "43"}).matches(inc));
 }
 
 TEST(CASRetry, BackoffIsFullJitterUnderTheCap)
@@ -80,20 +58,19 @@ TEST(CASRetry, BackoffIsFullJitterUnderTheCap)
 
 TEST(CASRetry, PoliciesAreShapedAsSpecified)
 {
-    const uint64_t now = DB::Cas::CasMountRuntime::bootMs();
-    EXPECT_GE(Retry::standard().deadline_ms, now + 90'000 - 5);
+    const uint64_t now = 1'000'000;
+    EXPECT_EQ(Retry::standard().bind(now).deadline_ms, now + 90'000);
+    EXPECT_FALSE(Retry::standard().bind(now).lease_bound);
     EXPECT_FALSE(Retry::standard().single_attempt);
     EXPECT_TRUE(Retry::once().single_attempt);
-    const Retry lease = Retry::untilLeaseSafe(now + 10'000, 2'000);
-    EXPECT_LE(lease.deadline_ms, now + 8'000);
-    EXPECT_GE(Retry::within(1'000).deadline_ms, now + 1'000 - 5);
+    const Retry::Bound lease = Retry::untilLeaseSafe(now + 10'000, 2'000).bind(now);
+    EXPECT_EQ(lease.deadline_ms, now + 8'000);
+    EXPECT_TRUE(lease.lease_bound);
+    EXPECT_EQ(Retry::within(1'000).bind(now).deadline_ms, now + 1'000);
 }
 
 TEST(CASWriteResult, OrThrowMapsEveryAlternative)
 {
-    auto inc = CasIncarnationTestAccess::mint(1, "k", Dialect::Emulated, "1");
-    EXPECT_EQ(*orThrow(WriteResult{Committed{inc, 1, false}}, "t"), inc);
-    EXPECT_FALSE(orThrow(WriteResult{Declined{NotObserved{}}}, "t").has_value());
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { orThrow(WriteResult{Conflict{ProvenAbsent{}}}, "t"); });
     expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { orThrow(WriteResult{Refused{DB::ErrorCodes::S3_ERROR, "denied"}}, "t"); });
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::Deadline, GaveUp::Source::Policy, true, NotObserved{}}}, "t"); });

@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <base/defines.h>
 #include <base/types.h>
 #include <cstdint>
 
@@ -15,9 +16,9 @@ using Dialect = TokenType;
 bool isIncarnationValue(Dialect dialect, const String & value);
 
 /// One backend-observed incarnation of an object: the transport's own token value together with the
-/// backend and key it was observed against. Not default-constructible and not constructible from a
-/// bare `String` -- a caller must go through a backend (or, in tests, `CasIncarnationTestAccess`) to
-/// hold one, so an `Incarnation` is always traceable to the read or write that minted it.
+/// backend and key it was observed against. Not default-constructible, not constructible from a bare
+/// `String`, and minted ONLY by `CasRequests` -- a caller can hold one only by way of an admitted
+/// read or write, so an `Incarnation` is always traceable to the request that produced it.
 class Incarnation
 {
 public:
@@ -32,7 +33,6 @@ public:
 
 private:
     friend class CasRequests;
-    friend class CasIncarnationTestAccess;         /// tests only: gtest_cas_requests.cpp
 
     Incarnation(uint64_t backend_id, String key, Dialect dialect, String value)
         : backend_id_(backend_id), key_(std::move(key)), dialect_(dialect), value_(std::move(value))
@@ -56,19 +56,29 @@ inline String Incarnation::render() const
         case Dialect::Generation: return "generation:" + value_;
         case Dialect::Emulated: return "emulated:" + value_;
     }
-    return "unknown:" + value_;
+    UNREACHABLE();
 }
 
 /// An incarnation as recorded in a persisted manifest/ref: the dialect word and value, without any
-/// live backend to check them against. `matches` re-derives the same rendering the live incarnation
-/// would produce and compares it textually, so the two representations can never drift apart.
+/// live backend to check them against. Forward-only: a `PersistedIncarnation` is captured FROM a live
+/// `Incarnation`, never the reverse -- a persisted record must never be trusted to mint a live one.
+/// `matches` re-derives the same rendering the live incarnation would produce and compares it
+/// textually, so the two representations can never drift apart.
 struct PersistedIncarnation
 {
     String dialect;    /// "etag" | "generation" | "emulated"
     String value;
 
+    static PersistedIncarnation capture(const Incarnation & live);
     bool matches(const Incarnation & live) const;
 };
+
+inline PersistedIncarnation PersistedIncarnation::capture(const Incarnation & live)
+{
+    const String rendered = live.render();
+    const auto colon = rendered.find(':');
+    return PersistedIncarnation{rendered.substr(0, colon), rendered.substr(colon + 1)};
+}
 
 inline bool PersistedIncarnation::matches(const Incarnation & live) const
 {
