@@ -15,6 +15,7 @@
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
 #include <base/defines.h>
+#include <base/sleep.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
@@ -354,6 +355,12 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     for (int attempt = 0; attempt < max_publication_attempts; ++attempt)
     {
         requireAlive();
+        /// Pace the reissues the way the request engine paces its own: an ambiguous publication is most
+        /// often a store under load, and a large body republished eight times back to back is what
+        /// makes that worse. After `requireAlive`, so a cancelled or superseded build fails closed
+        /// instead of spending a backoff first.
+        if (attempt > 0)
+            sleepForMilliseconds(Retry::backoff(attempt));
         const std::optional<Meta> present = op.head(key, policy);
         BlobPublicationReason reason = BlobPublicationReason::Absent;
 
@@ -438,12 +445,13 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
 
         try
         {
-            /// A single physical publication per iteration, deliberately not the shared policy: the
-            /// engine would reissue this exact envelope, and a re-publication that repeats an envelope
-            /// repeats its `incarnation_tag`, so the republished body is byte-identical to the one GC
-            /// may have condemned and a content-derived incarnation no longer distinguishes them. Each
-            /// iteration below builds a fresh envelope, which is what keeps them distinguishable; the
-            /// verbatim staged copy is additionally a once-only privilege `beginPublication` spends.
+            /// A single physical publication, deliberately not under the shared policy: the engine
+            /// would reissue this exact envelope, and a re-sent envelope re-publishes the same
+            /// `incarnation_tag`, so on a content-derived-ETag dialect the republished body carries the
+            /// incarnation GC condemned and the exact-incarnation delete would remove a live body.
+            /// Every physical publication therefore mints its own envelope -- each iteration of this
+            /// loop builds one -- and the engine may never reissue one. The verbatim staged copy is
+            /// additionally a once-only privilege `beginPublication` spends.
             op.publish(BlobPublishRequest{key, std::move(publication)}, Retry::once());
         }
         catch (const std::exception & error)

@@ -2519,6 +2519,9 @@ public:
     int publish_copy_attempts = 0;       /// unconditional native-copy publications observed
     int blob_head_attempts = 0;          /// transaction-level blob observations
     std::function<void()> on_publish;    /// runs before each publication, for a test that spends time in one
+    /// The envelope of every streaming publication the store was asked to make, in order. A test reads
+    /// it to prove two physical publications were two DIFFERENT bodies.
+    std::vector<String> published_envelopes;
 
     /// Both seams sit on the transport primitives: the writer's mandatory HEAD and its publication
     /// both reach the store through them.
@@ -2531,8 +2534,11 @@ public:
 
     void publish(const BlobPublishRequest & request, TransportAccess & access) override
     {
-        if (std::holds_alternative<StreamingBlobPublication>(request.publication))
+        if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
+        {
             ++publish_stream_attempts;
+            published_envelopes.push_back(streaming->fresh_envelope);
+        }
         else
             ++publish_copy_attempts;
         if (on_publish)
@@ -2651,6 +2657,37 @@ TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
     EXPECT_EQ(std::count_if(events.begin(), events.end(),
                             [](const CasEvent & e) { return e.type == CasEventType::BlobPut; }), 0)
         << "no fresh-upload event: the body was never re-uploaded";
+}
+
+/// Every physical publication mints its own envelope, and the request engine never reissues one. Two
+/// attempts sharing an `incarnation_tag` would send byte-identical bodies, so on a
+/// content-derived-ETag dialect the republished body would read back as the incarnation GC condemned,
+/// and GC's exact-incarnation delete would then remove a live body.
+TEST(CASPartWrite, EveryPhysicalPublicationMintsAFreshIncarnationTag)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultPool(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-fresh-tag";
+
+    auto build = startBuildFor(s, ns, "part_blob_fresh_tag");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_blob_fresh_tag", id);
+
+    int payload_streams = 0;
+    b->fault_count = 1;
+    const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+    EXPECT_EQ(res.size, payload.size());
+
+    ASSERT_EQ(b->published_envelopes.size(), 2u) << "one ambiguous publication and the committing second";
+    EXPECT_NE(b->published_envelopes[0], b->published_envelopes[1])
+        << "the second physical publication re-sent the first one's envelope";
+
+    const uint64_t object_size = s->poolMeta().blob_header_len + payload.size();
+    const auto first = decodeEnvelopeHeader(b->published_envelopes[0], object_size, ObjectKind::Blob);
+    const auto second = decodeEnvelopeHeader(b->published_envelopes[1], object_size, ObjectKind::Blob);
+    EXPECT_TRUE(first.incarnation_tag != second.incarnation_tag)
+        << "a repeated incarnation_tag is a repeated incarnation: GC's condemn would name the live body";
 }
 
 /// "One `Retry::standard()`" is one policy VALUE, not one shared deadline: each verb of the
