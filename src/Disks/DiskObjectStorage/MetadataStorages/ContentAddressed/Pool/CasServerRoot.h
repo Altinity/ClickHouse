@@ -50,8 +50,8 @@ struct MountRenewResult
 {
     MountRenewOutcome outcome = MountRenewOutcome::Terminal;
     uint64_t attempt_start_boot_ms = 0;
-    /// Physical attempts this renewal sent. The engine counts them only for a write it proved
-    /// committed; every other ending reports `sent_any` instead, which is all that is known there.
+    /// Physical attempts this renewal sent. Carried for a write that committed and for one that gave
+    /// up; a conflict and a store refusal report no count, so `sent_any` is what those two leave.
     uint32_t attempts_sent = 0;
     bool resolved_by_read = false;
     bool sent_any = false;
@@ -319,7 +319,7 @@ MountClaimResult claimMountAwaitingExpiry(
 /// `computeHeartbeatFloor` calls — one GC round is one observation tick. Mirrors
 /// `claimMountAwaitingExpiry`'s observation loop, but at heartbeat-gate granularity rather than a
 /// tight poll loop.
-struct MountTokenObservation
+struct MountIncarnationObservation
 {
     Incarnation incarnation;
     uint64_t first_seen_mono_ms = 0;
@@ -328,7 +328,7 @@ struct MountTokenObservation
 /// Keyed by `server_root_id`. In-memory only: a fresh leader (after a steal, or a process restart)
 /// starts with an empty map, which only delays fencing an already-dead mount by one extra round while
 /// it (re)establishes the observation — safe (never fences early), never unsafe.
-using MountObservationMap = std::map<String, MountTokenObservation>;
+using MountObservationMap = std::map<String, MountIncarnationObservation>;
 
 /// GC heartbeat gate (GC round protocol step 1). Run by the GC leader at the top of a round: LIST
 /// `gc/server-roots/` (O(servers), single-digit counts), GET each mount body, and classify + fence out
@@ -496,8 +496,8 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 /// authority the fence is tracking. The claim and the farewell are admitted off it: a self-remount
 /// claims with the fence already latched lost, so a claim gated on the fence could never reclaim, and
 /// a farewell refused because the fence has run down would leave the slot looking live until GC
-/// fences it out. Neither is unguarded -- a claim's safety is its own conditional write, and both
-/// carry whatever `Liveness` the caller supplies for shutdown.
+/// fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a caller
+/// that has shutdown facts hands them over as a `Liveness`.
 class MountLeaseKeeper
 {
 public:
@@ -515,7 +515,15 @@ public:
     /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
     /// the caller's shutdown terms; the mount fence is deliberately not consulted here.
     uint64_t start(Liveness liveness = {});
+    /// The steady-state renewal, admitted under the mount fence.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
+    /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
+    /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an
+    /// operation admitted under it would be refused before its first attempt. `open_plane` must be
+    /// open-fenced -- passing the mount plane here is the bug this exists to avoid. Same policy and
+    /// same verdicts as `renew`.
+    MountRenewResult renewForRemount(
+        CasRequests & open_plane, const MountRenewOperationEnvironment & environment = {});
     void release();
 
     MountLeaseKeeperState state() const { return keeper_state; }
@@ -527,6 +535,8 @@ private:
     /// The incarnation every guarded write of this slot names. Engaged for exactly the states that
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
     const Incarnation & precondition() const;
+    /// One renewal admitted on `plane`; `renew` and `renewForRemount` differ only in which they pass.
+    MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment);
     Incarnation claim(CasOperation & op, const String & body);
     [[noreturn]] void throwRenewConflict(const Observation & seen) const;
     MountRenewResult terminalResult(MountRenewResult result);

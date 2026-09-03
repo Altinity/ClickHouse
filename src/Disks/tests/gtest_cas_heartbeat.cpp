@@ -35,7 +35,10 @@ namespace
 /// tests exercise is the mount protocol's own, not a fence's -- on the same injected boot clock the
 /// keeper's lease deadline is expressed on, so the two never disagree about how much budget is left.
 /// `sleep_step_ms`, when set, makes one inter-attempt pause jump the clock past the lease bound: that
-/// is how a test asks for exactly one physical attempt without a per-call attempt cap.
+/// is how a test asks for exactly one physical attempt without a per-call attempt cap. It depends on
+/// the engine checking the bound, sleeping, then checking again -- a reissue that slept first would
+/// send a second attempt. `tests::OperationForTest` covers a fixture needing one operation, but
+/// neither the two planes a keeper takes nor this clock, which is why this stays local.
 class Ops
 {
 public:

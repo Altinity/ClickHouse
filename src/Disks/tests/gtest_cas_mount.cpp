@@ -56,10 +56,13 @@ void renewKeeperOrThrow(MountLeaseKeeper & keeper)
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
 }
 
-/// The two request planes a direct protocol call in this file runs on. Both are open-fence: these
-/// fixtures hold no mount lease, so nothing here should be refused by a fence it does not have. A
-/// caller that also drives a lease deadline passes its own boot clock, so a slow machine cannot run
-/// the lease bound out in the middle of a test.
+/// The two request planes a keeper in this file runs on, plus one operation for the protocol calls
+/// driven directly. Both planes are open-fence: these fixtures hold no mount lease, so nothing here
+/// should be refused by a fence it does not have. The clock and the sleep are ALWAYS injected -- a
+/// fixture that drives a lease deadline passes its own so a slow machine cannot run the bound out
+/// mid-test, and one that does not still must not sleep for real when a fault sends the engine round
+/// again. `tests::OperationForTest` covers the one-operation case but neither the two planes nor the
+/// clock, which is why this stays local.
 class Ops
 {
 public:
@@ -70,12 +73,11 @@ public:
         , farewell(openRequestsForTest(std::move(backend)))
         , op(mount.admit())
     {
-        if (!boot_ms)
-            return;
+        uint64_t * clock = boot_ms ? boot_ms : &own_clock;
         for (CasRequests * requests : {&mount, &farewell})
         {
-            requests->setNowFnForTest([boot_ms] { return *boot_ms; });
-            requests->setSleepFnForTest([boot_ms](uint64_t ms) { *boot_ms += ms; });
+            requests->setNowFnForTest([clock] { return *clock; });
+            requests->setSleepFnForTest([clock](uint64_t ms) { *clock += ms; });
         }
     }
 
@@ -85,6 +87,9 @@ public:
     CasRequests mount;
     CasRequests farewell;
     CasOperation op;
+
+private:
+    uint64_t own_clock = 0;
 };
 
 /// The incarnation currently at `key`, for a fixture that has to name it as a precondition.
@@ -121,6 +126,35 @@ public:
     }
 
     bool fired = false;
+};
+
+/// Loses the owner key to a racing claimer between the read and the create: installs `winner`'s owner
+/// object, then refuses this write. The subtree stays empty, so the emptiness recompute passes and the
+/// claim has to decide the race from what its own write observed.
+class OwnerRaceBackend : public InMemoryBackend
+{
+public:
+    explicit OwnerRaceBackend(UInt128 winner_) : winner(winner_) {}
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (!fired && !expected_value && key == "p/gc/server-roots/r/owner")
+        {
+            fired = true;
+            InMemoryBackend::write(
+                key, encodeOwner(OwnerObject{.server_uuid = winner, .retired_at_ms = std::nullopt}),
+                std::nullopt, access);
+            return std::unexpected(RawConflict{});
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+
+    bool fired = false;
+
+private:
+    UInt128 winner;
 };
 
 /// Refuses the FIRST write of the epoch key after installing a competing allocator's own epoch, so the
@@ -623,8 +657,13 @@ TEST(CASServerRootSafety, OwnerConflictRecomputesTheWholeEmptinessBundle)
     auto backend = std::make_shared<OwnerConflictRevealsManifestBackend>();
     Ops ops(backend);
     const Layout layout("p");
-    EXPECT_THROW(claimOwnerOrThrow(
-        ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()), DB::Exception);
+    /// The message, not just the code: without the post-conflict recompute the claim still throws
+    /// `CORRUPTED_DATA`, from the vanished-anchor arm below it, so a bare code assertion would hold
+    /// with the behaviour this test is named for deleted.
+    DB::Cas::tests::expectThrowsCodeWithMessage(
+        DB::ErrorCodes::CORRUPTED_DATA,
+        "newly visible owned work blocks recreation",
+        [&] { claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()); });
     EXPECT_TRUE(backend->fired);
     EXPECT_FALSE(ops.op.head(layout.ownerKey("root/x"), Retry::standard()).has_value());
 }
@@ -2074,4 +2113,59 @@ TEST(CASMountLease, ClaimIsNotAdmittedUnderTheMountFence)
     const MountLease claimed = decodeMountLease(reader.read(l.mountKey("r"), Retry::standard())->bytes);
     EXPECT_EQ(claimed.writer_epoch, 7u);
     EXPECT_EQ(claimed.seq, 1u);
+}
+
+/// A lost owner-claim race is decided from the conflict's OWN resolve observation, so the two outcomes
+/// have to be told apart from that alone: a racer that installed our uuid leaves nothing to do, a
+/// foreign one fails closed. Reading the key again would answer a later question than the conflict
+/// asked, and would cost a request per race.
+TEST(CASServerRootClaim, OwnerLostToARacerIsDecidedFromTheConflictObservation)
+{
+    Layout l("p");
+    {
+        auto backend = std::make_shared<OwnerRaceBackend>(UInt128(1));
+        Ops ops(backend);
+        EXPECT_NO_THROW(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()));
+        EXPECT_TRUE(backend->fired);
+    }
+    {
+        auto backend = std::make_shared<OwnerRaceBackend>(UInt128(2));
+        Ops ops(backend);
+        DB::Cas::tests::expectThrowsCodeWithMessage(
+            DB::ErrorCodes::CORRUPTED_DATA,
+            "claimed by a different server during our claim",
+            [&] { claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()); });
+        EXPECT_TRUE(backend->fired);
+    }
+}
+
+/// A remount re-anchors its lease BEFORE it arms the fence for the new incarnation, so the fence is
+/// still latched lost at that moment. The steady-state renewal is refused there — the sibling test
+/// above pins that — and the remount's own renewal has to be admitted off the fence, or the pool could
+/// never re-anchor and the remount attempt would fail on exactly the throttled store that caused it.
+TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    uint64_t boot = 0;
+
+    CasRequests mount_requests(backend, Fence{
+        [] { return uint64_t{0}; },
+        [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
+        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
+    mount_requests.setNowFnForTest([&boot] { return boot; });
+    CasRequests open_requests = openRequestsForTest(backend);
+    open_requests.setNowFnForTest([&boot] { return boot; });
+
+    MountLeaseKeeper keeper(mount_requests, open_requests, l, "r", UInt128(1), 7,
+                            std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
+                            {}, std::chrono::milliseconds(0), [&] { return boot; });
+    keeper.start();
+
+    const MountRenewResult redo = keeper.renewForRemount(open_requests, MountRenewOperationEnvironment{});
+    EXPECT_EQ(redo.outcome, MountRenewOutcome::Committed);
+
+    CasOperation reader = open_requests.admit();
+    EXPECT_EQ(decodeMountLease(reader.read(l.mountKey("r"), Retry::standard())->bytes).seq, 2u);
 }

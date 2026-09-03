@@ -62,15 +62,16 @@ bool prefixHasAnyKey(CasOperation & op, const String & prefix)
     return !op.list(prefix, /*cursor*/ "", /*limit*/ 1, Retry::standard()).keys.empty();
 }
 
-/// The write's own verdict on whether somebody else holds the key: TRUE for a refused precondition,
-/// FALSE when this write landed. Every other ending failed to reach the store and must surface as
-/// itself -- reading it as a rival writer is how a transport outage becomes a "double start" report.
-bool conflictedOrThrow(WriteResult && result, const String & what)
+/// The write's own verdict on whether somebody else holds the key: for a refused precondition, what
+/// the write's resolve read saw there; nothing when this write landed. Every other ending failed to
+/// reach the store and must surface as itself -- reading it as a rival writer is how a transport
+/// outage becomes a "double start" report.
+std::optional<Observation> conflictOrThrow(WriteResult && result, const String & what)
 {
-    if (std::holds_alternative<Conflict>(result))
-        return true;
+    if (Conflict * conflict = std::get_if<Conflict>(&result))
+        return std::move(conflict->seen);
     orThrow(std::move(result), what);
-    return false;
+    return std::nullopt;
 }
 
 uint64_t defaultBootMs()
@@ -544,10 +545,11 @@ void claimOwnerOrThrow(
             "(identity lost over existing data) — refusing to re-claim",
             srid);
 
-    if (!conflictedOrThrow(
-            op.create(key, encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt}),
-                      Retry::standard()),
-            fmt::format("CAS server-root '{}' owner claim", srid)))
+    const std::optional<Observation> occupant = conflictOrThrow(
+        op.create(key, encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt}),
+                  Retry::standard()),
+        fmt::format("CAS server-root '{}' owner claim", srid));
+    if (!occupant)
         return;
 
     /// The conditional create conflicted. Recompute the whole catalog + manifest + roots bundle;
@@ -556,8 +558,14 @@ void claimOwnerOrThrow(
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' owner claim conflicted and newly visible owned work blocks recreation", srid);
 
-    /// Race: another process claimed between our read and our create. Re-read and compare.
-    const std::optional<OwnerObject> reread = readOwnerObject(op, l, srid);
+    /// Race: another process claimed between our read and our create. The write's own resolve read
+    /// already observed who took the key, and reading again would answer a later question than the one
+    /// the conflict asked. Only an observation that settled nothing still owes a read.
+    std::optional<OwnerObject> reread;
+    if (const Object * observed = std::get_if<Object>(&*occupant))
+        reread = decodeOwner(observed->bytes);
+    else if (!std::holds_alternative<ProvenAbsent>(*occupant))
+        reread = readOwnerObject(op, l, srid);
     if (!reread)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' owner anchor vanished during claim", srid);
@@ -676,6 +684,10 @@ uint64_t allocateWriterEpoch(
         },
         Retry::standard());
 
+    /// Non-convergence used to be `CORRUPTED_DATA`, on the reasoning that a hundred lost conditional
+    /// writes really is evidence of something wrong. The bound is a wall-clock deadline now, and ninety
+    /// seconds of a throttled store is not evidence of anything, so `orThrow`'s retry-later class is
+    /// the honest verdict. Both fail closed at `Pool::open`.
     orThrow(std::move(result), fmt::format("CAS server-root '{}' writer_epoch allocation", srid));
     return allocated;
 }
@@ -769,8 +781,8 @@ MountClaimResult claimMount(
     if (!got)
     {
         const MountLease body = makeMountBody(our_uuid, our_epoch, /*seq=*/ 1, now_ms, ttl_ms);
-        if (conflictedOrThrow(op.create(key, encodeMountLease(body), Retry::standard()),
-                              fmt::format("CAS mount slot claim of '{}'", key)))
+        if (conflictOrThrow(op.create(key, encodeMountLease(body), Retry::standard()),
+                            fmt::format("CAS mount slot claim of '{}'", key)))
             /// Raced with a concurrent writer between the read and the create. Treat as a live double
             /// start — fail closed; never overwrite a slot that appeared under us. The occupant was
             /// not decoded here, so no conflicting identity is known to attach to an event.
@@ -804,8 +816,8 @@ MountClaimResult claimMount(
             return {.kind = MountClaimResult::FencedSelf, .body = existing, .incarnation = std::nullopt};
         }
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (conflictedOrThrow(op.replace(key, encodeMountLease(body), got->incarnation, Retry::standard()),
-                              fmt::format("CAS mount slot refresh of '{}'", key)))
+        if (conflictOrThrow(op.replace(key, encodeMountLease(body), got->incarnation, Retry::standard()),
+                            fmt::format("CAS mount slot refresh of '{}'", key)))
             /// The mount changed under us between the read and the write: `got->incarnation` is now
             /// KNOWN STALE (that mismatch is exactly why the write was refused), not merely unknown --
             /// leaving `.incarnation` unset (rather than handing back one the caller would wrongly
@@ -837,8 +849,8 @@ MountClaimResult claimMount(
     if (existing.gc_fenced || clean_marker || proven_dead)
     {
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (conflictedOrThrow(op.replace(key, encodeMountLease(body), got->incarnation, Retry::standard()),
-                              fmt::format("CAS mount slot reclaim of '{}'", key)))
+        if (conflictOrThrow(op.replace(key, encodeMountLease(body), got->incarnation, Retry::standard()),
+                            fmt::format("CAS mount slot reclaim of '{}'", key)))
             /// The mount changed under us between the read and the write — someone else is racing the
             /// reclaim. Fail closed. `got->incarnation` is now KNOWN STALE (that mismatch is exactly why
             /// the write was refused) -- leaving `.incarnation` unset is deliberate, not an oversight.
@@ -1048,7 +1060,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 if (!stable)
                 {
                     if (it == obs.end() || it->second.incarnation != observed->incarnation)
-                        obs.insert_or_assign(srid, MountTokenObservation{observed->incarnation, mono_now_ms});
+                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->incarnation, mono_now_ms});
                     ++floor.live;
                     return std::nullopt;
                 }
@@ -1507,6 +1519,18 @@ MountRenewResult MountLeaseKeeper::terminalResult(MountRenewResult result)
 
 MountRenewResult MountLeaseKeeper::renew(const MountRenewOperationEnvironment & environment)
 {
+    return renewOn(mount_requests, environment);
+}
+
+MountRenewResult MountLeaseKeeper::renewForRemount(
+    CasRequests & open_plane, const MountRenewOperationEnvironment & environment)
+{
+    return renewOn(open_plane, environment);
+}
+
+MountRenewResult MountLeaseKeeper::renewOn(
+    CasRequests & plane, const MountRenewOperationEnvironment & environment)
+{
     const MountRenewObservabilityRegistration observability_registration = beginMountRenewObservabilityCall();
     const MountRenewObservabilityCallGuard observability_guard(observability_registration);
 
@@ -1544,7 +1568,7 @@ MountRenewResult MountLeaseKeeper::renew(const MountRenewOperationEnvironment & 
     MountRenewResult result;
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
-    CasOperation op = mount_requests.admit(environment.live);
+    CasOperation op = plane.admit(environment.live);
     std::optional<WriteResult> written;
     try
     {
@@ -1602,6 +1626,7 @@ MountRenewResult MountLeaseKeeper::renew(const MountRenewOperationEnvironment & 
     if (const GaveUp * gave_up = std::get_if<GaveUp>(&*written))
     {
         result.sent_any = gave_up->sent_any;
+        result.attempts_sent = gave_up->attempts_sent;
         if (gave_up->why == GaveUp::Why::Deadline)
             result.deadline_source = gave_up->deadline_source;
 
