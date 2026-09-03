@@ -83,7 +83,6 @@ PoolPtr openPoolFenceControlled(const std::shared_ptr<InMemoryBackend> & backend
     cfg.mount_renew_period = std::chrono::milliseconds{3600000};
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
@@ -117,10 +116,11 @@ size_t eraseKeysContaining(Backend & backend, const String & substr)
     size_t removed = 0;
     String cursor;
     std::vector<String> keys;
+    OperationForTest op(backend);
     while (true)
     {
-        const ListPage page = backend.list("", cursor, 1000);
-        for (const ListedKey & listed : page.keys)
+        const KeyPage page = (*op).list("", cursor, 1000, Retry::standard());
+        for (const KeyEntry & listed : page.keys)
             if (substr.empty() || listed.key.find(substr) != String::npos)
                 keys.push_back(listed.key);
         if (page.next_cursor.empty())
@@ -129,8 +129,8 @@ size_t eraseKeysContaining(Backend & backend, const String & substr)
     }
     for (const String & key : keys)
     {
-        const HeadResult h = backend.head(key);
-        if (h.exists && backend.deleteExact(key, h.token).kind == DeleteOutcome::Kind::Deleted)
+        const auto h = (*op).head(key, Retry::standard());
+        if (h && (*op).remove(key, h->incarnation, Retry::standard()) == Removal::Removed)
             ++removed;
     }
     return removed;
@@ -364,7 +364,7 @@ TEST(CASRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
     CasOperation catalog_op = catalog_requests.admit();
     const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns).value();
     for (uint64_t seq = 1; seq <= 3; ++seq)
-        EXPECT_TRUE(backend->head(store->layout().refLogKey(life, RefTxnId{epoch, seq})).exists)
+        EXPECT_TRUE(catalog_op.head(store->layout().refLogKey(life, RefTxnId{epoch, seq}), Retry::once()).has_value())
             << "log object " << epoch << "-" << seq << " must exist: the durable stream has no hole";
 }
 
@@ -526,7 +526,8 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     /// conflict already counted the conclusive foreign successor, and teardown must neither double-count
     /// it nor stamp a farewell over the successor's slot.
     const String survivor_mount_key = recreated->layout().mountKey("test");
-    const auto successor_slot_before = backend->get(survivor_mount_key);
+    OperationForTest teardown_op(*backend);
+    const auto successor_slot_before = (*teardown_op).read(survivor_mount_key, Retry::once());
     ASSERT_TRUE(successor_slot_before.has_value());
     const uint64_t skipped_after_deposition
         = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
@@ -539,7 +540,7 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
               violations_before)
         << "and must NOT report an exclusivity violation: this is a failover, not a broken guarantee";
-    const auto successor_slot_after = backend->get(survivor_mount_key);
+    const auto successor_slot_after = (*teardown_op).read(survivor_mount_key, Retry::once());
     ASSERT_TRUE(successor_slot_after.has_value());
     EXPECT_EQ(successor_slot_after->bytes, successor_slot_before->bytes)
         << "the deposed writer must not stamp its farewell over the successor's lease";
