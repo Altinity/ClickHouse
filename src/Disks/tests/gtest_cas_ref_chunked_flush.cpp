@@ -539,8 +539,8 @@ std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::La
     String cursor;
     for (;;)
     {
-        const KeyPage page = (*operation).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
-        for (const KeyEntry & lk : page.keys)
+        const ListPage page = (*operation).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
+        for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
             if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation
