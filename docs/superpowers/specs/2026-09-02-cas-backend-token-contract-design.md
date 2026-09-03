@@ -9,11 +9,12 @@ doc_type: 'guide'
 
 # CAS backend request contract {#cas-backend-request-contract}
 
-Revision 6. Revision 5 folded the retry half into the identity contract and was reviewed twice, by two
-independent models; both found the same structural holes — an access scheme that private virtuals
-cannot deliver, a two-outcome write result for a three-outcome protocol, a retry ceiling that binds
-before the deadline it was meant to back, an upstream claim the slice could not keep, and a
-migration step that needed a conversion the contract forbids. This revision closes them. [What earlier
+Revision 7. Revision 5 folded the retry half into the identity contract; revision 6 answered two
+reviews of it; this revision answers the review of revision 6 (twenty-one findings, seven that
+changed the design: a keyless `publish`, an observation that could not say "proved absent", a
+`once` that contradicted `slotOccupy`, a read pin that broke credential rotation, a heartbeat rule
+that never wrote, a fence interface that could only throw, and an attempt reservation with no
+carrier). [What earlier
 revisions got wrong](#what-earlier-revisions-got-wrong) keeps the record. This document supersedes
 `2026-09-02-cas-retry-coverage-by-construction.md` and
 `2026-09-02-cas-empty-conditional-token-guard-design.md`, and revises the prerequisites of
@@ -60,18 +61,21 @@ adopt; `GetStreamResult::token` is produced by a `HEAD` on every stream open and
 >
 > **`Backend` is transport: one physical request per call, strings in and strings out, and no call can
 > be made without a `TransportAccess` that only `CasRequests` can construct.** No production code and
-> no test calls the store directly.
+> no test calls the store directly. Four capability predicates on `Backend` are not transport and are
+> named as such.
 >
 > **Every `CasRequests` call names its retry policy.** There is no default, so a call that has not
 > thought about retry does not compile.
 >
 > **One engine serves reads and writes alike** — exponential backoff with full jitter, a deadline that
 > is the only bound, an ambiguous write resolved by an exact read before reissue, and the fence
-> generation captured at call entry and re-checked before every attempt and every sleep. Under a
-> lease-bound policy no attempt or sleep that would end past the lease is started.
+> admitted — generation and budget — before every attempt and every sleep. Under a lease-bound policy
+> no attempt or sleep that would end past the lease is started.
 >
-> **A write has three outcomes and reports all three.** `Committed`, `Conflict`, `GaveUp` — and
-> `GaveUp` says whether anything was sent, because the ref lane's wedge decision hangs on that bit.
+> **A write reports what happened and what was seen.** `Committed`, `Declined`, `Conflict`, `GaveUp`;
+> the last two carry an `Observation` that distinguishes "nothing observed" from "proved absent" from
+> "someone else's object", and `GaveUp` says whether anything was sent, because the ref lane's wedge
+> decision and the renewer's "vanished" verdict hang on exactly those bits.
 
 ## One type {#one-type}
 
@@ -83,9 +87,10 @@ class Incarnation;   // opaque; operator==; created only by CasRequests; no defa
 The word already lives in the code. It is not `Token`, because it is not something the caller
 *sends*; it is something the caller *saw* — of one key, from one backend. A `CasRequests` call given
 an incarnation of another key or another `CasRequests` throws `LOGICAL_ERROR`: a programming error,
-not a store answer. "Backend identity" is a per-instance counter id, never the address. A cache
-holding an `Incarnation` (`readShardDecoded`'s) must not outlive the `CasRequests` that minted it;
-today it is owned by the `Pool` that owns the backend.
+not a store answer. "Backend identity" is a per-instance counter id, never the address. A holder
+that keeps an `Incarnation` across calls — `MountLeaseKeeper::last_token`, the mount observation map,
+GC's manifest-cleanup map, `CasBlobInDegree`'s condemned rows — must not outlive the `CasRequests`
+that minted it; all of them are owned by the `Pool` that owns the backend.
 
 ```cpp
 static_assert(!std::is_default_constructible_v<Incarnation>);
@@ -131,9 +136,24 @@ public:
     virtual std::expected<String, RawConflict> write(key, bytes, std::optional<String> expected_value, TransportAccess &) = 0;
     virtual RawSentinel            probeSentinelRaw(key, TransportAccess &) = 0;                    // one GET
     virtual std::unique_ptr<ReadBuffer> stream(key, TransportAccess &) = 0;                        // data-plane body
-    virtual void                   publish(BlobPublishRequest) = 0;     // data-plane, unconditional, no key
+    virtual void                   publish(BlobPublishRequest, TransportAccess &) = 0;             // data-plane, unconditional
+
+    // capability predicates, not transport: answered from configuration or one preflight request
+    virtual bool supportsListTokens() const = 0;
+    virtual void checkPoolPreconditions() = 0;            // the one that issues a request (bucket versioning)
+    virtual void checkSkipAccessCheckSupport() const = 0;
+    virtual void checkConditionalWriteSingleAttemptSupport() const = 0;
 };
+struct RawConflict {};   // the store refused the precondition; 404 and 412 on an If-Match write collapse here,
+                         // and the façade's resolve read is what tells them apart
 ```
+
+`Raw` carries bytes and the store's value and nothing else: `ObjectMeta` (the owner triple no
+production caller supplies or reads) and the `Range` argument of `get`/`getStream` (every production
+caller uses the default window) are retired with their contract tests. The four predicates are
+outside the transport contract: three answer from configuration; `checkPoolPreconditions` is
+`runCapabilityProbe`'s step 0 and issues one bucket-versioning request on the SDK path, bounded like
+the rest of that path by the CAS disk's `s3_retry_attempts`.
 
 Why a key argument and not private virtuals: C++ applies access control to the *call* through the
 *static type*, so a private virtual in `Backend` leaves every public override on `InMemoryBackend` and
@@ -154,19 +174,38 @@ type exists on one side of the key.
 
 `write` is one operation with the precondition as a parameter (`nullopt` = the key must be absent);
 `putIfAbsent`, `putOverwrite` and `casPut` collapse into it. `publish` returns `void` (no transport
-but one can name what it wrote, and no consumer exists) and takes no key so unconditional sites stay
-greppable; the three unconditional mutations on mount-owned staging keys live outside this API by
-design. `stream` and `publish` are the data-plane exceptions to "one physical request": the SDK
-retries inside a body stream and inside a multipart upload, and that is right for them.
+but one can name what it wrote, and no consumer exists) and takes the key like every other method;
+the three unconditional mutations on mount-owned staging keys live outside this API by design.
+`stream` and `publish` are the data-plane exceptions to "one physical request": the SDK retries
+inside a body stream and inside a multipart upload, and that is right for them; what the façade's
+policy governs is the *initiation*.
 
 **`CasRequests` is the only caller.** It is constructed with a **fence**, because the fence is a
 property of whoever owns the lease, not of a call: the mount plane passes the mount fence, the GC
 plane an open fence (its writes are guarded by the `gc/state` incarnation, not by a mount lease, as
-today), the tools an open fence (`CasDecommission` says so explicitly today). The engine captures the
-fence **generation** at call entry and calls `checkFenceOrThrow(admitted)` before every attempt and
-every sleep — the generation is bumped by every loss *and every re-arm*, so a caller admitted under a
-prior lease incarnation aborts even when the fence is currently open, which is the invariant
-`casPutObject`, `publishCkpt` and the ref lane hold by hand today and would otherwise lose.
+today), the tools an open fence (`CasDecommission` says so explicitly today). The fence has one
+non-throwing admission predicate:
+
+```cpp
+struct Fence
+{
+    uint64_t generation() const;
+    enum class Admit { Ok, LostOrRearmed, NoBudget };
+    Admit admit(uint64_t admitted_generation, uint64_t needed_ms) const;   // never throws
+    void  checkOrThrow(uint64_t admitted_generation) const;                // for the sites that want the exception
+};
+```
+
+Today the two predicates are disjoint and neither is the one an engine needs: `checkFenceOrThrow`
+knows the generation and can only throw; `refAppendFenceOk` knows the budget and never compares the
+generation. `admit` is both. The engine captures `generation()` at call entry and calls
+`admit(admitted, sleep + attempt_reservation)` before every attempt and every sleep;
+`LostOrRearmed` is `GaveUp{FenceLost}`, `NoBudget` is `GaveUp{Deadline}` with the lease as its
+source. The generation is bumped by every loss *and every re-arm*, so a caller admitted under a prior
+lease incarnation gives up even when the fence is currently open — the invariant `casPutObject`,
+`publishCkpt` and the ref lane hold by hand today and would otherwise lose. Sites that want the typed
+transient exception with the operator message (`casPutObject` today) call `orThrow()`, which maps
+`FenceLost` back onto it.
 
 ```cpp
 class CasRequests
@@ -181,10 +220,12 @@ public:
     Removal                     remove(key, Incarnation seen, const Retry &);
     SentinelProbe               probeSentinel(key, const Retry &);
     std::unique_ptr<ReadBuffer> stream(key, const Retry &);          // the OPEN is under policy; the body is the SDK's
+    void                        publish(BlobPublishRequest, const Retry &);   // the INITIATION is under policy
 
     WriteResult create (key, bytes,                    const Retry &);
     WriteResult replace(key, bytes, Incarnation seen,  const Retry &);
-    WriteResult readModifyWrite(key, Decide,           const Retry &);
+    WriteResult readModifyWrite(key, DecideOnObject,   const Retry &);   // reads the body
+    WriteResult readModifyWrite(key, DecideOnMeta,     const Retry &);   // reads presence only (HEAD)
 };
 struct Object { String bytes;  Incarnation incarnation; };
 struct Meta   { uint64_t size; Incarnation incarnation; };
@@ -199,10 +240,21 @@ is the engine's own resolve step, not an entry point.
 ## One write result {#write-result}
 
 ```cpp
-struct Committed { Incarnation incarnation; };
-struct Conflict  { std::optional<Object> occupant; };   // filled ONLY from the engine's own resolve read
-struct GaveUp    { enum Why { Deadline, FenceLost, Cancelled } why; bool sent_any; std::optional<Object> last_seen; };
-using WriteResult = std::variant<Committed, Conflict, GaveUp>;     // .orThrow() for callers that want S3_ERROR
+struct NotObserved {};                 // no resolve read was made (a 412 without a resolve, a refused admission)
+struct ProvenAbsent {};                // the resolve read completed and found no object
+using Observation = std::variant<NotObserved, ProvenAbsent, Object>;   // Object: someone's object, from the resolve read
+
+struct Committed { Incarnation incarnation; uint32_t attempts_sent; bool resolved_by_read; };
+struct Declined  { Observation seen; };                      // readModifyWrite only: decide returned nullopt
+struct Conflict  { Observation seen; };
+struct GaveUp
+{
+    enum Why { Deadline, FenceLost, Cancelled, Unresolved } why;
+    enum Source { Policy, Lease } deadline_source;           // which bound of untilLeaseSafe produced Deadline
+    bool sent_any;
+    Observation last_seen;
+};
+using WriteResult = std::variant<Committed, Declined, Conflict, GaveUp>;   // .orThrow() for callers that want the exception
 ```
 
 A controlled write has three outcomes today, and the third is consumed as a **protocol fact**, not a
@@ -211,18 +263,35 @@ reason proves nothing was sent and wedges otherwise; the recovery walk and the w
 same bit; `MountLeaseKeeper::renew` classifies `Committed` / `Conflict` / `NotAttempted` / `Vanished`
 from the controller's fields. `std::expected<Incarnation, Conflict>` could express none of it and
 would have collapsed "gave up" into an exception — precisely the bare-`Unresolved` collapse the ref
-lane guards against. One variant carries all three; `sent_any` is the bit the wedge decision needs
-(today's `unresolvedProvesNothingWasSent`, whose header says adding a member is a protocol decision —
-it stays a protocol decision, now a field).
+lane guards against. `sent_any` is the bit the wedge decision needs (today's
+`unresolvedProvesNothingWasSent`, whose header says adding a member is a protocol decision — it stays
+a protocol decision, now a field).
 
-`Conflict::occupant` bends a rule revision 4 stated: "a `Conflict` carries no incarnation". That
-rule is right for the **write's own response** — today's `PutResult{PreconditionFailed, {}}` was
-exactly how empty tokens entered circulation — and does not apply to an object the engine *read*.
-`slotOccupy`'s `Occupied{bytes, incarnation}` is `Conflict{occupant}` filled from the resolve read,
-and only from it. `create`'s content-addressed corruption verdict (a different occupant at a
-content-addressed key is `CORRUPTED_DATA` in `putIfAbsentControlled`, a plain `Conflict` in the
-mutable variant) moves to the two callers that own the key's meaning — the ref lane and
-`stageManifest` — which compare the occupant and throw.
+**The observation is a tri-state, not an optional.** `MountLeaseKeeper::renew` consumes
+`resolve_observation_completed` on two paths: a conflict *without* an authoritative resolve is a
+retry-later transient (`NETWORK_ERROR`), a conflict *with* a resolve that found nothing is
+`Vanished`, terminal, fail closed. Two optionals would make "no observation" and "observed absent"
+the same value, and getting them backwards either fails a healthy mount closed or keeps a mount
+writing after a successor deleted its slot — the two errors this branch exists to keep apart. The
+same tri-state is `slotOccupy`'s `Occupied` (an `Object` from the resolve read, and only from it),
+`readModifyWrite`'s "404 on `replace` means the key vanished", and the `Why::Unresolved` case below.
+It bends a rule revision 4 stated — "a `Conflict` carries no incarnation" — which is right for the
+**write's own response** (today's `PutResult{PreconditionFailed, {}}` was exactly how empty tokens
+entered circulation) and does not apply to an object the engine *read*.
+
+**`Why::Unresolved`** is the outcome `slotOccupy` reports as `AttemptsExhausted` today: the create
+was ambiguous or admission was lost after it, and the resolve read found nothing — no deadline
+passed, no fence was lost, nothing was cancelled, and the only honest label is that it is
+unresolved, with `sent_any = true` and `last_seen = ProvenAbsent`. **`Committed`** carries
+`attempts_sent` and `resolved_by_read`, and **`GaveUp`** its `deadline_source`, because the mount
+runtime's two counters (`CASMountRenewalRecovered`, `CASMountRenewalDeadlineExceeded`) are computed
+from exactly those, and an operator reads the second to learn whether the lease or the policy bound
+ended the renewal.
+
+`create`'s content-addressed corruption verdict (a different occupant at a content-addressed key is
+`CORRUPTED_DATA` in `putIfAbsentControlled`, a plain `Conflict` in the mutable variant) moves to the
+two callers that own the key's meaning — the ref lane and `stageManifest` — which compare the
+occupant and throw.
 
 ## Retry {#retry}
 
@@ -230,10 +299,11 @@ mutable variant) moves to the two callers that own the key's meaning — the ref
 struct Retry
 {
     uint64_t deadline_ms;         // absolute, boot clock; the one bound
-    bool     single_attempt;      // once(): no reissue, no sleep
+    bool     single_attempt;      // once(): one write attempt, no reissue, no sleep; the resolve read is not an attempt
 
-    static Retry standard();                                    // now + 90 s
-    static Retry untilLeaseSafe(uint64_t lease_deadline_ms);    // min(now + 90 s, lease - safety margin)
+    static Retry within(uint64_t ms);                           // the primitive: now + ms
+    static Retry standard();                                    // within(90 s)
+    static Retry untilLeaseSafe(uint64_t lease_deadline_ms);    // min(standard, lease - safety margin)
     static Retry once();
 };
 ```
@@ -246,18 +316,28 @@ seconds. The ceiling is gone; `once()` is a flag; there is no `GaveUp::Attempts`
 one number that can be said aloud, and the user statement waits that long under throttling rather
 than failing faster. That is the decision, and there is one class of wait.
 
-**An attempt is reserved before it is started.** The engine owns one constant, `attempt_reservation_ms`
-— the request timeout the single-attempt client is built with (today the cloned client keeps the
-disk's 30 s transport timeout while the controller budgets 5 s "as a scheduling estimate only", so a
-single hung attempt can already outlive `lease − margin`; the clone gets `request_timeout =
-attempt_reservation` in the same commit) — and starts no attempt and no sleep unless
-`now + sleep + attempt_reservation ≤ deadline`. `untilLeaseSafe` takes the safety margin from mount
-config. The two numbers survive as mount configuration under today's names
-(`attempt_timeout_ms`, `lease_safety_margin_ms`); `CasRequestBudget` loses `operation_deadline_ms`
-and `max_attempts`, keeps those two, and keeps its consumers — the mount fence's own margin in
-`refAppendFenceOk`, the startup inequality `attempt_timeout + margin < TTL` in
-`validateCasRequestBudget` on which the successor's observation threshold rests, the detached-drain
-deadlines, the recovery walk's bounds — unchanged.
+**`once` means one write attempt.** The resolve read that follows an ambiguous or refused write is
+part of settling that one attempt, not a second attempt: `slotOccupy`'s contract — `Created` costs
+one request, `Occupied` costs two (the create, then the resolve `GET`) — is exactly `create` under
+`once`, and `Conflict{Object}` is only reachable because the resolve read is made.
+
+**An attempt is reserved before it is started, and the transport honours the reservation.** The
+engine starts no attempt and no sleep unless `now + sleep + attempt_reservation ≤ deadline`, and the
+reservation is the request timeout the single-attempt client is built with. Today neither half
+holds: the controller budgets 5 s "as a scheduling estimate only" while the cloned client keeps the
+disk's 30 s transport timeout, so a single hung attempt can outlive `lease − margin`. The carrier is
+the same door the profile already opened: `object_storage_attempt_timeout_ms` beside
+`object_storage_retry_profile` in both settings headers, and `getSingleAttemptClient(request_timeout_ms)`
+keyed on `(base client, timeout)` — generic, no CAS identifier, in the slice. On the CAS side
+`attempt_timeout_ms` and `lease_safety_margin_ms` **become parsed disk settings** with today's values
+as defaults; today they are compiled-in struct defaults that production never assigns.
+`CasRequestBudget` keeps those two and the recovery walk's three (`recovery_retry_budget_ms`,
+`recovery_retry_initial_backoff_ms`, `recovery_retry_max_backoff_ms`) and loses
+`operation_deadline_ms` and `max_attempts`; its three non-controller consumers of the deadline — the
+two `CkptDeadline` constructions in `CasRefLedger` and `renew`'s `request_deadline` — become
+`Retry::standard()`. `validateCasRequestBudget` keeps `attempt_timeout + margin < TTL`, on which the
+successor's observation threshold rests, and loses its `attempt_timeout < operation_deadline` clause
+with the field. `refAppendFenceOk` and the detached-drain deadlines read the survivors as before.
 
 **Backoff is exponential with full jitter**: `sleep = uniform(0, min(cap, base · 2ⁿ))`, base 200 ms,
 cap 5 s — the shape AWS and Google Cloud Storage both document. Today's engine has the exponent and no
@@ -268,7 +348,7 @@ jittered cap already approximates.
 
 **What retries**, one classification for reads and writes: 429, 408, 5xx (`SlowDown`,
 `InternalError`, `ServiceUnavailable` included), connection loss, client timeout, and `ExpiredToken`
-once after the credential refresh the read buffer already performs. **What does not**: 404 (an
+once after the credential refresh the slice makes effective on the read path (below). **What does not**: 404 (an
 answer), 412 (`Conflict`, an answer), and the existing whitelist of definite failures (malformed
 request, entity too large, access denied) in `classifyConditionalWriteResult`, which stays.
 
@@ -283,20 +363,23 @@ deadline, byte comparison, and only then a reissue — the engine's existing `re
 unchanged under the new verbs. A read is idempotent and needs no resolve; a retried `read` is a fresh
 read with its own first ETag, so the drift check is undisturbed.
 
-**Three policies, because there are three real differences.** `standard`: everything that waits for
+**Four policies, because there are four real differences.** `standard`: everything that waits for
 a result and can afford ninety seconds — catalog, `_ckpt`, table files, the GC plane, the mount at
 open, and **the capability probe**: a 429 is not an answer to "does the store enforce the
 precondition", a 412 is, so the probe's steps retry like any other request and a writable mount at
 open succeeds under throttling. `untilLeaseSafe`: renew, and every read *inside* it — nothing else.
-`once`: the `slotOccupy` callers, which drive their own outer loop, and the **farewell** at
-shutdown — it is a certificate of convenience (the clean marker lets `claimMount` reclaim without
-the ~36.5 s observation), harmless past the lease, and not worth ninety seconds of a shutdown; a
-lease-bound policy would *skip* it after a failed renewal, which is the case where it matters most. A
-fourth shape would be a fourth named constructor, never a parameter.
+`once`: the `slotOccupy` callers, which drive their own outer loop, and the GC heartbeat pulse,
+which is periodic by nature and re-pulses on cadence. `within(10 s)`: the **farewell** at shutdown
+— a certificate of convenience (the clean marker lets `claimMount` reclaim without the ~36.5 s
+observation), harmless past the lease, worth a few seconds of a shutdown and not ninety; a
+lease-bound policy would *skip* it after a failed renewal, which is the case where it matters most,
+and a single attempt would forfeit it to one 429 on exactly the throttled store where the successor's
+wait is expensive. A fifth shape would be a fifth named constructor, never a parameter.
 
 **The lease guarantee, mechanically.** `untilLeaseSafe` starts no attempt and no sleep that would end
 past `lease_deadline − margin`, with the reservation above as the premise — the check
-`pauseBeforeReissue` already makes, now with a reservation the transport honours. The renewal's
+`pauseBeforeReissue` already makes, now with a reservation the transport honours and with the fence's
+`admit` carrying the same arithmetic for the mount's own margin. The renewal's
 resolve `GET` used to live in the SDK's own loop outside this deadline — the amplifier in the
 audit's Gap 7 — and now lives under it, sharing the write's deadline. `mountObservationThresholdMs`
 is unaffected: its argument rests on `attempt_timeout + margin < TTL` and on each attempt being
@@ -307,15 +390,19 @@ bounded, and the reservation is what makes the second premise true.
 ```cpp
 /// decide sees the current object (or absence) and returns the bytes to write, or nullopt: nothing to do.
 /// It may consult the caller's state and may issue reads of its own through the same CasRequests.
-using Decide = std::function<std::optional<String>(const std::optional<Object> & current)>;
+using DecideOnObject = std::function<std::optional<String>(const std::optional<Object> & current)>;
+using DecideOnMeta   = std::function<std::optional<String>(const std::optional<Meta>   & current)>;   // presence only
 ```
 
-The loop, once for everyone: `read` under the policy → `decide` → `nullopt` is `Committed` with the
-incarnation read (nothing to write, the observation stands) — or, when nothing was read, a `Conflict`
-with no occupant; otherwise `replace` against what was read, or `create` if nothing was; `Committed`
-returns; `Conflict` sleeps with jitter and re-reads; an ambiguous write is resolved by exact read — our
-bytes are `Committed`, another's are a conflict; deadline, fence or cancellation are `GaveUp` with
-`sent_any` and the last object seen. Conflicts spend the same budget as errors: a hot key is also a
+Two overloads, one loop. The `Meta` overload reads by `HEAD` and exists for the sites whose decision
+needs presence and nothing else — `casPutObject`, whose bytes the caller froze before the loop, and
+`claim`'s absent branch — so that "no operation issues a request it does not need" holds in this
+direction too. The loop, once for everyone: read under the policy → `decide` → `nullopt` is
+`Declined{seen}` (nothing to write; the observation is returned so the caller can say what it saw);
+otherwise `replace` against what was read, or `create` if nothing was; `Committed` returns;
+`Conflict` sleeps with jitter and re-reads; an ambiguous write is resolved by exact read — our bytes
+are `Committed`, another's are a conflict; a 404 on the `replace` is a vanish: re-read, and `decide`
+sees absence; deadline, fence or cancellation are `GaveUp` with `sent_any` and the last observation. Conflicts spend the same budget as errors: a hot key is also a
 failure, and it must end — GCS bounds mutations of one object at about one per second, and today's
 `_ckpt` and catalog loops reissue without a sleep.
 
@@ -328,23 +415,24 @@ audits and the two reviews found:
 | site | today | after |
 |---|---|---|
 | `CasRefCatalog::casUpdateImpl` | 100 attempts, no retry on throw, **no sleep** | `readModifyWrite`, `standard` |
-| `CasRefCatalog` completed-removal deletion | 100 attempts, same shape | `readModifyWrite`, `standard` |
+| `CasRefCatalog` completed-removal deletion | 100 attempts; `casPut` in `try/catch` and continue; the fence generation checked per iteration; `EntryChanged` a terminal exit from the read | `readModifyWrite`, `standard`; decide returns `nullopt` on `EntryChanged` and on a moved generation — the engine's admit covers the second |
 | `PoolMeta::admitOrValidate` | `for (;;)`, unbounded (the livelock) | `readModifyWrite`, `standard` — bounded for free |
 | `PoolMeta::createOrValidate` | one `create`, then `admitOrValidate` | `create`, then the row above |
 | `publishCkpt` | 100 attempts + deadline, **no sleep** | `readModifyWrite`, `standard` |
 | `allocateWriterEpoch` | 100 attempts | `readModifyWrite`, `standard`; decide issues the subtree `LIST` and the sentinel probe on the absent branch, as today |
 | `computeHeartbeatFloor` fence-out | 4 reclassify attempts | `readModifyWrite`, `standard`; decide = the stability classification |
 | `Gc::acquireOrRenewLease` | 2 attempts, observation/steal machine | `readModifyWrite`, `standard`; decide **is** the machine: renew when ours, steal when the foreign heartbeat is frozen past the threshold the GC already tracks, `nullopt` otherwise; `CORRUPTED_DATA` on vanish-after-observe as today |
-| `Gc::pulseHeartbeat` | 1 attempt, conflict ignored | `readModifyWrite`, `standard`; decide = `++seq` **only while the current owner is us**, else `nullopt` — a deposed leader must not fight the new one on a key GCS bounds to one write per second |
-| `casGcMaintenanceState` | 1 attempt against a caller-supplied expected | **`replace`**, `standard` — "write if unchanged, else skip"; a concurrently advanced cursor wins, as today |
-| `CasPlainObjects::casPutObject` | `HEAD` → put, 100 iterations | `readModifyWrite`, `standard`; decide reads presence only (the single-appender invariant) |
+| `Gc::pulseHeartbeat` | 1 attempt, `owner = gc_id`, conflict ignored | `replace` (or `create` when absent), **`once`**, `owner = gc_id` as today; conflict terminal, the next pulse comes on cadence. The discriminator against a deposed leader fighting is the **lease**, which `heartbeatLoop` already checks (`i_am_leader`) before every pulse — not the heartbeat's owner field, which a new leader must be able to take over |
+| `casGcMaintenanceState` | 1 attempt against a caller-supplied expected, `nullopt` when absent | `create` on absence, else **`replace`**, `standard` — "write if unchanged, else skip"; a concurrently advanced cursor wins, as today. The one write made from inside a `catch (...)` before rethrow is `once` |
+| `CasPlainObjects::casPutObject` | `HEAD` → put, 100 iterations | `readModifyWrite` over `Meta`, `standard`; decide reads presence only (the single-appender invariant) — still a `HEAD`, never a body |
 | GC round commit; GC rebuild commit | 1 attempt, conflict drops the round | **`replace`**, `standard` — no re-decide, and the verb says so |
-| `MountLeaseKeeper::claim` | `head` → `putIfAbsent`, or `get` → `putOverwrite` (+ diagnostic re-`get`) | `readModifyWrite`, `standard`; two requests on both paths |
-| `claimOwnerOrThrow` | read → `putIfAbsent` → re-read with corruption arms | `create`, then `read` on `Conflict` — two calls, because `Conflict` carries bytes only from the engine's resolve |
-| `putDeterministicArtifact`; the outcomes log | `putIfAbsent` then `get`-and-compare-adopt | `create`, then `read` on `Conflict` — same |
-| `PartWriteTxn::ensureBlobPresent` | `head` → data-plane publish → `putMetaIfAbsent` via controller | `head` under `standard`; `publish`; `create` under `standard` |
+| `claimMount`, `claimMountAwaitingExpiry` | read → `putIfAbsent` on absence / `putOverwrite` on same-epoch refresh / `putOverwrite` on the fenced, clean or proven-dead reclaim; **conflict terminal** (`LiveDoubleStart`, never overwrite a slot that appeared under us) | `read`, then `create` or `replace`, `standard`; never `readModifyWrite` — the conflict is the verdict |
+| `MountLeaseKeeper::claim` | `head` → `putIfAbsent`, or `get` → `putOverwrite` (+ diagnostic re-`get`) | `readModifyWrite` over `Meta` on the absent branch, over `Object` on the adopt branch, `standard`; two requests on both paths |
+| `claimOwnerOrThrow` | read → `putIfAbsent` → re-read with corruption arms | `create`, `standard`; the `Conflict`'s `Observation` is the re-read |
+| `putDeterministicArtifact`; the outcomes log | `putIfAbsent` then `get`-and-compare-adopt | `create`, `standard`; compare-adopt on the `Conflict`'s `Object` |
+| `PartWriteTxn::ensureBlobPresent` | `head` → data-plane publish → `putMetaIfAbsent` via controller | `head`, `standard`; `publish`, `standard`; `create`, `standard` |
 | `MountLeaseKeeper::renew` | controlled overwrite under the lease deadline | `replace`, `untilLeaseSafe` |
-| `MountLeaseKeeper::terminate` (farewell) | unconditional-by-intent `If-Match` write | `replace`, `once` |
+| `MountLeaseKeeper::terminate` (farewell) | `If-Match` write; on refusal a re-`get`, silent when `gc_fenced`, else `CASMountExclusivityViolation` + `ABORTED` | `replace`, `within(10 s)`; the refusal's `Observation` is the re-read |
 | `runCapabilityProbe` | raw calls, one attempt each | `create`/`replace`/`remove`, `standard` |
 
 The ref catalog — the site behind the `CREATE TABLE` failures — before and after:
@@ -374,8 +462,8 @@ existing `observe` diagnostics).
 
 ## The upstream slice {#upstream-slice}
 
-About forty additive lines in six files under `src/IO` and `src/Disks/DiskObjectStorage/ObjectStorages/S3`,
-generic, no CAS identifier, portable on its own. Three facts make it necessary, and one honest limit
+About sixty additive lines in six files under `src/IO` and `src/Disks/DiskObjectStorage/ObjectStorages/S3`,
+generic, no CAS identifier, portable on its own. Four facts make it necessary, and one honest limit
 bounds it.
 
 **A plain `GET` never carries a GCS generation.** The generation reaches the SDK's ETag field only
@@ -406,10 +494,21 @@ the default client, whose retry strategy is 500 attempts at a 5 s cap; and benea
 backoff, for every retryable S3 error including 429. `WriteSettings` already carries
 `object_storage_retry_profile`, which `writeObject` honours by selecting the single-attempt client;
 `ReadSettings` gains the same field, and `readObject`, when it is set, selects the same client **and
-pins `max_single_read_retries` to one** in the request settings it hands the buffer. With that, `read`
-and `write` are one physical attempt each, `readSmallObjectAndGetObjectMetadata` is exactly one
-request per call, and the single-attempt client is built with `request_timeout = attempt_reservation`
-so an attempt is bounded by the number the engine reserves.
+pins `max_single_read_retries` to one** in the request settings it hands the buffer. Both settings
+headers also gain `object_storage_attempt_timeout_ms`, and `getSingleAttemptClient(request_timeout_ms)`
+builds and caches the clone per `(base client, timeout)`. With that, `read` and `write` are one
+physical attempt each, `readSmallObjectAndGetObjectMetadata` is exactly one request per call, and an
+attempt is bounded by the number the engine reserves.
+
+**Pinning the read to one attempt breaks credential rotation unless the storage learns of it.**
+`ReadBufferFromS3::processException` refreshes an expired token into the **buffer's own** client and
+returns "retry"; with one attempt the buffer rethrows and the refreshed client dies with it, and
+`readObject` builds the next buffer from the storage's unchanged client — so the engine's one
+permitted `ExpiredToken` reissue would hit the same stale credentials until the deadline. (The
+`HEAD` path already installs the refreshed client into the storage; a read preceded by a `head`
+recovers by accident.) The slice makes `readObject` install the refreshed client into the storage
+the way `tryGetObjectMetadataImpl` does, so the reissue sees it. This is the fourth fact, and the one
+the previous revision's claim of "one attempt" would have regressed.
 
 **What the slice does not do, by choice.** `HEAD`, `LIST`, conditional `DELETE` and the sentinel
 `GET` go through `IObjectStorage` methods that take no settings and use the default client; threading
@@ -506,10 +605,11 @@ much; it is stated here once.
   and 73 `InMemoryBackend` subclasses change with the signatures; they are counted in
   [Landing order](#landing-order) and migrate with the production sites, mostly by pattern.
 - **Decorators keep working.** `InstrumentedBackend`, the two test decorators, and the new
-  `ThrottlingBackend` forward the `TransportAccess` they receive. `ThrottlingBackend` answers a chosen
-  retryable status on every *n*-th request of any kind; the gate under it is in
-  [Verification](#verification). The fake GCS service of the integration suite gains the same mode on
-  its control surface.
+  `ThrottlingBackend` forward the `TransportAccess` they receive. `ThrottlingBackend` has two modes:
+  **first-per-key** — refuse the first request on every key once with a chosen retryable status,
+  which is the deterministic seam the coverage gate needs — and **every-*n*-th**, for the
+  distribution tests. The gate under it is in [Verification](#verification). The fake GCS service of
+  the integration suite gains the first-per-key mode on its control surface.
 - **`runCapabilityProbe`** constructs three synthetic tokens today and cannot under this contract. It
   is reordered so every wrong value is the same key's stale incarnation: overwrite with `t1` first,
   then the refusal check with `t1`; on the CAS key, create and commit with `ct1`, then the stale
@@ -523,10 +623,14 @@ much; it is stated here once.
 
 ## Landing order {#landing-order}
 
-About 300 production sites — 80 `get`, 24 `head`, 38 writes, 17 deletes, 11 `forEachListedKey`, 26
-default-constructed holders, 3 backend implementations, 4 codecs — plus about 1,600 test transport
-calls in 57 files, 73 `InMemoryBackend` subclasses and 59 test constructions in 14 files. Five steps,
-each green:
+About 300 production call sites — 80 `get`, 24 `head`, 38 writes, 17 deletes, 11 `forEachListedKey`,
+26 default-constructed holders, 3 backend implementations, 4 codecs — plus 53 production functions
+declared over `Backend &` that become `CasRequests &` (`CasRefCatalog::read`, `publishCkpt`,
+`allocateWriterEpoch`, `computeHeartbeatFloor`, `loadMeta`, `openSourceEdgeRun`, `listMounts`, …),
+`Pool::backend()` itself, about 1,600 test transport calls in 57 files, 73 `InMemoryBackend`
+subclasses, 59 test constructions in 14 files, the `ObjectMeta` and ranged-read contract tests that
+go with their seams, and `gtest_cas_request_control.cpp`, the old controller's own file, deleted
+whole at the lock. Five steps, each green:
 
 1. **Safety, inside the backend, small.** In `ObjectStorageBackend`, no caller change: the full
    minting grammar enforced at the legacy write entry points as `LOGICAL_ERROR`, the same on the
@@ -550,9 +654,10 @@ each green:
    (`backend.putIfAbsent(k, v)` → `requests.create(k, v, Retry::once())`). The `read`-or-`stream`
    decision per site is already tabulated by the review of revision 1. Mechanical, delegated,
    reviewed per file, gate green after each.
-5. **The lock.** The old `Backend` signatures, the old controller and its five entry points, `Token`,
-   `mintingTypeMatches`, the fallback `HEAD` and `CasRequestBudget`'s two dead fields are deleted;
-   the `static_assert`s go in. The compiler lists what was missed.
+5. **The lock.** The old `Backend` signatures, the old controller and its five entry points and test
+   file, `Pool::backend()`, `Token`, `mintingTypeMatches`, the fallback `HEAD` and
+   `CasRequestBudget`'s two dead fields are deleted; the `static_assert`s go in. The compiler lists
+   what was missed.
 
 Unconstructibility and uncallability are properties of step 5; key binding and the three-outcome
 result of step 3 for every migrated site. Until then the safety rests on step 1 — what is needed
@@ -565,16 +670,18 @@ immediately — and the retries on step 3.
 including from a test and from code holding the concrete backend type; a `CasRequests` call without
 a `Retry` does not compile.
 
-**No site without a retry, executably.** Under `ThrottlingBackend` answering 429 on every *n*-th
-request, the pool-level scenario tests — `CREATE TABLE`, `INSERT`, `DROP`, `RENAME`, a writable mount
-at open (probe included), a GC round — all succeed, and every key touched shows at least one reissue.
-This is the audit as a test: a call under `Retry::once()` where `standard` was meant turns the gate
-red in seconds.
+**No site without a retry, executably.** Under `ThrottlingBackend` in first-per-key mode (every
+key's first request refused once with 429), the pool-level scenario tests — `CREATE TABLE`, `INSERT`,
+`DROP`, `RENAME`, a writable mount at open (probe included), a GC round — all succeed, and every key
+touched shows exactly one refusal and at least one reissue. This is the audit as a test: a call under
+`Retry::once()` where `standard` was meant turns the gate red in seconds. The heartbeat pulse and the
+`slotOccupy` callers, which are `once` by design, are exercised by their own tests, not this gate.
 
 **The lease, on fake clocks.** Under sustained 429, `untilLeaseSafe` starts its last attempt before
 `lease_deadline − margin − attempt_reservation` and issues **zero** requests after it; a renewal whose
-resolve `GET` is throttled terminates by the deadline rather than hanging; the single-attempt client
-is constructed with `request_timeout == attempt_reservation`.
+resolve `GET` is throttled terminates by the deadline rather than hanging, with
+`GaveUp{deadline_source = Lease}`; the single-attempt client the fake S3 storage hands out is
+constructed with `request_timeout == object_storage_attempt_timeout_ms`.
 
 **The deadline is the only bound.** Under zero-latency 429s, `standard` keeps reissuing until the
 ninety-second deadline and gives up with `GaveUp{Deadline}`, never earlier; `once` sends one request
@@ -586,17 +693,24 @@ with a mean near half the ceiling; without jitter the test is red.
 **The write result.** A write whose only attempt was refused by the fence before sending reports
 `GaveUp{sent_any = false}`; one that went ambiguous and then hit the deadline reports
 `GaveUp{sent_any = true}`; `commitRefChunk` releases the transaction id on the first and wedges on the
-second — the existing ref-lane tests, re-pointed at the field. `Conflict::occupant` is set only after
-a resolve read: a 412 without a resolve carries `nullopt`.
+second — the existing ref-lane tests, re-pointed at the field. The observation is honest: a 412
+without a resolve carries `NotObserved`; a resolve that finds nothing carries `ProvenAbsent` and
+`renew` reports `Vanished` on it and retry-later on `NotObserved` — the two existing renewer tests,
+re-pointed; `create` under `once` costs one request when it commits and two when it conflicts, and
+the conflict carries the occupant. `Committed::attempts_sent` and `GaveUp::deadline_source` feed the
+two mount counters as today.
 
-**The fence generation.** A call admitted under generation *g*, with the fence re-armed to *g+1* and
-open before its second attempt, ends in `GaveUp{FenceLost}` without sending — the invariant
-`casPutObject` holds by hand today, now on every site.
+**The fence.** A call admitted under generation *g*, with the fence re-armed to *g+1* and open before
+its second attempt, ends in `GaveUp{FenceLost}` without sending — the invariant `casPutObject` holds
+by hand today, now on every site; `admit` with `needed_ms` larger than the mount's remaining
+`deadline − margin` returns `NoBudget` and the call ends in `GaveUp{Deadline, Lease}`; `orThrow()` on
+`FenceLost` throws the same transient-unavailable exception `checkFenceOrThrow` throws today.
 
 **`readModifyWrite` under contention.** Two threads incrementing one counter through it on
 `InMemoryBackend`: the total is the sum, every conflict is followed by a sleep, and a key in perpetual
-conflict ends in `GaveUp{Deadline}` — the bound `PoolMeta` lacks today. The heartbeat decide declines
-when the owner has changed: a deposed leader issues no second write.
+conflict ends in `GaveUp{Deadline}` — the bound `PoolMeta` lacks today. The `Meta` overload issues
+`HEAD`s and no `GET`. A decide that declines returns `Declined`, and `orThrow()` does not throw on it.
+The heartbeat under `once` issues exactly one write per pulse, conflict or not.
 
 **Identity.** Key binding: `head("a")` applied to `replace("b", …)` throws before any request. Minting
 refuses empty, `*`, a comma list, `00123`, `0`, and a generation still quoted after the strip.
@@ -621,19 +735,23 @@ every step; `Cas::Probe` passes on every supported writable store.
 2. The upstream slice lands as one commit, under a hundred lines, `IO/` and `ObjectStorages/S3/` only,
    no CAS identifier.
 3. After step 5: the three `static_assert`s hold; `get`, `getStream`, `putIfAbsent`, `putOverwrite`,
-   `casPut`, `deleteExact`, `Token`, `mintingTypeMatches`, the old controller and its five entry points,
-   the fallback `HEAD` no longer exist; no `Backend` method is callable without a `TransportAccess`;
-   every `CasRequests` call names a policy; no test calls a `Backend` method.
+   `casPut`, `deleteExact`, `publishBlob`, `Token`, `ObjectMeta`, `Range`, `mintingTypeMatches`,
+   `Pool::backend()`, the old controller and its five entry points, the fallback `HEAD` no longer
+   exist; no transport method of `Backend` is callable without a `TransportAccess` (the four
+   capability predicates are the named exceptions); every `CasRequests` call names a policy; no test
+   calls a transport method.
 4. The throttling gate is green with a reissue observed on every touched key, the probe included; the
    audit's twenty-three sites are all under `CasRequests`.
 5. `untilLeaseSafe` issues no request past `lease_deadline − margin`; `standard` gives up only at its
    deadline; the jitter test is red without jitter; `readModifyWrite` loses no increment under
    contention and bounds a hot key; the fence-generation test passes on every write verb.
-6. `GaveUp::sent_any` drives the ref lane's wedge decision; `Conflict::occupant` is set only from a
-   resolve read.
-7. `read` and `write` are one physical attempt each; no needless `HEAD`; `read` throws on drift and on
-   the bound; no string becomes an `Incarnation` anywhere; `remove` never reports `Mismatch` for any
-   reason other than the store's own.
+6. `GaveUp::sent_any` drives the ref lane's wedge decision; the `Observation` tri-state drives the
+   renewer's `Vanished`-versus-retry-later verdict; an `Object` in an observation comes only from a
+   resolve read; the two mount renewal counters keep their inputs.
+7. `read` and `write` are one physical attempt each and credential rotation still recovers on the
+   read path; no needless `HEAD` and no needless `GET`; `read` throws on drift and on the bound; no
+   string becomes an `Incarnation` anywhere; `remove` never reports `Mismatch` for any reason other
+   than the store's own; `attempt_timeout_ms` and `lease_safety_margin_ms` are parsed disk settings.
 8. Existing lanes and gates green at every step.
 
 ## Companion change: the `Keeper` name {#companion-keeper-rename}
@@ -680,8 +798,21 @@ request became one physical attempt when `ReadBufferFromS3` retries four times b
 `HEAD`/`LIST`/`DELETE` never leave the default one; it dropped revision 4's read bound; it put the
 probe and the farewell under policies that defeat their purpose; it counted 300 sites and missed
 1,600 in tests; and it had the old controller delegate to the new engine across a conversion the
-contract forbids. Revision 6 keeps the shape — one minted key-bound incarnation, a transport nobody
-else can call, one façade whose every call names a policy, one engine, one primitive — and changes
+contract forbids. Revision 6 kept the shape — one minted key-bound incarnation, a transport nobody
+else can call, one façade whose every call names a policy, one engine, one primitive — and changed
 the mechanisms: a key instead of access specifiers, strings on the transport side, one three-outcome
 result, a deadline-only policy with a reserved attempt, a fence generation pinned at entry, a slice
 that promises what it keeps, and two engines side by side until the lock.
+
+**Revision 6** was reviewed once more and still had seven design holes, each a place where the
+document described a mechanism the code could not supply: `publish` had no key and no façade verb;
+two optionals stood where the renewer needs a tri-state ("nothing observed" and "proved absent" were
+one value); `once` could not both be one request and return `slotOccupy`'s occupant; the read pin
+silently broke credential rotation; the heartbeat rule "only while the owner is us" meant a new leader
+could never pulse; the `Fence` interface could only throw where the result type demanded a value and
+had no budget arithmetic; and the attempt reservation had no carrier into the single-attempt client
+and the two budget numbers were not configuration. Revision 7 supplies the mechanisms: a keyed
+`publish` and its verb, the `Observation` tri-state and `Why::Unresolved`, "`once` is one write
+attempt, the resolve read is not an attempt", a `readObject` that installs the refreshed client, the
+heartbeat as a one-attempt write discriminated on the lease, `Fence::admit`, and
+`object_storage_attempt_timeout_ms` with the two CAS numbers as parsed settings.
