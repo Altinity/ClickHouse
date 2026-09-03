@@ -71,7 +71,7 @@ bool headExists(Backend & backend, const String & key)
     return (*op).head(key, Retry::standard()).has_value();
 }
 
-KeyPage listOf(Backend & backend, const String & prefix, const String & cursor, size_t limit)
+ListPage listOf(Backend & backend, const String & prefix, const String & cursor, size_t limit)
 {
     OperationForTest op(backend);
     return (*op).list(prefix, cursor, limit, Retry::standard());
@@ -192,9 +192,9 @@ std::map<String, String> snapshotKeyTokens(CasOperation & op)
     String cursor;
     while (true)
     {
-        const KeyPage page = op.list("", cursor, 100000, Retry::once());
-        for (const KeyEntry & k : page.keys)
-            out[k.key] = k.incarnation ? k.incarnation->render() : String{};
+        const ListPage page = op.list("", cursor, 100000, Retry::once());
+        for (const ListedKey & k : page.keys)
+            out[k.key] = k.etag ? k.etag->render() : String{};
         if (page.next_cursor.empty())
             break;
         cursor = page.next_cursor;
@@ -575,7 +575,7 @@ TEST(CASGCLease, VanishedStateAfterObservationFailsClosed)
     OperationForTest wipe_op(*b);   /// out-of-model wipe (raw delete)
     const auto meta = (*wipe_op).head(s->layout().gcStateKey(), Retry::standard());
     ASSERT_TRUE(meta.has_value());
-    ASSERT_EQ((*wipe_op).remove(s->layout().gcStateKey(), meta->incarnation, Retry::standard()), Removal::Removed);
+    ASSERT_EQ((*wipe_op).remove(s->layout().gcStateKey(), meta->etag, Retry::standard()), Removal::Removed);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.runRegularRound(); });
 }
@@ -1373,7 +1373,7 @@ TEST(CASGCSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     EXPECT_FALSE(headExists(*backend, decoy_run)) << "non-adopted blob-target run leaked past retention";
 
     /// Nothing remains under the old generation prefix at all.
-    const KeyPage residue = listOf(*backend, store->layout().gcGenPrefix(old_gen), "", 1000);
+    const ListPage residue = listOf(*backend, store->layout().gcGenPrefix(old_gen), "", 1000);
     EXPECT_TRUE(residue.keys.empty()) << "old generation prefix must be fully reclaimed; left "
                                       << residue.keys.size() << " objects";
 
@@ -1432,7 +1432,7 @@ TEST(CASGCSnapRetention, PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAParti
     {
         ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
         const GcState st = readState(*backend, *store);
-        const KeyPage residue = listOf(*backend, store->layout().gcGenPrefix(old_gen), "", 1000);
+        const ListPage residue = listOf(*backend, store->layout().gcGenPrefix(old_gen), "", 1000);
 
         if (st.snap_pruned_through >= old_gen)
             EXPECT_TRUE(residue.keys.empty())
@@ -1633,7 +1633,7 @@ TEST(CASGCRetention, HandOffDeletesSupersededRef)
     /// ... and the post-CAS hand-off delete reclaimed gen-1's WHOLE prefix (not just the single run
     /// object): seal, attempt subtree, run — all gone. The ordinary prune would have leaked it because its
     /// cursor is already past gen-1.
-    const KeyPage residue = listOf(*backend, old_prefix, "", 1000);
+    const ListPage residue = listOf(*backend, old_prefix, "", 1000);
     EXPECT_TRUE(residue.keys.empty())
         << "the superseded gen-1 prefix must be hand-off deleted; left " << residue.keys.size() << " objects";
 
@@ -1945,7 +1945,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
             .committed_through = RefTxnId{2, 1},
             .checkpoint_snapshot_id = std::nullopt,
             .last_epoch_seal = RefTxnId{1, 2},
-        }), old_ckpt->incarnation, Retry::standard())));
+        }), old_ckpt->etag, Retry::standard())));
     }
 
     /// The list budget is one key per round, so reclaiming both debris bodies takes a circuit.
