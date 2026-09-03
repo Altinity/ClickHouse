@@ -38,7 +38,6 @@ using namespace DB::Cas;
 namespace DB::ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
-    extern const int CAS_WRITE_UNATTRIBUTED;
 }
 
 #if USE_AWS_S3
@@ -675,8 +674,8 @@ TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
 /// ETag-dialect sibling of PublishBlobSucceedsWithoutResponseGeneration above: a publication has no
 /// incarnation to attribute in the first place, so it is unaffected by this guard. Default (ETag)
 /// dialect here, deliberately NOT stamped Generation, whose own two cases are covered by
-/// CASBackendGenerationS3.WriteEmptyGenerationIsUnattributed and WriteNonNumericGenerationIsUnattributed.
-TEST(CASBackendGrammar, NamelessWriteResponseThrowsWriteUnattributed)
+/// CASBackendGenerationS3.WriteEmptyGenerationIsUnresolvedNotThrown and WriteNonNumericGenerationIsUnresolvedNotThrown.
+TEST(CASBackendGrammar, NamelessWriteResponseIsUnresolvedNotThrown)
 {
     (void)getContext();
     FakeGenerationS3Client * client = nullptr;
@@ -685,9 +684,15 @@ TEST(CASBackendGrammar, NamelessWriteResponseThrowsWriteUnattributed)
     ASSERT_EQ(backend.nativeTokenType(), Dialect::ETag);
     client->put_returns_no_etag = true;
 
+    /// A 2xx write reply carrying no usable incarnation is an ambiguity the engine settles by a
+    /// resolve read (CasRequests::writeLoop), never an immediate corruption verdict; the mock's
+    /// resolve GET finds nothing at the key, so the create-if-absent precondition is still
+    /// satisfiable and a single-attempt policy reports GaveUp{Unresolved} rather than throwing.
     DB::Cas::tests::OperationForTest op(backend);
-    DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED, [&] { (*op).create("p/gen/nameless-write", "v", Retry::once()); });
+    const WriteResult result = (*op).create("p/gen/nameless-write", "v", Retry::once());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
     EXPECT_EQ(client->put_object_calls, 1u);
 }
 
@@ -737,28 +742,34 @@ TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPut
 /// the CAS layer receives in the shape production actually produces, which is why a mount that could
 /// never succeed passed every unit test. These three tests are that crossing.
 
-TEST_F(CASBackendGenerationS3, WriteEmptyGenerationIsUnattributed)
+TEST_F(CASBackendGenerationS3, WriteEmptyGenerationIsUnresolvedNotThrown)
 {
     backend = makeBackend();
     client->next_put_etag = "";
     /// The write may well have landed -- an empty response value says nothing about that -- so this is
-    /// the resolve-by-reading class, not the corrupt-response one.
+    /// the resolve-by-reading class, not the corrupt-response one (CasRequests::writeLoop): a 2xx
+    /// carrying a value no grammar accepts is an ambiguity, never an immediate corruption verdict. The
+    /// mock's resolve GET finds nothing at the key either, so the create-if-absent precondition is
+    /// still satisfiable and a single-attempt policy reports GaveUp{Unresolved} rather than throwing.
     DB::Cas::tests::OperationForTest op(*backend);
-    DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED,
-        [&] { (*op).create("p/gen/no-etag", "v", Retry::once()); });
+    const WriteResult result = (*op).create("p/gen/no-etag", "v", Retry::once());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
 }
 
-TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationIsUnattributed)
+TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationIsUnresolvedNotThrown)
 {
     backend = makeBackend();
     /// An MD5-shaped ETag where a generation belongs: the store answered, but not with an incarnation
-    /// this dialect can use, and no follow-up read can attribute the write on its behalf.
+    /// this dialect can use; see WriteEmptyGenerationIsUnresolvedNotThrown for why this settles as an
+    /// ambiguity (GaveUp{Unresolved}) rather than a thrown exception.
     client->next_put_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
     DB::Cas::tests::OperationForTest op(*backend);
-    DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED,
-        [&] { (*op).create("p/gen/bad-etag", "v", Retry::once()); });
+    const WriteResult result = (*op).create("p/gen/bad-etag", "v", Retry::once());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
 }
 
 /// A mutable conditional write whose response generation arrives quoted -- exactly what
