@@ -179,7 +179,7 @@ TEST(CASPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
         const String pkey = s->layout().blobKey(idOf(P));
         const auto h = (*reclaim_op).head(pkey, Retry::once());
         ASSERT_TRUE(h.has_value()) << "P must be present before the simulated reclaim";
-        ASSERT_EQ((*reclaim_op).remove(pkey, h->incarnation, Retry::once()), Removal::Removed);
+        ASSERT_EQ((*reclaim_op).remove(pkey, h->etag, Retry::once()), Removal::Removed);
     }
     /// Drop the source ref too (the state a real premature reclaim leaves: P unprotected and gone).
     s->dropRef(ns, "refA");
