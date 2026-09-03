@@ -30,7 +30,7 @@ TEST(CASProbe, PassesOnEnforcingBackend)
     auto requests = makeRequests(*b);
     auto op = requests.admit();
     EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe"));
-    EXPECT_TRUE(b->list("p/.cas_probe", "", 10).keys.empty());   // probe cleans up after itself
+    EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());   // probe cleans up after itself
 }
 
 TEST(CASProbe, FailsClosedOnNonEnforcingDelete)
@@ -73,9 +73,12 @@ TEST(CASProbe, PassesOnEmulatedLocal)
 TEST(CASProbe, ConcurrentMountsDoNotCollide)
 {
     auto b = std::make_shared<InMemoryBackend>();
+    auto probe_requests = makeRequests(*b);
+    auto probe_op = probe_requests.admit();
 
     /// Simulate a concurrent mounter whose probe object under the legacy fixed key is still present.
-    ASSERT_EQ(b->putIfAbsent("p/_probe/token", "concurrent-mounter-in-flight").outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        probe_op.create("p/_probe/token", "concurrent-mounter-in-flight", Retry::once())));
 
     /// A real (second) mount over the same shared pool must still succeed — its probe runs under a
     /// fresh per-mount-unique prefix and never touches the seeded fixed key.
@@ -85,7 +88,7 @@ TEST(CASProbe, ConcurrentMountsDoNotCollide)
     EXPECT_NO_THROW(Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
 
     /// The seeded fixed-key artifact is untouched (the probe never collided with it).
-    EXPECT_TRUE(b->get("p/_probe/token").has_value());
+    EXPECT_TRUE(probe_op.read("p/_probe/token", Retry::once()).has_value());
 }
 
 /// RFC cas-s3-timeout-retry-control: a Native-mode mount over an object storage that does not support
@@ -222,7 +225,7 @@ TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
         auto requests = makeRequests(b);
         auto op = requests.admit();
         EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe")) << "dialect " << static_cast<int>(dialect);
-        EXPECT_TRUE(b.list("p/.cas_probe", "", 10).keys.empty()) << "dialect " << static_cast<int>(dialect);
+        EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty()) << "dialect " << static_cast<int>(dialect);
         EXPECT_EQ(b.write_reached, 4) << "dialect " << static_cast<int>(dialect);
         EXPECT_EQ(b.remove_reached, 2) << "dialect " << static_cast<int>(dialect);
     }
