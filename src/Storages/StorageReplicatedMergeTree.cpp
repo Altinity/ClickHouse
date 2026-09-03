@@ -249,6 +249,8 @@ namespace Setting
     extern const SettingsUInt64 iceberg_insert_max_bytes_in_data_file;
     extern const SettingsUInt64 iceberg_insert_max_rows_in_data_file;
     extern const SettingsTimezone iceberg_partition_timezone;
+    extern const SettingsBool allow_experimental_aggregate_function_states_in_parquet;
+    extern const SettingsBool allow_experimental_aggregate_function_states_in_iceberg;
 }
 
 
@@ -8763,6 +8765,10 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     manifest.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
     manifest.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
+    manifest.allow_aggregate_function_states_in_parquet
+        = query_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_parquet];
+    manifest.allow_aggregate_function_states_in_iceberg
+        = query_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_iceberg];
     manifest.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
     manifest.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
     manifest.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;

@@ -42,6 +42,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.6.2.20001.altinityantalya",
         {
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"allow_experimental_aggregate_function_states_in_iceberg", false, false, "New setting gating aggregate function states in Iceberg tables, on creation and on read. Disabled by default, so such a column keeps being refused with `SUPPORT_IS_DISABLED` as in versions without the feature."},
+            {"allow_experimental_aggregate_function_states_in_parquet", false, false, "New setting gating `AggregateFunction` states in Parquet files, on write and in schema inference. Disabled by default, so writing such a column keeps throwing `UNKNOWN_TYPE` as in versions without the feature."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

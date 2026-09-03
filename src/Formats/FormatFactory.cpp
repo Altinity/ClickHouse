@@ -52,6 +52,7 @@ FORMAT_FACTORY_SETTINGS(DECLARE_FORMAT_EXTERN, INITIALIZE_SETTING_EXTERN)
     extern const SettingsAggregateFunctionInputFormat aggregate_function_input_format;
     extern const SettingsBool allow_special_serialization_kinds_in_output_formats;
     extern const SettingsBool allow_experimental_nullable_tuple_type;
+    extern const SettingsBool allow_experimental_aggregate_function_states_in_parquet;
 
     extern SettingsGeoJSONUnsupportedGeometryHandling input_format_geojson_unsupported_geometry_handling;
     extern SettingsBool input_format_parallel_parsing;
@@ -252,6 +253,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.verify_checksums = settings[Setting::input_format_parquet_verify_checksums];
     format_settings.parquet.local_time_as_utc = settings[Setting::input_format_parquet_local_time_as_utc];
     format_settings.parquet.allow_geoparquet_parser = settings[Setting::input_format_parquet_allow_geoparquet_parser];
+    format_settings.parquet.allow_aggregate_function_states = settings[Setting::allow_experimental_aggregate_function_states_in_parquet];
     format_settings.parquet.write_geometadata = settings[Setting::output_format_parquet_geometadata];
     if (auto memory_limit = total_memory_tracker.getHardLimit(); memory_limit > 0)
     {

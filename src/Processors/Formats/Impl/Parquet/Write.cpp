@@ -27,6 +27,8 @@
 #include <DataTypes/DataTypeEnum.h>
 #include <Core/Block.h>
 #include <DataTypes/DataTypeCustom.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <Poco/JSON/Stringifier.h>
 
 #if USE_SNAPPY
 #include <snappy.h>
@@ -1566,6 +1568,34 @@ void writeFileFooter(FileWriteState & file,
 
             parquet::format::KeyValue key_value;
             key_value.__set_key("geo");
+            key_value.__set_value(oss.str());
+
+            meta.key_value_metadata.push_back(std::move(key_value));
+            meta.__isset.key_value_metadata = true;
+        }
+    }
+
+    /// Record the names of types the parquet schema cannot describe on its own (aggregate states),
+    /// so that schema inference can reconstruct them.
+    {
+        Poco::JSON::Object::Ptr column_types = new Poco::JSON::Object;
+        bool any = false;
+        for (const auto & [column_name, type] : header.getNamesAndTypesList())
+        {
+            if (!needsClickHouseTypeAnnotation(type))
+                continue;
+            column_types->set(column_name, getClickHouseTypeAnnotationName(type));
+            any = true;
+        }
+
+        if (any)
+        {
+            std::ostringstream // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+                oss;
+            Poco::JSON::Stringifier::stringify(column_types, oss);
+
+            parquet::format::KeyValue key_value;
+            key_value.__set_key(clickhouse_column_types_key);
             key_value.__set_value(oss.str());
 
             meta.key_value_metadata.push_back(std::move(key_value));

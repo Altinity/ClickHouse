@@ -1,6 +1,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/DataFileStatistics.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Columns/ColumnAggregateFunction.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/IColumn.h>
 
@@ -28,6 +29,21 @@ static Range getExtremeRangeFromColumn(const ColumnPtr & column)
     return Range(min_val, true, max_val, true);
 }
 
+/// `ColumnAggregateFunction::getExtremes` reports a serialized state, and comparing two such
+/// `Field`s throws. Iceberg records no bounds for aggregate states anyway.
+static bool supportsExtremeRange(const IColumn & column)
+{
+    if (checkAndGetColumn<ColumnAggregateFunction>(&column))
+        return false;
+
+    bool result = true;
+    column.forEachSubcolumnRecursively([&](const IColumn & subcolumn)
+    {
+        result &= checkAndGetColumn<ColumnAggregateFunction>(&subcolumn) == nullptr;
+    });
+    return result;
+}
+
 void DataFileStatistics::update(const Chunk & chunk)
 {
     if (!chunk.hasRows())
@@ -37,9 +53,12 @@ void DataFileStatistics::update(const Chunk & chunk)
     {
         column_sizes.resize(num_columns, 0);
         null_counts.resize(num_columns, 0);
+        track_ranges.resize(num_columns);
         for (size_t i = 0; i < num_columns; ++i)
         {
-            ranges.push_back(getExtremeRangeFromColumn(chunk.getColumns()[i]));
+            const auto & col = chunk.getColumns()[i];
+            track_ranges[i] = supportsExtremeRange(*col);
+            ranges.push_back(track_ranges[i] ? getExtremeRangeFromColumn(col) : Range::createWholeUniverse());
         }
     }
 
@@ -54,7 +73,8 @@ void DataFileStatistics::update(const Chunk & chunk)
             for (UInt8 v : nullable_col->getNullMapData())
                 null_counts[i] += v;
         }
-        ranges[i] = uniteRanges(ranges[i], getExtremeRangeFromColumn(col));
+        if (track_ranges[i])
+            ranges[i] = uniteRanges(ranges[i], getExtremeRangeFromColumn(col));
     }
 }
 
@@ -68,6 +88,7 @@ void DataFileStatistics::merge(const DataFileStatistics & other)
         column_sizes = other.column_sizes;
         null_counts = other.null_counts;
         ranges = other.ranges;
+        track_ranges = other.track_ranges;
         return;
     }
 
@@ -76,7 +97,8 @@ void DataFileStatistics::merge(const DataFileStatistics & other)
     {
         column_sizes[i] += other.column_sizes[i];
         null_counts[i] += other.null_counts[i];
-        ranges[i] = uniteRanges(ranges[i], other.ranges[i]);
+        if (track_ranges[i])
+            ranges[i] = uniteRanges(ranges[i], other.ranges[i]);
     }
 }
 
@@ -115,6 +137,11 @@ std::vector<std::pair<size_t, Field>> DataFileStatistics::getLowerBounds() const
     std::vector<std::pair<size_t, Field>> result;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
+        /// Untracked columns (aggregate states) carry a whole-universe range whose infinite bounds
+        /// cannot be dumped. Emitting them would fail the all-or-nothing canWriteStatistics() check
+        /// and drop bounds for every column in the file; omit them so the rest still prune.
+        if (!track_ranges[i])
+            continue;
         result.push_back({field_ids[i], ranges[i].left});
     }
     return result;
@@ -125,6 +152,8 @@ std::vector<std::pair<size_t, Field>> DataFileStatistics::getUpperBounds() const
     std::vector<std::pair<size_t, Field>> result;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
+        if (!track_ranges[i])
+            continue;
         result.push_back({field_ids[i], ranges[i].right});
     }
     return result;

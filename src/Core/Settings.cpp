@@ -7428,6 +7428,34 @@ Query Iceberg table using the specific snapshot id.
     DECLARE(Bool, allow_experimental_geo_types_in_iceberg, false, R"(
 Allow parsing Iceberg `geometry` and `geography` field types as ClickHouse `Geometry` (Variant) type.
 )", 0) \
+    DECLARE(Bool, allow_experimental_aggregate_function_states_in_iceberg, false, R"(
+Allow `AggregateFunction` and `SimpleAggregateFunction` columns in Iceberg tables, both when creating
+a table and when reading one. Writing additionally requires
+[`allow_experimental_aggregate_function_states_in_parquet`](/operations/settings/settings#allow_experimental_aggregate_function_states_in_parquet),
+since the data files are Parquet.
+
+An `AggregateFunction` state is stored as an opaque `binary` value with its ClickHouse type name in
+the schema field's `clickhouse.type` key. Honouring that key means the table's metadata, not the
+query, chooses the deserializer the stored bytes are handed to, so keep this disabled for tables from
+untrusted sources; a field recording such a type is then rejected rather than read as `String`.
+`SimpleAggregateFunction` is not gated on read, holding ordinary values of its storage type.
+
+The setting is read from the query that parses the table's schema. [More about aggregate function
+states in Iceberg](/engines/table-engines/integrations/iceberg#aggregate-function-states).
+)", 0) \
+    DECLARE(Bool, allow_experimental_aggregate_function_states_in_parquet, false, R"(
+Allow `AggregateFunction` states in Parquet files, both when writing and when inferring a schema.
+While disabled, writing such a column is refused with `UNKNOWN_TYPE`.
+
+A state is written as an opaque `BYTE_ARRAY`, with the ClickHouse type name - including the state
+version, which pins the serialized layout - recorded in the `clickhouse.column_types` file metadata
+key. Reconstructing the type from that key means the file, not the query, chooses the deserializer
+the stored bytes are handed to, so keep this disabled for files from untrusted sources; a file
+recording such a type is then rejected rather than read as `String`.
+
+Neither direction affects an explicitly given structure, nor `SimpleAggregateFunction`. [More about
+aggregate function states in Parquet](/interfaces/formats/Parquet#aggregate-function-states).
+)", 0) \
     DECLARE(Bool, show_data_lake_catalogs_in_system_tables, false, R"(
 Enables showing data lake catalogs in system tables.
 )", 0) \
