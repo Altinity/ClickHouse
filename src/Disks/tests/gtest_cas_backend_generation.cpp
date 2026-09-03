@@ -683,15 +683,13 @@ TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
     EXPECT_EQ(client->objects.at("p/gen/publish-no-generation"), "freshpayload");
 }
 
-/// The write-response half of the incarnation grammar: a real S3-style write response (see the class
-/// comment on tokenFromWriteResult) that carries no ETag at all must not fall back to a HEAD -- there
-/// is no HEAD that can attribute the write with certainty, since the object it would read back might
-/// not even be the one this call just wrote. This is the ETag-dialect sibling of
-/// PublishBlobSucceedsWithoutResponseGeneration above: that test's publishBlob call never reaches
-/// tokenFromWriteResult, so it is unaffected by this guard. Default (ETag) dialect here, deliberately
-/// NOT stamped Generation: the Generation branch of tokenFromWriteResult has its own, already-covered
-/// CORRUPTED_DATA path (CASBackendGenerationS3.WriteEmptyGenerationThrows and
-/// WriteNonNumericGenerationThrows, above).
+/// The write-response half of the incarnation grammar: a write response that carries no ETag at all
+/// must not fall back to a HEAD -- there is no HEAD that can attribute the write with certainty, since
+/// the object it would read back might not even be the one this call just wrote. This is the
+/// ETag-dialect sibling of PublishBlobSucceedsWithoutResponseGeneration above: a publication has no
+/// incarnation to attribute in the first place, so it is unaffected by this guard. Default (ETag)
+/// dialect here, deliberately NOT stamped Generation, whose own two cases are covered by
+/// CASBackendGenerationS3.WriteEmptyGenerationIsUnattributed and WriteNonNumericGenerationIsUnattributed.
 TEST(CASBackendGrammar, NamelessWriteResponseThrowsWriteUnattributed)
 {
     (void)getContext();
@@ -751,20 +749,26 @@ TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPut
 /// the CAS layer receives in the shape production actually produces, which is why a mount that could
 /// never succeed passed every unit test. These three tests are that crossing.
 
-TEST_F(CASBackendGenerationS3, WriteEmptyGenerationThrows)
+TEST_F(CASBackendGenerationS3, WriteEmptyGenerationIsUnattributed)
 {
     backend = makeBackend();
+    client->next_put_etag = "";
+    /// The write may well have landed -- an empty response value says nothing about that -- so this is
+    /// the resolve-by-reading class, not the corrupt-response one.
     DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { backend->tokenFromWriteResult("p/gen/no-etag", String{}); });
+        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED,
+        [&] { backend->putIfAbsent("p/gen/no-etag", "v"); });
 }
 
-TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationThrows)
+TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationIsUnattributed)
 {
     backend = makeBackend();
+    /// An MD5-shaped ETag where a generation belongs: the store answered, but not with an incarnation
+    /// this dialect can use, and no follow-up read can attribute the write on its behalf.
+    client->next_put_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
     DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { backend->tokenFromWriteResult("p/gen/bad-etag", "\"d41d8cd98f00b204e9800998ecf8427e\""); });
+        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED,
+        [&] { backend->putIfAbsent("p/gen/bad-etag", "v"); });
 }
 
 /// A mutable conditional write whose response generation arrives quoted -- exactly what
@@ -773,8 +777,10 @@ TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationThrows)
 TEST_F(CASBackendGenerationS3, WriteGenerationTokenStripsTransportQuoting)
 {
     backend = makeBackend();
-    const Token tok = backend->tokenFromWriteResult("p/gen/quoted-write", "\"1783078552147137\"");
-    EXPECT_EQ(tok, (Token{"1783078552147137", TokenType::Generation}));
+    client->next_put_etag = "\"1783078552147137\"";
+    const auto put = backend->putIfAbsent("p/gen/quoted-write", "v");
+    ASSERT_EQ(put.outcome, PutOutcome::Done);
+    EXPECT_EQ(put.token, (Token{"1783078552147137", TokenType::Generation}));
 }
 
 /// The same crossing on the read side: a marked HEAD whose ETag field carries a quoted generation

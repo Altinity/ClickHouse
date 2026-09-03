@@ -45,7 +45,7 @@ private:
         const S3CredentialsRefreshCallback & credentials_refresh_callback_ = [] -> std::unique_ptr<const S3::Client>{ return nullptr; })
         : uri(uri_)
         , disk_name(disk_name_)
-        , client(std::move(client_))
+        , client(std::make_shared<MultiVersion<S3::Client>>(std::move(client_)))
         , s3_settings(std::move(s3_settings_))
         , s3_capabilities(s3_capabilities_)
         , key_generator(std::move(key_generator_))
@@ -225,7 +225,11 @@ private:
 
     std::string disk_name;
 
-    mutable MultiVersion<S3::Client> client;
+    /// The slot this disk's client lives in, and the only thing a credential refresh installs into.
+    /// Held by `shared_ptr` so a read buffer -- which can outlive this storage -- carries the SLOT
+    /// rather than a pointer to the storage: a refresh that arrives late then replaces a client
+    /// nobody will read again, instead of writing into a destroyed object.
+    const std::shared_ptr<MultiVersion<S3::Client>> client;
     MultiVersion<S3Settings> s3_settings;
     S3Capabilities s3_capabilities;
 

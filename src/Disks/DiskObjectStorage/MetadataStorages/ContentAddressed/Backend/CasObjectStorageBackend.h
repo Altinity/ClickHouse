@@ -48,8 +48,9 @@ PutOutcome finalizeConditionalWrite(WriteBuffer & buf);
 class ObjectStorageBackend final : public Backend
 {
 public:
-    /// Unhide the base overloads this class's own declarations would otherwise shadow: the legacy
-    /// `head`/`list`/`probeSentinelRaw` names, and `getStream`'s omitted-`Range` convenience.
+    /// Unhide the base overloads this class's own declarations would otherwise shadow: the
+    /// convenience forms that omit `Range`, and the keyed primitives that share a legacy name.
+    using Backend::get;
     using Backend::getStream;
     using Backend::head;
     using Backend::list;
@@ -103,8 +104,22 @@ public:
     /// Ask the storage to re-acquire credentials through its refresh callback.
     bool refreshCredentials() override { return object_storage->tryRefreshCredentialsViaCallback(); }
 
-    /// Open a forward-only ranged stream for a write-once object. Kept for the migration window: see
-    /// `Backend::getStream` for why it is not a forwarder.
+    /// ---- The legacy surface, kept for the migration window ----
+    ///
+    /// Not inherited from `Backend`: its forwarders would issue these requests under the profile the
+    /// keyed primitives use, which on a writable Native mount is SingleAttempt. That is right for a
+    /// primitive -- `CasRequests` is the retry loop around it -- and wrong for a legacy caller, which
+    /// has no loop at all and would lose the storage's own retries on the first blip. These keep the
+    /// storage's default profile until their callers move onto the engine, and are deleted at the
+    /// lock. Each mints its `Token` through the base's legacy mint, so a malformed response is
+    /// judged in exactly one place.
+    std::optional<GetResult> get(const String & key, Range range) override;
+    HeadResult head(const String & key) override;
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override;
+    DeleteOutcome deleteExact(const String & key, const Token & token) override;
+    SentinelProbeResult probeSentinelRaw(const String & key) override;
+    /// Open a forward-only ranged stream for a write-once object. See `Backend::getStream` for why it
+    /// is not a forwarder.
     std::optional<GetStreamResult> getStream(const String & key, Range range) override;
     /// S3 ETags are content-derived and surfaced in list responses — TRUE for ETag-token Native
     /// and EmulatedSingleProcess modes. FALSE on a generation-token store (GCS): the XML LIST
@@ -164,12 +179,9 @@ public:
         return etag;
     }
 
-    /// Mint the incarnation token for a key we just HEAD'd or wrote: the object ETag/generation
-    /// string carried under this backend's native dialect (native_token_type).
-    ///
-    /// This is the ONLY site that mints a Generation token: `tokenForList` is the sole other
-    /// `native_token_type` mint, and `supportsListTokens` above returns false for Generation, so it
-    /// cannot produce one.
+    /// The `Token` form of an observed ETag/generation: normalized, and stamped with this backend's
+    /// native dialect. The transport itself deals in bare values; this is the normalize-and-stamp
+    /// step on its own, with `tokenForList` as its LIST-side sibling.
     Token tokenForHead(const String & etag) const
     {
         return Token{normalizeTokenValue(etag), native_token_type};
@@ -204,14 +216,6 @@ public:
     /// enforce the condition on multipart completion.
     WriteSettings conditionalWriteSettings() const;
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(); }
-    /// Convert a successful write/copy response's incarnation-identifying string into this backend's
-    /// token -- the ONE place that decides how strictly to trust it ("Exact successful-write token").
-    /// Generation dialect (GCS): the response MUST carry a non-empty, purely numeric generation, and a
-    /// non-numeric one is CORRUPTED_DATA. Under every dialect, a response carrying NO incarnation at
-    /// all is `CAS_WRITE_UNATTRIBUTED`: the write may well have landed, and only the caller reading
-    /// the key back can settle that -- a follow-up HEAD here would attribute this call an incarnation
-    /// that some other writer may have created.
-    Token tokenFromWriteResult(const String & key, const std::optional<String> & etag);
     /// Override the emulated backend's wall clock for deterministic expiry tests.
     void setEmuNowNsForTest(uint64_t now_ns);
     /// Return the guarded per-key token-state size for expiry tests.
@@ -228,9 +232,20 @@ private:
     {
         return single_attempt_control_plane ? ObjectStorageRetryProfile::SingleAttempt : ObjectStorageRetryProfile::Default;
     }
-    /// The read settings every READ-class request carries: the native conditional dialect, this
-    /// mount's retry profile, and its per-attempt bound.
-    ReadSettings controlPlaneReadSettings() const;
+    /// The read settings a request carries: the native conditional dialect, plus the retry profile and
+    /// per-attempt bound its caller is entitled to.
+    ReadSettings readSettingsFor(ObjectStorageRetryProfile profile, uint64_t timeout_ms) const;
+
+    /// The bodies a keyed primitive and its legacy override share. They differ in one thing: the
+    /// keyed call passes `controlPlaneProfile(), attempt_timeout_ms`, the legacy one the storage's
+    /// defaults. The legacy arguments disappear with the legacy methods.
+    std::optional<Raw> readUnder(const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms);
+    std::optional<RawMeta> headUnder(const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms);
+    RawListPage listUnder(const String & prefix, const String & cursor, size_t limit,
+                          ObjectStorageRetryProfile profile, uint64_t timeout_ms);
+    RawRemoval removeUnder(const String & key, const String & expected_value,
+                           ObjectStorageRetryProfile profile, uint64_t timeout_ms);
+    SentinelProbeResult probeSentinelUnder(const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms);
     /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. A successfully
     /// deleted entry is retained only while its etag is recent enough that an immediate recreate could
     /// land in the same mtime quantum. `deleteExact` erases already-old entries immediately and queues
@@ -247,19 +262,16 @@ private:
     };
     std::deque<EmuTokenExpiry> emu_token_expiry;
     uint64_t emu_now_ns_for_test = 0;
-    /// Fallback nonce for the (anomalous) case where the object storage reports an EMPTY etag: mints a
-    /// fresh, unpersisted value each time — never worse than the old counter for that case, but never
-    /// masquerading as a real etag-derived identity either.
-    uint64_t emu_seq = 0;
 
     /// Look up Native metadata and normalize the storage ETag or generation into an incarnation
-    /// value. The value is validated against isValidTokenValue before this returns it: a
-    /// missing/malformed response value on an otherwise-successful HEAD would otherwise be handed to
-    /// the first conditional operation that trusts it.
-    std::optional<RawMeta> nativeHead(const String & key);
+    /// value. The value is returned as the store gave it: whether it IS an incarnation is judged by
+    /// whoever can act on the answer, never here.
+    std::optional<RawMeta> nativeHead(const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms);
 
     /// Write a body with the condition already encoded in `ws`, finalize it, map a lost precondition
-    /// onto `RawConflict`, and return the write response's own incarnation value on success.
+    /// onto `RawConflict`, and return the write response's own value on success -- normalized, and
+    /// otherwise untouched: an empty one means the response named no incarnation, which is the
+    /// caller's to resolve, not this seam's to refuse.
     std::expected<String, RawConflict> nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws);
 
     /// §3.18 №19 hardening: whether `t` is the dialect this backend itself mints (native_token_type
@@ -302,8 +314,9 @@ private:
     /// Single source of truth for minting an emulated token from an observed `etag`: the wire value IS
     /// the etag while it is the first thing minted for `key` at that etag, or `etag#N` once a SAME-etag
     /// rewrite forces a disambiguator (`just_wrote` — see the mtime-quantum note in emu_token_state's
-    /// declaration and codex-review-triage §3.18 19c step 4). An empty `etag` (the storage could not
-    /// report one) falls back to a fresh, UNPERSISTED monotonic value from emu_seq.
+    /// declaration). An empty `etag` means the storage could not identify the object at all, and
+    /// there is nothing to invent from: a just-completed write cannot be attributed
+    /// (`CAS_WRITE_UNATTRIBUTED`) and an observation has no incarnation to report (`CORRUPTED_DATA`).
     Token emuMintToken(const String & key, const String & etag, bool just_wrote);
 };
 

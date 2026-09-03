@@ -22,6 +22,7 @@
 
 namespace DB::ErrorCodes
 {
+    extern const int CAS_WRITE_UNATTRIBUTED;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
@@ -398,16 +399,7 @@ public:
         auto raw = read(key, access);
         if (!raw)
             return std::nullopt;
-        /// `read` hands back the store's value unvalidated, because deciding what a malformed one
-        /// means belongs to the caller that can resolve it. A LEGACY caller has no such judgement: it
-        /// puts the `Token` straight into its next conditional operation, which refuses a malformed
-        /// value as a caller bug -- one layer too late, and with the key no longer in hand. Refuse it
-        /// here, the same way `head` does.
-        if (!isIncarnationValue(dialect(), raw->value))
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS backend: the store answered for '{}' with a value '{}' that is not a valid incarnation",
-                key, raw->value);
-        return GetResult{std::move(raw->bytes), Token{std::move(raw->value), dialect()}, {}};
+        return GetResult{std::move(raw->bytes), legacyMintObserved(key, std::move(raw->value)), {}};
     }
     std::optional<GetResult> get(const String & key) { return get(key, {}); }
 
@@ -427,7 +419,7 @@ public:
         auto raw = head(key, access);
         if (!raw)
             return {};
-        return HeadResult{true, raw->size, Token{std::move(raw->value), dialect()}, {}};
+        return HeadResult{true, raw->size, legacyMintObserved(key, std::move(raw->value)), {}};
     }
 
     virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & /*meta*/)
@@ -436,7 +428,7 @@ public:
         auto r = write(key, bytes, std::nullopt, access);
         if (!r)
             return PutResult{PutOutcome::PreconditionFailed, {}};
-        return PutResult{PutOutcome::Done, Token{std::move(*r), dialect()}};
+        return PutResult{PutOutcome::Done, legacyMintWritten(key, std::move(*r))};
     }
     PutResult putIfAbsent(const String & key, const String & bytes) { return putIfAbsent(key, bytes, {}); }
 
@@ -449,7 +441,7 @@ public:
         auto r = write(key, bytes, expected.value, access);
         if (!r)
             return PutResult{PutOutcome::PreconditionFailed, {}};
-        return PutResult{PutOutcome::Done, Token{std::move(*r), dialect()}};
+        return PutResult{PutOutcome::Done, legacyMintWritten(key, std::move(*r))};
     }
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected)
     {
@@ -465,7 +457,7 @@ public:
         auto r = write(key, bytes, expected ? std::optional<String>(expected->value) : std::nullopt, access);
         if (!r)
             return CasResult{CasOutcome::Conflict, {}};
-        return CasResult{CasOutcome::Committed, Token{std::move(*r), dialect()}};
+        return CasResult{CasOutcome::Committed, legacyMintWritten(key, std::move(*r))};
     }
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected)
     {
@@ -495,8 +487,12 @@ public:
         page.next_cursor = std::move(raw.next_cursor);
         page.keys.reserve(raw.keys.size());
         for (auto & k : raw.keys)
-            page.keys.push_back(ListedKey{std::move(k.key), k.size,
-                k.value ? std::optional<Token>(Token{std::move(*k.value), dialect()}) : std::nullopt});
+        {
+            std::optional<Token> token;
+            if (k.value)
+                token = legacyMintObserved(k.key, std::move(*k.value));
+            page.keys.push_back(ListedKey{std::move(k.key), k.size, std::move(token)});
+        }
         return page;
     }
 
@@ -517,7 +513,39 @@ protected:
     /// mechanism is deleted with the forwarders at the lock.
     static TransportAccess migrationAccess() { return TransportAccess{}; }
 
-private:
+    /// ---- Where a raw response becomes a legacy `Token` ----
+    ///
+    /// The primitives return the store's value as it arrived: judging it belongs to the caller that
+    /// can act on the judgement. A legacy caller cannot -- it puts the `Token` straight into its next
+    /// request -- so these two are where a legacy response is judged, and the ONLY places a legacy
+    /// `Token` is minted. A backend that overrides a legacy method for the migration window mints
+    /// through them too.
+
+    /// An OBSERVED value (read, head, list) that is not an incarnation means the response fell
+    /// through unmapped: nothing was changed by it, and the caller must not act on it.
+    Token legacyMintObserved(const String & key, String value)
+    {
+        if (!isIncarnationValue(dialect(), value))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS backend: the store answered for '{}' with a value '{}' that is not a valid incarnation",
+                key, value);
+        return Token{std::move(value), dialect()};
+    }
+
+    /// A value from a SUCCESSFUL write that is not an incarnation is the ambiguous case, not the
+    /// corrupt one: the write may well have landed, and only reading the key back can say. Hence
+    /// `CAS_WRITE_UNATTRIBUTED`, which names that duty, and never `CORRUPTED_DATA`, which a caller
+    /// may treat as a deterministic failure and stop.
+    Token legacyMintWritten(const String & key, String value)
+    {
+        if (!isIncarnationValue(dialect(), value))
+            throw Exception(ErrorCodes::CAS_WRITE_UNATTRIBUTED,
+                "CAS backend: the store accepted a write of '{}' but answered with '{}', which is not an "
+                "incarnation; the write may have committed and must be resolved by reading back",
+                key, value);
+        return Token{std::move(value), dialect()};
+    }
+
     /// The dialect half of the legacy token check: the primitives take a bare VALUE and cannot see
     /// the dialect a `Token` declares, so a foreign-dialect token is answered here as an ordinary
     /// non-match rather than being forwarded to a wire (or a value space) that was never designed to
@@ -533,6 +561,7 @@ private:
         return token.type != dialect();
     }
 
+private:
     uint64_t backend_id;
 };
 
