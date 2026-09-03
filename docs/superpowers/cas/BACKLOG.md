@@ -59,6 +59,30 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### Soak 2026-09-04 (phase 3, 30 min, seed 20260904, binary 6ddaefbcc9e) — return items {#soak-2026-09-04-return-items}
+
+Verdict PASS (`SOAK_EXIT=0`, both checkpoints `dangling=0 stale_edge=0 dryrun_count=0`, `GaveUp` = 0 on both
+nodes; ch1 self-fenced and remounted cleanly under the one `freeze_long` fault). Three items survive the
+analysis (full evidence in the plan workspace's soak report at the time; the run row is appended to
+`utils/ca-soak/scenarios/RUN_HISTORY.md`):
+
+- **GC round cost at ~825k objects.** The `gc_checkpoint` stage's GC on ch1 cost 1934.9 s cumulative over
+  50 rounds, single rounds up to 179.8 s in `manifest_deletes`; the driver's pool-drain wait blocked on it,
+  so the "30-minute" run took 2590 s wall-clock (+44%). Profile `CasPool`'s `manifest_deletes` and
+  `fold_ref_intake` phases at that object count before trusting any duration-budgeted phase-3 gate.
+- **`B152/B185` warning text is wrong for this occurrence.** `wait_for_pool_consistent` in
+  `utils/ca-soak/soak/run.py` reports "did not HOLD dangling==0 … after a fault window", but the flap
+  happened in the routine `gc_checkpoint` stage before any chaos fault. Broaden or correct the message so
+  a real future finding is not dismissed as the known post-restart flap.
+- **Pool drain probe `None` under load.** One `pool_bytes=None` sample at 23:26:26Z inside the GC-drain
+  window; plausibly a `docker exec`/`du` subprocess timeout under host I/O contention, unprovable from
+  RustFS logs (known observability gap). `soak/pool.py` `pool_size` should log subprocess-timeout and
+  empty-stdout as distinct causes.
+
+Also noted, no item: `_ckpt checkpoint could not be advanced … persistent CAS contention` errors in the
+steady/mutations stages traced to RustFS `PUT` timeouts on the same objects moments earlier, all
+self-healed; the dominant `AWSClient 404` error-log volume is the expected `HEAD`-miss dedup probing.
+
 ### Codex production review (2026-09-03, adjudicated) — residue {#codex-prod-review-2026-09-03-residue}
 
 Adjudication of the external reviewer's 10 findings against spec revision 13: 3 confirmed defects (fixed in
