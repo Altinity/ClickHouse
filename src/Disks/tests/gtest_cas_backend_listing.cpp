@@ -23,7 +23,7 @@ TEST(CASBackendListing, ForEachWalksEveryPageOnce)
     op.create("q/other", "v", Retry::once());   /// out of prefix — must not be visited
 
     std::vector<String> seen;
-    op.forEachListedKey("p/", [&](const KeyEntry & k) { seen.push_back(k.key); return true; },
+    op.forEachListedKey("p/", [&](const ListedKey & k) { seen.push_back(k.key); return true; },
                         Retry::standard(), /*page_limit=*/1000);
     EXPECT_EQ(seen.size(), 2500u);                                  /// paged (3 pages), no key dropped/duplicated
     EXPECT_TRUE(std::is_sorted(seen.begin(), seen.end()));
@@ -37,7 +37,7 @@ TEST(CASBackendListing, ForEachEmptyPrefixVisitsNothing)
     op.create("q/other", "v", Retry::once());
 
     size_t visits = 0;
-    op.forEachListedKey("p/", [&](const KeyEntry &) { ++visits; return true; }, Retry::standard());
+    op.forEachListedKey("p/", [&](const ListedKey &) { ++visits; return true; }, Retry::standard());
     EXPECT_EQ(visits, 0u);
 }
 
