@@ -36,6 +36,22 @@ ManifestRef testRef(uint64_t seq)
     return ManifestRef{.writer_epoch = 1, .build_sequence = seq, .manifest_ordinal = 1};
 }
 
+/// ---- Small raw-fixture request-engine wrappers shared by the tests below ----
+
+/// True iff `key` exists.
+bool existsAt(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).head(key, Retry::once()).has_value();
+}
+
+/// Unconditional create of a fresh key (the fixture's own setup, never a real conflict).
+void createAt(Backend & backend, const String & key, const String & bytes)
+{
+    OperationForTest op(backend);
+    EXPECT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
+}
+
 }
 
 /// Review I5: `discoverUniverse` is catalog-authoritative (Task 4-C), and this test used to survive
@@ -76,10 +92,10 @@ TEST(CASGCShardIncarnation, DiscoveryEqualsPresentShards)
         {
             CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
             std::erase_if(snap.catalog.entries, [&](const CatalogEntry & e) { return e.ns.string() == ns_uncataloged.string(); });
-            const HeadResult h = backend->head(layout.refCatalogKey());
-            ASSERT_TRUE(h.exists);
-            ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h.token).outcome,
-                       PutOutcome::Done);
+            const auto h = op.head(layout.refCatalogKey(), Retry::once());
+            ASSERT_TRUE(h.has_value());
+            ASSERT_TRUE(std::holds_alternative<Committed>(
+                op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->incarnation, Retry::once())));
         }
 
         const auto universe = gc.discoverUniverseForTest();
@@ -123,10 +139,11 @@ TEST(CASGCShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
             .incarnation = UInt128{77},
             .removal_started_round = 1},
     };
-    const auto empty_catalog = backend->get(layout.refCatalogKey());
+    OperationForTest op(*backend);
+    const auto empty_catalog = (*op).read(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(empty_catalog);
-    ASSERT_EQ(backend->putOverwrite(
-        layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->token).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->incarnation, Retry::once())));
     backend->resetCounts();
 
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
@@ -166,17 +183,17 @@ TEST(CASGCShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
             [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
         ASSERT_NE(it, snap.catalog.entries.end());
         it->incarnation = UInt128(22);   // "recreated" -- same name, different (empty) key space
-        const HeadResult h = backend->head(layout.refCatalogKey());
-        ASSERT_TRUE(h.exists);
-        ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h.token).outcome,
-                   PutOutcome::Done);
+        const auto h = op.head(layout.refCatalogKey(), Retry::once());
+        ASSERT_TRUE(h.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->incarnation, Retry::once())));
     }
 
     const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(22));
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(current_life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(current_life), encodeRefCkpt(RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt}), Retry::once())));
     const ManifestRef current_ref = testRef(2);
     writeBlobBody(*backend, layout, UInt128(22));
     writeManifestRaw(*backend, layout, ns, current_ref, {blobEntryFor("current", UInt128(22))});
@@ -223,18 +240,18 @@ TEST(CASGCShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
             [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
         ASSERT_NE(it, snap.catalog.entries.end());
         *it = after_rebirth;   // "recreated" -- same name, new (current) incarnation 22
-        const HeadResult h = backend->head(layout.refCatalogKey());
-        ASSERT_TRUE(h.exists);
-        ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h.token).outcome,
-                   PutOutcome::Done);
+        const auto h = op.head(layout.refCatalogKey(), Retry::once());
+        ASSERT_TRUE(h.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->incarnation, Retry::once())));
     }
 
     /// The successor's own genesis `_ckpt`, published for the current physical life. Hiding it from
     /// LIST must be irrelevant because the walk obtains state only through exact GETs.
     const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(22));
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(current_life),
+    createAt(*backend, layout.refCkptKey(current_life),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+                              .last_epoch_seal = std::nullopt}));
     backend->hide(layout.refCkptKey(current_life));
     backend->resetCounts();
     std::vector<GcPhaseRecord> phases;
@@ -252,7 +269,7 @@ TEST(CASGCShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
         << "the only broader LIST is the separately paced janitor page";
     EXPECT_EQ(backend->holesServed(), 1u)
         << "the hidden checkpoint is omitted only from the janitor's broad page, never from the hot stream LIST";
-    EXPECT_TRUE(backend->head(layout.refCkptKey(current_life)).exists)
+    EXPECT_TRUE(existsAt(*backend, layout.refCkptKey(current_life)))
         << "the post-page catalog cut retains the current life even when LIST omitted its checkpoint";
     const auto cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
     {
@@ -288,15 +305,15 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
     {
         CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
         std::erase_if(snap.catalog.entries, [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
-        const HeadResult h = backend->head(layout.refCatalogKey());
-        ASSERT_TRUE(h.exists);
-        ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h.token).outcome,
-                   PutOutcome::Done);
+        const auto h = op.head(layout.refCatalogKey(), Retry::once());
+        ASSERT_TRUE(h.has_value());
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->incarnation, Retry::once())));
     }
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     EXPECT_TRUE(report.anomalies.empty());
-    EXPECT_FALSE(backend->list(layout.namespaceStreamPrefix(forgotten_life), "", 100).keys.empty());
+    EXPECT_FALSE(op.list(layout.namespaceStreamPrefix(forgotten_life), "", 100, Retry::once()).keys.empty());
 }
 
 /// State-tree objects are point-addressed only. A stalled creator's checkpoint and an unowned opaque
@@ -321,15 +338,15 @@ TEST(CASGCShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     /// Creating entry names -- exactly what `completeCreation` durably leaves behind if the creator
     /// crashes between its own steps 2 and 3.
     const NamespaceLifeId creating_life = NamespaceLifeId::fromCatalogEntry(creating_ns, UInt128(33));
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(creating_life),
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(creating_life),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+                              .last_epoch_seal = std::nullopt}), Retry::once())));
 
     /// Opaque state debris with no corresponding catalog entry.
     const NamespaceLifeId gone_life = NamespaceLifeId::fromCatalogEntry(unrelated_gone_ns, UInt128(44));
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(gone_life),
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(gone_life),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+                              .last_epoch_seal = std::nullopt}), Retry::once())));
 
     /// Add one fully current stream so the round performs a fold rather than stopping at an empty
     /// walk. Catalog and checkpoint admission keep this traffic out of the janitor's dead-life set,
@@ -337,9 +354,9 @@ TEST(CASGCShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     const RootNamespace ordinary_ns{"srv1/tblOrdinaryTraffic"};
     fixture::admitLive(*backend, layout, ordinary_ns);
     const NamespaceLifeId ordinary_life = fixture::fixtureLife(ordinary_ns);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(ordinary_life),
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(ordinary_life),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+                              .last_epoch_seal = std::nullopt}), Retry::once())));
     appendRefLogSeed(*backend, layout, ordinary_ns, {});
 
     backend->resetCounts();
@@ -370,9 +387,9 @@ TEST(CASGCShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
         << "Creating is retained by the janitor cut but excluded from hot checkpoint intake";
     EXPECT_EQ(backend->getCount(layout.refCkptKey(gone_life)), 0u)
         << "uncataloged state debris is classified by the janitor page, never exact-read by the hot walk";
-    EXPECT_TRUE(backend->head(layout.refCkptKey(creating_life)).exists);
-    EXPECT_TRUE(backend->head(layout.refCkptKey(ordinary_life)).exists);
-    EXPECT_FALSE(backend->head(layout.refCkptKey(gone_life)).exists)
+    EXPECT_TRUE(op.head(layout.refCkptKey(creating_life), Retry::once()).has_value());
+    EXPECT_TRUE(op.head(layout.refCkptKey(ordinary_life), Retry::once()).has_value());
+    EXPECT_FALSE(op.head(layout.refCkptKey(gone_life), Retry::once()).has_value())
         << "catalog absence is inert to the hot walk but authorizes the later janitor exact-token delete";
     const auto cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
     {
