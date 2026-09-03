@@ -55,20 +55,18 @@ struct Gate
 /// a reported failure into a whole-binary deadlock.
 struct GateOpenedOnExit
 {
-    explicit GateOpenedOnExit(std::shared_ptr<Gate> gate_) : gate(std::move(gate_)) {}
+    explicit GateOpenedOnExit(Gate & gate_) : gate(gate_) {}
     GateOpenedOnExit(const GateOpenedOnExit &) = delete;
     GateOpenedOnExit & operator=(const GateOpenedOnExit &) = delete;
-    ~GateOpenedOnExit() { gate->open(); }
-    std::shared_ptr<Gate> gate;
+    ~GateOpenedOnExit() { gate.open(); }
+    Gate & gate;
 };
 
-/// Completes the watched first `GET`, then withholds its return so teardown can latch before the
+/// Completes the watched first read, then withholds its return so teardown can latch before the
 /// helper is able to issue its next raw request.
 class BetweenRecoveryGetsBackend : public DB::Cas::tests::OrderedFaultBackend
 {
 public:
-    using DB::Cas::tests::OrderedFaultBackend::get;
-
     void armBetweenGets(String first_key_, std::shared_ptr<Gate> first_completed_, std::shared_ptr<Gate> release_first_)
     {
         first_key = std::move(first_key_);
@@ -77,9 +75,9 @@ public:
         armed.store(true);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        auto result = DB::Cas::tests::OrderedFaultBackend::get(key, range);
+        auto result = DB::Cas::tests::OrderedFaultBackend::read(key, access);
         if (key == first_key && armed.exchange(false))
         {
             first_completed->open();
@@ -96,14 +94,11 @@ private:
 };
 
 /// Identifies recovery's final authority read without changing the recovery implementation: after the
-/// recovered-frontier CAS, its first checkpoint `GET` verifies that contribution and its second is the
+/// recovered-frontier CAS, its first checkpoint read verifies that contribution and its second is the
 /// final authority read immediately preceding materialization.
 class FinalAuthorityBackend : public DB::Cas::tests::OrderedFaultBackend
 {
 public:
-    using DB::Cas::tests::OrderedFaultBackend::casPut;
-    using DB::Cas::tests::OrderedFaultBackend::get;
-
     void armFinalAuthorityRead(String checkpoint_key_)
     {
         checkpoint_key = std::move(checkpoint_key_);
@@ -113,20 +108,22 @@ public:
         armed.store(true);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        auto result = DB::Cas::tests::OrderedFaultBackend::get(key, range);
+        auto result = DB::Cas::tests::OrderedFaultBackend::read(key, access);
         if (armed.load() && checkpoint_cas_committed.load() && key == checkpoint_key
             && gets_after_checkpoint_cas.fetch_add(1) + 1 == 2)
             final_authority_returned.store(true);
         return result;
     }
 
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
     {
-        CasResult result = DB::Cas::tests::OrderedFaultBackend::casPut(key, bytes, expected, meta);
-        if (armed.load() && key == checkpoint_key && result.outcome == CasOutcome::Committed)
+        auto result = DB::Cas::tests::OrderedFaultBackend::write(key, bytes, expected_value, access);
+        /// A value is the store's committed incarnation; a `RawConflict` is a refused precondition.
+        if (armed.load() && key == checkpoint_key && result.has_value())
             checkpoint_cas_committed.store(true);
         return result;
     }
@@ -188,6 +185,13 @@ public:
               {},
               [](const RootNamespace &) {})
     {
+        /// The engine's own retry pauses, on a clock the engine reads: one call reaches its retry
+        /// deadline against a latched fault with no real time passing. `setCasRetrySleepForTest`
+        /// installs the sleep on both `mount_requests` and the recovery retry loop.
+        auto clock = std::make_shared<DB::Cas::tests::VirtualRetryClock>();
+        mount_requests.setNowFnForTest(DB::Cas::tests::VirtualRetryClock::nowFnOf(clock));
+        ledger.setCasRetrySleepForTest(DB::Cas::tests::VirtualRetryClock::sleepFnOf(clock));
+
         CasOperation op = mount_requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
 
@@ -690,7 +694,7 @@ TEST(CASDetachedWork, StopWakesAConcurrentRecoveryWaiter)
     auto first_recovery = std::async(std::launch::async, [&store, &ns] { store->listRefs(ns); });
     /// Declared AFTER the future, so it is destroyed BEFORE it: `first_recovery`'s destructor joins
     /// the recovery thread, which cannot leave the hook until this gate is open.
-    GateOpenedOnExit recovery_released{release_recovery};
+    GateOpenedOnExit recovery_released{*release_recovery};
     recovery_entered->wait("recovery_entered");
 
     release_first_publisher->open();
@@ -845,9 +849,11 @@ TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
     CasOperation catalog_op = catalog_requests.admit();
     const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, fixture.layout, ns).value();
     const String ckpt_key = fixture.layout.refCkptKey(life);
-    fixture.backend->armWriteConflict(ckpt_key, 100);
+    /// Latched: the checkpoint write is reissued until its retry window closes, so a counted refusal
+    /// the reissues outlive would let this drop commit and leave the lane Ready.
+    fixture.backend->armLatchedWriteConflict(ckpt_key);
     EXPECT_ANY_THROW(fixture.ledger.dropRef(ns, "ref_1"));
-    fixture.backend->armWriteConflict(ckpt_key, 0);
+    fixture.backend->armLatchedWriteConflict({});
     ASSERT_EQ(fixture.ledger.laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     auto detached_publisher = fixture.takeDetachedTask();
@@ -858,6 +864,9 @@ TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
         {
             task(DetachedStopToken(fixture.registry));
         });
+    /// Released on every exit, before `running` is joined: the task parks behind this gate, and a
+    /// failed assertion that left it shut deadlocked the join.
+    GateOpenedOnExit final_install_released{fixture.release_final_install};
 
     fixture.final_install_reached.wait("final_install_reached");
     fixture.latchStop();

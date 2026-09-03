@@ -2482,9 +2482,20 @@ public:
     static std::shared_ptr<VirtualRetryClock> installOn(const PoolPtr & store)
     {
         auto clock = std::make_shared<VirtualRetryClock>();
-        store->setCasRequestNowFnForTest([clock] { return clock->nowMs(); });
-        store->setCasRetrySleepForTest([clock](uint64_t ms) { clock->advance(ms); });
+        store->setCasRequestNowFnForTest(nowFnOf(clock));
+        store->setCasRetrySleepForTest(sleepFnOf(clock));
         return clock;
+    }
+
+    /// The two seams on their own, for a fixture that assembles its own `CasRequests` and ledger
+    /// rather than a whole `Pool`. Each closure keeps the clock alive.
+    static std::function<uint64_t()> nowFnOf(std::shared_ptr<VirtualRetryClock> owned)
+    {
+        return [clock = std::move(owned)] { return clock->nowMs(); };
+    }
+    static std::function<void(uint64_t)> sleepFnOf(std::shared_ptr<VirtualRetryClock> owned)
+    {
+        return [clock = std::move(owned)](uint64_t ms) { clock->advance(ms); };
     }
 
     uint64_t nowMs() const
