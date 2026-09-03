@@ -143,9 +143,8 @@ bool pollUntil(Pred pred)
 class VanishMidTailOnceBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the primitive overload that the override below would otherwise hide.
     using InMemoryBackend::list;
-    using InMemoryBackend::get;   /// keep the one-arg convenience overload visible past our override
 
     String target_log_key;
     String refs_prefix;
@@ -153,18 +152,18 @@ public:
     std::atomic<bool> vanished{false};
     std::atomic<int> fresh_list_count{0};
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (armed.load() && key == target_log_key && !vanished.exchange(true))
             return std::nullopt;   /// selected object gone between LIST and GET; recovery must re-LIST
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (armed.load() && prefix == refs_prefix && cursor.empty())
             fresh_list_count.fetch_add(1, std::memory_order_relaxed);
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 };
 
@@ -174,9 +173,8 @@ public:
 class CorruptLogOnGetBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the primitive overload that the override below would otherwise hide.
     using InMemoryBackend::list;
-    using InMemoryBackend::get;   /// keep the one-arg convenience overload visible past our override
 
     String target_log_key;
     String corrupt_bytes;
@@ -184,19 +182,19 @@ public:
     std::atomic<bool> armed{false};
     std::atomic<int> refs_list_count{0};
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        auto got = InMemoryBackend::get(key, range);
+        auto got = InMemoryBackend::read(key, access);
         if (armed.load() && got && key == target_log_key)
             got->bytes = corrupt_bytes;
         return got;
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (armed.load() && prefix == refs_prefix && cursor.empty())
             refs_list_count.fetch_add(1, std::memory_order_relaxed);
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 };
 
@@ -206,9 +204,8 @@ public:
 class BlockingFirstLogGetBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the primitive overload that the override below would otherwise hide.
     using InMemoryBackend::list;
-    using InMemoryBackend::get;
 
     String refs_prefix;
     String target_log_key;
@@ -217,18 +214,18 @@ public:
     std::atomic<int> list_calls{0};
     std::function<void()> on_first_target_get;
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (armed.load() && key == target_log_key && !blocked.exchange(true))
             on_first_target_get();
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (armed.load() && prefix == refs_prefix && cursor.empty())
             list_calls.fetch_add(1, std::memory_order_relaxed);
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 };
 
