@@ -140,21 +140,17 @@ using DB::Cas::tests::LatchedChunkFaultBackend;
 /// The mount-fence deadlines the pre-attempt tests drive, in the FROZEN boot clock of
 /// `openPoolFenceControlled` (which is pinned at 0, so these are also the remaining lease budgets).
 ///
-/// Three gates stand between "the flush is admitted" and "an attempt may start", and they are
-/// deliberately not the same:
-///   `mayMutate`               -- `now < deadline`; the top-of-flush gate in `flushRefBatch`.
-///   `CasOperation::admitted`  -- every guard reached on the way in (e.g. `namespaceLife`'s "resident
-///                                namespace life" guard) asks the fence for `needed_ms = 0`, so it
-///                                needs only `lease_safety_margin_ms < deadline - now`.
-///   the write engine           -- `writeLoop` reserves TWO attempt envelopes before its first request,
-///                                the attempt and the read that settles it, so it needs
-///                                `2 * attempt_timeout_ms + lease_safety_margin_ms < deadline - now`.
-/// With `openPoolFenceControlled`'s budget the zero-needed guards refuse at `deadline - now <= 100` and
-/// the engine's own gate refuses at `deadline - now <= 300`; a "pre-attempt refusal" test wants the
-/// flush admitted and the zero-needed guards clear while no attempt fits, which is strictly between
-/// those two, e.g. 150 ms.
+/// `mayMutate` -- `now < deadline` -- is the top-of-flush gate in `flushRefBatch`. Behind it the fence
+/// is asked again by everything the flush issues, and each of those refuses until its own reservation
+/// plus `lease_safety_margin_ms` (100) is STRICTLY cleared:
+///   a `CasOperation::admitted` guard (e.g. `namespaceLife`'s "resident namespace life" one) reserves
+///     nothing                                                      -- clears above 100;
+///   a read reserves one attempt envelope                           -- clears above 200;
+///   a write reserves TWO, the attempt and the read that settles it -- clears above 300.
+/// A "pre-attempt refusal" test wants the flush admitted and everything on the way in to pass while
+/// the append's own first request is refused, so it sits strictly between the second and the third.
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
-constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 150;
+constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 250;
 
 /// A legal blob-free part: stage an empty manifest, precommit, promote -- enough to drive real
 /// ref-log transactions through the append lane.

@@ -91,15 +91,16 @@ PoolPtr openPoolFenceControlled(const std::shared_ptr<InMemoryBackend> & backend
 }
 
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
-/// Between "the flush is admitted" and "an attempt may start" sit two gates with different appetites,
-/// both measured against the lease's remaining time (the frozen clock at 0 makes the deadline BE the
-/// remaining time). A `CasOperation::admitted` guard reached on the way in asks the fence for nothing
-/// beyond the margin, so it clears while `lease_safety_margin_ms` (100) is strictly cleared; the write
-/// engine reserves TWO attempt envelopes before its first request -- the attempt and the read that
-/// settles it -- so it refuses until `2 * attempt_timeout_ms + lease_safety_margin_ms` (300) is
-/// strictly cleared. This test wants the first to pass and the second to refuse, which is anything
-/// strictly between.
-constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 200;
+/// Between "the flush is admitted" and "an attempt may start" sit three gates with different
+/// appetites, all measured against the lease's remaining time (the frozen clock at 0 makes the
+/// deadline BE the remaining time), and each refuses until its own reservation plus
+/// `lease_safety_margin_ms` (100) is STRICTLY cleared:
+///   a `CasOperation::admitted` guard reserves nothing            -- clears above 100;
+///   a read reserves one attempt envelope                         -- clears above 200;
+///   a write reserves TWO, the attempt and the read that settles it -- clears above 300.
+/// This test wants the guards and the reads on the way in to pass while the append's own first
+/// request is refused, so it sits strictly between the second and the third.
+constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 250;
 
 /// A bare `Pool::open` with no `_pool_meta` seeded: the path an operator's pool RECREATION takes, and
 /// the only one that runs the bootstrap residual + quiesce gates (`seedPoolMetaForRestart` mints the
