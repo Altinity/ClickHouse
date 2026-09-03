@@ -2397,9 +2397,9 @@ TEST(CASPartWriteTxn, WDepSetCrossAlgoSatisfactionFailsClosed)
 }
 
 /// =====================================================================================
-/// Task B (chaos-tolerance-report §Task B): stageManifest's part-manifest conditional PUT rides the
-/// shared CasRequestController — budgeted attempts + resolve-before-reissue — instead of the old
-/// single bare attempt (which a 19s object-store pause killed while every read path survived).
+/// Task B (chaos-tolerance-report §Task B): stageManifest's part-manifest conditional PUT rides
+/// budgeted attempts with resolve-before-reissue, instead of the old single bare attempt (which a
+/// 19s object-store pause killed while every read path survived).
 /// =====================================================================================
 
 namespace
