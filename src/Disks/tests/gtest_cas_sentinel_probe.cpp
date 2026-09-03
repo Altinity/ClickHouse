@@ -96,7 +96,7 @@ TEST(CASSentinelProbe, PresentKeyReturnsPresentWithBody)
 
     auto requests = makeRequests(backend);
     auto op = requests.admit();
-    const auto result = probeSentinel(op, "k");
+    const auto result = probeSentinel(op, "k", Retry::standard());
     EXPECT_EQ(result.outcome, ProbeOutcome::Present);
     ASSERT_TRUE(result.body.has_value());
     EXPECT_EQ(*result.body, "hello");
@@ -110,7 +110,7 @@ TEST(CASSentinelProbe, AbsentKeyWithContainerAliveReturnsKeyAbsent)
 
     auto requests = makeRequests(backend);
     auto op = requests.admit();
-    const auto result = probeSentinel(op, "missing");
+    const auto result = probeSentinel(op, "missing", Retry::standard());
     EXPECT_EQ(result.outcome, ProbeOutcome::KeyAbsent);
     EXPECT_FALSE(result.body.has_value());
 }
@@ -132,12 +132,12 @@ TEST(CASSentinelProbe, ContainerDirectoryRemovedReturnsContainerAbsent)
     auto op = requests.admit();
 
     /// Sanity, container alive: Present vs. KeyAbsent are genuinely distinct before we remove anything.
-    EXPECT_EQ(probeSentinel(op, "k").outcome, ProbeOutcome::Present);
-    EXPECT_EQ(probeSentinel(op, "missing").outcome, ProbeOutcome::KeyAbsent);
+    EXPECT_EQ(probeSentinel(op, "k", Retry::standard()).outcome, ProbeOutcome::Present);
+    EXPECT_EQ(probeSentinel(op, "missing", Retry::standard()).outcome, ProbeOutcome::KeyAbsent);
 
     std::filesystem::remove_all(storage->getCommonKeyPrefix());
 
-    const auto result = probeSentinel(op, "k");
+    const auto result = probeSentinel(op, "k", Retry::standard());
     EXPECT_EQ(result.outcome, ProbeOutcome::ContainerAbsent);
     EXPECT_FALSE(result.body.has_value());
 }
@@ -163,7 +163,7 @@ TEST(CASSentinelProbe, NativePresentKeyReturnsPresentWithBody)
 
     auto requests = makeRequests(backend);
     auto op = requests.admit();
-    const auto result = probeSentinel(op, key);
+    const auto result = probeSentinel(op, key, Retry::standard());
     EXPECT_EQ(result.outcome, ProbeOutcome::Present);
     ASSERT_TRUE(result.body.has_value());
     EXPECT_EQ(*result.body, "native body");
@@ -179,7 +179,7 @@ TEST(CASSentinelProbe, TransportErrorNeverClassifiesAsAbsent)
     DB::Cas::tests::FakeClock clock;
     auto requests = makeRequests(backend, &clock);
     auto op = requests.admit();
-    const auto result = probeSentinel(op, "k");
+    const auto result = probeSentinel(op, "k", Retry::standard());
     EXPECT_EQ(result.outcome, ProbeOutcome::Indeterminate);
     EXPECT_FALSE(result.body.has_value());
 }
@@ -252,7 +252,7 @@ TEST(CASSentinelProbe, NativeClassifiesNoSuchKeyAsKeyAbsent)
 
     auto requests = makeRequests(backend);
     auto op = requests.admit();
-    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key"), Retry::standard()).outcome, ProbeOutcome::KeyAbsent);
 }
 
 /// A real S3 HEAD's 404 has no response body, so the SDK cannot parse a `NoSuchKey` `<Code>` and
@@ -267,7 +267,7 @@ TEST(CASSentinelProbe, NativeClassifiesResourceNotFoundAsKeyAbsent)
 
     auto requests = makeRequests(backend);
     auto op = requests.admit();
-    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key"), Retry::standard()).outcome, ProbeOutcome::KeyAbsent);
 }
 
 TEST(CASSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
@@ -278,7 +278,7 @@ TEST(CASSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
 
     auto requests = makeRequests(backend);
     auto op = requests.admit();
-    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key"), Retry::standard()).outcome, ProbeOutcome::ContainerAbsent);
 }
 
 TEST(CASSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
@@ -289,7 +289,7 @@ TEST(CASSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
 
     auto requests = makeRequests(backend);
     auto op = requests.admit();
-    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::AccessDenied);
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key"), Retry::standard()).outcome, ProbeOutcome::AccessDenied);
 }
 
 TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
@@ -303,7 +303,7 @@ TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
     DB::Cas::tests::FakeClock clock;
     auto requests = makeRequests(backend, &clock);
     auto op = requests.admit();
-    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::Indeterminate);
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key"), Retry::standard()).outcome, ProbeOutcome::Indeterminate);
 }
 
 /// Production wiring (`Pool::open`) ALWAYS wraps the real backend in `InstrumentedBackend` before
@@ -323,7 +323,7 @@ TEST(CASSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
 
     auto requests = makeRequests(instrumented);
     auto op = requests.admit();
-    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key"), Retry::standard()).outcome, ProbeOutcome::ContainerAbsent);
 }
 
 #endif
