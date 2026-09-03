@@ -274,7 +274,7 @@ public:
                 DB::Cas::tests::OperationForTest mint_op(*this);
                 const auto meta = (*mint_op).head(request.destination_key, DB::Cas::Retry::once());
                 if (meta)
-                    queued_delete_incarnation = meta->incarnation;
+                    queued_delete_incarnation = meta->etag;
             }
 
             if (script != FaultScript::CopyLandsThenCondemned)
@@ -456,7 +456,7 @@ TEST(CASS3Staging, FirstCondemnedAttemptThenAbsentRetryNeverRecopies)
     DB::Cas::Etag original_staged_etag = [&]
     {
         DB::Cas::tests::OperationForTest op(*backend);
-        return (*op).head(store->layout().blobKey(ref), DB::Cas::Retry::once())->incarnation;
+        return (*op).head(store->layout().blobKey(ref), DB::Cas::Retry::once())->etag;
     }();
     auto build = precommittedBuildFor(
         store, DB::Cas::RootNamespace{"srv1/etag-first-condemned"}, "part",
@@ -670,7 +670,7 @@ TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobMaterializedProof)
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
     const auto hr = headAt(*backend, blob_key);
     ASSERT_TRUE(hr.has_value());
-    EXPECT_FALSE(DB::Cas::PersistedEtag::capture(hr->incarnation).value.empty());
+    EXPECT_FALSE(DB::Cas::PersistedEtag::capture(hr->etag).value.empty());
     EXPECT_EQ(bref.size, payload.size());
 
     /// The promoted blob body IS the staging bytes (server-side copy moved them verbatim).
@@ -718,7 +718,7 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     /// The existing incarnation is untouched: same token, same bytes.
     const auto after = headAt(*backend, blob_key);
     ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->incarnation, before->incarnation);
+    EXPECT_EQ(after->etag, before->etag);
 
     /// Observing the existing incarnation records materialized evidence without retaining its token.
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
@@ -781,7 +781,7 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
     /// The incarnation token is REFRESHED (a fresh incarnation displaced the condemned one).
     const auto after = headAt(*backend, blob_key);
     ASSERT_TRUE(after.has_value());
-    EXPECT_NE(after->incarnation, before->incarnation);
+    EXPECT_NE(after->etag, before->etag);
 
     const auto got = readAt(*backend, blob_key);
     ASSERT_TRUE(got.has_value());
