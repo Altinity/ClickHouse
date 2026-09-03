@@ -32,6 +32,35 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 {
     return ManifestRef{.writer_epoch = 1, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
+
+/// An exact read (mirrors the retired `backend->get(key)`).
+std::optional<Object> readObj(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).read(key, Retry::standard());
+}
+
+/// A HEAD (mirrors the retired `backend->head(key)`).
+std::optional<Meta> headObj(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).head(key, Retry::standard());
+}
+
+/// A one-shot `create`, asserting it committed (mirrors the retired `backend->putIfAbsent(key, bytes)`).
+void createObj(Backend & backend, const String & key, const String & bytes)
+{
+    OperationForTest op(backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
+}
+
+/// A delete-exact against `key`/`expected` (mirrors the retired `backend->deleteExact(key, token)`);
+/// the caller decides whether to assert the outcome.
+Removal removeExact(Backend & backend, const String & key, const Etag & expected)
+{
+    OperationForTest op(backend);
+    return (*op).remove(key, expected, Retry::once());
+}
 }
 
 /// (`CASGCBaselineGuard.FreshStateOverTrimmedJournalsFailsClosed` was removed with the snapshot+log ref
@@ -72,12 +101,12 @@ TEST(CASGCBaselineGuard, AbsentAdoptedSealFailsClosed)
     gc.runRegularRound();
 
     /// Corrupt (б): delete the adopted fold seal out from under a healthy gc/state.
-    const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const GcState st = decodeGcState(readObj(*backend, store->layout().gcStateKey())->bytes);
     ASSERT_GT(st.snap_generation, 0u);
     const String seal_key = store->layout().foldSealKey(st.snap_generation, st.snap_attempt);
-    const HeadResult sh = backend->head(seal_key);
-    ASSERT_TRUE(sh.exists);
-    ASSERT_EQ(backend->deleteExact(seal_key, sh.token).kind, DeleteOutcome::Kind::Deleted);
+    const auto sh = headObj(*backend, seal_key);
+    ASSERT_TRUE(sh.has_value());
+    ASSERT_EQ(removeExact(*backend, seal_key, sh->incarnation), Removal::Removed);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.runRegularRound(); });
 }
@@ -114,10 +143,10 @@ TEST(CASGCRebuild, RecoversLostStateAndConverges)
     store->renewWatermarkOnce();   /// renews the lease + build-watermark floor
 
     /// Capture the round reached before gc/state is destroyed (the rebuild must mint strictly above it).
-    const auto pre_rebuild_got = backend->get(store->layout().gcStateKey());
+    const auto pre_rebuild_got = readObj(*backend, store->layout().gcStateKey());
     ASSERT_TRUE(pre_rebuild_got.has_value());
     const uint64_t pre_rebuild_round = decodeGcState(pre_rebuild_got->bytes).round;
-    ASSERT_EQ(backend->deleteExact(store->layout().gcStateKey(), pre_rebuild_got->token).kind, DeleteOutcome::Kind::Deleted);
+    ASSERT_EQ(removeExact(*backend, store->layout().gcStateKey(), pre_rebuild_got->incarnation), Removal::Removed);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000003"));
     /// A fresh GC over the orphaned generation artifacts fails closed: re-folding from a fresh gc/state
@@ -142,8 +171,8 @@ TEST(CASGCRebuild, RecoversLostStateAndConverges)
         runRegularRoundReclaiming(gc2);
         store->renewWatermarkOnce();
     }
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(2))})).exists)
+    EXPECT_TRUE(headObj(*backend, store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).has_value());
+    EXPECT_TRUE(headObj(*backend, store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(2))})).has_value())
         << "a rebuild condemns nothing, so a pre-rebuild drop is retained — never reclaimed by a "
            "substitute pass, and never lost";
 
@@ -175,13 +204,13 @@ TEST(CASGCRebuild, RecoversLostGenerationArtifact)
     gc.runRegularRound();
 
     /// Lose one snapshot run object out from under the healthy state.
-    const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
-    const auto seal = decodeFoldSeal(backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+    const GcState st = decodeGcState(readObj(*backend, store->layout().gcStateKey())->bytes);
+    const auto seal = decodeFoldSeal(readObj(*backend, store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
     ASSERT_FALSE(seal.blob_target_runs.empty());
     const String run_key = seal.blob_target_runs.front().key;
-    const HeadResult rh = backend->head(run_key);
-    ASSERT_TRUE(rh.exists);
-    ASSERT_EQ(backend->deleteExact(run_key, rh.token).kind, DeleteOutcome::Kind::Deleted);
+    const auto rh = headObj(*backend, run_key);
+    ASSERT_TRUE(rh.has_value());
+    ASSERT_EQ(removeExact(*backend, run_key, rh->incarnation), Removal::Removed);
 
     /// A pure ref-carry round would not read the lost run; land a REAL delta so the fold's
     /// three-cursor merge must stream the prior run — and fails closed on its absence.
@@ -194,7 +223,7 @@ TEST(CASGCRebuild, RecoversLostGenerationArtifact)
     const RebuildReport rep = gc.rebuildBaseline(/*force*/ false);
     ASSERT_TRUE(rep.performed) << rep.refusal;
     EXPECT_NO_THROW(gc.runRegularRound());
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
+    EXPECT_TRUE(headObj(*backend, store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).has_value());
 }
 
 /// FORCE: a healthy state refuses the plain rebuild; FORCE rebuilds; rounds run clean after.
@@ -261,12 +290,12 @@ TEST(CASGCRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
     fixture::writeRefLogRaw(*backend, layout,
         RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = publishCommittedOps("unfrontiered", unfrontiered),
                   .prev_epoch_seal = std::nullopt});
-    ASSERT_TRUE(backend->head(layout.refLogKey(life, RefTxnId{1, 2})).exists);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(headObj(*backend, layout.refLogKey(life, RefTxnId{1, 2})).has_value());
+    createObj(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt}));
 
     Gc gc(store, kGc);
     const RebuildReport report = gc.rebuildBaseline(/*force=*/false);
@@ -302,7 +331,7 @@ TEST(CASGCRebuild, LiveCatalogLifeWithoutCheckpointFailsClosed)
     Gc gc(store, kGc);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)gc.rebuildBaseline(/*force=*/false); });
 
-    const auto state = backend->get(layout.gcStateKey());
+    const auto state = readObj(*backend, layout.gcStateKey());
     ASSERT_TRUE(state);
     EXPECT_EQ(decodeGcState(state->bytes).snap_generation, 0u)
         << "a rejected recovery must not adopt a new baseline";
@@ -344,16 +373,16 @@ TEST(CASGCRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
     applyRefLogTxn(through_seal, seal_txn);
     writeRefSnapshotRaw(*backend, layout, snapshotOf(through_seal, ns.string()));
 
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    createObj(*backend, layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
-        .last_epoch_seal = RefTxnId{2, 1}})).outcome, PutOutcome::Done);
+        .last_epoch_seal = RefTxnId{2, 1}}));
 
     Gc gc(store, kGc);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)gc.rebuildBaseline(/*force=*/false); });
 
-    const auto state = backend->get(layout.gcStateKey());
+    const auto state = readObj(*backend, layout.gcStateKey());
     ASSERT_TRUE(state);
     EXPECT_EQ(decodeGcState(state->bytes).snap_generation, 0u)
         << "a rejected checkpoint base must not publish a REBUILD baseline";
@@ -377,11 +406,11 @@ TEST(CASGCRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
         next.entries[0].removal_started_round = 1;
         return next;
     });
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_id)), encodeRefCkpt(RefCkpt{
+    createObj(*backend, layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_id)), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt}));
     const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
     const uint64_t plans_before
         = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
@@ -416,12 +445,13 @@ TEST(CASGCRebuild, MissingCommittedManifestRefuses)
     gc.runRegularRound();   /// trim
 
     /// Disaster pair: gc/state lost AND tbl_b's manifest body lost.
-    const HeadResult st = backend->head(store->layout().gcStateKey());
-    backend->deleteExact(store->layout().gcStateKey(), st.token);
+    const auto st = headObj(*backend, store->layout().gcStateKey());
+    ASSERT_TRUE(st.has_value());
+    removeExact(*backend, store->layout().gcStateKey(), st->incarnation);
     const String mkey = store->layout().manifestKey(ManifestId{ns, b});
-    const HeadResult mh = backend->head(mkey);
-    ASSERT_TRUE(mh.exists);
-    backend->deleteExact(mkey, mh.token);
+    const auto mh = headObj(*backend, mkey);
+    ASSERT_TRUE(mh.has_value());
+    removeExact(*backend, mkey, mh->incarnation);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000004"));
     const RebuildReport rep = gc2.rebuildBaseline(/*force*/ false);
@@ -429,7 +459,7 @@ TEST(CASGCRebuild, MissingCommittedManifestRefuses)
     EXPECT_NE(rep.refusal.find("tbl_b"), String::npos) << rep.refusal;
     /// The lease acquire minted a gen-0 bootstrap body (that is the acquire's contract, not the
     /// rebuild's); the rebuild's own contract is that NO baseline was blessed by the refusal.
-    const auto post = backend->get(store->layout().gcStateKey());
+    const auto post = readObj(*backend, store->layout().gcStateKey());
     ASSERT_TRUE(post.has_value());
     const GcState post_state = decodeGcState(post->bytes);
     EXPECT_EQ(post_state.snap_generation, 0u) << "a refused rebuild must not adopt a baseline";
@@ -463,7 +493,7 @@ TEST(CASGCRebuild, LivePrecommitEdgesIncluded)
         gc2.runRegularRound();
         store->renewWatermarkOnce();
     }
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(9))})).exists);
+    EXPECT_TRUE(headObj(*backend, store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(9))})).has_value());
 }
 
 /// O(budget) attempt iteration: a tiny edge budget forces multi-batch folding; the rebuilt
@@ -496,8 +526,9 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
     Gc gc(store, kGc);
     gc.runRegularRound();
     gc.runRegularRound();
-    const HeadResult st = backend->head(store->layout().gcStateKey());
-    backend->deleteExact(store->layout().gcStateKey(), st.token);
+    const auto st = headObj(*backend, store->layout().gcStateKey());
+    ASSERT_TRUE(st.has_value());
+    removeExact(*backend, store->layout().gcStateKey(), st->incarnation);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000006"));
     /// Every shard has `edge_budget + 1` live edges, so each independently crosses the flush budget;
@@ -510,9 +541,9 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
     /// Multiple rebuild flushes still converge to one authoritative row domain: no more than one
     /// canonical seq-0 `blob_run` per shard and exactly one `condemned` per shard. These are the cardinalities the
     /// catalog admission reservation over-covers independently of catalog-entry count.
-    const GcState rebuilt_state = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const GcState rebuilt_state = decodeGcState(readObj(*backend, store->layout().gcStateKey())->bytes);
     const CasFoldSeal rebuilt_seal = decodeFoldSeal(
-        backend->get(store->layout().foldSealKey(
+        readObj(*backend, store->layout().foldSealKey(
             rebuilt_state.snap_generation, rebuilt_state.snap_attempt))->bytes,
         store->layout(), gc_shards);
     ASSERT_EQ(rebuilt_seal.condemned_summary.size(), gc_shards);
@@ -538,7 +569,7 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
         store->renewWatermarkOnce();
     }
     for (const UInt128 blob : blobs)
-        EXPECT_TRUE(backend->head(store->layout().blobKey(legacyMetaTestRef(blob))).exists)
+        EXPECT_TRUE(headObj(*backend, store->layout().blobKey(legacyMetaTestRef(blob))).has_value())
             << "blob " << u128ToHex(blob);
 }
 
@@ -576,7 +607,7 @@ TEST(CASGCRebuild, UnownedAliveManifestOverProtected)
         gc.runRegularRound();
         store->renewWatermarkOnce();
     }
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(9))})).exists);
+    EXPECT_TRUE(headObj(*backend, store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(9))})).has_value());
 }
 
 /// Task 4 (SYSTEM CAS GC REBUILD): a rebuild refuses when ANOTHER Gc instance holds
@@ -654,7 +685,7 @@ TEST(CASGCClampSuppression, LandedEdgeBehindClampNeverDeleted)
     {
         gc.runRegularRound();
         store->renewWatermarkOnce();
-        ASSERT_TRUE(backend->head(blob_key).exists)
+        ASSERT_TRUE(headObj(*backend, blob_key).has_value())
             << "round " << i << ": X was deleted while its landed +1 sat unfolded behind the clamp";
     }
 
@@ -676,7 +707,7 @@ TEST(CASGCClampSuppression, LandedEdgeBehindClampNeverDeleted)
         gc.runRegularRound();
         store->renewWatermarkOnce();
     }
-    EXPECT_TRUE(backend->head(blob_key).exists);
+    EXPECT_TRUE(headObj(*backend, blob_key).has_value());
     /// And the pipeline is unwedged: a genuinely-unreferenced blob still gets reclaimed.
     const ManifestRef m3 = ref(3, 0xC3);
     writeBlobBody(*backend, store->layout(), DB::UInt128(5));
