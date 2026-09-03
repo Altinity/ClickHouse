@@ -686,7 +686,7 @@ TEST(CASRefCheckpoint, AnIdenticalMergedBodyIssuesNoWrite)
     EXPECT_EQ(backend->writes(key), writes_after_create) << "a skip must issue no write at all";
     const auto meta_after_skips = op.head(key, Retry::standard());
     ASSERT_TRUE(meta_after_skips.has_value());
-    EXPECT_EQ(meta_after_skips->incarnation, meta_after_create->incarnation)
+    EXPECT_EQ(meta_after_skips->etag, meta_after_create->etag)
         << "and must not mint a new incarnation";
 }
 
@@ -723,7 +723,7 @@ TEST(CASRefCheckpoint, AnAdmissionLossBetweenTheReadAndTheWriteWritesNothing)
     EXPECT_EQ(backend->writes(key), writes_before) << "the check precedes the write, so nothing is sent";
     const auto meta_after = reader.head(key, Retry::standard());
     ASSERT_TRUE(meta_after.has_value());
-    EXPECT_EQ(meta_after->incarnation, meta_before->incarnation);
+    EXPECT_EQ(meta_after->etag, meta_before->etag);
     EXPECT_EQ(readCkptOrFail(reader, layout, life), base);
 }
 
@@ -1036,8 +1036,8 @@ TEST(CASRefCheckpoint, AMissingSampledBaseRestartsOnAnAdvancedIncarnationAndIsCo
     overwriteObject(op, key, "second");
     const auto second = op.read(key, Retry::standard());
     ASSERT_TRUE(second.has_value());
-    const Etag sampled = first->incarnation;
-    const Etag advanced = second->incarnation;
+    const Etag sampled = first->etag;
+    const Etag advanced = second->etag;
     ASSERT_FALSE(sampled == advanced) << "the rewrite must mint a different incarnation";
 
     EXPECT_EQ(classifyMissingSampledBase(sampled, advanced), MissingBaseVerdict::RestartRecovery)
