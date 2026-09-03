@@ -748,7 +748,7 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
     after_snapshot_publish.checkpoint_snapshot_id = RefTxnId{1, va2};
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
         layout.refCkptKey(life_a), encodeRefCkpt(after_snapshot_publish),
-        before_snapshot_publish.incarnation, Retry::standard())));
+        before_snapshot_publish.etag, Retry::standard())));
 
     Gc gc(store, kGc);
     runToFixpoint(store, gc);
@@ -924,7 +924,7 @@ TEST(CASRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     OperationForTest evidence_op(*backend);
     const auto h = (*evidence_op).head(garbage_key, Retry::once());
     ASSERT_TRUE(h.has_value());
-    ASSERT_EQ((*evidence_op).remove(garbage_key, h->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_EQ((*evidence_op).remove(garbage_key, h->etag, Retry::once()), Removal::Removed);
 
     for (int i = 0; i < 4; ++i)
     {
