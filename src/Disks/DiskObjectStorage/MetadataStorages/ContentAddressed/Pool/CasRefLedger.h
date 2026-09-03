@@ -406,6 +406,12 @@ public:
     /// `install_region_probe_for_test`).
     void setInstallRegionProbeForTest(std::function<void()> probe) { install_region_probe_for_test = std::move(probe); }
 
+    /// Installs a probe at `ensureRefTableRecovered`'s step 8 -- the LAST admission recheck before a
+    /// materialized recovery result installs, after the final authority read and O(N) materialization
+    /// have already run. A test pausing here and then latching a stop token observes whether that stop
+    /// is honored before install (see `recovery_install_probe_for_test`).
+    void setRecoveryInstallProbeForTest(std::function<void()> probe) { recovery_install_probe_for_test = std::move(probe); }
+
     /// Installs the pre-tenure fault seam (see `ref_pre_tenure_hook_for_test`).
     void setRefPreTenureHookForTest(std::function<void()> hook) { ref_pre_tenure_hook_for_test = std::move(hook); }
 
@@ -1021,6 +1027,8 @@ private:
     /// otherwise non-throwing regions. A test that installs a throwing probe must therefore disarm it
     /// after the region it targets, or every later install throws too. Null in production.
     std::function<void()> install_region_probe_for_test;
+    /// See `setRecoveryInstallProbeForTest`. Null in production.
+    std::function<void()> recovery_install_probe_for_test;
     std::function<void()> append_after_runtime_capture_hook_for_test;
     std::function<void()> read_before_state_lock_hook_for_test;
     std::function<void()> readable_catalog_after_observation_hook_for_test;

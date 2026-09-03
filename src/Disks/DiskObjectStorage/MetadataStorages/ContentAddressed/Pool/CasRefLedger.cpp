@@ -1553,6 +1553,8 @@ void CasRefLedger::ensureRefTableRecovered(
                 /// of time to come back, and a recovery whose window straddled a fence bump describes a
                 /// mount incarnation that no longer owns this namespace. It must publish NOTHING: the
                 /// table stays unrecovered and the next touch recovers it properly.
+                if (recovery_install_probe_for_test)
+                    recovery_install_probe_for_test();
                 refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref recovery install");
                 if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
                     throwCasWriteRetryLater(fmt::format(

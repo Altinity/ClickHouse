@@ -132,8 +132,8 @@ CasRequestBudget oneAttemptBudget()
     return budget;
 }
 
-/// A ledger-level fixture keeps the real detached publisher but injects its already-public mount-fence
-/// callback. That callback is the existing deterministic boundary after recovery materialized its
+/// A ledger-level fixture keeps the real detached publisher but arms `CasRefLedger`'s recovery-install
+/// test probe. That probe is the existing deterministic boundary after recovery materialized its
 /// result and before `installRecoveryResult`.
 class ManualDetachedLedger
 {
@@ -157,14 +157,6 @@ public:
               [] { return uint64_t{1}; },
               [] { return true; },
               [] { return uint64_t{1}; },
-              [this](uint64_t)
-              {
-                  if (backend->finalAuthorityReturned() && !final_install_gate_claimed.exchange(true))
-                  {
-                      final_install_reached.open();
-                      release_final_install.wait();
-                  }
-              },
               [] { return uint64_t{0}; },
               [] { return true; },
               [](const String &, const String &, const std::optional<String> &) {},
@@ -179,6 +171,18 @@ public:
     {
         CasOperation op = mount_requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
+
+        /// The deterministic boundary a test pauses on: after recovery's final authority read and O(N)
+        /// materialization, immediately before a materialized result installs. A no-op for every test
+        /// that never arms `backend`'s final-authority read.
+        ledger.setRecoveryInstallProbeForTest([this]
+        {
+            if (backend->finalAuthorityReturned() && !final_install_gate_claimed.exchange(true))
+            {
+                final_install_reached.open();
+                release_final_install.wait();
+            }
+        });
     }
 
     std::function<void(DetachedStopToken)> takeDetachedTask()
