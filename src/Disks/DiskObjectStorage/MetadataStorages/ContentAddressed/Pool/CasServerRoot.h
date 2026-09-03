@@ -234,6 +234,11 @@ struct MountClaimResult
         FencedSelf,
     };
     Kind kind = ForeignOwner;
+    /// The lease this result is ABOUT. For `Claimed` it is the body this server installed; for
+    /// `ForeignOwner`, `FencedSelf` and `LiveDoubleStart` it is the body that was observed at the key,
+    /// which is what `mountDoubleStartMessage` renders as the existing mount. The one exception is a
+    /// raced write whose conflict settled to no observation at all: nothing was seen to report, so
+    /// this carries the lease this server proposed and `etag` is empty.
     MountLease body;
     /// Which certificate of death justified a same-uuid, different-epoch `Claimed` reclaim (`None` for
     /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).

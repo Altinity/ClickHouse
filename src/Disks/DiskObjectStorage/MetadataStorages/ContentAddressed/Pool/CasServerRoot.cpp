@@ -74,6 +74,21 @@ std::optional<Observation> conflictOrThrow(WriteResult && result, const String &
     return std::nullopt;
 }
 
+/// A raced claim, reported as the OCCUPANT the write's own resolve read observed rather than as the
+/// lease this server proposed and failed to install -- that body is what the caller renders into the
+/// fail-closed operator message, and naming ourselves there points an operator at the wrong process.
+/// The observed incarnation names the body returned beside it, so the caller's observation loop
+/// compares like with like. A conflict the resolve read could not settle to a body observed nothing to
+/// name, and leaves the caller's own re-read to identify the holder.
+MountClaimResult racedDoubleStart(const Observation & seen, const MountLease & proposed)
+{
+    if (const Object * occupant = std::get_if<Object>(&seen))
+        return {.kind = MountClaimResult::LiveDoubleStart,
+                .body = decodeMountLease(occupant->bytes),
+                .etag = occupant->etag};
+    return {.kind = MountClaimResult::LiveDoubleStart, .body = proposed, .etag = std::nullopt};
+}
+
 uint64_t defaultBootMs()
 {
     struct timespec ts{};
@@ -781,12 +796,12 @@ MountClaimResult claimMount(
     if (!got)
     {
         const MountLease body = makeMountBody(our_uuid, our_epoch, /*seq=*/ 1, now_ms, ttl_ms);
-        if (conflictOrThrow(op.create(key, encodeMountLease(body), Retry::standard()),
-                            fmt::format("CAS mount slot claim of '{}'", key)))
+        if (const std::optional<Observation> raced
+                = conflictOrThrow(op.create(key, encodeMountLease(body), Retry::standard()),
+                                  fmt::format("CAS mount slot claim of '{}'", key)))
             /// Raced with a concurrent writer between the read and the create. Treat as a live double
-            /// start — fail closed; never overwrite a slot that appeared under us. The occupant was
-            /// not decoded here, so no conflicting identity is known to attach to an event.
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .etag = std::nullopt};
+            /// start — fail closed; never overwrite a slot that appeared under us.
+            return racedDoubleStart(*raced, body);
         emitMountEvent(sink, CasEventType::MountClaim, srid, "mint", nullptr, "fresh mount slot minted");
         return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
     }
@@ -816,13 +831,13 @@ MountClaimResult claimMount(
             return {.kind = MountClaimResult::FencedSelf, .body = existing, .etag = std::nullopt};
         }
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
-                            fmt::format("CAS mount slot refresh of '{}'", key)))
-            /// The mount changed under us between the read and the write: `got->etag` is now
-            /// KNOWN STALE (that mismatch is exactly why the write was refused), not merely unknown --
-            /// leaving `.etag` unset (rather than handing back one the caller would wrongly
-            /// treat as current) is deliberate, matching the identical race below.
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .etag = std::nullopt};
+        if (const std::optional<Observation> raced
+                = conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
+                                  fmt::format("CAS mount slot refresh of '{}'", key)))
+            /// The mount changed under us between the read and the write, so `got->etag` is KNOWN
+            /// STALE -- that mismatch is exactly why the write was refused. What the write's resolve
+            /// read observed is current, and it is that pair that is reported.
+            return racedDoubleStart(*raced, body);
         emitMountEvent(sink, CasEventType::MountClaim, srid, "refresh", &existing,
             "own claim replayed — refreshed seq + expiry");
         return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
@@ -849,12 +864,13 @@ MountClaimResult claimMount(
     if (existing.gc_fenced || clean_marker || proven_dead)
     {
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
-                            fmt::format("CAS mount slot reclaim of '{}'", key)))
+        if (const std::optional<Observation> raced
+                = conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
+                                  fmt::format("CAS mount slot reclaim of '{}'", key)))
             /// The mount changed under us between the read and the write — someone else is racing the
-            /// reclaim. Fail closed. `got->etag` is now KNOWN STALE (that mismatch is exactly why
-            /// the write was refused) -- leaving `.etag` unset is deliberate, not an oversight.
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .etag = std::nullopt};
+            /// reclaim. Fail closed, and report what the write's resolve read observed rather than
+            /// `got->etag`, which that mismatch just proved stale.
+            return racedDoubleStart(*raced, body);
         const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
                                      : clean_marker       ? MountPriorState::Clean
                                                            : MountPriorState::UncleanObserved;

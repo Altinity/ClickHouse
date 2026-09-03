@@ -10,6 +10,7 @@ extern const int ABORTED;
 using namespace DB::Cas;
 using DB::Cas::tests::MountSlotRaceBackend;
 using DB::Cas::tests::expectThrowsCodeWithMessage;
+using DB::Cas::tests::OperationForTest;
 
 namespace
 {
@@ -184,4 +185,66 @@ TEST(CASMountClaimConflicts, FencedInsideAdoptionWindowRaisesMountFencedNotAbort
     };
     auto renewer = makeRenewer(requests, now);
     EXPECT_THROW(renewer.start(), MountFencedException);
+}
+
+/// A raced claim reports a body its caller renders into the fail-closed operator message. Reporting
+/// the PROPOSER's own lease there names this very server as the existing mount, which sends an
+/// operator hunting a second process that is not the one holding the slot. The write's own resolve
+/// read already observed the occupant, so that is what the result must carry.
+TEST(CASMountClaimConflicts, ALostCreateReportsTheOccupantNotTheProposer)
+{
+    auto backend = std::make_shared<MountSlotRaceBackend>();
+    Layout layout("p");
+    uint64_t now = 1000;
+    CasRequests requests = openRequestsForTest(backend);
+    /// Absent at our read; a foreign server mints the slot before our create lands.
+    backend->before_put_if_absent = [&]
+    {
+        CasOperation racer = requests.admit();
+        ASSERT_EQ(claimMount(racer, layout, "r", DB::UInt128(2), 1, now, /*ttl_ms=*/100).kind,
+                  MountClaimResult::Claimed);
+    };
+    CasOperation op = requests.admit();
+    const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100);
+
+    EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
+    EXPECT_EQ(claim.body.server_uuid, DB::UInt128(2)) << "the result named this server's own proposal";
+    EXPECT_EQ(claim.body.writer_epoch, 1u);
+    ASSERT_TRUE(claim.etag.has_value()) << "the observed occupant's incarnation is what was read";
+    EXPECT_NE(mountDoubleStartMessage("r", claim.body).find(u128ToHex(DB::UInt128(2))), String::npos)
+        << "the operator message must name the foreign holder";
+}
+
+/// The same for the refresh branch: a body that changed under our own adoption is the one the message
+/// must name. The reclaim branch reaches the identical helper, so it is not repeated here.
+TEST(CASMountClaimConflicts, ALostRefreshReportsTheObservedBodyNotTheProposer)
+{
+    auto backend = std::make_shared<MountSlotRaceBackend>();
+    Layout layout("p");
+    uint64_t now = 1000;
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation seed = requests.admit();
+    ASSERT_EQ(claimMount(seed, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100).kind,
+              MountClaimResult::Claimed);
+    /// A distinguishable body lands under our own refresh, so a result carrying the proposal cannot
+    /// pass by accident: our proposal would carry `seq` 2 and this process's pid.
+    backend->before_put_overwrite = [&]
+    {
+        OperationForTest racer(*backend);
+        const String key = layout.mountKey("r");
+        const auto got = (*racer).read(key, Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease raced = decodeMountLease(got->bytes);
+        raced.pid = 4242;
+        raced.seq = 99;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*racer).replace(key, encodeMountLease(raced), got->etag, Retry::standard())));
+    };
+    CasOperation op = requests.admit();
+    const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100);
+
+    EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
+    EXPECT_EQ(claim.body.pid, 4242);
+    EXPECT_EQ(claim.body.seq, 99u);
+    ASSERT_TRUE(claim.etag.has_value());
 }
