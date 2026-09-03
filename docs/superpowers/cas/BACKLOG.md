@@ -59,6 +59,17 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### Spec drift: the ref-lane inventory row says `standard`, the coverage-gate paragraph and the code say `once` (2026-09-04) {#spec-drift-ref-lane-once}
+
+`docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md` (revision 13) lists "the ref lane
+(`commitRefChunk`, the recovery walk, `resolveWedgeOnce`) — `create` under `standard`" in the inventory
+table, while its coverage-gate paragraph states that "the `once` writes of the pulse and the wedge retry
+are never a key's first request" and that the recovery walk's epoch seal at `T+1` is a `once` write.
+The implementation follows the paragraph (`resolveWedgeOnce` and the recovery seal `create` under
+`Retry::once`; the lane's own next flush is the retry), as chosen in the migration's ref-ledger unit and
+approved by its review. Fix: reword the inventory row to say `commitRefChunk` under `standard`, the wedge
+retry and the epoch seal under `once` with the reason. Found by the external test review (tests-02 #7/#8).
+
 ### Soak 2026-09-04 (phase 3, 30 min, seed 20260904, binary 6ddaefbcc9e) — return items {#soak-2026-09-04-return-items}
 
 Verdict PASS (`SOAK_EXIT=0`, both checkpoints `dangling=0 stale_edge=0 dryrun_count=0`, `GaveUp` = 0 on both
