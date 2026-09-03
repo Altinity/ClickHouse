@@ -82,14 +82,14 @@ public:
         return served;
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
-        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
         std::lock_guard lock(m);
         if (omitted.empty())
             return page;
         auto it = std::find_if(page.keys.begin(), page.keys.end(),
-                               [&](const ListedKey & k) { return k.key == omitted; });
+                               [&](const RawListedKey & k) { return k.key == omitted; });
         if (it == page.keys.end())
             return page;              /// not a qualifying call -- do not count it
         if (seen_calls++ != target_call)
@@ -123,13 +123,13 @@ public:
     std::atomic<size_t> ref_prefix_lists{0};
     std::atomic<size_t> janitor_prefix_lists{0};
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (!refs_prefix.empty() && prefix == refs_prefix)
             ++ref_prefix_lists;
         if (!janitor_prefix.empty() && prefix == janitor_prefix)
             ++janitor_prefix_lists;
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 };
 
@@ -142,19 +142,19 @@ public:
 class UnresolvedPutBackend final : public InMemoryBackend
 {
 public:
-    using Backend::putIfAbsent;
-
     String fault_key_substr;
     int fault_count = 0;
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
     {
         if (fault_count > 0 && !fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
         {
             --fault_count;
             throw Poco::TimeoutException("UnresolvedPutBackend: simulated ambiguous result (response lost)");
         }
-        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 };
 
