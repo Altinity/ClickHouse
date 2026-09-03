@@ -251,6 +251,13 @@ TEST(CASBackendPrimitives, ALegacyCallReachesAnOverrideOfThePrimitiveItForwardsT
 
     b->putOverwrite("k", "w", Token{first, Dialect::Emulated});     /// legacy call
     EXPECT_EQ(b->writes, 1u);
+
+    /// And the negative half of the same ruling: the two exceptions really do route around the
+    /// primitive. Both writes LAND, so this cannot pass by the calls having done nothing.
+    b->writes = 0;
+    EXPECT_EQ(b->putIfAbsent("k2", "v").outcome, PutOutcome::Done);
+    EXPECT_EQ(b->casPut("k3", "v", std::nullopt).outcome, CasOutcome::Committed);
+    EXPECT_EQ(b->writes, 0u);
 }
 
 TEST(CASBackendPrimitives, EachWriteKnobFiresOnlyForTheVerbItNames)

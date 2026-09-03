@@ -109,10 +109,9 @@ public:
     /// `Removed`. An invalid index returns `NotFound`.
     DeleteOutcome landPendingDelete(size_t i);
 
-    /// Injects a one-shot artificial refusal on the next write of `key`, CREATING OR REPLACING. Both,
-    /// because the store cannot tell a create-if-absent `casPut` from a `putIfAbsent` and the knob is
-    /// armed against conditional writes of both shapes -- a GC lease acquire creates its object, and
-    /// a test that arms this knob for it is testing exactly that create losing its condition.
+    /// Injects a one-shot artificial refusal on the next `casPut` of `key`, IN EITHER FORM: a GC lease
+    /// acquire creates its object, and a test arming this knob for it is testing exactly that create
+    /// losing its condition.
     void failNextCasPut(const String & key);
 
     /// Injects a one-shot AMBIGUOUS outcome on the next CREATING write of `key` (a write with no
@@ -127,8 +126,9 @@ public:
 
     /// The other ambiguity, and the only one that can prove a resolve read settles a commit: the next
     /// write of `key` IS APPLIED and then throws a plain (non-`DB::Exception`) exception, so the object
-    /// is durable and its incarnation was never returned. Consumed by the keyed `write` alone -- it
-    /// names no legacy verb, so no legacy verb consumes it. One-shot.
+    /// is durable and its incarnation was never returned. One-shot, and consumed by the keyed `write`
+    /// and by every legacy verb that forwards through it -- `putOverwrite` today. The two verbs that
+    /// route around the primitive, `putIfAbsent` and `casPut`, do not consume it.
     void injectAmbiguousLandedWrite(const String & key);
 
     /// Enables or disables value checks for remove and replace. Disabling checks models a backend
@@ -197,7 +197,7 @@ private:
     /// Which of the verb-scoped write knobs one call may consume.
     enum class WriteKnobs : uint8_t
     {
-        All,                    /// the keyed `write`: the one caller every knob is armed against
+        All,                    /// the keyed `write`, and the legacy verbs that forward through it
         AmbiguousPutIfAbsent,   /// legacy `putIfAbsent`
         FailNextCasPut,         /// legacy `casPut`, either form
     };
