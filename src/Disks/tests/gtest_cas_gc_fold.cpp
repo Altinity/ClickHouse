@@ -357,7 +357,7 @@ String corruptSealedRunChecksum(InMemoryBackend & backend, const Layout & layout
     const String run_key = seal.blob_target_runs.front().key;
     seal.blob_target_runs.front().checksum = seal.blob_target_runs.front().checksum + 1;
     OperationForTest op(backend);
-    (*op).replace(sk, encodeFoldSeal(seal), existing->incarnation, Retry::standard());
+    (*op).replace(sk, encodeFoldSeal(seal), existing->etag, Retry::standard());
     return run_key;
 }
 }
