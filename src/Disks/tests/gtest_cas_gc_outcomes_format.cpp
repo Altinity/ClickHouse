@@ -37,7 +37,7 @@ TEST(CASFormatBattery, GcOutcomes)
     OutcomeEntry e;
     e.kind = ObjectKind::Blob;
     e.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("00112233445566778899aabbccddeeff"))};
-    e.token = Token{"e-1", TokenType::ETag};
+    e.token = PersistedIncarnation{"etag", "e-1"};
     e.outcome = OutcomeKind::Deleted;
     log.entries.push_back(e);
     runFormatBattery({FormatId::GcOutcomes,
@@ -57,13 +57,13 @@ TEST(CASGCOutcomesFormat, MultiEntryRoundTripAllOutcomes)
 {
     OutcomeLog log;
     log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a"))},
-                           Token{"etag-1", TokenType::ETag}, OutcomeKind::Deleted});
+                           PersistedIncarnation{"etag", "etag-1"}, OutcomeKind::Deleted});
     log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("bb00000000000000000000000000000b"))},
-                           Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
+                           PersistedIncarnation{"emulated", "7"}, OutcomeKind::Spared});
     log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("cc00000000000000000000000000000c"))},
-                           Token{"8", TokenType::Emulated}, OutcomeKind::Replaced});
+                           PersistedIncarnation{"emulated", "8"}, OutcomeKind::Replaced});
     log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("dd00000000000000000000000000000d"))},
-                           Token{"9", TokenType::Emulated}, OutcomeKind::Absent});
+                           PersistedIncarnation{"emulated", "9"}, OutcomeKind::Absent});
     const String text = encodeOutcomeLog(log);
     const OutcomeLog d = decodeOutcomeLog(text);
     ASSERT_EQ(d.entries.size(), 4u);
@@ -73,7 +73,7 @@ TEST(CASGCOutcomesFormat, MultiEntryRoundTripAllOutcomes)
     EXPECT_EQ(d.entries[2].outcome, OutcomeKind::Replaced);
     EXPECT_EQ(d.entries[3].outcome, OutcomeKind::Absent);
     EXPECT_EQ(d.entries[0].token.value, "etag-1");
-    EXPECT_EQ(d.entries[0].token.type, TokenType::ETag);
+    EXPECT_EQ(d.entries[0].token.dialect, "etag");
     EXPECT_EQ(d.entries[3].token.value, "9");
     /// Insertion order + byte-stable text (the encoder is a pure function of the log).
     EXPECT_EQ(encodeOutcomeLog(d), text);
@@ -97,7 +97,7 @@ TEST(CASGCOutcomesFormat, RecordRequiresCompleteBlobRefAndTokenGroups)
     OutcomeLog log;
     log.entries.push_back({ObjectKind::Blob,
         BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("00112233445566778899aabbccddeeff"))},
-        Token{"e-1", TokenType::ETag}, OutcomeKind::Deleted});
+        PersistedIncarnation{"etag", "e-1"}, OutcomeKind::Deleted});
     const String bytes = encodeOutcomeLog(log);
 
     for (const auto & [field, expected_message] : {

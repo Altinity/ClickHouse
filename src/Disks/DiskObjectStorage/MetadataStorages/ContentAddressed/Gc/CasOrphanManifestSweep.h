@@ -132,12 +132,13 @@ struct ManifestSweepResult
     uint64_t retained_work_budget = 0;
 
     /// Exact-GET/decode candidates. The reducer must adopt every `source_retirements` entry before the
-    /// caller may exact-token-delete `key` with `token`.
+    /// caller may delete `key`, and only after re-observing `token` at it: a key whose incarnation
+    /// moved on belongs to a fresh owner and must be left alone.
     struct Nomination
     {
         ManifestId id;
         String key;
-        Token token;
+        PersistedIncarnation token;
         std::vector<BlobSourceRetirement> source_retirements;
     };
     std::vector<Nomination> nominations;
@@ -161,19 +162,19 @@ struct ManifestSweepResult
 ///   - a 404 between listing and deletion is record-and-continue, never a throw;
 ///   - never GETs a condemned body to revive it — eligibility +
 ///     exact-token delete only.
-/// Returns the number of bodies actually deleted (a `DeleteClass::Deleted`-classified exact-token
-/// delete only, never a spared `NotFound`/`TokenMismatch`) — the decommission manifest-debris drain
+/// Returns the number of bodies actually deleted (a `Removal::Removed` exact-token
+/// delete only, never a spared `Gone`/`Mismatch`) — the decommission manifest-debris drain
 /// (`Core/CasDecommission.cpp`) sums this across every eligible build prefix into
 /// `DecommissionReport::manifest_debris_removed`.
 ///
 /// `warnings`, when non-null, opts in to the decommission drain's tolerate-and-continue contract: a
-/// per-key transient failure (a thrown backend exception on `head`/`deleteExact`)
+/// per-key transient failure (a thrown backend exception on `head`/`remove`)
 /// is pushed onto `*warnings` and the sweep continues with the next key, instead of throwing out of
 /// this call; likewise a protection-view-unavailable namespace (the pre-existing corrupt-snapshot skip
 /// below) also pushes a "cannot confirm emptiness" warning, not just a `LOG_WARNING`. `warnings ==
 /// nullptr` (the default, every pre-existing caller) preserves the original behaviour exactly: a
 /// per-key failure propagates as an exception (fail-close default), and the protection-view skip is
-/// log-only. `NotFound`/`TokenMismatch` delete outcomes stay silently spared either way — those are the
+/// log-only. `Gone`/`Mismatch` delete outcomes stay silently spared either way — those are the
 /// normal "a fresh owner reclaimed it" race the periodic sweep expects, not a failure to warn about.
 /// This direct decommission path relies on the caller's held server-root claim/fence: while that claim
 /// is held, a same-server-root rebirth cannot become live between its catalog cut and exact-token delete.

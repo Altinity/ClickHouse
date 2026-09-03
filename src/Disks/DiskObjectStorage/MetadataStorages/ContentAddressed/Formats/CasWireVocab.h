@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
@@ -17,7 +18,9 @@ namespace DB::Cas
 /// unrecognized value with `CORRUPTED_DATA`; silently choosing a default would turn malformed
 /// persisted data into a different valid-looking record.
 
-/// The `TokenType` wire vocabulary; coverage is proven in `CasWireVocab.cpp`.
+/// The incarnation-dialect wire vocabulary; coverage is proven in `CasWireVocab.cpp`. It has two
+/// persisted encodings -- the word, used by every JSON codec here, and the one byte the condemned-row
+/// payload stores -- and both go through this one table so they can never name different sets.
 inline constexpr EnumWireTable<TokenType, 3> kTokenTypeWords{{{
     {TokenType::ETag, "etag"},
     {TokenType::Generation, "generation"},
@@ -29,13 +32,15 @@ inline constexpr EnumWireTable<ObjectKind, 1> kObjectKindWords{{{
     {ObjectKind::Blob, "blob"},
 }}};
 
-/// Convert a token discriminator to its canonical wire word. Throws `LOGICAL_ERROR` for an
-/// out-of-range enum value.
-std::string_view tokenTypeToWord(TokenType t);
+/// Validate a persisted dialect word and return its canonical spelling. `what` identifies the
+/// containing codec or field in the `CORRUPTED_DATA` exception; an unrecognized word is rejected
+/// rather than carried into a record no reader could decode.
+std::string_view dialectWordFromString(std::string_view w, std::string_view what);
 
-/// Parse a canonical token-type word. `what` identifies the containing codec or field in the
-/// `CORRUPTED_DATA` exception; unknown words are rejected rather than treated as a default type.
-TokenType tokenTypeFromWord(std::string_view w, std::string_view what);
+/// The same vocabulary in the one-byte form the condemned-row payload stores. Both directions are
+/// fail-closed: an unrecognized word or byte is `CORRUPTED_DATA`.
+uint8_t dialectByteFromWord(std::string_view w, std::string_view what);
+std::string_view dialectWordFromByte(uint8_t byte, std::string_view what);
 
 /// Parse a canonical blob-hash algorithm word. The write side uses `blobHashAlgoName` directly, so
 /// this is its fail-closed inverse. `what` identifies the containing codec or field in the
@@ -51,8 +56,9 @@ std::string_view objectKindToWord(ObjectKind k);
 ObjectKind objectKindFromWord(std::string_view w, std::string_view what);
 
 /// Append the sibling fields `token_type` and `token` to an in-progress JSON object. The caller owns `first`,
-/// which must describe the fields already written to that object; the token value is JSON-escaped.
-void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t);
+/// which must describe the fields already written to that object; the value is JSON-escaped. The
+/// dialect is validated on the way out, so a record can never persist a word its reader would reject.
+void writeTokenFields(CasJsonWriter & out, bool & first, const PersistedIncarnation & inc);
 
 /// Append the sibling fields `algo` and `digest` to an in-progress JSON object. The algorithm word and
 /// lowercase digest are canonical, and the digest is rendered at the width required by `r.algo`.
@@ -145,15 +151,16 @@ struct BlobRefFields
     BlobRef build(std::string_view what) const;
 };
 
-/// Collector for one `Token`'s two flat fields (`token_type`/`token`), filled in by `matchTokenFields`.
+/// Collector for one persisted incarnation's two flat fields (`token_type`/`token`), filled in by
+/// `matchTokenFields`.
 struct TokenFields
 {
     std::optional<String> type_word;
     std::optional<String> value;
 
-    /// Requires both fields and parses the token type word. `what` identifies the enclosing codec
+    /// Requires both fields and validates the dialect word. `what` identifies the enclosing codec
     /// in `CORRUPTED_DATA` exceptions.
-    Token build(std::string_view what) const;
+    PersistedIncarnation build(std::string_view what) const;
 };
 
 /// Each `match*Fields` helper tests `key` against the one or two field names it owns, consumes the

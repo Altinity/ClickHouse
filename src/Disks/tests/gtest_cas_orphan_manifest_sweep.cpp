@@ -44,7 +44,9 @@ void seedConsumedSealCursor(InMemoryBackend & backend, const Layout & layout, co
 /// creation would have, rather than relying on the retired sentinel fallback.
 void seedEmptyRecoveryAuthority(InMemoryBackend & backend, const Layout & layout, const RootNamespace & ns)
 {
-    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
     const auto entry = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
         [&](const CatalogEntry & candidate) { return candidate.ns == ns; });
     ASSERT_NE(entry, catalog.catalog.entries.end());
@@ -63,8 +65,6 @@ void seedEmptyRecoveryAuthority(InMemoryBackend & backend, const Layout & layout
 class CatalogChangingOnSecondReadBackend : public InMemoryBackend
 {
 public:
-    using Backend::get;
-
     void arm(const Layout & layout, CatalogEntry predecessor_, CatalogEntry successor_)
     {
         catalog_key = layout.refCatalogKey();
@@ -76,11 +76,11 @@ public:
 
     bool didSwitch() const { return did_switch; }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (armed && key == catalog_key && ++catalog_reads == 2)
         {
-            const auto current = InMemoryBackend::get(key, range);
+            const auto current = InMemoryBackend::read(key, access);
             if (!current)
                 throw std::runtime_error("test catalog disappeared");
             RefCatalog next = decodeRefCatalog(current->bytes);
@@ -88,11 +88,11 @@ public:
             if (it == next.entries.end())
                 throw std::runtime_error("test predecessor catalog row disappeared");
             *it = successor;
-            if (InMemoryBackend::casPut(key, encodeRefCatalog(next), current->token).outcome != CasOutcome::Committed)
+            if (!InMemoryBackend::write(key, encodeRefCatalog(next), current->value, access).has_value())
                 throw std::runtime_error("test catalog replacement conflicted");
             did_switch = true;
         }
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 
 private:
@@ -110,10 +110,6 @@ private:
 class ReplacingManifestAfterObservationBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::list;
-    using Backend::get;
-
     void arm(const Layout & layout, String manifest_key_)
     {
         catalog_key = layout.refCatalogKey();
@@ -126,23 +122,23 @@ public:
 
     bool didReplace() const { return replaced_manifest; }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
-        const ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
         if (armed && prefix == manifests_prefix)
             listed_page = true;
         return page;
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        const auto result = InMemoryBackend::get(key, range);
+        auto result = InMemoryBackend::read(key, access);
         if (armed && listed_page && !replaced_manifest && key == catalog_key)
         {
-            const auto current = InMemoryBackend::get(manifest_key);
+            const auto current = InMemoryBackend::read(manifest_key, access);
             if (!current)
                 throw std::runtime_error("test manifest disappeared before replacement");
-            if (InMemoryBackend::casPut(manifest_key, current->bytes, current->token).outcome != CasOutcome::Committed)
+            if (!InMemoryBackend::write(manifest_key, current->bytes, current->value, access).has_value())
                 throw std::runtime_error("test manifest replacement conflicted");
             replaced_manifest = true;
         }
@@ -186,7 +182,9 @@ TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/sweep-checkpoint-base-seal@cas@"};
     fixture::admitLive(*backend, layout, ns);
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(op, layout, ns);
 
     const RefLogTxn birth{
         .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
@@ -423,15 +421,17 @@ TEST(CASOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
     seedConsumedSealCursor(*backend, store->layout(), ns);
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
 
-    const CasRefCatalog::Snapshot before = CasRefCatalog::read(*backend, store->layout());
+    CasOperation op = store->gcRequests().admit();
+    const CasRefCatalog::Snapshot before = CasRefCatalog::read(op, store->layout());
     RefCatalog damaged = before.catalog;
     CatalogEntry duplicate = damaged.entries.front();
     duplicate.ns = RootNamespace{"00/ambiguous-life-twin@cas@"};
     damaged.entries.push_back(duplicate);
     std::sort(damaged.entries.begin(), damaged.entries.end(),
         [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
-    ASSERT_EQ(backend->casPut(store->layout().refCatalogKey(), encodeRefCatalog(damaged), before.token).outcome,
-              CasOutcome::Committed);
+    ASSERT_TRUE(before.incarnation.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(store->layout().refCatalogKey(), encodeRefCatalog(damaged), *before.incarnation, Retry::standard())));
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10); });
@@ -467,8 +467,9 @@ TEST(CASOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecis
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
     seedConsumedSealCursor(*backend, store->layout(), ns);
 
-    const CatalogEntry entry = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
-    ASSERT_FALSE(readCkpt(*backend, store->layout(), NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation)));
+    CasOperation op = store->gcRequests().admit();
+    const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
+    ASSERT_FALSE(readCkpt(op, store->layout(), NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation)));
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
 
@@ -488,7 +489,8 @@ TEST(CASOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccess
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/seal-cursor-tail@cas@"};
     fixture::admitLive(*backend, store->layout(), ns);
-    const CatalogEntry entry = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
+    CasOperation op = store->gcRequests().admit();
+    const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
     const ManifestRef removed{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
@@ -536,7 +538,8 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/missing-next-epoch@cas@"};
     fixture::admitLive(*backend, store->layout(), ns);
-    const CatalogEntry entry = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
+    CasOperation op = store->gcRequests().admit();
+    const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
     const RefTxnId cursor{2, 2};
@@ -596,7 +599,8 @@ TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/exact-next-epoch@cas@"};
     fixture::admitLive(*backend, store->layout(), ns);
-    const CatalogEntry entry = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
+    CasOperation op = store->gcRequests().admit();
+    const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
     const RefTxnId cursor{2, 2};
@@ -642,7 +646,8 @@ TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/frozen-catalog-cut@cas@"};
     fixture::admitLive(*backend, store->layout(), ns);
-    const CatalogEntry predecessor = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
+    CasOperation op = store->gcRequests().admit();
+    const CatalogEntry predecessor = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
 
     const ManifestRef r = ref(5, 0xB1);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});

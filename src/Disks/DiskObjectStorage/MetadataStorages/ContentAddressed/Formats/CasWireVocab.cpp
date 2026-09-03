@@ -20,14 +20,25 @@ namespace DB::Cas
 static_assert(casEnumTableCoversEnum<kTokenTypeWords, TokenType>());
 static_assert(casEnumTableCoversEnum<kObjectKindWords, ObjectKind>());
 
-std::string_view tokenTypeToWord(TokenType t)
+std::string_view dialectWordFromString(std::string_view w, std::string_view what)
 {
-    return kTokenTypeWords.toWord(t, "CAS wire: TokenType");
+    /// Parse then re-render, so what a record carries is the table's own spelling rather than the
+    /// caller's copy of it.
+    return kTokenTypeWords.toWord(kTokenTypeWords.fromWord(w, what), what);
 }
 
-TokenType tokenTypeFromWord(std::string_view w, std::string_view what)
+uint8_t dialectByteFromWord(std::string_view w, std::string_view what)
 {
-    return kTokenTypeWords.fromWord(w, what);
+    return static_cast<uint8_t>(kTokenTypeWords.fromWord(w, what));
+}
+
+std::string_view dialectWordFromByte(uint8_t byte, std::string_view what)
+{
+    for (const auto & entry : kTokenTypeWords.entries)
+        if (static_cast<uint8_t>(entry.value) == byte)
+            return entry.word;
+    /// The byte comes off persisted media, so an unknown one is malformed data, not a caller bug.
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown dialect byte {}", what, byte);
 }
 
 BlobHashAlgo blobHashAlgoFromWord(std::string_view w, std::string_view what)
@@ -45,10 +56,10 @@ ObjectKind objectKindFromWord(std::string_view w, std::string_view what)
     return kObjectKindWords.fromWord(w, what);
 }
 
-void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t)
+void writeTokenFields(CasJsonWriter & out, bool & first, const PersistedIncarnation & inc)
 {
-    writeStringField(out, SharedWire::token_type, tokenTypeToWord(t.type), first);
-    writeStringField(out, SharedWire::token, t.value, first);
+    writeStringField(out, SharedWire::token_type, dialectWordFromString(inc.dialect, "wire: dialect"), first);
+    writeStringField(out, SharedWire::token, inc.value, first);
 }
 
 void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r)
@@ -107,11 +118,11 @@ BlobRef BlobRefFields::build(std::string_view what) const
     return BlobRef{algo, codecFor(algo).fromHex(*digest_hex)};
 }
 
-Token TokenFields::build(std::string_view what) const
+PersistedIncarnation TokenFields::build(std::string_view what) const
 {
     if (!type_word || !value)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: token missing token_type/token", what);
-    return Token{*value, tokenTypeFromWord(*type_word, what)};
+    return PersistedIncarnation{String(dialectWordFromString(*type_word, what)), *value};
 }
 
 }

@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
@@ -21,21 +22,32 @@ UInt128 s(uint64_t n) { return UInt128(n); }   // source-edge id
 /// `BlobCandidate.ref` / `inDegreeInRuns` argument is a `BlobRef` as of Phase 3 T3.
 BlobRef bh(uint64_t n) { return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(n))}; }
 
-/// Scale thresholds for the "the run genuinely spans several blocks" sanity assertions below. These are
-/// NOT format constants — the SourceEdge run is a plain NDJSON stream (`CasRecordStreamFormat`) with no
-/// block framing of its own — they only pin the same byte-size scale the (now-deleted, codecs-v3 phase 6)
+/// Scale threshold for the "the run genuinely spans several blocks" sanity assertions below. This is
+/// NOT a format constant — the SourceEdge run is a plain NDJSON stream (`CasRecordStreamFormat`) with no
+/// block framing of its own — it only pins the same byte-size scale the (now-deleted, codecs-v3 phase 6)
 /// `CasRunFile` block codec used, so the multi-block-sized fixtures below stay meaningfully large.
-/// (Previously read straight off `CasRunFile.h`'s own `kRunTargetBlockSize`/`kRunHardCapBlockSize`; this
-/// file's `#include` of that header looked removable when `CasRunFile` was deleted in the phase-6 cutover,
-/// but these two thresholds turned out to be the only remaining users — hence the local, explicitly-legacy
-/// copies here instead of a dangling include. Values unchanged.)
 constexpr uint32_t kLegacyBlockSize = 256u * 1024u;
-constexpr uint32_t kLegacyHardCapBlockSize = 1024u * 1024u;
+
+/// The fold, `zeroInDegree` and the run readers all take an admitted operation; each test opens one
+/// over its own backend.
+struct TestRequests
+{
+    explicit TestRequests(Backend & backend)
+        : engine(DB::Cas::tests::openRequestsForTest(backend)), op(engine.admit())
+    {
+    }
+    TestRequests(const TestRequests &) = delete;
+    TestRequests & operator=(const TestRequests &) = delete;
+
+    CasRequests engine;
+    CasOperation op;
+};
 }
 
 TEST(CASBlobInDegree, FoldStartsFromEmptyPriorGeneration)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// Generation 1 from empty prior: two distinct edges on b1 and one on b2.
@@ -46,29 +58,30 @@ TEST(CASBlobInDegree, FoldStartsFromEmptyPriorGeneration)
         {bh(2), s(1), false},
     };
     std::vector<RunRef> runs;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, /*new*/1, /*attempt*/0, /*shard*/0, deltas, runs);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, /*new*/1, /*attempt*/0, /*shard*/0, deltas, runs);
     ASSERT_FALSE(runs.empty());
 
-    const auto zero = zeroInDegree(backend, runs);
+    const auto zero = zeroInDegree(backend_req.op, runs);
     EXPECT_TRUE(zero.empty());   /// nothing at zero yet
 }
 
 TEST(CASBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// Gen 1: activate edge (b1,s1) and (b2,s1).
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}}, runs1);
 
     /// Generation 2 merges prior gen-1 run (resolved via runs1 refs) with removal of (b1,s1): indeg(b1)=0, indeg(b2)=1.
     std::vector<RunRef> runs2;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, /*new*/2, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1, /*new*/2, /*attempt*/0, 0,
         {{bh(1), s(1), true}}, runs2);
 
-    const auto zero = zeroInDegree(backend, runs2);
+    const auto zero = zeroInDegree(backend_req.op, runs2);
     ASSERT_EQ(zero.size(), 1u);
     EXPECT_EQ(zero[0].ref, bh(1));
 }
@@ -76,14 +89,16 @@ TEST(CASBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
 TEST(CASBlobInDegree, RunsAreByteDeterministic)
 {
     InMemoryBackend a;
+    TestRequests a_req(a);
     InMemoryBackend b2;
+    TestRequests b2_req(b2);
     Layout layout{"pool"};
     std::vector<RunRef> ra;
     std::vector<RunRef> rb;
     /// Same deltas in a DIFFERENT input order must produce the same sealed run bytes (sorted by key).
-    foldDeltasIntoGeneration(a,  layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(a_req.op, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{bh(3), s(1), false}, {bh(1), s(1), false}, {bh(2), s(1), false}}, ra);
-    foldDeltasIntoGeneration(b2, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(b2_req.op, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(3), s(1), false}}, rb);
     const auto ga = a.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
     const auto gb = b2.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
@@ -101,44 +116,47 @@ TEST(CASBlobInDegree, SameEdgeActivatedTwiceCountsOnce)
     /// The source-edge set is a SET, not a counter — re-adding the same edge is a no-op.
     /// indeg(b1) must be 1 after both activations, not 2.
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
     std::vector<BlobDelta> deltas{
         {bh(1), s(1), false},   // activate (b1,s1)
         {bh(1), s(1), false},   // same edge again — must deduplicate
     };
     std::vector<RunRef> runs;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0, deltas, runs);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0, deltas, runs);
     ASSERT_FALSE(runs.empty());
 
     const int64_t deg = DB::Cas::tests::inDegreeInRuns(backend, runs, bh(1));
     EXPECT_EQ(deg, 1);   /// deduplicated, not 2
 
-    const auto zero = zeroInDegree(backend, runs);
+    const auto zero = zeroInDegree(backend_req.op, runs);
     EXPECT_TRUE(zero.empty());   /// b1 still has an active edge
 }
 
 TEST(CASBlobInDegree, FoldDeltaByteEqualReplayAdopts)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
     std::vector<BlobDelta> deltas{{bh(1), s(1), false}};
     std::vector<RunRef> runs1;
     std::vector<RunRef> runs2;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs1);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs1);
     /// Same inputs, same attempt => byte-identical run already present => adopt, no throw.
-    EXPECT_NO_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs2));
+    EXPECT_NO_THROW(foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs2));
     EXPECT_EQ(runs1, runs2);
 }
 
 TEST(CASBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
     /// Pre-occupy the run key (attempt 7) with junk, then fold => divergent => CORRUPTED_DATA.
     backend.putIfAbsent(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run");
     std::vector<BlobDelta> deltas{{bh(1), s(1), false}};
     std::vector<RunRef> runs;
-    EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs),
+    EXPECT_THROW(foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs),
                  DB::Exception);
 }
 
@@ -167,16 +185,16 @@ SourceEdgeRecord edgeRec(UInt128 h, UInt128 sid)
                             .source_id = sid, .marker = RunMarker::Edge};
 }
 
-/// head_blob / peek_head stub: present with a fixed token/size.
-std::function<std::optional<HeadResult>(const BlobRef &)> headPresent(const String & tok, uint64_t size)
+/// `head_blob` / `peek_head` stub. Only the request engine mints an incarnation, so the stub cannot
+/// fabricate one: it writes `size` bytes at the blob's own key and hands back the head of what it
+/// wrote, which is the incarnation the fold then condemns.
+BlobHeadFn headPresent(CasOperation & op, const Layout & layout, uint64_t size)
 {
-    return [tok, size](const BlobRef &) -> std::optional<HeadResult>
+    return [&op, &layout, size](const BlobRef & ref) -> std::optional<Meta>
     {
-        HeadResult hr;
-        hr.exists = true;
-        hr.size = size;
-        hr.token = Token{.value = tok, .type = TokenType::Emulated};
-        return hr;
+        const String key = layout.blobKey(ref);
+        op.create(key, String(size, 'x'), Retry::standard());
+        return op.head(key, Retry::standard());
     };
 }
 
@@ -185,7 +203,7 @@ CondemnedRow condemnedRowFor(uint64_t condemn_round, const String & tok = "t",
                              bool delete_pending = false, uint64_t size = 1)
 {
     return CondemnedRow{.delete_pending = delete_pending,
-                        .token = Token{.value = tok, .type = TokenType::Emulated},
+                        .token = PersistedIncarnation{"emulated", tok},
                         .size = size, .condemn_round = condemn_round};
 }
 
@@ -234,10 +252,10 @@ struct DecodedRun
     std::vector<std::pair<UInt128, UInt128>> edges;            /// (blob_hash, source_id)
 };
 
-DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
+DecodedRun decodeRun(CasOperation & op, const RunRef & run)
 {
     DecodedRun d;
-    auto r = openSourceEdgeRun(backend, run.key);
+    auto r = openSourceEdgeRun(op, run.key);
     /// Every run this test helper decodes is CityHash128 (16-byte), so `.toU128()` is a
     /// provably-exact round trip.
     String k;
@@ -272,6 +290,7 @@ DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
 TEST(CASBlobInDegree, FoldSealChecksumMismatchFailsClosed)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
     const RunRef good = writeSourceEdgeRun(backend, layout, /*gen*/1, /*attempt*/0, /*shard*/0,
                                            /*condemned*/{}, /*edges*/{{b(1), s(1)}});
@@ -282,7 +301,7 @@ TEST(CASBlobInDegree, FoldSealChecksumMismatchFailsClosed)
     /// A delta on a DIFFERENT blob forces the two-cursor merge to stream the prior run to completion, so
     /// the end-of-segment verifyAgainst fires (not a row-invariant abort).
     EXPECT_THROW(
-        foldDeltasIntoGeneration(backend, layout, prior, /*new*/2, /*attempt*/0, /*shard*/0,
+        foldDeltasIntoGeneration(backend_req.op, layout, prior, /*new*/2, /*attempt*/0, /*shard*/0,
                                  std::vector<BlobDelta>{{bh(2), s(1), false}}, out),
         DB::Exception);
 }
@@ -290,18 +309,20 @@ TEST(CASBlobInDegree, FoldSealChecksumMismatchFailsClosed)
 TEST(CASBlobInDegree, ZeroInDegreeSealChecksumMismatchFailsClosed)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
     const RunRef good = writeSourceEdgeRun(backend, layout, /*gen*/1, /*attempt*/0, /*shard*/0,
                                            /*condemned*/{}, /*edges*/{{b(1), s(1)}});
     RunRef bad = good;
     bad.checksum = good.checksum + 1;
     std::vector<RunRef> runs{bad};
-    EXPECT_THROW(zeroInDegree(backend, runs), DB::Exception);
+    EXPECT_THROW(zeroInDegree(backend_req.op, runs), DB::Exception);
 }
 
 TEST(CASThreeCursorMerge, FloorBoundary)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// Gen 1's run holds one unrelated surviving edge (b9) plus the carried RunMarker::Condemned rows for A=b1
@@ -312,7 +333,7 @@ TEST(CASThreeCursorMerge, FloorBoundary)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
         /*current_round*/3, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
@@ -330,7 +351,7 @@ TEST(CASThreeCursorMerge, FloorBoundary)
     EXPECT_TRUE(rmr.redelete.empty());
 
     /// still_retired mirrors exactly the RunMarker::Condemned rows written into the output run, in order.
-    const DecodedRun out = decodeRun(backend, runs2[0]);
+    const DecodedRun out = decodeRun(backend_req.op, runs2[0]);
     ASSERT_EQ(out.condemned.size(), 2u);
     EXPECT_EQ(out.condemned[0].first, b(1));
     EXPECT_TRUE(out.condemned[0].second.delete_pending);
@@ -342,6 +363,7 @@ TEST(CASThreeCursorMerge, FloorBoundary)
 TEST(CASThreeCursorMerge, PendingRedeletesAndDrops)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// A row the PRIOR pass published as delete_pending (carried on gen 1's run): this pass hands it to
@@ -351,7 +373,7 @@ TEST(CASThreeCursorMerge, PendingRedeletesAndDrops)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
         /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     ASSERT_EQ(rmr.redelete.size(), 1u);
@@ -361,7 +383,7 @@ TEST(CASThreeCursorMerge, PendingRedeletesAndDrops)
     EXPECT_TRUE(rmr.spared.empty());
 
     /// The redeleted blob leaves the run entirely (no sentinel carried, no zero marker — untouched).
-    const DecodedRun out = decodeRun(backend, runs2[0]);
+    const DecodedRun out = decodeRun(backend_req.op, runs2[0]);
     EXPECT_TRUE(out.condemned.empty());
     EXPECT_TRUE(out.zero_markers.empty());
 }
@@ -369,6 +391,7 @@ TEST(CASThreeCursorMerge, PendingRedeletesAndDrops)
 TEST(CASThreeCursorMerge, RecoverySpares)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// A (=b1) is retired at round 1 and would long since have graduated (current_round = 5) — but this
@@ -377,7 +400,7 @@ TEST(CASThreeCursorMerge, RecoverySpares)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {{bh(1), s(1), false}}, runs2,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{gen1}, 2, 0, 0, {{bh(1), s(1), false}}, runs2,
         /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
@@ -386,7 +409,7 @@ TEST(CASThreeCursorMerge, RecoverySpares)
     EXPECT_TRUE(rmr.still_retired.empty());
 
     /// b1 recovered its edge: the output run carries the surviving edge and no sentinel for it.
-    const DecodedRun out = decodeRun(backend, runs2[0]);
+    const DecodedRun out = decodeRun(backend_req.op, runs2[0]);
     EXPECT_TRUE(out.condemned.empty());
     ASSERT_EQ(out.edges.size(), 1u);
     EXPECT_EQ(out.edges[0].first, b(1));
@@ -395,55 +418,59 @@ TEST(CASThreeCursorMerge, RecoverySpares)
 TEST(CASThreeCursorMerge, NewCandidateCondemned)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// Gen 1: C (=b3) has one edge. Gen 2 removes it => transition to zero, not retired =>
     /// condemned with the head-captured token at THIS pass's condemn_round.
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{bh(3), s(1), false}}, runs1);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, 0, 0, {{bh(3), s(1), false}}, runs1);
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
-        /*current_round*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
+        /*current_round*/0, /*condemn_round*/7, headPresent(backend_req.op, layout, 42), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
     EXPECT_EQ(rmr.still_retired[0].ref, bh(3));
-    EXPECT_EQ(rmr.still_retired[0].token.value, "t9");
+    const std::optional<Meta> present = backend_req.op.head(layout.blobKey(bh(3)), Retry::standard());
+    ASSERT_TRUE(present.has_value());
+    EXPECT_TRUE(rmr.still_retired[0].token.matches(present->incarnation));
     EXPECT_EQ(rmr.still_retired[0].size, 42u);
     EXPECT_EQ(rmr.still_retired[0].condemn_round, 7u);
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
 
     /// The fresh condemn is emitted as a RunMarker::Condemned row (not a zero marker) into the output run.
-    const DecodedRun out = decodeRun(backend, runs2[0]);
+    const DecodedRun out = decodeRun(backend_req.op, runs2[0]);
     ASSERT_EQ(out.condemned.size(), 1u);
     EXPECT_EQ(out.condemned[0].first, b(3));
-    EXPECT_EQ(out.condemned[0].second.token.value, "t9");
+    EXPECT_TRUE(out.condemned[0].second.token.matches(present->incarnation));
     EXPECT_TRUE(out.zero_markers.empty());
 }
 
 TEST(CASThreeCursorMerge, AbsentBlobNotCondemned)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// Same transition-to-zero as above, but the blob object is already gone at condemn time:
     /// nothing to delete later, so no entry is minted — a plain zero marker is emitted instead.
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{bh(3), s(1), false}}, runs1);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, 0, 0, {{bh(3), s(1), false}}, runs1);
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
         /*current_round*/0, /*condemn_round*/7,
-        [](const BlobRef &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        [](const BlobRef &) -> std::optional<Meta> { return std::nullopt; }, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
 
-    const DecodedRun out = decodeRun(backend, runs2[0]);
+    const DecodedRun out = decodeRun(backend_req.op, runs2[0]);
     EXPECT_TRUE(out.condemned.empty());
     ASSERT_EQ(out.zero_markers.size(), 1u);
     EXPECT_EQ(out.zero_markers[0], b(3));
@@ -456,11 +483,13 @@ TEST(CASThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
     /// The preserved invariant (spec §2.1) is narrower: the retired machinery touches ONLY the sentinel
     /// namespace — the surviving EDGE rows are byte-identical to a plain fold of the same deltas.
     InMemoryBackend plain;
+    TestRequests plain_req(plain);
     InMemoryBackend engaged;
+    TestRequests engaged_req(engaged);
     Layout layout{"pool"};
 
     std::vector<RunRef> r1;
-    foldDeltasIntoGeneration(plain, layout, /*prior_runs*/{}, 1, 0, 0,
+    foldDeltasIntoGeneration(plain_req.op, layout, /*prior_runs*/{}, 1, 0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(2), s(2), true}}, r1);
 
     /// Engaged: the SAME deltas, but the prior run carries retired rows for b1 (which the delta re-edges
@@ -469,12 +498,12 @@ TEST(CASThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
         {{b(1), condemnedRowFor(1)}, {b(5), condemnedRowFor(2)}});
     std::vector<RunRef> r2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(engaged, layout, /*prior_runs*/{prior}, 2, 0, 0,
+    foldDeltasIntoGeneration(engaged_req.op, layout, /*prior_runs*/{prior}, 2, 0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(2), s(2), true}}, r2,
-        /*current_round*/9, /*condemn_round*/3, headPresent("t", 1), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/9, /*condemn_round*/3, headPresent(engaged_req.op, layout, 1), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
-    const DecodedRun plain_run = decodeRun(plain, r1[0]);
-    const DecodedRun engaged_run = decodeRun(engaged, r2[0]);
+    const DecodedRun plain_run = decodeRun(plain_req.op, r1[0]);
+    const DecodedRun engaged_run = decodeRun(engaged_req.op, r2[0]);
     EXPECT_EQ(plain_run.edges, engaged_run.edges);   /// edge rows byte-identical
     EXPECT_TRUE(plain_run.condemned.empty());
     /// The engaged run carries only the retired sentinel(s) on top: b1 spared (no row), b5 graduated.
@@ -489,17 +518,18 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
     /// has NO deltas at all: the carried row must (a) survive byte-identically, (b) emit no zero marker,
     /// (c) never call peek_head (a carried sentinel is not a touch).
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// Gen 1: (b,s1) added then removed => net-to-zero => fresh condemn at round 5 (token "tok", size 7).
     std::vector<RunRef> runs1;
     RetiredMergeResult rmr1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, 0, 0,
         {{bh(2), s(1), false}, {bh(2), s(1), true}}, runs1,
-        /*current_round*/0, /*condemn_round*/5, headPresent("tok", 7), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr1);
+        /*current_round*/0, /*condemn_round*/5, headPresent(backend_req.op, layout, 7), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr1);
     ASSERT_EQ(rmr1.still_retired.size(), 1u);
     {
-        const DecodedRun g1 = decodeRun(backend, runs1[0]);
+        const DecodedRun g1 = decodeRun(backend_req.op, runs1[0]);
         ASSERT_EQ(g1.condemned.size(), 1u);
         EXPECT_EQ(g1.condemned[0].first, b(2));
         EXPECT_TRUE(g1.zero_markers.empty());   /// a condemned blob emits RunMarker::Condemned, never a zero marker
@@ -507,10 +537,10 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
 
     /// Gen 2: empty deltas, current_round 1 (< 5 => b carries, does not graduate). peek_head must NOT fire.
     size_t peek_calls = 0;
-    auto peek = [&](const BlobRef &) -> std::optional<HeadResult> { ++peek_calls; return {}; };
+    auto peek = [&](const BlobRef &) -> std::optional<Meta> { ++peek_calls; return {}; };
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr2;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
         /*current_round*/1, /*condemn_round*/6, /*head_blob*/{}, peek, /*confirm_condemned_marker*/{}, &rmr2);
 
     EXPECT_EQ(peek_calls, 0u);
@@ -519,10 +549,12 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
     EXPECT_EQ(rmr2.still_retired[0].condemn_round, 5u);   /// carried unchanged
     EXPECT_TRUE(rmr2.graduated.empty());
 
-    const DecodedRun g2 = decodeRun(backend, runs2[0]);
+    const DecodedRun g2 = decodeRun(backend_req.op, runs2[0]);
     ASSERT_EQ(g2.condemned.size(), 1u);
     EXPECT_EQ(g2.condemned[0].first, b(2));
-    EXPECT_EQ(g2.condemned[0].second.token.value, "tok");
+    const std::optional<Meta> present = backend_req.op.head(layout.blobKey(bh(2)), Retry::standard());
+    ASSERT_TRUE(present.has_value());
+    EXPECT_TRUE(g2.condemned[0].second.token.matches(present->incarnation));
     EXPECT_EQ(g2.condemned[0].second.size, 7u);
     EXPECT_TRUE(g2.zero_markers.empty());
 }
@@ -534,6 +566,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
     /// (1) An active edge at the reserved sentinel source_id 0 -> the merge cursor fails closed.
     {
         InMemoryBackend backend;
+    TestRequests backend_req(backend);
         DB::WriteBufferFromOwnString out;
         SourceEdgeRunWriter writer(out);
         writer.append(edgeRec(1, UInt128{0}));   // edge at sentinel key
@@ -545,13 +578,14 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
         backend.putIfAbsent(bad.key, bytes);
 
         std::vector<RunRef> runs2;
-        EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
+        EXPECT_THROW(foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
                      DB::Exception);
     }
 
     /// (2) Two sentinel rows for one blob -> duplicate sentinel -> the merge cursor fails closed.
     {
         InMemoryBackend backend;
+    TestRequests backend_req(backend);
         DB::WriteBufferFromOwnString out;
         SourceEdgeRunWriter writer(out);
         /// Same (b,0) key twice (equal keys are allowed by the writer) — two condemned sentinels for b1.
@@ -565,7 +599,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
         backend.putIfAbsent(bad.key, bytes);
 
         std::vector<RunRef> runs2;
-        EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
+        EXPECT_THROW(foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
                      DB::Exception);
     }
 }
@@ -578,9 +612,11 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunBlockBounded)
 {
     using DB::Cas::tests::CountingBackend;
     CountingBackend backend;
+    TestRequests backend_req(backend);
     /// InMemory oracle: the SAME two folds against a plain backend must yield byte-identical runs —
     /// the streaming cursor changes I/O shape, not bytes.
     InMemoryBackend oracle;
+    TestRequests oracle_req(oracle);
     Layout layout{"pool"};
 
     /// Gen 1 from empty prior: enough edges that the SourceEdge run spills across many 256KB blocks.
@@ -593,8 +629,8 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunBlockBounded)
 
     std::vector<RunRef> runs1_c;
     std::vector<RunRef> runs1_o;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_c);
-    foldDeltasIntoGeneration(oracle, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_o);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_c);
+    foldDeltasIntoGeneration(oracle_req.op, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_o);
 
     const String gen1_run_key = layout.blobTargetRunKey(1, 0, 0, 0);
     const auto gen1_run = backend.get(gen1_run_key);
@@ -611,8 +647,8 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunBlockBounded)
     std::vector<BlobDelta> gen2{{bh(0), s(1), true}, {bh(19999), s(2), false}};
     std::vector<RunRef> runs2_c;
     std::vector<RunRef> runs2_o;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1_c, 2, 0, 0, gen2, runs2_c);
-    foldDeltasIntoGeneration(oracle, layout, /*prior_runs*/runs1_o, 2, 0, 0, gen2, runs2_o);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1_c, 2, 0, 0, gen2, runs2_c);
+    foldDeltasIntoGeneration(oracle_req.op, layout, /*prior_runs*/runs1_o, 2, 0, 0, gen2, runs2_o);
 
     /// Byte-reproducibility canary: streaming and materialized folds produce identical output bytes.
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
@@ -625,20 +661,13 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunBlockBounded)
     ASSERT_EQ(runs2_o.size(), 1u);
     EXPECT_EQ(runs2_c[0].checksum, runs2_o[0].checksum);
 
-    /// The core assertion: no whole-object get of the prior run key — every read carried a Range or a
-    /// stream (the resident-memory proof at the seam).
-    EXPECT_EQ(backend.wholeGetCount(gen1_run_key), 0u);
-    /// The cursor opened the prior run's segment via the streaming reader (head + tail get + getStream).
+    /// The core assertion: the prior run is never read whole — the cursor reaches it only through the
+    /// streaming open, so the seam sees no read of that key at all.
+    EXPECT_EQ(backend.getCount(gen1_run_key), 0u);
+    /// The cursor opened the prior run's segment through the streaming reader.
     EXPECT_GE(backend.getStreamCount(gen1_run_key), 1u);
-    /// Every ranged-get window on the prior run stays within one block + the footer allowance. This
-    /// bound is strict here because the prior run's footer fits inside the fixed tail probe (only very
-    /// large runs — ~13k blocks — spill the footer past the probe and add one exact-footer get; a note
-    /// for that regime lives in the streaming reader's open comment).
-    EXPECT_LE(backend.maxRangedGetLen(gen1_run_key),
-              static_cast<uint64_t>(kLegacyHardCapBlockSize) + 64u * 1024u);
-    /// Streaming open touches the prior run's tail probe (and at most one exact-footer get); it is never
-    /// re-materialized whole.
-    EXPECT_LE(backend.getCount(gen1_run_key), 2u);
+    /// This does NOT bound how much the stream buffers per request: the streaming primitive carries no
+    /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }
 
 /// The preview consumer `zeroInDegree` streams a multi-block run instead of materializing it whole: the
@@ -649,7 +678,9 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsBlockBounded)
 {
     using DB::Cas::tests::CountingBackend;
     CountingBackend backend;
+    TestRequests backend_req(backend);
     InMemoryBackend oracle;
+    TestRequests oracle_req(oracle);
     Layout layout{"pool"};
 
     /// Gen 1 from empty prior: ~20000 active edges spill the SourceEdge run across several 256KB blocks.
@@ -660,16 +691,16 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsBlockBounded)
 
     std::vector<RunRef> runs1_c;
     std::vector<RunRef> runs1_o;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_c);
-    foldDeltasIntoGeneration(oracle, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_o);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_c);
+    foldDeltasIntoGeneration(oracle_req.op, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_o);
 
     /// Gen 2 removes every edge on two of the blobs => two zero-transition markers in the gen-2 run,
     /// which is itself multi-block (the surviving-edge rows still span blocks).
     std::vector<BlobDelta> gen2{{bh(0), s(1), true}, {bh(19999), s(1), true}};
     std::vector<RunRef> runs2_c;
     std::vector<RunRef> runs2_o;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1_c, 2, 0, 0, gen2, runs2_c);
-    foldDeltasIntoGeneration(oracle, layout, /*prior_runs*/runs1_o, 2, 0, 0, gen2, runs2_o);
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1_c, 2, 0, 0, gen2, runs2_c);
+    foldDeltasIntoGeneration(oracle_req.op, layout, /*prior_runs*/runs1_o, 2, 0, 0, gen2, runs2_o);
 
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
     const auto gen2_run = backend.get(gen2_run_key);
@@ -678,8 +709,8 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
 
     backend.resetCounts();
-    const auto zero_c = zeroInDegree(backend, runs2_c);
-    const auto zero_o = zeroInDegree(oracle, runs2_o);
+    const auto zero_c = zeroInDegree(backend_req.op, runs2_c);
+    const auto zero_o = zeroInDegree(oracle_req.op, runs2_o);
 
     /// Equivalence with the borrowed-mode (InMemory oracle) result: same candidates, in the same order.
     ASSERT_EQ(zero_c.size(), zero_o.size());
@@ -687,27 +718,27 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     for (size_t i = 0; i < zero_c.size(); ++i)
         EXPECT_EQ(zero_c[i].ref, zero_o[i].ref);
 
-    /// The core assertion: no whole-object get of the run key — every read carried a Range or a stream.
-    EXPECT_EQ(backend.wholeGetCount(gen2_run_key), 0u);
-    /// The scan opened the run via the streaming reader (head + tail get + getStream).
+    /// The core assertion: the run is never read whole — the scan reaches it only through the streaming
+    /// open, so the seam sees no read of that key at all.
+    EXPECT_EQ(backend.getCount(gen2_run_key), 0u);
+    /// The scan opened the run through the streaming reader.
     EXPECT_GE(backend.getStreamCount(gen2_run_key), 1u);
-    /// Every ranged-get window stays within one block + the footer allowance (the seam memory bound).
-    EXPECT_LE(backend.maxRangedGetLen(gen2_run_key),
-              static_cast<uint64_t>(kLegacyHardCapBlockSize) + 64u * 1024u);
-    /// Streaming open touches the tail probe (and at most one exact-footer get); never re-materialized whole.
-    EXPECT_LE(backend.getCount(gen2_run_key), 2u);
+    /// This does NOT bound how much the stream buffers per request: the streaming primitive carries no
+    /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }
 
 /// ==== RunMarker::Condemned row codec + typed source-edge open (retired-in-snapshot T2, spec §2.1) ====
 
 TEST(CASCondemnedRow, RoundTripAllTokenTypes)
 {
-    for (auto type : {DB::Cas::TokenType::ETag, DB::Cas::TokenType::Generation, DB::Cas::TokenType::Emulated})
+    /// Walked over the vocabulary's own entries rather than a hand-copied list, so a dialect the
+    /// encoder can construct but this test forgot cannot exist.
+    for (const auto & entry : DB::Cas::kTokenTypeWords.entries)
     {
         DB::Cas::CondemnedRow row;
-        row.delete_pending = (type == DB::Cas::TokenType::Generation);
-        row.marker_confirmed = (type == DB::Cas::TokenType::Emulated);
-        row.token = DB::Cas::Token{.value = "etag-abc-123", .type = type};
+        row.delete_pending = (entry.value == DB::Cas::TokenType::Generation);
+        row.marker_confirmed = (entry.value == DB::Cas::TokenType::Emulated);
+        row.token = DB::Cas::PersistedIncarnation{String(entry.word), "etag-abc-123"};
         row.size = 4096;
         row.condemn_round = 7;
         const auto bytes = DB::Cas::encodeCondemnedRow(row);
@@ -720,7 +751,7 @@ TEST(CASCondemnedRow, UnknownMarkerByteFailsClosedWithCorruptedData)
 {
     /// This pins the condemned-row decoder's own marker validation.
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
+    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[0] = 0x03;
 
@@ -755,7 +786,7 @@ TEST(CASRecordStream, RunMarkerByteContractFailsClosed)
 TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
+    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[1] = 4;   // flags byte: only bits 0 (delete_pending) and 1 (marker_confirmed) are defined
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
@@ -764,7 +795,7 @@ TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
 TEST(CASCondemnedRow, UnknownTokenTypeFailsClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
+    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[2] = 99;   // token_type byte (offset: [0]=0x02 [1]=flags [2]=token_type)
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
@@ -773,7 +804,7 @@ TEST(CASCondemnedRow, UnknownTokenTypeFailsClosed)
 TEST(CASCondemnedRow, TruncatedPayloadFailsClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::Token{.value = "0123456789", .type = DB::Cas::TokenType::ETag};
+    row.token = DB::Cas::PersistedIncarnation{"etag", "0123456789"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes.resize(bytes.size() - 3);   // token bytes shorter than declared token_len
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
@@ -832,6 +863,7 @@ TEST(CASBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
     /// both settle (edges present, condemn on removal works per ref), mixed rows in one run, no
     /// algo loop.
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     const BlobRef ch_x{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(11))};
@@ -840,20 +872,20 @@ TEST(CASBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
     const BlobRef sha_y_ref{BlobHashAlgo::Sha256, sha_y};
 
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{ch_x, s(1), false}, {sha_y_ref, s(1), false}}, runs1);
     ASSERT_FALSE(runs1.empty());
 
     EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs1, ch_x), 1);
     EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs1, sha_y_ref), 1);
-    EXPECT_TRUE(zeroInDegree(backend, runs1).empty());
+    EXPECT_TRUE(zeroInDegree(backend_req.op, runs1).empty());
 
     /// Remove both edges in gen 2: each transitions to zero independently, condemned per its own ref.
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, /*attempt*/0, 0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1, 2, /*attempt*/0, 0,
         {{ch_x, s(1), true}, {sha_y_ref, s(1), true}}, runs2,
-        /*current_round*/0, /*condemn_round*/1, headPresent("t", 1), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
+        /*current_round*/0, /*condemn_round*/1, headPresent(backend_req.op, layout, 1), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 2u);
     std::vector<BlobRef> condemned_refs{rmr.still_retired[0].ref, rmr.still_retired[1].ref};
@@ -873,23 +905,24 @@ TEST(CASBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
 TEST(CASBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// Generation 1: blob b1 is referenced by TWO distinct sources (two manifests).
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0,
         {{bh(1), s(1), false}, {bh(1), s(2), false}}, runs1);
 
     /// Generation 2: fold a removal for a THIRD source that never had an activation folded.
     std::vector<RunRef> runs2;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, /*new_generation*/2, /*attempt*/0, /*shard*/0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1, /*new_generation*/2, /*attempt*/0, /*shard*/0,
         {{bh(1), s(99), true}}, runs2);
 
     /// Both original edges survive: the unmatched removal touched only its own (absent) key.
-    const DecodedRun out = decodeRun(backend, runs2[0]);
+    const DecodedRun out = decodeRun(backend_req.op, runs2[0]);
     ASSERT_EQ(out.edges.size(), 2u) << "an unmatched removal must not strip sibling edges";
     /// And the blob is NOT a deletion candidate.
-    const auto zero = zeroInDegree(backend, runs2);
+    const auto zero = zeroInDegree(backend_req.op, runs2);
     EXPECT_TRUE(zero.empty()) << "b1 still has two live source edges";
 }
 
@@ -901,23 +934,24 @@ TEST(CASBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
 TEST(CASBlobInDegree, UnmatchedRemovalIsCountedWithAnExample)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
 
     /// Generation 1: blob b1 is referenced by TWO distinct sources (two manifests), same fixture as the
     /// no-op test above.
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{}, /*new_generation*/1, /*attempt*/0, /*shard*/0,
         {{bh(1), s(1), false}, {bh(1), s(2), false}}, runs1);
 
     /// Generation 2: fold a removal for a THIRD source that never had an activation folded.
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, /*new_generation*/2, /*attempt*/0, /*shard*/0,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/runs1, /*new_generation*/2, /*attempt*/0, /*shard*/0,
         {{bh(1), s(99), true}}, runs2,
         /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     /// The run is byte-identical to the no-op test's outcome for the blob's OTHER edges: both survive.
-    const DecodedRun out = decodeRun(backend, runs2[0]);
+    const DecodedRun out = decodeRun(backend_req.op, runs2[0]);
     ASSERT_EQ(out.edges.size(), 2u) << "the counting surface must not perturb the no-op fold outcome";
     EXPECT_EQ(out.edges[0].first, b(1));
     EXPECT_EQ(out.edges[1].first, b(1));
@@ -951,6 +985,7 @@ std::vector<std::pair<UInt128, CondemnedRow>> condemnedCohort(uint64_t n, uint64
 TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, 1, /*delete_pending*/true));
 
@@ -959,7 +994,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
         /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
         &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
         /*source_retirements*/{}, &budget);
@@ -979,6 +1014,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
 TEST(CASThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
     const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, /*condemn_round*/1, /*delete_pending*/false));
 
@@ -987,7 +1023,7 @@ TEST(CASThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+    foldDeltasIntoGeneration(backend_req.op, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
         /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
         &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
         /*source_retirements*/{}, &budget);
@@ -1009,6 +1045,7 @@ TEST(CASThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
 TEST(CASThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
 {
     InMemoryBackend backend;
+    TestRequests backend_req(backend);
     Layout layout{"pool"};
     std::vector<RunRef> priors{writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, 1, /*delete_pending*/true))};
 
@@ -1020,7 +1057,7 @@ TEST(CASThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
         budget.max_redeletes = 3;
         std::vector<RunRef> out_runs;
         RetiredMergeResult rmr;
-        foldDeltasIntoGeneration(backend, layout, priors, 2 + rounds, 0, 0, {}, out_runs,
+        foldDeltasIntoGeneration(backend_req.op, layout, priors, 2 + rounds, 0, 0, {}, out_runs,
             /*current_round*/100, /*condemn_round*/100, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
             &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
             /*source_retirements*/{}, &budget);

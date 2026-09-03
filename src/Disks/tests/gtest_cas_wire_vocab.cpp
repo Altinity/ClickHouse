@@ -1,12 +1,17 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTableAsserts.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
 
 #include <magic_enum.hpp>
+#include <type_traits>
 
 using namespace DB::Cas;
 
@@ -57,7 +62,7 @@ TEST(CASWireVocab, EnumTablesPinTheCurrentWords)
 TEST(CASWireVocab, ClosedSetsRoundTripEveryEnumeratorExhaustively)
 {
     for (const auto t : magic_enum::enum_values<TokenType>())
-        EXPECT_EQ(tokenTypeFromWord(tokenTypeToWord(t), "t"), t);
+        EXPECT_EQ(kTokenTypeWords.fromWord(kTokenTypeWords.toWord(t, "t"), "t"), t);
     for (const auto k : magic_enum::enum_values<ObjectKind>())
         EXPECT_EQ(objectKindFromWord(objectKindToWord(k), "k"), k);
     for (const auto a : magic_enum::enum_values<BlobHashAlgo>())
@@ -69,11 +74,11 @@ TEST(CASWireVocab, ClosedSetsRoundTripEveryEnumeratorExhaustively)
 TEST(CASWireVocab, EnumWordsRoundTrip)
 {
     for (TokenType t : {TokenType::ETag, TokenType::Generation, TokenType::Emulated})
-        EXPECT_EQ(tokenTypeFromWord(tokenTypeToWord(t), "t"), t);
+        EXPECT_EQ(kTokenTypeWords.fromWord(kTokenTypeWords.toWord(t, "t"), "t"), t);
     for (BlobHashAlgo a : {BlobHashAlgo::CityHash128, BlobHashAlgo::XXH3_128, BlobHashAlgo::Sha256})
         EXPECT_EQ(blobHashAlgoFromWord(blobHashAlgoName(a), "a"), a);
     EXPECT_EQ(objectKindFromWord(objectKindToWord(ObjectKind::Blob), "k"), ObjectKind::Blob);
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { tokenTypeFromWord("nope", "t"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromString("nope", "t"); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { blobHashAlgoFromWord("nope", "a"); });
 }
 
@@ -81,7 +86,7 @@ TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
 {
     CasJsonWriter out;
     bool first = true;
-    writeTokenFields(out, first, Token{"etag-abc\"x", TokenType::ETag});
+    writeTokenFields(out, first, PersistedIncarnation{"etag", "etag-abc\"x"});
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("00112233445566778899aabbccddeeff"))};
     writeBlobRefFields(out, first, ref);
     closeObject(out, first);
@@ -95,16 +100,16 @@ TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
     String tv;
     String ha;
     String h;
-    TokenType tt{};
+    String tt;
     while (r.nextKey(key))
     {
-        if (key == "token_type") tt = tokenTypeFromWord(r.readString(), "t");
+        if (key == "token_type") tt = String(dialectWordFromString(r.readString(), "t"));
         else if (key == "token") tv = r.readString();
         else if (key == "algo") ha = r.readString();
         else if (key == "digest") h = r.readString();
         else r.skipUnknown(key);
     }
-    EXPECT_EQ(tt, TokenType::ETag);
+    EXPECT_EQ(tt, "etag");
     EXPECT_EQ(tv, "etag-abc\"x");
     const BlobRef back{blobHashAlgoFromWord(ha, "a"), codecFor(blobHashAlgoFromWord(ha, "a")).fromHex(h)};
     EXPECT_EQ(back, ref);
@@ -224,7 +229,9 @@ TEST(CASWireVocab, TokenFieldsBuildsInAnyKeyOrderAndRequiresBothFields)
             continue;
         r.skipUnknown(key);
     }
-    EXPECT_EQ(fields.build("t"), (Token{"abc", TokenType::ETag}));
+    const PersistedIncarnation built = fields.build("t");
+    EXPECT_EQ(built.dialect, "etag");
+    EXPECT_EQ(built.value, "abc");
 
     TokenFields only_type;
     only_type.type_word = "etag";
@@ -255,4 +262,81 @@ TEST(CASWireVocab, OldManifestEpochKeyDoesNotAliasTheSemanticKey)
         EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
         EXPECT_EQ(e.message(), "CAS RefTableSnapshot: committed manifest_ref missing epoch/build/ord");
     }
+}
+
+/// A `PersistedIncarnation` survives every encoding a durable CAS record uses for one, and the type
+/// system refuses the reverse direction: a persisted value must never be trusted to mint a live
+/// `Incarnation`, which only an admitted request may produce.
+static_assert(!std::is_constructible_v<DB::Cas::Incarnation, DB::Cas::PersistedIncarnation>);
+
+TEST(CASPersistedIncarnation, RoundTripsThroughEveryFormatAndNeverBecomesAnIncarnation)
+{
+    const PersistedIncarnation recorded{"generation", R"(17"3)"};   /// a quote the JSON encodings must escape
+
+    /// 1. The shared `token_type`/`token` JSON pair.
+    {
+        CasJsonWriter out;
+        bool first = true;
+        writeTokenFields(out, first, recorded);
+        closeObject(out, first);
+        const String rendered = std::move(out).take();
+        DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
+        JsonObjectReader r(in, KeyStrictness::Strict, "t");
+        TokenFields fields;
+        String key;
+        while (r.nextKey(key))
+            ASSERT_TRUE(matchTokenFields(key, r, fields)) << "unexpected key " << key;
+        const PersistedIncarnation back = fields.build("t");
+        EXPECT_EQ(back.dialect, recorded.dialect);
+        EXPECT_EQ(back.value, recorded.value);
+    }
+
+    /// 2. The `cas_run` condemned row's NDJSON form.
+    {
+        const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(9))};
+        DB::WriteBufferFromOwnString out;
+        SourceEdgeRunWriter writer(out);
+        writer.append(SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = RunMarker::Condemned,
+                                       .delete_pending = true, .token = recorded, .size = 64,
+                                       .condemn_round = 3, .marker_confirmed = true});
+        writer.finish();
+        out.finalize();
+        const String bytes = out.str();
+        DB::ReadBufferFromMemory in(bytes.data(), bytes.size());
+        SourceEdgeRunReader reader(in);
+        SourceEdgeRecord back;
+        ASSERT_TRUE(reader.next(back));
+        EXPECT_EQ(back.token.dialect, recorded.dialect);
+        EXPECT_EQ(back.token.value, recorded.value);
+        EXPECT_FALSE(reader.next(back));
+    }
+
+    /// 3. The GC outcome log.
+    {
+        OutcomeLog log;
+        log.entries.push_back(OutcomeEntry{ObjectKind::Blob,
+            BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, recorded, OutcomeKind::Deleted});
+        const OutcomeLog back = decodeOutcomeLog(encodeOutcomeLog(log));
+        ASSERT_EQ(back.entries.size(), 1u);
+        EXPECT_EQ(back.entries[0].token.dialect, recorded.dialect);
+        EXPECT_EQ(back.entries[0].token.value, recorded.value);
+    }
+
+    /// 4. The condemned row's packed byte form, whose dialect rides one byte rather than a word.
+    {
+        const CondemnedRow row{.delete_pending = false, .token = recorded, .size = 5,
+                               .condemn_round = 11, .marker_confirmed = true};
+        EXPECT_EQ(decodeCondemnedRow(encodeCondemnedRow(row)), row);
+    }
+}
+
+/// Both directions of the dialect vocabulary fail closed, so neither encoding can carry a value the
+/// other cannot name.
+TEST(CASPersistedIncarnation, UnknownDialectWordAndByteAreBothRefused)
+{
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromString("etags", "t"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectByteFromWord("etags", "t"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromByte(0, "t"); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromByte(4, "t"); });
+    EXPECT_EQ(dialectWordFromByte(dialectByteFromWord("generation", "t"), "t"), "generation");
 }
