@@ -360,10 +360,14 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     std::copy_if(seen.begin(), seen.end(), std::back_inserter(replaced_events),
         [&](const CasEvent & e){ return is_this_blob(e) && e.type == CasEventType::BlobRetireReplaced; });
     ASSERT_EQ(replaced_events.size(), 1u) << "exactly one blob_retire_replaced for the supersede";
-    EXPECT_EQ(replaced_events[0].token, hB.token.value) << "the event's own token is the fresh CURRENT token B";
+    /// The event's token text is dialect-qualified ("emulated:<value>", matching `Incarnation::render`
+    /// and `PersistedIncarnation`'s wire word) -- `Token::value` alone (from the legacy `head()` this
+    /// test reads hA/hB through) is only the bare value.
+    EXPECT_EQ(replaced_events[0].token, "emulated:" + hB.token.value)
+        << "the event's own token is the fresh CURRENT token B";
     ASSERT_TRUE(replaced_events[0].detail.count("superseded_token"));
     EXPECT_FALSE(replaced_events[0].detail.at("superseded_token").empty());
-    EXPECT_EQ(replaced_events[0].detail.at("superseded_token"), hA.token.value)
+    EXPECT_EQ(replaced_events[0].detail.at("superseded_token"), "emulated:" + hA.token.value)
         << "superseded_token must name the stale token (A) that republication replaced";
 
     EXPECT_EQ(replaced_after - replaced_before, 1u) << "CASGCRetireReplaced increments exactly once";
