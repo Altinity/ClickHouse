@@ -963,8 +963,11 @@ TEST(CASRefCheckpoint, DeclineTimeVerdictsReadAdmitted)
         const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(
             RootNamespace{decreasing ? "srv1/ckpt_decline_decrease" : "srv1/ckpt_decline_identical"});
         const String key = layout.refCkptKey(life);
-        const RefCkpt durable{.life_epoch = std::optional<uint64_t>{9}, .committed_through = ID_1_1,
-                              .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+        /// A genesis epoch of 2 with the frontier in that same epoch: `checkRefCkptInvariants` refuses
+        /// a `committed_through` preceding `life_epoch`, so the durable body a decrease is measured
+        /// against has to be one the format would actually store.
+        const RefCkpt durable{.life_epoch = std::optional<uint64_t>{2}, .committed_through = ID_2_1,
+                              .checkpoint_snapshot_id = ID_2_1, .last_epoch_seal = std::nullopt};
         ASSERT_EQ(publishCkpt(reader, layout, life, durable), CkptPublishOutcome::Published);
         const uint64_t writes_before = backend->writes(key);
 
@@ -973,7 +976,7 @@ TEST(CASRefCheckpoint, DeclineTimeVerdictsReadAdmitted)
         backend->watch(key);
         backend->after_read = [&admitted] { admitted = false; };
         const RefCkpt contribution = decreasing
-            ? RefCkpt{.life_epoch = std::optional<uint64_t>{3}, .checkpoint_snapshot_id = std::nullopt,
+            ? RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                       .last_epoch_seal = std::nullopt}
             : durable;
         EXPECT_EQ(publishCkpt(op, layout, life, contribution), CkptPublishOutcome::FencedOut)
