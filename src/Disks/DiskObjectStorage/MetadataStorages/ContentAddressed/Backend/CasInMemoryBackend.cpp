@@ -138,31 +138,11 @@ std::optional<Backend::RawMeta> InMemoryBackend::head(const String & key, Transp
 std::expected<String, Backend::RawConflict> InMemoryBackend::write(
     const String & key, const String & bytes, const std::optional<String> & expected_value, TransportAccess &)
 {
-    return applyWrite(key, bytes, expected_value, WriteKnobs::All);
-}
-
-PutResult InMemoryBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta &)
-{
-    auto r = applyWrite(key, bytes, std::nullopt, WriteKnobs::AmbiguousPutIfAbsent);
-    if (!r)
-        return PutResult{PutOutcome::PreconditionFailed, {}};
-    return PutResult{PutOutcome::Done, legacyMintWritten(key, std::move(*r))};
-}
-
-CasResult InMemoryBackend::casPut(const String & key, const String & bytes,
-                                  const std::optional<Token> & expected, const ObjectMeta &)
-{
-    if (expected && legacyTokenIsForeign(key, *expected))
-        return CasResult{CasOutcome::Conflict, {}};
-    auto r = applyWrite(key, bytes, expected ? std::optional<String>(expected->value) : std::nullopt,
-                        WriteKnobs::FailNextCasPut);
-    if (!r)
-        return CasResult{CasOutcome::Conflict, {}};
-    return CasResult{CasOutcome::Committed, legacyMintWritten(key, std::move(*r))};
+    return applyWrite(key, bytes, expected_value);
 }
 
 std::expected<String, Backend::RawConflict> InMemoryBackend::applyWrite(
-    const String & key, const String & bytes, const std::optional<String> & expected_value, WriteKnobs knobs)
+    const String & key, const String & bytes, const std::optional<String> & expected_value)
 {
     if (expected_value)
         checkExpectedValue(key, *expected_value);
@@ -175,7 +155,7 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::applyWrite(
     if (auto hook = hookFor(before_write_hooks_, key))
         hook();
 
-    auto result = writeUnderLock(key, bytes, expected_value, knobs);
+    auto result = writeUnderLock(key, bytes, expected_value);
     if (!result.has_value())
         return result;
 
@@ -183,41 +163,33 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::applyWrite(
         hook();
 
     /// Last, so the object is durable and every observer has run before the response goes missing.
-    if (knobs == WriteKnobs::All && takeAmbiguousLandedWrite(key))
+    if (takeAmbiguousLandedWrite(key))
         throw Poco::TimeoutException("InMemoryBackend: the write of '" + key + "' landed and its response was lost");
 
     return result;
 }
 
 std::expected<String, Backend::RawConflict> InMemoryBackend::writeUnderLock(
-    const String & key, const String & bytes, const std::optional<String> & expected_value, WriteKnobs knobs)
+    const String & key, const String & bytes, const std::optional<String> & expected_value)
 {
     std::lock_guard lock(mutex_);
 
-    if (!expected_value && (knobs == WriteKnobs::All || knobs == WriteKnobs::AmbiguousPutIfAbsent))
+    // One-shot injected ambiguous outcome: throw WITHOUT touching the store, modeling a request
+    // whose own attempt outcome never reached the caller. Poco::TimeoutException, not
+    // DB::Exception, is deliberate: a client-side timeout is the real shape of this failure, and
+    // its class is what every caller classifies by -- ambiguous, in both build configurations.
+    auto ambiguous_it = ambiguous_write_keys_.find(key);
+    if (ambiguous_it != ambiguous_write_keys_.end())
     {
-        // One-shot injected ambiguous outcome: throw WITHOUT touching the store, modeling a request
-        // whose own attempt outcome never reached the caller. Poco::TimeoutException, not
-        // DB::Exception, is deliberate: a client-side timeout is the real shape of this failure, and
-        // its class is what every caller classifies by -- ambiguous, in both build configurations.
-        auto ambiguous_it = ambiguous_put_keys_.find(key);
-        if (ambiguous_it != ambiguous_put_keys_.end())
-        {
-            ambiguous_put_keys_.erase(ambiguous_it);
-            throw Poco::TimeoutException("InMemoryBackend: injected ambiguous write outcome for '" + key + "'");
-        }
+        ambiguous_write_keys_.erase(ambiguous_it);
+        throw Poco::TimeoutException("InMemoryBackend: injected ambiguous write outcome for '" + key + "'");
     }
 
-    // One-shot injected conflict, on EITHER form: the knob is armed against a conditional write, and
-    // a create-if-absent is one -- the lease acquire this models creates its object.
-    if (knobs == WriteKnobs::All || knobs == WriteKnobs::FailNextCasPut)
+    auto refuse_it = refuse_next_write_keys_.find(key);
+    if (refuse_it != refuse_next_write_keys_.end())
     {
-        auto fail_it = fail_next_cas_.find(key);
-        if (fail_it != fail_next_cas_.end())
-        {
-            fail_next_cas_.erase(fail_it);
-            return std::unexpected(RawConflict{});
-        }
+        refuse_next_write_keys_.erase(refuse_it);
+        return std::unexpected(RawConflict{});
     }
 
     if (!expected_value)
@@ -471,16 +443,16 @@ DeleteOutcome InMemoryBackend::landPendingDelete(size_t i)
     return applyDelete(pd.key, pd.token);
 }
 
-void InMemoryBackend::failNextCasPut(const String & key)
+void InMemoryBackend::refuseNextWrite(const String & key)
 {
     std::lock_guard lock(mutex_);
-    fail_next_cas_.insert(key);
+    refuse_next_write_keys_.insert(key);
 }
 
-void InMemoryBackend::injectAmbiguousPutIfAbsent(const String & key)
+void InMemoryBackend::injectAmbiguousWrite(const String & key)
 {
     std::lock_guard lock(mutex_);
-    ambiguous_put_keys_.insert(key);
+    ambiguous_write_keys_.insert(key);
 }
 
 void InMemoryBackend::injectAmbiguousLandedWrite(const String & key)

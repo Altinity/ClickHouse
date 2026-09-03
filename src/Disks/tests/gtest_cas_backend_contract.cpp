@@ -8,6 +8,25 @@
 
 using namespace DB::Cas;
 
+namespace DB::ErrorCodes
+{
+extern const int NOT_IMPLEMENTED;
+}
+
+namespace
+{
+
+/// Asserts the object is present before comparing its body: an absent key would otherwise dereference
+/// an empty optional and take the whole binary down instead of failing this one case.
+void expectBytes(const BackendPtr & b, const String & key, const String & expected)
+{
+    const auto got = b->get(key);
+    ASSERT_TRUE(got.has_value()) << "object '" << key << "' is absent";
+    EXPECT_EQ(got->bytes, expected);
+}
+
+}
+
 /// Parameterized contract suite: every case creates a fresh backend from the factory,
 /// then exercises the Backend seam generically (no InMemoryBackend-specific calls).
 /// Fault-injection-only features are excluded — those are InMemory-specific tests.
@@ -35,11 +54,11 @@ TEST_P(CASBackendContract, OverwriteIsTokenExactAndMintsFreshToken)
     auto b = GetParam()();
     const Token t1 = b->putIfAbsent("k", "v1").token;
     EXPECT_EQ(b->putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}).outcome, PutOutcome::PreconditionFailed);
-    EXPECT_EQ(b->get("k")->bytes, "v1");                       // untouched on mismatch
+    expectBytes(b, "k", "v1");                                 // untouched on mismatch
     const auto overwrite = b->putOverwrite("k", "v2", t1);
     EXPECT_EQ(overwrite.outcome, PutOutcome::Done);
     EXPECT_NE(overwrite.token, t1);                            // tokens never repeat
-    EXPECT_EQ(b->get("k")->bytes, "v2");
+    expectBytes(b, "k", "v2");
 }
 
 TEST_P(CASBackendContract, CasPutCreateAndSwap)
@@ -50,9 +69,9 @@ TEST_P(CASBackendContract, CasPutCreateAndSwap)
     EXPECT_EQ(create.outcome, CasOutcome::Committed);                              // create-if-absent
     EXPECT_EQ(b->casPut("m", "s1x", std::nullopt).outcome, CasOutcome::Conflict);  // exists now
     EXPECT_EQ(b->casPut("m", "s2", Token{"stale", TokenType::Emulated}).outcome, CasOutcome::Conflict);
-    EXPECT_EQ(b->get("m")->bytes, "s1");
+    expectBytes(b, "m", "s1");
     EXPECT_EQ(b->casPut("m", "s2", t1).outcome, CasOutcome::Committed);
-    EXPECT_EQ(b->get("m")->bytes, "s2");
+    expectBytes(b, "m", "s2");
 }
 
 TEST_P(CASBackendContract, DeleteExactnessAndSurvival)
@@ -85,8 +104,8 @@ TEST_P(CASBackendContract, RangedGetIsRefusedAndTheWholeReadStillServes)
     Range r;
     r.offset = 2;
     r.length = 3u;
-    EXPECT_THROW(b->get("k", r), DB::Exception);
-    EXPECT_EQ(b->get("k")->bytes, "0123456789");
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&] { (void)b->get("k", r); });
+    expectBytes(b, "k", "0123456789");
 }
 
 TEST_P(CASBackendContract, Head)

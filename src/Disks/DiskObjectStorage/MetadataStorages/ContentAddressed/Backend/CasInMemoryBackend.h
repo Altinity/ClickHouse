@@ -17,7 +17,7 @@ namespace DB::Cas
 ///
 /// The backend also exposes fault-injection controls for probe tests and CAS correctness tests:
 ///   - `setHoldDeletes` / `landPendingDelete`: simulate async/delayed conditional deletes
-///   - `failNextCasPut`:                      inject a one-shot conflict
+///   - `refuseNextWrite`:                     inject a one-shot conflict
 ///   - `setEnforceTokens(false)`:             mimic a "dumb" backend that ignores token checks
 ///   - `setSimulateDeleteMarkers`:            mimic S3 versioning-enabled buckets
 ///
@@ -29,13 +29,10 @@ public:
     InMemoryBackend() = default;
 
     /// Unhide the base overloads this class's own declarations would otherwise shadow: the legacy
-    /// `head`/`list`/`getStream`/`putIfAbsent`/`casPut` names, and the omitted-`Range`/`ObjectMeta`
-    /// conveniences.
-    using Backend::casPut;
+    /// `head`/`list`/`getStream` names, and the omitted-`Range` convenience.
     using Backend::getStream;
     using Backend::head;
     using Backend::list;
-    using Backend::putIfAbsent;
 
     // ---- Backend interface ----
 
@@ -82,18 +79,6 @@ public:
     /// backend lock, so the returned stream remains independent of later backend mutations.
     std::optional<GetStreamResult> getStream(const String & key, Range range) override;
 
-    /// ---- Two legacy verbs, overridden ONLY so each write knob keeps its verb identity ----
-    ///
-    /// A knob is armed against a VERB, but the keyed `write` cannot see which verb its caller used, so
-    /// the base forwarder would let `failNextCasPut` fire on a `putIfAbsent` and
-    /// `injectAmbiguousPutIfAbsent` on a create-shaped `casPut`. Each of these consumes only the knob
-    /// named for it, and neither reaches the keyed primitive -- so, unlike every other legacy verb, an
-    /// override of `write` in a SUBCLASS of this backend does not intercept these two. Deleted with the
-    /// rest of the legacy surface at the lock, and the exception goes with them.
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override;
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override;
-
     // ---- Fault-injection controls ----
 
     /// When true, `remove` validates and enqueues deletes rather than applying them immediately.
@@ -109,25 +94,20 @@ public:
     /// `Removed`. An invalid index returns `NotFound`.
     DeleteOutcome landPendingDelete(size_t i);
 
-    /// Injects a one-shot artificial refusal on the next `casPut` of `key`, IN EITHER FORM: a GC lease
-    /// acquire creates its object, and a test arming this knob for it is testing exactly that create
-    /// losing its condition.
-    void failNextCasPut(const String & key);
+    /// Refuses the next write of `key` once, as a clean precondition failure that leaves the store
+    /// unchanged -- whatever the write's shape and whichever surface issued it.
+    void refuseNextWrite(const String & key);
 
-    /// Injects a one-shot AMBIGUOUS outcome on the next CREATING write of `key` (a write with no
-    /// expected value): instead of attempting it, that call throws `Poco::TimeoutException` and the
-    /// store is left exactly as it was. Models a request whose own HTTP attempt outcome is lost (a
-    /// timeout, a dropped connection) rather than a clean refusal, for tests that must exercise the
-    /// "ambiguous attempt, resolve before deciding" path without a live network. One-shot, mirroring
-    /// `failNextCasPut`'s contract: consumed by the first matching write, whether the key was already
-    /// present or not.
-    void injectAmbiguousPutIfAbsent(const String & key);
+    /// Injects a one-shot AMBIGUOUS outcome on the next write of `key`: instead of attempting it, that
+    /// call throws `Poco::TimeoutException` and the store is left exactly as it was. Models a request
+    /// whose own HTTP attempt outcome is lost (a timeout, a dropped connection) rather than a clean
+    /// refusal, for tests that must exercise the "ambiguous attempt, resolve before deciding" path
+    /// without a live network.
+    void injectAmbiguousWrite(const String & key);
 
     /// The other ambiguity, and the only one that can prove a resolve read settles a commit: the next
     /// write of `key` IS APPLIED and then throws `Poco::TimeoutException`, so the object is durable and
-    /// its incarnation was never returned. One-shot, and consumed by the keyed `write` and by every
-    /// legacy verb that forwards through it -- `putOverwrite` today. The two verbs that route around
-    /// the primitive, `putIfAbsent` and `casPut`, do not consume it.
+    /// its incarnation was never returned. One-shot.
     void injectAmbiguousLandedWrite(const String & key);
 
     /// Enables or disables value checks for remove and replace. Disabling checks models a backend
@@ -193,14 +173,6 @@ private:
     using ArmedFailures = std::map<String, std::vector<std::exception_ptr>>;
     using Hooks = std::map<String, std::function<void()>>;
 
-    /// Which of the verb-scoped write knobs one call may consume.
-    enum class WriteKnobs : uint8_t
-    {
-        All,                    /// the keyed `write`, and the legacy verbs that forward through it
-        AmbiguousPutIfAbsent,   /// legacy `putIfAbsent`
-        FailNextCasPut,         /// legacy `casPut`, either form
-    };
-
     /// Consumes and returns the next failure armed for `key`, or null when none is.
     std::exception_ptr takeArmedFailure(ArmedFailures & armed, const String & key);
     /// Consumes the landed-then-lost arming for `key`, if there is one.
@@ -208,13 +180,12 @@ private:
     /// A copy of the hook registered for `key`, taken under the lock so the caller can run it without
     /// one.
     std::function<void()> hookFor(const Hooks & hooks, const String & key) const;
-    /// One write, whichever verb asked for it: armed failure, hooks, the store mutation, and exactly
-    /// the knobs `knobs` allows.
+    /// One write, whichever verb asked for it: armed failure, hooks, the store mutation and the knobs.
     std::expected<String, RawConflict> applyWrite(const String & key, const String & bytes,
-                                                  const std::optional<String> & expected_value, WriteKnobs knobs);
+                                                  const std::optional<String> & expected_value);
     /// The part of `applyWrite` that touches the store, run with `mutex_` held.
     std::expected<String, RawConflict> writeUnderLock(const String & key, const String & bytes,
-                                                      const std::optional<String> & expected_value, WriteKnobs knobs);
+                                                      const std::optional<String> & expected_value);
 
     mutable std::mutex mutex_;
     std::map<String, Object> store_;
@@ -223,8 +194,8 @@ private:
     // Fault-injection state. These fields are protected by `mutex_` just like `store_`.
     bool hold_deletes_ = false;
     std::vector<PendingDelete> pending_deletes_;
-    std::set<String> fail_next_cas_;
-    std::set<String> ambiguous_put_keys_;
+    std::set<String> refuse_next_write_keys_;
+    std::set<String> ambiguous_write_keys_;
     std::set<String> ambiguous_landed_keys_;
     bool enforce_tokens_ = true;
     bool simulate_delete_markers_ = false;
