@@ -3,6 +3,9 @@
 #include <pcg_random.hpp>
 #include <Common/randomSeed.h>
 
+#include <Functions/FunctionsLogical.h>
+#include <Functions/IFunctionAdaptors.h>
+
 #include <Common/Exception.h>
 #include <Core/Settings.h>
 #include <Core/QueryProcessingStage.h>
@@ -96,15 +99,57 @@ void ReadFromCluster::describeActions(FormatSettings & format_settings) const
                             << format({.ctx = getContext(), .query = *query_to_send}) << '\n';
 }
 
+namespace
+{
+
+/// Independent filter DAGs (wrap `WHERE`, then a later pushed FilterStep) cannot
+/// be `merge`d: that wires the second DAG through the first's boolean output.
+/// `mergeNodes` keeps both predicates, then `and` is the listing condition.
+ActionsDAG andListingFilterDAGs(ActionsDAG first, ActionsDAG second)
+{
+    if (first.getOutputs().empty())
+        return second;
+    if (second.getOutputs().empty())
+        return first;
+
+    const auto * first_filter = first.getOutputs().front();
+    ActionsDAG::NodeRawConstPtrs second_outputs;
+    first.mergeNodes(std::move(second), &second_outputs);
+    if (second_outputs.empty())
+        return first;
+
+    const auto * second_filter = second_outputs.front();
+    if (first_filter == second_filter)
+        return first;
+
+    FunctionOverloadResolverPtr func_and
+        = std::make_unique<FunctionToOverloadResolverAdaptor>(std::make_shared<FunctionAnd>());
+    const auto & and_node = first.addFunction(func_and, {first_filter, second_filter}, {});
+    first.getOutputs() = {&and_node};
+    first.removeUnusedActions();
+    return first;
+}
+
+}
+
 void ReadFromCluster::applyFilters(ActionDAGNodes added_filter_nodes)
 {
     SourceStepWithFilter::applyFilters(std::move(added_filter_nodes));
-    /// Keep the first non-empty DAG. Later empty `applyFilters` (no FilterSteps
-    /// above this source) wipes `filter_actions_dag` and must not drop wrap `WHERE`.
-    if (!filter_actions_dag || listing_filter_dag)
+    /// Empty later `applyFilters` (optimizer walk stops at JOIN) wipes
+    /// `filter_actions_dag` and must not drop wrap `WHERE`.
+    if (!filter_actions_dag)
         return;
 
-    listing_filter_dag = filter_actions_dag;
+    if (!listing_filter_dag)
+    {
+        listing_filter_dag = filter_actions_dag;
+    }
+    else if (listing_filter_dag->getHash() != filter_actions_dag->getHash())
+    {
+        listing_filter_dag = std::make_shared<const ActionsDAG>(
+            andListingFilterDAGs(listing_filter_dag->clone(), filter_actions_dag->clone()));
+    }
+
     VirtualColumnUtils::buildSetsForDAGExcludingGlobalIn(*listing_filter_dag, getContext());
 }
 
