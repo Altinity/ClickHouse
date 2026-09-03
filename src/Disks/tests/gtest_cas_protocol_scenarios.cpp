@@ -67,7 +67,7 @@ Etag currentIncarnation(Backend & b, const String & key)
     const std::optional<Meta> meta = (*operation).head(key, Retry::standard());
     if (!meta)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "object {} is absent", key);
-    return meta->incarnation;
+    return meta->etag;
 }
 
 /// An exact-incarnation delete attempt, for the scenarios whose discriminator is that a displaced

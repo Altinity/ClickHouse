@@ -120,7 +120,7 @@ void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
     m.gc_fenced = true;
     m.seq += 1;
     ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(
-        (*op).replace(mount_key, DB::Cas::encodeMountLease(m), got->incarnation, DB::Cas::Retry::standard())));
+        (*op).replace(mount_key, DB::Cas::encodeMountLease(m), got->etag, DB::Cas::Retry::standard())));
 }
 
 }

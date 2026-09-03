@@ -92,7 +92,7 @@ TEST(CASGCRoundDefer, GraduationDueFailsClosedWhenSealMissing)
     const String seal_key = layout.foldSealKey(state.snap_generation, state.snap_attempt);
     const auto h = (*raw_op).head(seal_key, Retry::once());
     ASSERT_TRUE(h.has_value());
-    ASSERT_EQ((*raw_op).remove(seal_key, h->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_EQ((*raw_op).remove(seal_key, h->etag, Retry::once()), Removal::Removed);
 
     Gc gc(store, kGc);
     EXPECT_TRUE(gc.graduationDueForTest(state, /*current_round=*/5))

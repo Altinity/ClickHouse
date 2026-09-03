@@ -250,7 +250,7 @@ TEST(CASRefReadContract, StaleLifeDropRefusesAfterRebirthAndNeverTouchesSuccesso
 
     const auto catalog_head_after = (*catalog_probe).head(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_head_after.has_value());
-    EXPECT_EQ(catalog_head_after->incarnation, catalog_head_before->incarnation)
+    EXPECT_EQ(catalog_head_after->etag, catalog_head_before->etag)
         << "a refused stale-life drop must not touch the catalog object at all";
     const auto catalog_get_after = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_get_after.has_value());

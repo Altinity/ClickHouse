@@ -95,7 +95,7 @@ TEST(CASGCShardIncarnation, DiscoveryEqualsPresentShards)
             const auto h = op.head(layout.refCatalogKey(), Retry::once());
             ASSERT_TRUE(h.has_value());
             ASSERT_TRUE(std::holds_alternative<Committed>(
-                op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->incarnation, Retry::once())));
+                op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->etag, Retry::once())));
         }
 
         const auto universe = gc.discoverUniverseForTest();
@@ -143,7 +143,7 @@ TEST(CASGCShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
     const auto empty_catalog = (*op).read(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(empty_catalog);
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*op).replace(layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->incarnation, Retry::once())));
+        (*op).replace(layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->etag, Retry::once())));
     backend->resetCounts();
 
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
@@ -186,7 +186,7 @@ TEST(CASGCShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
         const auto h = op.head(layout.refCatalogKey(), Retry::once());
         ASSERT_TRUE(h.has_value());
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->incarnation, Retry::once())));
+            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->etag, Retry::once())));
     }
 
     const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(22));
@@ -243,7 +243,7 @@ TEST(CASGCShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
         const auto h = op.head(layout.refCatalogKey(), Retry::once());
         ASSERT_TRUE(h.has_value());
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->incarnation, Retry::once())));
+            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->etag, Retry::once())));
     }
 
     /// The successor's own genesis `_ckpt`, published for the current physical life. Hiding it from
@@ -308,7 +308,7 @@ TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
         const auto h = op.head(layout.refCatalogKey(), Retry::once());
         ASSERT_TRUE(h.has_value());
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->incarnation, Retry::once())));
+            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), h->etag, Retry::once())));
     }
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
@@ -485,7 +485,7 @@ TEST(CASGCShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         const String b1_key = store->layout().blobKey(b1_ref);
         const std::optional<Meta> b1_observed = op.head(b1_key, Retry::once());
         ASSERT_TRUE(b1_observed) << "b1 body must be present after the seed putBlob";
-        const PersistedEtag b1_token = PersistedEtag::capture(b1_observed->incarnation);
+        const PersistedEtag b1_token = PersistedEtag::capture(b1_observed->etag);
 
         /// --- Phase 2: Inject gc/state at round 1 with b1 CONDEMNED (body still present). ---
         /// This simulates GC having advanced to round 1 and retired b1 (condemned token recorded
@@ -538,7 +538,7 @@ TEST(CASGCShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         /// The condemned token is bound UNCHANGED — no displacement happens (and none is needed).
         const std::optional<Meta> b1_after = op.head(b1_key, Retry::once());
         ASSERT_TRUE(b1_after);
-        EXPECT_TRUE(b1_token.matches(b1_after->incarnation))
+        EXPECT_TRUE(b1_token.matches(b1_after->etag))
             << "gc_shards=" << gc_shards << ": no copy-forward under the Phase-A contract — the "
                "incarnation stays; the folded edge will spare it at the next fold (no round runs "
                "here to delete it)";

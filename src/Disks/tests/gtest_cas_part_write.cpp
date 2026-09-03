@@ -451,7 +451,7 @@ TEST(CASPartWriteTxn, PutBlobDedupSecondWriterAdopts)
     OperationForTest op(*b);
     const auto head_a = (*op).head(s->layout().blobKey(ref_a.ref), Retry::once());
     ASSERT_TRUE(head_a.has_value());
-    const Etag token_a = head_a->incarnation;
+    const Etag token_a = head_a->etag;
 
     /// Second writer ADOPTS — the adopt must happen under a durable precommit edge (EDGE-BEFORE-OBSERVE:
     /// stageManifest -> precommitAdd -> putBlob), so give build_b the wiring order.
@@ -465,7 +465,7 @@ TEST(CASPartWriteTxn, PutBlobDedupSecondWriterAdopts)
     /// A's incarnation survives — the second writer adopts, nothing was overwritten.
     const auto head_a_after = (*op).head(s->layout().blobKey(ref_a.ref), Retry::once());
     ASSERT_TRUE(head_a_after.has_value());
-    EXPECT_EQ(head_a_after->incarnation, token_a);
+    EXPECT_EQ(head_a_after->etag, token_a);
 }
 
 /// Task 3 (spec §meta-protocols v3): the writer's dedup gate no longer consults the RetireView for the
@@ -573,7 +573,7 @@ TEST(CASPartWriteTxn, PutBlobAdoptsWhenMetaCleanNoRetireView)
     OperationForTest op(*b);
     const auto head0 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head0.has_value());
-    const Etag t0 = head0->incarnation;
+    const Etag t0 = head0->etag;
 
     /// Adopt must happen under a durable precommit edge (EDGE-BEFORE-OBSERVE), mirroring
     /// PutBlobDedupSecondWriterAdopts above.
@@ -587,7 +587,7 @@ TEST(CASPartWriteTxn, PutBlobAdoptsWhenMetaCleanNoRetireView)
     /// Adopted: the pre-seeded incarnation survives untouched — no putOverwrite/re-upload happened.
     const auto head1 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head1.has_value());
-    EXPECT_EQ(head1->incarnation, t0);
+    EXPECT_EQ(head1->etag, t0);
 
     const auto lm = loadMetaForTest(*b, s->layout(), hash);
     ASSERT_TRUE(lm.has_value());
@@ -649,7 +649,7 @@ TEST(CASPartWriteTxn, PutBlobRepublishesWhenMetaCondemned)
     OperationForTest op(*b);
     const auto head0 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head0.has_value());
-    const Etag t0 = head0->incarnation;
+    const Etag t0 = head0->etag;
 
     /// No retire-view seeding: the replacement is decided from the metadata point-read.
     auto build = precommittedBuildForPayload(
@@ -660,7 +660,7 @@ TEST(CASPartWriteTxn, PutBlobRepublishesWhenMetaCondemned)
     /// Resurrected: the condemned incarnation was displaced by a fresh one.
     const auto hr = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_NE(hr->incarnation, t0) << "a condemned incarnation must be displaced by a fresh publication";
+    EXPECT_NE(hr->etag, t0) << "a condemned incarnation must be displaced by a fresh publication";
     EXPECT_EQ((*op).remove(blob_key, t0, Retry::once()), Removal::Mismatch)
         << "the condemned token must never return (INV-NO-RETURN)";
 
@@ -814,7 +814,7 @@ TEST(CASPartWriteTxn, PutBlobRepublishesVanishedBodyFromHeldSource)
         OperationForTest op(*b);
         const auto head = (*op).head(s0->layout().blobKey(id), Retry::once());
         ASSERT_TRUE(head.has_value());
-        t0 = head->incarnation;
+        t0 = head->etag;
         build0->abandon();
     }
 
@@ -849,7 +849,7 @@ TEST(CASPartWriteTxn, PutBlobRepublishesVanishedBodyFromHeldSource)
     OperationForTest op(*b);
     const auto hr = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_NE(hr->incarnation, *t0);
+    EXPECT_NE(hr->etag, *t0);
 
     auto raw = (*op).read(blob_key, Retry::once());
     ASSERT_TRUE(raw.has_value());
@@ -1004,8 +1004,8 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         const String seed_key = s0->layout().blobKey(id);
         const auto seeded = op0.head(seed_key, Retry::standard());
         ASSERT_TRUE(seeded.has_value());
-        t0 = PersistedEtag::capture(seeded->incarnation);
-        ASSERT_EQ(op0.remove(seed_key, seeded->incarnation, Retry::standard()), Removal::Removed);
+        t0 = PersistedEtag::capture(seeded->etag);
+        ASSERT_EQ(op0.remove(seed_key, seeded->etag, Retry::standard()), Removal::Removed);
         build0->abandon();
     }
 
@@ -1038,7 +1038,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     CasOperation probe_op = probe.admit();
     const auto after = probe_op.head(blob_key, Retry::standard());
     ASSERT_TRUE(after.has_value());
-    EXPECT_FALSE(t0.matches(after->incarnation)) << "a fresh publication must have a fresh incarnation";
+    EXPECT_FALSE(t0.matches(after->etag)) << "a fresh publication must have a fresh incarnation";
     const auto raw = probe_op.read(blob_key, Retry::standard());
     ASSERT_TRUE(raw.has_value());
     const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
@@ -1094,7 +1094,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
         OperationForTest seed_op(*b);
         const auto head0 = (*seed_op).head(s0->layout().blobKey(id), Retry::once());
         ASSERT_TRUE(head0.has_value());
-        t0 = head0->incarnation;
+        t0 = head0->etag;
         build0->abandon();
     }
 
@@ -1122,7 +1122,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     OperationForTest raw_op(*b);
     const auto hr = (*raw_op).head(blob_key, Retry::once());
     ASSERT_TRUE(hr.has_value());
-    EXPECT_NE(hr->incarnation, *t0) << "condemned incarnation must be displaced by a fresh token";
+    EXPECT_NE(hr->etag, *t0) << "condemned incarnation must be displaced by a fresh token";
     const auto raw = (*raw_op).read(blob_key, Retry::once());
     ASSERT_TRUE(raw.has_value());
     const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
@@ -1258,7 +1258,7 @@ TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
     OperationForTest op(*b);
     const auto head0 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head0.has_value());
-    const Etag t0 = head0->incarnation;
+    const Etag t0 = head0->etag;
 
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-RACE");
@@ -1334,7 +1334,7 @@ TEST(CASPartWriteTxn, MissingDependencyProofFailsClosed)
     OperationForTest op(*b);
     const auto head0 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head0.has_value());
-    const Etag t0 = head0->incarnation;
+    const Etag t0 = head0->etag;
 
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-NODEP");
@@ -1356,7 +1356,7 @@ TEST(CASPartWriteTxn, MissingDependencyProofFailsClosed)
     /// The pool blob was never touched (no probe, no displacement).
     const auto head1 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(head1.has_value());
-    EXPECT_EQ(head1->incarnation, t0);
+    EXPECT_EQ(head1->etag, t0);
 }
 
 TEST(CASPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
@@ -1556,7 +1556,7 @@ TEST(CASPartWriteTxn, PublishIntoSecondNamespaceSameBlob)
     OperationForTest op(*b);
     const auto blob_head0 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(blob_head0.has_value());
-    const Etag blob_token = blob_head0->incarnation;
+    const Etag blob_token = blob_head0->etag;
     build1->promote(ns1, "part_1", build1->buildId(), id1);
 
     /// Second build publishes part_1 in ns2 referencing the SAME blob: putBlob dedup-hits and ADOPTS the
@@ -1578,7 +1578,7 @@ TEST(CASPartWriteTxn, PublishIntoSecondNamespaceSameBlob)
     /// The blob object was uploaded once: its token is unchanged after both publishes.
     const auto blob_head1 = (*op).head(blob_key, Retry::once());
     ASSERT_TRUE(blob_head1.has_value());
-    EXPECT_EQ(blob_head1->incarnation, blob_token);
+    EXPECT_EQ(blob_head1->etag, blob_token);
 }
 
 /// Task 10: refs are no longer sharded (one whole-table cache per namespace, spec §Table State), so
@@ -1755,7 +1755,7 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
         CasOperation op0 = s0->mountRequests().admit();
         const auto seeded = op0.head(s0->layout().blobKey(h), Retry::standard());
         ASSERT_TRUE(seeded.has_value());
-        h_token0 = PersistedEtag::capture(seeded->incarnation);
+        h_token0 = PersistedEtag::capture(seeded->etag);
         s0->dropRef(ns, "part_1");
     }
 
@@ -1790,7 +1790,7 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
     CasOperation reupload_op = s->mountRequests().admit();
     const auto after_reupload = reupload_op.head(blob_key, Retry::standard());
     ASSERT_TRUE(after_reupload.has_value());
-    EXPECT_FALSE(h_token0.matches(after_reupload->incarnation));   /// a genuinely fresh incarnation
+    EXPECT_FALSE(h_token0.matches(after_reupload->etag));   /// a genuinely fresh incarnation
 
     /// 4. THE ADVERSARIAL LOOP. A real, productive GC keeps trying to reclaim. It reclaims the now-
     ///    unreferenced part_1 manifest (build A's, UNprotected) but H stays pinned by B's PRECOMMIT edge
@@ -2180,7 +2180,7 @@ TEST(CASPartWriteTxn, AbandonRetryableAfterAppendFailure)
     OperationForTest op(*b);
     for (String cursor;;)
     {
-        const KeyPage page = (*op).list(b->corrupt_key_substr, cursor, 1000, Retry::once());
+        const ListPage page = (*op).list(b->corrupt_key_substr, cursor, 1000, Retry::once());
         for (const auto & listed : page.keys)
         {
             if (listed.key > greatest_key)
@@ -2511,7 +2511,7 @@ TEST(CASPartWriteTxnStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedW
     CasOperation probe_op = probe.admit();
     const auto landed = probe_op.head(key, Retry::standard());
     ASSERT_TRUE(landed.has_value());
-    EXPECT_EQ(ev->token, landed->incarnation.render())
+    EXPECT_EQ(ev->token, landed->etag.render())
         << "the audit token must be the landed incarnation, rendered";
 }
 
@@ -2728,7 +2728,7 @@ TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
     CasOperation probe_op = probe.admit();
     const auto landed = probe_op.head(key, Retry::standard());
     ASSERT_TRUE(landed.has_value());
-    EXPECT_EQ(adopt->token, landed->incarnation.render())
+    EXPECT_EQ(adopt->token, landed->etag.render())
         << "the adopted token must be the landed incarnation, rendered";
     EXPECT_EQ(std::count_if(events.begin(), events.end(),
                             [](const CasEvent & e) { return e.type == CasEventType::BlobPut; }), 0)

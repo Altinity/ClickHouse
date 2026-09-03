@@ -148,7 +148,7 @@ TEST(CASInMemory, PutIfAbsentAndGet)
 
     const WriteResult put = op.create("k", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(put));
-    const Etag t1 = std::get<Committed>(put).incarnation;
+    const Etag t1 = std::get<Committed>(put).etag;
 
     const WriteResult clobber = op.create("k", "clobber", Retry::once());
     EXPECT_TRUE(std::holds_alternative<Conflict>(clobber));
@@ -156,7 +156,7 @@ TEST(CASInMemory, PutIfAbsentAndGet)
     auto g = op.read("k", Retry::once());
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "v1");
-    EXPECT_EQ(g->incarnation, t1);
+    EXPECT_EQ(g->etag, t1);
     EXPECT_FALSE(op.read("absent", Retry::once()).has_value());
 }
 
@@ -166,17 +166,17 @@ TEST(CASInMemory, OverwriteIsTokenExactAndMintsFreshToken)
     CasRequests requests = openRequestsForTest(b);
     CasOperation op = requests.admit();
 
-    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).etag;
     /// A stale precondition for the SAME key: an Etag is bound to the key it was minted for, so a
     /// cross-key Etag is a caller bug (LOGICAL_ERROR), not "the wrong token" any more -- a stale
     /// same-key incarnation is the real-world shape a precondition mismatch has to cover instead.
-    const Etag t2 = std::get<Committed>(op.replace("k", "v1.5", t1, Retry::once())).incarnation;
+    const Etag t2 = std::get<Committed>(op.replace("k", "v1.5", t1, Retry::once())).etag;
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("k", "v2", t1, Retry::once())));
     expectBytes(b, "k", "v1.5");                              // untouched on mismatch
 
     const WriteResult overwrite = op.replace("k", "v2", t2, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(overwrite));
-    EXPECT_NE(std::get<Committed>(overwrite).incarnation, t2);   // tokens never repeat
+    EXPECT_NE(std::get<Committed>(overwrite).etag, t2);   // tokens never repeat
     expectBytes(b, "k", "v2");
 }
 
@@ -188,12 +188,12 @@ TEST(CASInMemory, CasPutCreateAndSwap)
 
     const WriteResult create = op.create("m", "s1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(create));                     // create-if-absent
-    const Etag t1 = std::get<Committed>(create).incarnation;
+    const Etag t1 = std::get<Committed>(create).etag;
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("m", "s1x", Retry::once())));   // exists now
 
     /// A stale, same-key precondition -- see OverwriteIsTokenExactAndMintsFreshToken for why a
     /// cross-key Etag can no longer stand in for "the wrong token".
-    const Etag t2 = std::get<Committed>(op.replace("m", "s1.5", t1, Retry::once())).incarnation;
+    const Etag t2 = std::get<Committed>(op.replace("m", "s1.5", t1, Retry::once())).etag;
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("m", "s2", t1, Retry::once())));
     EXPECT_EQ(op.read("m", Retry::once())->bytes, "s1.5");
     EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("m", "s2", t2, Retry::once())));
@@ -206,8 +206,8 @@ TEST(CASInMemory, DeleteExactEnforced)
     CasRequests requests = openRequestsForTest(b);
     CasOperation op = requests.admit();
 
-    const Etag t0 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
-    const Etag t1 = std::get<Committed>(op.replace("k", "v1b", t0, Retry::once())).incarnation;
+    const Etag t0 = std::get<Committed>(op.create("k", "v1", Retry::once())).etag;
+    const Etag t1 = std::get<Committed>(op.replace("k", "v1b", t0, Retry::once())).etag;
     /// t0 is now stale for this SAME key -- see OverwriteIsTokenExactAndMintsFreshToken for why a
     /// cross-key Etag can no longer stand in for "the wrong token".
     EXPECT_EQ(op.remove("k", t0, Retry::once()), Removal::Mismatch);
@@ -383,7 +383,7 @@ TEST(CASInMemoryFaults, HeldDeleteLandsLater)
     InMemoryBackend b;
     CasRequests requests = openRequestsForTest(b);
     CasOperation op = requests.admit();
-    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).etag;
     b.setHoldDeletes(true);
     EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Removed);   // message "sent", not landed
     EXPECT_TRUE(op.read("k", Retry::once()).has_value());             // ... but nothing landed yet
@@ -400,7 +400,7 @@ TEST(CASInMemoryFaults, InjectedCasConflictFiresOnce)
     InMemoryBackend b;
     CasRequests requests = openRequestsForTest(b);
     CasOperation op = requests.admit();
-    const Etag t1 = std::get<Committed>(op.create("m", "s1", Retry::once())).incarnation;
+    const Etag t1 = std::get<Committed>(op.create("m", "s1", Retry::once())).etag;
     b.refuseNextWrite("m");
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("m", "s2", t1, Retry::once())));   // injected
     EXPECT_EQ(op.read("m", Retry::once())->bytes, "s1");
@@ -413,7 +413,7 @@ TEST(CASInMemoryFaults, NonEnforcingModeMimicsBadBackend)
     CasRequests requests = openRequestsForTest(b);
     CasOperation op = requests.admit();
     b.setEnforceTokens(false);                        // MinIO-OSS-shaped backend
-    const Etag t0 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    const Etag t0 = std::get<Committed>(op.create("k", "v1", Retry::once())).etag;
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace("k", "v2", t0, Retry::once())));   // mints a later incarnation
     EXPECT_EQ(op.remove("k", t0, Retry::once()), Removal::Removed);   // stale-but-same-key precondition silently deletes anyway — the dangerous behavior
     EXPECT_FALSE(op.read("k", Retry::once()).has_value());
@@ -425,7 +425,7 @@ TEST(CASInMemoryFaults, VersioningMarkerMode)
     b.setSimulateDeleteMarkers(true);
     CasRequests requests = openRequestsForTest(b);
     CasOperation op = requests.admit();
-    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).etag;
     /// A removal that only archives (never reclaims) is not an ordinary Removed: the engine reports it
     /// as CAS_DELETE_MARKER so the capability probe can reject a versioned pool.
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_DELETE_MARKER, [&] { op.remove("k", t1, Retry::once()); });
@@ -687,16 +687,16 @@ TEST(CASCountingBackendShape, OneRequestIsCountedOnceWhicheverSurfaceIssuedIt)
     EXPECT_TRUE(op.read("k", Retry::standard()));
     EXPECT_EQ(backend->getCount("k"), 2u);
 
-    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("k", "w", k_meta->incarnation, Retry::standard())));
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("k", "w", k_meta->etag, Retry::standard())));
     EXPECT_EQ(backend->putOverwriteCount("k"), 1u) << "a write with a precondition is the replace shape";
     EXPECT_EQ(backend->writeCount("k"), 2u);
 
     const std::optional<Meta> k2_meta = op.head("k2", Retry::standard());
     ASSERT_TRUE(k2_meta);
-    EXPECT_EQ(op.remove("k2", k2_meta->incarnation, Retry::standard()), Removal::Removed);
+    EXPECT_EQ(op.remove("k2", k2_meta->etag, Retry::standard()), Removal::Removed);
     const std::optional<Meta> k_meta_after = op.head("k", Retry::standard());
     ASSERT_TRUE(k_meta_after);
-    EXPECT_EQ(op.remove("k", k_meta_after->incarnation, Retry::standard()), Removal::Removed);
+    EXPECT_EQ(op.remove("k", k_meta_after->etag, Retry::standard()), Removal::Removed);
     EXPECT_EQ(backend->deleteCount("k"), 1u);
     EXPECT_EQ(backend->deleteCount("k2"), 1u);
     EXPECT_EQ(backend->deleteTotal(), 2u);
@@ -954,7 +954,7 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedWriteFailurePreservesDestinatio
         DB::writeString(String("old-complete-body"), *out);
         out->finalize();
     }
-    const Etag old_token = op.head(key, Retry::once())->incarnation;
+    const Etag old_token = op.head(key, Retry::once())->etag;
 
     storage->throw_after_open = true;
     EXPECT_THROW(
@@ -965,7 +965,7 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedWriteFailurePreservesDestinatio
     EXPECT_NE(storage->last_opened_key, physical_key);
     EXPECT_FALSE(storage->exists(DB::StoredObject(storage->last_opened_key)));
     EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
-    EXPECT_EQ(op.head(key, Retry::once())->incarnation, old_token);
+    EXPECT_EQ(op.head(key, Retry::once())->etag, old_token);
 }
 
 TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBeforeVisibility)
@@ -1323,7 +1323,7 @@ TEST(CASObjectStorageBackendDeathTest, EmuTokenSurvivesProcessRestartAcrossRecre
     ASSERT_TRUE(std::holds_alternative<Committed>(op1.create("k/other", "junk", Retry::once())));
     const WriteResult restart_create = op1.create("k/restart", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(restart_create));
-    const Etag stale_token = std::get<Committed>(restart_create).incarnation;
+    const Etag stale_token = std::get<Committed>(restart_create).etag;
 
     auto backend2 = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
     CasRequests requests2 = openRequestsForTest(backend2);
@@ -1331,7 +1331,7 @@ TEST(CASObjectStorageBackendDeathTest, EmuTokenSurvivesProcessRestartAcrossRecre
 
     const auto current = op2.head("k/restart", Retry::once());
     ASSERT_TRUE(current.has_value());
-    ASSERT_EQ(op2.remove("k/restart", current->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_EQ(op2.remove("k/restart", current->etag, Retry::once()), Removal::Removed);
     ASSERT_TRUE(std::holds_alternative<Committed>(op2.create("k/restart", "v2-after-restart", Retry::once())));
 
     /// See EmuTokenSurvivesProcessRestartAcrossRecreate above for the property under test; a
@@ -1359,12 +1359,12 @@ TEST(CASObjectStorageBackend, EmulatedListTokenMatchesHeadToken)
 
     const auto head = op.head("k/listed", Retry::once());
     ASSERT_TRUE(head.has_value());
-    ASSERT_EQ(head->incarnation.dialect(), Dialect::Emulated);
+    ASSERT_EQ(head->etag.dialect(), Dialect::Emulated);
 
-    const KeyPage page = op.list("k/", "", /*limit=*/10, Retry::once());
+    const ListPage page = op.list("k/", "", /*limit=*/10, Retry::once());
     ASSERT_EQ(page.keys.size(), 1u);
-    ASSERT_TRUE(page.keys.front().incarnation.has_value());
-    EXPECT_EQ(*page.keys.front().incarnation, head->incarnation);
+    ASSERT_TRUE(page.keys.front().etag.has_value());
+    EXPECT_EQ(*page.keys.front().etag, head->etag);
 }
 
 namespace
@@ -1416,10 +1416,10 @@ TEST(CASObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
 
     const WriteResult put1 = op.create("k/tick", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(put1));
-    const Etag inc1 = std::get<Committed>(put1).incarnation;
+    const Etag inc1 = std::get<Committed>(put1).etag;
     const WriteResult put2 = op.replace("k/tick", "v2", inc1, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(put2));
-    const Etag inc2 = std::get<Committed>(put2).incarnation;
+    const Etag inc2 = std::get<Committed>(put2).etag;
 
     EXPECT_NE(inc1, inc2);
     EXPECT_EQ(inc1.dialect(), Dialect::Emulated);
@@ -1440,20 +1440,20 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedDisambiguatesSameEtagFromStaleD
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, "old-complete-body", Retry::once())));
     const auto stale = op.head(key, Retry::once());
     ASSERT_TRUE(stale.has_value());
-    const Etag stale_token = stale->incarnation;
+    const Etag stale_token = stale->etag;
 
     op.publish(streamingPublication(key, "fresh-envelope", "payload", 7), Retry::once());
 
     const auto published = op.head(key, Retry::once());
     ASSERT_TRUE(published.has_value());
-    EXPECT_NE(published->incarnation, stale_token);
-    EXPECT_EQ(published->incarnation.dialect(), Dialect::Emulated);
+    EXPECT_NE(published->etag, stale_token);
+    EXPECT_EQ(published->etag.dialect(), Dialect::Emulated);
     EXPECT_EQ(op.remove(key, stale_token, Retry::once()), Removal::Mismatch);
 
     const auto live = op.read(key, Retry::once());
     ASSERT_TRUE(live.has_value());
     EXPECT_EQ(live->bytes, "fresh-envelopepayload");
-    EXPECT_EQ(live->incarnation, published->incarnation);
+    EXPECT_EQ(live->etag, published->etag);
 }
 
 namespace
@@ -1551,12 +1551,12 @@ TEST(CASObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfor
 
         const WriteResult put1 = op.create("k/old", "v1", Retry::once());
         ASSERT_TRUE(std::holds_alternative<Committed>(put1));
-        ASSERT_EQ(PersistedEtag::capture(std::get<Committed>(put1).incarnation).value, old_etag);
-        ASSERT_EQ(op.remove("k/old", std::get<Committed>(put1).incarnation, Retry::once()), Removal::Removed);
+        ASSERT_EQ(PersistedEtag::capture(std::get<Committed>(put1).etag).value, old_etag);
+        ASSERT_EQ(op.remove("k/old", std::get<Committed>(put1).etag, Retry::once()), Removal::Removed);
 
         const WriteResult put2 = op.create("k/old", "v2", Retry::once());
         ASSERT_TRUE(std::holds_alternative<Committed>(put2));
-        EXPECT_EQ(PersistedEtag::capture(std::get<Committed>(put2).incarnation).value, old_etag)
+        EXPECT_EQ(PersistedEtag::capture(std::get<Committed>(put2).etag).value, old_etag)
             << "entry should have been erased on delete (etag comfortably old), "
                "so the recreate mints the bare etag, not a disambiguated one";
     }
@@ -1573,12 +1573,12 @@ TEST(CASObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfor
 
         const WriteResult put1 = op.create("k/fresh", "v1", Retry::once());
         ASSERT_TRUE(std::holds_alternative<Committed>(put1));
-        ASSERT_EQ(PersistedEtag::capture(std::get<Committed>(put1).incarnation).value, recent_etag);
-        ASSERT_EQ(op.remove("k/fresh", std::get<Committed>(put1).incarnation, Retry::once()), Removal::Removed);
+        ASSERT_EQ(PersistedEtag::capture(std::get<Committed>(put1).etag).value, recent_etag);
+        ASSERT_EQ(op.remove("k/fresh", std::get<Committed>(put1).etag, Retry::once()), Removal::Removed);
 
         const WriteResult put2 = op.create("k/fresh", "v2", Retry::once());
         ASSERT_TRUE(std::holds_alternative<Committed>(put2));
-        EXPECT_EQ(PersistedEtag::capture(std::get<Committed>(put2).incarnation).value, recent_etag + "#1")
+        EXPECT_EQ(PersistedEtag::capture(std::get<Committed>(put2).etag).value, recent_etag + "#1")
             << "entry should have been RETAINED on delete (etag recent), "
                "so the recreate is disambiguated against it";
     }
@@ -1605,7 +1605,7 @@ TEST(CASObjectStorageBackend, EmuTokenStateEventuallyPrunesDistinctShortLivedKey
         const String key = "k/short-lived-" + std::to_string(i);
         const WriteResult put = op.create(key, "body", Retry::once());
         ASSERT_TRUE(std::holds_alternative<Committed>(put));
-        ASSERT_EQ(op.remove(key, std::get<Committed>(put).incarnation, Retry::once()), Removal::Removed);
+        ASSERT_EQ(op.remove(key, std::get<Committed>(put).etag, Retry::once()), Removal::Removed);
     }
 
     const uint64_t sweep_ns = start_ns + key_count * step_ns + 2'000'000'000ULL;
@@ -1613,7 +1613,7 @@ TEST(CASObjectStorageBackend, EmuTokenStateEventuallyPrunesDistinctShortLivedKey
     backend->setEmuNowNsForTest(sweep_ns);
     const WriteResult trigger = op.create("k/sweep-trigger", "body", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(trigger));
-    ASSERT_EQ(op.remove("k/sweep-trigger", std::get<Committed>(trigger).incarnation, Retry::once()), Removal::Removed);
+    ASSERT_EQ(op.remove("k/sweep-trigger", std::get<Committed>(trigger).etag, Retry::once()), Removal::Removed);
 
     EXPECT_LE(backend->emuTokenStateSizeForTest(), expected_recent_key_bound)
         << "token state should track only the bounded recent-key window, not all " << key_count << " deleted keys";

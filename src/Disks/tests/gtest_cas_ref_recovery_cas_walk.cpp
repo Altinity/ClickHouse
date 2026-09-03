@@ -121,7 +121,7 @@ void fenceOutMountForRemount(Backend & backend, const String & mount_key)
     mount.gc_fenced = true;
     mount.seq += 1;
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*op).replace(mount_key, encodeMountLease(mount), got->incarnation, Retry::once())));
+        (*op).replace(mount_key, encodeMountLease(mount), got->etag, Retry::once())));
 }
 
 /// The durable object at `key`, or `nullopt`.
@@ -518,9 +518,9 @@ CatalogEntry replaceCatalogLifeForTest(
     {
         return entry.ns == predecessor.ns && entry.incarnation == predecessor.incarnation;
     });
-    if (!before_delete.incarnation
+    if (!before_delete.etag
         || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(without_predecessor),
-                           *before_delete.incarnation))
+                           *before_delete.etag))
         throw std::runtime_error("test failed to retire exact predecessor catalog life");
 
     CatalogEntry successor{
@@ -531,8 +531,8 @@ CatalogEntry replaceCatalogLifeForTest(
     const CasRefCatalog::Snapshot after_delete = readCatalogForTest(backend, layout);
     RefCatalog reborn = after_delete.catalog;
     reborn.entries.push_back(successor);
-    if (!after_delete.incarnation
-        || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(reborn), *after_delete.incarnation))
+    if (!after_delete.etag
+        || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(reborn), *after_delete.etag))
         throw std::runtime_error("test failed to publish successor catalog life");
     return successor;
 }
@@ -646,7 +646,7 @@ TEST(CASRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
 
     const auto ckpt_after = readCkptForTest(backend, layout, life);
     ASSERT_TRUE(ckpt_after);
-    EXPECT_EQ(ckpt_after->incarnation, ckpt_before->incarnation)
+    EXPECT_EQ(ckpt_after->etag, ckpt_before->etag)
         << "an unchanged checkpoint makes the missing committed id corruption, not a shorter stream";
 }
 
@@ -710,8 +710,8 @@ TEST(CASRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
         String cursor;
         do
         {
-            const KeyPage page = seed_op.list("", cursor, 1000, Retry::standard());
-            for (const KeyEntry & listed : page.keys)
+            const ListPage page = seed_op.list("", cursor, 1000, Retry::standard());
+            for (const ListedKey & listed : page.keys)
             {
                 const auto object = seed_op.read(listed.key, Retry::standard());
                 if (!object)
@@ -826,8 +826,8 @@ TEST(CASRefRecoveryCasWalk, DuplicateCatalogLifeIsCorruptionBeforeColdRuntimeAdm
         .incarnation = life.incarnation});
     std::sort(ambiguous.entries.begin(), ambiguous.entries.end(),
         [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
-    ASSERT_TRUE(sampled.incarnation);
-    ASSERT_TRUE(replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(ambiguous), *sampled.incarnation));
+    ASSERT_TRUE(sampled.etag);
+    ASSERT_TRUE(replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(ambiguous), *sampled.etag));
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
@@ -855,7 +855,7 @@ TEST(CASRefRecoveryCasWalk, CheckpointAdvanceAfterLastLogProbeRestartsBeforeInst
         ASSERT_TRUE(sampled);
         RefCkpt advanced = sampled->ckpt;
         advanced.committed_through = concurrent_frontier;
-        ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life), encodeRefCkpt(advanced), sampled->incarnation));
+        ASSERT_TRUE(replaceForTest(backend, layout.refCkptKey(life), encodeRefCkpt(advanced), sampled->etag));
     };
 
     auto store = openWalkPool(backend);
@@ -1327,7 +1327,7 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
         << "no predecessor checkpoint CAS may be sent after exact retirement";
     const auto predecessor_ckpt_after = readAt(*backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after);
-    EXPECT_EQ(predecessor_ckpt_after->incarnation, predecessor_ckpt_before->incarnation);
+    EXPECT_EQ(predecessor_ckpt_after->etag, predecessor_ckpt_before->etag);
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "the detached predecessor result was installed";
     EXPECT_EQ(store->recoveryInstallCountForTest(), recovery_installs_before)
         << "the detached predecessor reached the recovery publication point";
@@ -1337,7 +1337,7 @@ TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
             << "predecessor recovery retargeted storage I/O into successor key " << key;
     const auto successor_ckpt_after = readAt(*backend, layout.refCkptKey(successor_life));
     ASSERT_TRUE(successor_ckpt_after);
-    EXPECT_EQ(successor_ckpt_after->incarnation, successor_ckpt_before->incarnation);
+    EXPECT_EQ(successor_ckpt_after->etag, successor_ckpt_before->etag);
     EXPECT_EQ(successor_ckpt_after->bytes, successor_ckpt_before->bytes);
 }
 
@@ -1370,7 +1370,7 @@ TEST(CASRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoChe
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->ckpt.last_epoch_seal, std::nullopt)
         << "the seal is durable but the checkpoint must not record it under a generation that moved";
-    EXPECT_EQ(ckpt_after->incarnation, ckpt_before->incarnation) << "no CAS was sent at all";
+    EXPECT_EQ(ckpt_after->etag, ckpt_before->etag) << "no CAS was sent at all";
 }
 
 /// Bump point 2: AFTER the `_ckpt` CAS, BEFORE the install. The checkpoint advance is harmless (the
@@ -1790,7 +1790,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPriv
         ASSERT_TRUE(current);
         /// `expected` is the raw transport value the publisher is presenting; `PersistedEtag::capture`
         /// re-derives the same raw value from the minted incarnation, so the two compare.
-        ASSERT_EQ(PersistedEtag::capture(current->incarnation).value, *expected);
+        ASSERT_EQ(PersistedEtag::capture(current->etag).value, *expected);
         const RefCkpt advanced = mergeCkpt(
             decodeRefCkpt(current->bytes),
             RefCkpt{.life_epoch = std::nullopt,
@@ -1798,7 +1798,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPriv
                     .checkpoint_snapshot_id = std::nullopt,
                     .last_epoch_seal = std::nullopt});
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*op).replace(key, encodeRefCkpt(advanced), current->incarnation, Retry::once())));
+            (*op).replace(key, encodeRefCkpt(advanced), current->etag, Retry::once())));
     };
 
     const auto refs = store->listRefs(ns);
@@ -1871,7 +1871,7 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheReta
         OperationForTest op(*backend);
         ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(successor_key,
             sealObject(FormatId::RefLog, encodeRefLogTxn(different)),
-            original->incarnation, Retry::once())));
+            original->etag, Retry::once())));
     }
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
@@ -1897,7 +1897,7 @@ TEST(CASRefRecoveryCasWalk, RetainedOldWriterAttemptLosesConclusiveToASuccessorS
         OperationForTest op(*backend);
         ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(successor_key,
             sealObject(FormatId::RefLog, encodeRefLogTxn(successor_seal)),
-            original->incarnation, Retry::once())));
+            original->etag, Retry::once())));
     }
 
     const auto refs = store->listRefs(ns);
@@ -2150,7 +2150,7 @@ TEST(CASRefRecoveryCasWalk, PutHookBackendComposesHidingListBackendCasPutFaultIn
     backend->on_key = [&] { on_key_fired = true; };
 
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*op).replace("p/probe", "x", std::get<Committed>(seeded).incarnation, Retry::once())));
+        (*op).replace("p/probe", "x", std::get<Committed>(seeded).etag, Retry::once())));
 
     EXPECT_TRUE(before_cas_put_fired)
         << "HidingListBackend's before_cas_put hook must still fire for a PutHookBackend instance";

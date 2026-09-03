@@ -356,7 +356,7 @@ TEST(CASRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTh
         st.snap_generation = 0;
         OperationForTest op(*backend);
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*op).replace(layout.gcStateKey(), encodeGcState(st), got->incarnation, Retry::standard())));
+            (*op).replace(layout.gcStateKey(), encodeGcState(st), got->etag, Retry::standard())));
     }
 
     /// Hand-built, and planted AFTER the round so the round itself is clean: one segment too deep under
@@ -401,7 +401,7 @@ TEST(CASRebuildCondemnNothing, OneCatalogCutDrivesHealthCheckAndRebuild)
         state.snap_generation = 0;
         OperationForTest op(*backend);
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*op).replace(layout.gcStateKey(), encodeGcState(state), got->incarnation, Retry::standard())));
+            (*op).replace(layout.gcStateKey(), encodeGcState(state), got->etag, Retry::standard())));
     }
 
     backend->armCatalogMutation(layout.refCatalogKey());
@@ -503,7 +503,7 @@ TEST(CASRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
     OperationForTest hole_op(*backend);
     const auto h = (*hole_op).head(holed, Retry::standard());
     ASSERT_TRUE(h.has_value());
-    ASSERT_EQ((*hole_op).remove(holed, h->incarnation, Retry::standard()), Removal::Removed);
+    ASSERT_EQ((*hole_op).remove(holed, h->etag, Retry::standard()), Removal::Removed);
 
     FsckReport rep;
     ASSERT_NO_THROW(rep = runFsck(*store, /*detail=*/true))
@@ -640,7 +640,7 @@ TEST(CASRebuildCondemnNothingFsck, OneBadNamespaceDoesNotAbortTheAudit)
     OperationForTest hole_op(*backend);
     const auto h = (*hole_op).head(holed, Retry::standard());
     ASSERT_TRUE(h.has_value());
-    ASSERT_EQ((*hole_op).remove(holed, h->incarnation, Retry::standard()), Removal::Removed);
+    ASSERT_EQ((*hole_op).remove(holed, h->etag, Retry::standard()), Removal::Removed);
 
     publishAt(*backend, layout, kNsB, RefTxnId{1, 1}, "ref_z", 1, DB::UInt128(9), /*birth=*/true);
     writeCkptRaw(*backend, layout, kNsB,

@@ -414,7 +414,7 @@ DB::Cas::Meta headMetaOf(const DB::Cas::PoolPtr & pool, const String & key)
 
 DB::Cas::Etag headIncarnationOf(const DB::Cas::PoolPtr & pool, const String & key)
 {
-    return headMetaOf(pool, key).incarnation;
+    return headMetaOf(pool, key).etag;
 }
 
 /// One part with a content blob, a projection file, and the small per-part files (uuid.txt,
@@ -2926,7 +2926,7 @@ void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,
     /// condemned decision point-reads the per-hash freshness meta (condemned below), so bumping the round
     /// and condemning the meta is enough.
     if (head.has_value())
-        (void)(*op).replace(layout.gcStateKey(), encodeGcState(state), head->incarnation, Retry::standard());
+        (void)(*op).replace(layout.gcStateKey(), encodeGcState(state), head->etag, Retry::standard());
     else
         (void)(*op).create(layout.gcStateKey(), encodeGcState(state), Retry::standard());
 
@@ -2962,7 +2962,7 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
     /// Condemn the freshly-uploaded blob's CURRENT token (GC condemning the not-yet-folded fresh incarnation).
     const String blob_key = store->layout().blobKey(idOf(P));
     const Meta h1 = headMetaOf(store, blob_key);
-    const Etag t0 = h1.incarnation;
+    const Etag t0 = h1.etag;
     seedCondemnBlobToken(*store, u128Of(P), t0, h1.size);
     {
         const auto lm = DB::Cas::tests::loadMetaForTest(*store->poolBackendPtr(), store->layout(), u128Of(P));
@@ -3022,7 +3022,7 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     const Meta h1 = headMetaOf(store, blob_key);
     /// Condemn the leaf so that, were the blob gate reached, promote would republish it — proving the abort
     /// happens strictly BEFORE any blob work.
-    seedCondemnBlobToken(*store, u128Of(P), h1.incarnation, h1.size);
+    seedCondemnBlobToken(*store, u128Of(P), h1.etag, h1.size);
     {
         const auto lm = DB::Cas::tests::loadMetaForTest(*store->poolBackendPtr(), store->layout(), u128Of(P));
         ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned);
@@ -3041,7 +3041,7 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
 
     /// No blob work ran before the abort: the leaf's token is UNCHANGED (still the condemned one) and its
     /// metadata is still Condemned — the owner check aborts before any blob publication.
-    EXPECT_EQ(headIncarnationOf(store, blob_key), h1.incarnation)
+    EXPECT_EQ(headIncarnationOf(store, blob_key), h1.etag)
         << "the aborting path must perform no PUT — the materialized leaf is untouched";
     const auto lm_after = DB::Cas::tests::loadMetaForTest(*store->poolBackendPtr(), store->layout(), u128Of(P));
     EXPECT_TRUE(lm_after.has_value() && lm_after->meta.state == MetaState::Condemned)

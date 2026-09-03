@@ -155,7 +155,7 @@ std::set<String> listRefKeys(Backend & b, const Layout & layout, const RootNames
     const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(op, layout, ns).value();
     std::set<String> keys;
     op.forEachListedKey(layout.namespaceStreamPrefix(life),
-        [&](const KeyEntry & k) { keys.insert(k.key); return true; }, Retry::standard());
+        [&](const ListedKey & k) { keys.insert(k.key); return true; }, Retry::standard());
     return keys;
 }
 

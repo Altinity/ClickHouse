@@ -360,7 +360,7 @@ void headThenReplace(Backend & backend, const String & key, const String & bytes
     const auto current = (*op).head(key, Retry::once());
     EXPECT_TRUE(current.has_value()) << "expected '" << key << "' to exist before overwrite";
     if (current)
-        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, bytes, current->incarnation, Retry::once())));
+        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, bytes, current->etag, Retry::once())));
 }
 
 /// Head, then exact-delete what was seen -- the raw-fixture corruption idiom for removing an object
@@ -370,7 +370,7 @@ void headThenRemove(Backend & backend, const String & key)
     OperationForTest op(backend);
     const auto current = (*op).head(key, Retry::once());
     ASSERT_TRUE(current.has_value()) << "expected '" << key << "' to exist before removal";
-    ASSERT_EQ((*op).remove(key, current->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_EQ((*op).remove(key, current->etag, Retry::once()), Removal::Removed);
 }
 
 }
@@ -1026,7 +1026,7 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     const auto ckpt_head = (*corrupt_op).head(bad_ckpt_key, Retry::once());
     ASSERT_TRUE(ckpt_head.has_value());
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*corrupt_op).replace(bad_ckpt_key, "this is not a cas_ref_ckpt", ckpt_head->incarnation, Retry::once())));
+        (*corrupt_op).replace(bad_ckpt_key, "this is not a cas_ref_ckpt", ckpt_head->etag, Retry::once())));
 
     /// Work only a round that COMPLETES can fold.
     publishAt(*backend, layout, good, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(12));
@@ -1038,7 +1038,7 @@ TEST(CASGCHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
         .last_epoch_seal = std::nullopt,
-    }), good_ckpt_head->incarnation, Retry::once())));
+    }), good_ckpt_head->etag, Retry::once())));
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
@@ -1260,7 +1260,7 @@ void mutateSealAt(Backend & backend, const Layout & layout, uint64_t generation,
     const auto current = (*op).head(key, Retry::once());
     EXPECT_TRUE(current.has_value());
     if (current)
-        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, encodeFoldSeal(seal), current->incarnation, Retry::once())));
+        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, encodeFoldSeal(seal), current->etag, Retry::once())));
 }
 
 /// Rewrite the adopted fold seal, applying `mutate` to it. Used to plant a hold that the rebuild must
@@ -1276,7 +1276,7 @@ void mutateAdoptedSeal(Backend & backend, const Layout & layout, const std::func
     const auto current = (*op).head(key, Retry::once());
     EXPECT_TRUE(current.has_value());
     if (current)
-        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, encodeFoldSeal(seal), current->incarnation, Retry::once())));
+        EXPECT_TRUE(std::holds_alternative<Committed>((*op).replace(key, encodeFoldSeal(seal), current->etag, Retry::once())));
 }
 
 RefHold plantedHold()

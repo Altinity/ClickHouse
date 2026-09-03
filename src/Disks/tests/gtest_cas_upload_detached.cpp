@@ -292,7 +292,7 @@ TEST(CASUploadDetached, PresentCondemnedPublishesFreshAndQueuedOldDeleteMisses)
     auto build = precommitBuildFor(store, RootNamespace{"srv1/protocol-condemned"}, "part", payload);
     const String blob_key = store->layout().blobKey(ref);
     DB::Cas::tests::OperationForTest condemned_probe(*backend);
-    const Etag condemned_token = (*condemned_probe).head(blob_key, Retry::standard())->incarnation;
+    const Etag condemned_token = (*condemned_probe).head(blob_key, Retry::standard())->etag;
     backend->watch(blob_key, store->layout().blobMetaKey(ref));
     const uint64_t avoided_before = ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided].load();
 
@@ -508,7 +508,7 @@ TEST(CASUploadDetached, CondemnedLocalResurrection)
     arrange(b1, s1, build1);
     const String key = s1->layout().blobKey(blob);
     DB::Cas::tests::OperationForTest token_probe(*b1);
-    const Etag condemned_token = (*token_probe).head(key, Retry::standard())->incarnation;
+    const Etag condemned_token = (*token_probe).head(key, Retry::standard())->etag;
 
     ASSERT_EQ(metaStateAt(*b1, s1->layout(), payload), std::optional<MetaState>(MetaState::Condemned));
     EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
@@ -524,7 +524,7 @@ TEST(CASUploadDetached, CondemnedLocalResurrection)
 
     EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
     /// The condemned incarnation was displaced by a fresh one (token changed) and the meta is Clean again.
-    const Etag after_token = (*token_probe).head(key, Retry::standard())->incarnation;
+    const Etag after_token = (*token_probe).head(key, Retry::standard())->etag;
     EXPECT_NE(after_token, condemned_token);
     EXPECT_EQ(metaStateAt(*b1, s1->layout(), payload), std::optional<MetaState>(MetaState::Clean));
     EXPECT_EQ(logicalPayloadAt(*b1, key, s1->poolMeta().blob_header_len), payload);
@@ -574,7 +574,7 @@ TEST(CASUploadDetached, CondemnedS3Resurrection)
     arrange(b1, s1, build1);
     const String key = s1->layout().blobKey(blob);
     DB::Cas::tests::OperationForTest token_probe(*b1);
-    const Etag condemned_token = (*token_probe).head(key, Retry::standard())->incarnation;
+    const Etag condemned_token = (*token_probe).head(key, Retry::standard())->etag;
 
     ASSERT_EQ(metaStateAt(*b1, s1->layout(), payload), std::optional<MetaState>(MetaState::Condemned));
     EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
@@ -593,7 +593,7 @@ TEST(CASUploadDetached, CondemnedS3Resurrection)
 
     EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
     /// A fresh incarnation displaced the condemned one (INV-NO-RETURN: fresh tag ⇒ different token).
-    const Etag after_token = (*token_probe).head(key, Retry::standard())->incarnation;
+    const Etag after_token = (*token_probe).head(key, Retry::standard())->etag;
     EXPECT_NE(after_token, condemned_token);
     EXPECT_EQ(metaStateAt(*b1, s1->layout(), payload), std::optional<MetaState>(MetaState::Clean));
 

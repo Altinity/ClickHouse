@@ -734,7 +734,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
         OperationForTest meta_op(*backend);
         PoolMeta pm = PoolMeta::createOrValidate(*meta_op, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
         pm.min_reader_generation = G_BUILD + 1;
-        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), encodePoolMeta(pm), (*meta_op).head(layout.poolMetaKey(), Retry::once())->incarnation, Retry::once())));
+        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), encodePoolMeta(pm), (*meta_op).head(layout.poolMetaKey(), Retry::once())->etag, Retry::once())));
 
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
         { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
@@ -756,7 +756,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
         ASSERT_NE(pos, String::npos);   // sanity: a fresh pool stamps the header at the floor
         String downgraded = fresh_bytes;
         downgraded.replace(pos, from.size(), to);
-        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), downgraded, (*meta_op).head(layout.poolMetaKey(), Retry::once())->incarnation, Retry::once())));
+        ASSERT_TRUE(std::holds_alternative<Committed>((*meta_op).replace(layout.poolMetaKey(), downgraded, (*meta_op).head(layout.poolMetaKey(), Retry::once())->etag, Retry::once())));
 
         /// `decodePoolMeta`'s backward floor rejects the downgraded bytes directly...
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(downgraded); });

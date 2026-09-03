@@ -125,13 +125,13 @@ std::vector<std::tuple<String, String, Etag>> snapshotPrefixObjects(
     String cursor;
     while (true)
     {
-        const KeyPage page = op.list(prefix, cursor, 1000, Retry::once());
-        for (const KeyEntry & listed : page.keys)
+        const ListPage page = op.list(prefix, cursor, 1000, Retry::once());
+        for (const ListedKey & listed : page.keys)
         {
             const auto got = op.read(listed.key, Retry::once());
             if (!got)
                 throw std::runtime_error("prefix snapshot fixture: listed object disappeared");
-            objects.emplace_back(listed.key, got->bytes, got->incarnation);
+            objects.emplace_back(listed.key, got->bytes, got->etag);
         }
         if (page.next_cursor.empty())
             return objects;
@@ -538,7 +538,7 @@ TEST(CASDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
     const auto empty_catalog = (*raw_op).read(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(empty_catalog);
     ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).replace(
-        layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->incarnation, Retry::once())));
+        layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->etag, Retry::once())));
     const auto owner_before = (*raw_op).read(layout.ownerKey("victim"), Retry::once());
     const auto epoch_before = (*raw_op).read(layout.epochKey("victim"), Retry::once());
     const auto mount_before = (*raw_op).read(layout.mountKey("victim"), Retry::once());
@@ -555,11 +555,11 @@ TEST(CASDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
     ASSERT_TRUE(epoch_after);
     ASSERT_TRUE(mount_after);
     EXPECT_EQ(owner_after->bytes, owner_before->bytes);
-    EXPECT_EQ(owner_after->incarnation, owner_before->incarnation);
+    EXPECT_EQ(owner_after->etag, owner_before->etag);
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
-    EXPECT_EQ(epoch_after->incarnation, epoch_before->incarnation);
+    EXPECT_EQ(epoch_after->etag, epoch_before->etag);
     EXPECT_EQ(mount_after->bytes, mount_before->bytes);
-    EXPECT_EQ(mount_after->incarnation, mount_before->incarnation);
+    EXPECT_EQ(mount_after->etag, mount_before->etag);
 }
 
 TEST(CASDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelection)
@@ -598,11 +598,11 @@ TEST(CASDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelect
     ASSERT_TRUE(epoch_after);
     ASSERT_TRUE(mount_after);
     EXPECT_EQ(owner_after->bytes, owner_before->bytes);
-    EXPECT_EQ(owner_after->incarnation, owner_before->incarnation);
+    EXPECT_EQ(owner_after->etag, owner_before->etag);
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
-    EXPECT_EQ(epoch_after->incarnation, epoch_before->incarnation);
+    EXPECT_EQ(epoch_after->etag, epoch_before->etag);
     EXPECT_EQ(mount_after->bytes, mount_before->bytes);
-    EXPECT_EQ(mount_after->incarnation, mount_before->incarnation);
+    EXPECT_EQ(mount_after->etag, mount_before->etag);
 }
 
 TEST(CASDecommission, NamespaceSelectionUsesThePreImpersonationCut)
@@ -642,7 +642,7 @@ TEST(CASDecommission, SameNameRebirthAfterTheCutIsRefusedWithoutTouchingTheNewLi
     const auto empty_catalog = (*raw_op).read(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(empty_catalog);
     ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).replace(
-        layout.refCatalogKey(), encodeRefCatalog(old_catalog), empty_catalog->incarnation, Retry::once())));
+        layout.refCatalogKey(), encodeRefCatalog(old_catalog), empty_catalog->etag, Retry::once())));
 
     RefLogTxn new_birth;
     new_birth.ns = ns.string();
@@ -1043,12 +1043,12 @@ TEST(CASDecommission, SuccessorReclaimFencesSlotRetirementTail)
     OperationForTest raw_op(*backend);
     const auto mount = (*raw_op).read("p/gc/server-roots/victim/mount", Retry::once());
     ASSERT_TRUE(mount.has_value());
-    EXPECT_EQ(PersistedEtag::capture(mount->incarnation).value, backend->successorMountValue());
+    EXPECT_EQ(PersistedEtag::capture(mount->etag).value, backend->successorMountValue());
     EXPECT_EQ(mount->bytes, backend->successorMountBytes());
 
     const auto epoch = (*raw_op).read("p/gc/server-roots/victim/epoch", Retry::once());
     ASSERT_TRUE(epoch.has_value());
-    EXPECT_EQ(PersistedEtag::capture(epoch->incarnation).value, backend->successorEpochValue());
+    EXPECT_EQ(PersistedEtag::capture(epoch->etag).value, backend->successorEpochValue());
     EXPECT_EQ(epoch->bytes, backend->successorEpochBytes());
     EXPECT_TRUE((*raw_op).read("p/gc/server-roots/victim/owner", Retry::once()).has_value());
 
@@ -1080,17 +1080,17 @@ TEST(CASDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
 
     const auto owner = (*raw_op).read(owner_key, Retry::once());
     ASSERT_TRUE(owner.has_value());
-    EXPECT_EQ(owner->incarnation, original_owner->incarnation);
+    EXPECT_EQ(owner->etag, original_owner->etag);
     EXPECT_EQ(owner->bytes, original_owner->bytes);
 
     const auto mount = (*raw_op).read("p/gc/server-roots/victim/mount", Retry::once());
     ASSERT_TRUE(mount.has_value());
-    EXPECT_EQ(PersistedEtag::capture(mount->incarnation).value, backend->successorMountValue());
+    EXPECT_EQ(PersistedEtag::capture(mount->etag).value, backend->successorMountValue());
     EXPECT_EQ(mount->bytes, backend->successorMountBytes());
 
     const auto epoch = (*raw_op).read("p/gc/server-roots/victim/epoch", Retry::once());
     ASSERT_TRUE(epoch.has_value());
-    EXPECT_EQ(PersistedEtag::capture(epoch->incarnation).value, backend->successorEpochValue());
+    EXPECT_EQ(PersistedEtag::capture(epoch->etag).value, backend->successorEpochValue());
     EXPECT_EQ(epoch->bytes, backend->successorEpochBytes());
 }
 
@@ -1167,7 +1167,7 @@ TEST(CASDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
     EXPECT_TRUE(report.slot_removed);
     const auto after = (*raw_op).read(owner_key, Retry::once());
     ASSERT_TRUE(after.has_value());
-    EXPECT_NE(after->incarnation, before->incarnation);
+    EXPECT_NE(after->etag, before->etag);
     EXPECT_EQ(decodeOwner(after->bytes).server_uuid, decodeOwner(before->bytes).server_uuid);
     EXPECT_TRUE(decodeOwner(after->bytes).retired_at_ms.has_value());
 }
@@ -1189,7 +1189,7 @@ TEST(CASDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
     OperationForTest raw_op(*backend);
     const auto owner = (*raw_op).read("p/gc/server-roots/victim/owner", Retry::once());
     ASSERT_TRUE(owner.has_value());
-    EXPECT_EQ(PersistedEtag::capture(owner->incarnation).value, backend->successorOwnerValue());
+    EXPECT_EQ(PersistedEtag::capture(owner->etag).value, backend->successorOwnerValue());
     EXPECT_EQ(owner->bytes, backend->successorOwnerBytes());
     EXPECT_FALSE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
@@ -1387,7 +1387,7 @@ TEST(CASDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
     {
         const auto head = (*raw_op).head(key, Retry::once());
         ASSERT_TRUE(head.has_value());
-        ASSERT_EQ((*raw_op).remove(key, head->incarnation, Retry::once()), Removal::Removed);
+        ASSERT_EQ((*raw_op).remove(key, head->etag, Retry::once()), Removal::Removed);
     }
     ASSERT_FALSE((*raw_op).head(layout.epochKey("victim"), Retry::once()).has_value());
     ASSERT_FALSE((*raw_op).head(layout.ownerKey("victim"), Retry::once()).has_value());

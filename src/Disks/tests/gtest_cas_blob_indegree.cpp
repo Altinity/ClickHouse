@@ -468,7 +468,7 @@ TEST(CASThreeCursorMerge, NewCandidateCondemned)
     EXPECT_EQ(rmr.still_retired[0].ref, bh(3));
     const std::optional<Meta> present = (*backend_req).head(layout.blobKey(bh(3)), Retry::standard());
     ASSERT_TRUE(present.has_value());
-    EXPECT_TRUE(rmr.still_retired[0].token.matches(present->incarnation));
+    EXPECT_TRUE(rmr.still_retired[0].token.matches(present->etag));
     EXPECT_EQ(rmr.still_retired[0].size, 42u);
     EXPECT_EQ(rmr.still_retired[0].condemn_round, 7u);
     EXPECT_TRUE(rmr.graduated.empty());
@@ -478,7 +478,7 @@ TEST(CASThreeCursorMerge, NewCandidateCondemned)
     const DecodedRun out = decodeRun(*backend_req, runs2[0]);
     ASSERT_EQ(out.condemned.size(), 1u);
     EXPECT_EQ(out.condemned[0].first, b(3));
-    EXPECT_TRUE(out.condemned[0].second.token.matches(present->incarnation));
+    EXPECT_TRUE(out.condemned[0].second.token.matches(present->etag));
     EXPECT_TRUE(out.zero_markers.empty());
 }
 
@@ -587,7 +587,7 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
     EXPECT_EQ(g2.condemned[0].first, b(2));
     const std::optional<Meta> present = (*backend_req).head(layout.blobKey(bh(2)), Retry::standard());
     ASSERT_TRUE(present.has_value());
-    EXPECT_TRUE(g2.condemned[0].second.token.matches(present->incarnation));
+    EXPECT_TRUE(g2.condemned[0].second.token.matches(present->etag));
     EXPECT_EQ(g2.condemned[0].second.size, 7u);
     EXPECT_TRUE(g2.zero_markers.empty());
 }
