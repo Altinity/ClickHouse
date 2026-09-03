@@ -9,6 +9,7 @@
 
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace DB::ErrorCodes
@@ -85,6 +86,12 @@ private:
 /// models a definite write failure, distinct from the acknowledgement-loss shape below: a retry must
 /// still be allowed to prove a new pool, and the failed first attempt must not have published
 /// `_pool_meta` without the catalog it makes mandatory.
+///
+/// A plain `std::runtime_error`, not a `Poco::Exception`: the engine's write loop treats any
+/// `Poco`/transport exception as an ambiguity it settles itself with one resolve read, and a one-shot
+/// fault of that class is retried and silently succeeds within the SAME `Pool::open` call -- it never
+/// reaches the caller at all. A non-`Poco` `std::exception` is the engine's own signal for "this could
+/// not have landed" and propagates unresolved, which is what "before it reaches durable storage" means.
 class CatalogBootstrapWriteFailsOnceBackend final : public WriteCountingBackend
 {
 public:
@@ -95,7 +102,7 @@ public:
         if (fail_once && key == Layout{"p"}.refCatalogKey())
         {
             fail_once = false;
-            throw Poco::TimeoutException("CatalogBootstrapWriteFailsOnceBackend: catalog write did not land");
+            throw std::runtime_error("CatalogBootstrapWriteFailsOnceBackend: catalog write did not land");
         }
         return WriteCountingBackend::write(key, bytes, expected_value, access);
     }
@@ -223,7 +230,7 @@ TEST(CASRefCatalogBirthWiring, FailedCatalogBootstrapDoesNotPublishPoolMetaAndRe
     EXPECT_TRUE(op.head(layout.refCatalogKey(), Retry::standard()).has_value());
 }
 
-TEST(CASRefCatalogBirthWiring, LostCatalogBootstrapAcknowledgementLeavesOnlyRetryableCatalogResidue)
+TEST(CASRefCatalogBirthWiring, LostCatalogBootstrapAcknowledgementResolvesToCommittedWithoutARetryOrADuplicate)
 {
     auto backend = std::make_shared<LandedButAckLostOnceBackend>();
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
@@ -231,14 +238,17 @@ TEST(CASRefCatalogBirthWiring, LostCatalogBootstrapAcknowledgementLeavesOnlyRetr
     const Layout layout{"p"};
     backend->key_substr = layout.refCatalogKey();
 
-    EXPECT_ANY_THROW(Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
-    EXPECT_FALSE(op.head(layout.poolMetaKey(), Retry::standard()).has_value());
-    EXPECT_TRUE(op.head(layout.refCatalogKey(), Retry::standard()).has_value())
-        << "the injected write must land before its acknowledgement is lost";
-
-    PoolPtr retry;
-    ASSERT_NO_THROW(retry = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
+    /// The catalog create's own write landed; only its response was lost. `LandedButAckLostOnceBackend`
+    /// is documented to model exactly that -- a caller that resolves the ambiguity meets its OWN
+    /// earlier write as the occupant -- so the engine's one resolve read proves this attempt committed.
+    /// The whole bootstrap therefore converges in this SINGLE `Pool::open` call: no throw, no second
+    /// catalog write, and no second `Pool::open` needed.
+    PoolPtr store;
+    ASSERT_NO_THROW(store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
     EXPECT_TRUE(op.head(layout.poolMetaKey(), Retry::standard()).has_value());
+    EXPECT_TRUE(op.head(layout.refCatalogKey(), Retry::standard()).has_value());
+    EXPECT_EQ(backend->putCount(layout.refCatalogKey()), 1u)
+        << "a landed write whose ack is lost must be proven by a read, never repeated";
 }
 
 TEST(CASRefCatalogBirthWiring, BootstrapConflictExactReadsTheCanonicalEmptyCatalog)
