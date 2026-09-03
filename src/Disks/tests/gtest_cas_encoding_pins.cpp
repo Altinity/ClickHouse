@@ -132,7 +132,7 @@ TEST(CASEncodingPins, SourceEdgeRunLines)
     condemned.source_id = UInt128(0);
     condemned.marker = RunMarker::Condemned;
     condemned.delete_pending = true;
-    condemned.token = Token{.value = "token", .type = TokenType::ETag};
+    condemned.token = PersistedIncarnation{"etag", "token"};
     condemned.size = 9;
     condemned.condemn_round = 7;
     condemned.marker_confirmed = true;
@@ -170,7 +170,7 @@ TEST(CASWireCutDeltas, ActiveCasRunRow)
 
 TEST(CASWireCutDeltas, CondemnedCasRunRow)
 {
-    SourceEdgeRecord record{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(3))}, .source_id = UInt128(0), .marker = RunMarker::Condemned, .delete_pending = true, .token = Token{"token", TokenType::ETag}, .size = 9, .condemn_round = 7, .marker_confirmed = true};
+    SourceEdgeRecord record{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(3))}, .source_id = UInt128(0), .marker = RunMarker::Condemned, .delete_pending = true, .token = PersistedIncarnation{"etag", "token"}, .size = 9, .condemn_round = 7, .marker_confirmed = true};
     WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);
     writer.append(record);
@@ -210,7 +210,7 @@ TEST(CASWireCutDeltas, InlinePartManifestEntry)
 
 TEST(CASWireCutDeltas, GcOutcomesRow)
 {
-    OutcomeLog log{{OutcomeEntry{ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, Token{"t", TokenType::ETag}, OutcomeKind::Deleted}}};
+    OutcomeLog log{{OutcomeEntry{ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, PersistedIncarnation{"etag", "t"}, OutcomeKind::Deleted}}};
     /// This literal is the pre-cut baseline this delta is measured against.
     const String old_bytes = "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00000000000000000000000000000004\",\"tt\":\"etag\",\"tv\":\"t\",\"oc\":\"deleted\"}\n";
     expectDelta(old_bytes, lineAt(encodeOutcomeLog(log), 1), 26);
