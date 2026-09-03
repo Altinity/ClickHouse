@@ -367,6 +367,19 @@ public:
     }
 };
 
+/// A backend whose store-level preconditions refuse the pool outright — a stand-in for a versioning or
+/// dialect combination `ObjectStorageBackend::checkPoolPreconditions` rejects.
+class ThrowingPoolPreconditionsBackend final : public ForwardingBackend
+{
+public:
+    using ForwardingBackend::ForwardingBackend;
+
+    void checkPoolPreconditions() override
+    {
+        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "test: pool preconditions refused");
+    }
+};
+
 /// A backend that forbids skipping the access-check battery — a stand-in for the writable
 /// generation-dialect (GCS) backend (see ObjectStorageBackend::checkSkipAccessCheckSupport).
 class ThrowingSkipAccessCheckBackend final : public ForwardingBackend
@@ -439,6 +452,71 @@ TEST(CASPool, BackendForbiddingSkipAccessCheckStillOpensWhenTheBatteryRuns)
 
     auto store = DB::Cas::Pool::open(backend, cfg);
     ASSERT_NE(store, nullptr);
+}
+
+/// The ORDINARY writable mount -- the one that runs the battery -- must still be refused by the two
+/// store-level gates. They used to be the capability probe's own first two steps; they are the caller's
+/// now, and nothing else in the open path would notice if the caller stopped asking. The write counter is
+/// what makes each of these a fence rather than a bare `EXPECT_THROW`: `Pool::open` refuses for many
+/// reasons, but only a refusal BEFORE the battery leaves the store unwritten.
+TEST(CASPool, WritableOpenRunsThePoolPreconditionGateBeforeTheBattery)
+{
+    auto counting = std::make_shared<WriteCountingBackend>(std::make_shared<DB::Cas::InMemoryBackend>());
+    auto backend = std::make_shared<ThrowingPoolPreconditionsBackend>(counting);
+
+    DB::Cas::PoolConfig cfg = writablePoolConfigForTest();
+    ASSERT_FALSE(cfg.skip_access_check) << "this test is about the branch that RUNS the battery";
+
+    try
+    {
+        DB::Cas::Pool::open(backend, cfg);
+        FAIL() << "expected the pool-precondition gate to refuse the mount";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NOT_IMPLEMENTED);
+        EXPECT_NE(e.message().find("pool preconditions refused"), std::string::npos)
+            << "actual message: " << e.message();
+    }
+    EXPECT_EQ(counting->writes, 0u) << "the gate must refuse before the battery writes anything";
+}
+
+TEST(CASPool, WritableOpenRunsTheSingleAttemptGateBeforeTheBattery)
+{
+    auto counting = std::make_shared<WriteCountingBackend>(std::make_shared<DB::Cas::InMemoryBackend>());
+    auto backend = std::make_shared<ThrowingSingleAttemptBackend>(counting);
+
+    DB::Cas::PoolConfig cfg = writablePoolConfigForTest();
+    ASSERT_FALSE(cfg.skip_access_check) << "this test is about the branch that RUNS the battery";
+
+    try
+    {
+        DB::Cas::Pool::open(backend, cfg);
+        FAIL() << "expected the single-attempt gate to refuse the mount";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NOT_IMPLEMENTED);
+        EXPECT_NE(e.message().find("no single-attempt client"), std::string::npos)
+            << "actual message: " << e.message();
+    }
+    EXPECT_EQ(counting->writes, 0u) << "the gate must refuse before the battery writes anything";
+}
+
+/// The positive control for the two above: with no gate refusing, the same open DOES write. Without it
+/// `writes == 0` would be satisfied by an open that refused for any earlier reason, and both fences would
+/// pass while the gates were gone.
+TEST(CASPool, WritableOpenWithoutAGateRefusalDoesReachTheBattery)
+{
+    auto counting = std::make_shared<WriteCountingBackend>(std::make_shared<DB::Cas::InMemoryBackend>());
+
+    DB::Cas::PoolConfig cfg = writablePoolConfigForTest();
+    cfg.background_watermark = false;
+    ASSERT_FALSE(cfg.skip_access_check);
+
+    auto store = DB::Cas::Pool::open(counting, cfg);
+    ASSERT_NE(store, nullptr);
+    EXPECT_GT(counting->writes, 0u);
 }
 
 TEST(CASPool, MinActiveTracksInFlightBuilds)
@@ -1999,14 +2077,14 @@ TEST(CASPoolRemount, ThrowingForeignConflictSinkCannotReplaceTerminalOutcome)
 class RemountStepBackend final : public DB::Cas::tests::CountingBackend
 {
 public:
-    void failNextGet(String key)
+    void failNextRead(String key)
     {
         failed_key = std::move(key);
     }
 
-    /// The fault sits on the PRIMITIVE, not on legacy `get`: the lifecycle gate reads `_pool_meta`
-    /// through `probeSentinelRaw`, which speaks the primitives. A legacy caller reaches this anyway,
-    /// through the forwarder, so arming it here covers both surfaces rather than only one.
+    /// The fault sits on the READ PRIMITIVE: the lifecycle gate reads `_pool_meta` through
+    /// `probeSentinelRaw`, which speaks the primitives. A legacy caller reaches it anyway, through the
+    /// forwarder, so arming it here covers both surfaces rather than only one.
     std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         if (!failed_key.empty() && key == failed_key)
@@ -3866,7 +3944,7 @@ TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
     ScopedRemountLogCapture logs;
 
     store->tripMountLost();
-    backend->failNextGet(store->layout().poolMetaKey());
+    backend->failNextRead(store->layout().poolMetaKey());
     const uint64_t attempts_before = ProfileEvents::global_counters[ProfileEvents::CASRemountAttempts].load();
     const uint64_t succeeded_before = ProfileEvents::global_counters[ProfileEvents::CASRemountSucceeded].load();
     const uint64_t failed_before = ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load();
@@ -3906,7 +3984,7 @@ TEST(CASPoolRemount, LeaseLossHasOneOperationalOwner)
 
     store->tripMountLost();
     store->tripMountLost();
-    backend->failNextGet(store->layout().poolMetaKey());
+    backend->failNextRead(store->layout().poolMetaKey());
     EXPECT_FALSE(store->tryRemountOnce());
     store->beginShutdownForTest();
     store->tripMountLost();

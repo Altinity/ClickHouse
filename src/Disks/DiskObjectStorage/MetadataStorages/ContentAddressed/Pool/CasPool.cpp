@@ -204,10 +204,12 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// Plain-object surface component, on the MOUNT plane: the namespace-file and mountpoint writes it
     /// offers are durable mutations whose right to land is the mount lease.
     , plain_objects(mount_requests, pool_layout)
-    /// Manifest reader component, on the OPEN plane: it only reads, a read holds no lease, and gating
-    /// it on the mount fence would stop a fenced mount answering a query it can still serve. The event
-    /// sink is installed by the factory before writable mounting starts.
-    , manifest_reader(gc_requests, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
+    /// Manifest reader component, on the MOUNT plane: a content read on a mount whose lease is gone is
+    /// refused, which is what the reader's own contract promises and what the metadata storage's op gate
+    /// already does for every content read. A reader for work that outlives the lease (GC) is a separate
+    /// reader over that plane, never this one shared across two. The event sink is installed by the
+    /// factory before writable mounting starts.
+    , manifest_reader(mount_requests, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
     /// Ref-log / ref-table subsystem, on the MOUNT plane: a ref-lane write and a mount-lease renewal
     /// are then measured against the same fence and the same clock. Injected with the
     /// RefLedgerConfig slice + the event-sink reference + the pool `cas_request_budget`, plus callbacks
@@ -471,6 +473,15 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 
         if (!config.skip_access_check)
         {
+            /// The two STORE-LEVEL gates run before the battery writes anything, so a backend this build
+            /// must refuse is refused without leaving `_probe/` debris behind. They ask the backend
+            /// directly because an admitted operation deliberately has no route back to it; the predicates
+            /// come from the same engine the probe operation is admitted from, so they can never be asked
+            /// of a different backend than the one probed.
+            Backend & probe_backend = bootstrap_requests.backendForCapabilityPredicates();
+            probe_backend.checkPoolPreconditions();
+            probe_backend.checkConditionalWriteSingleAttemptSupport();
+
             /// Give each mount a PER-MOUNT UNIQUE probe key prefix so two servers mounting the SAME
             /// shared pool concurrently never collide on the (formerly fixed) `<pool>/_probe/token` /
             /// `<pool>/_probe/cas` keys. Without this, the loser of the `putIfAbsent` race aborts startup
@@ -484,9 +495,9 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
         }
         else
         {
-            /// skip_access_check: skip the access-check-class probe I/O (store preconditions + the
-            /// `_probe/` round trip, both folded into runCapabilityProbe above) but NOT the two
-            /// fail-closed gates below — see `PoolConfig::skip_access_check`.
+            /// skip_access_check: skip the access-check-class probe I/O (the store-precondition gate and
+            /// the `_probe/` round trip above) but NOT the two fail-closed gates below — see
+            /// `PoolConfig::skip_access_check`.
             ///
             /// First, whether this backend may skip the battery AT ALL. A generation-dialect (GCS)
             /// backend may not: the battery is the only thing that proves a token-exact DELETE
