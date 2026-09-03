@@ -1743,9 +1743,33 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     const uint64_t condemn_round = state.round + 1;
     result.retired_merge.resize(state.gc_shards);
 
+    /// HEAD READ-AHEAD FOR THE REDUCE PHASE. `head_candidates[shard]` is filled in that phase with the
+    /// blobs the merge can bring to in-degree zero, in the merge's own ascending key order; `head_blob`
+    /// below tops the hints up a window deep before each take. It is EMPTY everywhere else, the whole of
+    /// intake included, so every take outside that phase is the plain inline HEAD.
+    ///
+    /// Hints are issued from INSIDE the lambda rather than in one burst at phase start, so the requests
+    /// this can ever add are bounded by one window past the last candidate the merge actually reaches.
+    /// A superset that overshoots badly therefore costs a window, not its own size -- which matters
+    /// because nothing bounds a round's condemnation count.
+    std::vector<std::vector<BlobRef>> head_candidates(state.gc_shards);
+    size_t head_hint_shard = 0;
+    size_t next_head_hint = 0;
+    const auto topUpHeadHints = [&]
+    {
+        const std::vector<BlobRef> & shard_candidates = head_candidates[head_hint_shard];
+        while (next_head_hint < shard_candidates.size() && reads.pending() < reads.window())
+            reads.hintHead(layout.blobKey(shard_candidates[next_head_hint++]));
+    };
+
     /// Condemn-time observation: ONE HEAD per new zero-transition captures the exact incarnation token
     /// the eventual delete carries (absent => a prior landed delete => nothing to condemn). Emits the
     /// Candidate trail (IndegZero / GcRetireObserve / BlobRetire) exactly where the decision is made.
+    ///
+    /// THE READ-AHEAD NEVER RUNS THIS LAMBDA, only feeds it. Everything below the HEAD is
+    /// side-effecting -- the trail, the counters, the condemn-marker write -- and running it over a
+    /// SUPERSET would stamp `Condemned` on blobs this round never condemns, forcing a live writer to
+    /// republish each one. The prefetch is a bare HEAD; the decision stays here.
     const auto head_blob = [&](const BlobRef & ref) -> std::optional<Meta>
     {
         EventEmitter{*store}.emit([&](CasEvent & e)
@@ -1757,7 +1781,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             e.gen = state.snap_generation + 1;
             e.reason = "last folded owner edge dropped; in-degree reached 0";
         });
-        const std::optional<Meta> observed = op.head(layout.blobKey(ref), Retry::standard());
+        topUpHeadHints();
+        const std::optional<Meta> observed = reads.takeHead(layout.blobKey(ref));
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::GcRetireObserve;
@@ -1804,6 +1829,15 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// hook is `head_blob` above, reserved for a genuinely NEW zero-in-degree candidate. A supersede's
     /// own event is `blob_retire_replaced`, emitted once below from `merge.replaced`. Plain HEAD, no
     /// events, no counters.
+    ///
+    /// AND IT IS NOT READ AHEAD, deliberately, unlike `head_blob`'s. This HEAD is not data handed to a
+    /// decision made elsewhere -- it IS the decision: `hr && !stale.token.matches(hr->etag)` is the
+    /// supersede branch itself, so observing earlier narrows the window in which a republication can be
+    /// seen and would genuinely change which entries supersede. The consequence of a missed supersede is
+    /// benign (the stale entry graduates and its exact-token delete mismatches, so reclamation is
+    /// delayed, never wrong), but "only the moment of the fetch moves, never a decision" is the property
+    /// this whole read-ahead is worth trusting for, and it is not worth spending on the rare blob that
+    /// carries a condemned row AND is touched again in the same round.
     const auto peek_head = [&](const BlobRef & ref) -> std::optional<Meta>
     {
         std::optional<Meta> hr = op.head(layout.blobKey(ref), Retry::standard());
@@ -3174,6 +3208,39 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 nomination.source_retirements.end());
     }
 
+    /// WHICH BLOBS THE MERGE CAN CLOSE AT ZERO. `closeBlob` HEADs under `cur_edges == 0 && cur_touched`:
+    /// no key of the blob ended present, and at least one was touched. Every prior-run edge that survives
+    /// increments `cur_edges`, so reaching zero requires each of them to be killed at its own key by a
+    /// `-1` delta or a source retirement -- which puts a removal-last verdict in the map below -- while
+    /// any activation-last verdict leaves an edge standing and is the exclusion clause. Retirements are
+    /// folded in AFTER the deltas because the merge applies them that way, unconditionally: a key whose
+    /// deltas end in an activation but which a retirement then clears is a candidate too.
+    ///
+    /// IT IS A SUPERSET, AND NOTHING MAY COME TO DEPEND ON IT BEING EXACT. A blob named here that keeps
+    /// an untouched prior edge costs one HEAD the merge never takes; a candidate this set misses is
+    /// HEADed inline, which is simply the behaviour with no read-ahead at all. Both are counted, and
+    /// neither is asserted.
+    ///
+    /// PLACED HERE, not at the top of the phase: `orphan_source_retirements` is decided just above by
+    /// the sweep, and a retirement is a removal like any other. The round's cut is frozen well before
+    /// this point -- intake has finished and `deltas` has taken its final form -- so no HEAD is issued
+    /// before the round knows what it folded.
+    {
+        std::map<std::pair<BlobRef, UInt128>, bool> last_verdict_is_remove;
+        for (const BlobDelta & delta : deltas)
+            last_verdict_is_remove[{delta.ref, delta.source_id}] = delta.remove;
+        for (const BlobSourceRetirement & retirement : orphan_source_retirements)
+            last_verdict_is_remove[{retirement.ref, retirement.source_id}] = true;
+
+        std::set<BlobRef> removed;
+        std::set<BlobRef> surviving_add;
+        for (const auto & [edge, is_remove] : last_verdict_is_remove)
+            (is_remove ? removed : surviving_add).insert(edge.first);
+        for (const BlobRef & ref : removed)
+            if (!surviving_add.contains(ref))
+                head_candidates[blobShard(ref, state.gc_shards)].push_back(ref);
+    }
+
     if (state.gc_shards == 1)
     {
         /// SINGLE-SHARD PATH (gc_shards == 1). Every blob routes to shard 0, so the entire delta stream
@@ -3189,6 +3256,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         {
             /// Either a real delta or a non-empty retired input: run the merge (empty deltas still settle
             /// the RunMarker::Condemned rows riding the parent run). The prior runs are the parent seal's shard-0 refs.
+            head_hint_shard = 0;
+            next_head_hint = 0;
             foldDeltasIntoGeneration(op, layout, priorRunsFor(0),
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
@@ -3231,6 +3300,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             /// A reducer owns exactly one disjoint shard. Two replicas may run reducers for DIFFERENT
             /// shards concurrently (CasGcScheduler ownership); their run-key namespaces never collide.
             std::vector<RunRef> shard_runs;
+            head_hint_shard = shard;
+            next_head_hint = 0;
             foldDeltasIntoGeneration(
                 op, layout, priorRunsFor(shard), new_generation, attempt, shard,
                 std::move(buckets[shard]), shard_runs,

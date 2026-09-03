@@ -391,6 +391,26 @@ TEST(CASGCReadAhead, FoldIsIdenticalAtConcurrencyOneAndEight)
         << "the wide namespace must carry more logs than the window, or the lookahead is untested";
 }
 
+TEST(CASGCReadAhead, ReduceCondemnsTheSameBlobsWithTheSameHeadsAtConcurrencyOneAndEight)
+{
+    /// `populate` gives every part its own blob and drops whole parts, so a dropped blob loses its only
+    /// edge and no surviving blob has a removal: the hinted set equals the set `head_blob` takes, and the
+    /// per-key HEAD counts must match exactly rather than merely producing the same verdict.
+    constexpr size_t kRounds = 6;
+    FoldRun one;
+    FoldRun eight;
+    ASSERT_NO_FATAL_FAILURE(runFolds(1, kRounds, one));
+    ASSERT_NO_FATAL_FAILURE(runFolds(8, kRounds, eight));
+
+    EXPECT_EQ(one.condemned, eight.condemned);
+    EXPECT_EQ(one.heads, eight.heads);
+
+    uint64_t condemned_total = 0;
+    for (const size_t n : one.condemned)
+        condemned_total += n;
+    EXPECT_GT(condemned_total, 0u) << "the scenario must condemn, or the reduce read-ahead is untested";
+}
+
 namespace
 {
 
