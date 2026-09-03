@@ -1594,18 +1594,28 @@ TEST(CASRefCatalogRemoval, PerpetualConflictEndsAtTheAttemptCapAndSaysSo)
     public:
         String refused_key;
 
+        uint64_t refusedAttempts() const { return refused_attempts; }
+
         std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
                                                                    const std::optional<String> & expected_value,
                                                                    DB::Cas::TransportAccess & access) override
         {
             if (key == refused_key)
             {
-                /// Counted, then refused: the count is what the assertions below compare against.
-                (void)WriteCountingBackend::write(key, bytes, expected_value, access);
+                /// A genuine refused precondition never applies -- unlike `WriteCountingBackend::write`,
+                /// which both counts AND delegates to the real, LANDING write. Counting this attempt
+                /// through that base would apply it to storage and then lie about the outcome, which
+                /// made the erase loop's very first attempt land for real and see `Deleted` instead of
+                /// the perpetual conflict this backend's name promises. Count it here instead, and
+                /// return only the refusal.
+                ++refused_attempts;
                 return std::unexpected(DB::Cas::Backend::RawConflict{});
             }
             return WriteCountingBackend::write(key, bytes, expected_value, access);
         }
+
+    private:
+        uint64_t refused_attempts = 0;
     };
 
     auto backend = std::make_shared<AlwaysRefusesCatalogWrites>();
@@ -1625,7 +1635,6 @@ TEST(CASRefCatalogRemoval, PerpetualConflictEndsAtTheAttemptCapAndSaysSo)
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
-    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
     backend->refused_key = layout.refCatalogKey();
 
     String message;
@@ -1643,7 +1652,7 @@ TEST(CASRefCatalogRemoval, PerpetualConflictEndsAtTheAttemptCapAndSaysSo)
         << "the cap, not a deadline, is what ended this call: " << message;
     /// One erase per iteration and one pause after each, so these agree exactly -- and both being
     /// greater than one is what proves the loop iterated rather than failing on its first attempt.
-    EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, clock.sleeps.size());
+    EXPECT_EQ(backend->refusedAttempts(), clock.sleeps.size());
     EXPECT_GT(clock.sleeps.size(), 1u);
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
 }
