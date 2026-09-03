@@ -6,9 +6,9 @@
 namespace DB::Cas
 {
 
-SentinelProbeResult probeSentinel(Backend & backend, const String & key)
+SentinelProbeResult probeSentinel(CasOperation & op, const String & key)
 {
-    return backend.probeSentinelRaw(key);
+    return op.probeSentinel(key, Retry::standard());
 }
 
 namespace
@@ -29,7 +29,7 @@ bool isProbeSubtreeDebris(const String & probe_root, const String & key)
 
 }
 
-BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & layout)
+BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & layout)
 {
     const String pool_meta_key = layout.poolMetaKey();
     const String catalog_key = layout.refCatalogKey();
@@ -40,31 +40,28 @@ BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & l
     /// `_pool_meta` anywhere is decisive. It relies on lexicographic LIST order only for COST — `_pool_meta`
     /// sorts first under `<prefix>/`, so a healthy pool short-circuits on the first page rather than
     /// enumerating its whole content on every open.
+    bool has_pool_meta = false;
     bool has_residual = false;
     bool has_catalog = false;
     try
     {
-        String cursor;
-        for (;;)
+        op.forEachListedKey(prefix, [&](const KeyEntry & listed) -> bool
         {
-            const ListPage page = backend.list(prefix, cursor, 1000);
-            for (const ListedKey & listed : page.keys)
+            if (listed.key == pool_meta_key)
             {
-                if (listed.key == pool_meta_key)
-                    return BootstrapResidual::PoolMetaPresent;   /// decisive — the pool is authoritative
-                if (isProbeSubtreeDebris(probe_root, listed.key))
-                    continue;   /// crash leftover / concurrent opener's battery — ignore ([D2])
-                if (listed.key == catalog_key)
-                {
-                    has_catalog = true;
-                    continue;
-                }
-                has_residual = true;   /// a non-`_probe` object, and no `_pool_meta` seen (so far)
+                has_pool_meta = true;
+                return false;   /// decisive — the pool is authoritative; stop the walk
             }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
+            if (isProbeSubtreeDebris(probe_root, listed.key))
+                return true;   /// crash leftover / concurrent opener's battery — ignore ([D2])
+            if (listed.key == catalog_key)
+            {
+                has_catalog = true;
+                return true;
+            }
+            has_residual = true;   /// a non-`_probe` object, and no `_pool_meta` seen (so far)
+            return true;
+        }, Retry::standard());
     }
     catch (...)
     {
@@ -77,6 +74,8 @@ BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & l
             prefix, getCurrentExceptionMessage(/*with_stacktrace=*/false));
         return BootstrapResidual::Indeterminate;
     }
+    if (has_pool_meta)
+        return BootstrapResidual::PoolMetaPresent;
     if (has_residual)
         return BootstrapResidual::ResidualWithoutMeta;
     if (!has_catalog)
@@ -88,7 +87,7 @@ BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & l
     /// license to mint `_pool_meta`.
     try
     {
-        const auto got = backend.get(catalog_key);
+        const auto got = op.read(catalog_key, Retry::standard());
         if (!got)
             return BootstrapResidual::ResidualWithoutMeta;
 

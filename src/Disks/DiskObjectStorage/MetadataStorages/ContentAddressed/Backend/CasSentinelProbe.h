@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 
 namespace DB::Cas
@@ -9,11 +9,12 @@ namespace DB::Cas
 /// timeouts / 5xx / connection errors => Indeterminate; permission errors => AccessDenied;
 /// missing container/bucket/prefix-parent => ContainerAbsent; a clean authoritative miss => KeyAbsent.
 ///
-/// Free-function entry point (spec §2) — a thin dispatch to the backend's own typed-evidence
-/// classification (`Backend::probeSentinelRaw`; see there for the per-backend semantics: the
-/// S3-native raw HEAD error, the Local container-directory stat, or the generic head/get-based
-/// default for a backend without sharper evidence).
-SentinelProbeResult probeSentinel(Backend & backend, const String & key);
+/// Free-function entry point (spec §2) — a thin dispatch to `op`'s own typed-evidence classification
+/// (`CasOperation::probeSentinel`, which in turn reaches `Backend::probeSentinelRaw`; see there for the
+/// per-backend semantics: the S3-native raw HEAD error, the Local container-directory stat, or the
+/// generic head/get-based default for a backend without sharper evidence). `Indeterminate` is the one
+/// outcome the request contract reissues on; every other outcome is authoritative and returns at once.
+SentinelProbeResult probeSentinel(CasOperation & op, const String & key);
 
 /// Verdict of the zero-write startup bootstrap residual check ("Startup ordered vs the capability
 /// probe"). Before a writable `Pool::open` runs
@@ -50,6 +51,6 @@ enum class BootstrapResidual : uint8_t
 /// bootstraps cleanly. On non-strong-LIST backends this is the single best-effort authoritative check the
 /// weaker guarantee allows — still fail-closed on any residual object found. Used by `Pool::open` BEFORE
 /// the capability battery so that no probe write ever precedes the emptiness proof.
-BootstrapResidual probePoolBootstrapResidual(Backend & backend, const Layout & layout);
+BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & layout);
 
 }

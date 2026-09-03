@@ -3,9 +3,11 @@
 #include "config.h"
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/WriteMode.h>
@@ -33,6 +35,20 @@ namespace
 {
 
 using DB::Cas::tests::nativeKeyUnder;
+
+/// Every test here constructs one backend and probes it once or a few times; a non-owning `BackendPtr`
+/// over the test's stack-allocated backend keeps that construction pattern rather than forcing every
+/// fixture in this file onto `std::make_shared`. The open fence never trips, matching every prior call
+/// here having had no fence to enforce. `clock`, when given, drives `probeSentinel`'s reissue-on-
+/// `Indeterminate` loop off an injected clock instead of a real sleep — needed by the one test whose
+/// fault never resolves, so the loop runs its whole policy window without taking real wall-clock time.
+CasRequests makeRequests(Backend & backend, DB::Cas::tests::FakeClock * clock = nullptr)
+{
+    BackendPtr ptr(&backend, [](Backend *) {});
+    if (clock)
+        return CasRequests(std::move(ptr), Fence::open(), clock->nowFn(), clock->sleepFn());
+    return CasRequests(std::move(ptr), Fence::open());
+}
 
 /// A Backend decorator whose read/head/list all throw an untyped runtime error when armed — modelling
 /// a backend with no sharper evidence than "something went wrong" (a network timeout, a 5xx, an
@@ -78,7 +94,9 @@ TEST(CASSentinelProbe, PresentKeyReturnsPresentWithBody)
     InMemoryBackend backend;
     ASSERT_EQ(backend.putIfAbsent("k", "hello").outcome, PutOutcome::Done);
 
-    const auto result = probeSentinel(backend, "k");
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+    const auto result = probeSentinel(op, "k");
     EXPECT_EQ(result.outcome, ProbeOutcome::Present);
     ASSERT_TRUE(result.body.has_value());
     EXPECT_EQ(*result.body, "hello");
@@ -90,7 +108,9 @@ TEST(CASSentinelProbe, AbsentKeyWithContainerAliveReturnsKeyAbsent)
     InMemoryBackend backend;
     ASSERT_EQ(backend.putIfAbsent("other", "x").outcome, PutOutcome::Done);   // proves the backend is alive
 
-    const auto result = probeSentinel(backend, "missing");
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+    const auto result = probeSentinel(op, "missing");
     EXPECT_EQ(result.outcome, ProbeOutcome::KeyAbsent);
     EXPECT_FALSE(result.body.has_value());
 }
@@ -108,13 +128,16 @@ TEST(CASSentinelProbe, ContainerDirectoryRemovedReturnsContainerAbsent)
 
     ASSERT_EQ(backend.putIfAbsent("k", "hello").outcome, PutOutcome::Done);
 
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+
     /// Sanity, container alive: Present vs. KeyAbsent are genuinely distinct before we remove anything.
-    EXPECT_EQ(probeSentinel(backend, "k").outcome, ProbeOutcome::Present);
-    EXPECT_EQ(probeSentinel(backend, "missing").outcome, ProbeOutcome::KeyAbsent);
+    EXPECT_EQ(probeSentinel(op, "k").outcome, ProbeOutcome::Present);
+    EXPECT_EQ(probeSentinel(op, "missing").outcome, ProbeOutcome::KeyAbsent);
 
     std::filesystem::remove_all(storage->getCommonKeyPrefix());
 
-    const auto result = probeSentinel(backend, "k");
+    const auto result = probeSentinel(op, "k");
     EXPECT_EQ(result.outcome, ProbeOutcome::ContainerAbsent);
     EXPECT_FALSE(result.body.has_value());
 }
@@ -138,7 +161,9 @@ TEST(CASSentinelProbe, NativePresentKeyReturnsPresentWithBody)
         out->finalize();
     }
 
-    const auto result = probeSentinel(backend, key);
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+    const auto result = probeSentinel(op, key);
     EXPECT_EQ(result.outcome, ProbeOutcome::Present);
     ASSERT_TRUE(result.body.has_value());
     EXPECT_EQ(*result.body, "native body");
@@ -149,7 +174,12 @@ TEST(CASSentinelProbe, NativePresentKeyReturnsPresentWithBody)
 TEST(CASSentinelProbe, TransportErrorNeverClassifiesAsAbsent)
 {
     TransportFaultBackend backend;
-    const auto result = probeSentinel(backend, "k");
+    /// The fault never resolves, so `probeSentinel`'s reissue-on-`Indeterminate` loop runs to its whole
+    /// policy window before giving up; an injected clock keeps that instantaneous instead of real time.
+    DB::Cas::tests::FakeClock clock;
+    auto requests = makeRequests(backend, &clock);
+    auto op = requests.admit();
+    const auto result = probeSentinel(op, "k");
     EXPECT_EQ(result.outcome, ProbeOutcome::Indeterminate);
     EXPECT_FALSE(result.body.has_value());
 }
@@ -220,7 +250,9 @@ TEST(CASSentinelProbe, NativeClassifiesNoSuchKeyAsKeyAbsent)
     storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_KEY);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
 }
 
 /// A real S3 HEAD's 404 has no response body, so the SDK cannot parse a `NoSuchKey` `<Code>` and
@@ -233,7 +265,9 @@ TEST(CASSentinelProbe, NativeClassifiesResourceNotFoundAsKeyAbsent)
     storage->throwOnObjectAccess(Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
 }
 
 TEST(CASSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
@@ -242,7 +276,9 @@ TEST(CASSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
     storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_BUCKET);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
 }
 
 TEST(CASSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
@@ -251,7 +287,9 @@ TEST(CASSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
     storage->throwOnObjectAccess(Aws::S3::S3Errors::ACCESS_DENIED);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::AccessDenied);
+    auto requests = makeRequests(backend);
+    auto op = requests.admit();
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::AccessDenied);
 }
 
 TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
@@ -260,7 +298,12 @@ TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
     storage->throwOnObjectAccess(Aws::S3::S3Errors::SERVICE_UNAVAILABLE);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::Indeterminate);
+    /// Every attempt classifies Indeterminate here too, so the reissue loop runs its whole policy
+    /// window; an injected clock keeps that instantaneous instead of real time.
+    DB::Cas::tests::FakeClock clock;
+    auto requests = makeRequests(backend, &clock);
+    auto op = requests.admit();
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::Indeterminate);
 }
 
 /// Production wiring (`Pool::open`) ALWAYS wraps the real backend in `InstrumentedBackend` before
@@ -278,7 +321,9 @@ TEST(CASSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
     auto inner = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
     InstrumentedBackend instrumented(inner);
 
-    EXPECT_EQ(probeSentinel(instrumented, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
+    auto requests = makeRequests(instrumented);
+    auto op = requests.admit();
+    EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
 }
 
 #endif
