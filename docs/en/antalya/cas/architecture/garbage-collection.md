@@ -317,14 +317,19 @@ catalog entries:
 1. Read a complete `<pool_prefix>/cas/ref_catalog` snapshot and its backend token.
 2. Select one eligible `Removing` entry.
 3. Re-read `<pool_prefix>/gc/state` and verify that `lease.owner` and `lease.seq` still match the
-   values obtained in phase 1.
+   values obtained in phase 1. A mismatch here skips the write and ends the drain as a lost-authority
+   failure.
 4. Write a new catalog without that exact entry, using the catalog token as the `CAS` precondition.
-5. Re-read the catalog to determine the durable result, then continue until no eligible entry
-   remains.
+5. Re-read the catalog to determine the durable result, and re-read `<pool_prefix>/gc/state` once
+   more to confirm leadership was still held across the write. Continue until no eligible entry
+   remains; after the eligible set empties, re-read `<pool_prefix>/gc/state` a final time before
+   declaring the drain complete.
 
-The catalog row is removed by replacing the whole catalog with `CAS`; this is not a backend
-`DELETE`. The mandatory re-read distinguishes a completed removal, replacement by a new
-incarnation, and a token conflict that still left the old entry present.
+The two `<pool_prefix>/gc/state` re-reads around every write are why phase 2 issues `2N + 1` state
+`GET`s for `N` removed rows (see the [phase costs](#phase-2-costs) below). The catalog row is
+removed by replacing the whole catalog with `CAS`; this is not a backend `DELETE`. The mandatory
+catalog re-read distinguishes a completed removal, replacement by a new incarnation, and a token
+conflict that still left the old entry present.
 
 ### 2.5 Result {#phase-2-result}
 
@@ -672,6 +677,23 @@ commit is still guarded by the phase 1 `gc/state` token.
 
 The phase sends exactly one backend read and no writes. It does not send a `GET` for any
 `blob_target_runs[].key`.
+
+## The one-pass commit {#gc-state}
+
+`<pool_prefix>/gc/state` is the durable safety and round-adoption state: `round`, `gc_shards`,
+`snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, and the lease. A
+folding round publishes it with exactly one commit `CAS` in phase 13, `round_commit`; the fold
+itself performs no `CAS` of its own, and phase 1's lease `CAS` over the same object is the only
+other writer.
+
+**The fold seal *is* the coverage record**: generation, parent generation, one `ref_lives` row per
+catalog-admitted opaque life (coverage plus optional cleanup evidence), references to the
+source-edge run segments, and a per-shard condemned summary. It is encoded deterministically, so a
+replayed round produces byte-identical bytes and adopts its own output through the
+`putDeterministicArtifact` adoption pin (see the [blob-protocol page](/antalya/cas/architecture/blob-protocol#deterministic-artifacts)).
+There is **no separate retired-list object** — condemned entries ride the source-edge run as
+sentinel rows at `source_id = 0` — and **no run-file list outside the seal**; runs are resolved
+*through* the seal's references, never by key construction.
 
 ## Finding orphans {#finding-orphans}
 
