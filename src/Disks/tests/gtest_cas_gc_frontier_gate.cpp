@@ -444,7 +444,7 @@ void transferGcLease(DrainRaceBackend & backend, const Layout & layout, const UI
     state.lease.owner = new_owner;
     ++state.lease.seq;
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        op.replace(layout.gcStateKey(), encodeGcState(state), got->incarnation, Retry::once())));
+        op.replace(layout.gcStateKey(), encodeGcState(state), got->etag, Retry::once())));
 }
 
 size_t findJournalAfter(const std::vector<String> & journal, const String & entry, size_t after)
@@ -869,7 +869,7 @@ TEST(CASGCFrontierGate, AnUndecodableCheckpointAnomalySuppressesEveryDeleteFamil
     const std::optional<CkptSample> damaged_ckpt = readCkpt(op, layout, *damaged_life);
     ASSERT_TRUE(damaged_ckpt.has_value()) << "the publish must have left a `_ckpt` to damage";
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-        layout.refCkptKey(*damaged_life), "not a checkpoint", damaged_ckpt->incarnation, Retry::once())));
+        layout.refCkptKey(*damaged_life), "not a checkpoint", damaged_ckpt->etag, Retry::once())));
 
     backend->resetCounts();
     std::vector<size_t> anomaly_counts;
@@ -964,7 +964,7 @@ TEST(CASGCFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
     ASSERT_TRUE(quiet_life.has_value());
     const std::optional<CkptSample> quiet_ckpt = readCkpt(op, layout, *quiet_life);
     ASSERT_TRUE(quiet_ckpt.has_value()) << "there must be a `_ckpt` to remove";
-    ASSERT_EQ(op.remove(layout.refCkptKey(*quiet_life), quiet_ckpt->incarnation, Retry::once()),
+    ASSERT_EQ(op.remove(layout.refCkptKey(*quiet_life), quiet_ckpt->etag, Retry::once()),
               Removal::Removed);
     backend->hidePrefix(layout.namespaceStreamPrefix(*quiet_life));
 
@@ -1008,7 +1008,7 @@ TEST(CASGCFrontierGate, ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndD
     const BlobRef blob_ref = legacyMetaTestRef(blob);
     const std::optional<Meta> blob_observed = op.head(layout.blobKey(blob_ref), Retry::once());
     ASSERT_TRUE(blob_observed) << "the seeded blob body must be present before it is condemned";
-    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->incarnation);
+    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->etag);
     injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
     store->renewWatermarkOnce();
@@ -1097,7 +1097,7 @@ TEST(CASGCFrontierGate, AZeroWalkableFrontierWithACreatingCatalogRowIsNotProvedE
     const BlobRef blob_ref = legacyMetaTestRef(blob);
     const std::optional<Meta> blob_observed = op.head(layout.blobKey(blob_ref), Retry::once());
     ASSERT_TRUE(blob_observed) << "the seeded blob body must be present before it is condemned";
-    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->incarnation);
+    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->etag);
     injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
     store->renewWatermarkOnce();
@@ -1144,7 +1144,7 @@ TEST(CASGCFrontierGate, AnAbsentCatalogNeverReadsAsAnEmptyUniverse)
     OperationForTest raw_op(*backend);
     const auto catalog_head = (*raw_op).head(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(catalog_head.has_value());
-    ASSERT_EQ((*raw_op).remove(layout.refCatalogKey(), catalog_head->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_EQ((*raw_op).remove(layout.refCatalogKey(), catalog_head->etag, Retry::once()), Removal::Removed);
 
     Gc gc(store, kGc);
     backend->resetCounts();
@@ -1228,7 +1228,7 @@ TEST(CASGCFrontierGate, AMalformedCatalogNeverDecodesIntoAnEmptyProof)
         const auto bootstrap_head = (*raw_op).head(layout.refCatalogKey(), Retry::once());
         ASSERT_TRUE(bootstrap_head.has_value()) << c.name;
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            (*raw_op).replace(layout.refCatalogKey(), c.bytes, bootstrap_head->incarnation, Retry::once()))) << c.name;
+            (*raw_op).replace(layout.refCatalogKey(), c.bytes, bootstrap_head->etag, Retry::once()))) << c.name;
 
         Gc gc(store, kGc);
         backend->resetCounts();
@@ -1258,7 +1258,7 @@ TEST(CASGCFrontierGate, AProvedEmptyCatalogUnderStageASuppressedStaysSuppressed)
     CasOperation op = requests.admit();
     const std::optional<Meta> blob_observed = op.head(layout.blobKey(blob_ref), Retry::once());
     ASSERT_TRUE(blob_observed) << "the seeded blob body must be present before it is condemned";
-    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->incarnation);
+    const PersistedEtag blob_token = PersistedEtag::capture(blob_observed->etag);
     injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
     store->renewWatermarkOnce();
@@ -1326,7 +1326,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
     store->renewWatermarkOnce();
     const auto condemned_head = op.head(key, Retry::once());
     ASSERT_TRUE(condemned_head.has_value());
-    const Etag condemned_token = condemned_head->incarnation;
+    const Etag condemned_token = condemned_head->etag;
     const auto condemned_meta = loadMetaForTest(*backend, layout, hash);
     ASSERT_TRUE(condemned_meta.has_value());
     ASSERT_EQ(condemned_meta->meta.state, MetaState::Condemned)
@@ -1383,7 +1383,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
         EXPECT_EQ(uploaded.ref, id);
         const auto fresh_head = op.head(key, Retry::once());
         ASSERT_TRUE(fresh_head.has_value());
-        fresh_token = fresh_head->incarnation;
+        fresh_token = fresh_head->etag;
         EXPECT_NE(*fresh_token, condemned_token)
             << "the writer must have observed Condemned and resurrected -- a fresh token, not an adopt "
                "of the dying incarnation";
@@ -1400,7 +1400,7 @@ TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlob
     EXPECT_TRUE(surviving_head.has_value())
         << "the resurrected incarnation must survive round R's delete";
     ASSERT_TRUE(fresh_token.has_value());
-    EXPECT_EQ(surviving_head->incarnation, *fresh_token) << "and it is still the writer's incarnation";
+    EXPECT_EQ(surviving_head->etag, *fresh_token) << "and it is still the writer's incarnation";
     EXPECT_EQ(op.remove(key, condemned_token, Retry::once()), Removal::Mismatch)
         << "the condemned token can never remove the fresh object (INV_NO_LOSS)";
 
@@ -1743,7 +1743,7 @@ TEST(CASGCFrontierGate, CheckpointFrontierBehindAnInheritedCursorFailsClosed)
         .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->incarnation, Retry::once())));
+    }), checkpoint_head->etag, Retry::once())));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -1797,7 +1797,7 @@ TEST(CASGCFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = RefTxnId{1, 2},
-    }), checkpoint_head->incarnation, Retry::once())));
+    }), checkpoint_head->etag, Retry::once())));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -1887,7 +1887,7 @@ TEST(CASGCFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->incarnation, Retry::once())));
+    }), checkpoint_head->etag, Retry::once())));
     backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
 
     runRegularRoundReclaiming(gc);
@@ -2080,7 +2080,7 @@ TEST(CASGCFrontierGate, MissingCommittedCheckpointLogHoldsInsteadOfProvingTheFro
     const String missing_key = layout.refLogKey(life, RefTxnId{1, 2});
     const auto missing_head = op.head(missing_key, Retry::once());
     ASSERT_TRUE(missing_head.has_value());
-    ASSERT_EQ(op.remove(missing_key, missing_head->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_EQ(op.remove(missing_key, missing_head->etag, Retry::once()), Removal::Removed);
 
     std::map<String, UInt64> intake;
     Gc gc(store, kGc);
@@ -2203,7 +2203,7 @@ TEST(CASGCFrontierGate, EmptyCheckpointFrontierRejectsAnInheritedCursor)
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
-    }), checkpoint_head->incarnation, Retry::once())));
+    }), checkpoint_head->etag, Retry::once())));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -2517,7 +2517,7 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     OperationForTest raw_op(*backend);
     const auto condemned_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(condemned_head.has_value());
-    const Etag condemned_token = condemned_head->incarnation;
+    const Etag condemned_token = condemned_head->etag;
     const auto condemned_meta = loadMetaForTest(*backend, layout, hash);
     ASSERT_TRUE(condemned_meta.has_value());
     ASSERT_EQ(condemned_meta->meta.state, MetaState::Condemned)
@@ -2537,7 +2537,7 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     build->promote(ns, "republished", build->buildId(), republished_manifest);
     const auto fresh_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(fresh_head.has_value());
-    const Etag fresh_token = fresh_head->incarnation;
+    const Etag fresh_token = fresh_head->etag;
     ASSERT_NE(fresh_token, condemned_token) << "republication must displace the condemned incarnation";
 
     /// GC's delayed delete still names the OLD token. It cannot touch the new object.
@@ -2546,7 +2546,7 @@ TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     const auto surviving_head = (*raw_op).head(key, Retry::once());
     ASSERT_TRUE(surviving_head.has_value())
         << "the resurrected incarnation survives the delete published against its predecessor";
-    EXPECT_EQ(surviving_head->incarnation, fresh_token) << "and it is still the writer's incarnation";
+    EXPECT_EQ(surviving_head->etag, fresh_token) << "and it is still the writer's incarnation";
     EXPECT_EQ((*raw_op).remove(key, condemned_token, Retry::once()), Removal::Mismatch)
         << "the condemned token can never remove the fresh object (INV-NO-RETURN)";
 }
@@ -2938,7 +2938,7 @@ TEST(CASGCFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDe
     parent.ref_lives.emplace(unmatched_life, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{9, 9}}});
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*raw_op).replace(parent_seal_key, encodeFoldSeal(parent), parent_object->incarnation, Retry::once())));
+        (*raw_op).replace(parent_seal_key, encodeFoldSeal(parent), parent_object->etag, Retry::once())));
 
     dropRefTransition(*backend, layout, ns, "victim", mref);
     const uint64_t events_before =
@@ -3134,7 +3134,7 @@ TEST(CASGCFrontierGate, ADeposedLeaderErasesNoCatalogRow)
         stolen.lease.owner = hexToU128("00000000000000000000000000000099");
         ++stolen.lease.seq;
         ASSERT_TRUE(std::holds_alternative<Committed>(
-            op.replace(layout.gcStateKey(), encodeGcState(stolen), got->incarnation, Retry::once())));
+            op.replace(layout.gcStateKey(), encodeGcState(stolen), got->etag, Retry::once())));
     };
 
     Gc gc(store, kGc);
@@ -3180,7 +3180,7 @@ TEST(CASGCFrontierGate, ALeaderDeposedBetweenTwoErasesStopsAfterTheFirst)
         stolen.lease.owner = hexToU128("00000000000000000000000000000099");
         ++stolen.lease.seq;
         EXPECT_TRUE(std::holds_alternative<Committed>(
-            op.replace(layout.gcStateKey(), encodeGcState(stolen), got->incarnation, Retry::once())));
+            op.replace(layout.gcStateKey(), encodeGcState(stolen), got->etag, Retry::once())));
     });
 
     Gc gc(store, kGc);
@@ -3527,9 +3527,9 @@ TEST_P(CASGCCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
             .last_epoch_seal = std::nullopt,
         }), Retry::once());
     }
-    ASSERT_TRUE(observed.incarnation);
+    ASSERT_TRUE(observed.etag);
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-        layout.refCatalogKey(), encodeRefCatalog(winner_catalog), *observed.incarnation, Retry::once())));
+        layout.refCatalogKey(), encodeRefCatalog(winner_catalog), *observed.etag, Retry::once())));
 
     backend->clearJournal();
     const uint64_t plans_before  /// NOLINT(clang-analyzer-deadcode.DeadStores)
