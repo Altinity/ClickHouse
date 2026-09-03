@@ -203,7 +203,7 @@ ReadyFixture makeReadyFixture()
         seed_op, f.store->layout().foldSealKey(new_generation, new_attempt), encodeFoldSeal(seal));
     state.snap_generation = new_generation;
     state.snap_attempt = new_attempt;
-    seed_op.replace(f.store->layout().gcStateKey(), encodeGcState(state), state_got->incarnation, Retry::standard());
+    seed_op.replace(f.store->layout().gcStateKey(), encodeGcState(state), state_got->etag, Retry::standard());
 
     f.backend->watched_manifest_key = f.store->layout().manifestKey(f.candidate);
     f.backend->watched_source_id = sourceEdgeId(f.candidate, "blob-0");
@@ -256,7 +256,7 @@ TEST(CASOrphanNomination, CorruptManifestIsRetainedAndSurfaced)
     DB::Cas::tests::OperationForTest op(f.backend);
     const auto got = (*op).read(f.backend->watched_manifest_key, Retry::standard());
     ASSERT_TRUE(got.has_value());
-    (*op).replace(f.backend->watched_manifest_key, "not a sealed manifest", got->incarnation, Retry::standard());
+    (*op).replace(f.backend->watched_manifest_key, "not a sealed manifest", got->etag, Retry::standard());
 
     std::optional<GcPhaseRecord> orphan_sweep;
     f.gc->setPhaseSink([&](const GcPhaseRecord & rec) { if (rec.phase == "orphan_sweep") orphan_sweep = rec; });
