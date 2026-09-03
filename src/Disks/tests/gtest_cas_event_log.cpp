@@ -358,7 +358,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
             ASSERT_TRUE(observed.has_value());
             MountLease foreign = decodeMountLease(observed->bytes);
             foreign.server_uuid = UInt128(100 + index);
-            ASSERT_TRUE(backends[index]->replaceForTest(key, encodeMountLease(foreign), observed->incarnation));
+            ASSERT_TRUE(backends[index]->replaceForTest(key, encodeMountLease(foreign), observed->etag));
         }
     }
     /// The deepest slot is the only one nobody took, so its renewal can recover: the attempt is lost
