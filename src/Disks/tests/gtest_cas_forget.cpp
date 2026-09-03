@@ -60,7 +60,7 @@ void deleteKeyExact(DB::Cas::Backend & backend, const String & key)
     const auto got = (*op).read(key, DB::Cas::Retry::once());
     ASSERT_TRUE(got.has_value()) << "expected '" << key << "' to exist before deletion";
     if (got)
-        (*op).remove(key, got->incarnation, DB::Cas::Retry::once());
+        (*op).remove(key, got->etag, DB::Cas::Retry::once());
 }
 
 /// GC's fence-out applied directly to the mount lease (preserve the body, set `gc_fenced`, bump `seq`) —
@@ -75,7 +75,7 @@ void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
     m.gc_fenced = true;
     m.seq += 1;
     ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(
-        (*op).replace(mount_key, DB::Cas::encodeMountLease(m), got->incarnation, DB::Cas::Retry::once())));
+        (*op).replace(mount_key, DB::Cas::encodeMountLease(m), got->etag, DB::Cas::Retry::once())));
 }
 
 /// A Backend decorator whose reads, heads and lists throw an untyped transport error while `fail` is
@@ -447,7 +447,7 @@ TEST(CASForget, ForgetIntentBlocksNaturalReplacedPromotion)
     DB::Cas::PoolMeta foreign = DB::Cas::decodePoolMeta(got->bytes);
     foreign.pool_id = foreign.pool_id + DB::UInt128(1);
     ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(
-        (*op).replace(meta_key, DB::Cas::encodePoolMeta(foreign), got->incarnation, DB::Cas::Retry::once())));
+        (*op).replace(meta_key, DB::Cas::encodePoolMeta(foreign), got->etag, DB::Cas::Retry::once())));
 
     /// The in-flight gate (run from the GC-stop callback) reaches the `Replaced` verdict but must BAIL on the
     /// already-published intent rather than settle `Vanished(replaced)`.
