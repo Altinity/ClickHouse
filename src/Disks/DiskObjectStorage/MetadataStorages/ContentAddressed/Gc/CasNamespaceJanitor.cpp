@@ -6,33 +6,33 @@
 namespace DB::Cas
 {
 
-NamespaceJanitorResult NamespaceJanitor::runOnePage(
-    bool suppress_deletes, const std::function<bool()> & fence_held)
+NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liveness liveness)
 {
     NamespaceJanitorResult result;
-    const GcMaintenanceReadResult progress = readGcMaintenanceState(backend, layout);
+    CasOperation op = requests.admit(std::move(liveness));
+    const GcMaintenanceReadResult progress = readGcMaintenanceState(op, layout);
     if (progress.status == GcMaintenanceReadStatus::Corrupt)
     {
         result.anomalies.push_back(progress.diagnostic);
-        (void)casGcMaintenanceState(backend, layout, progress.token, GcMaintenanceState{});
+        (void)casGcMaintenanceState(op, layout, progress.incarnation, GcMaintenanceState{}, Retry::standard());
         return result;
     }
 
     const String cursor = progress.state ? progress.state->janitor_cursor : String{};
-    ListPage page;
+    KeyPage page;
     try
     {
-        page = backend.list(layout.namespaceRootPrefix(), cursor, page_budget);
+        page = op.list(layout.namespaceRootPrefix(), cursor, page_budget, Retry::standard());
     }
     catch (...)
     {
-        (void)casGcMaintenanceState(backend, layout, progress.token, GcMaintenanceState{});
+        (void)casGcMaintenanceState(op, layout, progress.incarnation, GcMaintenanceState{}, Retry::once());
         throw;
     }
     result.pages = 1;
     result.keys = page.keys.size();
 
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(backend, layout);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     bool ambiguous = false;
     try
     {
@@ -51,7 +51,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
     /// outcomes and therefore do not by themselves prevent progress.
     bool page_decided = !ambiguous && !suppress_deletes;
 
-    for (const ListedKey & listed : page.keys)
+    for (const KeyEntry & listed : page.keys)
     {
         std::optional<NamespaceLifePhysicalId> life_id;
         try
@@ -83,15 +83,15 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
         if (ambiguous || suppress_deletes || catalog_cut.life_index.resolve(*life_id))
             continue;
 
-        std::optional<Token> token = listed.token;
-        if (!token)
+        std::optional<Incarnation> incarnation = listed.incarnation;
+        if (!incarnation)
         {
             try
             {
-                const HeadResult current = backend.head(listed.key);
-                if (!current.exists)
+                const std::optional<Meta> current = op.head(listed.key, Retry::standard());
+                if (!current)
                     continue;
-                token = current.token;
+                incarnation = current->incarnation;
             }
             catch (const std::exception & e)
             {
@@ -101,14 +101,14 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
                 continue;
             }
         }
-        if (!fence_held())
+        if (!op.admitted())
         {
             page_decided = false;
             break;
         }
         try
         {
-            if (backend.deleteExact(listed.key, *token).kind == DeleteOutcome::Kind::Deleted)
+            if (op.remove(listed.key, *incarnation, Retry::standard()) == Removal::Removed)
                 ++result.deleted;
         }
         catch (const std::exception & e)
@@ -122,7 +122,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
     /// Recheck even when the page had no dead candidate. A tenure that observes fence loss after LIST
     /// or after the last exact delete must not publish progress. Loss after this check may still race
     /// with the leak-only maintenance CAS; already completed exact deletes remain safe to repeat.
-    if (page_decided && !fence_held())
+    if (page_decided && !op.admitted())
         page_decided = false;
 
     if (page_decided)
@@ -130,7 +130,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
         const GcMaintenanceState next{.janitor_cursor = page.next_cursor};
         try
         {
-            (void)casGcMaintenanceState(backend, layout, progress.token, next);
+            (void)casGcMaintenanceState(op, layout, progress.incarnation, next, Retry::standard());
         }
         catch (const std::exception & e)
         {

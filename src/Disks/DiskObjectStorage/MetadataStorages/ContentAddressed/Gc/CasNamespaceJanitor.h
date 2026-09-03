@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <functional>
 #include <vector>
@@ -20,13 +20,16 @@ struct NamespaceJanitorResult
 class NamespaceJanitor
 {
 public:
-    NamespaceJanitor(Backend & backend_, const Layout & layout_, size_t page_budget_)
-        : backend(backend_), layout(layout_), page_budget(page_budget_) {}
+    NamespaceJanitor(CasRequests & requests_, const Layout & layout_, size_t page_budget_)
+        : requests(requests_), layout(layout_), page_budget(page_budget_) {}
 
-    NamespaceJanitorResult runOnePage(bool suppress_deletes, const std::function<bool()> & fence_held);
+    /// `liveness` is admitted once for the whole page (one `CasOperation` covers the read, the list,
+    /// every delete and the cursor publication): a fact the fence cannot see, such as "this tenure
+    /// still holds the GC round's own lease" -- see `CasRequests::admit`.
+    NamespaceJanitorResult runOnePage(bool suppress_deletes, Liveness liveness);
 
 private:
-    Backend & backend;
+    CasRequests & requests;
     const Layout & layout;
     size_t page_budget;
 };

@@ -18,7 +18,7 @@ namespace
 class FailingMaintenanceReadBackend : public InMemoryBackend
 {
 public:
-    std::optional<GetResult> get(const String &, Range) override
+    std::optional<DB::Cas::Backend::Raw> read(const String &, DB::Cas::TransportAccess &) override
     {
         throw std::runtime_error("injected maintenance read failure");
     }
@@ -100,115 +100,138 @@ TEST(CASGCMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
 
 TEST(CASGCMaintenanceState, ReadsAndCasWithoutAdoptingConflicts)
 {
-    InMemoryBackend backend;
+    auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests requests(backend, Fence::open());
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
-    const GcMaintenanceReadResult absent = readGcMaintenanceState(backend, layout);
+    auto op = requests.admit();
+
+    const GcMaintenanceReadResult absent = readGcMaintenanceState(op, layout);
     EXPECT_EQ(absent.status, GcMaintenanceReadStatus::Absent);
     EXPECT_FALSE(absent.state);
-    EXPECT_FALSE(absent.token);
+    EXPECT_FALSE(absent.incarnation);
 
     const GcMaintenanceState first{.janitor_cursor = "cas/ns/first"};
-    const GcMaintenanceCasResult created = casGcMaintenanceState(backend, layout, std::nullopt, first);
-    EXPECT_EQ(created.outcome, GcMaintenanceCasOutcome::Committed);
-    const GcMaintenanceReadResult valid = readGcMaintenanceState(backend, layout);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        casGcMaintenanceState(op, layout, std::nullopt, first, Retry::standard())));
+    const GcMaintenanceReadResult valid = readGcMaintenanceState(op, layout);
     ASSERT_EQ(valid.status, GcMaintenanceReadStatus::Valid);
-    ASSERT_TRUE(valid.token);
+    ASSERT_TRUE(valid.incarnation);
     ASSERT_TRUE(valid.state);
     EXPECT_EQ(*valid.state, first);
 
-    const GcMaintenanceCasResult advanced = casGcMaintenanceState(backend, layout, valid.token,
-        GcMaintenanceState{.janitor_cursor = "cas/ns/advanced"});
-    ASSERT_EQ(advanced.outcome, GcMaintenanceCasOutcome::Committed);
-    const auto advanced_body = backend.get(key);
-    ASSERT_TRUE(advanced_body);
+    const WriteResult advanced = casGcMaintenanceState(op, layout, valid.incarnation,
+        GcMaintenanceState{.janitor_cursor = "cas/ns/advanced"}, Retry::standard());
+    ASSERT_TRUE(std::holds_alternative<Committed>(advanced));
+    const Incarnation advanced_incarnation = std::get<Committed>(advanced).incarnation;
 
-    ASSERT_EQ(backend.casPut(key, encodeGcMaintenanceState({.janitor_cursor = "winner"}), advanced_body->token).outcome,
-        CasOutcome::Committed);
-    const GcMaintenanceCasResult conflict = casGcMaintenanceState(backend, layout, valid.token,
-        GcMaintenanceState{.janitor_cursor = "loser"});
-    EXPECT_EQ(conflict.outcome, GcMaintenanceCasOutcome::Conflict);
-    EXPECT_EQ(decodeGcMaintenanceState(backend.get(key)->bytes).janitor_cursor, "winner");
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(key, encodeGcMaintenanceState({.janitor_cursor = "winner"}), advanced_incarnation, Retry::standard())));
+    const WriteResult conflict = casGcMaintenanceState(op, layout, valid.incarnation,
+        GcMaintenanceState{.janitor_cursor = "loser"}, Retry::standard());
+    EXPECT_TRUE(std::holds_alternative<Conflict>(conflict));
+    EXPECT_EQ(decodeGcMaintenanceState(backend->get(key)->bytes).janitor_cursor, "winner");
 }
 
 TEST(CASGCMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
 {
-    InMemoryBackend backend;
+    auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests requests(backend, Fence::open());
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
-    ASSERT_EQ(backend.putIfAbsent(key, "malformed").outcome, PutOutcome::Done);
-    const GcMaintenanceReadResult corrupt = readGcMaintenanceState(backend, layout);
+    auto op = requests.admit();
+
+    ASSERT_EQ(backend->putIfAbsent(key, "malformed").outcome, PutOutcome::Done);
+    const GcMaintenanceReadResult corrupt = readGcMaintenanceState(op, layout);
     ASSERT_EQ(corrupt.status, GcMaintenanceReadStatus::Corrupt);
-    ASSERT_TRUE(corrupt.token);
+    ASSERT_TRUE(corrupt.incarnation);
     EXPECT_FALSE(corrupt.state);
     EXPECT_FALSE(corrupt.diagnostic.empty());
-    ASSERT_EQ(casGcMaintenanceState(backend, layout, corrupt.token, {}).outcome, GcMaintenanceCasOutcome::Committed);
-    EXPECT_EQ(decodeGcMaintenanceState(backend.get(key)->bytes), GcMaintenanceState{});
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        casGcMaintenanceState(op, layout, corrupt.incarnation, {}, Retry::standard())));
+    EXPECT_EQ(decodeGcMaintenanceState(backend->get(key)->bytes), GcMaintenanceState{});
 }
 
 TEST(CASGCMaintenanceState, UsesExactlyOneReadOrCasAttempt)
 {
-    DB::Cas::tests::CountingBackend backend;
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    CasRequests requests(backend, Fence::open());
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
-    EXPECT_EQ(readGcMaintenanceState(backend, layout).status, GcMaintenanceReadStatus::Absent);
-    EXPECT_EQ(backend.getCount(key), 1u);
+    auto op = requests.admit();
 
-    backend.resetCounts();
-    ASSERT_EQ(casGcMaintenanceState(backend, layout, std::nullopt, {}).outcome,
-        GcMaintenanceCasOutcome::Committed);
-    EXPECT_EQ(backend.casPutCount(key), 1u);
-    EXPECT_EQ(backend.getCount(key), 0u);
+    EXPECT_EQ(readGcMaintenanceState(op, layout).status, GcMaintenanceReadStatus::Absent);
+    EXPECT_EQ(backend->readRequestCount(key), 1u);
 
-    backend.resetCounts();
-    EXPECT_EQ(casGcMaintenanceState(backend, layout, std::nullopt,
-        GcMaintenanceState{.janitor_cursor = "loser"}).outcome, GcMaintenanceCasOutcome::Conflict);
-    EXPECT_EQ(backend.casPutCount(key), 1u);
-    EXPECT_EQ(backend.getCount(key), 0u);
+    backend->resetCounts();
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        casGcMaintenanceState(op, layout, std::nullopt, {}, Retry::standard())));
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->readRequestCount(key), 0u);
 
-    const auto current = backend.get(key);
+    backend->resetCounts();
+    const WriteResult loser_attempt = casGcMaintenanceState(op, layout, std::nullopt,
+        GcMaintenanceState{.janitor_cursor = "loser"}, Retry::standard());
+    ASSERT_TRUE(std::holds_alternative<Conflict>(loser_attempt));
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    /// Unlike the legacy CAS, a refused precondition is settled by ONE exact read before the write
+    /// reports the conflict -- `Conflict`'s observation needs to know what is actually there.
+    EXPECT_EQ(backend->readRequestCount(key), 1u);
+
+    const std::optional<Object> current = op.read(key, Retry::standard());
     ASSERT_TRUE(current);
-    ASSERT_EQ(backend.casPut(key, encodeGcMaintenanceState({.janitor_cursor = "winner"}), current->token).outcome,
-        CasOutcome::Committed);
-    backend.resetCounts();
-    EXPECT_EQ(casGcMaintenanceState(backend, layout, current->token,
-        GcMaintenanceState{.janitor_cursor = "stale"}).outcome, GcMaintenanceCasOutcome::Conflict);
-    EXPECT_EQ(backend.casPutCount(key), 1u);
-    EXPECT_EQ(backend.getCount(key), 0u);
-    EXPECT_EQ(decodeGcMaintenanceState(backend.InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(key, encodeGcMaintenanceState({.janitor_cursor = "winner"}), current->incarnation, Retry::standard())));
+
+    backend->resetCounts();
+    const WriteResult stale_attempt = casGcMaintenanceState(op, layout, current->incarnation,
+        GcMaintenanceState{.janitor_cursor = "stale"}, Retry::standard());
+    ASSERT_TRUE(std::holds_alternative<Conflict>(stale_attempt));
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->readRequestCount(key), 1u);
+    EXPECT_EQ(decodeGcMaintenanceState(backend->InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
 }
 
 TEST(CASGCMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
 {
-    DB::Cas::tests::CountingBackend backend;
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    CasRequests requests(backend, Fence::open());
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
-    ASSERT_EQ(backend.putIfAbsent(key, fmt::format(
+    auto op = requests.admit();
+
+    ASSERT_EQ(backend->putIfAbsent(key, fmt::format(
         "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"janitor_cursor\":\"\"}}\n", currentCompatibilityVersion() + 1)).outcome,
         PutOutcome::Done);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [&] { (void)readGcMaintenanceState(backend, layout); });
-    EXPECT_EQ(backend.casPutCount(key), 0u);
+        [&] { (void)readGcMaintenanceState(op, layout); });
+    EXPECT_EQ(backend->writeRequests(), 0u);
 
-    FailingMaintenanceReadBackend failing;
-    EXPECT_THROW((void)readGcMaintenanceState(failing, layout), std::runtime_error);
+    auto failing = std::make_shared<FailingMaintenanceReadBackend>();
+    CasRequests failing_requests(failing, Fence::open());
+    auto failing_op = failing_requests.admit();
+    EXPECT_THROW((void)readGcMaintenanceState(failing_op, layout), std::runtime_error);
 }
 
 TEST(CASGCMaintenanceState, LosingCorruptResetPreservesConcurrentWinner)
 {
-    DB::Cas::tests::CountingBackend backend;
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    CasRequests requests(backend, Fence::open());
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
-    ASSERT_EQ(backend.putIfAbsent(key, "corrupt").outcome, PutOutcome::Done);
-    const auto corrupt = readGcMaintenanceState(backend, layout);
+    auto op = requests.admit();
+
+    ASSERT_EQ(backend->putIfAbsent(key, "corrupt").outcome, PutOutcome::Done);
+    const GcMaintenanceReadResult corrupt = readGcMaintenanceState(op, layout);
     ASSERT_EQ(corrupt.status, GcMaintenanceReadStatus::Corrupt);
-    ASSERT_TRUE(corrupt.token);
-    ASSERT_EQ(backend.casPut(key, encodeGcMaintenanceState({.janitor_cursor = "winner"}), corrupt.token).outcome,
-        CasOutcome::Committed);
-    backend.resetCounts();
-    EXPECT_EQ(casGcMaintenanceState(backend, layout, corrupt.token, {}).outcome,
-        GcMaintenanceCasOutcome::Conflict);
-    EXPECT_EQ(backend.casPutCount(key), 1u);
-    EXPECT_EQ(backend.getCount(key), 0u);
-    EXPECT_EQ(decodeGcMaintenanceState(backend.InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
+    ASSERT_TRUE(corrupt.incarnation);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        op.replace(key, encodeGcMaintenanceState({.janitor_cursor = "winner"}), *corrupt.incarnation, Retry::standard())));
+
+    backend->resetCounts();
+    const WriteResult reset_attempt = casGcMaintenanceState(op, layout, corrupt.incarnation, {}, Retry::standard());
+    ASSERT_TRUE(std::holds_alternative<Conflict>(reset_attempt));
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->readRequestCount(key), 1u);
+    EXPECT_EQ(decodeGcMaintenanceState(backend->InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
 }
