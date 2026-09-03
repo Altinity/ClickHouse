@@ -160,7 +160,11 @@ Pipe StorageSystemContentAddressedMounts::read(
             bool list_ok = true;
             try
             {
-                mounts = Cas::listMounts(store->backend(), store->layout(), now_ms, skew_margin_ms);
+                /// Introspection reads on the open fence: a row describing this disk's mount slots must
+                /// still be produced when the local mount fence has already run down -- that is exactly
+                /// the state an operator opens this table to look at.
+                Cas::CasOperation op = store->gcRequests().admit();
+                mounts = Cas::listMounts(op, store->layout(), now_ms, skew_margin_ms);
             }
             catch (...)
             {
