@@ -97,6 +97,13 @@ def default_clickhouse_native_conn_args():
             "cast_keep_nullable": 1,
             "prefer_column_name_to_alias": 1,
             "aggregate_functions_null_for_empty": 1,
+            # Spill early and run each query single-threaded so concurrent
+            # workers stay under the FUNC_TESTER_ARM ~25 GiB server memory cap.
+            "max_bytes_before_external_group_by": 128 * 1024 * 1024,
+            "max_bytes_before_external_sort": 128 * 1024 * 1024,
+            "max_bytes_ratio_before_external_group_by": 0.0,
+            "max_bytes_ratio_before_external_sort": 0.0,
+            "max_threads": 1,
         }
     )
 
