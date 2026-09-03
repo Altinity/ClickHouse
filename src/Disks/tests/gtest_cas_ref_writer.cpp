@@ -270,7 +270,7 @@ uint64_t allocateWriterEpochForTest(const BackendPtr & backend, const Layout & l
 
 /// A fixture enumeration on an open fence: the primitive `list` override in this file's test backend
 /// hides the legacy name, and a test walking a prefix should ride the same engine production does.
-KeyPage listForTest(const BackendPtr & backend, const String & prefix, const String & cursor, size_t limit)
+ListPage listForTest(const BackendPtr & backend, const String & prefix, const String & cursor, size_t limit)
 {
     CasRequests requests(backend, Fence::open());
     CasOperation op = requests.admit();
@@ -315,9 +315,9 @@ CatalogEntry replaceCatalogLifeForRuntimeRace(
     {
         return entry.ns == predecessor.ns && entry.incarnation == predecessor.incarnation;
     });
-    if (!before_delete.incarnation
+    if (!before_delete.etag
         || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(without_predecessor),
-                           *before_delete.incarnation))
+                           *before_delete.etag))
         throw std::runtime_error("test failed to retire exact predecessor catalog life");
 
     CatalogEntry successor{
@@ -328,8 +328,8 @@ CatalogEntry replaceCatalogLifeForRuntimeRace(
     const CasRefCatalog::Snapshot after_delete = readCatalogForTest(backend, layout);
     RefCatalog reborn = after_delete.catalog;
     reborn.entries.push_back(successor);
-    if (!after_delete.incarnation
-        || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(reborn), *after_delete.incarnation))
+    if (!after_delete.etag
+        || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(reborn), *after_delete.etag))
         throw std::runtime_error("test failed to publish successor catalog life");
     return successor;
 }
@@ -345,8 +345,8 @@ std::optional<RefTxnId> listGreatestLogIdForLifeForTest(
     String cursor;
     for (;;)
     {
-        const KeyPage page = (*op).list(layout.namespaceStreamPrefix(life), cursor, 1000, Retry::standard());
-        for (const KeyEntry & listed : page.keys)
+        const ListPage page = (*op).list(layout.namespaceStreamPrefix(life), cursor, 1000, Retry::standard());
+        for (const ListedKey & listed : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(listed.key);
             if (parsed && parsed->life_id == life.incarnation && parsed->kind == RefObjectKind::Log
@@ -411,8 +411,8 @@ RefTableState independentFullReplayForTest(Backend & backend, const Layout & lay
     String cursor;
     for (;;)
     {
-        const KeyPage page = (*op).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
-        for (const KeyEntry & lk : page.keys)
+        const ListPage page = (*op).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
+        for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
             if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log
@@ -443,8 +443,8 @@ std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const L
     String cursor;
     for (;;)
     {
-        const KeyPage page = (*op).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
-        for (const KeyEntry & lk : page.keys)
+        const ListPage page = (*op).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
+        for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
             if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Snap
@@ -925,7 +925,7 @@ TEST(CASRefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->incarnation, catalog_before->incarnation);
+    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
 }
 
 TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocalInvalidation)
@@ -1124,7 +1124,7 @@ TEST(CASRefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->incarnation, catalog_before->incarnation);
+    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
 }
 
 TEST(CASRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
@@ -1146,7 +1146,7 @@ TEST(CASRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
     const auto catalog_after = readOf(backend, layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
     EXPECT_EQ(catalog_after->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after->incarnation, catalog_before->incarnation);
+    EXPECT_EQ(catalog_after->etag, catalog_before->etag);
 }
 
 /// A table born by a log tail alone (no snapshot yet): `namespace_birth` with nothing else is a legal
@@ -1333,7 +1333,7 @@ TEST(CASRefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
             .life_epoch = 1,
             .committed_through = RefTxnId{1, 20},
             .checkpoint_snapshot_id = snap_y,
-            .last_epoch_seal = std::nullopt}), before->incarnation, Retry::standard())));
+            .last_epoch_seal = std::nullopt}), before->etag, Retry::standard())));
     };
 
     backend->resetCounts();
@@ -1928,7 +1928,7 @@ TEST(CASRefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemou
     {
         CasRequests requests(backend, Fence::open());
         CasOperation op = requests.admit();
-        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(fenced_mount), mount->incarnation, Retry::standard())));
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(fenced_mount), mount->etag, Retry::standard())));
     }
     ASSERT_TRUE(store->tryRemountOnce());
 
@@ -2095,8 +2095,8 @@ TEST(CASAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
         String cursor;
         for (;;)
         {
-            const KeyPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
-            for (const KeyEntry & lk : page.keys)
+            const ListPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
+            for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
                 if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log)
@@ -2192,7 +2192,7 @@ TEST(CASRefWriteContract, CommittedSurfacesTheIncarnationFromTheWriteAndFromTheS
     CasOperation reader = requests.admit();
     const auto observed = reader.head("k1", Retry::standard());
     ASSERT_TRUE(observed.has_value());
-    EXPECT_EQ(direct_committed->incarnation, observed->incarnation)
+    EXPECT_EQ(direct_committed->etag, observed->etag)
         << "the direct-commit incarnation is the write's own response";
 
     /// The write of `k2` lands and its response is lost: the settling read proves the commit, and the
@@ -2206,7 +2206,7 @@ TEST(CASRefWriteContract, CommittedSurfacesTheIncarnationFromTheWriteAndFromTheS
     CasOperation second_reader = requests.admit();
     const auto second_observed = second_reader.head("k2", Retry::standard());
     ASSERT_TRUE(second_observed.has_value());
-    EXPECT_EQ(resolved_committed->incarnation, second_observed->incarnation)
+    EXPECT_EQ(resolved_committed->etag, second_observed->etag)
         << "the resolve-commit incarnation is the observed one";
 }
 
@@ -2408,7 +2408,7 @@ TEST(CASRefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameR
         << "a stale publisher recreated the retired predecessor snapshot";
     const auto predecessor_ckpt_after_resume = readOf(backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after_resume);
-    EXPECT_EQ(predecessor_ckpt_after_resume->incarnation, predecessor_ckpt_before_resume->incarnation)
+    EXPECT_EQ(predecessor_ckpt_after_resume->etag, predecessor_ckpt_before_resume->etag)
         << "a stale publisher replaced the retired predecessor checkpoint";
     EXPECT_EQ(predecessor_ckpt_after_resume->bytes, predecessor_ckpt_before_resume->bytes)
         << "a stale publisher changed the retired predecessor checkpoint";
@@ -2496,7 +2496,7 @@ TEST(CASRefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapsh
 
     const auto predecessor_ckpt_after_resume = readOf(backend, layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_after_resume);
-    EXPECT_EQ(predecessor_ckpt_after_resume->incarnation, predecessor_ckpt_before_resume->incarnation);
+    EXPECT_EQ(predecessor_ckpt_after_resume->etag, predecessor_ckpt_before_resume->etag);
     EXPECT_EQ(predecessor_ckpt_after_resume->bytes, predecessor_ckpt_before_resume->bytes);
     EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime);
     EXPECT_TRUE(store->resolveRef(ns, "successor"));
@@ -3147,7 +3147,7 @@ TEST(CASRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUn
         CasRequests requests(backend, Fence::open());
         CasOperation op = requests.admit();
         ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-            predecessor->layout().refCkptKey(life), encodeRefCkpt(recovered_seal), before->incarnation, Retry::standard())));
+            predecessor->layout().refCkptKey(life), encodeRefCkpt(recovered_seal), before->etag, Retry::standard())));
     }
 
     PoolConfig successor_config;
@@ -3469,8 +3469,8 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
         String cursor;
         for (;;)
         {
-            const KeyPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
-            for (const KeyEntry & lk : page.keys)
+            const ListPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
+            for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
                 if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation
@@ -3653,7 +3653,7 @@ void fenceOutRefMount(Backend & backend, const String & mount_key)
     MountLease m = decodeMountLease(got->bytes);
     m.gc_fenced = true;
     m.seq += 1;
-    (void)(*op).replace(mount_key, encodeMountLease(m), got->incarnation, Retry::standard());
+    (void)(*op).replace(mount_key, encodeMountLease(m), got->etag, Retry::standard());
 }
 
 /// The greatest `_log/<id>` transaction id currently present for `ns` (independent of any Pool cache).
@@ -3664,8 +3664,8 @@ std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout
     String cursor;
     for (;;)
     {
-        const KeyPage page = (*op).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
-        for (const KeyEntry & lk : page.keys)
+        const ListPage page = (*op).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
+        for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
             if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log
@@ -3693,7 +3693,7 @@ uint64_t seedTwinDrop(const BackendPtr & backend, const Layout & layout, const R
 {
     uint64_t greatest_in_previous_epoch = 0;
     uint64_t previous_epoch = 0;
-    for (const KeyEntry & lk : listForTest(
+    for (const ListedKey & lk : listForTest(
              backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), "", 1000).keys)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
@@ -3750,7 +3750,7 @@ TEST(CASRefWriterRemount, FailedRemountPublishesNoRuntimeUnderFenceLossGeneratio
     {
         CasRequests requests(backend, Fence::open());
         CasOperation op = requests.admit();
-        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(foreign), got->incarnation, Retry::standard())));
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(foreign), got->etag, Retry::standard())));
     }
 
     store->tripMountLost();
@@ -4064,8 +4064,8 @@ TEST(CASRefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
         String cursor;
         for (;;)
         {
-            const KeyPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
-            for (const KeyEntry & lk : page.keys)
+            const ListPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
+            for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
                 if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log
@@ -4115,7 +4115,7 @@ TEST(CASRefWriterNamespaceRemoval, RemovalPublishesTerminalLogWithoutTerminalSna
         << "the terminal transaction remains ordinary immutable stream work until GC folds it";
 
     size_t terminal_logs = 0;
-    for (const KeyEntry & listed : listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), "", 1000).keys)
+    for (const ListedKey & listed : listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), "", 1000).keys)
     {
         const auto parsed = layout.parseRefObjectKey(listed.key);
         if (!parsed || parsed->kind != RefObjectKind::Log)
@@ -4242,7 +4242,7 @@ TEST(CASRefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurabl
     EXPECT_EQ(backend->writeTotal(), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
     const CasRefCatalog::Snapshot catalog_after = readCatalogForTest(backend, store->layout());
-    EXPECT_EQ(catalog_after.incarnation, catalog_before.incarnation);
+    EXPECT_EQ(catalog_after.etag, catalog_before.etag);
     EXPECT_EQ(catalog_after.catalog, catalog_before.catalog);
     EXPECT_FALSE(store->refTableLifeForTest(ns));
 }
@@ -4266,7 +4266,7 @@ TEST(CASRefWriterNamespaceRemoval, CatalogedNamespaceFilesOnlyLifeCompletesRemov
     EXPECT_NO_THROW(store->dropNamespace(ns));
     ASSERT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
 
-    const KeyPage terminal_page = listForTest(backend, layout.namespaceStreamPrefix(life), "", 100);
+    const ListPage terminal_page = listForTest(backend, layout.namespaceStreamPrefix(life), "", 100);
     ASSERT_EQ(terminal_page.keys.size(), 1u);
     const auto parsed = layout.parseRefObjectKey(terminal_page.keys.front().key);
     ASSERT_TRUE(parsed);
@@ -4610,7 +4610,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeFenceLossPropagatesRatherThanAns
     {
         CasRequests requests(backend, Fence::open());
         CasOperation op = requests.admit();
-        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(foreign), got->incarnation, Retry::standard())));
+        ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(mount_key, encodeMountLease(foreign), got->etag, Retry::standard())));
     }
     store->tripMountLost();
 
@@ -4917,7 +4917,7 @@ TEST(CASRefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResi
     ASSERT_GT(backend->putTotal(), puts_before_drop)
         << "control: the real removal call returned after durably writing its terminal artifacts";
     std::optional<RefTxnId> terminal_id;
-    for (const KeyEntry & listed : listForTest(backend,
+    for (const ListedKey & listed : listForTest(backend,
         layout.namespaceStreamPrefix(NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation)),
         "", 1000).keys)
     {
@@ -4964,7 +4964,7 @@ TEST(CASRefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResi
     ASSERT_EQ(store->refTableLifeForTest(ns)->incarnation, successor.incarnation);
 
     const NamespaceLifeId successor_life = NamespaceLifeId::fromCatalogEntry(ns, successor.incarnation);
-    const KeyPage successor_stream = listForTest(backend, layout.namespaceStreamPrefix(successor_life), "", 1000);
+    const ListPage successor_stream = listForTest(backend, layout.namespaceStreamPrefix(successor_life), "", 1000);
     ASSERT_FALSE(successor_stream.keys.empty()) << "the real successor writer produced foldable stream work";
     std::vector<GcPhaseRecord> successor_phases;
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { successor_phases.push_back(phase); });
