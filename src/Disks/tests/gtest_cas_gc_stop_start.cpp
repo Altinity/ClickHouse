@@ -69,7 +69,7 @@ void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
     DB::Cas::MountLease m = DB::Cas::decodeMountLease(got->bytes);
     m.gc_fenced = true;
     m.seq += 1;
-    const auto put = (*op).replace(mount_key, DB::Cas::encodeMountLease(m), got->incarnation, DB::Cas::Retry::once());
+    const auto put = (*op).replace(mount_key, DB::Cas::encodeMountLease(m), got->etag, DB::Cas::Retry::once());
     ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
 }
 
