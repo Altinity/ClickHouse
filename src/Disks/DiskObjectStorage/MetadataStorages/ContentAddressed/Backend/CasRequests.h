@@ -22,10 +22,11 @@ namespace DB::Cas
 
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
 /// too large, an access denial, or a credential failure. Whether a STALE CREDENTIAL explains it is not
-/// asked here -- the engine asks the backend for fresh credentials first, and refuses only when NO
-/// refresh was performed: the error was outside the credential class, or the one refresh this call is
-/// allowed installed nothing. A successful refresh makes the attempt ambiguous instead. A non-S3
-/// exception is never a refusal: an unmodeled error may have landed.
+/// asked here -- the engine asks the backend for fresh credentials first, and refuses only when no
+/// refresh HELPED: the error was outside the credential class, the one refresh this call is allowed
+/// installed nothing, or there is no reissue left to sign with what it did install. A refresh that
+/// helps re-sends the attempt, which is known not to have applied. A non-S3 exception is never a
+/// refusal: an unmodeled error may have landed.
 bool isDefinitelyRefusedWrite(const std::exception & e);
 
 /// Deterministic caller/local bugs, surfaced unchanged by every loop here: reissuing only replays the
@@ -198,6 +199,8 @@ private:
     {
         uint32_t attempts_sent = 0;
         bool sent_any = false;
+        /// Did ANY attempt of this call end without proof of whether it applied? A credential answer
+        /// does not qualify: the store gives it before applying anything.
         bool any_ambiguous = false;
         Observation last_seen = NotObserved{};
         uint32_t reissues = 0;

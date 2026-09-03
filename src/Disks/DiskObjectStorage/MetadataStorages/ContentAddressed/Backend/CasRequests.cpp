@@ -233,9 +233,13 @@ uint64_t CasOperation::reservedFor(uint64_t sleep_ms, uint32_t envelopes) const
 
 bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
 {
+    /// Strict at the boundary. A backend with no attempt timeout reserves 0 and full jitter can draw a
+    /// 0 sleep, so a `needed <= remaining` test would keep issuing requests at and past the deadline --
+    /// the one thing "no request after the boundary" promises never happens.
     const uint64_t now = owner.now_ms();
-    const uint64_t remaining = now >= bound.deadline_ms ? 0 : bound.deadline_ms - now;
-    return needed_ms <= remaining;
+    if (now >= bound.deadline_ms)
+        return false;
+    return needed_ms <= bound.deadline_ms - now;
 }
 
 bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted)
@@ -647,6 +651,12 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
 
         /// Disengaged means the attempt threw: its fate is unproven, and nothing may be read out of it.
         std::optional<std::expected<String, Backend::RawConflict>> outcome;
+        /// A credential answer is given BEFORE the store applies anything, so the attempt provably did
+        /// not land. It is the one failure that is neither a commit nor an ambiguity, and keeping it out
+        /// of `any_ambiguous` is what lets a second credential failure of the same call be refused
+        /// instead of resolved by a read and reissued to the deadline.
+        bool credential_answer = false;
+        bool refreshed = false;
         try
         {
             outcome = owner.withTransportAccess([&](auto & access)
@@ -661,18 +671,18 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             /// ONE refresh per call, and only for the class a credential could explain -- so an
             /// oversized entity or a malformed request never triggers a re-acquisition, and a denial
             /// that fresh credentials do not fix is refused on the second look rather than reissued to
-            /// the deadline (the storage hands back a new client every time it is asked). Fresh
-            /// credentials make the attempt ambiguous rather than refused: it may have been signed
-            /// correctly and landed, and the reissue signs with the new client.
-            bool refreshed = false;
-            if (!state.refresh_attempted && isRefreshableCredentialError(e))
+            /// the deadline (the storage hands back a new client every time it is asked).
+            credential_answer = isRefreshableCredentialError(e);
+            if (credential_answer && !state.refresh_attempted)
             {
                 state.refresh_attempted = true;
                 refreshed = owner.backend->refreshCredentials();
             }
-            /// A refusal that FOLLOWS an ambiguous attempt of this call proves nothing about that
-            /// attempt, so it is settled by the read below instead of ending the call here.
-            if (!refreshed && isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
+            /// Fresh credentials only help if there is a reissue to sign with them, so under `once` the
+            /// store's answer stands even when a refresh succeeded. A refusal that FOLLOWS an ambiguous
+            /// attempt of this call proves nothing about that attempt, so it is settled by the read
+            /// below instead of ending the call here.
+            if ((!refreshed || policy.single_attempt) && isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
             {
                 ProfileEvents::increment(ProfileEvents::CASRequestRefused);
                 return Refused{e.code(), e.message()};
@@ -692,8 +702,19 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             /// ambiguity to settle by reading, never a corruption verdict about the object.
             outcome.reset();
         }
-        if (!outcome)
+        if (!outcome && !credential_answer)
             state.any_ambiguous = true;
+
+        /// Nothing for a read to settle: this attempt did not apply, and no EARLIER attempt of the call
+        /// is unresolved either. Re-send it under the credentials the refresh installed. The policy is
+        /// named here rather than inherited from the refusal above, so a gap in what counts as a
+        /// definite refusal can never turn `once` into a sleeping loop.
+        if (refreshed && !policy.single_attempt && !state.any_ambiguous)
+        {
+            if (auto given_up = pauseAndReissue(state, bound))
+                return *given_up;
+            continue;
+        }
 
         /// Every refused precondition and every ambiguous attempt is settled by ONE exact read, under
         /// every policy: a refused precondition does not say WHO holds the key, and a 404 and a 412
