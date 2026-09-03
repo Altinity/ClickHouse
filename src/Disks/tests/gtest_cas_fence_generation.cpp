@@ -244,7 +244,10 @@ TEST(CASFenceGeneration, BlobPublicationFenceLossBeforeFinalCheckPublishesNothin
     });
 
     EXPECT_EQ(backend->publish_calls, 0u);
-    EXPECT_FALSE(backend->head(backend->watched_key).exists);
+    {
+        DB::Cas::tests::OperationForTest raw_op(*backend);
+        EXPECT_FALSE((*raw_op).head(backend->watched_key, Retry::once()).has_value());
+    }
     EXPECT_EQ(build->dependencyProof(ref), std::nullopt);
 }
 
@@ -272,7 +275,10 @@ TEST(CASFenceGeneration, BlobPublicationHeadTripAndRearmCannotAdoptNewFenceGener
     });
 
     EXPECT_EQ(backend->publish_calls, 0u);
-    EXPECT_FALSE(backend->head(backend->watched_key).exists);
+    {
+        DB::Cas::tests::OperationForTest raw_op(*backend);
+        EXPECT_FALSE((*raw_op).head(backend->watched_key, Retry::once()).has_value());
+    }
     /// The mount is live again under a FRESH generation, so this read is admitted where the stale
     /// operation's writes were not.
     CasOperation probe = store->mountRequests().admit();
@@ -298,8 +304,11 @@ TEST(CASFenceGeneration, BlobPublicationFenceLossAfterLandingReturnsNoProof)
     });
 
     EXPECT_EQ(backend->publish_calls, 1u);
-    EXPECT_TRUE(backend->head(backend->watched_key).exists)
-        << "a publication that landed before fence loss is safe unreferenced debris";
+    {
+        DB::Cas::tests::OperationForTest raw_op(*backend);
+        EXPECT_TRUE((*raw_op).head(backend->watched_key, Retry::once()).has_value())
+            << "a publication that landed before fence loss is safe unreferenced debris";
+    }
     EXPECT_EQ(build->dependencyProof(ref), std::nullopt);
 }
 
@@ -322,8 +331,9 @@ TEST(CASFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDu
     /// No durable write ever landed. Asserted through the RAW backend: every request the pool issues
     /// is admitted under the mount fence, which this test has just tripped, so a read through the pool
     /// would report that refusal rather than what the store holds.
-    EXPECT_TRUE(backend->list(store->layout().namespaceFilesPrefix(
-        DB::Cas::tests::fixture::fixtureLife(ns)), "", 100).keys.empty());
+    DB::Cas::tests::OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).list(store->layout().namespaceFilesPrefix(
+        DB::Cas::tests::fixture::fixtureLife(ns)), "", 100, Retry::once()).keys.empty());
 }
 
 /// `casRemoveObject`'s delete sibling, same shape: the fence trips between admission and the durable
@@ -347,8 +357,9 @@ TEST(CASFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAn
 
     /// The durable delete never ran, so the object survives -- read raw, since a read through the pool
     /// is admitted under the fence this test has tripped and would report that refusal instead.
-    const auto still_there = backend->get(store->layout().namespaceFileKey(
-        DB::Cas::tests::fixture::fixtureLife(ns), "victim"));
+    DB::Cas::tests::OperationForTest raw_op(*backend);
+    const auto still_there = (*raw_op).read(store->layout().namespaceFileKey(
+        DB::Cas::tests::fixture::fixtureLife(ns), "victim"), Retry::once());
     ASSERT_TRUE(still_there.has_value());
     EXPECT_EQ(still_there->bytes, "still here");
 }
@@ -374,8 +385,9 @@ TEST(CASFenceGeneration, PlainObjectPutRechecksFenceOnEveryRetryIterationNotJust
     });
 
     EXPECT_EQ(backend->head_calls, 2);
-    EXPECT_TRUE(backend->list(store->layout().namespaceFilesPrefix(
-        DB::Cas::tests::fixture::fixtureLife(ns)), "", 100).keys.empty());
+    DB::Cas::tests::OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).list(store->layout().namespaceFilesPrefix(
+        DB::Cas::tests::fixture::fixtureLife(ns)), "", 100, Retry::once()).keys.empty());
 }
 
 /// (b) The S3-native staging-buffer finalize: the fence trips AFTER the buffer is constructed
