@@ -50,8 +50,8 @@ struct MountRenewResult
 {
     MountRenewOutcome outcome = MountRenewOutcome::Terminal;
     uint64_t attempt_start_boot_ms = 0;
-    /// Physical attempts this renewal sent. Carried for a write that committed and for one that gave
-    /// up; a conflict and a store refusal report no count, so `sent_any` is what those two leave.
+    /// Physical attempts this renewal sent, for every terminal ending the engine can count: a commit,
+    /// a give-up, a conflict, or a store refusal.
     uint32_t attempts_sent = 0;
     bool resolved_by_read = false;
     bool sent_any = false;

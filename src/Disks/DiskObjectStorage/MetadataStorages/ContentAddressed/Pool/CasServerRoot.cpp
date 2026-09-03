@@ -1601,6 +1601,7 @@ MountRenewResult MountLeaseKeeper::renewOn(
     if (const Conflict * conflict = std::get_if<Conflict>(&*written))
     {
         result.sent_any = true;
+        result.attempts_sent = conflict->attempts_sent;
         try
         {
             throwRenewConflict(conflict->seen);
@@ -1615,6 +1616,7 @@ MountRenewResult MountLeaseKeeper::renewOn(
     if (const Refused * refused = std::get_if<Refused>(&*written))
     {
         result.sent_any = true;
+        result.attempts_sent = refused->attempts_sent;
         markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
         result.failure = std::make_exception_ptr(Exception(
             refused->store_error,
