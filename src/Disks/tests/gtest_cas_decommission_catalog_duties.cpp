@@ -56,14 +56,16 @@ bool slotObjectExists(Backend & backend, const String & leaf)
 class AddVictimEntryDuringRootDrainBackend final : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::list;
+    /// Unhide the legacy `list` overloads the primitive override below would otherwise hide.
+    using Backend::list;
     void arm() { armed = true; }
     bool fired() const { return added; }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    /// Intercepted at the PRIMITIVE, which every legacy forwarder reaches too, so the injection fires
+    /// whichever surface issued the enumeration.
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
-        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
         if (armed && !added && prefix == "p/roots/victim/" && cursor.empty())
         {
             added = true;
@@ -87,26 +89,28 @@ private:
 /// Admits the late catalog entry between the retirement tail's two exact catalog reads
 /// (`retirement_catalog_cut`, then `fresh_retirement_catalog`), never before. The mountpoint drain's
 /// `list("p/roots/victim/", ...)` is the last LIST call in `decommissionPoolMember` before either
-/// read, so it orders the two `get("p/cas/ref_catalog")` calls that follow it: the first is
+/// read, so it orders the two `read("p/cas/ref_catalog")` calls that follow it: the first is
 /// `retirement_catalog_cut`, the second is `fresh_retirement_catalog`. Mutating on the second call
 /// makes that read observe a catalog the first read did not.
 class MutateCatalogBetweenRetirementReadsBackend final : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::list;
+    /// Unhide the legacy `list` overloads the primitive override below would otherwise hide.
+    using Backend::list;
     void arm() { armed = true; }
     bool fired() const { return added; }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    /// Both hooks sit on the PRIMITIVES, which every legacy forwarder reaches too, so the ordering
+    /// they observe is the physical request order whichever surface issued each request.
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
-        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
         if (armed && !past_mountpoint_drain && prefix == "p/roots/victim/" && cursor.empty())
             past_mountpoint_drain = true;
         return page;
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (armed && past_mountpoint_drain && !added && key == "p/cas/ref_catalog")
         {
@@ -125,7 +129,7 @@ public:
                         .incarnation = UInt128{707}});
             }
         }
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 
 private:

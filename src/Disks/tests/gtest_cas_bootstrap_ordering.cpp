@@ -41,55 +41,48 @@ const String kProbeUid2 = "fedcba9876543210fedcba9876543210";
 /// Records the ORDER of backend operations so a test can assert that the residual LIST precedes the first
 /// write, and that a fail path performs zero writes. Delegates every operation to `InMemoryBackend`
 /// unchanged; `Pool::open` wraps this in its `InstrumentedBackend`, which forwards every op here.
+///
+/// The `write` primitive covers create, replace and conditional-put alike, so the log distinguishes
+/// only writes from removals -- which is all the ordering assertions ask.
 class RecordingBackend final : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::list;
-    using Backend::get;
-    using Backend::getStream;
-    using Backend::putIfAbsent;
-    using Backend::putOverwrite;
-    using Backend::casPut;
+    /// Unhide the legacy `list` overloads the primitive override below would otherwise hide: the tests
+    /// seed and inspect this store through them.
+    using Backend::list;
 
-    enum class Op : uint8_t { List, PutIfAbsent, PutOverwrite, CasPut, Delete };
+    enum class Op : uint8_t { List, Write, Remove };
     struct Entry
     {
         Op op;
         String key;   /// the LIST prefix, or the written key
     };
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    /// Recorded at the PRIMITIVE, which every legacy forwarder reaches too, so an op is logged
+    /// whichever surface issued it.
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         record(Op::List, prefix);
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
     {
-        record(Op::PutIfAbsent, key);
-        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+        record(Op::Write, key);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
-    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
-        record(Op::PutOverwrite, key);
-        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+        record(Op::Remove, key);
+        return InMemoryBackend::remove(key, expected_value, access);
     }
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta) override
-    {
-        record(Op::CasPut, key);
-        return InMemoryBackend::casPut(key, bytes, expected, meta);
-    }
-    DeleteOutcome deleteExact(const String & key, const Token & token) override
-    {
-        record(Op::Delete, key);
-        return InMemoryBackend::deleteExact(key, token);
-    }
-    /// The bootstrap path (battery + createOrValidate + mount protocol) issues only whole-String writes,
-    /// never a streaming create, so recording the four write ops above captures every write `open` can do.
+    /// `publish` is the one mutating primitive left unrecorded: it writes a blob, and the bootstrap
+    /// path (battery + `createOrValidate` + mount protocol) publishes none.
 
     static bool isWrite(Op op)
     {
-        return op == Op::PutIfAbsent || op == Op::PutOverwrite || op == Op::CasPut || op == Op::Delete;
+        return op == Op::Write || op == Op::Remove;
     }
 
     void clearLog()
@@ -127,13 +120,11 @@ private:
 class CatalogMissingAfterListBackend final : public InMemoryBackend
 {
 public:
-    using Backend::get;
-
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (key == Layout{kPrefix}.refCatalogKey())
             return std::nullopt;
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 };
 
