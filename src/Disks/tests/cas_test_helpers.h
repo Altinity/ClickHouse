@@ -1495,6 +1495,7 @@ public:
         {
             std::lock_guard lock(count_mutex);
             ++read_requests;
+            ++read_request_counts[key];
         }
         return InMemoryBackend::read(key, access);
     }
@@ -1504,6 +1505,7 @@ public:
         {
             std::lock_guard lock(count_mutex);
             ++head_requests;
+            ++head_request_counts[key];
         }
         return InMemoryBackend::head(key, access);
     }
@@ -1514,6 +1516,7 @@ public:
         {
             std::lock_guard lock(count_mutex);
             ++list_requests;
+            ++list_request_counts[prefix];
         }
         return InMemoryBackend::list(prefix, cursor, limit, access);
     }
@@ -1538,6 +1541,13 @@ public:
         }
         return InMemoryBackend::remove(key, expected_value, access);
     }
+
+    /// Per-key counterparts of the three READ primitives. The aggregate counters above cannot say
+    /// WHICH key a request went to, and the legacy per-key counters below never see a caller that
+    /// speaks the primitives -- `probeSentinelRaw` is one, so a probe is invisible to `headCount`.
+    uint64_t readRequestCount(const String & key) const { return lookup(read_request_counts, key); }
+    uint64_t headRequestCount(const String & key) const { return lookup(head_request_counts, key); }
+    uint64_t listRequestCount(const String & prefix) const { return lookup(list_request_counts, prefix); }
 
     uint64_t readRequests() const { std::lock_guard lock(count_mutex); return read_requests; }
     uint64_t headRequests() const { std::lock_guard lock(count_mutex); return head_requests; }
@@ -1741,6 +1751,9 @@ public:
         head_total = get_total = put_total = cas_put_total = get_stream_total = list_total = delete_total = 0;
         put_overwrite_total = 0;
         read_requests = head_requests = list_requests = write_requests = remove_requests = 0;
+        read_request_counts.clear();
+        head_request_counts.clear();
+        list_request_counts.clear();
     }
 
 private:
@@ -1770,6 +1783,9 @@ private:
     uint64_t get_stream_total = 0;
     uint64_t list_total = 0;
     uint64_t delete_total = 0;
+    std::map<String, uint64_t> read_request_counts;
+    std::map<String, uint64_t> head_request_counts;
+    std::map<String, uint64_t> list_request_counts;
     uint64_t read_requests = 0;
     uint64_t head_requests = 0;
     uint64_t list_requests = 0;

@@ -11,6 +11,9 @@
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
 #include <base/defines.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
+#include <Disks/tests/cas_test_helpers.h>
+#include <IO/ReadSettings.h>
 
 #include <chrono>
 #include <atomic>
@@ -19,13 +22,10 @@
 #include <type_traits>
 
 #if USE_AWS_S3
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
-#include <Disks/tests/cas_test_helpers.h>
 #include <Disks/WriteMode.h>
 #include <IO/ReadBufferFromFileBase.h>
-#include <IO/ReadSettings.h>
 #include <IO/S3Common.h>
 #include <chrono>
 #include <filesystem>
@@ -595,6 +595,70 @@ TEST(CASInstrumentedBackend, PublishBlobDelegatesOnceAndRecordsOnePhysicalBlobWr
 // =====================================================================
 // M-C2 Task 2: typed S3 precondition signal
 // =====================================================================
+
+/// The per-dialect grammar in isolation, independent of any backend fixture.
+TEST(CASBackendGrammar, GenerationDialectAcceptsOnlyCanonicalPositiveDecimal)
+{
+    using DB::Cas::ObjectStorageBackend;
+    using DB::Cas::TokenType;
+    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "123"));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "0"));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "00123"));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "\"123\""));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "12a"));
+    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, "\"abc\""));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, " * "));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, "a,b"));
+    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::Emulated, "7"));
+    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Emulated, ""));
+}
+
+/// §1 (opt round-B): the fold/point GETs read tiny bodies but a default `ReadBufferFromS3` preallocates
+/// ~1 MiB. `casSizedReadSettings` shrinks the buffer to the known body size + slack, capped at the
+/// caller's default — never larger than before, regardless of the reported size.
+TEST(CASSizedReadSettings, CapsToKnownSizePlusSlackButNeverAboveBase)
+{
+    DB::ReadSettings base;
+    base.remote_fs_settings.buffer_size = 1ULL << 20;   /// 1 MiB default
+    base.local_fs_settings.buffer_size = 1ULL << 20;
+
+    /// A ~3.7 KB fold body: buffer shrinks to size + slack, far below the 1 MiB default.
+    const auto small = DB::Cas::casSizedReadSettings(base, 3700);
+    EXPECT_EQ(small.remote_fs_settings.buffer_size, 3700 + DB::Cas::CAS_FOLD_READ_SLACK_BYTES);
+    EXPECT_EQ(small.local_fs_settings.buffer_size, 3700 + DB::Cas::CAS_FOLD_READ_SLACK_BYTES);
+
+    /// A body larger than the default is capped AT the default (never grown).
+    const auto big = DB::Cas::casSizedReadSettings(base, 8ULL << 20);
+    EXPECT_EQ(big.remote_fs_settings.buffer_size, 1ULL << 20);
+
+    /// Unknown size (0) = leave the base untouched (the metadata-fetch fallback path).
+    const auto unknown = DB::Cas::casSizedReadSettings(base, 0);
+    EXPECT_EQ(unknown.remote_fs_settings.buffer_size, 1ULL << 20);
+}
+
+/// The CountingBackend request-shape recorders that the streaming-memory gates consume: per-key and
+/// total getStream counts, and the whole-object get flag that marks a resident-memory violation for a
+/// run object. The ranged-window recorder is no longer exercised here: a materialized read is always
+/// whole now, so only `getStream` still carries a window.
+TEST(CASCountingBackendShape, RecordsGetStreamAndWholeGetShape)
+{
+    DB::Cas::tests::CountingBackend backend;
+    backend.putIfAbsent("k", String(1000, 'x'));
+
+    backend.get("k");
+    EXPECT_EQ(backend.wholeGetCount("k"), 1u);
+
+    /// getStream counters (per-key and total).
+    backend.getStream("k", DB::Cas::Range{.offset = 2, .length = 5});
+    backend.getStream("k");
+    backend.getStream("absent");
+    EXPECT_EQ(backend.getStreamCount("k"), 2u);
+    EXPECT_EQ(backend.getStreamTotal(), 3u);
+
+    backend.resetCounts();
+    EXPECT_EQ(backend.wholeGetCount("k"), 0u);
+    EXPECT_EQ(backend.getStreamTotal(), 0u);
+}
 
 #if USE_AWS_S3
 
@@ -1564,69 +1628,5 @@ TEST(CASBackendGrammarDeathTest, RejectsEmptyStarAndListTokensOnEveryMutation)
     }
 }
 #endif
-
-/// The per-dialect grammar in isolation, independent of any backend fixture.
-TEST(CASBackendGrammar, GenerationDialectAcceptsOnlyCanonicalPositiveDecimal)
-{
-    using DB::Cas::ObjectStorageBackend;
-    using DB::Cas::TokenType;
-    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "123"));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "0"));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "00123"));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "\"123\""));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Generation, "12a"));
-    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, "\"abc\""));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, " * "));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::ETag, "a,b"));
-    EXPECT_TRUE(ObjectStorageBackend::isValidTokenValue(TokenType::Emulated, "7"));
-    EXPECT_FALSE(ObjectStorageBackend::isValidTokenValue(TokenType::Emulated, ""));
-}
-
-/// §1 (opt round-B): the fold/point GETs read tiny bodies but a default `ReadBufferFromS3` preallocates
-/// ~1 MiB. `casSizedReadSettings` shrinks the buffer to the known body size + slack, capped at the
-/// caller's default — never larger than before, regardless of the reported size.
-TEST(CASSizedReadSettings, CapsToKnownSizePlusSlackButNeverAboveBase)
-{
-    DB::ReadSettings base;
-    base.remote_fs_settings.buffer_size = 1ULL << 20;   /// 1 MiB default
-    base.local_fs_settings.buffer_size = 1ULL << 20;
-
-    /// A ~3.7 KB fold body: buffer shrinks to size + slack, far below the 1 MiB default.
-    const auto small = DB::Cas::casSizedReadSettings(base, 3700);
-    EXPECT_EQ(small.remote_fs_settings.buffer_size, 3700 + DB::Cas::CAS_FOLD_READ_SLACK_BYTES);
-    EXPECT_EQ(small.local_fs_settings.buffer_size, 3700 + DB::Cas::CAS_FOLD_READ_SLACK_BYTES);
-
-    /// A body larger than the default is capped AT the default (never grown).
-    const auto big = DB::Cas::casSizedReadSettings(base, 8ULL << 20);
-    EXPECT_EQ(big.remote_fs_settings.buffer_size, 1ULL << 20);
-
-    /// Unknown size (0) = leave the base untouched (the metadata-fetch fallback path).
-    const auto unknown = DB::Cas::casSizedReadSettings(base, 0);
-    EXPECT_EQ(unknown.remote_fs_settings.buffer_size, 1ULL << 20);
-}
-
-/// The CountingBackend request-shape recorders that the streaming-memory gates consume: per-key and
-/// total getStream counts, and the whole-object get flag that marks a resident-memory violation for a
-/// run object. The ranged-window recorder is no longer exercised here: a materialized read is always
-/// whole now, so only `getStream` still carries a window.
-TEST(CASCountingBackendShape, RecordsGetStreamAndWholeGetShape)
-{
-    DB::Cas::tests::CountingBackend backend;
-    backend.putIfAbsent("k", String(1000, 'x'));
-
-    backend.get("k");
-    EXPECT_EQ(backend.wholeGetCount("k"), 1u);
-
-    /// getStream counters (per-key and total).
-    backend.getStream("k", DB::Cas::Range{.offset = 2, .length = 5});
-    backend.getStream("k");
-    backend.getStream("absent");
-    EXPECT_EQ(backend.getStreamCount("k"), 2u);
-    EXPECT_EQ(backend.getStreamTotal(), 3u);
-
-    backend.resetCounts();
-    EXPECT_EQ(backend.wholeGetCount("k"), 0u);
-    EXPECT_EQ(backend.getStreamTotal(), 0u);
-}
 
 #endif

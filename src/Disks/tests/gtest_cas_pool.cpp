@@ -1950,21 +1950,22 @@ TEST(CASPoolRemount, ThrowingForeignConflictSinkCannotReplaceTerminalOutcome)
 class RemountStepBackend final : public DB::Cas::tests::CountingBackend
 {
 public:
-    using DB::Cas::tests::CountingBackend::get;
-
     void failNextGet(String key)
     {
         failed_key = std::move(key);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    /// The fault sits on the PRIMITIVE, not on legacy `get`: the lifecycle gate reads `_pool_meta`
+    /// through `probeSentinelRaw`, which speaks the primitives. A legacy caller reaches this anyway,
+    /// through the forwarder, so arming it here covers both surfaces rather than only one.
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         if (!failed_key.empty() && key == failed_key)
         {
             failed_key.clear();
             throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected remount probe failure");
         }
-        return DB::Cas::tests::CountingBackend::get(key, range);
+        return DB::Cas::tests::CountingBackend::read(key, access);
     }
 
 private:
