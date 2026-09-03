@@ -87,6 +87,10 @@ public:
     CasRequests(BackendPtr backend_, Fence fence_,
                 std::function<uint64_t()> now_ms_ = {}, std::function<void(uint64_t)> sleep_ms_ = {});
 
+    /// Both may be called concurrently on one `CasRequests`: neither writes a member, and the only
+    /// state either reads is the backend and the fence -- whose closures must therefore be thread-safe
+    /// too. The test setters below DO write members, and belong to setup, before any operation runs.
+    ///
     /// Admitted now, under the fence's current generation.
     CasOperation admit(Liveness liveness = {});
     /// Admitted earlier: the generation came from a persisted runtime record, and an operation that
@@ -134,6 +138,9 @@ private:
 /// Move-only, and every request it makes re-checks its admission -- before each attempt, before each
 /// sleep, and once more after a proven commit, so a write whose fence was lost while it was in flight
 /// is never reported as committed.
+///
+/// SINGLE-THREADED: it carries mutable per-call state, so one operation belongs to one task. A caller
+/// that fans work out gives each task its own, built from `generation()` through `CasRequests::resume`.
 class CasOperation
 {
 public:
@@ -192,15 +199,19 @@ private:
     /// The admission point: the fence for `needed_ms` from now, then the caller's own facts.
     Gate gate(uint64_t needed_ms) const;
 
-    /// Everything ONE logical write call accumulates. It outlives each attempt, and for
-    /// `readModifyWrite` it outlives each inner write, so a `GaveUp` reports what the whole call did
-    /// rather than what its last attempt did.
+    /// Everything ONE logical write call accumulates. `attempts_sent`, `sent_any`, `last_seen`,
+    /// `reissues` and `refresh_attempted` outlive each attempt and, for `readModifyWrite`, each inner
+    /// write, so a `GaveUp` reports what the whole call did rather than what its last attempt did.
     struct WriteState
     {
         uint32_t attempts_sent = 0;
         bool sent_any = false;
-        /// Did ANY attempt of this call end without proof of whether it applied? A credential answer
-        /// does not qualify: the store gives it before applying anything.
+        /// The one field that belongs to the INNER write instead: did any of ITS attempts end without
+        /// proof of whether it applied? Every attempt of one inner write sends the same bytes, which is
+        /// what makes "the resolve read found our bytes" a statement about an attempt of ours; an inner
+        /// write that ended in `Conflict` saw the precondition move, which proves its ambiguous
+        /// attempts dead. A credential answer never sets it: the store gives one before applying
+        /// anything.
         bool any_ambiguous = false;
         Observation last_seen = NotObserved{};
         uint32_t reissues = 0;

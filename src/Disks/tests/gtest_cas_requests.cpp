@@ -24,6 +24,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace DB::ErrorCodes
 {
@@ -276,12 +277,12 @@ TEST(CASBackendPrimitives, EachWriteKnobFiresOnlyForTheVerbItNames)
 
     b->injectAmbiguousPutIfAbsent("k2");
     EXPECT_EQ(b->casPut("k2", "v", std::nullopt).outcome, CasOutcome::Committed);   /// not casPut's knob either
-    EXPECT_THROW(b->putIfAbsent("k2", "w"), std::runtime_error);
+    EXPECT_THROW(b->putIfAbsent("k2", "w"), Poco::TimeoutException);
 
     /// The keyed primitive is the one caller every knob is armed against, and each is still one-shot.
     b->injectAmbiguousPutIfAbsent("k3");
     b->failNextCasPut("k3");
-    EXPECT_THROW((void)b->write("k3", "v", std::nullopt, door), std::runtime_error);
+    EXPECT_THROW((void)b->write("k3", "v", std::nullopt, door), Poco::TimeoutException);
     EXPECT_FALSE(b->write("k3", "v", std::nullopt, door).has_value());
     EXPECT_TRUE(b->write("k3", "v", std::nullopt, door).has_value());
 }
@@ -699,7 +700,9 @@ TEST(CASRequests, OnPresenceIssuesHeadsAndNoGet)
         Retry::standard());
     ASSERT_TRUE(std::holds_alternative<Committed>(result));
     EXPECT_EQ(backend->readRequests(), 0u);
-    EXPECT_GE(backend->headRequests(), 1u);
+    /// One HEAD decided it and one write landed it: the loop issues no request it does not need.
+    EXPECT_EQ(backend->headRequests(), 1u);
+    EXPECT_EQ(backend->writeRequests(), 1u);
 }
 
 TEST(CASRequests, OnPresenceSettlesARefusedPreconditionWithAHead)
@@ -719,7 +722,7 @@ TEST(CASRequests, OnPresenceSettlesARefusedPreconditionWithAHead)
     ASSERT_TRUE(std::holds_alternative<Committed>(result));
     /// A refused precondition needs only to know WHAT is at the key, so this loop never fetches a body.
     EXPECT_EQ(backend->readRequests(), 0u);
-    EXPECT_GE(backend->headRequests(), 2u);
+    EXPECT_EQ(backend->headRequests(), 2u);
     EXPECT_EQ(backend->writeRequests(), 2u);
 }
 
@@ -1056,11 +1059,22 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
 {
     FakeClock clock;
     auto backend = std::make_shared<CountingBackend>();
+    auto door = RawDoor::key();
+
+    /// A competitor takes the key while our own create is in flight, and that create's own fate is
+    /// lost. The ambiguity is armed from inside the hook so the competitor's write cannot consume it.
+    bool staged = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (staged)
+            return;
+        staged = true;
+        (void)backend->write("k", "theirs", std::nullopt, door);
+        backend->injectAmbiguousPutIfAbsent("k");
+    });
+
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    orThrow(op.create("k", "theirs", Retry::standard()), "create");
-
-    backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
     WriteResult result = op.readModifyWriteOnPresence("k",
         [](const std::optional<Meta> &) -> std::optional<String> { return String("mine"); }, Retry::once());
     const auto * conflict = std::get_if<Conflict>(&result);
@@ -1069,7 +1083,126 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
     /// presence loop can never come to depend on bytes the loop does not promise.
     EXPECT_TRUE(std::holds_alternative<Meta>(conflict->seen));
     EXPECT_FALSE(std::holds_alternative<Object>(conflict->seen));
-    EXPECT_GE(backend->readRequests(), 1u);
+    EXPECT_EQ(backend->readRequests(), 1u);
+}
+
+TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsThePreconditionUnchangedIsReissued)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Incarnation seen = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+    backend->resetCounts();
+
+    /// The attempt's fate is lost and the store is untouched. The incarnation it named is still the
+    /// current one -- which proves nothing landed, and leaves a precondition a reissue can still meet.
+    backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+    WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_FALSE(committed->resolved_by_read);
+    EXPECT_EQ(backend->writeRequests(), 2u);
+    EXPECT_EQ(backend->readRequests(), 1u);   /// exactly one resolve read, and it settled the ambiguity
+    EXPECT_EQ(clock.sleeps.size(), 1u);
+}
+
+TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsAnotherIncarnationIsAConflict)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Incarnation stale = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+    orThrow(op.replace("k", "theirs", stale, Retry::standard()), "the competitor's replace");
+    backend->resetCounts();
+
+    /// The attempt's fate is lost, and the key has moved past the incarnation it named: no reissue of
+    /// it could ever apply, so the ambiguity is settled and the occupant is the answer.
+    backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+    WriteResult result = op.replace("k", "mine", stale, Retry::standard());
+    const auto * conflict = std::get_if<Conflict>(&result);
+    ASSERT_NE(conflict, nullptr);
+    const auto * occupant = std::get_if<Object>(&conflict->seen);
+    ASSERT_NE(occupant, nullptr);
+    EXPECT_EQ(occupant->bytes, "theirs");
+    EXPECT_NE(occupant->incarnation, stale);
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->readRequests(), 1u);
+    EXPECT_TRUE(clock.sleeps.empty());
+}
+
+TEST(CASRequests, ReadModifyWriteDoesNotClaimACompetitorsIdenticalBytesAfterAnEarlierAmbiguity)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto door = RawDoor::key();
+
+    /// The competitor moves the key once before each of our two attempts, and its own writes re-enter
+    /// this hook. The ambiguity is armed here rather than up front so the competitor's create cannot
+    /// consume the arming meant for ours.
+    bool inside = false;
+    int staged = 0;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (inside)
+            return;
+        inside = true;
+        if (staged == 0)
+        {
+            (void)backend->write("k", "X", std::nullopt, door);
+            backend->injectAmbiguousPutIfAbsent("k");
+        }
+        else if (staged == 1)
+        {
+            /// The bytes we are about to send, under an incarnation that is not ours.
+            if (const auto current = backend->read("k", door))
+                (void)backend->write("k", "B", current->value, door);
+        }
+        ++staged;
+        inside = false;
+    });
+
+    std::vector<String> decided_on;
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    WriteResult result = op.readModifyWrite("k",
+        [&](const std::optional<Object> & current) -> std::optional<String>
+        {
+            decided_on.push_back(current ? current->bytes : String("<absent>"));
+            if (!current)
+                return String("A");
+            if (current->bytes == "X")
+                return String("B");
+            return std::nullopt;
+        },
+        Retry::standard());
+
+    /// The only ambiguity this call had belonged to "A", and the competitor's "X" already proved it
+    /// dead. "B" at the key is the competitor's, so the loop re-decides on it instead of claiming it.
+    const auto * declined = std::get_if<Declined>(&result);
+    ASSERT_NE(declined, nullptr);
+    const auto * seen = std::get_if<Object>(&declined->seen);
+    ASSERT_NE(seen, nullptr);
+    EXPECT_EQ(seen->bytes, "B");
+    EXPECT_EQ(decided_on, (std::vector<String>{"<absent>", "X", "B"}));
+}
+
+TEST(CASRequests, AnUnmodeledLocalExceptionOnAWritePropagatesUnchanged)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    /// Not a `Poco::Exception`, so it did not come from the transport and cannot have landed anything.
+    /// Settling it by a read would report a store answer the store never gave.
+    backend->failNextWriteWith("k", std::make_exception_ptr(std::logic_error("a local bug")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    EXPECT_THROW((void)op.create("k", "v", Retry::standard()), std::logic_error);
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->readRequests(), 0u);
+    EXPECT_TRUE(clock.sleeps.empty());
 }
 
 TEST(CASRequests, ForEachListedKeyGivesEachPageItsOwnPolicyWindow)
@@ -1287,23 +1420,46 @@ TEST(CASRequests, DeadlineIsTheOnlyBoundUnderZeroLatencyThrottling)
 
 TEST(CASRequests, LeaseBoundPolicyIssuesNothingPastTheBoundary)
 {
-    FakeClock clock;
-    auto throttled = std::make_shared<ThrottlingBackend>(
-        std::make_shared<InMemoryBackend>(), ThrottlingBackend::Mode::EveryNth, 1, 429);
-    auto requests = makeRequests(throttled, clock);
-    requests.setAttemptReservationForTest(1'000);
+    {
+        FakeClock clock;
+        auto throttled = std::make_shared<ThrottlingBackend>(
+            std::make_shared<InMemoryBackend>(), ThrottlingBackend::Mode::EveryNth, 1, 429);
+        auto requests = makeRequests(throttled, clock);
+        requests.setAttemptReservationForTest(1'000);
 
-    const uint64_t lease_deadline = clock.now + 10'000;
-    auto op = requests.admit();
-    WriteResult result = op.create("k", "v", Retry::untilLeaseSafe(lease_deadline, 2'000));
-    const auto * gave_up = std::get_if<GaveUp>(&result);
-    ASSERT_NE(gave_up, nullptr);
-    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
-    /// The lease was the smaller of the two bounds, and the give-up names it rather than the policy.
-    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
-    /// Nothing is STARTED that could not finish inside the bound: the last request began at least one
-    /// attempt reservation before lease minus margin.
-    EXPECT_LE(clock.now, lease_deadline - 2'000 - 1'000);
+        const uint64_t lease_deadline = clock.now + 10'000;
+        auto op = requests.admit();
+        WriteResult result = op.create("k", "v", Retry::untilLeaseSafe(lease_deadline, 2'000));
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_NE(gave_up, nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+        /// The lease was the smaller of the two bounds, and the give-up names it rather than the policy.
+        EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+        /// Nothing is STARTED that could not finish inside the bound: the last request began at least one
+        /// attempt reservation before lease minus margin.
+        EXPECT_LE(clock.now, lease_deadline - 2'000 - 1'000);
+    }
+    {
+        /// The boundary itself. Exactly ONE attempt reservation is left before lease minus margin, and a
+        /// write reserves TWO -- the attempt and the read that settles it -- so nothing may be started.
+        /// An engine that reserved only the attempt would find room here and send one.
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        requests.setAttemptReservationForTest(1'000);
+
+        const uint64_t lease_deadline = clock.now + 2'000 + 1'000;
+        auto op = requests.admit();
+        WriteResult result = op.create("k", "v", Retry::untilLeaseSafe(lease_deadline, 2'000));
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_NE(gave_up, nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+        EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+        EXPECT_FALSE(gave_up->sent_any);
+        EXPECT_EQ(backend->writeRequests(), 0u);
+        EXPECT_EQ(backend->readRequests(), 0u);
+        EXPECT_TRUE(clock.sleeps.empty());
+    }
 }
 
 TEST(CASRequests, AMalformedRequestIsRefusedWithoutAReissue)
@@ -1363,19 +1519,23 @@ TEST(CASRequests, ASecondCredentialAnswerAfterTheOneRefreshIsRefused)
     EXPECT_EQ(clock.sleeps.size(), 1u);   /// the one paced re-send under the credentials it installed
 }
 
-TEST(CASRequests, UnderOnceTheStoreAnswerStandsEvenWhenTheRefreshSucceeded)
+TEST(CASRequests, UnderOnceACredentialAnswerIsRefusedWithoutARefresh)
 {
     FakeClock clock;
     auto backend = std::make_shared<CountingBackend>();
+    /// A refresh that WOULD have installed credentials, so the zero below is the gate and not the
+    /// storage refusing to hand any back.
     backend->setRefreshCredentialsResult(true);
     backend->failNextWriteWith("k", s3Error(Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied"));
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
 
-    /// Fresh credentials only help a reissue, and `once` has none to sign. Reporting the attempt as
-    /// unresolved instead would turn a policy that sends one request into one that sleeps.
+    /// Fresh credentials only help a reissue, and `once` has none to sign, so none are asked for --
+    /// which is what keeps `Refused` meaning "no refresh installed credentials and no earlier
+    /// ambiguity" rather than "a refresh helped and the answer stood anyway".
     WriteResult result = op.create("k", "v", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Refused>(result));
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 0u);
     EXPECT_EQ(backend->writeRequests(), 1u);
     EXPECT_EQ(backend->readRequests(), 0u);
     EXPECT_TRUE(clock.sleeps.empty());
@@ -1457,6 +1617,45 @@ TEST(CASRequests, ANameOnlyAccessDenialOnAReadPropagatesWhenNoRefreshIsAvailable
     EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
     EXPECT_EQ(backend->readRequests(), 1u);
     EXPECT_TRUE(clock.sleeps.empty());
+}
+
+TEST(CASRequests, ReadModifyWriteWhoseResolveAndFreshObservationBothFailGivesUpUnresolved)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "v0", Retry::standard()), "create");
+    backend->resetCounts();
+
+    /// The store refuses the precondition, and both reads that would settle what happened answer with
+    /// a store refusal the read loop surfaces at once rather than reissuing. They are armed from inside
+    /// the write so the loop's OWN first read still succeeds and `decide` sees the object.
+    backend->failNextCasPut("k");
+    bool armed = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (armed)
+            return;
+        armed = true;
+        backend->failNextReadWith("k", s3Error(Aws::S3::S3Errors::UNKNOWN, "MalformedXML"));
+        backend->failNextReadWith("k", s3Error(Aws::S3::S3Errors::UNKNOWN, "MalformedXML"));
+    });
+
+    WriteResult result = op.readModifyWrite("k",
+        [](const std::optional<Object> &) -> std::optional<String> { return String("v1"); }, Retry::standard());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    /// No BOUND refused either read -- the reads themselves failed -- so naming a deadline the clock
+    /// never reached would send its reader to widen the wrong thing, and nothing was observed to
+    /// report as a conflict.
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
+    EXPECT_TRUE(gave_up->sent_any);
+    EXPECT_TRUE(std::holds_alternative<NotObserved>(gave_up->last_seen));
+    /// The write count is unchanged after the first attempt: nothing ever said another one was safe.
+    EXPECT_EQ(backend->writeRequests(), 1u);
+    EXPECT_EQ(backend->readRequests(), 3u);
+    EXPECT_EQ(clock.sleeps.size(), 1u);
 }
 
 TEST(CASRequests, AnUnmodeledStoreErrorOnAReadIsReissuedNotSurfaced)

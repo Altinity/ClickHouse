@@ -115,20 +115,19 @@ public:
     void failNextCasPut(const String & key);
 
     /// Injects a one-shot AMBIGUOUS outcome on the next CREATING write of `key` (a write with no
-    /// expected value): instead of attempting it, that call throws a plain (non-`DB::Exception`)
-    /// exception -- classified `Unresolved`, never `DefiniteFailure`, by
-    /// `classifyConditionalWriteResult` regardless of build flags -- and the store is left exactly as
-    /// it was. Models a request whose own HTTP attempt outcome is lost (a timeout, a dropped
-    /// connection) rather than a clean refusal, for tests that must exercise the "ambiguous attempt,
-    /// resolve before deciding" path without a live network. One-shot, mirroring `failNextCasPut`'s
-    /// contract: consumed by the first matching write, whether the key was already present or not.
+    /// expected value): instead of attempting it, that call throws `Poco::TimeoutException` and the
+    /// store is left exactly as it was. Models a request whose own HTTP attempt outcome is lost (a
+    /// timeout, a dropped connection) rather than a clean refusal, for tests that must exercise the
+    /// "ambiguous attempt, resolve before deciding" path without a live network. One-shot, mirroring
+    /// `failNextCasPut`'s contract: consumed by the first matching write, whether the key was already
+    /// present or not.
     void injectAmbiguousPutIfAbsent(const String & key);
 
     /// The other ambiguity, and the only one that can prove a resolve read settles a commit: the next
-    /// write of `key` IS APPLIED and then throws a plain (non-`DB::Exception`) exception, so the object
-    /// is durable and its incarnation was never returned. One-shot, and consumed by the keyed `write`
-    /// and by every legacy verb that forwards through it -- `putOverwrite` today. The two verbs that
-    /// route around the primitive, `putIfAbsent` and `casPut`, do not consume it.
+    /// write of `key` IS APPLIED and then throws `Poco::TimeoutException`, so the object is durable and
+    /// its incarnation was never returned. One-shot, and consumed by the keyed `write` and by every
+    /// legacy verb that forwards through it -- `putOverwrite` today. The two verbs that route around
+    /// the primitive, `putIfAbsent` and `casPut`, do not consume it.
     void injectAmbiguousLandedWrite(const String & key);
 
     /// Enables or disables value checks for remove and replace. Disabling checks models a backend

@@ -3,8 +3,8 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
+#include <Poco/Exception.h>
 #include <algorithm>
-#include <stdexcept>
 
 namespace DB
 {
@@ -184,7 +184,7 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::applyWrite(
 
     /// Last, so the object is durable and every observer has run before the response goes missing.
     if (knobs == WriteKnobs::All && takeAmbiguousLandedWrite(key))
-        throw std::runtime_error("InMemoryBackend: the write of '" + key + "' landed and its response was lost");
+        throw Poco::TimeoutException("InMemoryBackend: the write of '" + key + "' landed and its response was lost");
 
     return result;
 }
@@ -197,18 +197,14 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::writeUnderLock(
     if (!expected_value && (knobs == WriteKnobs::All || knobs == WriteKnobs::AmbiguousPutIfAbsent))
     {
         // One-shot injected ambiguous outcome: throw WITHOUT touching the store, modeling a request
-        // whose own attempt outcome never reached the caller (see the header doc for the
-        // classification this must produce). std::runtime_error, not DB::Exception, is deliberate: it
-        // dodges BOTH classification paths in BOTH build configurations -- dynamic_cast<const
-        // Exception *> fails (so isDeterministicLocalFailure is never consulted), and
-        // classifyConditionalWriteResult falls through to its Unresolved default because it isn't an
-        // S3Exception. A DB::Exception would have been fragile: picking a code outside
-        // isDeterministicLocalFailure's set is a landmine for the next person who extends that set.
+        // whose own attempt outcome never reached the caller. Poco::TimeoutException, not
+        // DB::Exception, is deliberate: a client-side timeout is the real shape of this failure, and
+        // its class is what every caller classifies by -- ambiguous, in both build configurations.
         auto ambiguous_it = ambiguous_put_keys_.find(key);
         if (ambiguous_it != ambiguous_put_keys_.end())
         {
             ambiguous_put_keys_.erase(ambiguous_it);
-            throw std::runtime_error("InMemoryBackend: injected ambiguous write outcome for '" + key + "'");
+            throw Poco::TimeoutException("InMemoryBackend: injected ambiguous write outcome for '" + key + "'");
         }
     }
 
