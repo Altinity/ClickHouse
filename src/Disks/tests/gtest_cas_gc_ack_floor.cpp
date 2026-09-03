@@ -904,17 +904,17 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
-    // srid2's keeper claims ONE lease via `start` and is never renewed again — tests never enable
+    // srid2's renewer claims ONE lease via `start` and is never renewed again — tests never enable
     // the runtime-owned renewal worker (`background_watermark` defaults to false), so this alone models a
     // crashed process: a body that is live-shaped (not terminated, not fenced) but whose write token
     // never changes again.
     const String srid2 = "stale-server";
-    CasRequests keeper_requests = openRequestsForTest(backend);
-    MountLeaseKeeper srid2_keeper(keeper_requests, keeper_requests, layout, srid2, DB::UInt128(0x2222),
+    CasRequests renewer_requests = openRequestsForTest(backend);
+    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
         /*writer_epoch=*/1,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
-    srid2_keeper.start();
+    srid2_renewer.start();
     ASSERT_FALSE(decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes).gc_fenced);
 
     // The fence-out threshold on the GC leader's OWN monotonic clock — mirrors the production formula
@@ -970,7 +970,7 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     // srid2's writer comes back and tries to renew: its held token was invalidated by the fence rewrite,
     // so synchronous renewal returns a terminal failure. (It renews on its own clock; liveness is irrelevant — the token guard
     // trips regardless.)
-    const MountRenewResult renewed = srid2_keeper.renew(MountRenewOperationEnvironment{});
+    const MountRenewResult renewed = srid2_renewer.renew(MountRenewOperationEnvironment{});
     ASSERT_EQ(renewed.outcome, MountRenewOutcome::Terminal);
     ASSERT_NE(renewed.failure, nullptr);
     EXPECT_THROW(std::rethrow_exception(renewed.failure), DB::Exception);
@@ -999,11 +999,11 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
 
     // A stale mount, exactly as `ExpiredMountFencedOutAndExcluded`: one claim, never renewed again.
     const String srid2 = "stale-server";
-    CasRequests keeper_requests = openRequestsForTest(backend);
-    MountLeaseKeeper srid2_keeper(keeper_requests, keeper_requests, layout, srid2, DB::UInt128(0x2222),
+    CasRequests renewer_requests = openRequestsForTest(backend);
+    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
         /*writer_epoch=*/1,
         std::chrono::milliseconds(100), [] { return 1000u; }, [&] { return fake_boot; });
-    srid2_keeper.start();
+    srid2_renewer.start();
     ASSERT_FALSE(decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes).gc_fenced);
 
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());

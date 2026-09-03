@@ -25,8 +25,8 @@
 
 /// Task 10 (rev.7 spec §5): `SYSTEM CAS FORGET` — the operator force-Vanish. FORGET drives a
 /// content-addressed pool to `Vanished(forgotten)` with the fence-first protocol: (1) publish terminal
-/// intent, (2) trip the local fence, (3+4) stop the GC scheduler, (5) join keeper/remount, drain, retire
-/// the keeper WITHOUT an unearned clean farewell, (6) publish `Vanished(forgotten)` with the [D5] message
+/// intent, (2) trip the local fence, (3+4) stop the GC scheduler, (5) join renewer/remount, drain, retire
+/// the renewer WITHOUT an unearned clean farewell, (6) publish `Vanished(forgotten)` with the [D5] message
 /// carrying the decommission timestamp. These tests exercise the Pool-level protocol body (`Pool::forgetDisk`)
 /// and the end-to-end verb through a real `ContentAddressedMetadataStorage` (the six-class gate wired to the
 /// new state). Harness patterns follow gtest_cas_lifecycle_condition.cpp and gtest_cas_operation_gate.cpp.

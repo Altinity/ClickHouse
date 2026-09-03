@@ -120,12 +120,12 @@ here for completeness, not because it changed anything.
 ## Wave migration units (U1-U12) {#wave-units}
 
 - **The bootstrap-control shapes — `claimMount`/`claimMountAwaitingExpiry`,
-  `MountLeaseKeeper::claim`, `claimOwnerOrThrow`, `allocateWriterEpoch`, the remount driver's
+  `MountLeaseRenewer::claim`, `claimOwnerOrThrow`, `allocateWriterEpoch`, the remount driver's
   re-anchor renewal (`renewForRemount`) — run on the open plane, `Pool::openRequests()` (renamed
   from `gcRequests()`, which now serves more than GC).** Reason: a self-remount runs with the mount
   fence already latched lost, so a claim made while re-establishing that fence cannot itself be
   admitted under it; each site's safety is its own conditional write's precondition, not fence
-  admission — same logic as `MountLeaseKeeper::claim`. Cost if wrong: none — the rename was deferred
+  admission — same logic as `MountLeaseRenewer::claim`. Cost if wrong: none — the rename was deferred
   to the lock task precisely so nothing depended on the old name mid-wave.
 - **`renewForRemount` takes no plane parameter; it always uses the keeper's own open plane.** Reason:
   a plane parameter would make "renew on the wrong plane" a representable call; the keeper has

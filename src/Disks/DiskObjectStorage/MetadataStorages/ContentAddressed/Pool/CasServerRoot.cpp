@@ -132,7 +132,7 @@ struct MountRenewObservabilityConfiguration
 /// registered outer per-call snapshot stable without allocation, including while a parked redo holds
 /// `remount_mutex`. Overflow suppresses rich event/log delivery for the nested call rather than
 /// aliasing an outer call or changing protocol behavior; physical attempt truth is independently
-/// retained by the stack-local observer in `MountLeaseKeeper::renew`.
+/// retained by the stack-local observer in `MountLeaseRenewer::renew`.
 struct MountRenewObservabilityStack
 {
     static constexpr size_t capacity = 8;
@@ -334,7 +334,7 @@ void deliverMountRenewObservability(
             try
             {
                 LOG_DEBUG(
-                    getLogger("CasMountLeaseKeeper"),
+                    getLogger("CasMountLeaseRenewer"),
                     "CAS mount renewal '{}' physical retry attempt {} (writer_epoch={}, seq={})",
                     *context.server_root_id,
                     attempt_no,
@@ -364,7 +364,7 @@ void deliverMountRenewObservability(
             try
             {
                 LOG_INFO(
-                    getLogger("CasMountLeaseKeeper"),
+                    getLogger("CasMountLeaseRenewer"),
                     "CAS mount renewal '{}' recovered after {} physical attempts in {} ms "
                     "(classification={}, confirmed_deadline_boot_ms={})",
                     *context.server_root_id,
@@ -391,7 +391,7 @@ void deliverMountRenewObservability(
             try
             {
                 LOG_WARNING(
-                    getLogger("CasMountLeaseKeeper"),
+                    getLogger("CasMountLeaseRenewer"),
                     "CAS mount renewal '{}' fenced after {} physical attempts in {} ms "
                     "(classification={}, confirmed_deadline_boot_ms={})",
                     *context.server_root_id,
@@ -830,12 +830,12 @@ MountClaimResult claimMount(
 
     /// Same uuid, DIFFERENT epoch: reclaim ONLY on a certificate of death that needs no fresh
     /// wall-clock trust — never by comparing `expires_at_ms` against `now_ms`:
-    ///   - `gc_fenced` → the fence-out is terminal for that incarnation by construction (its keeper's
+    ///   - `gc_fenced` → the fence-out is terminal for that incarnation by construction (its renewer's
     ///     every renewal fails the token guard forever, so it can never write again) — there is no
     ///     liveness left to wait for. This is what makes self-remount (and a fast restart after a
     ///     fence-out) instant instead of an observation wait.
     ///   - the clean marker (`min_active_build_sequence == UINT64_MAX`) → the predecessor's OWN graceful farewell
-    ///     (`MountLeaseKeeper::terminate`) — no observation needed either.
+    ///     (`MountLeaseRenewer::terminate`) — no observation needed either.
     ///   - `proven_dead_incarnation` matches the one we just read → the CALLER
     ///     (`claimMountAwaitingExpiry`) already watched that exact incarnation hold stable for the full
     ///     observation threshold on its own clock; re-deriving that here from a bare wall-clock
@@ -1264,7 +1264,7 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 /// and a slot it fails to hand back is fenced out by the next GC round anyway.
 constexpr uint64_t kFarewellBudgetMs = 10'000;
 
-MountLeaseKeeper::MountLeaseKeeper(
+MountLeaseRenewer::MountLeaseRenewer(
     CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
@@ -1287,7 +1287,7 @@ MountLeaseKeeper::MountLeaseKeeper(
 {
 }
 
-String MountLeaseKeeper::encodeBody(
+String MountLeaseRenewer::encodeBody(
     uint64_t seq_, uint64_t wall_ms, uint64_t min_active_build_sequence, UInt128 write_attempt_id) const
 {
     const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
@@ -1307,7 +1307,7 @@ String MountLeaseKeeper::encodeBody(
     });
 }
 
-const Etag & MountLeaseKeeper::precondition() const
+const Etag & MountLeaseRenewer::precondition() const
 {
     if (!last_etag)
         throw Exception(
@@ -1316,7 +1316,7 @@ const Etag & MountLeaseKeeper::precondition() const
     return *last_etag;
 }
 
-Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
+Etag MountLeaseRenewer::claim(CasOperation & op, const String & body)
 {
     /// One read decides the branch AND supplies the precondition, so both the mint and the adoption
     /// are two requests: a separate presence probe would only re-ask what these bytes already answer.
@@ -1332,7 +1332,7 @@ Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
             = orThrow(std::move(minted), fmt::format("CAS mount-lease mint of key '{}'", key));
         emitMountEvent(
             event_sink, CasEventType::MountClaim, srid, "mint", nullptr,
-            "mount slot absent -- keeper minted it directly");
+            "mount slot absent -- renewer minted it directly");
         return *etag;
     }
 
@@ -1361,9 +1361,9 @@ Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
     {
         emitMountEvent(
             event_sink, CasEventType::MountConflict, srid, "fenced_by_gc", &observed,
-            "own mount slot was fenced by GC before keeper adoption");
+            "own mount slot was fenced by GC before renewer adoption");
         throw MountFencedException(fmt::format(
-            "CAS mount-lease: key '{}' was fenced by GC before keeper adoption ({})",
+            "CAS mount-lease: key '{}' was fenced by GC before renewer adoption ({})",
             key, describeMountHolder(observed)));
     }
 
@@ -1397,9 +1397,9 @@ Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
     return *etag;
 }
 
-uint64_t MountLeaseKeeper::start(Liveness liveness)
+uint64_t MountLeaseRenewer::start(Liveness liveness)
 {
-    if (keeper_state != MountLeaseKeeperState::New)
+    if (renewer_state != MountLeaseRenewerState::New)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount-lease: start is allowed only in New state for key '{}'", key);
 
     const uint64_t wall_ms = now_ms_fn();
@@ -1418,11 +1418,11 @@ uint64_t MountLeaseKeeper::start(Liveness liveness)
     confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
         ? std::numeric_limits<uint64_t>::max()
         : attempt_start_boot_ms + ttl_ms;
-    keeper_state = MountLeaseKeeperState::Active;
+    renewer_state = MountLeaseRenewerState::Active;
     return attempt_start_boot_ms;
 }
 
-[[noreturn]] void MountLeaseKeeper::throwRenewConflict(const Observation & seen) const
+[[noreturn]] void MountLeaseRenewer::throwRenewConflict(const Observation & seen) const
 {
     if (const Object * occupant = std::get_if<Object>(&seen))
     {
@@ -1460,7 +1460,7 @@ uint64_t MountLeaseKeeper::start(Liveness liveness)
 
         /// This decoded authoritative observation is the exact point at which this incarnation learns
         /// that a foreign successor owns the slot. Terminal teardown intentionally performs no release
-        /// I/O, so account the skipped farewell here, once, before the keeper enters its terminal state.
+        /// I/O, so account the skipped farewell here, once, before the renewer enters its terminal state.
         /// The renewal may be parked under `remount_mutex`; keep the increment trace-free.
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountReleaseSkippedForeignOccupant);
         emitMountEvent(
@@ -1491,7 +1491,7 @@ uint64_t MountLeaseKeeper::start(Liveness liveness)
         "an occupant nor an absence", key));
 }
 
-MountRenewResult MountLeaseKeeper::terminalResult(MountRenewResult result)
+MountRenewResult MountLeaseRenewer::terminalResult(MountRenewResult result)
 {
     if (!result.failure)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount-lease: terminal renewal requires a failure");
@@ -1507,38 +1507,38 @@ MountRenewResult MountLeaseKeeper::terminalResult(MountRenewResult result)
     catch (...)
     {
     }
-    if (keeper_state != MountLeaseKeeperState::Active)
+    if (renewer_state != MountLeaseRenewerState::Active)
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
             "CAS mount-lease: terminal renewal outside Active state (observed state {})",
-            static_cast<uint32_t>(keeper_state));
-    keeper_state = MountLeaseKeeperState::RenewalTerminal;
+            static_cast<uint32_t>(renewer_state));
+    renewer_state = MountLeaseRenewerState::RenewalTerminal;
     result.outcome = MountRenewOutcome::Terminal;
     return result;
 }
 
-MountRenewResult MountLeaseKeeper::renew(const MountRenewOperationEnvironment & environment)
+MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment & environment)
 {
     return renewOn(mount_requests, environment);
 }
 
-MountRenewResult MountLeaseKeeper::renewForRemount(const MountRenewOperationEnvironment & environment)
+MountRenewResult MountLeaseRenewer::renewForRemount(const MountRenewOperationEnvironment & environment)
 {
     return renewOn(open_requests, environment);
 }
 
-MountRenewResult MountLeaseKeeper::renewOn(
+MountRenewResult MountLeaseRenewer::renewOn(
     CasRequests & plane, const MountRenewOperationEnvironment & environment)
 {
     const MountRenewObservabilityRegistration observability_registration = beginMountRenewObservabilityCall();
     const MountRenewObservabilityCallGuard observability_guard(observability_registration);
 
-    if (keeper_state != MountLeaseKeeperState::Active)
+    if (renewer_state != MountLeaseRenewerState::Active)
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
             "CAS mount-lease: renew is allowed only in Active state for key '{}' (observed state {})",
             key,
-            static_cast<uint32_t>(keeper_state));
+            static_cast<uint32_t>(renewer_state));
 
     const auto boot_clock = environment.boot_ms ? environment.boot_ms : boot_ms_fn;
     /// Sampled BEFORE the write. A refused admission is reported as "never attempted" only when this
@@ -1675,7 +1675,7 @@ MountRenewResult MountLeaseKeeper::renewOn(
         "CAS mount-lease: the renewal of key '{}' was declined, which a replace cannot report", key);
 }
 
-void MountLeaseKeeper::terminate(CasOperation & op)
+void MountLeaseRenewer::terminate(CasOperation & op)
 {
     const uint64_t wall_ms = now_ms_fn();
     const String body = encodeMountLease(MountLease{
@@ -1722,11 +1722,11 @@ void MountLeaseKeeper::terminate(CasOperation & op)
     orThrow(std::move(written), fmt::format("CAS mount-lease release of key '{}'", key));
 }
 
-void MountLeaseKeeper::release()
+void MountLeaseRenewer::release()
 {
-    if (keeper_state != MountLeaseKeeperState::Active)
+    if (renewer_state != MountLeaseRenewerState::Active)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount-lease: release is allowed only in Active state for key '{}'", key);
-    keeper_state = MountLeaseKeeperState::Released;
+    renewer_state = MountLeaseRenewerState::Released;
     /// Off the mount fence, for the same reason the claim is: a departing mount whose lease has already
     /// run down still has to hand the slot back, and refusing the write there would leave the slot
     /// looking live until GC fences it out.

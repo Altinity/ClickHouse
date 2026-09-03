@@ -193,8 +193,8 @@ uint64_t CasMountRuntime::peekNextBuildSeq()
 
 void CasMountRuntime::renewWatermarkOnce()
 {
-    auto call = admitKeeperCall(RenewalDriverState::Dormant, RenewalDriverState::DirectCall);
-    (void)renewKeeperOnce(
+    auto call = admitRenewerCall(RenewalDriverState::Dormant, RenewalDriverState::DirectCall);
+    (void)renewRenewerOnce(
         std::move(call),
         RenewalDriverState::DirectCall,
         /*propagate_failure=*/true,
@@ -271,8 +271,8 @@ CasMountRuntime::DriverLease::DriverLease(CasMountRuntime & runtime_, RenewalDri
 bool CasMountRuntime::renewalWorkerMayRenew() const
 {
     return renewal_driver_state == RenewalDriverState::WorkerIdle
-        && mount_keeper
-        && mount_keeper->state() == MountLeaseKeeperState::Active;
+        && mount_renewer
+        && mount_renewer->state() == MountLeaseRenewerState::Active;
 }
 
 CasMountRuntime::DriverLease::~DriverLease()
@@ -333,7 +333,7 @@ RenewalDriverState CasMountRuntime::DriverLease::finish(
     return runtime.renewal_driver_state;
 }
 
-CasMountRuntime::AdmittedKeeperCall CasMountRuntime::admitKeeperCall(
+CasMountRuntime::AdmittedRenewerCall CasMountRuntime::admitRenewerCall(
     RenewalDriverState required,
     RenewalDriverState active)
 {
@@ -346,23 +346,23 @@ CasMountRuntime::AdmittedKeeperCall CasMountRuntime::admitKeeperCall(
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
             "CAS mount runtime: renewal driver is not admitted from the required state");
-    if (!mount_keeper)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal without a keeper");
-    if (mount_keeper->state() != MountLeaseKeeperState::Active)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal requires an Active keeper");
-    MountLeaseKeeper * keeper = mount_keeper.get();
+    if (!mount_renewer)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal without a renewer");
+    if (mount_renewer->state() != MountLeaseRenewerState::Active)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal requires an Active renewer");
+    MountLeaseRenewer * renewer = mount_renewer.get();
     auto lease = std::make_unique<DriverLease>(*this, active);
     renewal_driver_state = active;
     driver_cv.notify_all();
-    return AdmittedKeeperCall{std::move(lease), keeper};
+    return AdmittedRenewerCall{std::move(lease), renewer};
 }
 
-void CasMountRuntime::installKeeper(
+void CasMountRuntime::installRenewer(
     UInt128 our_uuid,
     uint64_t writer_epoch,
     const std::function<uint64_t()> & now_ms)
 {
-    auto replacement = std::make_unique<MountLeaseKeeper>(
+    auto replacement = std::make_unique<MountLeaseRenewer>(
         mount_requests, farewell_requests, layout, server_root_id, our_uuid, writer_epoch,
         config.mount_lease_ttl_ms, now_ms,
         [this] { return minActive(); },
@@ -375,21 +375,21 @@ void CasMountRuntime::installKeeper(
         && renewal_driver_state != RenewalDriverState::Parked)
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
-            "CAS mount runtime: keeper replacement requires Dormant or Parked renewal ownership");
-    mount_keeper = std::move(replacement);
+            "CAS mount runtime: renewer replacement requires Dormant or Parked renewal ownership");
+    mount_renewer = std::move(replacement);
 }
 
-uint64_t CasMountRuntime::startKeeper()
+uint64_t CasMountRuntime::startRenewer()
 {
     RenewalDriverState active;
     RenewalDriverState destination;
-    MountLeaseKeeper * keeper;
+    MountLeaseRenewer * renewer;
     {
         std::lock_guard lock(driver_mutex);
-        if (!mount_keeper)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startKeeper without a keeper");
-        if (mount_keeper->state() != MountLeaseKeeperState::New)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startKeeper requires a New keeper");
+        if (!mount_renewer)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startRenewer without a renewer");
+        if (mount_renewer->state() != MountLeaseRenewerState::New)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startRenewer requires a New renewer");
         if (renewal_driver_state == RenewalDriverState::Dormant)
         {
             active = RenewalDriverState::StartupCall;
@@ -402,15 +402,15 @@ uint64_t CasMountRuntime::startKeeper()
         }
         else
         {
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startKeeper is not admitted in the current state");
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startRenewer is not admitted in the current state");
         }
-        keeper = mount_keeper.get();
+        renewer = mount_renewer.get();
         renewal_driver_state = active;
         driver_cv.notify_all();
     }
 
     DriverLease lease(*this, active);
-    const uint64_t anchor = keeper->start([this] { return !renewalCancelled(); });
+    const uint64_t anchor = renewer->start([this] { return !renewalCancelled(); });
     (void)lease.finish(destination);
     return anchor;
 }
@@ -458,7 +458,7 @@ void CasMountRuntime::consumeRenewResult(
     bool propagate_failure)
 {
     /// Driver ownership has already been restored by `DriverLease::finish`; this is the single logical
-    /// consumption boundary and it runs without `driver_mutex` or keeper access.
+    /// consumption boundary and it runs without `driver_mutex` or renewer access.
     /// The physical counters come off the result rather than off a per-attempt callback, so they count
     /// the same on every ending: a renewal that gave up still sent what it sent.
     if (result.attempts_sent > 0)
@@ -515,8 +515,8 @@ void CasMountRuntime::consumeRenewResult(
         std::rethrow_exception(result.failure);
 }
 
-uint64_t CasMountRuntime::renewKeeperOnce(
-    AdmittedKeeperCall call,
+uint64_t CasMountRuntime::renewRenewerOnce(
+    AdmittedRenewerCall call,
     RenewalDriverState active,
     bool propagate_failure,
     bool worker_call)
@@ -526,12 +526,12 @@ uint64_t CasMountRuntime::renewKeeperOnce(
     configureMountRenewObservability(
         &server_root_id, &event_sink, active == RenewalDriverState::RemountCall);
     /// The remount redo re-anchors the lease BEFORE `armMountFence`, with the fence still latched lost,
-    /// so it renews on the keeper's open plane: admitted under the mount fence it could only ever give
+    /// so it renews on the renewer's open plane: admitted under the mount fence it could only ever give
     /// up, and every remount would fail at this step. `RemountCall` is reached from
-    /// `renewKeeperForRemountOnce` alone.
+    /// `renewRenewerForRemountOnce` alone.
     const MountRenewResult result = active == RenewalDriverState::RemountCall
-        ? call.keeper->renewForRemount(renewalEnvironment(worker_call))
-        : call.keeper->renew(renewalEnvironment(worker_call));
+        ? call.renewer->renewForRemount(renewalEnvironment(worker_call))
+        : call.renewer->renew(renewalEnvironment(worker_call));
     const RenewalDriverState destination = active == RenewalDriverState::WorkerCall
         ? RenewalDriverState::WorkerIdle
         : (active == RenewalDriverState::RemountCall ? RenewalDriverState::Parked : RenewalDriverState::Dormant);
@@ -542,33 +542,33 @@ uint64_t CasMountRuntime::renewKeeperOnce(
     return result.attempt_start_boot_ms;
 }
 
-uint64_t CasMountRuntime::renewKeeperForStartupOnce()
+uint64_t CasMountRuntime::renewRenewerForStartupOnce()
 {
-    auto call = admitKeeperCall(RenewalDriverState::Dormant, RenewalDriverState::StartupCall);
-    return renewKeeperOnce(
+    auto call = admitRenewerCall(RenewalDriverState::Dormant, RenewalDriverState::StartupCall);
+    return renewRenewerOnce(
         std::move(call),
         RenewalDriverState::StartupCall,
         /*propagate_failure=*/true,
         /*worker_call=*/false);
 }
 
-uint64_t CasMountRuntime::renewKeeperForRemountOnce()
+uint64_t CasMountRuntime::renewRenewerForRemountOnce()
 {
-    auto call = admitKeeperCall(RenewalDriverState::Parked, RenewalDriverState::RemountCall);
-    return renewKeeperOnce(
+    auto call = admitRenewerCall(RenewalDriverState::Parked, RenewalDriverState::RemountCall);
+    return renewRenewerOnce(
         std::move(call),
         RenewalDriverState::RemountCall,
         /*propagate_failure=*/true,
         /*worker_call=*/false);
 }
 
-void CasMountRuntime::keeperReset()
+void CasMountRuntime::renewerReset()
 {
     std::lock_guard lock(driver_mutex);
     if (renewal_driver_state != RenewalDriverState::Dormant
         && renewal_driver_state != RenewalDriverState::Parked)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: keeper reset while renewal is active");
-    mount_keeper.reset();
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewer reset while renewal is active");
+    mount_renewer.reset();
 }
 
 ThreadFromGlobalPool CasMountRuntime::makeWorker(std::function<void()> body)
@@ -586,8 +586,8 @@ void CasMountRuntime::startBackgroundWorkers(std::chrono::milliseconds period)
             || workers_starting || workers_started
             || renewal_worker.joinable() || remount_worker.joinable())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: background workers cannot start in the current state");
-        if (!mount_keeper || mount_keeper->state() != MountLeaseKeeperState::Active)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: background workers require an Active keeper");
+        if (!mount_renewer || mount_renewer->state() != MountLeaseRenewerState::Active)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: background workers require an Active renewer");
         workers_starting = true;
         workers_stop_requested = false;
         worker_loops_released = false;
@@ -638,7 +638,7 @@ void CasMountRuntime::startBackgroundWorkers(std::chrono::milliseconds period)
 
 void CasMountRuntime::renewalLoop()
 {
-    setThreadName(ThreadName::CAS_LEASE_KEEPER);
+    setThreadName(ThreadName::CAS_LEASE_RENEWER);
     {
         std::unique_lock lock(driver_mutex);
         driver_cv.wait(lock, [this] { return worker_loops_released; });
@@ -651,7 +651,7 @@ void CasMountRuntime::renewalLoop()
         if (config.renewal_before_driver_lock_hook_for_test)
             config.renewal_before_driver_lock_hook_for_test();
 
-        AdmittedKeeperCall call;
+        AdmittedRenewerCall call;
         {
             std::unique_lock lock(driver_mutex);
             if (workers_stop_requested || remountTerminal())
@@ -678,7 +678,7 @@ void CasMountRuntime::renewalLoop()
                 continue;
             }
 
-            const uint64_t last_anchor = mount_keeper->lastCommittedAttemptStartBootMs();
+            const uint64_t last_anchor = mount_renewer->lastCommittedAttemptStartBootMs();
             const uint64_t period_ms = static_cast<uint64_t>(std::max<int64_t>(0, renewal_period.count()));
             const uint64_t due = last_anchor > std::numeric_limits<uint64_t>::max() - period_ms
                 ? std::numeric_limits<uint64_t>::max()
@@ -688,23 +688,23 @@ void CasMountRuntime::renewalLoop()
             {
                 /// Every runtime notification can change the cadence decision: park/resume may happen
                 /// entirely while this worker is idle, and a remount may publish an already-overdue
-                /// keeper anchor. Re-sample state and BOOTTIME after any wake instead of retaining the
+                /// renewer anchor. Re-sample state and BOOTTIME after any wake instead of retaining the
                 /// old relative wait until its wall-clock timeout.
                 driver_cv.wait_for(lock, std::chrono::milliseconds(due - now));
                 continue;
             }
-            MountLeaseKeeper * keeper = mount_keeper.get();
+            MountLeaseRenewer * renewer = mount_renewer.get();
             auto lease = std::make_unique<DriverLease>(*this, RenewalDriverState::WorkerCall);
             renewal_driver_state = RenewalDriverState::WorkerCall;
             driver_cv.notify_all();
-            call = AdmittedKeeperCall{std::move(lease), keeper};
+            call = AdmittedRenewerCall{std::move(lease), renewer};
         }
 
         if (config.renewal_admitted_hook_for_test)
             config.renewal_admitted_hook_for_test();
         try
         {
-            (void)renewKeeperOnce(
+            (void)renewRenewerOnce(
                 std::move(call),
                 RenewalDriverState::WorkerCall,
                 /*propagate_failure=*/false,
@@ -811,8 +811,8 @@ void CasMountRuntime::remountLoop()
             if (remount_requested_generation > remount_handled_generation)
                 continue;
             if (lifecycle() == PoolLifecycle::Live
-                && mount_keeper
-                && mount_keeper->state() == MountLeaseKeeperState::Active)
+                && mount_renewer
+                && mount_renewer->state() == MountLeaseRenewerState::Active)
             {
                 renewal_driver_state = RenewalDriverState::WorkerIdle;
                 driver_cv.notify_all();
@@ -935,7 +935,7 @@ void CasMountRuntime::enterIdentityLost()
 {
     /// `TransientNotLive -> IdentityLost`, one way. The compare-exchange FROM `TransientNotLive` gives
     /// the brief's "from TransientNotLive only" precondition, idempotency (a second call finds the state
-    /// already `IdentityLost` and its exchange fails), and safety against a concurrent keeper
+    /// already `IdentityLost` and its exchange fails), and safety against a concurrent renewer
     /// `noteLeaseLost` (which only ever moves `Live -> TransientNotLive`, never away from it). It does NOT
     /// set `vanished_intent` (that latch is reserved for the `Vanished*` idempotency/FORGET protocol);
     /// rev.8 makes `IdentityLost` a fail-loud TERMINAL state through `remountTerminal`, which folds it
@@ -1120,13 +1120,13 @@ void CasMountRuntime::finishTeardown(bool drained)
 {
     stopBackgroundWorkers();
 
-    if (!mount_keeper)
+    if (!mount_renewer)
         return;
-    if (drained && mount_keeper->state() == MountLeaseKeeperState::Active)
+    if (drained && mount_renewer->state() == MountLeaseRenewerState::Active)
     {
         try
         {
-            mount_keeper->release();
+            mount_renewer->release();
         }
         catch (...)
         {

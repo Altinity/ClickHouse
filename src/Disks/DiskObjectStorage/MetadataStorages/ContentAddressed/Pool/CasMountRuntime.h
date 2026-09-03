@@ -81,9 +81,9 @@ struct MountConfig
     /// `driver_mutex` to inspect cadence or parking state.
     std::function<void()> renewal_before_driver_lock_hook_for_test = {};
     /// Deterministic test interposition after a due worker has atomically reserved renewal ownership
-    /// and captured its keeper, but before keeper/backend I/O starts.
+    /// and captured its renewer, but before renewer/backend I/O starts.
     std::function<void()> renewal_admitted_hook_for_test = {};
-    /// Deterministic test interposition after terminal ownership has been deposited and the keeper is
+    /// Deterministic test interposition after terminal ownership has been deposited and the renewer is
     /// no longer reachable by the completed call.
     std::function<void()> renewal_terminal_deposited_hook_for_test = {};
     /// Deterministic test interposition after the parked renewal predicate has sampled terminal false,
@@ -105,7 +105,7 @@ struct MountConfig
 };
 
 /// Local, in-memory write fence. It is deliberately not checked by reading the object store for every
-/// write: the `MountLeaseKeeper` is the sole lease reader/renewer. A successful renewal translates the
+/// write: the `MountLeaseRenewer` is the sole lease reader/renewer. A successful renewal translates the
 /// durable `expires_at_ms` into `deadline_boot_ms`; a foreign owner, newer `writer_epoch`, or failed
 /// renewal latches `lost`. Mutable operations are allowed only while the latch is clear and the local
 /// deadline has not passed. The `writer_epoch` is the durable fencing token.
@@ -127,7 +127,7 @@ struct MountFence
 };
 
 /// Owns the live writer-incarnation mechanics shared by the pool's mount and recovery orchestration:
-/// the `MountLeaseKeeper`, local `MountFence`, build watermark and in-flight build registry,
+/// the `MountLeaseRenewer`, local `MountFence`, build watermark and in-flight build registry,
 /// `live_writer_epoch`, unclean-boundary marker, and both persistent workers. `Pool` retains the higher-level
 /// claim/recovery sequence and its `remount_mutex`; in particular, the runtime does not acquire or own
 /// the ref-ledger locks. The runtime receives its backend, layout, configuration, event sink, request
@@ -138,7 +138,7 @@ class CasMountRuntime
 public:
     CasMountRuntime(
         BackendPtr backend_ptr_,
-        /// The two planes the `MountLeaseKeeper` runs on: renewals under the mount fence, the farewell
+        /// The two planes the `MountLeaseRenewer` runs on: renewals under the mount fence, the farewell
         /// on an open one. Owned by `Pool` and outliving this runtime.
         CasRequests & mount_requests_,
         CasRequests & farewell_requests_,
@@ -162,7 +162,7 @@ public:
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
     /// Renew the merged mount heartbeat once, including its build-watermark floor. A read-only runtime
-    /// has no keeper and fails with a logical exception rather than fabricating a heartbeat.
+    /// has no renewer and fails with a logical exception rather than fabricating a heartbeat.
     void renewWatermarkOnce();
 
     /// ---- local write fence ----
@@ -215,7 +215,7 @@ public:
     /// `enterVanished`, OR EARLY (spec §5 step 1) by FORGET's `publishVanishedIntent`, and NEVER by the
     /// non-absorbing `IdentityLost` ([C1]). This is the EARLIEST terminal signal: it can already be true
     /// while the state is still pre-terminal (mid-FORGET). Consulted alongside `isVanished()` by every
-    /// background worker that must self-exit the moment the pool is (being driven) terminal — the keeper
+    /// background worker that must self-exit the moment the pool is (being driven) terminal — the renewer
     /// callback (`scheduleRemount`), the remount loop, and the GC scheduler.
     bool vanishedIntentPublished() const { return vanished_intent.load(std::memory_order_acquire); }
 
@@ -353,12 +353,12 @@ public:
     /// Publish the live-incarnation `live_writer_epoch` with release ordering.
     void setLiveWriterEpoch(uint64_t v);
 
-    /// ---- mount-lease keeper and persistent workers ----
-    void installKeeper(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms);
-    uint64_t startKeeper();
-    uint64_t renewKeeperForStartupOnce();
-    uint64_t renewKeeperForRemountOnce();
-    void keeperReset();
+    /// ---- mount-lease renewer and persistent workers ----
+    void installRenewer(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms);
+    uint64_t startRenewer();
+    uint64_t renewRenewerForStartupOnce();
+    uint64_t renewRenewerForRemountOnce();
+    void renewerReset();
     void startBackgroundWorkers(std::chrono::milliseconds period);
     void stopBackgroundWorkers();
     /// Latch a recovery generation. Persistent remount ownership means this never constructs a thread.
@@ -366,7 +366,7 @@ public:
     bool scheduleRemountForTest();
     void beginShutdownForTest();
     /// Return how many times `scheduleRemount` was entered, including calls refused by the background
-    /// setting. This is useful for testing the keeper's loss callback without starting a real recovery.
+    /// setting. This is useful for testing the renewer's loss callback without starting a real recovery.
     uint64_t scheduleRemountCallCountForTest() const
     {
         return schedule_remount_calls_for_test.load(std::memory_order_relaxed);
@@ -377,14 +377,14 @@ public:
     bool workersRunningForTest() const;
     uint64_t remountRequestedGenerationForTest() const;
 
-    /// Join both persistent workers before an `Active` keeper may write its clean farewell.
+    /// Join both persistent workers before an `Active` renewer may write its clean farewell.
     void finishTeardown(bool drained);
 
     /// Sleep through the injected test hook when present; otherwise use the production thread sleep.
     /// `Pool` claim observation and materialization grace waits share this seam so tests control both.
     void waitSleep(uint64_t ms) const;
 
-    /// Forward keeper events to the injected sink. The sink is held by reference so it observes the
+    /// Forward renewer events to the injected sink. The sink is held by reference so it observes the
     /// owning pool's current event routing for the runtime's entire lifetime.
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }
 
@@ -402,22 +402,22 @@ private:
         bool finished = false;
     };
 
-    struct AdmittedKeeperCall
+    struct AdmittedRenewerCall
     {
         std::unique_ptr<DriverLease> lease;
-        MountLeaseKeeper * keeper = nullptr;
+        MountLeaseRenewer * renewer = nullptr;
     };
 
-    /// The renewal worker may drive a renewal only while it exclusively owns the driver and the keeper
-    /// is Active. Requires `driver_mutex`. `admitKeeperCall` enforces the same three conditions for every
+    /// The renewal worker may drive a renewal only while it exclusively owns the driver and the renewer
+    /// is Active. Requires `driver_mutex`. `admitRenewerCall` enforces the same three conditions for every
     /// other driver; the worker loop must park rather than throw when they do not hold, so it needs the
     /// predicate separately. Both the park test and the wake predicate use this one definition, so they
     /// cannot drift apart.
     bool renewalWorkerMayRenew() const;
 
-    AdmittedKeeperCall admitKeeperCall(RenewalDriverState required, RenewalDriverState active);
-    uint64_t renewKeeperOnce(
-        AdmittedKeeperCall call,
+    AdmittedRenewerCall admitRenewerCall(RenewalDriverState required, RenewalDriverState active);
+    uint64_t renewRenewerOnce(
+        AdmittedRenewerCall call,
         RenewalDriverState active,
         bool propagate_failure,
         bool worker_call);
@@ -455,7 +455,7 @@ private:
     /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
     /// per-process counter (monotonicity is load-bearing — a seq is never reused or lowered);
     /// active_build_seqs holds the seqs of in-flight builds, so `minActive` yields the GC floor. The floor
-    /// is published by the merged `mount_keeper`
+    /// is published by the merged `mount_renewer`
     /// beat (there is no standalone watermark object anymore). ATOMIC because a self-remount re-stamps it
     /// (kept equal to `live_writer_epoch`) from the runtime-owned remount worker while `epoch`/`writerEpoch`
     /// may observe it; the ref-lane hot readers were moved to `liveWriterEpoch`, so this now backs only
@@ -472,15 +472,15 @@ private:
     /// Synchronous mount-lease protocol state. Constructed and started on a writable open after the
     /// owner/epoch/mount startup protocol; the runtime-owned renewal worker is its sole background
     /// driver and publishes successful anchors or terminal loss into the local fence. After both
-    /// workers join, teardown releases an `Active` keeper so a same-server reopen can reclaim
+    /// workers join, teardown releases an `Active` renewer so a same-server reopen can reclaim
     /// immediately. Null on a read-only open.
-    std::unique_ptr<MountLeaseKeeper> mount_keeper;
+    std::unique_ptr<MountLeaseRenewer> mount_renewer;
 
     std::atomic<uint64_t> live_writer_epoch{0};
 
     /// One mutex/condition pair owns driver admission, worker lifecycle, cadence, and the remount
     /// generation latch, and terminal predicates paired with `driver_cv`. It is never held across
-    /// keeper/backend calls, remount callbacks, logging, or joins.
+    /// renewer/backend calls, remount callbacks, logging, or joins.
     mutable std::mutex driver_mutex;
     mutable std::condition_variable driver_cv;
     RenewalDriverState renewal_driver_state = RenewalDriverState::Dormant;
@@ -497,7 +497,7 @@ private:
     std::atomic<uint64_t> schedule_remount_calls_for_test{0};
 
     /// Local write fence. The unarmed default (`deadline_boot_ms = UINT64_MAX`, `lost = false`) permits
-    /// mutation until a keeper supplies a real lease deadline or reports that the lease was lost. This
+    /// mutation until a renewer supplies a real lease deadline or reports that the lease was lost. This
     /// is the gate at the ref-append mutation chokepoint.
     MountFence mount_fence;
 

@@ -48,15 +48,15 @@ RefCatalog catalogOwning(const String & ns, NsState state)
     return RefCatalog{.entries = {std::move(entry)}};
 }
 
-void renewKeeperOrThrow(MountLeaseKeeper & keeper)
+void renewOrThrow(MountLeaseRenewer & renewer)
 {
-    const MountRenewResult result = keeper.renew(MountRenewOperationEnvironment{});
+    const MountRenewResult result = renewer.renew(MountRenewOperationEnvironment{});
     if (result.outcome == MountRenewOutcome::Terminal)
         std::rethrow_exception(result.failure);
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
 }
 
-/// The two request planes a keeper in this file runs on, plus one operation for the protocol calls
+/// The two request planes a renewer in this file runs on, plus one operation for the protocol calls
 /// driven directly. Both planes are open-fence: these fixtures hold no mount lease, so nothing here
 /// should be refused by a fence it does not have. The clock and the sleep are ALWAYS injected -- a
 /// fixture that drives a lease deadline passes its own so a slow machine cannot run the bound out
@@ -252,7 +252,7 @@ class ScopedRenewalLogCapture
 {
 public:
     explicit ScopedRenewalLogCapture(const String & level)
-        : logger(getLogger("CasMountLeaseKeeper"))
+        : logger(getLogger("CasMountLeaseRenewer"))
         , channel(new Poco::StreamChannel(stream))
         , old_channel(logger->getChannel(), /*shared=*/true)
         , old_level(logger->getLevel())
@@ -701,12 +701,12 @@ TEST(CASMountLease, AbsentClaimThenRenewBumpsSeq)
     Ops ops(b, &boot);
     auto r = claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100);
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
-    MountLeaseKeeper k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                        [&] { return boot; });
     k.start();
     EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).seq, 1u);
-    renewKeeperOrThrow(k);
+    renewOrThrow(k);
     EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).seq, 2u);
 }
 
@@ -721,11 +721,11 @@ TEST(CASMountLease, HolderBodiesMintFreshAttemptIdsAndFenceCopiesIt)
     const String key = layout.mountKey("r");
     const MountLease claimed = decodeMountLease(ops.op.read(key, Retry::standard())->bytes);
 
-    MountLeaseKeeper keeper(ops.mount, ops.farewell, layout, "r", UInt128{1}, 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, "r", UInt128{1}, 7, std::chrono::milliseconds(100),
                             [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot; });
-    keeper.start();
-    renewKeeperOrThrow(keeper);
+    renewer.start();
+    renewOrThrow(renewer);
     const MountLease renewed = decodeMountLease(ops.op.read(key, Retry::standard())->bytes);
     EXPECT_NE(claimed.write_attempt_id, UInt128{});
     EXPECT_NE(renewed.write_attempt_id, UInt128{});
@@ -765,7 +765,7 @@ TEST(CASMountLease, ReclaimAndSuccessorBodiesMintNewAttemptIds)
 }
 
 /// STID 3982-3b48: `rm -rf` of the pool dir under a live mount deletes the mount slot object out from
-/// under a running keeper. The next synchronous renewal must return terminal WITHOUT constructing a
+/// under a running renewer. The next synchronous renewal must return terminal WITHOUT constructing a
 /// `LOGICAL_ERROR` -- that aborts debug/ASan builds at
 /// exception construction, and there is no foreign writer here to fail closed against, only an
 /// environmental condition.
@@ -777,7 +777,7 @@ TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     uint64_t boot = 0;
     Ops ops(b, &boot);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseKeeper k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                        [&] { return boot; });
     k.start();
@@ -785,13 +785,13 @@ TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     const String mount_key = l.mountKey("r");
     const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();  /// NOLINT(clang-analyzer-deadcode.DeadStores)
 
-    /// Simulate `rm -rf` of the backing store: the mount slot object is gone, but the keeper still
+    /// Simulate `rm -rf` of the backing store: the mount slot object is gone, but the renewer still
     /// names a (now stale) incarnation as its precondition.
     ASSERT_EQ(ops.op.removeCurrent(mount_key, Retry::standard()), Removal::Removed);
 
     try
     {
-        renewKeeperOrThrow(k);
+        renewOrThrow(k);
         FAIL() << "renew against a vanished mount object must throw";
     }
     catch (const DB::Exception & e)
@@ -800,7 +800,7 @@ TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
         EXPECT_NE(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before)
-        << "keeper classification is metric-free; the runtime records operational loss";
+        << "renewer classification is metric-free; the runtime records operational loss";
 }
 
 /// STID 3982-3b48 (part 1b): the terminal/clean-release counterpart to the renewal fix above. When
@@ -820,7 +820,7 @@ TEST(CASMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
     uint64_t now = 1000;
     Ops ops(b);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseKeeper k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; });
     k.start();
 
@@ -1081,15 +1081,15 @@ TEST(CASMountAwaitExpiry, SkewedFarFutureExpiryHasNoEffectOnObservationThreshold
     EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 8u);   // reclaimed
 }
 
-TEST(CASMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
+TEST(CASMountLease, RenewerStartAdoptsOurOwnClaimNotDoubleStart)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
     uint64_t now = 1000;
     Ops ops(b);
-    // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN keeper.start().
+    // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN renewer.start().
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseKeeper k(ops.mount, ops.farewell, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; });
     EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
     EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 7u);
@@ -1133,7 +1133,7 @@ TEST(CASMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     const uint64_t e1 = s1->writerEpoch();
 
-    /// Simulate shutdown: the Pool dtor stops the keeper, whose terminate() retires the lease
+    /// Simulate shutdown: the Pool dtor stops the renewer, whose terminate() retires the lease
     /// (stamps it already-expired). The owner + the durable epoch object stay sticky.
     s1.reset();
 
@@ -1403,7 +1403,7 @@ constexpr uint64_t kNowMs = 1'000'000;
 /// of any lease's stamped `expires_at_ms`.
 constexpr uint64_t kStableThresholdMs = 10'000;
 
-/// Seed one mount body under mountKey(srid) via the on-storage codec — the same interface the keeper
+/// Seed one mount body under mountKey(srid) via the on-storage codec — the same interface the renewer
 /// writes through.
 MountLease seedMount(
     CasOperation & op, const Layout & l, const String & srid,
@@ -1424,7 +1424,7 @@ MountLease seedMount(
     return m;
 }
 
-/// Simulate a keeper's real renewal between two `computeHeartbeatFloor` calls: a guarded write that
+/// Simulate a renewer's real renewal between two `computeHeartbeatFloor` calls: a guarded write that
 /// bumps `seq` (and so mints a fresh incarnation), leaving everything else as-is. Models the one
 /// thing the observation-based fence cares about: the incarnation changed, so any in-progress
 /// observation of the OLD one must restart.
@@ -1528,7 +1528,7 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     ASSERT_TRUE(obs.contains("s2"));
 
     /// s2's `/mount` key is removed entirely -- e.g. `SYSTEM CAS DROP POOL MEMBER` -- so
-    /// no future LIST pass will ever visit it again. s1 renews (a live keeper would), so its OWN
+    /// no future LIST pass will ever visit it again. s1 renews (a live renewer would), so its OWN
     /// observation restarts and it stays `live` -- isolating this test to the pruning behavior alone,
     /// not confounding it with s1 also becoming fence-eligible (which would erase its `obs` entry too,
     /// for an unrelated reason).
@@ -1568,7 +1568,7 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
     EXPECT_EQ(floor_before.fenced_now, 0u);
     EXPECT_EQ(floor_before.already_fenced, 1u);  // s4
 
-    /// s1 and s2 renew between rounds (as a live keeper would); s3 does not (it crashed).
+    /// s1 and s2 renew between rounds (as a live renewer would); s3 does not (it crashed).
     renewMount(ops.op, l, "s1");
     renewMount(ops.op, l, "s2");
 
@@ -1828,18 +1828,18 @@ TEST(CASMountObservation, RenewalDuringObservationRestartsIt)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
-    uint64_t keeper_boot = 0;
-    Ops ops(b, &keeper_boot);
+    uint64_t renewer_boot = 0;
+    Ops ops(b, &renewer_boot);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, 500, 500).kind, MountClaimResult::Claimed);
 
-    /// The real (still-alive) holder's keeper for epoch 7: `start()` adopts the slot `claimMount` just
+    /// The real (still-alive) holder's renewer for epoch 7: `start()` adopts the slot `claimMount` just
     /// wrote (no seq bump, per the ADOPT RULE), then a synchronous renewal mints a new incarnation
     /// mid-observation.
-    uint64_t keeper_wall = 500;
-    MountLeaseKeeper keeper(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(500),
-                             [&] { return keeper_wall; }, [] { return uint64_t{0}; }, {},
-                             std::chrono::milliseconds(0), [&] { return keeper_boot; });
-    keeper.start();
+    uint64_t renewer_wall = 500;
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(500),
+                             [&] { return renewer_wall; }, [] { return uint64_t{0}; }, {},
+                             std::chrono::milliseconds(0), [&] { return renewer_boot; });
+    renewer.start();
 
     const uint64_t threshold_ms = 500 + 500 / 20 + 50;   /// = 575
     uint64_t mono = 0;
@@ -1857,7 +1857,7 @@ TEST(CASMountObservation, RenewalDuringObservationRestartsIt)
             if (!renewed && mono >= threshold_ms - 50)
             {
                 renewed = true;
-                renewKeeperOrThrow(keeper);
+                renewOrThrow(renewer);
             }
         },
         /*on_wait_start=*/[&](const MountLease &, uint64_t) { ++wait_starts; });
@@ -2025,7 +2025,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
 
     /// The absent-slot mint.
     backend->reads = backend->heads = backend->writes = 0;
-    MountLeaseKeeper minting(ops.mount, ops.farewell, l, "fresh", UInt128(1), 7,
+    MountLeaseRenewer minting(ops.mount, ops.farewell, l, "fresh", UInt128(1), 7,
                              std::chrono::milliseconds(100), [&] { return now; }, [] { return uint64_t{0}; });
     minting.start();
     EXPECT_EQ(backend->reads, 1u);
@@ -2036,7 +2036,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
     ASSERT_EQ(claimMount(ops.op, l, "adopted", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind,
               MountClaimResult::Claimed);
     backend->reads = backend->heads = backend->writes = 0;
-    MountLeaseKeeper adopting(ops.mount, ops.farewell, l, "adopted", UInt128(1), 7,
+    MountLeaseRenewer adopting(ops.mount, ops.farewell, l, "adopted", UInt128(1), 7,
                               std::chrono::milliseconds(100), [&] { return now; }, [] { return uint64_t{0}; });
     adopting.start();
     EXPECT_EQ(backend->reads, 1u);
@@ -2046,7 +2046,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
 
 /// A mount whose fence has dropped must still hand its slot back: the renewal is refused (it would be
 /// writing under authority this node no longer holds), while the farewell runs on the open plane and
-/// lands. Deliberately two keepers: `release` is admitted only from `Active`, so a keeper whose
+/// lands. Deliberately two renewers: `release` is admitted only from `Active`, so a renewer whose
 /// renewal already went terminal never reaches its own farewell -- the ordering the two halves below
 /// pin separately.
 TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
@@ -2075,10 +2075,10 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
     ASSERT_EQ(claimMount(seed, l, "renewing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
     ASSERT_EQ(claimMount(seed, l, "departing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
 
-    MountLeaseKeeper renewing(mount_requests, open_requests, l, "renewing", UInt128(1), 7,
+    MountLeaseRenewer renewing(mount_requests, open_requests, l, "renewing", UInt128(1), 7,
                               std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                               {}, std::chrono::milliseconds(0), [&] { return boot; });
-    MountLeaseKeeper departing(mount_requests, open_requests, l, "departing", UInt128(1), 7,
+    MountLeaseRenewer departing(mount_requests, open_requests, l, "departing", UInt128(1), 7,
                                std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                                {}, std::chrono::milliseconds(0), [&] { return boot; });
     renewing.start();
@@ -2116,10 +2116,10 @@ TEST(CASMountLease, ClaimIsNotAdmittedUnderTheMountFence)
     open_requests.setNowFnForTest([&boot] { return boot; });
     open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
-    MountLeaseKeeper keeper(mount_requests, open_requests, l, "r", UInt128(1), 7,
+    MountLeaseRenewer renewer(mount_requests, open_requests, l, "r", UInt128(1), 7,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                             {}, std::chrono::milliseconds(0), [&] { return boot; });
-    EXPECT_NO_THROW(keeper.start());
+    EXPECT_NO_THROW(renewer.start());
 
     CasOperation reader = open_requests.admit();
     const MountLease claimed = decodeMountLease(reader.read(l.mountKey("r"), Retry::standard())->bytes);
@@ -2176,12 +2176,12 @@ TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
     open_requests.setNowFnForTest([&boot] { return boot; });
     open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
-    MountLeaseKeeper keeper(mount_requests, open_requests, l, "r", UInt128(1), 7,
+    MountLeaseRenewer renewer(mount_requests, open_requests, l, "r", UInt128(1), 7,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                             {}, std::chrono::milliseconds(0), [&] { return boot; });
-    keeper.start();
+    renewer.start();
 
-    const MountRenewResult redo = keeper.renewForRemount();
+    const MountRenewResult redo = renewer.renewForRemount();
     EXPECT_EQ(redo.outcome, MountRenewOutcome::Committed);
 
     CasOperation reader = open_requests.admit();

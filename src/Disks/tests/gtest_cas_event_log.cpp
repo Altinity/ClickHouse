@@ -298,7 +298,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
     std::array<std::shared_ptr<RenewalEventBackend>, depth> backends;
     std::array<std::unique_ptr<Layout>, depth> layouts;
     std::array<std::unique_ptr<CasRequests>, depth> planes;
-    std::array<std::unique_ptr<MountLeaseKeeper>, depth> keepers;
+    std::array<std::unique_ptr<MountLeaseRenewer>, depth> renewers;
     std::array<String, depth> server_root_ids;
     std::array<CasEventSink, depth> sinks;
     std::array<uint32_t, depth> renew_events{};
@@ -310,7 +310,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
     renew_at = [&](size_t index)
     {
         configureMountRenewObservability(&server_root_ids[index], &sinks[index], /*deferred=*/false);
-        MountRenewResult result = keepers[index]->renew(MountRenewOperationEnvironment{});
+        MountRenewResult result = renewers[index]->renew(MountRenewOperationEnvironment{});
         reportMountRenewCompletion(result);
         return result;
     };
@@ -331,12 +331,12 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
                     deepest_result = std::move(child_result);
             }
         };
-        /// One open-fence plane per keeper, on the same injected clock the keeper anchors its lease
+        /// One open-fence plane per renewer, on the same injected clock the renewer anchors its lease
         /// against, and with a sleep that advances it: the deepest renewal reissues, and no unit test
         /// may serve the engine's jittered backoff for real.
         planes[index] = std::make_unique<CasRequests>(
             backends[index], Fence::open(), [&] { return boot_ms; }, [&](uint64_t ms) { boot_ms += ms; });
-        keepers[index] = std::make_unique<MountLeaseKeeper>(
+        renewers[index] = std::make_unique<MountLeaseRenewer>(
             *planes[index],
             *planes[index],
             *layouts[index],
@@ -349,7 +349,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
             sinks[index],
             std::chrono::milliseconds(0),
             [&] { return boot_ms; });
-        keepers[index]->start();
+        renewers[index]->start();
 
         if (index + 1 < depth)
         {
@@ -426,7 +426,7 @@ TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
         const std::optional<CasEvent> failed = one_failed_event(events);
         ASSERT_TRUE(failed.has_value()) << "the store's refusal must reach the event log";
-        /// A deterministic failure reaches the keeper as the exception the engine refuses to reissue,
+        /// A deterministic failure reaches the renewer as the exception the engine refuses to reissue,
         /// and an exception carries no attempt count -- so the classification is all this ending states.
         EXPECT_EQ(failed->detail.at("classification"), "deterministic_failure");
     }

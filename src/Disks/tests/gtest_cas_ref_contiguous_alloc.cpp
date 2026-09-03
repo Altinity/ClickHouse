@@ -448,7 +448,7 @@ TEST(CASRefContiguousAlloc, RecreationProceedsOnceTheHolderIsTerminal)
     {
         auto holder = openPool(backend);
         publishRef(holder, ns, "ref_1", 1);
-    }   /// destroyed: the keeper stamps the farewell, making the slot terminal
+    }   /// destroyed: the renewer stamps the farewell, making the slot terminal
     ASSERT_EQ(eraseKeysContaining(*backend, "_pool_meta"), 1u);
 
     /// The prefix still holds this pool's data, so the bootstrap still refuses -- but on the ORDINARY
@@ -476,14 +476,14 @@ TEST(CASRefContiguousAlloc, RecreationProceedsOnceTheHolderIsTerminal)
 /// survivor's renewal conclusive. Clearing the prefix also resets the durable writer-epoch counter, so
 /// a recreation by the SAME server uuid can be handed the very same `(uuid, epoch)` the survivor still
 /// holds -- and the two are then indistinguishable to the lease protocol, which reads the survivor's
-/// renewal as its own keeper adopting a refreshed body. That is precisely why the refusal above is the
+/// renewal as its own renewer adopting a refreshed body. That is precisely why the refusal above is the
 /// primary defence and this fence is only the backstop: quiescing the holder BEFORE the prefix is
 /// cleared is what keeps the ambiguous case from arising at all.
 TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// The survivor uses the runtime-owned renewal worker, as a real mount does: the runtime terminal
-    /// consumer is what latches the write fence when a renewal fails, so a keeper-only call would
+    /// consumer is what latches the write fence when a renewal fails, so a renewer-only call would
     /// reproduce the failure but not the lifecycle effect it causes.
     PoolConfig survivor_cfg{.pool_prefix = "p", .server_root_id = "test"};
     survivor_cfg.background_watermark = true;
@@ -522,7 +522,7 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     EXPECT_EQ(publishRef(recreated, ns, "ref_1", 1), (RefTxnId{recreated->writerEpoch(), 1}));
 
     /// The survivor's TEARDOWN is the other half, and it is asserted here rather than left to the
-    /// destructor at scope exit. A terminal keeper must skip release without backend I/O: the renewal
+    /// destructor at scope exit. A terminal renewer must skip release without backend I/O: the renewal
     /// conflict already counted the conclusive foreign successor, and teardown must neither double-count
     /// it nor stamp a farewell over the successor's slot.
     const String survivor_mount_key = recreated->layout().mountKey("test");

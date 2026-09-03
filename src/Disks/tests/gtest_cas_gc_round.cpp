@@ -1873,7 +1873,7 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     PoolConfig config;
     config.pool_prefix = "p";
     /// The GC runner owns a different mount from the synthetic `test` watermark below. This keeps the
-    /// cursor-sweep assertions in the parent process without replacing its live keeper incarnation.
+    /// cursor-sweep assertions in the parent process without replacing its live renewer incarnation.
     config.server_root_id = "gc-runner";
     config.manifest_sweep_list_budget_keys = 1;
     config.manifest_sweep_delete_budget_keys = 1;

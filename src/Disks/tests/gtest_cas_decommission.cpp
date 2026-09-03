@@ -1364,7 +1364,7 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 /// therefore uses a victim with NO namespaces at all: identity persisted
 /// (mount/owner/epoch exist from a real graceful close), data subtree genuinely empty -- the exact
 /// precondition the fallback is designed for. Simulate the crash directly: claim the slot once (exactly
-/// `decommissionPoolMember`'s own first step), let it close gracefully (the mount-lease keeper's
+/// `decommissionPoolMember`'s own first step), let it close gracefully (the mount-lease renewer's
 /// farewell stamp, same as a real `admin.reset()`), then manually strike `epochKey`+`ownerKey`, leaving
 /// `mountKey`. A `decommissionPoolMember` re-run must resolve identity via the mount-lease fallback and
 /// finish retiring the slot; a further re-run then sees the tombstone and refuses to resume it.

@@ -69,7 +69,7 @@ value anyone can construct, a primitive anyone can call. The fixes are the same 
 value unconstructible and the primitive uncallable, and give callers one layer above with one door.
 
 A second waste rides along: `get` issues a `HEAD` and a `GET` though a `GET` returns everything a
-`HEAD` does plus the body; `MountLeaseKeeper::claim` pays three requests on a successful adopt;
+`HEAD` does plus the body; `MountLeaseRenewer::claim` pays three requests on a successful adopt;
 `GetStreamResult::token` is produced by a `HEAD` on every stream open and consumed by nobody;
 `probeSentinelRaw` is a raw `HEAD`, then `get`'s `HEAD`, then a `GET`.
 
@@ -126,7 +126,7 @@ incarnation of another key or of another backend throws `LOGICAL_ERROR`: a progr
 store answer. "Backend identity" is a per-instance counter id, never the address; the mount plane, the
 GC plane and the tools each hold a `CasRequests` over the same `Pool`-owned backend, and their
 incarnations are interchangeable by design (the mount observation map and GC's manifest-cleanup map
-cross planes). A holder that keeps an `Etag` across calls — `MountLeaseKeeper::last_token`, the
+cross planes). A holder that keeps an `Etag` across calls — `MountLeaseRenewer::last_token`, the
 mount observation map, GC's manifest-cleanup map, `CasBlobInDegree`'s condemned rows — must not
 outlive the backend; all of them are owned by the `Pool` that owns it.
 
@@ -231,7 +231,7 @@ policy governs is the *initiation*.
 passes the mount fence, the GC plane an open fence (its writes are guarded by the `gc/state`
 incarnation, not by a mount lease, as today), the tools an open fence (`CasDecommission` and `CasFsck`
 consult no fence today — by omission, not by a stated choice; this makes the choice stated). The
-bootstrap-control shapes — `claimMount`/`claimMountAwaitingExpiry`, `MountLeaseKeeper::claim`,
+bootstrap-control shapes — `claimMount`/`claimMountAwaitingExpiry`, `MountLeaseRenewer::claim`,
 `claimOwnerOrThrow`, `allocateWriterEpoch`, and the remount driver's re-anchor renewal — also run on an
 open fence, on `Pool::openRequests()` (renamed from `gcRequests()`, which now serves more than the GC
 plane): a self-remount runs with the mount fence already latched lost, so a claim or a renewal made
@@ -387,14 +387,14 @@ because a deadline exhausted under contention is not proof of a corrupted epoch 
 A controlled write has three outcomes today, and the third is consumed as a **protocol fact**, not a
 diagnostic: `CasRefLedger::commitRefChunk` releases the transaction id only when the unresolved
 reason proves nothing was sent and wedges otherwise; the recovery walk and the wedge retry act on the
-same bit; `MountLeaseKeeper::renew` classifies `Committed` / `Conflict` / `NotAttempted` / `Vanished`
+same bit; `MountLeaseRenewer::renew` classifies `Committed` / `Conflict` / `NotAttempted` / `Vanished`
 from the controller's fields. `std::expected<Etag, Conflict>` could express none of it and
 would have collapsed "gave up" into an exception — precisely the bare-`Unresolved` collapse the ref
 lane guards against. `sent_any` is the bit the wedge decision needs (today's
 `unresolvedProvesNothingWasSent`, whose header says adding a member is a protocol decision — it stays
 a protocol decision, now a field).
 
-**The observation is a tri-state, not an optional.** `MountLeaseKeeper::renew` consumes
+**The observation is a tri-state, not an optional.** `MountLeaseRenewer::renew` consumes
 `resolve_observation_completed` on two paths: a conflict *without* an authoritative resolve is a
 retry-later transient (`NETWORK_ERROR`), a conflict *with* a resolve that found nothing is
 `Vanished`, terminal, fail closed. Two optionals would make "no observation" and "observed absent"
@@ -701,11 +701,11 @@ from the code, and the plan's checklist carries it. Rules first, then the sites.
 | `CasPlainObjects::casPutObject` | `readModifyWriteOnPresence`, `standard` — a `HEAD`, never a body |
 | `CasPlainObjects::casRemoveObject` | `removeCurrent`, `standard` |
 | GC round commit; GC rebuild commit | `replace`, `standard` — no re-decide, and the verb says so |
-| `claimMount` / `claimMountAwaitingExpiry`; `MountLeaseKeeper::claim`; `claimOwnerOrThrow` | one shape, three sites, all on `Pool::openRequests()` (bootstrap-control, not the mount fence — a claim is made precisely where no lease is yet held): `read`, then `create` or `replace`, `standard`; conflict terminal, its `Observation` the re-read; `claim`'s successful adopt goes from three requests to two |
+| `claimMount` / `claimMountAwaitingExpiry`; `MountLeaseRenewer::claim`; `claimOwnerOrThrow` | one shape, three sites, all on `Pool::openRequests()` (bootstrap-control, not the mount fence — a claim is made precisely where no lease is yet held): `read`, then `create` or `replace`, `standard`; conflict terminal, its `Observation` the re-read; `claim`'s successful adopt goes from three requests to two |
 | `putDeterministicArtifact`; the outcomes log | `create`, `standard`; compare-adopt on the `Conflict`'s `Object` |
 | `PartWriteTxn::ensureBlobPresent` | the outer publication loop stays hand-written, bounded by its own `max_publication_attempts`, and paces itself with `op.pause(Retry::backoff(attempt))` between iterations — never the shared `standard`, because a reissued `publish` under the engine's own policy would re-send the identical envelope, and on a content-derived-ETag dialect a re-sent envelope re-publishes the incarnation GC already condemned; each iteration therefore mints a fresh envelope and calls `op.publish(…, Retry::once())`, one physical attempt per loop turn, while its `head` runs under `standard` and its dependency-proof returns stay behind `op.admitted()`; `reconcileMetaClean` is create-first — a publication with nothing at the marker key spends its `create` as the whole reconciliation, and only a `create` that loses (a racing writer's marker, or the stale `Condemned` marker a resurrect always finds) falls through to `readModifyWrite`, `standard`; its `putMetaIfAbsent` backfill runs on the caller's own operation, whichever plane admitted it |
-| `MountLeaseKeeper::renew` | `replace`, `untilLeaseSafe` |
-| `MountLeaseKeeper::terminate` (farewell) | `replace`, `within(10 s)`, on an operation admitted against an open fence; the refusal's `Observation` is the re-read |
+| `MountLeaseRenewer::renew` | `replace`, `untilLeaseSafe` |
+| `MountLeaseRenewer::terminate` (farewell) | `replace`, `within(10 s)`, on an operation admitted against an open fence; the refusal's `Observation` is the re-read |
 | `runCapabilityProbe` | every call `standard`; its delete-marker refusal keeps its operator message (below) |
 | `probePoolBootstrapResidual` | `forEachListedKey` with an early stop on the first page, then one `read`, both `standard`; the whole-function fail-closed `catch` stays |
 | the ref lane (`commitRefChunk`, the recovery walk, `resolveWedgeOnce`) | `create` under `standard` on a `resume(g, liveness)` handle; four arms: `Committed`, `Refused`, `GaveUp{sent_any}`, and `Conflict{Object}` — a different occupant at the content-addressed key, which the lane compares and reports as `CORRUPTED_DATA` (today the controller's resolve throws it) |
@@ -848,7 +848,7 @@ code no longer marks it, is an open product question this design does not settle
 
 **No operation issues a request it does not need**: `read`, `stream` and the Native `probeSentinel`
 issue no `HEAD`; `head` issues one; `readModifyWriteOnPresence` issues no `GET`. Reading an object's
-metadata is one `GET` at the caller level: `MountLeaseKeeper::claim` goes from two and three requests
+metadata is one `GET` at the caller level: `MountLeaseRenewer::claim` goes from two and three requests
 to two and two; the manifest reader's own change (`2026-09-02-cas-manifest-cache-by-id-design.md`)
 landed first and independently.
 
@@ -1065,8 +1065,8 @@ every step; `Cas::Probe` passes on every supported writable store.
 
 ## Companion change: the `Keeper` name {#companion-keeper-rename}
 
-`MountLeaseKeeper`, `installKeeper`, `startKeeper`, `admitKeeperCall`, `MountLeaseKeeperState`,
-`keeper_state` and `mount_keeper` read as calls into ClickHouse Keeper. They are not: the object renews
+`MountLeaseRenewer`, `installRenewer`, `startRenewer`, `admitRenewerCall`, `MountLeaseRenewerState`,
+`renewer_state` and `mount_renewer` read as calls into ClickHouse Keeper. They are not: the object renews
 a mount lease. The collision is real and not the comment's fault — CAS lives inside
 `ReplicatedMergeTree`, whose commit path goes through ClickHouse Keeper, so `CasRequestControl.h`
 must name the real Keeper when it rules out a `Coordination::Exception` collision. The name is

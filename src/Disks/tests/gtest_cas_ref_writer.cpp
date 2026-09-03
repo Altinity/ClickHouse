@@ -2057,7 +2057,7 @@ TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     /// `scheduleRemount`'s own entry regardless of `background_watermark` -- see that accessor's
     /// comment for why this test deliberately does NOT enable `background_watermark` to observe a real
     /// automatic recovery: doing so was tried and makes the store's self-remount attempt race its own
-    /// still-live keeper for 30+ seconds per call (confirmed while building this test), which is not
+    /// still-live renewer for 30+ seconds per call (confirmed while building this test), which is not
     /// something a fast unit test should be driving.
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
         << "reportImpossibleInterference must have called scheduleRemount exactly once";
@@ -2125,7 +2125,7 @@ TEST(CASAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
     EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the wedge-contract violation";
     /// See the sibling test's comment on why this checks the call-count seam (never
     /// `background_watermark` plus automatic recovery -- that combination makes the store's self-remount
-    /// race its own still-live keeper).
+    /// race its own still-live renewer).
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
         << "reportImpossibleInterference must have called scheduleRemount exactly once";
 

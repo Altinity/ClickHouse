@@ -14,16 +14,16 @@ using DB::Cas::tests::expectThrowsCodeWithMessage;
 namespace
 {
 
-/// One keeper for the mount slot of server-root "r", under (uuid=1, epoch=7) unless overridden. Both
+/// One renewer for the mount slot of server-root "r", under (uuid=1, epoch=7) unless overridden. Both
 /// of its planes are the same open-fence one: what these tests exercise is the mount protocol's own
 /// exclusivity, not a fence's, and no test here renews, which is the only caller of the mount plane.
-MountLeaseKeeper makeKeeper(
+MountLeaseRenewer makeRenewer(
     CasRequests & requests,
     uint64_t & now,
     DB::UInt128 uuid = DB::UInt128(1),
     uint64_t epoch = 7)
 {
-    return MountLeaseKeeper(
+    return MountLeaseRenewer(
         requests,
         requests,
         Layout("p"),
@@ -61,11 +61,11 @@ TEST(CASMountClaimConflicts, SlotAppearedBetweenTheReadAndTheCreate)
         CasOperation racer = requests.admit();
         claimMount(racer, layout, "r", DB::UInt128(2), 1, now, /*ttl_ms=*/100);
     };
-    auto keeper = makeKeeper(requests, now);
+    auto renewer = makeRenewer(requests, now);
     expectThrowsCodeWithMessage(
         DB::ErrorCodes::ABORTED,
         "appeared between the read and the create",
-        [&] { keeper.start(); });
+        [&] { renewer.start(); });
 }
 
 TEST(CASMountClaimConflicts, SlotHeldByForeignServer)
@@ -78,11 +78,11 @@ TEST(CASMountClaimConflicts, SlotHeldByForeignServer)
     ASSERT_EQ(
         claimMount(op, layout, "r", DB::UInt128(2), 1, now, /*ttl_ms=*/100).kind,
         MountClaimResult::Claimed);
-    auto keeper = makeKeeper(requests, now);
+    auto renewer = makeRenewer(requests, now);
     expectThrowsCodeWithMessage(
         DB::ErrorCodes::ABORTED,
         "held by a foreign server",
-        [&] { keeper.start(); });
+        [&] { renewer.start(); });
 }
 
 TEST(CASMountClaimConflicts, SlotHeldByDifferentWriterEpoch)
@@ -95,11 +95,11 @@ TEST(CASMountClaimConflicts, SlotHeldByDifferentWriterEpoch)
     ASSERT_EQ(
         claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100).kind,
         MountClaimResult::Claimed);
-    auto keeper = makeKeeper(requests, now, DB::UInt128(1), /*epoch=*/8);
+    auto renewer = makeRenewer(requests, now, DB::UInt128(1), /*epoch=*/8);
     expectThrowsCodeWithMessage(
         DB::ErrorCodes::ABORTED,
         "held by a different writer_epoch",
-        [&] { keeper.start(); });
+        [&] { renewer.start(); });
 }
 
 TEST(CASMountClaimConflicts, SlotChangedInsideAdoptionWindow)
@@ -118,11 +118,11 @@ TEST(CASMountClaimConflicts, SlotChangedInsideAdoptionWindow)
         CasOperation racer = requests.admit();
         claimMount(racer, layout, "r", DB::UInt128(1), 7, now + 1, /*ttl_ms=*/100);
     };
-    auto keeper = makeKeeper(requests, now);
+    auto renewer = makeRenewer(requests, now);
     expectThrowsCodeWithMessage(
         DB::ErrorCodes::ABORTED,
         "changed while adopting our own mount slot",
-        [&] { keeper.start(); });
+        [&] { renewer.start(); });
 }
 
 TEST(CASMountClaimConflicts, SlotVanishedInsideAdoptionWindow)
@@ -140,11 +140,11 @@ TEST(CASMountClaimConflicts, SlotVanishedInsideAdoptionWindow)
         CasOperation racer = requests.admit();
         ASSERT_EQ(racer.removeCurrent(layout.mountKey("r"), Retry::standard()), Removal::Removed);
     };
-    auto keeper = makeKeeper(requests, now);
+    auto renewer = makeRenewer(requests, now);
     expectThrowsCodeWithMessage(
         DB::ErrorCodes::ABORTED,
         "vanished while adopting our own mount slot",
-        [&] { keeper.start(); });
+        [&] { renewer.start(); });
 }
 
 /// The two fenced branches keep their own type, and keep PRECEDENCE over the conflicts above: the
@@ -161,8 +161,8 @@ TEST(CASMountClaimConflicts, FencedBeforeAdoptionRaisesMountFenced)
         claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100).kind,
         MountClaimResult::Claimed);
     markMountGcFenced(op, layout, "r");
-    auto keeper = makeKeeper(requests, now);
-    EXPECT_THROW(keeper.start(), MountFencedException);
+    auto renewer = makeRenewer(requests, now);
+    EXPECT_THROW(renewer.start(), MountFencedException);
 }
 
 TEST(CASMountClaimConflicts, FencedInsideAdoptionWindowRaisesMountFencedNotAborted)
@@ -182,6 +182,6 @@ TEST(CASMountClaimConflicts, FencedInsideAdoptionWindowRaisesMountFencedNotAbort
         CasOperation racer = requests.admit();
         markMountGcFenced(racer, layout, "r");
     };
-    auto keeper = makeKeeper(requests, now);
-    EXPECT_THROW(keeper.start(), MountFencedException);
+    auto renewer = makeRenewer(requests, now);
+    EXPECT_THROW(renewer.start(), MountFencedException);
 }
