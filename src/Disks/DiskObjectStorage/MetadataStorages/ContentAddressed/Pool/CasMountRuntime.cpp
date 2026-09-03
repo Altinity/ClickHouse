@@ -410,7 +410,7 @@ uint64_t CasMountRuntime::startKeeper()
     }
 
     DriverLease lease(*this, active);
-    const uint64_t anchor = keeper->start();
+    const uint64_t anchor = keeper->start([this] { return !renewalCancelled(); });
     (void)lease.finish(destination);
     return anchor;
 }
@@ -445,6 +445,12 @@ bool CasMountRuntime::renewalCancelled() const
     return workers_stop_requested;
 }
 
+void CasMountRuntime::sleepInterruptibly(uint64_t ms)
+{
+    std::unique_lock lock(driver_mutex);
+    driver_cv.wait_for(lock, std::chrono::milliseconds(ms), [this] { return workers_stop_requested; });
+}
+
 void CasMountRuntime::consumeRenewResult(
     const MountRenewResult & result,
     RenewalDriverState active_state,
@@ -453,6 +459,16 @@ void CasMountRuntime::consumeRenewResult(
 {
     /// Driver ownership has already been restored by `DriverLease::finish`; this is the single logical
     /// consumption boundary and it runs without `driver_mutex` or keeper access.
+    /// The physical counters come off the result rather than off a per-attempt callback, so they count
+    /// the same on every ending: a renewal that gave up still sent what it sent.
+    if (result.attempts_sent > 0)
+    {
+        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts, result.attempts_sent);
+        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries, result.attempts_sent - 1);
+    }
+    if (result.resolved_by_read)
+        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalResolved);
+
     if (result.outcome == MountRenewOutcome::Committed && (result.attempts_sent > 1 || result.resolved_by_read))
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRecovered);
     if (result.outcome == MountRenewOutcome::Terminal

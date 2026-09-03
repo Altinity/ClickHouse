@@ -1240,7 +1240,10 @@ void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(con
     Cas::CasOperation probe_op = pool->gcRequests().admit();
     const Cas::SentinelProbeResult probe = empty_proof_probe_override_for_test
         ? empty_proof_probe_override_for_test()
-        : Cas::probeSentinel(probe_op, pool->layout().poolMetaKey());
+        /// `once`: this probe is the gate that authorises an empty answer, and an inconclusive one is a
+        /// refusal the caller retries -- reissuing here would stall a directory listing for the whole
+        /// retry window instead.
+        : Cas::probeSentinel(probe_op, pool->layout().poolMetaKey(), Cas::Retry::once());
 
     switch (probe.outcome)
     {

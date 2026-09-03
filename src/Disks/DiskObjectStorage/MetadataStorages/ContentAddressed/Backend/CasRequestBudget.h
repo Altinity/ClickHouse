@@ -4,10 +4,16 @@
 namespace DB::Cas
 {
 
-/// The three separate limits a CAS-owned retry controller enforces for ONE logical conditional-write
-/// operation. Never represented by a single `request_timeout_ms` value — see `validateCasRequestBudget`
-/// for the relationship a writable mount enforces at startup, and `CasRequestController` for the
-/// runtime use.
+/// The limits a writable mount is configured with. `attempt_timeout_ms` and `lease_safety_margin_ms`
+/// are what `CasMountRuntime::admit` measures a request against, and the three `recovery_retry_*` fields
+/// bound a whole ref-table recovery; see `validateCasRequestBudget` for the relationship a writable
+/// mount enforces at startup.
+///
+/// The four fields below them -- `operation_deadline_ms`, `max_attempts` and the two inter-attempt
+/// backoff bounds -- belong to the retiring `CasRequestController` and have no consumer in the request
+/// contract, which expresses the same bounds as a `Retry` policy per call. They are kept only so the
+/// controller and its tests still compile, and they go when it does; their doc comments still describe
+/// the controller's own loop.
 struct CasRequestBudget
 {
     /// Maximum client wait budgeted for one HTTP attempt. `CasRequestController` uses this ONLY as a

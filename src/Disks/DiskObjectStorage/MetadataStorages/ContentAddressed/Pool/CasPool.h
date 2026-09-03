@@ -9,7 +9,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.h>
@@ -880,10 +879,9 @@ private:
     /// `cancel_inflight_builds` callback.
     void cancelInflightBuildsForNamespace(const RootNamespace & ns);
 
-    /// Delegate to `mount_runtime`: the write fence moved there. pre-attempt fence check: extends
-    /// `mayMutate` with the REMAINING budget check -- an attempt is not even started unless there is
-    /// enough of the mount lease left for one more attempt_timeout plus the lease safety margin. Passed
-    /// as `fence_ok` to every `CasRequestController` call the ref-log writer path makes.
+    /// Delegate to `mount_runtime`: the write fence moved there. Extends `mayMutate` with the REMAINING
+    /// budget check -- work is not started unless there is enough of the mount lease left for one more
+    /// attempt timeout plus the safety margin.
     bool refAppendFenceOk() const;
 
     /// incidental-detection reaction for a foreign-interference
@@ -1034,11 +1032,10 @@ public:
         ref_ledger.setSnapshotBeforeCkptCasHookForTest(std::move(hook));
     }
 
-    /// Test-only: replace the request controller's inter-attempt backoff sleep (e.g. with a no-op) —
-    /// for tests that drive a persistent conditional-write fault to budget exhaustion through a fully
-    /// wired Pool/disk and must not serve the production capped-exponential sleeps for real (see
-    /// `CasRequestController::setSleepFnForTest`). Call before driving traffic; empty restores the
-    /// real sleep.
+    /// Test-only: replace the inter-attempt backoff sleep (e.g. with a clock-advancing no-op) on all
+    /// three request planes and on ref-table recovery, for tests that drive a persistent write fault to
+    /// exhaustion through a fully wired Pool/disk and must not serve the production capped-exponential
+    /// sleeps for real. Call before driving traffic; empty restores the real sleep.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
 
     /// Test-only: replace only ref-table recovery's token-aware retry delay seam.

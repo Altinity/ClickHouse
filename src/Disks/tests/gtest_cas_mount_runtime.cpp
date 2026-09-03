@@ -98,6 +98,11 @@ TEST(CASMountRuntime, AdmitRefusesAnExpiredLease)
     EXPECT_STREQ(admitName(f->admit(generation, 0)), "Ok");
     f.boot_ms = 1'100;
     EXPECT_STREQ(admitName(f->admit(generation, 0)), "NoBudget") << "the deadline instant is already past";
+    /// One millisecond further is what the `now >= deadline` guard actually earns: without it
+    /// `deadline - now` underflows to a huge remaining and the budget test reads it as room.
+    f.boot_ms = 1'101;
+    EXPECT_STREQ(admitName(f->admit(generation, 0)), "NoBudget")
+        << "a deadline already past must not underflow into room";
 }
 
 /// A re-arm is a fresh lease incarnation. A caller admitted under the previous one is stale even though

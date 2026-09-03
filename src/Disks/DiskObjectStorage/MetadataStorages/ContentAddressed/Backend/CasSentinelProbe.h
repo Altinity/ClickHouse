@@ -12,9 +12,14 @@ namespace DB::Cas
 /// Free-function entry point (spec §2) — a thin dispatch to `op`'s own typed-evidence classification
 /// (`CasOperation::probeSentinel`, which in turn reaches `Backend::probeSentinelRaw`; see there for the
 /// per-backend semantics: the S3-native raw HEAD error, the Local container-directory stat, or the
-/// generic head/get-based default for a backend without sharper evidence). `Indeterminate` is the one
-/// outcome the request contract reissues on; every other outcome is authoritative and returns at once.
-SentinelProbeResult probeSentinel(CasOperation & op, const String & key);
+/// generic head/get-based default for a backend without sharper evidence).
+///
+/// `policy` is required and has no default, because `Indeterminate` is the one outcome the request
+/// contract REISSUES on and the right number of reissues is the caller's question, not this function's.
+/// A caller that owns an outer retry loop -- the lifecycle gate, whose inconclusive verdict IS
+/// `StayTransient` for the recovery loop to retry -- passes `Retry::once()`, or it pays its own loop's
+/// interval inside every probe. A caller with no loop of its own passes `Retry::standard()`.
+SentinelProbeResult probeSentinel(CasOperation & op, const String & key, const Retry & policy);
 
 /// Verdict of the zero-write startup bootstrap residual check ("Startup ordered vs the capability
 /// probe"). Before a writable `Pool::open` runs

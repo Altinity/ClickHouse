@@ -50,21 +50,25 @@ public:
         LandThenThrow,
     };
 
-    using InMemoryBackend::putOverwrite;
-
     Fault fault = Fault::None;
 
-    PutResult putOverwrite(
+    /// The fault sits on the WRITE PRIMITIVE, and only on a CONDITIONAL one: the renewal issues
+    /// `op.replace`, which reaches the store here, and a create on the same key must not consume the
+    /// one-shot fault.
+    std::expected<String, RawConflict> write(
         const String & key,
         const String & bytes,
-        const Token & expected,
-        const ObjectMeta & meta) override
+        const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
+        if (!expected_value)
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+
         const Fault current = std::exchange(fault, Fault::None);
         if (current == Fault::ThrowBefore)
             throw Poco::TimeoutException("injected renewal timeout before commit");
 
-        PutResult result = InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+        auto result = InMemoryBackend::write(key, bytes, expected_value, access);
         if (current == Fault::LandThenThrow)
             throw Poco::TimeoutException("injected renewal response loss after commit");
         return result;
@@ -180,9 +184,11 @@ TEST(CASObservability, ExternalLeaseDeadlineCountsOnceWithoutReconstructingAttem
         .boot_ms_fn = [&] { return boot_ms; },
     });
 
-    /// The confirmed external safety deadline is 1080. At 1071 a ten-millisecond physical attempt
-    /// no longer fits, so the logical renewal ends without reconstructing a sent attempt.
-    boot_ms = 1071;
+    /// The fence deadline is 1100 and the safety margin 20, so admission refuses once fewer than
+    /// twenty milliseconds of lease remain. At 1090 nothing can be started and the logical renewal ends
+    /// without reconstructing a sent attempt. (Not 1071: the engine reserves the backend's own attempt
+    /// timeout, which is zero for an in-memory backend, so 29 ms of remaining lease is still room.)
+    boot_ms = 1090;
     const RenewalCounterSnapshot before = renewalCounters();
     EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
     const RenewalCounterSnapshot after = renewalCounters();

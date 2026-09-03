@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
@@ -302,6 +301,25 @@ public:
     /// it cannot plausibly finish before the fence expires.
     bool refAppendFenceOk() const;
 
+    /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
+    /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
+    /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
+    /// it is published before the state store) OR `IdentityLost` (rev.8: a fail-loud TERMINAL state — no
+    /// demoted observer; recovery is restart or FORGET). Consulted by `scheduleRemount` before arming and by
+    /// the remount loop at every step boundary. (The GC scheduler applies the same three-way test through
+    /// `Pool`, spec §9 rev.8 item 8.)
+    bool remountTerminal() const
+    {
+        return vanished_intent.load(std::memory_order_acquire)
+            || lifecycle() == PoolLifecycle::IdentityLost;
+    }
+
+    /// The inter-attempt sleep the mount plane runs on. A plain sleep would hold a parked or stopping
+    /// renewal for the whole capped backoff; this one wakes on the same stop signal the workers watch.
+    /// It shortens a stop, not a fence loss: the fence cannot see a stop request, so a woken operation
+    /// still reissues unless its own liveness predicate refuses.
+    void sleepInterruptibly(uint64_t ms);
+
     /// The mount fence's admission verdict, as `Fence::admit` expects it: may a request admitted under
     /// `admitted_generation`, still expected to be running `needed_ms` from now, proceed?
     /// `LostOrRearmed` when the fence is latched lost or a fresh lease incarnation replaced the one the
@@ -421,18 +439,6 @@ private:
     void tripFenceWithoutOperationalLoss();
     std::unique_lock<std::mutex> lockTerminalPublication();
 
-    /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
-    /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
-    /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
-    /// it is published before the state store) OR `IdentityLost` (rev.8: a fail-loud TERMINAL state — no
-    /// demoted observer; recovery is restart or FORGET). Consulted by `scheduleRemount` before arming and by
-    /// the remount loop at every step boundary. (The GC scheduler applies the same three-way test through
-    /// `Pool`, spec §9 rev.8 item 8.)
-    bool remountTerminal() const
-    {
-        return vanished_intent.load(std::memory_order_acquire)
-            || lifecycle() == PoolLifecycle::IdentityLost;
-    }
 
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     BackendPtr backend_ptr;

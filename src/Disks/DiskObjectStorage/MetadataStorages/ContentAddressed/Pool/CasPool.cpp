@@ -131,7 +131,10 @@ LifecycleGate probePoolLifecycleGate(
     CasOperation & op, const Layout & layout, const String & srid,
     UInt128 expected_pool_id, uint64_t expected_blob_header_len)
 {
-    const SentinelProbeResult meta_probe = probeSentinel(op, layout.poolMetaKey());
+    /// `once` on both probes: an inconclusive answer IS this gate's verdict (`StayTransient`), and the
+    /// recovery loop that called it is what retries. Reissuing here would spend the loop's whole
+    /// interval inside a single probe and make a terminal transition wait for it.
+    const SentinelProbeResult meta_probe = probeSentinel(op, layout.poolMetaKey(), Retry::once());
     switch (meta_probe.outcome)
     {
         case ProbeOutcome::Present:
@@ -164,7 +167,7 @@ LifecycleGate probePoolLifecycleGate(
             /// authoritatively absent ⇒ `IdentityLost` (a fail-loud terminal state), regardless of whatever
             /// else remains under the prefix. Erasure is never PROVEN by the system — only asserted by the
             /// operator's `FORGET` — so there is no prefix-emptiness leg here.
-            const SentinelProbeResult owner_probe = probeSentinel(op, layout.ownerKey(srid));
+            const SentinelProbeResult owner_probe = probeSentinel(op, layout.ownerKey(srid), Retry::once());
             if (owner_probe.outcome != ProbeOutcome::KeyAbsent)
                 return {LifecycleGateVerdict::StayTransient,
                         "_pool_meta absent but the owner sentinel was not conclusively absent"};
@@ -190,7 +193,9 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] { return mount_runtime.fenceGeneration(); },
           [this](uint64_t g, uint64_t needed) { return mount_runtime.admit(g, needed); },
           [this](uint64_t g) { mount_runtime.checkFenceOrThrow(g); }},
-          config.boot_ms_fn)
+          config.boot_ms_fn,
+          /// Interruptible: a parked or stopping renewal must not be held for a whole capped backoff.
+          [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); })
     , farewell_requests(pool_backend, Fence::open(), config.boot_ms_fn)
     , gc_requests(pool_backend, Fence::open(), config.boot_ms_fn)
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
@@ -388,7 +393,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     Layout layout(config.pool_prefix);
     /// The whole bootstrap runs on an OPEN fence: there is no mount lease yet, and the claim below is
     /// what establishes one.
-    CasRequests bootstrap_requests(backend, Fence::open());
+    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn);
     bool initialize_empty_catalog = false;
     /// The probe writes and deletes throwaway keys to verify conditional-op enforcement. A read-only
     /// open must never mutate the pool it inspects; fsck only reads, so skip it. (Pool meta below is
@@ -880,7 +885,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// decommission.
     /// The open plane: this factory impersonates the victim to take its mount, so there is no lease of
     /// ours to be gated on until the claim below establishes one.
-    CasRequests bootstrap_requests(backend, Fence::open());
+    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn);
     CasOperation owner_op = bootstrap_requests.admit();
     std::optional<UInt128> victim_uuid = readOwnerUuid(owner_op, layout, victim_srid);
     if (!victim_uuid)
@@ -1268,8 +1273,10 @@ bool Pool::tryRemountOnce()
     {
         step = "pool_identity_probe";
         /// The open plane: this runs with the mount fence latched lost -- that is what a remount is
-        /// recovering from -- so an operation admitted under the fence could never issue the probe.
-        CasOperation probe_op = gc_requests.admit();
+        /// recovering from -- so an operation admitted under the fence could never issue the probe. An
+        /// open fence never refuses, so the terminal check is the only thing that can end the probe: a
+        /// FORGET publishing its intent must not have to wait one out.
+        CasOperation probe_op = gc_requests.admit([this] { return !mount_runtime.remountTerminal(); });
         const LifecycleGate gate = probePoolLifecycleGate(
             probe_op, pool_layout, config.server_root_id, meta.pool_id, meta.blob_header_len);
         switch (gate.verdict)
@@ -1777,7 +1784,9 @@ NamespaceListing Pool::listNamespaces(const String & prefix)
     /// opaque life id and therefore cannot mint a namespace during discovery.
     std::unordered_set<String> found;
     std::vector<UnattributableNamespaceKey> skipped;
-    CasOperation catalog_op = gc_requests.admit();
+    /// The mount plane, like every other content read: enumerating a namespace on a mount whose lease
+    /// is gone must be refused, not answered.
+    CasOperation catalog_op = mount_requests.admit();
     const CasRefCatalog::Snapshot cut = CasRefCatalog::read(catalog_op, pool_layout);
     for (const CatalogEntry & entry : cut.catalog.entries)
     {
@@ -1804,7 +1813,8 @@ std::vector<String> Pool::listMirroredChildren(const String & prefix)
     /// Namespace children come from the catalog. `roots/` is still listed for loose mountpoint files,
     /// whose logical paths retain path identity.
     std::unordered_set<String> children;
-    CasOperation catalog_op = gc_requests.admit();
+    /// The mount plane: this is a content enumeration, the same class as `listNamespaces` above.
+    CasOperation catalog_op = mount_requests.admit();
     const CasRefCatalog::Snapshot cut = CasRefCatalog::read(catalog_op, pool_layout);
     for (const CatalogEntry & entry : cut.catalog.entries)
     {
@@ -1818,7 +1828,7 @@ std::vector<String> Pool::listMirroredChildren(const String & prefix)
     }
 
     const String roots_full = pool_layout.rootsPrefix() + prefix;
-    CasOperation roots_op = gc_requests.admit();
+    CasOperation roots_op = mount_requests.admit();
     roots_op.forEachListedKey(roots_full, [&](const KeyEntry & listed)
     {
         const String & key = listed.key;

@@ -129,8 +129,8 @@ TEST(CASLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
     backend->resetCounts();
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
-    EXPECT_EQ(backend->putTotal(), 0u) << "a terminal-IdentityLost gate probe must never claim, allocate, or write";
-    EXPECT_GE(backend->headRequestCount(meta_key), 1u) << "the gate still probes _pool_meta authoritatively";
+    EXPECT_EQ(backend->writeTotal(), 0u) << "a terminal-IdentityLost gate probe must never claim, allocate, or write";
+    EXPECT_GE(backend->headCount(meta_key), 1u) << "the gate still probes _pool_meta authoritatively";
 }
 
 /// (a2) rev.8 worker-exit: `IdentityLost` is terminal, so the persistent self-remount worker must self-exit

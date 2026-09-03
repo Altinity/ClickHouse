@@ -6,9 +6,9 @@
 namespace DB::Cas
 {
 
-SentinelProbeResult probeSentinel(CasOperation & op, const String & key)
+SentinelProbeResult probeSentinel(CasOperation & op, const String & key, const Retry & policy)
 {
-    return op.probeSentinel(key, Retry::standard());
+    return op.probeSentinel(key, policy);
 }
 
 namespace
