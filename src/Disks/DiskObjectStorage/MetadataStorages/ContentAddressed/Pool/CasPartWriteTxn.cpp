@@ -316,9 +316,12 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                 source.size);
     };
 
-    /// One read-decide-write over the freshness marker: the engine settles every refused precondition
-    /// by an exact read, so the marker's own read-modify-write loop is the engine's and ends at the
-    /// policy's deadline rather than after a fixed count of unpaced attempts.
+    /// Bring the freshness marker to `Clean`. A publication that followed an ABSENT observation has
+    /// nothing at the marker key to decide from, so its create IS the whole reconciliation; routing it
+    /// through a read-decide-write would spend a GET on every insert to learn what the create settles
+    /// for itself. Only a create that loses -- a racing writer's marker, or the stale `Condemned` one a
+    /// resurrect always finds -- needs the read, and there the engine's own loop is what bounds the
+    /// retries at the policy's deadline instead of a fixed count of unpaced attempts.
     auto reconcileMetaClean = [&](BlobPublicationReason reason)
     {
         if (reason == BlobPublicationReason::Absent)
@@ -327,6 +330,23 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             ProfileEvents::increment(ProfileEvents::CASMetaResurrectClean);
 
         const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = source.size};
+        const String what = fmt::format(
+            "PartWriteTxn::ensureBlobPresent: reconciling the freshness metadata of '{}' to `Clean` "
+            "after blob publication", key);
+
+        if (reason == BlobPublicationReason::Absent)
+        {
+            ProfileEvents::increment(ProfileEvents::CASMetaPut);
+            WriteResult created = op.create(meta_key, encodeBlobMeta(clean), policy);
+            /// Anything but a lost race is this call's answer, and `orThrow` maps it exactly as it maps
+            /// the read-decide-write's own result.
+            if (!std::holds_alternative<Conflict>(created))
+            {
+                orThrow(std::move(created), what);
+                return;
+            }
+        }
+
         orThrow(
             op.readModifyWrite(
                 meta_key,
@@ -347,8 +367,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     return encodeBlobMeta(clean);
                 },
                 policy),
-            fmt::format("PartWriteTxn::ensureBlobPresent: reconciling the freshness metadata of '{}' to "
-                        "`Clean` after blob publication", key));
+            what);
     };
 
     constexpr int max_publication_attempts = 8;

@@ -73,13 +73,17 @@ PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & b)
 /// plane every write below is admitted on. A policy that has to be EXHAUSTED then closes in
 /// microseconds of wall clock instead of ninety real seconds, and a policy that merely reissues costs
 /// no sleep at all, so these tests pin retry semantics and never a schedule.
-void useVirtualMountRequestClock(const PoolPtr & store)
+/// `step_ms` is a FLOOR on how far each sleep moves the clock. A test that must see a policy exhaust
+/// raises it so the window closes after a countable handful of attempts rather than after however many
+/// near-zero jitter draws fit into ninety seconds.
+void useVirtualMountRequestClock(const PoolPtr & store, uint64_t step_ms = 0)
 {
     auto now = std::make_shared<std::atomic<uint64_t>>(0);
     store->mountRequests().setNowFnForTest([now] { return now->load(); });
     /// `+ 1` because a jittered draw may be zero, and a clock that can stand still never closes the
     /// window.
-    store->mountRequests().setSleepFnForTest([now](uint64_t ms) { now->fetch_add(ms + 1); });
+    store->mountRequests().setSleepFnForTest(
+        [now, step_ms](uint64_t ms) { now->fetch_add(std::max(ms, step_ms) + 1); });
 }
 
 /// Start a build whose owning manifest namespace + final ref name are `ns`/`ref` (promote/stageManifest
@@ -849,12 +853,22 @@ namespace
 class AmbiguousMetaWriteBackend final : public InMemoryBackend
 {
 public:
+    /// Past this many faulted attempts the double stops faulting and raises a deterministic local
+    /// failure instead, which every loop here surfaces unchanged. A caller whose retries are no longer
+    /// bounded therefore FAILS on the wrong error code rather than running until the suite times out.
+    int attempt_cap = 100;
+    int attempts = 0;
+
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value,
                                              TransportAccess & access) override
     {
         if (!key.ends_with(".meta"))
             return InMemoryBackend::write(key, bytes, expected_value, access);
+        if (++attempts > attempt_cap)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "AmbiguousMetaWriteBackend: {} attempts exceeded the cap of {}; the caller's retries "
+                "are no longer bounded", attempts, attempt_cap);
         throw Poco::TimeoutException("AmbiguousMetaWriteBackend: blob meta write response lost");
     }
 };
@@ -869,7 +883,7 @@ TEST(CASPartWriteTxn, PutBlobFreshMetaExhaustionThrowsRetryLater)
 {
     auto b = std::make_shared<AmbiguousMetaWriteBackend>();
     auto s = openPool(b);
-    useVirtualMountRequestClock(s);
+    useVirtualMountRequestClock(s, /*step_ms=*/10'000);
 
     const String payload = "fresh-meta-exhaustion-payload";
     auto build = precommittedBuildForPayload(
@@ -2368,6 +2382,10 @@ public:
     bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
     String plant_different_on_fault;     /// a FOREIGN different body lands at the key before the fault
     int put_attempts = 0;                /// matching body-PUT attempts observed
+    /// Past this many attempts the double stops faulting and raises a deterministic local failure
+    /// instead, which every loop here surfaces unchanged. A caller whose retries are no longer bounded
+    /// therefore FAILS on the wrong error code rather than running until the suite times out. 0 = off.
+    int attempt_cap = 0;
 
     /// The fault sits on the write primitive: a staged part-manifest body is a create, which is a
     /// `write` with no precondition.
@@ -2378,6 +2396,10 @@ public:
         if (!isManifestBodyKey(key))
             return InMemoryBackend::write(key, bytes, expected_value, access);
         ++put_attempts;
+        if (attempt_cap > 0 && put_attempts > attempt_cap)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "ManifestPutFaultBackend: {} attempts exceeded the cap of {}; the caller's retries are "
+                "no longer bounded", put_attempts, attempt_cap);
         maybeFault(key, bytes, access);
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
@@ -2478,22 +2500,29 @@ TEST(CASPartWriteTxnStageManifestRetry, DifferentObjectAtKeyStaysLoudConflict)
 /// Policy exhaustion: EVERY attempt is ambiguous and nothing ever lands. The write gives up, and
 /// stageManifest maps that to NETWORK_ERROR — the same retryable abort class the ref-log lane's
 /// exhausted budget maps to. Nothing was durably named: the caller re-stages with a fresh ManifestId.
-/// The attempt COUNT is the request policy's business and is pinned where that policy lives; what
-/// this fence checks is that the stage reissues at all, and that its give-up is mapped, not leaked.
+///
+/// Two things make the BOUND itself observable rather than assumed. The injected clock is advanced by
+/// each reissue's own sleep, so the policy's window closes after a handful of attempts instead of after
+/// ninety real seconds; and the double refuses deterministically past a cap far above that handful, so
+/// a stage whose retries stopped being bounded fails on the wrong error code instead of running until
+/// the suite times out. The exact attempt COUNT belongs to the request policy and is pinned where that
+/// policy lives.
 TEST(CASPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
 {
     auto b = std::make_shared<ManifestPutFaultBackend>();
     auto s = openPool(b);
-    useVirtualMountRequestClock(s);
+    useVirtualMountRequestClock(s, /*step_ms=*/10'000);
     const RootNamespace ns{"srv/tbl"};
 
     auto build = startBuildFor(s, ns, "part_exhausted");
     b->fault_count = 1000000;
+    b->attempt_cap = 100;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         build->stageManifest({blobManifestEntry("a.bin", "a")});
     });
     EXPECT_GT(b->put_attempts, 1) << "the ambiguous attempt must be reissued before the write gives up";
+    EXPECT_LE(b->put_attempts, b->attempt_cap) << "the policy's window, not the double's cap, ended it";
     EXPECT_FALSE(b->head(s->layout().manifestKey(ManifestId{ns, ManifestRef{s->liveWriterEpoch(), 1, 0}})).exists)
         << "an exhausted stage names nothing durable";
 }
