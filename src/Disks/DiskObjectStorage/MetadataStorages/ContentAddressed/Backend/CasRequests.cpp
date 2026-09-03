@@ -712,7 +712,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             if (!refreshed && isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
             {
                 ProfileEvents::increment(ProfileEvents::CASRequestRefused);
-                return Refused{e.code(), e.message()};
+                return Refused{e.code(), e.message(), state.attempts_sent};
             }
         }
         catch (const std::exception & e)
@@ -765,7 +765,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// Identical bytes here are somebody else's object, and the caller that owns the key's meaning
         /// decides what that means.
         if (!state.any_ambiguous)
-            return Conflict{state.last_seen};
+            return Conflict{state.last_seen, state.attempts_sent};
 
         if (!preconditionStillSatisfiable(state.last_seen, expected))
         {
@@ -776,7 +776,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             if (const auto * obj = std::get_if<Object>(&state.last_seen); obj && obj->bytes == bytes)
                 return postCommit(obj->incarnation, /*resolved_by_read=*/true, state, bound);
             /// Nothing of this inner write's is at the key, and a reissue would be refused too.
-            return Conflict{state.last_seen};
+            return Conflict{state.last_seen, state.attempts_sent};
         }
 
         /// Unresolved but repeatable: the precondition would still be met -- or nothing was observed at
@@ -891,7 +891,7 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
             current.reset();
 
         if (policy.single_attempt)
-            return Conflict{state.last_seen};
+            return Conflict{state.last_seen, state.attempts_sent};
         if (auto given_up = pauseAndReissue(state, bound))
             return *given_up;
 

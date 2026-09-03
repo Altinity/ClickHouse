@@ -41,10 +41,14 @@ struct Committed { Incarnation incarnation; uint32_t attempts_sent; bool resolve
 /// present under the caller's intended content. `seen` is whatever the resolve read observed.
 struct Declined  { Observation seen; };
 /// A competing write won: the key's current state does not match what this call expected.
-struct Conflict  { Observation seen; };
+/// `attempts_sent` counts the HTTP attempts this call made, the same count `Committed` and `GaveUp`
+/// carry: an operator's attempt counters sum over ALL the endings of a write, and losing the key is
+/// one an operator wants counted rather than dropped.
+struct Conflict  { Observation seen; uint32_t attempts_sent = 0; };
 /// The store itself refused the request (not a lost precondition) -- `store_error` is a ClickHouse
-/// error code and `message` explains it.
-struct Refused   { int store_error; String message; };
+/// error code and `message` explains it. `attempts_sent` is the same count `Conflict` carries, for
+/// the same reason.
+struct Refused   { int store_error; String message; uint32_t attempts_sent = 0; };
 /// No attempt landed and none can be proven safe to keep making.
 struct GaveUp
 {

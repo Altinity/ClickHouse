@@ -1197,6 +1197,9 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsAnotherIncarnationIsAConflict
     EXPECT_NE(occupant->incarnation, stale);
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getTotal(), 1u);
+    /// The count the conflict reports is the count the transport saw, not a constant that happens to
+    /// match here: a caller totalling attempts across endings has to be able to add this one.
+    EXPECT_EQ(conflict->attempts_sent, backend->writeTotal());
     EXPECT_TRUE(clock.sleeps.empty());
 }
 
@@ -1558,10 +1561,14 @@ TEST(CASRequests, ASecondCredentialAnswerAfterTheOneRefreshIsRefused)
     WriteResult result = op.create("k", "v", Retry::standard());
     /// The store answers a denial BEFORE it applies anything, so neither attempt landed and no read
     /// has anything to settle. A call gets one refresh, so the denial that survives it is the answer.
-    ASSERT_TRUE(std::holds_alternative<Refused>(result));
+    const auto * refused = std::get_if<Refused>(&result);
+    ASSERT_NE(refused, nullptr);
     EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
     EXPECT_EQ(backend->writeTotal(), 2u);
     EXPECT_EQ(backend->getTotal(), 0u);
+    /// BOTH attempts are counted, not just the one that produced the answer -- which is why this is
+    /// asserted on the refusal that took two rather than on one of the single-attempt refusals.
+    EXPECT_EQ(refused->attempts_sent, backend->writeTotal());
     EXPECT_EQ(clock.sleeps.size(), 1u);   /// the one paced re-send under the credentials it installed
 }
 
