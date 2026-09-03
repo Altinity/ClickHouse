@@ -4020,36 +4020,52 @@ TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
 /// fence still latched lost. Admitted on the mount plane it could only ever give up, and every remount
 /// that reached the step would fail -- so it renews on the keeper's open plane instead.
 ///
+/// Driven the way production reaches the step, which is the only way it CAN be reached: the persistent
+/// renewal worker runs, `scheduleRemount` parks it, and the redo is the parked driver's one call. A
+/// remount driven directly with no workers leaves that driver dormant, and the step's admission refuses
+/// a dormant driver rather than renewing.
+///
 /// The step is reached only when quiescence has eaten most of the new lease: with a fresh anchor the
 /// renewal window fits and the step is skipped entirely. So the quiesce hook advances the injected boot
 /// clock to just inside the safety margin, and the paired run with no quiesce cost is the control that
 /// proves the step was reached rather than skipped.
 TEST(CASPoolRemount, TheKeeperRedoRenewsOnTheOpenPlane)
 {
-    /// One successful remount whose quiescence costs `quiesce_ms`; returns the conditional mount-slot
-    /// writes it issued.
+    /// One successful self-remount whose quiescence costs `quiesce_ms`; returns the conditional
+    /// mount-slot writes it issued. Counted while the remount worker is still held inside the event
+    /// sink that reported the result, so the renewal worker it un-parks cannot add one.
     const auto remountConditionalMountWrites = [](uint64_t quiesce_ms) -> uint64_t
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
         uint64_t fake_boot = 1'000'000;
+        DB::Cas::tests::ManualBarrier committed;
         auto store = Pool::open(backend, PoolConfig{
             .pool_prefix = "remount-keeper-redo",
             .server_root_id = "test",
+            .background_watermark = true,
+            .event_sink = [&committed](const CasEvent & event)
+            {
+                if (event.type == CasEventType::MountRemount && event.outcome == "ok")
+                    committed.arriveAndWait();
+            },
             .boot_ms_fn = [&fake_boot] { return fake_boot; },
             .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; },
             .remount_quiesce_hook_for_test = [&fake_boot, quiesce_ms] { fake_boot += quiesce_ms; },
         });
         const String mount_key = store->layout().mountKey("test");
 
-        store->tripMountLost();
         fenceOutMount(*backend, mount_key);
         const uint64_t before = backend->putOverwriteCount(mount_key);
-        EXPECT_TRUE(store->tryRemountOnce())
-            << "the remount must complete with quiesce_ms=" << quiesce_ms;
-        return backend->putOverwriteCount(mount_key) - before;
+        EXPECT_TRUE(store->scheduleRemountForTest())
+            << "the remount must be latched with quiesce_ms=" << quiesce_ms;
+        committed.waitUntilArrived();
+        const uint64_t writes = backend->putOverwriteCount(mount_key) - before;
+        committed.release();
+        return writes;
     };
 
-    /// 27 s of a 30 s lease, against a 2 s safety margin and a 5 s attempt: the window no longer fits.
+    /// 27 s of a 30 s lease, against a 2 s safety margin and a window of one renewal period plus one
+    /// attempt (15 s, since the renewal worker runs here): the window no longer fits.
     EXPECT_GT(remountConditionalMountWrites(27'000), remountConditionalMountWrites(0))
         << "a quiescence that consumed the lease must cost one extra lease write -- the redo";
 }
