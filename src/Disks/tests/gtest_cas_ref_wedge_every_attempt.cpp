@@ -83,16 +83,30 @@ PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 
+/// An exact read (mirrors the retired `backend.get(key)`).
+std::optional<Object> readObj(Backend & backend, const String & key)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    return (*op).read(key, Retry::standard());
+}
+
+/// A one-shot `create`, asserting it committed (mirrors the retired `backend.putIfAbsent(key, bytes)`).
+void createObj(Backend & backend, const String & key, const String & bytes)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
+}
+
 /// The budget every wedge test uses. It bounds the mount lease's own admission arithmetic
 /// (`attempt_timeout_ms` is what one attempt reserves, `lease_safety_margin_ms` the room kept past it)
-/// and nothing else: a write's ATTEMPT COUNT is the `Retry` policy's, so no budget field can make an
-/// injected fault conclusive. What makes a fault conclusive here is that it stays armed for the whole
-/// call while `VirtualRetryClock` carries the call to its own deadline.
+/// and nothing else: a write's ATTEMPT COUNT is the `Retry` policy's, and a call's own deadline is
+/// fence-derived (`Retry::untilLeaseSafe`/`Retry.bind`), so no budget field can make an injected fault
+/// conclusive. What makes a fault conclusive here is that it stays armed for the whole call while
+/// `VirtualRetryClock` carries the call to its own deadline.
 CasRequestBudget wedgeTestBudget()
 {
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     return budget;
 }
@@ -119,8 +133,6 @@ void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String 
 class WedgeTestBackend : public CountingBackend
 {
 public:
-    using CountingBackend::putIfAbsent;
-
     /// One-shot ambiguity that writes NOTHING: the response is lost and the key stays absent, which is
     /// the input that makes a later bounded create commit.
     String ambiguous_substr;
@@ -176,7 +188,7 @@ public:
     String refuse_precondition_substr;
     bool refuse_read_after_precondition = false;
 
-    /// Straight past every seam below, for the writes a test makes on its own behalf. `putIfAbsent`
+    /// Straight past every seam below, for the writes a test makes on its own behalf. `create`
     /// reaches the store through the VIRTUAL `write`, so a qualified call cannot bypass this override --
     /// only this flag can.
     std::atomic<bool> bypass_seams{false};
@@ -252,13 +264,13 @@ public:
     /// Write straight through, bypassing every fault and block seam above -- how a test models what a
     /// SUCCESSOR (another process entirely) put at a key. Routing it through the seams instead would
     /// park the test's own write on the very gate it is trying to drive a scenario through, or spend
-    /// the fault meant for the lane's attempt. Qualifying the call does NOT achieve that:
-    /// `Backend::putIfAbsent` reaches the store through the VIRTUAL `write`, so the override above runs
-    /// either way -- `bypass_seams` is what it reads to step aside.
-    PutResult putAsSuccessor(const String & key, const String & bytes)
+    /// the fault meant for the lane's attempt. `create` reaches the store through the VIRTUAL `write`,
+    /// so the override above runs either way -- `bypass_seams` is what it reads to step aside.
+    WriteResult putAsSuccessor(const String & key, const String & bytes)
     {
         bypass_seams.store(true, std::memory_order_release);
-        const PutResult result = CountingBackend::putIfAbsent(key, bytes, ObjectMeta{});
+        DB::Cas::tests::OperationForTest op(*this);
+        const WriteResult result = (*op).create(key, bytes, Retry::once());
         bypass_seams.store(false, std::memory_order_release);
         return result;
     }
@@ -404,7 +416,8 @@ CatalogEntry replaceCatalogLifeForWedgeRace(
 /// hand-rolled parse), so an assertion about `prev_epoch_seal` is an assertion about the WIRE.
 RefLogTxn readRefLogTxn(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id)
 {
-    const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id));
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto got = (*op).read(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id), Retry::standard());
     if (!got)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "no ref-log object at {}-{}", id.writer_epoch, id.ref_sequence);
     return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
@@ -536,7 +549,7 @@ TEST(CASRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     wedgeLaneOnUnresolvedAppend(*clock, *backend, store, ns, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->resolveRef(ns, "x").has_value()) << "a wedged transaction is not applied";
     const String wedged_key = store->wedgedKeyForTest(ns);
-    ASSERT_FALSE(backend->get(wedged_key).has_value()) << "the ambiguous attempt wrote nothing";
+    ASSERT_FALSE(readObj(*backend, wedged_key).has_value()) << "the ambiguous attempt wrote nothing";
     const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
 
     /// The next caller's flush resolves the wedge with ONE create, adopts it, and only then carves and
@@ -546,7 +559,7 @@ TEST(CASRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     EXPECT_FALSE(store->refLaneWedgedForTest(ns));
     EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "the adopted wedge applied its drop";
     EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "the resolving flush committed its own drop";
-    EXPECT_TRUE(backend->get(wedged_key).has_value()) << "the wedged transaction is durable at its own key";
+    EXPECT_TRUE(readObj(*backend, wedged_key).has_value()) << "the wedged transaction is durable at its own key";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before + 2)
         << "the adopted wedge and the ordinary commit must each join the tail exactly once";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
@@ -564,12 +577,12 @@ TEST(CASRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCan
 
     wedgeLaneOnUnresolvedAppend(*clock, *backend, store, ns, [&] { store->dropRef(ns, "x"); });
     const String wedged_key = store->wedgedKeyForTest(ns);
-    ASSERT_FALSE(backend->get(wedged_key));
+    ASSERT_FALSE(readObj(*backend, wedged_key));
     const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
 
     const NamespaceLifeId life = *store->refTableLifeForTest(ns);
     const String ckpt_key = store->layout().refCkptKey(life);
-    const RefCkpt ckpt_before = decodeRefCkpt(backend->get(ckpt_key)->bytes);
+    const RefCkpt ckpt_before = decodeRefCkpt(readObj(*backend, ckpt_key)->bytes);
     /// Latched, not counted: the frontier publish reissues an ambiguous replace until ITS window
     /// closes, so a bounded fault would simply be outlived and the publication would succeed.
     backend->fail_cas_substr = ckpt_key;
@@ -582,12 +595,12 @@ TEST(CASRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCan
 
     EXPECT_GT(clock->pauseCount(), pauses_before + 1)
         << "the publication's reissues must pace through the injected sleep, never a real one";
-    EXPECT_TRUE(backend->get(wedged_key)) << "the exact wedged log was proven durable";
+    EXPECT_TRUE(readObj(*backend, wedged_key)) << "the exact wedged log was proven durable";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery)
         << "a durable log without a confirmed frontier must not return to Ready";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
         << "the unfrontiered wedge must not be installed into the resident table";
-    EXPECT_EQ(decodeRefCkpt(backend->get(ckpt_key)->bytes), ckpt_before);
+    EXPECT_EQ(decodeRefCkpt(readObj(*backend, ckpt_key)->bytes), ckpt_before);
 }
 
 TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdoption)
@@ -605,7 +618,7 @@ TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdop
 
     wedgeLaneOnUnresolvedAppend(*clock, *backend, store, ns, [&] { store->dropRef(ns, "x"); });
     const String wedged_key = store->wedgedKeyForTest(ns);
-    ASSERT_FALSE(backend->get(wedged_key));
+    ASSERT_FALSE(readObj(*backend, wedged_key));
 
     std::mutex mutex;
     std::condition_variable cv;
@@ -640,10 +653,10 @@ TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdop
         = replaceCatalogLifeForWedgeRace(backend, store->layout(), predecessor, UInt128{0x71f2});
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
-    ASSERT_EQ(backend->putIfAbsent(store->layout().refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+    createObj(*backend, store->layout().refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
         .life_epoch = store->liveWriterEpoch(),
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt}));
     store->invalidateRemovedCatalogLife(predecessor_life);
     backend->resetCounts();
 
@@ -658,7 +671,7 @@ TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdop
     EXPECT_TRUE(retry_error);
     EXPECT_EQ(backend->putCount(wedged_key), 0u) << "retirement must refuse before the retry send";
     EXPECT_EQ(backend->getCount(wedged_key), 0u) << "a refused retry needs no occupant resolution read";
-    EXPECT_FALSE(backend->get(wedged_key)) << "the predecessor wedge was adopted or made durable";
+    EXPECT_FALSE(readObj(*backend, wedged_key)) << "the predecessor wedge was adopted or made durable";
     EXPECT_NO_THROW((void)store->listRefs(ns));
     ASSERT_TRUE(store->refTableLifeForTest(ns));
     EXPECT_EQ(*store->refTableLifeForTest(ns), successor_life);
@@ -682,7 +695,7 @@ TEST(CASRefWedgeEveryAttempt, OwnLandedAttemptIsAdoptedFromOccupiedWithoutDouble
 
     wedgeLaneOverADurableObject(*clock, *backend, store, ns, "x");
     const String wedged_key = store->wedgedKeyForTest(ns);
-    ASSERT_TRUE(backend->get(wedged_key).has_value()) << "this fault LANDS the write; only the ack was lost";
+    ASSERT_TRUE(readObj(*backend, wedged_key).has_value()) << "this fault LANDS the write; only the ack was lost";
     ASSERT_TRUE(store->resolveRef(ns, "x").has_value()) << "durable, but not applied while wedged";
     const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
     const uint64_t puts_before = backend->putCount(wedged_key);
@@ -722,7 +735,7 @@ TEST(CASRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "a definite refusal AFTER an ambiguous attempt must not unwedge";
     EXPECT_EQ(store->wedgedKeyForTest(ns), wedged_key) << "the SAME wedge, not a fresh one";
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "nothing was adopted";
-    EXPECT_FALSE(backend->get(wedged_key).has_value()) << "and nothing became durable";
+    EXPECT_FALSE(readObj(*backend, wedged_key).has_value()) << "and nothing became durable";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged)
         << "a wedged lane's steady state is 'may be durable, not applied'";
 
@@ -838,7 +851,7 @@ TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before + 1);
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "nothing is applied while the lane is wedged";
     const String wedged_key = store->wedgedKeyForTest(ns);
-    EXPECT_FALSE(backend->get(wedged_key).has_value()) << "and nothing became durable";
+    EXPECT_FALSE(readObj(*backend, wedged_key).has_value()) << "and nothing became durable";
 
     /// And it still recovers by the ordinary route: the next flush's bounded create lands the wedged
     /// transaction and adopts it, so wedging costs availability only until the next caller arrives.
@@ -879,7 +892,7 @@ TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
 
     /// A successor closes our epoch at exactly the slot our attempt was aiming at.
-    ASSERT_EQ(backend->putAsSuccessor(wedged_key, epochSealBytes(ns, seal_id)).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(backend->putAsSuccessor(wedged_key, epochSealBytes(ns, seal_id))));
 
     /// The next caller's resolution meets the seal. Its own items fail -- permanently, not "retry
     /// later": nothing about this lane's epoch will ever accept a write again.
@@ -903,7 +916,7 @@ TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     /// wedge-resolve site does.
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
     expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "y"); });
-    EXPECT_EQ(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch, seal_id.ref_sequence + 1})), std::nullopt)
+    EXPECT_EQ(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch, seal_id.ref_sequence + 1})), std::nullopt)
         << "nothing of ours may exist above the seal in the closed epoch";
     EXPECT_TRUE(store->mayMutate()) << "meeting a successor's seal is the protocol working, not an anomaly";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before)
@@ -1001,7 +1014,7 @@ TEST(CASRefWedgeEveryAttempt, ForeignNonSealOccupantIsCorruptedDataAndSchedulesA
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
 
     /// Something that is neither our bytes nor a seal occupies the slot.
-    ASSERT_EQ(backend->putAsSuccessor(wedged_key, "not a ref-log object at all").outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(backend->putAsSuccessor(wedged_key, "not a ref-log object at all")));
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
 
@@ -1027,8 +1040,8 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteProvenDifferentObjectAlsoSchedulesARemou
     /// Occupy the id the next append will derive with a foreign object, so its create conflicts and
     /// the controller's resolve-before-reissue proves the occupant is not ours.
     const RefTxnId next{store->liveWriterEpoch(), 3};
-    ASSERT_EQ(backend->putIfAbsent(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next),
-                                   "a different object entirely").outcome, PutOutcome::Done);
+    createObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next),
+             "a different object entirely");
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
@@ -1073,7 +1086,7 @@ TEST(CASRefWedgeEveryAttempt, RetryUnderAnOlderAdmissionGenerationSendsNothing)
     EXPECT_EQ(backend->putCount(wedged_key), puts_before)
         << "the retry must be refused pre-attempt: nothing may reach the store under a foreign generation";
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "and the wedge is untouched";
-    EXPECT_FALSE(backend->get(wedged_key).has_value());
+    EXPECT_FALSE(readObj(*backend, wedged_key).has_value());
 }
 
 /// The post-I/O recheck, deterministically. The retry's create is parked mid-flight; while it is
@@ -1110,7 +1123,7 @@ TEST(CASRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsIne
     backend->awaitBlockEntered();
 
     /// Everything that makes this runtime superseded happens INSIDE the I/O window.
-    ASSERT_EQ(backend->putAsSuccessor(wedged_key, epochSealBytes(ns, seal_id)).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(backend->putAsSuccessor(wedged_key, epochSealBytes(ns, seal_id))));
     bumpFenceGeneration(store, epoch + 1);
     backend->releaseBlock();
     resolver.join();
@@ -1186,7 +1199,7 @@ TEST(CASRefWedgeEveryAttempt, KnownDurableInstallFailureMovesDirectlyToRecovery)
 
     wedgeLaneOverADurableObject(*clock, *backend, store, ns, "x");
     const String wedged_key = store->wedgedKeyForTest(ns);
-    ASSERT_TRUE(backend->get(wedged_key).has_value()) << "the wedged transaction is durable";
+    ASSERT_TRUE(readObj(*backend, wedged_key).has_value()) << "the wedged transaction is durable";
     /// The adoption reaches its install region and the install throws.
     armOneShotInstallFailure(store);
     expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "y"); });
@@ -1275,7 +1288,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesAConclusiveFirstRefLogRejectio
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
-    const auto ckpt_before = backend->get(ckpt_key);
+    const auto ckpt_before = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
 
     /// A successor's epoch seal lands at exactly the id this first `NamespaceBirth` transaction derives.
@@ -1285,7 +1298,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesAConclusiveFirstRefLogRejectio
 
     expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { publishEmptyPart(store, ns, "x"); });
 
-    const auto ckpt_after = backend->get(ckpt_key);
+    const auto ckpt_after = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->bytes, ckpt_before->bytes)
         << "the creation checkpoint must survive a conclusively rejected first ref-log PUT unchanged";
@@ -1315,7 +1328,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesALaterConclusiveRejection)
     publishEmptyPart(store, ns, "x");
 
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
-    const auto ckpt_before = backend->get(ckpt_key);
+    const auto ckpt_before = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation step must have published a real _ckpt";
 
     const RefTxnId next{store->liveWriterEpoch(), 3};
@@ -1325,7 +1338,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesALaterConclusiveRejection)
 
     expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "x"); });
 
-    const auto ckpt_after = backend->get(ckpt_key);
+    const auto ckpt_after = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_after.has_value()) << "a Live namespace's _ckpt must never be deleted by this path";
     EXPECT_EQ(ckpt_after->bytes, ckpt_before->bytes)
         << "not merely present but UNCHANGED -- no code anywhere on this path deletes _ckpt any more "
@@ -1349,13 +1362,13 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthIsAm
     const RootNamespace ns{"srv1/birth_ckpt_ambiguous"};
     admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
-    const auto ckpt_before = backend->get(ckpt_key);
+    const auto ckpt_before = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
 
     /// The wedge is the assertion: an ambiguous outcome must not resolve into one of the conclusive
     /// branches, so `wedgeLaneOnUnresolvedAppend` insisting on it is what this row needs.
     wedgeLaneOnUnresolvedAppend(*clock, *backend, store, ns, [&] { publishEmptyPart(store, ns, "x"); });
-    const auto ckpt_after = backend->get(ckpt_key);
+    const auto ckpt_after = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->bytes, ckpt_before->bytes)
         << "the creation checkpoint must survive an ambiguous first ref-log outcome unchanged";
@@ -1377,7 +1390,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthName
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
-    const auto ckpt_before = backend->get(ckpt_key);
+    const auto ckpt_before = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
 
     /// The store refuses the birth create's precondition while the key is in fact ABSENT, so the
@@ -1386,7 +1399,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthName
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishEmptyPart(store, ns, "x"); });
 
-    const auto ckpt_after = backend->get(ckpt_key);
+    const auto ckpt_after = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->bytes, ckpt_before->bytes)
         << "the creation checkpoint must survive an unnameable first ref-log occupant unchanged";
@@ -1404,7 +1417,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesFirstNamespaceBirthForeignInte
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
-    const auto ckpt_before = backend->get(ckpt_key);
+    const auto ckpt_before = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
 
     /// A perfectly decodable transaction for this exact namespace and id -- just not an epoch seal, and
@@ -1418,7 +1431,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesFirstNamespaceBirthForeignInte
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { publishEmptyPart(store, ns, "x"); });
 
-    const auto ckpt_after = backend->get(ckpt_key);
+    const auto ckpt_after = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->bytes, ckpt_before->bytes)
         << "the creation checkpoint must survive a foreign-interference first ref-log outcome unchanged";
@@ -1601,7 +1614,7 @@ TEST(CASRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
         EXPECT_NE(e.message().find("resumes only under a later epoch"), String::npos)
             << "the deposition must be surfaced, not just the failure: " << e.message();
     }
-    EXPECT_FALSE(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})).has_value())
+    EXPECT_FALSE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})).has_value())
         << "nothing may be written: the lane could not construct a legal transaction, so it sent none";
     EXPECT_EQ(backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})), puts_before)
         << "and no request was spent learning what the lane could already prove about itself";
@@ -1693,7 +1706,7 @@ TEST(CASRefLane, PostCommitFenceLossWedges)
         << "the object is durable, so the lane must not be returned to Ready";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before + 1);
-    EXPECT_TRUE(backend->get(store->wedgedKeyForTest(ns)).has_value())
+    EXPECT_TRUE(readObj(*backend, store->wedgedKeyForTest(ns)).has_value())
         << "the write landed -- what was refused is the CLAIM, not the object";
 }
 
