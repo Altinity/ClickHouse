@@ -751,7 +751,21 @@ TEST(CASRefCheckpoint, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLate
     /// Every read is followed by a rewrite of the SAME body under a fresh incarnation, so the
     /// precondition this call holds is always stale and every write it issues is refused. Only the
     /// policy's deadline can end the loop, and the injected clock reaches it without sleeping.
-    backend->after_read = [&] { overwriteObject(setup, key, encodeRefCkpt(base)); };
+    ///
+    /// `overwriteObject` itself reads `key` (its own `readModifyWrite`'s precondition read), which
+    /// would re-enter this very hook -- unlike the concurrent-actor fixtures elsewhere in this file,
+    /// this rewrite is not a one-shot: it must keep firing on every OUTER read, so a plain one-shot
+    /// latch would silently stop the persistent conflict after the first attempt. Guard only the
+    /// reentrant call instead.
+    bool rewriting = false;
+    backend->after_read = [&]
+    {
+        if (rewriting)
+            return;
+        rewriting = true;
+        overwriteObject(setup, key, encodeRefCkpt(base));
+        rewriting = false;
+    };
 
     const RefCkpt advance{.life_epoch = std::nullopt, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishCkpt(op, layout, life, advance); });
