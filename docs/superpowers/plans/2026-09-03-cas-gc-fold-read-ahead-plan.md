@@ -22,13 +22,7 @@ doc_type: 'guide'
 ## Global Constraints {#global-constraints}
 
 - **Worktree and branch.** Work in `/home/mfilimonov/workspace/ClickHouse/lane-g` (it has `build/` with `ENABLE_TESTS=ON` and `contrib/` populated). Branch `cas-gc-fold-read-ahead`, created from `cas-gc-rebuild` (`94aaedb8a1e` or later). On completion the branch is merged back into `cas-gc-rebuild` with `--no-ff` from the `master` worktree (Task 7). Never rebase or amend; add commits. Never push.
-- **Commit discipline (shared worktrees, HARD RULE).** Always `git commit -m "ca-gc: cas_gc_read_concurrency setting and the read-ahead counters
-
-The fold's read-ahead pool size, plumbed like gc_meta_pool_size, refused at 0 like gc_shards;
-three ProfileEvents for hits, misses and wasted results.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01ExU35Ljr6yxMDCmKC4191s" -- <paths>` with named files; before every commit run `git diff --cached --stat` and `git status --short` and refuse to commit if anything foreign is staged. Verify `git branch --show-current` after each commit. Never `git add -A`.
+- **Commit discipline (shared worktrees, HARD RULE).** Always `git commit -m <msg> -- <paths>` with named files (the `--` comes last: anything after it is a pathspec); before every commit run `git diff --cached --stat` and `git status --short` and refuse to commit if anything foreign is staged. Verify `git branch --show-current` after each commit. Never `git add -A`.
 - **Commit trailers:** `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01ExU35Ljr6yxMDCmKC4191s`.
 - **Build and test command shapes** (always redirected, always with the marker, logs read by a subagent, never into the implementer's context; no `-j`, no `nproc`):
   - `ninja -C /home/mfilimonov/workspace/ClickHouse/lane-g/build unit_tests_dbms > /home/mfilimonov/workspace/ClickHouse/lane-g/build/build_<task>.log 2>&1; echo NINJA_EXIT=$? >> /home/mfilimonov/workspace/ClickHouse/lane-g/build/build_<task>.log`
@@ -223,7 +217,13 @@ Run the build command shape with `<task>` = `task1`; subagent reads the log. Exp
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/lane-g && git status --short | grep -v '^??' && git diff --cached --stat && \
-git commit -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp \
+git commit -m "ca-gc: cas_gc_read_concurrency setting and the read-ahead counters
+
+The fold's read-ahead pool size, plumbed like gc_meta_pool_size, refused at 0 like gc_shards;
+three ProfileEvents for hits, misses and wasted results.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ExU35Ljr6yxMDCmKC4191s" -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp \
   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h \
   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp \
   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h \
