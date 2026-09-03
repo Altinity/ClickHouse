@@ -211,7 +211,7 @@ TEST(CASNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTok
 
     const auto life2_after = op.head(life2_key, Retry::standard());
     ASSERT_TRUE(life2_after.has_value());
-    EXPECT_EQ(life2_after->incarnation, life2_before->incarnation);
+    EXPECT_EQ(life2_after->etag, life2_before->etag);
     const auto life2_body_after = op.read(life2_key, Retry::standard());
     ASSERT_TRUE(life2_body_after.has_value());
     EXPECT_EQ(life2_body_after->bytes, "life-2-stable\n");
