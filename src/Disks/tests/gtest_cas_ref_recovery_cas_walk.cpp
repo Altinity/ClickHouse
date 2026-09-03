@@ -1462,6 +1462,82 @@ TEST(CASRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "and ZERO installs";
 }
 
+/// The cancellation reaches the walk's REQUESTS, not just its own polls. `readCheckpointSnapshotBase`
+/// issues several reads back to back -- the base log, then the snapshot body -- and the walk's poll runs
+/// only before the call, so a cancellation landing between those two reads used to be invisible until
+/// the whole call returned. The walk's operation now carries the cancellation in its liveness, so the
+/// next request is the one that refuses.
+///
+/// Parked on the base-log read, which is the FIRST request that call makes, so the snapshot body read
+/// is the one that must never happen.
+TEST(CASRefRecoveryCasWalk, CancellationStopsTheWalkBetweenTwoReadsOfOneCall)
+{
+    auto backend = std::make_shared<GetSeamBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/cancel_between_reads"};
+    const RefTxnId base{1, 1};
+    const RefTxnId frontier{1, 2};
+
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
+    seedTxn(*backend, layout, ns, base, "a", /*birth=*/true);
+    writeRefSnapshotRaw(*backend, layout,
+        minimalLiveSnapshot(ns.string(), base, {committedRow("a", manifestRef(1, 1, 1))}));
+    seedTxn(*backend, layout, ns, frontier, "b", /*birth=*/false);
+    seedCkpt(*backend, layout, ns, RefCkpt{
+        .life_epoch = std::optional<uint64_t>{1},
+        .committed_through = frontier,
+        .checkpoint_snapshot_id = base,
+        .last_epoch_seal = std::nullopt});
+    const NamespaceLifeId life = catalogLife(backend, layout, ns);
+
+    auto store = openWalkPool(backend);
+    ASSERT_TRUE(store);
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool recovery_parked = false;
+    bool release_recovery = false;
+
+    backend->watched_substr = "_log/";
+    /// `GetSeamBackend` moves the hook out before calling it, so this parks exactly once.
+    backend->on_key = [&](const String &)
+    {
+        std::unique_lock lock(m);
+        recovery_parked = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_recovery; });
+    };
+
+    std::thread recovery([&] { try { store->listRefs(ns); } catch (...) {} }); // NOLINT(bugprone-empty-catch): the outcome is asserted below through the request counts
+
+    {
+        std::unique_lock lock(m);
+        cv.wait(lock, [&] { return recovery_parked; });
+    }
+
+    std::thread barrier([&] { store->cancelRefRecoveriesAndAwaitQuiescence(); });
+    /// Wait for the REQUEST to be visible before releasing: releasing any earlier would race the walk
+    /// past a flag set a moment too late, and the test would read an ordinary completion as a
+    /// cancellation that never happened.
+    while (!store->refRecoveryCancelRequestedForTest(ns))
+        std::this_thread::yield();
+
+    const uint64_t snapshot_reads_before = backend->getCount(layout.refSnapshotKey(life, base));
+    ASSERT_EQ(snapshot_reads_before, 0u) << "the parked read is the base LOG read, before the body read";
+
+    {
+        std::lock_guard lock(m);
+        release_recovery = true;
+    }
+    cv.notify_all();
+    barrier.join();
+    recovery.join();
+
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, base)), 0u)
+        << "the cancellation must refuse the very next request of the same call, not be noticed after it";
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "and nothing is installed";
+}
+
 /// A `NeedsRecovery` lane replays the known-durable transaction before returning to `Ready`.
 TEST(CASRefRecoveryCasWalk, NeedsRecoveryReplaysTheStrandedTxn)
 {

@@ -827,11 +827,18 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
 
     /// ONE operation for the whole walk, resumed under the generation this recovery was admitted at:
     /// its reads, its seal creates and its `_ckpt` publishes are all measured against that admission,
-    /// and a result returning after a fence bump can install nothing. The liveness terms are the ones
-    /// `checkRecoveryStillAdmitted` polls that the fence cannot see.
+    /// and a result returning after a fence bump can install nothing.
+    ///
+    /// The liveness carries EVERY term `checkRecoveryStillAdmitted` polls except the generation, which
+    /// is the fence's. That makes the poll and the request gate one rule rather than two that can drift:
+    /// a walk cancelled between two of its own polls used to keep reading until it reached the next one.
+    /// The predicate is a bool where the poll throws, so the poll still runs at the boundaries -- it is
+    /// what turns each of these facts into the right exception, and what LATCHES a cancellation for the
+    /// caller's retry classification.
     CasOperation op = mount_requests.resume(admitted_generation, [&rt, &token]
     {
         return !(token && token->stopping())
+            && !rt.recovery_cancel_requested.load(std::memory_order_acquire)
             && !rt.catalog_life_invalidated.load(std::memory_order_acquire)
             && !rt.superseded_by_remount.load(std::memory_order_acquire);
     });
@@ -1585,6 +1592,13 @@ void CasRefLedger::ensureRefTableRecovered(
             if (vanish_brake_tripped || cancelled || (token && token->stopping())
                 || !isTransientRecoveryError(code))
                 throw;   /// a latched terminal case, or a non-transient failure -- fail fast
+
+            /// A cancellation now ends the walk through the operation's liveness, which refuses
+            /// silently -- so the exception that arrives here carries a transport code and `cancelled`
+            /// is not yet latched. Take the latch before the backoff rather than one whole attempt
+            /// later: the self-remount barrier is waiting for this recovery to stop.
+            if (rt.recovery_cancel_requested.load(std::memory_order_acquire))
+                checkRecoveryStillAdmitted(ns, rt, cancelled, token);
 
             const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
             /// Fail closed BEFORE sleeping: budget spent, mount fence lost, this runtime superseded by a
