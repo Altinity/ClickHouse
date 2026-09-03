@@ -319,8 +319,11 @@ TEST(CASFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDu
         store->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "somefile", "hello");
     });
 
-    /// No durable write ever landed -- assert via the Emulated backend listing.
-    EXPECT_TRUE(store->listNamespaceFiles(DB::Cas::tests::fixture::fixtureLife(ns)).empty());
+    /// No durable write ever landed. Asserted through the RAW backend: every request the pool issues
+    /// is admitted under the mount fence, which this test has just tripped, so a read through the pool
+    /// would report that refusal rather than what the store holds.
+    EXPECT_TRUE(backend->list(store->layout().namespaceFilesPrefix(
+        DB::Cas::tests::fixture::fixtureLife(ns)), "", 100).keys.empty());
 }
 
 /// `casRemoveObject`'s delete sibling, same shape: the fence trips between admission and the durable
@@ -342,10 +345,12 @@ TEST(CASFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAn
         store->removeNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "victim");
     });
 
-    /// The durable delete never ran, so the object survives; reads are not fence-gated.
-    const auto still_there = store->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "victim");
+    /// The durable delete never ran, so the object survives -- read raw, since a read through the pool
+    /// is admitted under the fence this test has tripped and would report that refusal instead.
+    const auto still_there = backend->get(store->layout().namespaceFileKey(
+        DB::Cas::tests::fixture::fixtureLife(ns), "victim"));
     ASSERT_TRUE(still_there.has_value());
-    EXPECT_EQ(*still_there, "still here");
+    EXPECT_EQ(still_there->bytes, "still here");
 }
 
 /// The fence re-check must run before EVERY conditional-retry iteration, not just the first attempt
@@ -369,7 +374,8 @@ TEST(CASFenceGeneration, PlainObjectPutRechecksFenceOnEveryRetryIterationNotJust
     });
 
     EXPECT_EQ(backend->head_calls, 2);
-    EXPECT_TRUE(store->listNamespaceFiles(DB::Cas::tests::fixture::fixtureLife(ns)).empty());
+    EXPECT_TRUE(backend->list(store->layout().namespaceFilesPrefix(
+        DB::Cas::tests::fixture::fixtureLife(ns)), "", 100).keys.empty());
 }
 
 /// (b) The S3-native staging-buffer finalize: the fence trips AFTER the buffer is constructed
