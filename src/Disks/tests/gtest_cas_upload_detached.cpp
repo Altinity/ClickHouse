@@ -106,7 +106,7 @@ std::optional<MetaState> metaStateAt(InMemoryBackend & b, const Layout & layout,
 class ProtocolRecordingBackend final : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    /// Unhide the legacy overload that the primitive override below would otherwise hide.
     using InMemoryBackend::head;
     void watch(String blob_key_, String meta_key_)
     {
@@ -119,27 +119,27 @@ public:
         meta_gets_before_first_publish.reset();
     }
 
-    HeadResult head(const String & key) override
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (key == blob_key)
         {
             ++blob_heads;
             operations.emplace_back("head");
         }
-        return InMemoryBackend::head(key);
+        return InMemoryBackend::head(key, access);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (key == meta_key)
         {
             ++meta_gets;
             operations.emplace_back("meta-get");
         }
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 
-    void publishBlob(const BlobPublishRequest & request) override
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override
     {
         if (request.destination_key == blob_key)
         {
@@ -148,7 +148,7 @@ public:
             if (!meta_gets_before_first_publish)
                 meta_gets_before_first_publish = meta_gets;
         }
-        InMemoryBackend::publishBlob(request);
+        InMemoryBackend::publish(request, access);
     }
 
     String blob_key;
