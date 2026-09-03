@@ -335,12 +335,21 @@ void putDeterministicArtifact(CasOperation & op, const String & key, const Strin
     WriteResult result = op.create(key, bytes, Retry::standard());
     if (const auto * conflict = std::get_if<Conflict>(&result))
     {
-        const auto * occupant = std::get_if<Object>(&conflict->seen);
-        if (!occupant || occupant->bytes != bytes)
+        /// Only something the resolve read actually OBSERVED can support a corruption verdict.
+        if (const auto * occupant = std::get_if<Object>(&conflict->seen))
+        {
+            if (occupant->bytes == bytes)
+                return;   /// our own deterministic replay; adopt (no-op).
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS gc: deterministic artifact at {} occupied by divergent bytes (impossible under "
                 "correct operation; refusing to proceed)", key);
-        return;   /// byte-equal => our own deterministic replay; adopt (no-op).
+        }
+        if (std::holds_alternative<ProvenAbsent>(conflict->seen))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS gc: deterministic artifact at {} refused the write but reads as absent (impossible "
+                "under correct operation; refusing to proceed)", key);
+        /// Nothing was observed, so the key's state is unknown. Reporting that as corruption would be a
+        /// deterministic local failure, which nothing above this retries -- it falls through instead.
     }
     const String what = "CAS gc: deterministic artifact at " + key;
     orThrow(std::move(result), what);

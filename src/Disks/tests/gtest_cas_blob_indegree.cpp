@@ -6,11 +6,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
+#include "config.h"
+#if USE_AWS_S3
+#include <IO/S3Common.h>
+#endif
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 
-namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; extern const int NOT_IMPLEMENTED; }
+namespace DB::ErrorCodes { extern const int ABORTED; extern const int CORRUPTED_DATA; extern const int NOT_IMPLEMENTED; }
 
 using namespace DB::Cas;
 
@@ -142,9 +146,50 @@ TEST(CASBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
     backend.putIfAbsent(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run");
     std::vector<BlobDelta> deltas{{bh(1), s(1), false}};
     std::vector<RunRef> runs;
-    EXPECT_THROW(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs),
-                 DB::Exception);
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs); });
 }
+
+#if USE_AWS_S3
+namespace
+{
+/// Refuses to serve one key's body. An access denial is the class the request engine surfaces
+/// unchanged instead of reissuing, so the write's resolve read ends having observed nothing.
+class ReadRefusingBackend : public InMemoryBackend
+{
+public:
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (key == refuse_key)
+            throw DB::S3Exception("injected access denial on the resolve read", Aws::S3::S3Errors::ACCESS_DENIED);
+        return InMemoryBackend::read(key, access);
+    }
+
+    String refuse_key;
+};
+}
+
+/// A refused write whose resolve read observed NOTHING says nothing about what is at the key, so it
+/// must not be reported as pool corruption. `CORRUPTED_DATA` is a deterministic local failure: no
+/// caller above reissues it, so a permission or credential blip during the resolve would wedge every
+/// later round on the same artifact. The companion arm is `FoldDeltaDivergentBytesThrowsCorrupted`,
+/// where the read DID observe divergent bytes and corruption is the right verdict.
+TEST(CASBlobInDegree, DeterministicArtifactWhoseResolveReadObservedNothingIsNotCorruption)
+{
+    ReadRefusingBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    const String key = layout.blobTargetRunKey(1, /*attempt*/0, /*shard*/0, /*seq*/0);
+
+    /// Occupy the key so the create's precondition is refused, THEN arm the refusal, so the failure
+    /// falls on the resolve read rather than on the setup.
+    ASSERT_EQ(backend.putIfAbsent(key, "someone else's bytes").outcome, PutOutcome::Done);
+    backend.refuse_key = key;
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED,
+        [&] { putDeterministicArtifact(*backend_req, key, "our deterministic bytes"); });
+}
+#endif
 
 /// ==== two-cursor settlement merge (retired-in-snapshot T3, spec §2.1/§3) ====
 ///
@@ -552,7 +597,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
     /// (1) An active edge at the reserved sentinel source_id 0 -> the merge cursor fails closed.
     {
         InMemoryBackend backend;
-    DB::Cas::tests::OperationForTest backend_req(backend);
+        DB::Cas::tests::OperationForTest backend_req(backend);
         DB::WriteBufferFromOwnString out;
         SourceEdgeRunWriter writer(out);
         writer.append(edgeRec(1, UInt128{0}));   // edge at sentinel key
@@ -571,7 +616,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
     /// (2) Two sentinel rows for one blob -> duplicate sentinel -> the merge cursor fails closed.
     {
         InMemoryBackend backend;
-    DB::Cas::tests::OperationForTest backend_req(backend);
+        DB::Cas::tests::OperationForTest backend_req(backend);
         DB::WriteBufferFromOwnString out;
         SourceEdgeRunWriter writer(out);
         /// Same (b,0) key twice (equal keys are allowed by the writer) — two condemned sentinels for b1.
@@ -590,11 +635,13 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
     }
 }
 
-/// A prior run spanning several blocks folds correctly with the streaming prior cursor AND the backend
-/// sees only block-bounded ranged/stream requests for it — never a whole-object get of the prior run
-/// key. Byte-reproducibility of the merged output is the load-bearing canary (the merge logic is
-/// unchanged; only the prior cursor's byte source moved from materialize-whole to stream).
-TEST(CASBlobInDegree, FoldStreamsPriorRunBlockBounded)
+/// A prior run several times larger than one buffer folds correctly with the streaming prior cursor
+/// AND the backend is never asked to READ that run's key — the cursor reaches it only through the
+/// streaming open. Byte-reproducibility of the merged output is the load-bearing canary (the merge
+/// logic is unchanged; only the prior cursor's byte source moved from materialize-whole to stream).
+/// What this does NOT check is how much the open stream buffers: the streaming primitive carries no
+/// window, so the seam has nothing to measure.
+TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
 {
     using DB::Cas::tests::CountingBackend;
     CountingBackend backend;
@@ -622,8 +669,8 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunBlockBounded)
     const auto gen1_run = backend.get(gen1_run_key);
     ASSERT_TRUE(gen1_run.has_value());
     const String gen1_run_bytes = gen1_run->bytes;
-    /// Sanity: the prior run really spans several blocks (else the block-bounded assertions are
-    /// vacuous). Blocks seal at kLegacyBlockSize (256KB); ~820KB is 3-4 blocks.
+    /// Sanity: the prior run is far larger than one read buffer, so "it was never read whole" is a
+    /// claim about a genuinely large object rather than one a single buffer could have swallowed.
     ASSERT_GT(gen1_run_bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
 
     /// Reset counters and fold gen 2 with a small delta: remove one edge and add another. The prior
@@ -656,11 +703,12 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunBlockBounded)
     /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }
 
-/// The preview consumer `zeroInDegree` streams a multi-block run instead of materializing it whole: the
-/// backend sees only block-bounded ranged/stream requests for the run key (never a whole-object get), and
-/// the candidate set equals the pre-change (borrowed-mode) result. Byte-parity against an InMemory oracle
-/// is the load-bearing canary — the scan logic is unchanged; only the byte source moved to the stream.
-TEST(CASBlobInDegree, ZeroInDegreeStreamsBlockBounded)
+/// The preview consumer `zeroInDegree` streams a large run instead of materializing it whole: the
+/// backend is never asked to READ the run's key, only to open it as a stream, and the candidate set
+/// equals the pre-change (borrowed-mode) result. Byte-parity against an InMemory oracle is the
+/// load-bearing canary — the scan logic is unchanged; only the byte source moved to the stream.
+/// As above, the buffering inside the open stream is not bounded here; nothing at the seam sees it.
+TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
 {
     using DB::Cas::tests::CountingBackend;
     CountingBackend backend;
@@ -691,7 +739,7 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
     const auto gen2_run = backend.get(gen2_run_key);
     ASSERT_TRUE(gen2_run.has_value());
-    /// Sanity: the run genuinely spans several blocks (else the block-bounded assertions are vacuous).
+    /// Sanity: the run is far larger than one read buffer, for the same reason as above.
     ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
 
     backend.resetCounts();

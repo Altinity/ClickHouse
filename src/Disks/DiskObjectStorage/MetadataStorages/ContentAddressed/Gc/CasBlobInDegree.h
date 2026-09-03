@@ -141,11 +141,12 @@ SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
 SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key);
 
 /// Store a deterministic write-once artifact (same inputs => byte-identical bytes): the blob in-degree
-/// runs and fold seals. `create`; a `Conflict` means the key is already occupied — its observation
-/// carries the occupant, and byte-equal bytes are our own deterministic replay (adopt, no-op) while
-/// divergent bytes are impossible under correct operation and fail closed with `CORRUPTED_DATA`
-/// rather than let a divergent artifact disagree with the adopted snapshot. Deterministic artifacts are
-/// therefore byte-equal-or-`CORRUPTED_DATA`. It is
+/// runs and fold seals. `create`; a `Conflict` means the write was refused, and only what its resolve
+/// read OBSERVED decides what that means: byte-equal bytes are our own deterministic replay (adopt,
+/// no-op), divergent bytes or a key that reads as absent are impossible under correct operation and
+/// fail closed with `CORRUPTED_DATA` rather than let a divergent artifact disagree with the adopted
+/// snapshot, and an unobserved key proves nothing and is reported as the ordinary refusal it is --
+/// a corruption verdict there would be a deterministic local failure no caller retries. It is
 /// NOT for observation-bearing artifacts (outcome logs) — those carry HEAD-observed
 /// incarnations that two observers may legitimately differ on and keep first-durable-write-wins semantics.
 void putDeterministicArtifact(CasOperation & op, const String & key, const String & bytes);

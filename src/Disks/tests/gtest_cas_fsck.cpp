@@ -163,7 +163,7 @@ public:
     std::optional<Raw> read(const String & requested_key, TransportAccess & access) override
     {
         if (requested_key == key)
-            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected exact read failure");
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected exact GET failure");
         return InMemoryBackend::read(requested_key, access);
     }
 
@@ -972,7 +972,24 @@ TEST(CASFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
     writeFsckCheckpointWithBase(*backend, layout, ns, base);
     backend->fail(layout.refLogKey(life, base));
 
+    /// The injected fault is PERMANENT and the read runs under `Retry::standard()`, so the reissue
+    /// loop would otherwise burn the policy's ninety seconds of gate wall-clock. Drive the plane fsck
+    /// admits from off a counter the sleeps advance. The extra millisecond stands for the attempt that
+    /// preceded each sleep: full jitter can draw a zero pause, and a clock that only ever moved by the
+    /// pause would then never reach the deadline.
+    uint64_t virtual_now_ms = 0;
+    uint64_t sleeps_taken = 0;
+    store->gcRequests().setNowFnForTest([&virtual_now_ms] { return virtual_now_ms; });
+    store->gcRequests().setSleepFnForTest([&virtual_now_ms, &sleeps_taken](uint64_t ms)
+    {
+        virtual_now_ms += ms + 1;
+        ++sleeps_taken;
+    });
+
     const FsckReport report = runFsck(*store, /*detail=*/true);
+    /// Without this the test still reaches the right verdict while silently serving the whole window
+    /// off the wall clock, which is how a ninety-second unit test hides in a green gate.
+    EXPECT_GT(sleeps_taken, 0u) << "the retry loop must have paced on the injected clock, not wall time";
     EXPECT_EQ(report.ref_records_walked, 0u);
     expectCheckpointBaseVerdict(
         report, layout.refSnapshotKey(life, base), FsckClass::Unchecked, "injected exact GET failure");
