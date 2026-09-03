@@ -629,8 +629,8 @@ TEST(CASUploadFanout, CondemnedLocalResurrectStreamsAndFlipsMetaClean)
     /// delete of the condemned incarnation must miss the resurrection.
     const auto after = (*op).head(blob_key, Retry::standard());
     ASSERT_TRUE(after.has_value());
-    EXPECT_NE(after->incarnation, condemned_meta->incarnation);
-    EXPECT_EQ((*op).remove(blob_key, condemned_meta->incarnation, Retry::standard()), Removal::Mismatch);
+    EXPECT_NE(after->etag, condemned_meta->etag);
+    EXPECT_EQ((*op).remove(blob_key, condemned_meta->etag, Retry::standard()), Removal::Mismatch);
     EXPECT_TRUE(headExists(*b, blob_key));
 
     /// The payload survived verbatim under the fresh header.
@@ -712,7 +712,7 @@ TEST(CASUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
     EXPECT_EQ(build->dependencyProof(idOf(payload)), BlobDependencyProof::Materialized);
     const auto after_meta = (*op).head(s->layout().blobKey(idOf(payload)), Retry::standard());
     ASSERT_TRUE(after_meta.has_value());
-    EXPECT_NE(after_meta->incarnation, condemned_meta->incarnation) << "a fresh incarnation displaced the condemned one";
+    EXPECT_NE(after_meta->etag, condemned_meta->etag) << "a fresh incarnation displaced the condemned one";
     EXPECT_EQ(metaStateAt(*b, s->layout(), payload), std::optional<MetaState>(MetaState::Clean));
     EXPECT_EQ(logicalPayloadAt(*b, s->layout().blobKey(idOf(payload)), s->poolMeta().blob_header_len), payload);
 }
