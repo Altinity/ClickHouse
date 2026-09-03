@@ -661,6 +661,23 @@ for correctness on every generic S3 disk consumer (e.g. detecting a truncated/re
 mid-read), this is a ClickHouse-wide question and does not belong on this CAS backlog at all. Full
 measurement: `docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md#opp-fold-head-successor`.
 
+## `[gc-intake-manifest-edge-serial-chain]` one manifest round trip per ref log is what `fold_ref_intake` still cannot overlap {#gc-intake-manifest-edge-serial-chain}
+
+Measured (`docs/superpowers/worklogs/2026-09-04-cas-gc-fold-read-ahead-measurement.md`): with the fold
+read-ahead on, `fold_ref_intake` improves by about 2.4x against a fixed per-request latency and then
+stops, and the reason is a one-to-one count — 83 ref-log GETs against 83 manifest GETs in the measured
+round. Ref-log keys are arithmetic, so the lookahead knows the next window of them before reading any;
+a manifest key is named by the decoded body of the log that owns it, so the earliest the round can know
+manifest N's key is after log N has been read AND decoded. Hinting "all the edges of this log" hints one
+key whenever a log names one edge, which overlaps nothing with itself.
+
+The fix needs a different mechanism than key arithmetic: decode an ALREADY-FETCHED later log purely to
+learn its manifest keys and hint them, leaving the fold's own decode, its order and every decision
+exactly where they are. That means a peek on the read-ahead that does not consume, and a speculative
+decode whose failure must be discarded rather than acted on — the real decode still runs in order and
+still holds the namespace at the right position. **Not sized**, and it is a design question rather than
+a tactical one, which is why it is not part of the read-ahead change.
+
 ## `[gc-reduce-confirm-marker-read-ahead]` the graduation gate's meta re-check is the last serial read of `fold_reduce` {#gc-reduce-confirm-marker-read-ahead}
 
 The fold's read-ahead (`GcReadAhead`, `cas_gc_read_concurrency`) now covers the checkpoints, the ref
@@ -669,8 +686,9 @@ is the graduation gate's `loadMeta` re-check, issued per carried condemned entry
 confirmation — which, after a restart or a leadership change, is every entry graduating that round.
 Its candidates are known only from the prior run's condemned sentinel rows, which the merge streams, so
 hinting them needs a lookahead on the run cursor rather than a pre-pass over anything already in
-memory. **Not sized.** Read `CASGCReadAheadMiss` against the round's `graduated` count on a round
-following a restart before building it.
+memory. **Now sized enough to rank it:** with the zero-in-degree `HEAD`s read ahead, `fold_reduce` still
+improves only about 1.2x against a fixed per-request latency, and this re-check is what it spends the
+rest on (`docs/superpowers/worklogs/2026-09-04-cas-gc-fold-read-ahead-measurement.md`).
 
 ## `[gc-phase-rows-lose-worker-requests]` phase rows do not see requests made on worker pools {#gc-phase-rows-lose-worker-requests}
 
