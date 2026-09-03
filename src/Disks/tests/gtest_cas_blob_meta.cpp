@@ -37,11 +37,11 @@ TEST(CASBlobMeta, PutIfAbsentThenCasTransitions)
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(lm->meta.state, MetaState::Clean);
 
-    EXPECT_TRUE(std::holds_alternative<Committed>(casMeta(op, store->layout(), ref, lm->incarnation,
+    EXPECT_TRUE(std::holds_alternative<Committed>(casMeta(op, store->layout(), ref, lm->etag,
         BlobMeta{.state = MetaState::Condemned, .condemn_round = 5, .size = 10})));
 
     /// the stale incarnation loses
-    EXPECT_TRUE(std::holds_alternative<Conflict>(casMeta(op, store->layout(), ref, lm->incarnation,
+    EXPECT_TRUE(std::holds_alternative<Conflict>(casMeta(op, store->layout(), ref, lm->etag,
         BlobMeta{.state = MetaState::Clean})));
 }
 
@@ -54,7 +54,7 @@ TEST(CASBlobMeta, DeleteMetaExactMatchesTheObservedIncarnation)
     putMetaIfAbsent(op, store->layout(), ref, BlobMeta{.state = MetaState::Condemned});
     const auto lm = loadMeta(op, store->layout(), ref);
     ASSERT_TRUE(lm.has_value());
-    EXPECT_EQ(deleteMetaExact(op, store->layout(), ref, lm->incarnation), Removal::Removed);
+    EXPECT_EQ(deleteMetaExact(op, store->layout(), ref, lm->etag), Removal::Removed);
     EXPECT_FALSE(loadMeta(op, store->layout(), ref).has_value());
 }
 
@@ -87,13 +87,13 @@ TEST(CASBlobMeta, PutLoadCasDeleteRoundTripAtWidth32)
     EXPECT_EQ(lm->meta.state, MetaState::Clean);
     EXPECT_EQ(lm->meta.size, 555u);
 
-    ASSERT_TRUE(std::holds_alternative<Committed>(casMeta(op, layout, ref, lm->incarnation,
+    ASSERT_TRUE(std::holds_alternative<Committed>(casMeta(op, layout, ref, lm->etag,
         BlobMeta{.state = MetaState::Condemned, .condemn_round = 7, .size = 555})));
     const auto lm2 = loadMeta(op, layout, ref);
     ASSERT_TRUE(lm2.has_value());
     EXPECT_EQ(lm2->meta.state, MetaState::Condemned);
 
-    EXPECT_EQ(deleteMetaExact(op, layout, ref, lm2->incarnation), Removal::Removed);
+    EXPECT_EQ(deleteMetaExact(op, layout, ref, lm2->etag), Removal::Removed);
     EXPECT_FALSE(loadMeta(op, layout, ref).has_value());
 }
 
@@ -159,7 +159,7 @@ TEST(CASBlobMeta, AnAmbiguousMarkerWriteIsResolvedAndReissued)
     const auto clean = loadMeta(op, store->layout(), ref);
     ASSERT_TRUE(clean.has_value());
     backend->throw_next_overwrite = true;
-    EXPECT_TRUE(std::holds_alternative<Committed>(casMeta(op, store->layout(), ref, clean->incarnation,
+    EXPECT_TRUE(std::holds_alternative<Committed>(casMeta(op, store->layout(), ref, clean->etag,
         BlobMeta{.state = MetaState::Condemned, .condemn_round = 1, .size = 10})));
     EXPECT_EQ(backend->overwrite_attempts, 2u);
 }
