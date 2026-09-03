@@ -201,7 +201,7 @@ TEST(CASRefCatalogBirthWiring, CatalogLossAfterMountCannotRecreateAOneRowAuthori
     publishBirth(store, RootNamespace{"srv1/existing"}, "old");
     const auto catalog = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog);
-    ASSERT_EQ(op.remove(layout.refCatalogKey(), catalog->incarnation, Retry::standard()), Removal::Removed);
+    ASSERT_EQ(op.remove(layout.refCatalogKey(), catalog->etag, Retry::standard()), Removal::Removed);
     backend->resetCounts();
     backend->resetWriteCounts();
 
@@ -294,7 +294,7 @@ TEST(CASRefCatalogBirthWiring, ExistingPoolMetaWithMissingCatalogStillFailsClose
     PoolPtr first = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const auto catalog = op.read(first->layout().refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog);
-    ASSERT_EQ(op.remove(first->layout().refCatalogKey(), catalog->incarnation, Retry::standard()), Removal::Removed);
+    ASSERT_EQ(op.remove(first->layout().refCatalogKey(), catalog->etag, Retry::standard()), Removal::Removed);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
@@ -314,7 +314,7 @@ TEST(CASRefCatalogBirthWiring, RestartFixturePreservesItsExistingNonemptyCatalog
         .ns = RootNamespace{"test/preserved"}, .state = NsState::Live, .incarnation = UInt128{1}, .creator = std::nullopt}}};
     const String bytes = encodeRefCatalog(nonempty);
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        op.replace(layout.refCatalogKey(), bytes, empty->incarnation, Retry::standard())));
+        op.replace(layout.refCatalogKey(), bytes, empty->etag, Retry::standard())));
     const auto before = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(before);
 
@@ -322,7 +322,7 @@ TEST(CASRefCatalogBirthWiring, RestartFixturePreservesItsExistingNonemptyCatalog
     const auto after = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(after);
     EXPECT_EQ(after->bytes, before->bytes);
-    EXPECT_EQ(after->incarnation, before->incarnation);
+    EXPECT_EQ(after->etag, before->etag);
 }
 
 /// A namespace whose catalog entry is ALREADY `Live` (e.g. admitted by an earlier mount that this
