@@ -88,7 +88,8 @@ struct MergeTreePartitionExportTask
     std::optional<UInt64> output_format_compression_level;
     std::optional<UInt64> parquet_row_group_size;
     std::optional<UInt64> parquet_row_group_size_bytes;
-    std::optional<MergeTreePartExportSchemaMismatchMode> schema_mismatch_mode;
+    std::optional<MergeTreePartExportSchemaMatchMode> schema_match_mode;
+    std::optional<bool> ignore_extra_source_columns;
     std::optional<String> iceberg_partition_timezone;
 
     size_t partsCount() const { return parts.size(); }
@@ -195,8 +196,10 @@ struct MergeTreePartitionExportTask
             json.set("parquet_row_group_size_bytes", *parquet_row_group_size_bytes);
         if (iceberg_partition_timezone)
             json.set("iceberg_partition_timezone", *iceberg_partition_timezone);
-        if (schema_mismatch_mode)
-            json.set("schema_mismatch_mode", String(magic_enum::enum_name(*schema_mismatch_mode)));
+        if (schema_match_mode)
+            json.set("schema_match_mode", String(magic_enum::enum_name(*schema_match_mode)));
+        if (ignore_extra_source_columns)
+            json.set("ignore_extra_source_columns", *ignore_extra_source_columns);
 
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
@@ -272,11 +275,16 @@ struct MergeTreePartitionExportTask
             task.parquet_row_group_size_bytes = json->getValue<UInt64>("parquet_row_group_size_bytes");
         if (json->has("iceberg_partition_timezone"))
             task.iceberg_partition_timezone = json->getValue<String>("iceberg_partition_timezone");
-        if (json->has("schema_mismatch_mode"))
+        /// Left unset (nullopt) for tasks created before these fields existed - such tasks were
+        /// always scheduled under the old, strict column-matching check, so callers should treat
+        /// an absent value as `POSITION` with `ignore_extra_source_columns = false`.
+        if (json->has("schema_match_mode"))
         {
-            if (const auto mode = magic_enum::enum_cast<MergeTreePartExportSchemaMismatchMode>(json->getValue<String>("schema_mismatch_mode")))
-                task.schema_mismatch_mode = mode;
+            if (const auto mode = magic_enum::enum_cast<MergeTreePartExportSchemaMatchMode>(json->getValue<String>("schema_match_mode")))
+                task.schema_match_mode = mode;
         }
+        if (json->has("ignore_extra_source_columns"))
+            task.ignore_extra_source_columns = json->getValue<bool>("ignore_extra_source_columns");
 
         return task;
     }
