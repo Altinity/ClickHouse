@@ -1035,6 +1035,7 @@ class JobConfigs:
                 parameter=f"{BuildTypes.PER_TEST_COVERAGE}, per_test_coverage, {batch}/{total_batches}",
                 runs_on=RunnerLabels.AMD_SMALL,
                 requires=[ArtifactNames.CH_AMD_PER_TEST_COVERAGE_BUILD],
+                timeout=3600 * 5,
             )
             for total_batches in (8,)
             for batch in range(1, total_batches + 1)
