@@ -7,6 +7,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/tests/cas_test_helpers.h>
 
+#include <Poco/Exception.h>
+
 #include <chrono>
 #include <limits>
 #include <memory>
@@ -88,6 +90,56 @@ uint64_t leaveRejectedCleanupDuty(const PoolPtr & store, const RootNamespace & n
     return rejected_seq;
 }
 
+/// `ChunkFaultBackend` counts its faults, and a count can no longer wedge one logical write: the write
+/// engine settles every ambiguity by an exact read and reissues, so a bounded fault is outlived and the
+/// call commits on a later attempt instead of exhausting its own retry window. Latching keeps the fault
+/// (and, for `LandedThenLost`, the paired lost resolve-read) armed on every reissue, so the duty tests
+/// below can drive a call all the way to a genuine give-up.
+class LatchedChunkFaultBackend : public DB::Cas::tests::ChunkFaultBackend
+{
+public:
+    bool latched = false;
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (latched && !fail_read_once_key.empty() && key == fail_read_once_key)
+            throw Poco::TimeoutException("LatchedChunkFaultBackend: the lost read stays lost");
+        return ChunkFaultBackend::read(key, access);
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             DB::Cas::TransportAccess & access) override
+    {
+        if (latched && mode != Mode::None && fault_skip == 0 && !expected_value && !fault_substr.empty()
+            && key.find(fault_substr) != String::npos)
+            fault_count = 1;
+        return ChunkFaultBackend::write(key, bytes, expected_value, access);
+    }
+
+    /// Disarms completely (not just unlatches): what a caller does right after driving a call to its
+    /// give-up is a further mutation that must reach the store normally.
+    void disarm()
+    {
+        latched = false;
+        mode = Mode::None;
+        fault_count = 0;
+        fault_skip = 0;
+        fail_read_once_key.clear();
+    }
+};
+
+/// Latches `backend` and drives `f` to a NETWORK_ERROR give-up, then disarms the fault completely so a
+/// caller's next mutation reaches the store normally. The caller must have installed a
+/// `VirtualRetryClock` on the store first, or the give-up paces through a real sleep instead of a
+/// virtual one.
+void driveToNetworkErrorGiveUp(LatchedChunkFaultBackend & backend, const std::function<void()> & f)
+{
+    backend.latched = true;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, f);
+    backend.disarm();
+}
+
 }
 
 /// Removing the deferred-cleanup transfer from `~PartWriteTxn` makes this test fail at the first
@@ -96,8 +148,9 @@ uint64_t leaveRejectedCleanupDuty(const PoolPtr & store, const RootNamespace & n
 /// next mutation resolves the durable wedge, removes the exact old precommit, and only then retires it.
 TEST(CASWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemovesIt)
 {
-    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto backend = std::make_shared<LatchedChunkFaultBackend>();
     auto store = openSingleAttemptPool(backend);
+    DB::Cas::tests::VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/writer_duty_adopt"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
@@ -109,9 +162,7 @@ TEST(CASWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemove
     backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
-    DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::NETWORK_ERROR,
-        [&] { abandoned->precommitAdd(ns, "abandoned", abandoned_id); });
+    driveToNetworkErrorGiveUp(*backend, [&] { abandoned->precommitAdd(ns, "abandoned", abandoned_id); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_EQ(abandoned->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
 
@@ -190,8 +241,9 @@ TEST(CASWriterDuties, ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation)
 /// past the rejected build exactly as the no-wedge reject arm does.
 TEST(CASWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
 {
-    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto backend = std::make_shared<LatchedChunkFaultBackend>();
     auto store = openSingleAttemptPool(backend);
+    DB::Cas::tests::VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/writer_duty_wedge_reject"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
@@ -202,9 +254,7 @@ TEST(CASWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
     backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
-    DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::NETWORK_ERROR,
-        [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
+    driveToNetworkErrorGiveUp(*backend, [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_EQ(rejected->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
 
@@ -396,7 +446,7 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
 /// build is REJECTED rather than adopted) and then runs real GC rounds until the body is gone.
 TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
 {
-    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto backend = std::make_shared<LatchedChunkFaultBackend>();
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     const CasRequestBudget budget{
         .attempt_timeout_ms = 50,
@@ -423,6 +473,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = budget,
     });
+    DB::Cas::tests::VirtualRetryClock::installOn(predecessor);
 
     /// A real, fully-promoted ref through the ordinary production write path (no seeded catalog/ckpt)
     /// gives the namespace genuine epoch-1 content, so the successor's recovery below has something
@@ -444,9 +495,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     backend->fault_substr = predecessor->layout().namespaceStreamPrefix(predecessor->namespaceLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
-    DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::NETWORK_ERROR,
-        [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
+    driveToNetworkErrorGiveUp(*backend, [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
     ASSERT_TRUE(predecessor->refLaneWedgedForTest(ns));
     ASSERT_EQ(rejected->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
     const uint64_t predecessor_epoch = predecessor->writerEpoch();
@@ -506,8 +555,9 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
 /// very next drain -- once the fault clears -- settles the duty and lets that mutation proceed.
 TEST(CASWriterDuties, DutySurvivesSettlementFailureForRetry)
 {
-    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto backend = std::make_shared<LatchedChunkFaultBackend>();
     auto store = openFrozenSingleAttemptPool(backend);
+    DB::Cas::tests::VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/writer_duty_settlement_retry"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
     publishEmptyRef(store, ns, "target");
@@ -525,9 +575,7 @@ TEST(CASWriterDuties, DutySurvivesSettlementFailureForRetry)
     backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
-    DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::NETWORK_ERROR,
-        [&] { store->dropRef(ns, "target"); });
+    driveToNetworkErrorGiveUp(*backend, [&] { store->dropRef(ns, "target"); });
 
     EXPECT_TRUE(store->writerCleanupDutiesPendingForTest())
         << "a settlement that throws must retain the duty for retry, never lose it";
@@ -535,7 +583,6 @@ TEST(CASWriterDuties, DutySurvivesSettlementFailureForRetry)
         << "the settlement's failure must abort the mutation it was blocking too, not just its own append";
     EXPECT_EQ(store->minActive(), durable_seq);
 
-    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
     store->dropRef(ns, "target");
 
     EXPECT_FALSE(store->writerCleanupDutiesPendingForTest());
