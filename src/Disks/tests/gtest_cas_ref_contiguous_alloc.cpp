@@ -89,7 +89,14 @@ PoolPtr openPoolFenceControlled(const BackendPtr & backend)
 }
 
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
-constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 100;
+/// The doc-comment above names the window: `attempt_timeout_ms + lease_safety_margin_ms` (200 ms) is
+/// where "an attempt may start" ends. `CasMountRuntime::admit` refuses a needed-0 admission check only
+/// once the remaining time no longer clears `lease_safety_margin_ms` STRICTLY (100), so 100 ms remaining
+/// refuses admission itself -- one check too early, at the wrong site, with the wrong message. 200 ms
+/// remaining clears that outer admission check (200 > 100) while still refusing the append's own
+/// two-envelope reservation (`2 * attempt_timeout_ms` = 200 ms needed against 200 ms remaining), which
+/// is the specific pre-attempt gate this test is about.
+constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 200;
 
 /// A bare `Pool::open` with no `_pool_meta` seeded: the path an operator's pool RECREATION takes, and
 /// the only one that runs the bootstrap residual + quiesce gates (`seedPoolMetaForRestart` mints the
