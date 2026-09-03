@@ -18,22 +18,22 @@ extern const int CORRUPTED_DATA;
 extern const int NETWORK_ERROR;
 }
 
-/// Stage B Task 4-C: production birth wiring. `CasRefLedger::resolveNamespaceLife`, called from
+/// Stage B: production birth wiring. `CasRefLedger::resolveNamespaceLife`, called from
 /// `ensureRefTableRecovered`, resolves a namespace's real catalog life ONCE per table-open --
 /// create-if-absent, adopt an existing `Live`/`Removing` entry, or reconcile a stale `Creating` one via
 /// `CasRefCatalog::reconcileStaleCreator` + `isCreatorFenceTerminal` -- so every ref-layer object a
 /// mounted writer produces is keyed at a real, catalog-proven incarnation (spec INV-3), never the
 /// Stage-A sentinel.
 ///
-/// OBLIGATION 3 (carried from Task 3's review, closed here): Task 3 could only enforce "`Creating`
-/// forbids publication" (`CasRefCatalog::checkPublicationAdmittedOrThrow`) AT THE CATALOG LEVEL, because
-/// nothing on the production ref-write path consulted the catalog at all. The refusal this suite pins
-/// below rests on CONSTRUCTION, not a check: there is no `if (state == Creating) throw` anywhere in
-/// `appendRefOps`'s path. `ensureRefTableRecovered` simply cannot make a table's runtime usable
-/// (`rt.recovered` never becomes `true`, `rt.life` never gets set) while the catalog entry is `Creating`
-/// under a fence that is not provably dead -- so no append can reach `commitRefChunk` for such a
-/// namespace, by construction, stronger than any per-write check could prove. Stated here so nobody
-/// later greps for a check and concludes the gap Task 3's review flagged is still open.
+/// OBLIGATION 3 (closed here): `CasRefCatalog::checkPublicationAdmittedOrThrow` can only enforce
+/// "`Creating` forbids publication" AT THE CATALOG LEVEL, because nothing on the production ref-write
+/// path consulted the catalog at all. The refusal this suite pins below rests on CONSTRUCTION, not a
+/// check: there is no `if (state == Creating) throw` anywhere in `appendRefOps`'s path.
+/// `ensureRefTableRecovered` simply cannot make a table's runtime usable (`rt.recovered` never becomes
+/// `true`, `rt.life` never gets set) while the catalog entry is `Creating` under a fence that is not
+/// provably dead -- so no append can reach `commitRefChunk` for such a namespace, by construction,
+/// stronger than any per-write check could prove. Stated here so nobody later greps for a check and
+/// concludes this gap is still open.
 ///
 /// The suite name is prefixed `Cas` so it is covered by the `Cas*` unit-test gate filter.
 
@@ -395,10 +395,10 @@ TEST(CASRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefu
     EXPECT_EQ(backend->writeTotal(), 0u);
 }
 
-/// The mirror image, and Task 3's own deferred obligation ("wire `reconcileStaleCreator` and pin it
-/// with a test that drives reconciliation through the discovery path rather than by calling the
-/// primitive directly"): a dead predecessor's `Creating` entry is reconciled onto THIS mount and
-/// completed to `Live`, over the SAME incarnation -- resumption, not rebirth.
+/// The mirror image, and the deferred obligation to wire `reconcileStaleCreator` and pin it with a
+/// test that drives reconciliation through the discovery path rather than by calling the primitive
+/// directly: a dead predecessor's `Creating` entry is reconciled onto THIS mount and completed to
+/// `Live`, over the SAME incarnation -- resumption, not rebirth.
 TEST(CASRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsReconciledThroughTheProductionPath)
 {
     auto backend = std::make_shared<InMemoryBackend>();

@@ -104,7 +104,7 @@ RefCkpt readCkptOrFail(CasOperation & op, const Layout & layout, const Namespace
     return sample->ckpt;
 }
 
-/// Stage B (Task 4-C): the incarnation `store`'s production birth wiring minted for `ns`, learned back
+/// Stage B: the incarnation `store`'s production birth wiring minted for `ns`, learned back
 /// from the catalog exactly as a real reader would (`NamespaceLifeId::fromCatalogEntry`) -- once a real
 /// `Pool`/`CasRefLedger` has opened the table, its ref-layer objects are no longer keyed at the
 /// Stage-A sentinel, so every test below that drives the REAL append lane must ask the catalog what
@@ -1075,7 +1075,7 @@ TEST(CASRefCheckpoint, NamespaceBirthCreatesTheCheckpointCarryingItsLifeEpoch)
     CasOperation op = requests.admit();
     const RootNamespace ns{"srv1/ckpt_birth"};
 
-    /// Stage B (Task 4-C): the catalog carries no entry for `ns` before its first open, and the
+    /// Stage B: the catalog carries no entry for `ns` before its first open, and the
     /// namespace's real incarnation does not exist to name a key with yet -- the pre-birth analog of
     /// "nothing exists" is "nothing is even NAMED", checked at the catalog rather than at a key this
     /// test cannot yet compute.
@@ -1317,7 +1317,7 @@ TEST(CASRefCheckpoint, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
 }
 
 /// ===================================================================================
-/// Equivalence fences for the `prepareRefChunk` extraction (Stage B `{#extract-prepare-ref-chunk}`)
+/// Equivalence fences for the `prepareRefChunk` extraction
 /// ===================================================================================
 ///
 /// An extraction is only safe to review if something pins what crosses its boundary. These three
@@ -1342,9 +1342,9 @@ TEST(CASRefCheckpoint, CommitRefChunkDurableBytesUnchangedByExtraction)
     ASSERT_EQ(id.writer_epoch, 1u);
     ASSERT_EQ(id.ref_sequence, 1u);
 
-    /// The KEY carries the namespace incarnation, so its life segment is rendered rather than pasted
-    /// (Task 1c re-keys it); every other segment is literal. Stage B (Task 4-C): the incarnation is now
-    /// a REAL, randomly minted catalog value rather than the Stage-A sentinel, so it is learned back
+    /// The KEY carries the namespace incarnation, so its life segment is rendered rather than pasted;
+    /// every other segment is literal. Stage B: the incarnation is now a REAL, randomly minted catalog
+    /// value rather than the Stage-A sentinel, so it is learned back
     /// from the catalog (`liveLifeOrFail`) rather than pasted as a literal -- the shape assertion below
     /// is unaffected, since it names every OTHER segment literally and renders this one dynamically.
     const NamespaceLifeId life = liveLifeOrFail(op, store->layout(), ns);
@@ -1398,7 +1398,7 @@ TEST(CASRefCheckpoint, AppendRequestCountUnchangedByExtraction)
     const String ckpt_key = store->layout().refCkptKey(life);
 
     EXPECT_EQ(backend->writes(log_key), 1u) << "exactly one write-once request per committed chunk";
-    /// ONE GET, not zero, since Stage B (Task 4-C): `resolveNamespaceLife`'s `completeCreation` call
+    /// ONE GET, not zero, since Stage B: `resolveNamespaceLife`'s `completeCreation` call
     /// publishes this life's `_ckpt.life_epoch` BEFORE the birth chunk is prepared, so this table's
     /// OWN recovery walk (also inside this `appendRefOps`, ahead of the commit) grounds itself at the
     /// genesis position `_ckpt` now names and confirms it absent by exact key -- which is `log_key`

@@ -196,7 +196,7 @@ public:
         if (key == target_key && !fired)
         {
             fired = true;
-            /// GC's single content-delete site, landing in the HEAD->GET window.
+            /// Fires here: after the inner HEAD observation, before it is returned to the writer.
             inner->remove(target_key, condemned_value, access);
         }
         return observed;

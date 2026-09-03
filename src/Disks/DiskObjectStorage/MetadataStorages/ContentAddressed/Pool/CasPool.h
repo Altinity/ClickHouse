@@ -714,9 +714,10 @@ public:
     /// operation admitted here is refused the moment the fence trips, is re-armed under a fresh lease
     /// incarnation, or runs out of room before the lease expires.
     CasRequests & mountRequests() { return mount_requests; }
-    /// The farewell plane, on an open fence. Releasing the lease is the last thing a departing mount
-    /// does, and refusing it because the mount fence has already run down would leave the slot looking
-    /// live until GC fences it out.
+    /// The farewell plane, on an open fence -- shared with the mount-lease renewer's own claim/adopt,
+    /// not only its release: a self-remount claims with the fence already latched lost, so gating the
+    /// claim on the fence could never reclaim, and refusing the farewell because the mount fence has
+    /// already run down would leave the slot looking live until GC fences it out.
     CasRequests & farewellRequests() { return farewell_requests; }
     /// The open-fence plane: GC, the offline tools, this pool's own reads, and the bootstrap-control
     /// claims. None of them hold a mount lease -- the claims are what ESTABLISHES one, so gating them
