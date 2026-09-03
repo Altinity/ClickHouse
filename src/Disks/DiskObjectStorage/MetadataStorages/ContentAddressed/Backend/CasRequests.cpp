@@ -144,7 +144,12 @@ bool isDefinitelyRefusedWrite([[maybe_unused]] const std::exception & e)
 {
 #if USE_AWS_S3
     if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
-        return S3::isMalformedRequestError(*s3) || S3::isEntityTooLargeError(*s3) || S3::isAccessDeniedError(*s3);
+        /// The refresh class is included rather than left to overlap: the two name lists agree, but
+        /// `InvalidSignature` carries a code `isAccessDeniedError` does not match, and an error that is
+        /// refreshable without being refusable would spend the whole deadline whenever no refresh is
+        /// available -- which is every CAS disk today.
+        return S3::isMalformedRequestError(*s3) || S3::isEntityTooLargeError(*s3)
+            || S3::isAccessDeniedError(*s3) || isRefreshableCredentialError(e);
 #endif
     return false;
 }
@@ -233,7 +238,7 @@ bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
     return needed_ms <= remaining;
 }
 
-bool CasOperation::refreshAndClassifyReadFault(const std::exception & e)
+bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted)
 {
     if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
         return true;
@@ -242,8 +247,15 @@ bool CasOperation::refreshAndClassifyReadFault(const std::exception & e)
     /// exception the transport raises is a `Poco::Exception`, `DB::Exception` included.
     if (!dynamic_cast<const Poco::Exception *>(&e))
         return true;
-    if (isRefreshableCredentialError(e) && owner.backend->refreshCredentials())
-        return false;
+    /// ONE refresh per call. The storage hands back a fresh client every time it is asked, so a denial
+    /// that fresh credentials do not fix would otherwise refresh-and-reissue until the deadline instead
+    /// of surfacing on the second look.
+    if (!refresh_attempted && isRefreshableCredentialError(e))
+    {
+        refresh_attempted = true;
+        if (owner.backend->refreshCredentials())
+            return false;
+    }
     /// No credentials were installed, so the store's own answer decides: a definite one would replay
     /// identically, and everything else -- an unmodeled name an S3-compatible store reports, a
     /// throttle, a 5xx -- may still be transient and is reissued.
@@ -408,6 +420,7 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
 SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry & policy)
 {
     const Retry::Bound bound = policy.bind(owner.now_ms());
+    bool refresh_attempted = false;
     for (uint32_t attempt = 1;; ++attempt)
     {
         const uint64_t reservation = reservedFor(0, 1);
@@ -433,7 +446,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
         }
         catch (const std::exception & e)
         {
-            if (refreshAndClassifyReadFault(e))
+            if (refreshAndClassifyReadFault(e, refresh_attempted))
                 throw;
             /// The probe reports every transport failure as `Indeterminate` rather than by throwing, so
             /// a decorator that does throw is folded onto the same inconclusive outcome.
@@ -447,8 +460,9 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
 
         const uint64_t pause_ms = Retry::backoff(attempt);
         const uint64_t needed = reservedFor(pause_ms, 1);
-        /// At the bound the inconclusive outcome IS the answer: a probe did run, and reporting what it
-        /// saw is more than a give-up exception could say.
+        /// Once a probe HAS run, its inconclusive outcome is the answer, whichever of the three ends
+        /// the loop -- a lost fence, a spent lease budget, or the deadline. Reporting what was seen
+        /// says more than a give-up exception, and every consumer treats `Indeterminate` fail-closed.
         if (gate(needed) != Gate::Ok || !fits(needed, bound))
             return result;
         detail::recordReissue();
@@ -607,12 +621,18 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         {
             if (isDeterministicLocalFailure(e.code()))
                 throw;
-            /// One refresh, and only for the class a credential could explain -- so an oversized entity
-            /// or a malformed request never triggers a re-acquisition. Fresh credentials make the
-            /// attempt ambiguous rather than refused: it may have been signed correctly and landed, and
-            /// the reissue signs with the new client. Nothing installed means nothing would sign
-            /// differently, so the store's answer stands.
-            const bool refreshed = isRefreshableCredentialError(e) && owner.backend->refreshCredentials();
+            /// ONE refresh per call, and only for the class a credential could explain -- so an
+            /// oversized entity or a malformed request never triggers a re-acquisition, and a denial
+            /// that fresh credentials do not fix is refused on the second look rather than reissued to
+            /// the deadline (the storage hands back a new client every time it is asked). Fresh
+            /// credentials make the attempt ambiguous rather than refused: it may have been signed
+            /// correctly and landed, and the reissue signs with the new client.
+            bool refreshed = false;
+            if (!state.refresh_attempted && isRefreshableCredentialError(e))
+            {
+                state.refresh_attempted = true;
+                refreshed = owner.backend->refreshCredentials();
+            }
             /// A refusal that FOLLOWS an ambiguous attempt of this call proves nothing about that
             /// attempt, so it is settled by the read below instead of ending the call here.
             if (!refreshed && isDefinitelyRefusedWrite(e) && !state.any_ambiguous)

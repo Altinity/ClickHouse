@@ -21,10 +21,11 @@ namespace DB::Cas
 {
 
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
-/// too large, or an access denial. Whether a STALE CREDENTIAL explains the denial is not asked here --
-/// the engine asks the backend for fresh credentials first, and an answer that survives a successful
-/// refresh is the refusal this predicate names. A non-S3 exception is never a refusal: an unmodeled
-/// error may have landed.
+/// too large, an access denial, or a credential failure. Whether a STALE CREDENTIAL explains it is not
+/// asked here -- the engine asks the backend for fresh credentials first, and refuses only when NO
+/// refresh was performed: the error was outside the credential class, or the one refresh this call is
+/// allowed installed nothing. A successful refresh makes the attempt ambiguous instead. A non-S3
+/// exception is never a refusal: an unmodeled error may have landed.
 bool isDefinitelyRefusedWrite(const std::exception & e);
 
 /// Deterministic caller/local bugs, surfaced unchanged by every loop here: reissuing only replays the
@@ -200,6 +201,7 @@ private:
         bool any_ambiguous = false;
         Observation last_seen = NotObserved{};
         uint32_t reissues = 0;
+        bool refresh_attempted = false;
     };
 
     /// One read-class request under the policy: admission, attempt, classification, jittered reissue.
@@ -245,9 +247,11 @@ private:
     /// start side: nothing is begun that could not finish inside it.
     bool fits(uint64_t needed_ms, const Retry::Bound & bound) const;
 
-    /// One failed read-class attempt, classified. An expired credential is refreshed HERE so the
-    /// reissue signs with the new client; TRUE means the failure must surface unchanged.
-    bool refreshAndClassifyReadFault(const std::exception & e);
+    /// One failed read-class attempt, classified. A credential failure is refreshed HERE so the reissue
+    /// signs with the new client, at most once per call -- `refresh_attempted` is the caller's, and a
+    /// second credential failure under the same call is classified as if no refresh were available.
+    /// TRUE means the failure must surface unchanged.
+    bool refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted);
 
     [[noreturn]] void giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when) const;
     [[noreturn]] void giveUpReadNoBudget(std::string_view verb, const String & subject, std::string_view what) const;
@@ -263,6 +267,7 @@ template <typename Fn>
 auto CasOperation::readLoop(std::string_view verb, const String & subject, const Retry & policy,
                             const Retry::Bound & bound, Fn && once)
 {
+    bool refresh_attempted = false;
     for (uint32_t attempt = 1;; ++attempt)
     {
         const uint64_t reservation = reservedFor(0, 1);
@@ -282,7 +287,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         }
         catch (const std::exception & e)
         {
-            if (refreshAndClassifyReadFault(e) || policy.single_attempt)
+            if (refreshAndClassifyReadFault(e, refresh_attempted) || policy.single_attempt)
                 throw;
         }
 
