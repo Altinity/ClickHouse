@@ -17,7 +17,7 @@ std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, con
     auto got = op.read(layout.blobMetaKey(ref), Retry::standard());
     if (!got)
         return std::nullopt;
-    return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .incarnation = std::move(got->incarnation)};
+    return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .etag = std::move(got->etag)};
 }
 
 WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const BlobRef & ref,

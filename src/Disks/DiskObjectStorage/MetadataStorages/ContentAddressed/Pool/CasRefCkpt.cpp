@@ -189,7 +189,7 @@ std::optional<CkptSample> readCkpt(CasOperation & op, const Layout & layout, con
         return std::nullopt;
     /// Materialized read, then decode: the object is MUTABLE, so the body must be fixed before it is
     /// parsed, and the incarnation must be the one that labels exactly these bytes.
-    return CkptSample{decodeRefCkpt(got->bytes), got->incarnation};
+    return CkptSample{decodeRefCkpt(got->bytes), got->etag};
 }
 
 CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,

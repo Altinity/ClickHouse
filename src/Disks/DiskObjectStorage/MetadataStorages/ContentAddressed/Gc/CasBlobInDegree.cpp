@@ -541,12 +541,12 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
             if (cur_edges == 0 && cur_touched && peek_head)
             {
                 if (const auto hr = peek_head(cur_blob);
-                    hr && !stale.token.matches(hr->incarnation))
+                    hr && !stale.token.matches(hr->etag))
                 {
                     RetiredEntry fresh;
                     fresh.kind = ObjectKind::Blob;
                     fresh.ref = cur_blob;
-                    fresh.token = PersistedEtag::capture(hr->incarnation);
+                    fresh.token = PersistedEtag::capture(hr->etag);
                     fresh.size = hr->size;
                     fresh.condemn_round = condemn_round;
                     ReplacedEntry re;
@@ -569,7 +569,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                 RetiredEntry fresh;
                 fresh.kind = ObjectKind::Blob;
                 fresh.ref = cur_blob;
-                fresh.token = PersistedEtag::capture(hr->incarnation);
+                fresh.token = PersistedEtag::capture(hr->etag);
                 fresh.size = hr->size;
                 fresh.condemn_round = condemn_round;
                 rmr.still_retired.push_back(std::move(fresh));

@@ -99,23 +99,23 @@ using Liveness       = std::function<bool()>;
 using DecideOnObject = std::function<std::optional<String>(const std::optional<Object> &)>;
 using DecideOnMeta   = std::function<std::optional<String>(const std::optional<Meta> &)>;
 
-/// One key returned by `list`. `incarnation` is present only on a backend that surfaces per-key
+/// One key returned by `list`. `etag` is present only on a backend that surfaces per-key
 /// incarnations through LIST -- see `Backend::supportsListTokens`.
-struct KeyEntry
+struct ListedKey
 {
     String key;
     uint64_t size;
-    std::optional<Etag> incarnation;
+    std::optional<Etag> etag;
 };
 /// One page of an enumeration. `next_cursor` resumes strictly after the last returned key; empty
 /// marks the end.
-struct KeyPage
+struct ListPage
 {
-    std::vector<KeyEntry> keys;
+    std::vector<ListedKey> keys;
     String next_cursor;
 };
 /// The walk's callback: FALSE stops the walk.
-using KeyEntryFn = std::function<bool(const KeyEntry &)>;
+using ListedKeyFn = std::function<bool(const ListedKey &)>;
 
 namespace detail
 {
@@ -221,12 +221,12 @@ public:
 
     std::optional<Object> read(const String & key, const Retry & policy);
     std::optional<Meta>   head(const String & key, const Retry & policy);
-    KeyPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
+    ListPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
     /// Walks every key under `prefix` exactly once. The policy governs EACH PAGE, not the walk: a walk
     /// is an unbounded number of requests, and a silently truncated enumeration is the error a
     /// coverage record exists to prevent. `on_page_fetched` fires once per page DELIVERED; a page that
     /// took several reissues still fires once, and `CASRequestAttempt` is the physical count.
-    void forEachListedKey(const String & prefix, const KeyEntryFn & fn, const Retry & per_page,
+    void forEachListedKey(const String & prefix, const ListedKeyFn & fn, const Retry & per_page,
                           size_t page_limit = 1000, const std::function<void()> & on_page_fetched = {});
     Removal remove(const String & key, const Etag & seen, const Retry & policy);
     /// `head` then `remove` of what it saw, repeating on `Mismatch`. `Gone` when the key is already
@@ -308,7 +308,7 @@ private:
 
     std::optional<Object> readUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
     std::optional<Meta>   headUnder(const String & key, const Retry & policy, const Retry::Bound & bound);
-    KeyPage               listUnder(const String & prefix, const String & cursor, size_t limit,
+    ListPage               listUnder(const String & prefix, const String & cursor, size_t limit,
                                     const Retry & policy, const Retry::Bound & bound);
     Removal               removeUnder(const String & key, const String & expected_value,
                                       const Retry & policy, const Retry::Bound & bound);

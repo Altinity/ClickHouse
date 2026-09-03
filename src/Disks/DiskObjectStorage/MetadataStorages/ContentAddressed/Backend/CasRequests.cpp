@@ -172,8 +172,8 @@ bool preconditionStillSatisfiable(const Observation & seen, const std::optional<
         /// be alive. Reporting a conflict on it would name an occupant nobody observed.
         [](const NotObserved &) { return true; },
         [&](const ProvenAbsent &) { return !expected.has_value(); },
-        [&](const Meta & m) { return expected.has_value() && m.incarnation == *expected; },
-        [&](const Object & o) { return expected.has_value() && o.incarnation == *expected; }},
+        [&](const Meta & m) { return expected.has_value() && m.etag == *expected; },
+        [&](const Object & o) { return expected.has_value() && o.etag == *expected; }},
         seen);
 }
 
@@ -183,7 +183,7 @@ bool preconditionStillSatisfiable(const Observation & seen, const std::optional<
 Observation withoutBody(Observation seen)
 {
     if (const auto * obj = std::get_if<Object>(&seen))
-        return Meta{obj->bytes.size(), obj->incarnation};
+        return Meta{obj->bytes.size(), obj->etag};
     return seen;
 }
 
@@ -377,20 +377,20 @@ std::optional<Meta> CasOperation::headUnder(const String & key, const Retry & po
     });
 }
 
-KeyPage CasOperation::listUnder(const String & prefix, const String & cursor, size_t limit,
+ListPage CasOperation::listUnder(const String & prefix, const String & cursor, size_t limit,
                                 const Retry & policy, const Retry::Bound & bound)
 {
     return readLoop("list", prefix, policy, bound, [&](auto & access)
     {
         Backend::RawListPage raw = owner.backend->list(prefix, cursor, limit, access);
-        KeyPage page;
+        ListPage page;
         page.next_cursor = std::move(raw.next_cursor);
         page.keys.reserve(raw.keys.size());
         for (auto & listed : raw.keys)
         {
-            KeyEntry entry{std::move(listed.key), listed.size, std::nullopt};
+            ListedKey entry{std::move(listed.key), listed.size, std::nullopt};
             if (listed.value)
-                entry.incarnation = owner.mint(entry.key, std::move(*listed.value));
+                entry.etag = owner.mint(entry.key, std::move(*listed.value));
             page.keys.push_back(std::move(entry));
         }
         return page;
@@ -428,21 +428,21 @@ std::optional<Meta> CasOperation::head(const String & key, const Retry & policy)
     return headUnder(key, policy, policy.bind(owner.now_ms()));
 }
 
-KeyPage CasOperation::list(const String & prefix, const String & cursor, size_t limit, const Retry & policy)
+ListPage CasOperation::list(const String & prefix, const String & cursor, size_t limit, const Retry & policy)
 {
     return listUnder(prefix, cursor, limit, policy, policy.bind(owner.now_ms()));
 }
 
-void CasOperation::forEachListedKey(const String & prefix, const KeyEntryFn & fn, const Retry & per_page,
+void CasOperation::forEachListedKey(const String & prefix, const ListedKeyFn & fn, const Retry & per_page,
                                     size_t page_limit, const std::function<void()> & on_page_fetched)
 {
     String cursor;
     for (;;)
     {
-        KeyPage page = list(prefix, cursor, page_limit, per_page);
+        ListPage page = list(prefix, cursor, page_limit, per_page);
         if (on_page_fetched)
             on_page_fetched();
-        for (const KeyEntry & entry : page.keys)
+        for (const ListedKey & entry : page.keys)
             if (!fn(entry))
                 return;
         if (page.next_cursor.empty())
@@ -464,7 +464,7 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         const std::optional<Meta> seen = headUnder(key, policy, bound);
         if (!seen)
             return Removal::Gone;
-        const Removal removed = removeUnder(key, owner.valueFor(key, seen->incarnation), policy, bound);
+        const Removal removed = removeUnder(key, owner.valueFor(key, seen->etag), policy, bound);
         if (removed != Removal::Mismatch)
             return removed;
 
@@ -818,7 +818,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             /// did not move our own bytes cannot be told from the bytes already there. A create reaches
             /// here for every object it sees -- an occupied key never satisfies its precondition.
             if (const auto * obj = std::get_if<Object>(&state.last_seen); obj && obj->bytes == bytes)
-                return postCommit(obj->incarnation, /*resolved_by_read=*/true, state, bound);
+                return postCommit(obj->etag, /*resolved_by_read=*/true, state, bound);
             /// Nothing of this inner write's is at the key, and a reissue would be refused too.
             return Conflict{state.last_seen, state.attempts_sent};
         }
@@ -868,7 +868,7 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
             return Declined{state.last_seen};
 
         WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Etag>(current->incarnation) : std::nullopt, policy, bound, state,
+            current ? std::optional<Etag>(current->etag) : std::nullopt, policy, bound, state,
             ResolveWith::Body);
         if (!std::holds_alternative<Conflict>(result))
             return result;
@@ -921,7 +921,7 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
             return Declined{state.last_seen};
 
         WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Etag>(current->incarnation) : std::nullopt, policy, bound, state,
+            current ? std::optional<Etag>(current->etag) : std::nullopt, policy, bound, state,
             ResolveWith::Presence);
         /// A refused precondition was settled by a HEAD, but proving an ambiguous attempt landed needs
         /// the bytes; this loop is presence-only by contract, so that body stops here.

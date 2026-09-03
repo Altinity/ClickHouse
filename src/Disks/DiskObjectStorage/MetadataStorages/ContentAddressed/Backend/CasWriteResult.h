@@ -25,8 +25,8 @@ namespace DB::Cas
 [[noreturn]] void throwCasWriteRetryLater(const String & why);
 [[noreturn]] void throwCasTransientUnavailable(const String & subject, const String & condition);
 
-struct Object { String bytes; Etag incarnation; };
-struct Meta   { uint64_t size; Etag incarnation; };
+struct Object { String bytes; Etag etag; };
+struct Meta   { uint64_t size; Etag etag; };
 enum class Removal : uint8_t { Removed, Gone, Mismatch };
 
 /// What a write attempt observed of the key's current state before giving up, so a caller (or the
@@ -35,11 +35,11 @@ struct NotObserved {};
 struct ProvenAbsent {};
 using Observation = std::variant<NotObserved, ProvenAbsent, Meta, Object>;
 
-/// A durable write landed: `incarnation` names the incarnation it created (or, for a retried write
+/// A durable write landed: `etag` names the incarnation it created (or, for a retried write
 /// resolved by a read, the incarnation already present), `attempts_sent` counts the HTTP attempts this
 /// call made, and `resolved_by_read` is true when the commit was proven by a read rather than by the
 /// attempt's own response.
-struct Committed { Etag incarnation; uint32_t attempts_sent; bool resolved_by_read; };
+struct Committed { Etag etag; uint32_t attempts_sent; bool resolved_by_read; };
 /// The write was never attempted or never needed -- e.g. `putIfAbsent` finding the key already
 /// present under the caller's intended content. `seen` is whatever the resolve read observed.
 struct Declined  { Observation seen; };
@@ -84,7 +84,7 @@ inline String renderObservation(const Observation & seen)
         [](const NotObserved &) -> String { return "nothing observed"; },
         [](const ProvenAbsent &) -> String { return "absent"; },
         [](const Meta &) -> String { return "present (meta)"; },
-        [](const Object & o) -> String { return "present (" + o.incarnation.render() + ")"; }}, seen);
+        [](const Object & o) -> String { return "present (" + o.etag.render() + ")"; }}, seen);
 }
 
 }
@@ -98,7 +98,7 @@ inline std::optional<Etag> orThrow(WriteResult && result, std::string_view what)
     using detail::Overload;
     using detail::renderObservation;
     return std::visit(Overload{
-        [](Committed & c) -> std::optional<Etag> { return std::move(c.incarnation); },
+        [](Committed & c) -> std::optional<Etag> { return std::move(c.etag); },
         [](Declined &) -> std::optional<Etag> { return std::nullopt; },
         [&](Conflict & c) -> std::optional<Etag>
         {

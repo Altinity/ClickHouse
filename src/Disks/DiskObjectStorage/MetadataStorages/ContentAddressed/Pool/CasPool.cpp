@@ -1851,7 +1851,7 @@ std::vector<String> Pool::listMirroredChildren(const String & prefix)
 
     const String roots_full = pool_layout.rootsPrefix() + prefix;
     CasOperation roots_op = mount_requests.admit();
-    roots_op.forEachListedKey(roots_full, [&](const KeyEntry & listed)
+    roots_op.forEachListedKey(roots_full, [&](const ListedKey & listed)
     {
         const String & key = listed.key;
         if (key.starts_with(roots_full))

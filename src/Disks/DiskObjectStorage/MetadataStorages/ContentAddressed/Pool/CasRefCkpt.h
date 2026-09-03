@@ -97,7 +97,7 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
 struct CkptSample
 {
     RefCkpt ckpt;
-    Etag incarnation;
+    Etag etag;
 };
 
 /// Point-read of `life`'s `_ckpt`. `nullopt` means the object is absent (a namespace whose creation has

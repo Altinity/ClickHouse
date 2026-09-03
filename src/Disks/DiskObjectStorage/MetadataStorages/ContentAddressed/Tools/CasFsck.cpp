@@ -57,7 +57,7 @@ void listAll(CasOperation & op, const String & prefix, std::unordered_map<String
     static constexpr size_t kPageLimit = 1000;
     uint64_t pages = 0;
     size_t count_in_page = 0;
-    op.forEachListedKey(prefix, [&](const KeyEntry & k)
+    op.forEachListedKey(prefix, [&](const ListedKey & k)
     {
         out[k.key] = k.size;
         if (++count_in_page == kPageLimit)
@@ -345,7 +345,7 @@ void checkRefStream(CasOperation & op, const Layout & layout, const NamespaceLif
             try
             {
                 const std::optional<CkptSample> current = readCkpt(op, layout, life);
-                if (!current || !checkpoint_sample || current->incarnation != checkpoint_sample->incarnation)
+                if (!current || !checkpoint_sample || current->etag != checkpoint_sample->etag)
                 {
                     verdicts.recordUnchecked(report, ns, key,
                         note + "; checkpoint authority changed while validating its snapshot base");
@@ -526,7 +526,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         };
         std::vector<CanonicalNamespaceKey> canonical_candidates;
 
-        op.forEachListedKey(layout.namespaceRootPrefix(), [&](const KeyEntry & listed)
+        op.forEachListedKey(layout.namespaceRootPrefix(), [&](const ListedKey & listed)
         {
             std::optional<NamespaceLifePhysicalId> physical_id;
             try
@@ -959,7 +959,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// HEAD only for a hash the snapshot actually retired, so an unretired blob still costs no request.
         const std::optional<Meta> retired_head
             = rit != retired_by_hash.end() ? op.head(bkey, Retry::standard()) : std::nullopt;
-        if (retired_head && rit->second.token.matches(retired_head->incarnation))
+        if (retired_head && rit->second.token.matches(retired_head->etag))
         {
             /// The PRESENT incarnation is the condemned one — deletion is scheduled. A mismatch
             /// means the listed entry belongs to a displaced older incarnation and says

@@ -50,11 +50,11 @@ CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout
     {
         RefCatalog empty;
         return CasRefCatalog::Snapshot{
-            .catalog = empty, .incarnation = std::nullopt, .life_index = CatalogLifeIndex(empty)};
+            .catalog = empty, .etag = std::nullopt, .life_index = CatalogLifeIndex(empty)};
     }
     RefCatalog catalog = decodeRefCatalog(got->bytes);
     return CasRefCatalog::Snapshot{
-        .catalog = catalog, .incarnation = got->incarnation, .life_index = CatalogLifeIndex(catalog)};
+        .catalog = catalog, .etag = got->etag, .life_index = CatalogLifeIndex(catalog)};
 }
 
 }
@@ -62,7 +62,7 @@ CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout
 CasRefCatalog::Snapshot CasRefCatalog::read(CasOperation & op, const Layout & layout)
 {
     Snapshot snapshot = readOptionalForBootstrap(op, layout);
-    if (!snapshot.incarnation)
+    if (!snapshot.etag)
         throwMandatoryCatalogAbsent(layout.refCatalogKey());
     return snapshot;
 }
@@ -74,7 +74,7 @@ CasRefCatalog::Snapshot CasRefCatalog::initializeEmptyForNewPool(CasOperation & 
     const String canonical_empty = encodeRefCatalog(empty);
     WriteResult result = op.create(key, canonical_empty, Retry::standard());
     if (const auto * committed = std::get_if<Committed>(&result))
-        return Snapshot{.catalog = empty, .incarnation = committed->incarnation, .life_index = CatalogLifeIndex(empty)};
+        return Snapshot{.catalog = empty, .etag = committed->etag, .life_index = CatalogLifeIndex(empty)};
 
     /// A second opener can win after both proved the prefix empty. The refused precondition was
     /// settled by an exact read, so the winner's object is decoded from what that read observed;
@@ -91,7 +91,7 @@ CasRefCatalog::Snapshot CasRefCatalog::initializeEmptyForNewPool(CasOperation & 
     if (!catalog.entries.empty() || occupant->bytes != canonical_empty)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS ref catalog '{}' conflicts with bootstrap's required canonical empty catalog", key);
-    return Snapshot{.catalog = std::move(catalog), .incarnation = occupant->incarnation,
+    return Snapshot{.catalog = std::move(catalog), .etag = occupant->etag,
                     .life_index = CatalogLifeIndex(empty)};
 }
 
@@ -460,7 +460,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         catalog_snapshot.life_index.throwIfAmbiguous("CAS completed-removal deletion");
         /// A caller-supplied cut without an incarnation cannot state a precondition, and an erase that
         /// fell back to an unconditional write would delete whatever a concurrent writer had put there.
-        if (!catalog_snapshot.incarnation)
+        if (!catalog_snapshot.etag)
             throwMandatoryCatalogAbsent(layout.refCatalogKey());
         const auto observed_it = findEntry(catalog_snapshot.catalog, observed.ns);
         if (observed_it == catalog_snapshot.catalog.entries.end() || *observed_it != observed)
@@ -473,7 +473,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         RefCatalog candidate = catalog_snapshot.catalog;
         candidate.entries.erase(candidate.entries.begin() + (observed_it - catalog_snapshot.catalog.entries.begin()));
         WriteResult erase = op.replace(layout.refCatalogKey(), encodeRefCatalog(candidate),
-                                       *catalog_snapshot.incarnation, policy);
+                                       *catalog_snapshot.etag, policy);
 
         /// An operation whose admission is gone cannot issue the resolution read either, so the call
         /// ends HERE and reports the cut it was given rather than a fresh one. There is nothing further

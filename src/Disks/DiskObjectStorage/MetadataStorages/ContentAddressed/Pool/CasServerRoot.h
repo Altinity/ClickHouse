@@ -244,7 +244,7 @@ struct MountClaimResult
     /// loop would otherwise re-read the mount key just to recover what `claimMount` had already read
     /// one line earlier and thrown away -- one wasted read per iteration. Empty for every other
     /// `Kind` (nothing to compare against).
-    std::optional<Etag> incarnation;
+    std::optional<Etag> etag;
 };
 
 /// Thrown when a mount operation observes that OUR OWN (uuid, epoch) slot was `gc_fenced` by the GC
@@ -321,7 +321,7 @@ MountClaimResult claimMountAwaitingExpiry(
 /// tight poll loop.
 struct MountIncarnationObservation
 {
-    Etag incarnation;
+    Etag etag;
     uint64_t first_seen_mono_ms = 0;
 };
 
@@ -560,7 +560,7 @@ private:
     uint64_t seq = 0;
     /// The incarnation our last landed write created; every renewal and the farewell name it as the
     /// precondition. Unset only before `start` has landed one.
-    std::optional<Etag> last_incarnation;
+    std::optional<Etag> last_etag;
     uint64_t confirmed_deadline_boot_ms = 0;
     uint64_t last_committed_attempt_start_boot_ms = 0;
 };

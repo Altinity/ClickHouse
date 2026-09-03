@@ -75,7 +75,7 @@ bool writeCondemnedMeta(CasOperation & op, const Layout & layout, const BlobRef 
     if (!lm)
         return std::holds_alternative<Committed>(putMetaIfAbsent(op, layout, ref, desired));
     if (lm->meta.state != MetaState::Condemned)
-        return std::holds_alternative<Committed>(casMeta(op, layout, ref, lm->incarnation, desired));
+        return std::holds_alternative<Committed>(casMeta(op, layout, ref, lm->etag, desired));
     return true;
 }
 
@@ -88,7 +88,7 @@ void deleteConfirmedMeta(CasOperation & op, const Layout & layout, const BlobRef
     const auto lm = loadMeta(op, layout, ref);
     if (!lm)
         return;
-    deleteMetaExact(op, layout, ref, lm->incarnation);
+    deleteMetaExact(op, layout, ref, lm->etag);
 }
 
 }

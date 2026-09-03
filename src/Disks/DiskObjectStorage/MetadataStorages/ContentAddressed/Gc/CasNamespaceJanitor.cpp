@@ -30,20 +30,20 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     {
         result.anomalies.push_back(progress.diagnostic);
         throwOnRefusedOrGaveUp(
-            casGcMaintenanceState(op, layout, progress.incarnation, GcMaintenanceState{}, Retry::standard()),
+            casGcMaintenanceState(op, layout, progress.etag, GcMaintenanceState{}, Retry::standard()),
             "CAS namespace janitor: corrupt maintenance-state reset");
         return result;
     }
 
     const String cursor = progress.state ? progress.state->janitor_cursor : String{};
-    KeyPage page;
+    ListPage page;
     try
     {
         page = op.list(layout.namespaceRootPrefix(), cursor, page_budget, Retry::standard());
     }
     catch (...)
     {
-        (void)casGcMaintenanceState(op, layout, progress.incarnation, GcMaintenanceState{}, Retry::once());
+        (void)casGcMaintenanceState(op, layout, progress.etag, GcMaintenanceState{}, Retry::once());
         throw;
     }
     result.pages = 1;
@@ -71,7 +71,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     /// themselves prevent progress.
     bool page_decided = !ambiguous && !suppress_deletes;
 
-    for (const KeyEntry & listed : page.keys)
+    for (const ListedKey & listed : page.keys)
     {
         std::optional<NamespaceLifePhysicalId> life_id;
         try
@@ -103,15 +103,15 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
         if (ambiguous || suppress_deletes || catalog_cut.life_index.resolve(*life_id))
             continue;
 
-        std::optional<Etag> incarnation = listed.incarnation;
-        if (!incarnation)
+        std::optional<Etag> etag = listed.etag;
+        if (!etag)
         {
             try
             {
                 const std::optional<Meta> current = op.head(listed.key, Retry::standard());
                 if (!current)
                     continue;
-                incarnation = current->incarnation;
+                etag = current->etag;
             }
             catch (const std::exception & e)
             {
@@ -128,7 +128,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
         }
         try
         {
-            if (op.remove(listed.key, *incarnation, Retry::standard()) == Removal::Removed)
+            if (op.remove(listed.key, *etag, Retry::standard()) == Removal::Removed)
                 ++result.deleted;
         }
         catch (const std::exception & e)
@@ -150,7 +150,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
         const GcMaintenanceState next{.janitor_cursor = page.next_cursor};
         try
         {
-            const WriteResult published = casGcMaintenanceState(op, layout, progress.incarnation, next, Retry::standard());
+            const WriteResult published = casGcMaintenanceState(op, layout, progress.etag, next, Retry::standard());
             if (std::holds_alternative<Refused>(published) || std::holds_alternative<GaveUp>(published))
                 result.anomalies.push_back("cursor publication did not commit");
         }

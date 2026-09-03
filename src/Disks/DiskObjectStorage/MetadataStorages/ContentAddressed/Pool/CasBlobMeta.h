@@ -16,7 +16,7 @@ namespace DB::Cas
 struct LoadedMeta
 {
     BlobMeta meta;
-    Etag incarnation;
+    Etag etag;
 };
 
 /// Shared lifecycle operations for the blob freshness marker used by the writer and GC. The key is

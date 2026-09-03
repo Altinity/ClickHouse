@@ -26,7 +26,7 @@ public:
     struct Snapshot
     {
         RefCatalog catalog;
-        std::optional<Etag> incarnation;
+        std::optional<Etag> etag;
         CatalogLifeIndex life_index;
     };
 

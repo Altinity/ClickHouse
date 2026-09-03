@@ -692,8 +692,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             const std::optional<Meta> observed = op.head(blob_key, Retry::standard());
             Removal del = Removal::Gone;
             if (observed)
-                del = entry.token.matches(observed->incarnation)
-                    ? op.remove(blob_key, observed->incarnation, Retry::standard())
+                del = entry.token.matches(observed->etag)
+                    ? op.remove(blob_key, observed->etag, Retry::standard())
                     : Removal::Mismatch;
 
             const OutcomeKind outcome_kind = del == Removal::Removed ? OutcomeKind::Deleted
@@ -1120,8 +1120,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             const std::optional<Meta> observed = op.head(nomination.key, Retry::standard());
             Removal outcome = Removal::Gone;
             if (observed)
-                outcome = nomination.token.matches(observed->incarnation)
-                    ? op.remove(nomination.key, observed->incarnation, Retry::standard())
+                outcome = nomination.token.matches(observed->etag)
+                    ? op.remove(nomination.key, observed->etag, Retry::standard())
                     : Removal::Mismatch;
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
@@ -1258,7 +1258,7 @@ bool Gc::foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, s
         }
 
     if (sign < 0)
-        mf_cleanup.emplace(id, got->incarnation);   /// owner removed: defer the exact body delete to recheck
+        mf_cleanup.emplace(id, got->etag);   /// owner removed: defer the exact body delete to recheck
     return true;
 }
 
@@ -1356,7 +1356,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
     std::set<uint64_t> listed_generations;
     bool listed_anything = false;
     std::optional<std::pair<uint64_t, uint64_t>> newest;
-    op.forEachListedKey(top, [&](const KeyEntry & k)
+    op.forEachListedKey(top, [&](const ListedKey & k)
     {
         listed_anything = true;
         const size_t from = top.size();
@@ -1480,7 +1480,7 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
     const Layout & layout = store->layout();
 
     GenerationSealProbe probe;
-    op.forEachListedKey(layout.gcGenPrefix(generation), [&](const KeyEntry & k)
+    op.forEachListedKey(layout.gcGenPrefix(generation), [&](const ListedKey & k)
     {
         probe.generation_exists = true;   /// ANY object proves this generation was minted
         /// Parse a candidate attempt out of the path and then PROVE it by rebuilding the key: only a
@@ -1601,13 +1601,13 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_incarnati
     /// `cleanupRefObjects` and terminal-evidence attribution -- retains both the chosen incarnation and
     /// the lifecycle/absence distinction instead of re-reading or reducing the catalog independently.
     result.catalog_cut = catalog_snapshot;
-    /// THE POSITIVE EMPTY-UNIVERSE PROOF (see the destructive gate below). `incarnation` is guaranteed by
+    /// THE POSITIVE EMPTY-UNIVERSE PROOF (see the destructive gate below). `etag` is guaranteed by
     /// `CasRefCatalog::read` on every operational path -- absence there is `CORRUPTED_DATA`, never an
     /// empty snapshot -- but the check stays here so this fails closed if a bootstrap/test snapshot
     /// ever reaches this line. `entries` (not `live_incarnation`, which drops `Creating`) is the right
     /// source: a catalog holding only `Creating` rows must NOT read as an empty universe, and `entries`
     /// is the one view that still carries those rows.
-    result.catalog_cut_proved_empty = catalog_snapshot.incarnation.has_value() && catalog_snapshot.catalog.entries.empty();
+    result.catalog_cut_proved_empty = catalog_snapshot.etag.has_value() && catalog_snapshot.catalog.entries.empty();
 
     /// A malformed ref-object key or namespace aborts ref folding for the whole round: the
     /// round produces no ref delta, advances no cursor, and authorizes no destructive work -- recorded as
@@ -1707,7 +1707,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_incarnati
             e.type = CasEventType::GcRetireObserve;
             e.object_kind = CasEventObjectKind::Blob;
             e.object_hash = blobIdOf(ref);
-            e.token = observed ? observed->incarnation.render() : "";
+            e.token = observed ? observed->etag.render() : "";
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
             e.outcome = observed ? "present" : "absent";
@@ -1723,7 +1723,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_incarnati
             e.type = CasEventType::BlobRetire;
             e.object_kind = CasEventObjectKind::Blob;
             e.object_hash = blobIdOf(ref);
-            e.token = observed->incarnation.render();
+            e.token = observed->etag.render();
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
             e.outcome = "retired";
@@ -1737,7 +1737,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_incarnati
         /// sees it; a successful write records the in-process (hash, token) confirmation the graduation
         /// gate consumes (`scheduleCondemnMarkerWrite` captures everything BY VALUE — never by reference
         /// to `cur_blob`, which the fold's tight streaming loop mutates while the job is queued).
-        meta_writer->scheduleCondemnMarkerWrite(ref, PersistedEtag::capture(observed->incarnation),
+        meta_writer->scheduleCondemnMarkerWrite(ref, PersistedEtag::capture(observed->etag),
                                                 condemn_round, adjusted.size);
         return adjusted;
     };
@@ -3307,7 +3307,7 @@ void Gc::cleanupRefObjects(
                     [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
                 const std::optional<NamespaceLifeId> current_life
                     = current_catalog.life_index.resolve(life.incarnation);
-                if (current_catalog.incarnation != folded.catalog_cut->incarnation
+                if (current_catalog.etag != folded.catalog_cut->etag
                     || current_entry_it == current_catalog.catalog.entries.end()
                     || current_entry_it->ns != ns || *current_entry_it != observed_entry
                     || !current_life || *current_life != life)
@@ -3344,7 +3344,7 @@ void Gc::cleanupRefObjects(
                 return false;
             }
 
-            op.remove(key, h->incarnation, Retry::standard());
+            op.remove(key, h->etag, Retry::standard());
             ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted);   /// cleanup object deletion
             return true;
         };
@@ -3437,22 +3437,22 @@ uint64_t deletePrefixWholesale(CasOperation & op, const String & prefix, uint64_
     String cursor;
     while (deleted < bounded_remaining)
     {
-        KeyPage page = op.list(prefix, cursor, kListPageLimit, Retry::standard());
+        ListPage page = op.list(prefix, cursor, kListPageLimit, Retry::standard());
         /// One page fetched, not one increment per listed key below.
         ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
         for (const auto & listed : page.keys)
         {
             if (deleted >= bounded_remaining)
                 return deleted;
-            if (listed.incarnation.has_value())
+            if (listed.etag.has_value())
             {
                 /// `Gone` and `Mismatch` are both benign here (already gone / rewritten by a live
                 /// attempt); do not throw.
-                op.remove(listed.key, *listed.incarnation, Retry::standard());
+                op.remove(listed.key, *listed.etag, Retry::standard());
             }
             else if (const auto head = op.head(listed.key, Retry::standard()))
             {
-                op.remove(listed.key, head->incarnation, Retry::standard());
+                op.remove(listed.key, head->etag, Retry::standard());
             }
             ++deleted;
         }
@@ -3670,7 +3670,7 @@ RefScanSummary Gc::enumerateRefPrefix()
     RefScanSummary scan;
     static constexpr size_t kListPageLimit = 1000;
     size_t count_in_page = 0;
-    op.forEachListedKey(layout.casRefsPrefix(), [&](const KeyEntry & lk)
+    op.forEachListedKey(layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
         scan.keys.push_back(lk.key);
         const auto parsed = parseRefObjectKeyForEnumeration(layout, lk.key);
@@ -3937,7 +3937,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         {
             std::vector<String> table_keys;
             op.forEachListedKey(layout.namespaceStreamPrefix(life),
-                [&](const KeyEntry & lk) { table_keys.push_back(lk.key); return true; },
+                [&](const ListedKey & lk) { table_keys.push_back(lk.key); return true; },
                 Retry::standard(), 1000, onGcEnumerationPage);
             std::map<NamespaceLifePhysicalId, RefTableListing> grouped;
             try
@@ -3974,7 +3974,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     {
         const String gen_prefix = layout.gcGenPrefix(0);
         const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
-        op.forEachListedKey(top, [&](const KeyEntry & k)
+        op.forEachListedKey(top, [&](const ListedKey & k)
         {
             const size_t from = top.size();
             const size_t slash = k.key.find('/', from);
@@ -4171,7 +4171,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     {
         const RootNamespace ns{ns_str};
         std::vector<BlobDelta> deltas;
-        op.forEachListedKey(layout.manifestNamespacePrefix(ns), [&](const KeyEntry & k)
+        op.forEachListedKey(layout.manifestNamespacePrefix(ns), [&](const ListedKey & k)
         {
             if (owned_manifest_keys.contains(k.key))
                 return true;
@@ -4418,7 +4418,7 @@ void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
     /// one on cadence, so a deposed leader must never spend a whole retry budget fighting for this key.
     const String body = encodeGcHeartbeat(hb);
     if (got)
-        op.replace(key, body, got->incarnation, Retry::once());
+        op.replace(key, body, got->etag, Retry::once());
     else
         op.create(key, body, Retry::once());
 }

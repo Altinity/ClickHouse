@@ -60,12 +60,12 @@ std::string_view removalName(Removal r)
 uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vector<String> & warnings)
 {
     uint64_t deleted = 0;
-    op.forEachListedKey(prefix, [&](const KeyEntry & listed)
+    op.forEachListedKey(prefix, [&](const ListedKey & listed)
     {
         try
         {
-            std::optional<Etag> incarnation = listed.incarnation;
-            if (!incarnation)
+            std::optional<Etag> etag = listed.etag;
+            if (!etag)
             {
                 const std::optional<Meta> head = op.head(listed.key, Retry::standard());
                 if (!head)
@@ -73,10 +73,10 @@ uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vecto
                     warnings.push_back("decommission drain: " + listed.key + " vanished before delete");
                     return true;
                 }
-                incarnation = head->incarnation;
+                etag = head->etag;
             }
 
-            const Removal outcome = op.remove(listed.key, *incarnation, Retry::standard());
+            const Removal outcome = op.remove(listed.key, *etag, Retry::standard());
             if (outcome == Removal::Removed)
                 ++deleted;
             else
@@ -96,11 +96,11 @@ uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vecto
 /// Delete one slot control object by an incarnation captured at the protocol-defined fence point. Slot
 /// retirement is fail-closed: unlike the debris drains above, any non-`Removed` outcome or exception
 /// stops the tail before it can touch the next control object.
-bool deleteSlotObject(CasOperation & op, const String & key, const Etag & incarnation, std::vector<String> & warnings)
+bool deleteSlotObject(CasOperation & op, const String & key, const Etag & etag, std::vector<String> & warnings)
 {
     try
     {
-        const Removal outcome = op.remove(key, incarnation, Retry::standard());
+        const Removal outcome = op.remove(key, etag, Retry::standard());
         if (outcome == Removal::Removed)
             return true;
 
@@ -242,7 +242,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     {
         const String debris_prefix = admin->layout().casManifestsServerPrefix(victim_srid);
         std::set<std::tuple<String, uint64_t, uint64_t>> groups;   /// (namespace, writer epoch, build sequence)
-        op.forEachListedKey(debris_prefix, [&](const KeyEntry & listed)
+        op.forEachListedKey(debris_prefix, [&](const ListedKey & listed)
         {
             if (const auto parsed = admin->layout().parseManifestKey(listed.key))
                 groups.emplace(parsed->root_namespace.string(), parsed->ref.writer_epoch, parsed->ref.build_sequence);
@@ -296,7 +296,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     {
         const CasRefCatalog::Snapshot fresh_retirement_catalog = CasRefCatalog::read(op, admin->layout());
         if (!retirement_catalog_cut
-            || fresh_retirement_catalog.incarnation != retirement_catalog_cut->incarnation
+            || fresh_retirement_catalog.etag != retirement_catalog_cut->etag
             || fresh_retirement_catalog.catalog != retirement_catalog_cut->catalog)
         {
             report.warnings.push_back(
@@ -391,8 +391,8 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         /// (finding #9) intentionally stopped short of making concurrent decommission-vs-recreate
         /// airtight to the microsecond, since that was explicitly not the priority for this fix.
         report.slot_removed = false;
-        if (captures_match && deleteSlotObject(op, mount_key, farewell_mount->incarnation, report.warnings)
-            && deleteSlotObject(op, epoch_key, claimed_epoch->incarnation, report.warnings))
+        if (captures_match && deleteSlotObject(op, mount_key, farewell_mount->etag, report.warnings)
+            && deleteSlotObject(op, epoch_key, claimed_epoch->etag, report.warnings))
         {
             std::optional<Object> current_mount;
             std::optional<Object> current_epoch;
@@ -440,7 +440,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                         /// `Refused` is the store's own definite answer (a denial, a malformed
                         /// request, an expired credential) and carries its own code and message,
                         /// which is worth more here than the generic retry advice below.
-                        WriteResult result = op.replace(owner_key, encodeOwner(tombstoned), owner->incarnation, Retry::standard());
+                        WriteResult result = op.replace(owner_key, encodeOwner(tombstoned), owner->etag, Retry::standard());
                         if (std::holds_alternative<Committed>(result))
                             report.slot_removed = true;
                         else if (std::holds_alternative<Conflict>(result))

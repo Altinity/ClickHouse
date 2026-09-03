@@ -12,7 +12,7 @@ struct GcMaintenanceReadResult
 {
     GcMaintenanceReadStatus status;
     std::optional<GcMaintenanceState> state;
-    std::optional<Etag> incarnation;
+    std::optional<Etag> etag;
     String diagnostic;
 };
 

@@ -45,7 +45,7 @@ BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & l
     bool has_catalog = false;
     try
     {
-        op.forEachListedKey(prefix, [&](const KeyEntry & listed) -> bool
+        op.forEachListedKey(prefix, [&](const ListedKey & listed) -> bool
         {
             if (listed.key == pool_meta_key)
             {

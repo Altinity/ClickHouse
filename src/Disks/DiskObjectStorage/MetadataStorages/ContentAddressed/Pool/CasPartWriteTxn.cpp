@@ -431,7 +431,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     event.type = CasEventType::BlobReuseAdopt;
                     event.object_kind = CasEventObjectKind::Blob;
                     event.object_hash = blobIdOf(ref);
-                    event.token = present->incarnation.render();
+                    event.token = present->etag.render();
                     event.outcome = "observed";
                     event.reason = "a present non-condemned blob was observed after mandatory `HEAD`";
                     event.detail = {{"action", "observed"}, {"size", std::to_string(source.size)}};
@@ -634,14 +634,14 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     /// an ambiguous attempt landed. Still NO preliminary HEAD.
     WriteResult staged = store->stagingPutIfAbsent(key, encoded);
     const Etag manifest_incarnation = std::visit(detail::Overload{
-        [](Committed & committed) -> Etag { return std::move(committed.incarnation); },
+        [](Committed & committed) -> Etag { return std::move(committed.etag); },
         [&](Conflict & conflict) -> Etag
         {
             /// Our own bytes under our own `ManifestId` name this same body, whoever wrote them; a
             /// DIFFERENT object under an id this build minted is a ManifestId collision, fail-closed
             /// before any owner transition can name it.
             if (const auto * object = std::get_if<Object>(&conflict.seen); object && object->bytes == encoded)
-                return object->incarnation;
+                return object->etag;
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "stageManifest: part-manifest key '{}' already holds {} that is not this manifest's body "
                 "-- a ManifestId collision", key, detail::renderObservation(conflict.seen));
@@ -1211,7 +1211,7 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
         {
             const String key = store->layout().manifestKey(id);
             if (const auto observed = op.head(key, Retry::standard()))
-                op.remove(key, observed->incarnation, Retry::standard());
+                op.remove(key, observed->etag, Retry::standard());
         }
         catch (...) // NOLINT(bugprone-empty-catch)
         {

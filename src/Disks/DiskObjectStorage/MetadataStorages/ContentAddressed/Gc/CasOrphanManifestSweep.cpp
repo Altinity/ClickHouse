@@ -562,7 +562,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
         + renderRefTxnId(RefTxnId{prefix.writer_epoch, prefix.build_sequence}) + "/";
 
     uint64_t deleted = 0;
-    op.forEachListedKey(prefix_key, [&](const KeyEntry & listed)
+    op.forEachListedKey(prefix_key, [&](const ListedKey & listed)
     {
         if (protection.active.contains(listed.key))
             return true;   /// owned by a committed or precommit owner — never sweep
@@ -593,7 +593,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
             const std::optional<Meta> head = op.head(listed.key, Retry::standard());
             if (!head)
                 return true;
-            if (op.remove(listed.key, head->incarnation, Retry::standard()) == Removal::Removed)
+            if (op.remove(listed.key, head->etag, Retry::standard()) == Removal::Removed)
                 ++deleted;
         }
         catch (...)
@@ -623,7 +623,7 @@ ManifestSweepResult planManifestCursorPage(
 
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
-    const KeyPage page = op.list(layout.casManifestsPrefix(), cursor, list_budget, Retry::standard());
+    const ListPage page = op.list(layout.casManifestsPrefix(), cursor, list_budget, Retry::standard());
     /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
@@ -644,7 +644,7 @@ ManifestSweepResult planManifestCursorPage(
     if (nomination_budget > 0)
     {
         uint64_t frozen = 0;
-        for (const KeyEntry & listed : page.keys)
+        for (const ListedKey & listed : page.keys)
         {
             if (frozen >= nomination_budget)
                 break;
@@ -668,12 +668,12 @@ ManifestSweepResult planManifestCursorPage(
     std::set<String> errored_namespaces;   /// protection view unavailable => skip, never delete
 
     /// The key of the last candidate this page actually DECIDED on. The cursor resumes strictly after
-    /// it (`KeyPage::next_cursor` is the last returned key), so a candidate the page never decided on
+    /// it (`ListPage::next_cursor` is the last returned key), so a candidate the page never decided on
     /// stays ahead of the cursor and is examined next pass. See the budget rule below.
     String decided_through;
     bool budget_exhausted = false;
 
-    for (const KeyEntry & listed : page.keys)
+    for (const ListedKey & listed : page.keys)
     {
         ++result.listed;
 
@@ -916,7 +916,7 @@ ManifestSweepResult planManifestCursorPage(
         ManifestSweepResult::Nomination nomination{
             .id = id,
             .key = parsed->key,
-            .token = PersistedEtag::capture(got->incarnation),
+            .token = PersistedEtag::capture(got->etag),
             .source_retirements = {}};
         for (const ManifestEntry & entry : body->entries)
             if (entry.placement == EntryPlacement::Blob)

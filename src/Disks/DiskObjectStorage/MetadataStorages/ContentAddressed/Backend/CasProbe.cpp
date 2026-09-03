@@ -61,7 +61,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
         {
             const auto h = op.head(key, Retry::standard());
             if (h)
-                op.remove(key, h->incarnation, Retry::standard());
+                op.remove(key, h->etag, Retry::standard());
         }
         catch (...) {} /// NOLINT(bugprone-empty-catch)
     };
@@ -75,7 +75,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
             if (!std::holds_alternative<Committed>(r))
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: create on a fresh key did not commit — backend is unexpectedly occupied or broken");
-            return std::get<Committed>(r).incarnation;
+            return std::get<Committed>(r).etag;
         }();
         {
             const auto g = op.read(key, Retry::standard());
@@ -110,7 +110,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
             if (!std::holds_alternative<Committed>(r))
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: replace with the correct incarnation was rejected — backend does not accept a valid overwrite");
-            Etag next = std::get<Committed>(r).incarnation;
+            Etag next = std::get<Committed>(r).etag;
             if (next == t1)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: replace succeeded but did not mint a new incarnation — an incarnation must "
@@ -158,7 +158,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
         // ---- Step 6: list(probe_prefix) contains the probe key (list-after-write). ----
         {
             bool found = false;
-            op.forEachListedKey(probe_prefix, [&](const KeyEntry & listed) -> bool
+            op.forEachListedKey(probe_prefix, [&](const ListedKey & listed) -> bool
             {
                 if (listed.key != key)
                     return true;
@@ -183,7 +183,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: remove succeeded (Removed) but the object is still readable — backend delete is not effective");
             bool still_listed = false;
-            op.forEachListedKey(probe_prefix, [&](const KeyEntry & listed) -> bool
+            op.forEachListedKey(probe_prefix, [&](const ListedKey & listed) -> bool
             {
                 if (listed.key != key)
                     return true;

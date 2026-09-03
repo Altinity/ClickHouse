@@ -786,9 +786,9 @@ MountClaimResult claimMount(
             /// Raced with a concurrent writer between the read and the create. Treat as a live double
             /// start — fail closed; never overwrite a slot that appeared under us. The occupant was
             /// not decoded here, so no conflicting identity is known to attach to an event.
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .incarnation = std::nullopt};
+            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .etag = std::nullopt};
         emitMountEvent(sink, CasEventType::MountClaim, srid, "mint", nullptr, "fresh mount slot minted");
-        return {.kind = MountClaimResult::Claimed, .body = body, .incarnation = std::nullopt};
+        return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
     }
 
     const MountLease existing = decodeMountLease(got->bytes);
@@ -799,7 +799,7 @@ MountClaimResult claimMount(
     {
         emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
             "mount slot is held by a foreign server_uuid — refusing to take over across identities");
-        return {.kind = MountClaimResult::ForeignOwner, .body = existing, .incarnation = std::nullopt};
+        return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
     }
 
     /// Same uuid + same epoch: it is OUR OWN claim — but a FENCED body is terminal for this
@@ -813,19 +813,19 @@ MountClaimResult claimMount(
             emitMountEvent(sink, CasEventType::MountConflict, srid, "fenced_by_gc", &existing,
                 "own (uuid, epoch) mount slot is GC-fenced — terminal for this incarnation; "
                 "recover with a fresh writer_epoch");
-            return {.kind = MountClaimResult::FencedSelf, .body = existing, .incarnation = std::nullopt};
+            return {.kind = MountClaimResult::FencedSelf, .body = existing, .etag = std::nullopt};
         }
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (conflictOrThrow(op.replace(key, encodeMountLease(body), got->incarnation, Retry::standard()),
+        if (conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
                             fmt::format("CAS mount slot refresh of '{}'", key)))
-            /// The mount changed under us between the read and the write: `got->incarnation` is now
+            /// The mount changed under us between the read and the write: `got->etag` is now
             /// KNOWN STALE (that mismatch is exactly why the write was refused), not merely unknown --
-            /// leaving `.incarnation` unset (rather than handing back one the caller would wrongly
+            /// leaving `.etag` unset (rather than handing back one the caller would wrongly
             /// treat as current) is deliberate, matching the identical race below.
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .incarnation = std::nullopt};
+            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .etag = std::nullopt};
         emitMountEvent(sink, CasEventType::MountClaim, srid, "refresh", &existing,
             "own claim replayed — refreshed seq + expiry");
-        return {.kind = MountClaimResult::Claimed, .body = body, .incarnation = std::nullopt};
+        return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
     }
 
     /// Same uuid, DIFFERENT epoch: reclaim ONLY on a certificate of death that needs no fresh
@@ -845,16 +845,16 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead lease may simply be a live twin, and `expires_at_ms` alone
     /// can never distinguish that from a dead predecessor across two different clocks.
     const bool clean_marker = existing.min_active_build_sequence == std::numeric_limits<uint64_t>::max();
-    const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->incarnation;
+    const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
     if (existing.gc_fenced || clean_marker || proven_dead)
     {
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (conflictOrThrow(op.replace(key, encodeMountLease(body), got->incarnation, Retry::standard()),
+        if (conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
                             fmt::format("CAS mount slot reclaim of '{}'", key)))
             /// The mount changed under us between the read and the write — someone else is racing the
-            /// reclaim. Fail closed. `got->incarnation` is now KNOWN STALE (that mismatch is exactly why
-            /// the write was refused) -- leaving `.incarnation` unset is deliberate, not an oversight.
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .incarnation = std::nullopt};
+            /// reclaim. Fail closed. `got->etag` is now KNOWN STALE (that mismatch is exactly why
+            /// the write was refused) -- leaving `.etag` unset is deliberate, not an oversight.
+            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .etag = std::nullopt};
         const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
                                      : clean_marker       ? MountPriorState::Clean
                                                            : MountPriorState::UncleanObserved;
@@ -863,16 +863,16 @@ MountClaimResult claimMount(
             : clean_marker     ? "same server_uuid, different writer_epoch, clean farewell — reclaimed"
                                : "same server_uuid, different writer_epoch, observed dead by "
                                  "incarnation stability — reclaimed");
-        return {.kind = MountClaimResult::Claimed, .body = body, .prior = prior, .incarnation = std::nullopt};
+        return {.kind = MountClaimResult::Claimed, .body = body, .prior = prior, .etag = std::nullopt};
     }
 
     emitMountEvent(sink, CasEventType::MountConflict, srid, "live_double_start", &existing,
         "same server_uuid, different writer_epoch, not fenced/clean/proven-dead — no wall-clock trust; "
         "the caller must run the incarnation-stability observation wait before reclaiming");
-    /// No write was attempted on this path -- `got->incarnation` is exactly the CURRENT body's
-    /// incarnation (what we just read is what's still there), so it is safe to hand back for the
+    /// No write was attempted on this path -- `got->etag` is exactly the CURRENT body's
+    /// etag (what we just read is what's still there), so it is safe to hand back for the
     /// caller's observation loop to compare across polls without a redundant re-read.
-    return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .incarnation = got->incarnation};
+    return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .etag = got->etag};
 }
 
 String mountDoubleStartMessage(const String & srid, const MountLease & existing)
@@ -943,12 +943,12 @@ MountClaimResult claimMountAwaitingExpiry(
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
 
-        /// `claimMount` already read the current body. Reuse `r.incarnation` whenever `claimMount`
+        /// `claimMount` already read the current body. Reuse `r.etag` whenever `claimMount`
         /// set it (the common case: no write was attempted, so what it read is still current) instead of
-        /// re-reading the SAME key here. The rare stale-race branches deliberately leave `.incarnation`
+        /// re-reading the SAME key here. The rare stale-race branches deliberately leave `.etag`
         /// unset (see their own comments), so this still falls back to a fresh read exactly there.
-        std::optional<Etag> current_incarnation = r.incarnation;
-        if (!current_incarnation)
+        std::optional<Etag> current_etag = r.etag;
+        if (!current_etag)
         {
             const auto got = op.read(l.mountKey(srid), Retry::standard());
             if (!got)
@@ -966,16 +966,16 @@ MountClaimResult claimMountAwaitingExpiry(
                 sleep_ms_fn(poll);
                 continue;
             }
-            current_incarnation = got->incarnation;
+            current_etag = got->etag;
         }
 
-        if (!observed || *observed != *current_incarnation)
+        if (!observed || *observed != *current_etag)
         {
             if (observed && ++restarts > kMaxObservationRestarts)
                 /// The incarnation kept changing across bounded restarts — the holder is genuinely alive
                 /// (actively renewing), not a dead predecessor. Report it rather than waiting forever.
                 return r;
-            observed = *current_incarnation;
+            observed = *current_etag;
             observed_since = mono_ms_fn();
             if (on_wait_start)
                 on_wait_start(r.body, threshold_ms);
@@ -1005,7 +1005,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
     std::set<String> seen_srids;
 
     const String prefix = l.serverRootsPrefix();
-    op.forEachListedKey(prefix, [&](const KeyEntry & listed)
+    op.forEachListedKey(prefix, [&](const ListedKey & listed)
     {
         /// `/owner` and `/epoch` objects share the subtree — only mount bodies gate the floor.
         static constexpr std::string_view mount_suffix = "/mount";
@@ -1054,13 +1054,13 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// raced against our own fence-out attempt) — (re)starts the observation window and
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
-                const bool stable = it != obs.end() && it->second.incarnation == observed->incarnation
+                const bool stable = it != obs.end() && it->second.etag == observed->etag
                     && mono_now_ms - it->second.first_seen_mono_ms >= stable_threshold_ms;
 
                 if (!stable)
                 {
-                    if (it == obs.end() || it->second.incarnation != observed->incarnation)
-                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->incarnation, mono_now_ms});
+                    if (it == obs.end() || it->second.etag != observed->etag)
+                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_now_ms});
                     ++floor.live;
                     return std::nullopt;
                 }
@@ -1109,7 +1109,7 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(CasOperation & op, 
     /// `/mount` bodies -- but read-only and without any observation state: this answers "is anyone
     /// still entitled to write here", not "may I fence them out".
     const String prefix = l.serverRootsPrefix();
-    op.forEachListedKey(prefix, [&](const KeyEntry & listed)
+    op.forEachListedKey(prefix, [&](const ListedKey & listed)
     {
         static constexpr std::string_view mount_suffix = "/mount";
         if (!listed.key.ends_with(mount_suffix))
@@ -1155,7 +1155,7 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 {
     std::vector<MountInfo> out;
     const String prefix = layout.serverRootsPrefix();
-    op.forEachListedKey(prefix, [&](const KeyEntry & listed)
+    op.forEachListedKey(prefix, [&](const ListedKey & listed)
     {
         static constexpr std::string_view suffix = "/mount";
         if (!listed.key.ends_with(suffix))
@@ -1309,11 +1309,11 @@ String MountLeaseKeeper::encodeBody(
 
 const Etag & MountLeaseKeeper::precondition() const
 {
-    if (!last_incarnation)
+    if (!last_etag)
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
             "CAS mount-lease: key '{}' has no incarnation to name as a write precondition", key);
-    return *last_incarnation;
+    return *last_etag;
 }
 
 Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
@@ -1328,12 +1328,12 @@ Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
             throw Exception(
                 ErrorCodes::ABORTED,
                 "CAS mount-lease: key '{}' appeared between the read and the create", key);
-        const std::optional<Etag> incarnation
+        const std::optional<Etag> etag
             = orThrow(std::move(minted), fmt::format("CAS mount-lease mint of key '{}'", key));
         emitMountEvent(
             event_sink, CasEventType::MountClaim, srid, "mint", nullptr,
             "mount slot absent -- keeper minted it directly");
-        return *incarnation;
+        return *etag;
     }
 
     const MountLease observed = decodeMountLease(got->bytes);
@@ -1367,7 +1367,7 @@ Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
             key, describeMountHolder(observed)));
     }
 
-    WriteResult adopted = op.replace(key, body, got->incarnation, Retry::standard());
+    WriteResult adopted = op.replace(key, body, got->etag, Retry::standard());
     if (const Conflict * conflict = std::get_if<Conflict>(&adopted))
     {
         /// The write's own resolve read is the re-read: it observed what took the key from us.
@@ -1388,13 +1388,13 @@ Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
                 ErrorCodes::ABORTED,
                 "CAS mount-lease: key '{}' vanished while adopting our own mount slot", key);
     }
-    const std::optional<Etag> incarnation
+    const std::optional<Etag> etag
         = orThrow(std::move(adopted), fmt::format("CAS mount-lease adoption of key '{}'", key));
 
     emitMountEvent(
         event_sink, CasEventType::MountClaim, srid, "adopt", &observed,
         "adopted our own already-live mount slot");
-    return *incarnation;
+    return *etag;
 }
 
 uint64_t MountLeaseKeeper::start(Liveness liveness)
@@ -1409,10 +1409,10 @@ uint64_t MountLeaseKeeper::start(Liveness liveness)
     /// admitted under it would be refused on every request. What makes the claim safe is that every
     /// write below is conditional.
     CasOperation op = open_requests.admit(std::move(liveness));
-    const Etag incarnation = claim(op, body);
+    const Etag etag = claim(op, body);
 
     seq = 1;
-    last_incarnation = incarnation;
+    last_etag = etag;
     last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
     const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
     confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
@@ -1585,7 +1585,7 @@ MountRenewResult MountLeaseKeeper::renewOn(
     if (Committed * committed = std::get_if<Committed>(&*written))
     {
         seq = next_seq;
-        last_incarnation = std::move(committed->incarnation);
+        last_etag = std::move(committed->etag);
         last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
         const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
         confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
@@ -1694,7 +1694,7 @@ void MountLeaseKeeper::terminate(CasOperation & op)
     if (Committed * committed = std::get_if<Committed>(&written))
     {
         seq += 1;
-        last_incarnation = std::move(committed->incarnation);
+        last_etag = std::move(committed->etag);
         emitMountEvent(
             event_sink, CasEventType::MountRelease, srid, "farewell", nullptr,
             "graceful release -- lease stamped already-expired and watermark retired");
