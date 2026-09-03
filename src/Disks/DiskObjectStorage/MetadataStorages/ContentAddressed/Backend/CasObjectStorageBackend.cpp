@@ -24,6 +24,8 @@
 #include <IO/S3Common.h>
 #endif
 
+#include <boost/algorithm/string/trim.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -35,6 +37,8 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
     extern const int NOT_IMPLEMENTED;
+    extern const int LOGICAL_ERROR;
+    extern const int CAS_WRITE_UNATTRIBUTED;
 }
 }
 
@@ -130,9 +134,28 @@ void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 /// Native helpers
 /// =========================================================================================
 
-bool ObjectStorageBackend::isValidGenerationTokenValue(const String & value)
+bool ObjectStorageBackend::isValidTokenValue(TokenType type, const String & value)
 {
-    return !value.empty() && std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; });
+    switch (type)
+    {
+        case TokenType::Generation:
+        {
+            if (value.empty() || value == "0")
+                return false;
+            if (value.size() > 1 && value.front() == '0')
+                return false;
+            return std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; });
+        }
+        case TokenType::ETag:
+        {
+            String trimmed = value;
+            boost::algorithm::trim(trimmed);
+            return !trimmed.empty() && trimmed != "*" && trimmed.find(',') == String::npos;
+        }
+        case TokenType::Emulated:
+            return !value.empty();
+    }
+    return false;
 }
 
 std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
@@ -145,15 +168,16 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
     hr.exists = true;
     hr.size = metadata->size_bytes;
     hr.token = tokenForHead(metadata->etag);
-    /// A generation-token store guarantees a numeric x-goog-generation on every successful HEAD;
-    /// a missing or non-numeric value (a proxy dropping the header, a service regression) means the
-    /// ordinary ETag fell through unmapped. There is no follow-up HEAD to patch this over, so surface
-    /// the failure here rather than minting a token that would poison the first conditional operation
-    /// that trusts it -- exactly the contract tokenFromWriteResult already enforces on the write path.
-    if (native_token_type == TokenType::Generation && !isValidGenerationTokenValue(hr.token.value))
+    /// The store guarantees a well-formed incarnation value under this backend's dialect on every
+    /// successful HEAD; a missing or malformed value (a proxy dropping the header, a service
+    /// regression) means the response fell through unmapped. There is no follow-up HEAD to patch this
+    /// over, so surface the failure here rather than minting a token that would poison the first
+    /// conditional operation that trusts it -- exactly the contract tokenFromWriteResult already
+    /// enforces on the write path.
+    if (!isValidTokenValue(native_token_type, hr.token.value))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS on GCS: a HEAD of {} succeeded but its response carried no valid generation ({})",
-            key, metadata->etag);
+            "CAS backend: the store answered for '{}' with a value '{}' that is not a valid {} incarnation",
+            key, metadata->etag, native_token_type == TokenType::Generation ? "generation" : "ETag");
     hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
     return hr;
 }
@@ -847,7 +871,7 @@ Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::
         /// that transport syntax. Validating before the strip would reject every real GCS write.
         /// The message still reports the raw arrival, since that is what needs diagnosing.
         const Token token = tokenForHead(*etag);
-        if (!isValidGenerationTokenValue(token.value))
+        if (!isValidTokenValue(TokenType::Generation, token.value))
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS on GCS: a conditional write to {} succeeded but its response carried no "
                 "valid generation ({}) -- there is no follow-up HEAD to patch this over, so the write "
@@ -856,10 +880,18 @@ Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::
         return token;
     }
 
-    /// ETag dialect (and any backend with no write-time token at all, e.g. local files): unchanged
-    /// pre-existing behavior -- an absent/empty value falls back to a fresh HEAD of `key`.
+    /// ETag dialect (and any backend with no write-time token at all, e.g. local files): an ABSENT
+    /// value (etag == nullopt) is structural -- see the class comment above `tokenFromWriteResult` --
+    /// and still falls back to a fresh HEAD of `key`. A PRESENT but empty value is different: it is a
+    /// real S3-style write response that simply carried no incarnation, and there is no follow-up HEAD
+    /// that can attribute the write with certainty -- the object it would read back might not even be
+    /// the one this call just wrote.
     if (etag && !etag->empty())
         return tokenForHead(*etag);
+    if (etag.has_value())
+        throw Exception(ErrorCodes::CAS_WRITE_UNATTRIBUTED,
+            "CAS backend: the store accepted a write of '{}' but returned no incarnation; the write may "
+            "have committed and must be resolved by reading back", key);
 
     auto hr = nativeHead(key);
     return hr ? hr->token : Token{};
@@ -958,9 +990,18 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
 PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
 {
     /// §3.18 №19: reject a wrong-dialect expected token before it ever reaches the wire (Native) or
-    /// the emu compare (Emulated) — see mintingTypeMatches.
+    /// the emu compare (Emulated) — see mintingTypeMatches. A caller-visible mismatch, answered like
+    /// any other non-matching token, not a backend malfunction.
     if (!mintingTypeMatches(expected.type))
         return {PutOutcome::PreconditionFailed, {}};
+
+    /// An empty, wildcard or list token would turn the precondition into an unconditional write --
+    /// refuse it as a caller bug, before it ever reaches the wire or the emu compare.
+    if (!isValidTokenValue(expected.type, expected.value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, expected.value, static_cast<int>(expected.type));
 
     if (mode == Mode::Native)
     {
@@ -985,6 +1026,14 @@ CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes,
     /// else runs.
     if (expected.has_value() && !mintingTypeMatches(expected->type))
         return {CasOutcome::Conflict, {}};
+
+    /// Same grammar guard as putOverwrite: an empty, wildcard or list expected token would turn the
+    /// compare into an unconditional write.
+    if (expected.has_value() && !isValidTokenValue(expected->type, expected->value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, expected->value, static_cast<int>(expected->type));
 
     if (mode == Mode::Native)
     {
@@ -1031,6 +1080,14 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
         d.kind = DeleteOutcome::Kind::TokenMismatch;
         return d;
     }
+
+    /// Same grammar guard as putOverwrite/casPut: an empty, wildcard or list token would turn the
+    /// precondition into an unconditional delete.
+    if (!isValidTokenValue(token.type, token.value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, token.value, static_cast<int>(token.type));
 
     if (mode == Mode::Native)
     {
@@ -1162,7 +1219,15 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         /// token unset, which GC discover treats as Read (fail closed). The supportsListTokens()+
         /// empty-etag gate now lives in tokenForList.
         if (child->metadata)
+        {
             lk.token = tokenForList(child->metadata->etag);
+            /// Same grammar check as nativeHead: a listed value that fails this backend's dialect
+            /// grammar is a broken response, not a token to hand a future conditional operation.
+            if (lk.token && !isValidTokenValue(lk.token->type, lk.token->value))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS backend: the store answered for '{}' with a value '{}' that is not a valid {} incarnation",
+                    lk.key, lk.token->value, lk.token->type == TokenType::Generation ? "generation" : "ETag");
+        }
 
         if (page.keys.size() == limit)
         {

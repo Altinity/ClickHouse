@@ -11,6 +11,7 @@ namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -31,6 +32,14 @@ String sliceWindow(const String & data, Range range)
     if (range.length.has_value())
         return data.substr(offset, static_cast<size_t>(*range.length));
     return data.substr(offset);
+}
+
+/// A CALLER bug, refused before it ever reaches the store: an empty, wildcard or list token would
+/// turn a conditional mutation into an unconditional one. Mirrors the grammar
+/// `ObjectStorageBackend::isValidTokenValue` enforces for its own Emulated-dialect tokens.
+bool isValidEmulatedTokenValue(const String & value)
+{
+    return !value.empty() && value != "*" && value.find(',') == String::npos;
 }
 
 }
@@ -181,6 +190,17 @@ PutResult InMemoryBackend::putOverwrite(const String & key, const String & bytes
     if (it == store_.end())
         return {PutOutcome::PreconditionFailed, {}};
 
+    /// An empty, wildcard or list token would turn the precondition into an unconditional write --
+    /// refuse it as a caller bug. Checked only once there is a REAL object the malformed token could
+    /// clobber: a delete/overwrite of an absent key is already a no-op regardless of token shape (see
+    /// gtest_cas_mount.cpp's `AllocatorIsMonotoneAndSurvivesMountConcept`, which deletes an absent
+    /// mount with a HEAD-derived, necessarily empty token and expects a graceful NotFound/PreconditionFailed).
+    if (!isValidEmulatedTokenValue(expected.value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, expected.value);
+
     if (enforce_tokens_ && it->second.token != expected)
         return {PutOutcome::PreconditionFailed, {}};
 
@@ -224,6 +244,15 @@ CasResult InMemoryBackend::casPut(const String & key, const String & bytes, cons
         // swap-if-current CAS
         if (!exists)
             return {CasOutcome::Conflict, {}};
+
+        /// See putOverwrite: refuse a malformed expected token as a caller bug, but only once there is
+        /// a real object it could turn into an unconditional overwrite of.
+        if (!isValidEmulatedTokenValue(expected->value))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
+                "an empty, wildcard or list token would turn the precondition into an unconditional write",
+                key, expected->value);
+
         if (enforce_tokens_ && it->second.token != *expected)
             return {CasOutcome::Conflict, {}};
         Token t = mintToken();
@@ -244,6 +273,15 @@ DeleteOutcome InMemoryBackend::applyDelete(const String & key, const Token & tok
         d.kind = DeleteOutcome::Kind::NotFound;
         return d;
     }
+
+    /// See putOverwrite: refuse a malformed token as a caller bug, but only once there is a real
+    /// object it could turn an unconditional delete of -- deleting an absent key is already a
+    /// harmless NotFound no-op regardless of token shape.
+    if (!isValidEmulatedTokenValue(token.value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, token.value);
 
     if (enforce_tokens_ && it->second.token != token)
     {
@@ -274,6 +312,15 @@ DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & tok
             d.kind = DeleteOutcome::Kind::NotFound;
             return d;
         }
+
+        /// See applyDelete: refuse a malformed token only once there is a real object it could turn
+        /// an unconditional delete of.
+        if (!isValidEmulatedTokenValue(token.value))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "InMemoryBackend: refusing a conditional mutation of '{}' with a malformed token '{}': "
+                "an empty, wildcard or list token would turn the precondition into an unconditional write",
+                key, token.value);
+
         if (enforce_tokens_ && it->second.token != token)
         {
             DeleteOutcome d;

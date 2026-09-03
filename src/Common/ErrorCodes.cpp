@@ -679,6 +679,8 @@
     M(1009, PENDING_MUTATIONS_NOT_ALLOWED) \
     M(1010, EXPORT_PARTITION_ALREADY_EXPORTED) \
     M(1011, PARTITION_EXPORT_FAILED) \
+    M(1012, CAS_WRITE_UNATTRIBUTED) \
+    M(1013, CAS_DELETE_MARKER) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -695,7 +697,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1011;
+    constexpr ErrorCode END = 1013;
     ErrorPairHolder values[END + 1]{};
 
     struct ErrorCodesNames

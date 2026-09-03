@@ -179,6 +179,12 @@ public:
         return observed == expected;
     }
 
+    /// The per-dialect grammar a response value must meet to be an incarnation. Generation: canonical
+    /// positive decimal AFTER the SDK ETag-field quote strip (no leading zero, not "0" — zero is the
+    /// dialect's absence sentinel). ETag: non-empty, not "*" after trimming whitespace, no comma (a
+    /// list matches any member). Emulated: non-empty.
+    static bool isValidTokenValue(TokenType type, const String & value);
+
     /// Settings for a Native COMPARE/CREATE write (create-if-absent, compare-and-set): mark the request
     /// conditional, make exactly one attempt at every retry layer, skip the racy post-upload
     /// existence/size check, and force a single PUT on generation stores because GCS does not
@@ -223,18 +229,12 @@ private:
     /// masquerading as a real etag-derived identity either.
     uint64_t emu_seq = 0;
 
-    /// Look up Native metadata and convert the storage ETag or generation to this backend's token. On
-    /// a generation-token store, the minted token is validated exactly like a write result (see
-    /// isValidGenerationTokenValue) before this returns it: a missing/malformed x-goog-generation on an
-    /// otherwise-successful HEAD would otherwise mint an invalid token here with no check at all, one
-    /// layer before tokenFromWriteResult's own check on the write path.
+    /// Look up Native metadata and convert the storage ETag or generation to this backend's token. The
+    /// minted token is validated against isValidTokenValue before this returns it: a missing/malformed
+    /// response value on an otherwise-successful HEAD would otherwise mint an invalid token here with no
+    /// check at all, one layer before tokenFromWriteResult's own check on the write path.
     std::optional<HeadResult> nativeHead(const String & key);
 
-    /// True iff `value` is a well-formed generation: non-empty and every character an ASCII digit.
-    /// Shared by nativeHead and tokenFromWriteResult so the two places that mint a Generation token
-    /// from a remote response cannot drift apart on what "valid" means. Deliberately NOT folded into
-    /// tokenForHead, which stays a pure minter with no opinion on the value it is handed.
-    static bool isValidGenerationTokenValue(const String & value);
     /// Write a body with the condition already encoded in `ws`, finalize it, classify a lost
     /// precondition, and return the new token when the write succeeds.
     PutResult nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, const ObjectMeta & meta);
