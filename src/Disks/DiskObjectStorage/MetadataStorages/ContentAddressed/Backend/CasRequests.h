@@ -91,8 +91,7 @@ public:
     /// resumes under a generation the fence has since moved past gives up rather than writing.
     CasOperation resume(uint64_t admitted_generation, Liveness liveness = {});
 
-    /// The capability predicates and `dialect()`. No transport method is reachable through this
-    /// reference without a `TransportAccess`, which only this class can construct.
+    /// The capability predicates and `dialect()`.
     Backend & backendForCapabilityPredicates() { return *backend; }
 
     void setNowFnForTest(std::function<uint64_t()> now_ms_);
@@ -150,13 +149,19 @@ public:
     KeyPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);
     /// Walks every key under `prefix` exactly once. The policy governs EACH PAGE, not the walk: a walk
     /// is an unbounded number of requests, and a silently truncated enumeration is the error a
-    /// coverage record exists to prevent. `on_page_fetched` fires once per physical request.
+    /// coverage record exists to prevent. `on_page_fetched` fires once per page DELIVERED; a page that
+    /// took several reissues still fires once, and `CASRequestAttempt` is the physical count.
     void forEachListedKey(const String & prefix, const KeyEntryFn & fn, const Retry & per_page,
                           size_t page_limit = 1000, const std::function<void()> & on_page_fetched = {});
     Removal remove(const String & key, const Incarnation & seen, const Retry & policy);
     /// `head` then `remove` of what it saw, repeating on `Mismatch`. `Gone` when the key is already
-    /// absent; never returns `Mismatch`.
+    /// absent; never returns `Mismatch` -- under `once`, where there is no reissue to resolve one, a
+    /// `Mismatch` is the retry-later throw the read verbs use when their policy is exhausted.
     Removal removeCurrent(const String & key, const Retry & policy);
+    /// The one primitive that reports failure as a value, so the policy reissues on the OUTCOME:
+    /// `Indeterminate` is retried, the four authoritative outcomes return at once, and an
+    /// `Indeterminate` that outlives the bound is returned rather than thrown. Admission refused before
+    /// the first attempt still throws -- nothing was probed.
     SentinelProbeResult probeSentinel(const String & key, const Retry & policy);
     /// The OPEN is under the policy; the body is the SDK's.
     std::unique_ptr<ReadBuffer> stream(const String & key, const Retry & policy);
@@ -168,8 +173,9 @@ public:
     /// Read, decide, write, and re-decide on conflict against what the write's own resolve read
     /// already observed. `decide` returning nullopt is `Declined`.
     WriteResult readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy);
-    /// The same loop over `head`. Reports a `Meta`, never an `Object`: the body a resolve read had to
-    /// fetch to settle the write is not this verb's answer.
+    /// The same loop over `head`, settling a refused precondition with a `head` too. Proving that an
+    /// ambiguous attempt landed needs the bytes, so that one path does read a body; either way the verb
+    /// reports a `Meta` and never an `Object`.
     WriteResult readModifyWriteOnPresence(const String & key, const DecideOnMeta & decide, const Retry & policy);
 
 private:
@@ -209,10 +215,16 @@ private:
     Removal               removeUnder(const String & key, const String & expected_value,
                                       const Retry & policy, const Retry::Bound & bound);
 
+    /// How a write settles a REFUSED PRECONDITION, which needs only to know what is at the key. An
+    /// ambiguous attempt always reads the body, whichever this says, because only the bytes can prove
+    /// the attempt landed.
+    enum class ResolveWith : uint8_t { Body, Presence };
+
     /// The write engine: one call, any policy. Settles every refused precondition and every ambiguity
     /// by an exact read before it reports anything.
     WriteResult writeLoop(const String & key, const String & bytes, const std::optional<Incarnation> & expected,
-                          const Retry & policy, const Retry::Bound & bound, WriteState & state);
+                          const Retry & policy, const Retry::Bound & bound, WriteState & state,
+                          ResolveWith resolve_refusal_with);
     /// The resolve read: an exact read under the same policy and deadline. `NotObserved` when it gave
     /// up or failed -- the caller's terminal branch decides what that means.
     Observation observe(const String & key, const Retry & policy, const Retry::Bound & bound);

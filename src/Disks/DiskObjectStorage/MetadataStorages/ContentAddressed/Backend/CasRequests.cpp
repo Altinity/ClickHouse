@@ -12,6 +12,8 @@
 #include <IO/S3Common.h>
 #endif
 
+#include <Poco/Exception.h>
+
 #include <fmt/format.h>
 
 #include <ctime>
@@ -70,15 +72,28 @@ uint64_t saturatingAdd(uint64_t lhs, uint64_t rhs)
     return lhs > std::numeric_limits<uint64_t>::max() - rhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
 }
 
-/// The failure class a fresh credential could fix. Everything it names is carved OUT of
-/// `isDefinitelyRefusedWrite`, so the two are complements over the access-denied family.
+/// The failure class a fresh credential could fix, named here rather than taken from
+/// `S3Exception::isAccessTokenExpiredError`, which also fires on `S3Errors::UNKNOWN` -- the SDK's code
+/// for EVERY error it does not model. Borrowing it would put throttling codes an S3-compatible store
+/// reports under a non-AWS name into the credential class, and would carve a real access denial out of
+/// `isDefinitelyRefusedWrite` so the write wedges its caller instead of being refused. `UNKNOWN` is
+/// therefore never matched by code alone; a store that spells the error out by name still matches.
 bool isRefreshableCredentialError([[maybe_unused]] const std::exception & e)
 {
 #if USE_AWS_S3
-    if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
-        return s3->isAccessTokenExpiredError();
-#endif
+    const auto * s3 = dynamic_cast<const S3Exception *>(&e);
+    if (!s3)
+        return false;
+    const Aws::S3::S3Errors code = s3->getS3ErrorCode();
+    if (code == Aws::S3::S3Errors::INVALID_ACCESS_KEY_ID || code == Aws::S3::S3Errors::ACCESS_DENIED
+        || code == Aws::S3::S3Errors::INVALID_SIGNATURE || code == Aws::S3::S3Errors::INVALID_CLIENT_TOKEN_ID)
+        return true;
+    const String & name = s3->getExceptionName();
+    return name == "ExpiredToken" || name == "InvalidToken" || name == "InvalidAccessKeyId"
+        || name == "SignatureDoesNotMatch" || name == "AccessDenied" || name == "AccountProblem";
+#else
     return false;
+#endif
 }
 
 /// An answer from the store rather than a fault in reaching it: reissuing replays it unchanged.
@@ -130,7 +145,7 @@ bool isDefinitelyRefusedWrite([[maybe_unused]] const std::exception & e)
 #if USE_AWS_S3
     if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
         return S3::isMalformedRequestError(*s3) || S3::isEntityTooLargeError(*s3)
-            || (S3::isAccessDeniedError(*s3) && !s3->isAccessTokenExpiredError());
+            || (S3::isAccessDeniedError(*s3) && !isRefreshableCredentialError(e));
 #endif
     return false;
 }
@@ -223,12 +238,16 @@ bool CasOperation::refreshAndClassifyReadFault(const std::exception & e)
 {
     if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
         return true;
-    if (isRefreshableCredentialError(e))
-        /// Without fresh credentials the reissue would sign exactly the same way, so a backend with no
-        /// refresh mechanism makes an expired credential terminal for this policy.
-        return !owner.backend->refreshCredentials();
-    /// Absence is an answer `once` handles itself; what arrives here as a definite store answer would
-    /// replay identically, and everything unmodeled may still be transient, so it is reissued.
+    /// A local failure -- a bad allocation, a logic error raised inside the attempt -- is not a
+    /// transport fault, and reissuing it would spend the whole deadline replaying the same bug. Every
+    /// exception the transport raises is a `Poco::Exception`, `DB::Exception` included.
+    if (!dynamic_cast<const Poco::Exception *>(&e))
+        return true;
+    if (isRefreshableCredentialError(e) && owner.backend->refreshCredentials())
+        return false;
+    /// No credentials were installed, so the store's own answer decides: a definite one would replay
+    /// identically, and everything else -- an unmodeled name an S3-compatible store reports, a
+    /// throttle, a 5xx -- may still be transient and is reissued.
     return isDefiniteStoreRefusal(e);
 }
 
@@ -363,6 +382,13 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
         if (removed != Removal::Mismatch)
             return removed;
 
+        /// A `Mismatch` is a VALUE, so it never reaches the fault check inside the two loops above: this
+        /// verb has to honour `once` itself, and its contract is that it never hands a `Mismatch` back.
+        /// The message says what actually stopped it, which is the policy and not the deadline.
+        if (policy.single_attempt)
+            throwCasWriteRetryLater(fmt::format(
+                "removeCurrent of '{}': the observed incarnation was replaced and the policy allows no reissue", key));
+
         /// Another incarnation became current between the observation and the delete. Re-observe, paced
         /// like every other reissue: the reservation covers the next `head` and the `remove` after it.
         const uint64_t pause_ms = Retry::backoff(attempt);
@@ -383,10 +409,52 @@ Removal CasOperation::removeCurrent(const String & key, const Retry & policy)
 SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry & policy)
 {
     const Retry::Bound bound = policy.bind(owner.now_ms());
-    return readLoop("probeSentinel", key, policy, bound, [&](auto & access)
+    for (uint32_t attempt = 1;; ++attempt)
     {
-        return owner.backend->probeSentinelRaw(key, access);
-    });
+        const uint64_t reservation = reservedFor(0, 1);
+        switch (gate(reservation))
+        {
+            case Gate::FenceLost: giveUpReadFenceLost("probeSentinel", key, "before the request");
+            case Gate::NoBudget:  giveUpReadNoBudget("probeSentinel", key, "for one more request");
+            case Gate::Ok: break;
+        }
+        /// Before the first attempt nothing has been probed, so the caller is told the request never
+        /// happened rather than being handed an outcome no request produced.
+        if (!fits(reservation, bound))
+            giveUpReadDeadline("probeSentinel", key, bound, attempt - 1);
+
+        detail::recordAttempt();
+        SentinelProbeResult result{ProbeOutcome::Indeterminate, std::nullopt};
+        try
+        {
+            result = owner.withTransportAccess([&](auto & access)
+            {
+                return owner.backend->probeSentinelRaw(key, access);
+            });
+        }
+        catch (const std::exception & e)
+        {
+            if (refreshAndClassifyReadFault(e))
+                throw;
+            /// The probe reports every transport failure as `Indeterminate` rather than by throwing, so
+            /// a decorator that does throw is folded onto the same inconclusive outcome.
+        }
+
+        /// The reissue is driven by the OUTCOME: this is the one primitive whose failures never reach a
+        /// `catch`, and `Indeterminate` means "inconclusive", which is exactly what a retry resolves.
+        /// The other four outcomes are authoritative answers and return on the first attempt.
+        if (result.outcome != ProbeOutcome::Indeterminate || policy.single_attempt)
+            return result;
+
+        const uint64_t pause_ms = Retry::backoff(attempt);
+        const uint64_t needed = reservedFor(pause_ms, 1);
+        /// At the bound the inconclusive outcome IS the answer: a probe did run, and reporting what it
+        /// saw is more than a give-up exception could say.
+        if (gate(needed) != Gate::Ok || !fits(needed, bound))
+            return result;
+        detail::recordReissue();
+        owner.sleep_ms(pause_ms);
+    }
 }
 
 std::unique_ptr<ReadBuffer> CasOperation::stream(const String & key, const Retry & policy)
@@ -409,7 +477,6 @@ void CasOperation::publish(const BlobPublishRequest & request, const Retry & pol
 
 Observation CasOperation::observe(const String & key, const Retry & policy, const Retry::Bound & bound)
 {
-    ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
     try
     {
         auto got = readUnder(key, policy, bound);
@@ -434,7 +501,6 @@ Observation CasOperation::observe(const String & key, const Retry & policy, cons
 
 Observation CasOperation::observePresence(const String & key, const Retry & policy, const Retry::Bound & bound)
 {
-    ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
     try
     {
         auto got = headUnder(key, policy, bound);
@@ -504,7 +570,8 @@ std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, con
 }
 
 WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Incarnation> & expected,
-                                    const Retry & policy, const Retry::Bound & bound, WriteState & state)
+                                    const Retry & policy, const Retry::Bound & bound, WriteState & state,
+                                    ResolveWith resolve_refusal_with)
 {
     std::optional<String> expected_value;
     if (expected)
@@ -541,17 +608,19 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         {
             if (isDeterministicLocalFailure(e.code()))
                 throw;
-            if (isRefreshableCredentialError(e))
-                owner.backend->refreshCredentials();
-            /// The refusal predicate carves the refresh class out by construction, so an expired
-            /// credential never reaches this branch: it stays ambiguous and the reissue signs with
-            /// whatever the refresh installed. A refusal that FOLLOWS an ambiguous attempt of this call
-            /// proves nothing about that attempt, so it is settled by the read below instead.
+            /// The refusal is decided BEFORE any refresh, so an oversized entity or a malformed
+            /// request -- neither of which a credential can fix -- never triggers a re-acquisition.
+            /// The refusal predicate carves the refresh class out by construction, so a stale
+            /// credential cannot reach here: it stays ambiguous and the reissue signs with whatever the
+            /// refresh installed. A refusal that FOLLOWS an ambiguous attempt of this call proves
+            /// nothing about that attempt, so it is settled by the read below instead.
             if (isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
             {
                 ProfileEvents::increment(ProfileEvents::CASRequestRefused);
                 return Refused{e.code(), e.message()};
             }
+            if (isRefreshableCredentialError(e))
+                owner.backend->refreshCredentials();
         }
         catch (const std::exception &)
         {
@@ -572,8 +641,13 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
 
         /// Every refused precondition and every ambiguous attempt is settled by ONE exact read, under
         /// every policy: a refused precondition does not say WHO holds the key, and a 404 and a 412
-        /// reach here as the same answer.
-        state.last_seen = observe(key, policy, bound);
+        /// reach here as the same answer. A refused precondition needs only to know WHAT is there, so a
+        /// presence-only caller settles it with a HEAD; proving an ambiguous attempt landed needs the
+        /// bytes, and there the body read is unavoidable.
+        ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
+        state.last_seen = resolve_refusal_with == ResolveWith::Presence && !state.any_ambiguous
+            ? observePresence(key, policy, bound)
+            : observe(key, policy, bound);
         if (const auto * obj = std::get_if<Object>(&state.last_seen))
         {
             /// Our own bytes prove an earlier ambiguous attempt landed. Without an ambiguity there was
@@ -595,13 +669,13 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
 WriteResult CasOperation::create(const String & key, const String & bytes, const Retry & policy)
 {
     WriteState state;
-    return writeLoop(key, bytes, std::nullopt, policy, policy.bind(owner.now_ms()), state);
+    return writeLoop(key, bytes, std::nullopt, policy, policy.bind(owner.now_ms()), state, ResolveWith::Body);
 }
 
 WriteResult CasOperation::replace(const String & key, const String & bytes, const Incarnation & seen, const Retry & policy)
 {
     WriteState state;
-    return writeLoop(key, bytes, seen, policy, policy.bind(owner.now_ms()), state);
+    return writeLoop(key, bytes, seen, policy, policy.bind(owner.now_ms()), state, ResolveWith::Body);
 }
 
 WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObject & decide, const Retry & policy)
@@ -625,7 +699,8 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
             return Declined{state.last_seen};
 
         WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Incarnation>(current->incarnation) : std::nullopt, policy, bound, state);
+            current ? std::optional<Incarnation>(current->incarnation) : std::nullopt, policy, bound, state,
+            ResolveWith::Body);
         if (!std::holds_alternative<Conflict>(result))
             return result;
 
@@ -675,9 +750,10 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
             return Declined{state.last_seen};
 
         WriteResult result = writeLoop(key, *next,
-            current ? std::optional<Incarnation>(current->incarnation) : std::nullopt, policy, bound, state);
-        /// The write had to fetch a body to prove whose bytes were at the key; this loop is
-        /// presence-only by contract, so the body stops here.
+            current ? std::optional<Incarnation>(current->incarnation) : std::nullopt, policy, bound, state,
+            ResolveWith::Presence);
+        /// A refused precondition was settled by a HEAD, but proving an ambiguous attempt landed needs
+        /// the bytes; this loop is presence-only by contract, so that body stops here.
         state.last_seen = withoutBody(std::move(state.last_seen));
         if (!std::holds_alternative<Conflict>(result))
             return withoutBody(std::move(result));
