@@ -58,7 +58,8 @@ std::optional<RefCoverage> coverageOf(Backend & backend, const Layout & layout, 
     const UInt128 life_id = catalogLifeIdForTest(backend, layout, ns);
     for (uint64_t g = gen; ; --g)
     {
-        if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
+        OperationForTest op(backend);
+        if (const auto got = (*op).read(layout.foldSealKey(g, attempt), Retry::once()))
         {
             const CasFoldSeal seal = decodeFoldSeal(got->bytes);
             const auto it = seal.ref_lives.find(life_id);
@@ -482,7 +483,10 @@ TEST(CASGCArithmeticIntake, CorruptBodyClampsOneNamespaceWhileAnotherFolds)
     const RootNamespace ns_b{"00/bb@cas@"};
 
     publishAt(*backend, layout, ns_a, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
-    backend->putIfAbsent(layout.refLogKey(fixture::fixtureLife(ns_a), RefTxnId{1, 2}), "this is not a cas_ref_log object");
+    {
+        OperationForTest op(*backend);
+        (*op).create(layout.refLogKey(fixture::fixtureLife(ns_a), RefTxnId{1, 2}), "this is not a cas_ref_log object", Retry::once());
+    }
     writeRecoverableCkptForRawFixture(*backend, layout, ns_a, RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
