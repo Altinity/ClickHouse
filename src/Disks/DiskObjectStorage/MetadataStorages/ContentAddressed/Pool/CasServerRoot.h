@@ -519,11 +519,10 @@ public:
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
     /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
     /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an
-    /// operation admitted under it would be refused before its first attempt. `open_plane` must be
-    /// open-fenced -- passing the mount plane here is the bug this exists to avoid. Same policy and
-    /// same verdicts as `renew`.
-    MountRenewResult renewForRemount(
-        CasRequests & open_plane, const MountRenewOperationEnvironment & environment = {});
+    /// operation admitted under it would be refused before its first attempt. It admits on this
+    /// keeper's own open plane, the one the claim and the farewell use, so there is no plane for a
+    /// caller to get wrong. Same policy and same verdicts as `renew`.
+    MountRenewResult renewForRemount(const MountRenewOperationEnvironment & environment = {});
     void release();
 
     MountLeaseKeeperState state() const { return keeper_state; }

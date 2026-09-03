@@ -2163,7 +2163,7 @@ TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
                             {}, std::chrono::milliseconds(0), [&] { return boot; });
     keeper.start();
 
-    const MountRenewResult redo = keeper.renewForRemount(open_requests, MountRenewOperationEnvironment{});
+    const MountRenewResult redo = keeper.renewForRemount();
     EXPECT_EQ(redo.outcome, MountRenewOutcome::Committed);
 
     CasOperation reader = open_requests.admit();

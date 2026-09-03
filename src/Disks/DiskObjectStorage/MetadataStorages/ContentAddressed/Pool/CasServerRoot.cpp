@@ -1522,10 +1522,9 @@ MountRenewResult MountLeaseKeeper::renew(const MountRenewOperationEnvironment & 
     return renewOn(mount_requests, environment);
 }
 
-MountRenewResult MountLeaseKeeper::renewForRemount(
-    CasRequests & open_plane, const MountRenewOperationEnvironment & environment)
+MountRenewResult MountLeaseKeeper::renewForRemount(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(open_plane, environment);
+    return renewOn(open_requests, environment);
 }
 
 MountRenewResult MountLeaseKeeper::renewOn(
