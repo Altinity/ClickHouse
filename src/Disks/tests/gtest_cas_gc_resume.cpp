@@ -22,7 +22,8 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 }
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
 {
-    return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
+    OperationForTest op(b);
+    return (*op).head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)}), Retry::once()).has_value();
 }
 
 /// Whether the CURRENT retired list (any gc-shard) still holds an entry.
@@ -30,7 +31,7 @@ bool anyRetiredPending(const PoolPtr & s)
 {
     /// Condemned state rides the adopted fold seal's RunMarker::Condemned rows, not a
     /// separate retired list — reconstruct the in-flight set from the seal.
-    return anyCondemnedInSeal(s->backend(), s->layout());
+    return anyCondemnedInSeal(*s->poolBackendPtr(), s->layout());
 }
 
 /// Drive regular GC to a fixpoint over the ACK-FLOOR round (renew the store's mount ack after each round;
@@ -145,7 +146,8 @@ TEST(CASGCReplay, DeposedRoundRerunsUnderFreshAttempt)
     Gc gc1(store, hexToU128("00000000000000000000000000000001"));
     runRegularRoundReclaiming(gc1);
     store->renewWatermarkOnce();
-    const auto after_fold = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    OperationForTest op(*backend);
+    const auto after_fold = decodeGcState((*op).read(store->layout().gcStateKey(), Retry::once())->bytes);
     ASSERT_EQ(after_fold.snap_attempt, after_fold.lease.seq);
     ASSERT_GT(after_fold.snap_generation, 0u);
 
@@ -157,7 +159,7 @@ TEST(CASGCReplay, DeposedRoundRerunsUnderFreshAttempt)
     EXPECT_THROW(runRegularRoundReclaiming(gc1), DB::Exception);
     backend->arm_interrupt = false;
 
-    const auto after_interrupt = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const auto after_interrupt = decodeGcState((*op).read(store->layout().gcStateKey(), Retry::once())->bytes);
     EXPECT_EQ(after_interrupt.snap_generation, after_fold.snap_generation)
         << "the denied round-commit CAS must NOT advance the adopted generation";
     EXPECT_EQ(after_interrupt.snap_attempt, after_fold.snap_attempt)
@@ -165,7 +167,7 @@ TEST(CASGCReplay, DeposedRoundRerunsUnderFreshAttempt)
     // The deposed round's fold seal is durable under its OWN (unadopted) attempt — unreferenced by gc/state.
     const uint64_t deposed_attempt = after_fold.lease.seq + 1;   // round 2 renewed the lease once
     const uint64_t deposed_gen = after_fold.snap_generation + 1;
-    EXPECT_TRUE(backend->head(store->layout().foldSealKey(deposed_gen, deposed_attempt)).exists)
+    EXPECT_TRUE((*op).head(store->layout().foldSealKey(deposed_gen, deposed_attempt), Retry::once()).has_value())
         << "the deposed round's fold seal is durable under its own unadopted attempt (harmless debris)";
 
     // A DIFFERENT leader takes over. The lease steal protocol observes the stalled lease twice before
@@ -180,7 +182,7 @@ TEST(CASGCReplay, DeposedRoundRerunsUnderFreshAttempt)
     EXPECT_NO_THROW(runGcToFixpoint(store, gc2));
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 
-    const auto after_drain = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const auto after_drain = decodeGcState((*op).read(store->layout().gcStateKey(), Retry::once())->bytes);
     EXPECT_GT(after_drain.snap_generation, after_fold.snap_generation) << "the round completed under gc2";
     EXPECT_NE(after_drain.snap_attempt, deposed_attempt) << "the drained round never adopted the deposed attempt";
 
