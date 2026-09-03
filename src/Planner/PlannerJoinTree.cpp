@@ -253,8 +253,10 @@ bool joinTreePreservesRowsForTable(const QueryTreeNodePtr & join_tree, const Que
 }
 
 /// `IStorageCluster` JOINs wrap the left table in a subquery. Attach dummy-analysis
-/// filters to the wrap source for listing only; do not add a FilterStep, which would
-/// drop unused columns from the wrap header.
+/// filters to `ReadFromCluster` for listing only; do not add a FilterStep, which would
+/// drop unused columns from the wrap header. Other wrap sources (`ReadFromMergeTree`
+/// for a remote `Distributed` replica, `ReadFromObjectStorageStep` after cluster
+/// fallback) keep the optimizer's later `applyFilters`.
 void tryAddClusterWrapFilter(QueryPlan & query_plan, const TableExpressionData & table_expression_data)
 {
     const auto & filter_actions = table_expression_data.getFilterActions();
@@ -265,7 +267,7 @@ void tryAddClusterWrapFilter(QueryPlan & query_plan, const TableExpressionData &
     while (node && !node->children.empty())
         node = node->children.front();
 
-    auto * source = node ? dynamic_cast<SourceStepWithFilter *>(node->step.get()) : nullptr;
+    auto * source = node ? typeid_cast<ReadFromCluster *>(node->step.get()) : nullptr;
     if (!source)
         return;
 
