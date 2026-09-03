@@ -23,10 +23,10 @@ struct CasRequestBudget
     /// attempt (LIST + snapshot/log GETs + seal PUT) that fails with a transient NETWORK_ERROR is
     /// retried, with capped-exponential backoff, until this total wall-clock budget is spent — then the
     /// error propagates and the table's load fails for this touch (the `lazy_load_tables` database
-    /// setting makes the NEXT touch retry). This sits ON TOP of the per-request `operation_deadline_ms`
-    /// envelope above: one recovery attempt may itself burn ~90s inside a single seal PUT. Independent
-    /// of the mount-lease invariants validated in `validateCasRequestBudget` — not part of that
-    /// inequality set.
+    /// setting makes the NEXT touch retry). This sits ON TOP of each write's own `Retry` policy window
+    /// (`Retry::standard()`'s 90s): one recovery attempt may itself burn ~90s inside a single seal PUT.
+    /// Independent of the mount-lease invariants validated in `validateCasRequestBudget` — not part of
+    /// that inequality set.
     uint64_t recovery_retry_budget_ms = 120000;
     uint64_t recovery_retry_initial_backoff_ms = 1000;
     uint64_t recovery_retry_max_backoff_ms = 30000;
