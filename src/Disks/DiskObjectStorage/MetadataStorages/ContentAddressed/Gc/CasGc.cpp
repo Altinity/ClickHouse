@@ -88,7 +88,7 @@ uint64_t deletePrefixWholesale(CasOperation & op, const String & prefix, uint64_
 
 /// The text an incarnation carries into the event log. Persisted and live incarnations render the
 /// same way, so the column speaks one vocabulary whichever half of the pipeline wrote the row.
-String renderIncarnation(const PersistedIncarnation & token)
+String renderIncarnation(const PersistedEtag & token)
 {
     return token.dialect + ":" + token.value;
 }
@@ -342,7 +342,7 @@ void Gc::runNamespaceJanitorPage(
     NamespaceJanitorResult janitor_result;
     try
     {
-        CasRequests & requests = store->gcRequests();
+        CasRequests & requests = store->openRequests();
         const Layout & layout = store->layout();
         NamespaceJanitor janitor(requests, layout, 1000);
         /// ONE authority read per page, made here rather than from the predicate: the janitor's
@@ -371,7 +371,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     RoundReport & report = progress ? *progress : local_report;
     report = RoundReport{};
     GcState state;
-    std::optional<Incarnation> state_incarnation;
+    std::optional<Etag> state_incarnation;
 
     /// Every exit path waits for this round's meta jobs. The throwing `meta_pool_wait` phase below is
     /// a protocol barrier -- this round's condemns must be durable no later than the ledger they are
@@ -412,7 +412,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// attempt is idempotent.
 
     const Layout & layout = store->layout();
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const uint64_t new_round = state.round + 1;
 
     /// ONE budget instance for the WHOLE round, threaded into every destructive-or-observability-write
@@ -446,7 +446,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("deleted", drain_result.deleted);
     }
 
-    /// Incarnation-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
+    /// Etag-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
     /// rounds via `new_round`, not on heartbeat acks). Fencing no longer trusts a predecessor's stamped
     /// `expires_at_ms` against our wall clock — it
     /// fences ONLY once `mount_obs` has watched the mount's write-token hold unchanged for the full
@@ -1057,8 +1057,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// sealed AND taken on a round that could prove its frontier -- an unprovable round's `-1` may
         /// itself be the observation that is missing an owner elsewhere, so deleting the body on it is
         /// exactly the irreversible step the gate exists to withhold.
-        static const std::map<ManifestId, Incarnation> kNoManifestCleanup;
-        const std::map<ManifestId, Incarnation> & mf_cleanup_now =
+        static const std::map<ManifestId, Etag> kNoManifestCleanup;
+        const std::map<ManifestId, Etag> & mf_cleanup_now =
             suppress_destructive ? kNoManifestCleanup : folded.mf_cleanup;
         uint64_t attempted = 0;
         for (const auto & [id, incarnation] : mf_cleanup_now)
@@ -1181,7 +1181,7 @@ void Gc::reportStuckRemovals(const RefPlan & plan, uint64_t current_round)
 }
 
 bool Gc::foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
-                           std::map<ManifestId, Incarnation> & mf_cleanup, uint32_t txn_ordinal)
+                           std::map<ManifestId, Etag> & mf_cleanup, uint32_t txn_ordinal)
 {
     const Layout & layout = store->layout();
 
@@ -1274,7 +1274,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     /// not show a `_ckpt` would make the second witness a function of the first, which is precisely the
     /// dependency it exists to break: the listing is a SNAPSHOT, and a `_ckpt` that became durable after
     /// the enumeration is exactly the one whose namespace has records the same enumeration also missed.
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
 
     std::set<String> witness_namespaces;
@@ -1344,7 +1344,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
 
 std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
     const String gen_prefix = layout.gcGenPrefix(0);
     const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
@@ -1476,7 +1476,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
 
 Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
 
     GenerationSealProbe probe;
@@ -1553,12 +1553,12 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
     }
 }
 
-Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_incarnation*/,
+Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_incarnation*/,
                         RoundReport & report,
                         uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy,
                         GcRoundWorkBudget & work_budget)
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
     FoldResult result;
 
@@ -1737,7 +1737,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_in
         /// sees it; a successful write records the in-process (hash, token) confirmation the graduation
         /// gate consumes (`scheduleCondemnMarkerWrite` captures everything BY VALUE — never by reference
         /// to `cur_blob`, which the fold's tight streaming loop mutates while the job is queued).
-        meta_writer->scheduleCondemnMarkerWrite(ref, PersistedIncarnation::capture(observed->incarnation),
+        meta_writer->scheduleCondemnMarkerWrite(ref, PersistedEtag::capture(observed->incarnation),
                                                 condemn_round, adjusted.size);
         return adjusted;
     };
@@ -2411,7 +2411,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_in
             /// CLAMP (barrier), never a round abort: keep the cursor below THIS log and re-read it next
             /// round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
             std::vector<BlobDelta> log_deltas;
-            std::map<ManifestId, Incarnation> log_mf_cleanup;
+            std::map<ManifestId, Etag> log_mf_cleanup;
             for (const RefManifestEdge & edge : edges)
             {
                 ProfileEvents::increment(ProfileEvents::CASRefEmittedEdges);   /// one manifest-edge event
@@ -3265,7 +3265,7 @@ void Gc::cleanupRefObjects(
     if (suppress_destructive)
         return;
 
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
     if (!folded.catalog_cut)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS GC ref cleanup: fold result carries no catalog cut");
@@ -3483,7 +3483,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
     if (keep == 0)
         return;   /// keep ALL (debug/forensics — replay GC's in-degree view as-of a past round)
 
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
 
     static constexpr uint64_t kMaxPrunePerRound = 64;   /// bound the per-round prune burst
@@ -3567,7 +3567,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
 
 std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attempt)
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     if (const auto got = op.read(store->layout().foldSealKey(generation, attempt), Retry::standard()))
         return decodeFoldSeal(
             got->bytes, store->layout(), store->poolConfig().gc_shards, generation);
@@ -3617,7 +3617,7 @@ std::vector<NamespaceLifeId> Gc::discoverUniverse()
     /// The filter itself lives in `CasRefCatalog::liveUniverse` (review Important C) -- fsck's own
     /// reachability walk needed the identical catalog-authoritative set and is not this class, so the
     /// filter moved to where both can share it rather than grow a second copy that could disagree.
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     return CasRefCatalog::liveUniverse(op, store->layout());
 }
 
@@ -3665,7 +3665,7 @@ RefScanSummary Gc::enumerateRefPrefix()
     /// name is absorbed per key by `parseRefObjectKeyForEnumeration`, which is what keeps this
     /// enumeration -- which runs before the fold, outside its catch -- unable to wedge the round.
     const Layout & layout = store->layout();
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
 
     RefScanSummary scan;
     static constexpr size_t kListPageLimit = 1000;
@@ -3706,7 +3706,7 @@ RoundInput Gc::listRefPrefix(const GcState & state)
     /// plan. A listed id absent from the later cut is dead, inert debris: it contributes no work and
     /// cannot force DEFER.
     RefScanSummary scan = enumerateRefPrefix();
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, store->layout());
     /// TEST SEAM: see `setPostHotScanCatalogReadHookForTest`. Moved into a local before invoking (the
     /// same reason `create_namespace_step1_pre_read_hook_for_test` is swapped rather than called
@@ -3745,7 +3745,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// Writes ONLY the GC plane; namespace streams/state, manifests, and blobs are read-only inputs;
     /// the rebuild never deletes them.
     RebuildReport rep;
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
 
     /// Read bookkeeping health before the lease (the lease acquire on an absent state CREATES a
@@ -3896,7 +3896,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// has_observation==false always takes the non-steal branch on its one and only call), pass it
     /// explicitly rather than rely on that invariant.
     GcState state;
-    std::optional<Incarnation> state_incarnation;
+    std::optional<Etag> state_incarnation;
     if (!acquireOrRenewLease(state, state_incarnation, /*allow_steal=*/false))
     {
         rep.refusal = "another GC leader holds the lease";
@@ -4049,7 +4049,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// round once it is known, and nothing else is touched.
     std::set<UInt128> minted_hold_lives;
     uint64_t max_fence_round = 0;
-    std::map<ManifestId, Incarnation> mf_cleanup_unused;
+    std::map<ManifestId, Etag> mf_cleanup_unused;
 
     for (const NamespaceLifeId & life : rebuild_walk_universe)
     {
@@ -4303,7 +4303,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
 {
     std::vector<PreviewEntry> out;
 
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const auto state_bytes = op.read(store->layout().gcStateKey(), Retry::standard());
     if (!state_bytes)
         return out;
@@ -4389,7 +4389,7 @@ void Gc::refreshAuthority(uint64_t admitted_generation)
     authority_held = false;
     try
     {
-        CasOperation op = store->gcRequests().admit();
+        CasOperation op = store->openRequests().admit();
         const auto got = op.read(store->layout().gcStateKey(), Retry::standard());
         if (!got)
             return;
@@ -4406,7 +4406,7 @@ void Gc::refreshAuthority(uint64_t admitted_generation)
 
 void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
 {
-    CasOperation op = store.gcRequests().admit();
+    CasOperation op = store.openRequests().admit();
     const String key = store.layout().gcHbKey();
     const auto got = op.read(key, Retry::standard());
     GcHeartbeat hb;
@@ -4423,16 +4423,16 @@ void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
         op.create(key, body, Retry::once());
 }
 
-bool Gc::acquireOrRenewLease(GcState & state, std::optional<Incarnation> & state_incarnation, bool allow_steal)
+bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_incarnation, bool allow_steal)
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const String key = store->layout().gcStateKey();
 
     /// What the decision that actually landed wrote. `readModifyWrite` re-decides on every conflict
     /// against what the losing write's own resolve read observed, so the last decision is the committed
     /// one, and a competing leader's write makes the next decision see a moved lease tuple.
     GcState decided;
-    const std::optional<Incarnation> committed = orThrow(op.readModifyWrite(key,
+    const std::optional<Etag> committed = orThrow(op.readModifyWrite(key,
         [&](const std::optional<Object> & current_object) -> std::optional<String>
     {
         if (!current_object)
@@ -4547,7 +4547,7 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     /// second -- the single reading taken here would otherwise authorise all of them.
     const uint64_t admitted_generation = leased_state.lease.seq;
     refreshAuthority(admitted_generation);
-    CasOperation op = store->gcRequests().admit([this] { return authority_held; });
+    CasOperation op = store->openRequests().admit([this] { return authority_held; });
     return CatalogLifecycleReconciler(op, store->layout(), *parent)
         .reconcile([this, admitted_generation] { refreshAuthority(admitted_generation); });
 }

@@ -546,7 +546,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                     RetiredEntry fresh;
                     fresh.kind = ObjectKind::Blob;
                     fresh.ref = cur_blob;
-                    fresh.token = PersistedIncarnation::capture(hr->incarnation);
+                    fresh.token = PersistedEtag::capture(hr->incarnation);
                     fresh.size = hr->size;
                     fresh.condemn_round = condemn_round;
                     ReplacedEntry re;
@@ -569,7 +569,7 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                 RetiredEntry fresh;
                 fresh.kind = ObjectKind::Blob;
                 fresh.ref = cur_blob;
-                fresh.token = PersistedIncarnation::capture(hr->incarnation);
+                fresh.token = PersistedEtag::capture(hr->incarnation);
                 fresh.size = hr->size;
                 fresh.condemn_round = condemn_round;
                 rmr.still_retired.push_back(std::move(fresh));

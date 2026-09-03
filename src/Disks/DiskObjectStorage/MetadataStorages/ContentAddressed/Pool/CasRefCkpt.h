@@ -97,7 +97,7 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
 struct CkptSample
 {
     RefCkpt ckpt;
-    Incarnation incarnation;
+    Etag incarnation;
 };
 
 /// Point-read of `life`'s `_ckpt`. `nullopt` means the object is absent (a namespace whose creation has
@@ -128,7 +128,7 @@ enum class MissingBaseVerdict : uint8_t
 ///
 /// Pure, so it is decided the same way at every call site; the caller raises `CORRUPTED_DATA` on
 /// `Corrupted` with its own context.
-MissingBaseVerdict classifyMissingSampledBase(const Incarnation & sampled, const std::optional<Incarnation> & current);
+MissingBaseVerdict classifyMissingSampledBase(const Etag & sampled, const std::optional<Etag> & current);
 
 /// INV-4's snapshot-deletion gate: a snapshot is deletable only STRICTLY BELOW the checkpoint. Strict
 /// rather than at-or-below because the checkpoint names the snapshot a recovery is entitled to fetch

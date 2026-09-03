@@ -425,7 +425,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                   const String & namespace_prefix, FsckReport & report)
 {
     const Layout & layout = store.layout();
-    CasOperation op = store.gcRequests().admit();
+    CasOperation op = store.openRequests().admit();
     /// Path-derived per-object algorithm parsing: every listed blob-tree key -- across every
     /// admitted algo, not just the pool's node-local write algo -- is classified via
     /// `Layout::parseBlobKey`, which derives the `BlobRef` from the key's OWN `<algo>` path segment

@@ -771,7 +771,7 @@ void emitMountEvent(const CasEventSink & sink, CasEventType type, const String &
 
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
-    uint64_t now_ms, uint64_t ttl_ms, const std::optional<Incarnation> & proven_dead_incarnation,
+    uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation,
     const CasEventSink & sink)
 {
     const String key = l.mountKey(srid);
@@ -931,7 +931,7 @@ MountClaimResult claimMountAwaitingExpiry(
     /// identical.
     const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
 
-    std::optional<Incarnation> observed;
+    std::optional<Etag> observed;
     uint64_t observed_since = 0;
     size_t restarts = 0;
 
@@ -947,7 +947,7 @@ MountClaimResult claimMountAwaitingExpiry(
         /// set it (the common case: no write was attempted, so what it read is still current) instead of
         /// re-reading the SAME key here. The rare stale-race branches deliberately leave `.incarnation`
         /// unset (see their own comments), so this still falls back to a fresh read exactly there.
-        std::optional<Incarnation> current_incarnation = r.incarnation;
+        std::optional<Etag> current_incarnation = r.incarnation;
         if (!current_incarnation)
         {
             const auto got = op.read(l.mountKey(srid), Retry::standard());
@@ -1307,7 +1307,7 @@ String MountLeaseKeeper::encodeBody(
     });
 }
 
-const Incarnation & MountLeaseKeeper::precondition() const
+const Etag & MountLeaseKeeper::precondition() const
 {
     if (!last_incarnation)
         throw Exception(
@@ -1316,7 +1316,7 @@ const Incarnation & MountLeaseKeeper::precondition() const
     return *last_incarnation;
 }
 
-Incarnation MountLeaseKeeper::claim(CasOperation & op, const String & body)
+Etag MountLeaseKeeper::claim(CasOperation & op, const String & body)
 {
     /// One read decides the branch AND supplies the precondition, so both the mint and the adoption
     /// are two requests: a separate presence probe would only re-ask what these bytes already answer.
@@ -1328,7 +1328,7 @@ Incarnation MountLeaseKeeper::claim(CasOperation & op, const String & body)
             throw Exception(
                 ErrorCodes::ABORTED,
                 "CAS mount-lease: key '{}' appeared between the read and the create", key);
-        const std::optional<Incarnation> incarnation
+        const std::optional<Etag> incarnation
             = orThrow(std::move(minted), fmt::format("CAS mount-lease mint of key '{}'", key));
         emitMountEvent(
             event_sink, CasEventType::MountClaim, srid, "mint", nullptr,
@@ -1388,7 +1388,7 @@ Incarnation MountLeaseKeeper::claim(CasOperation & op, const String & body)
                 ErrorCodes::ABORTED,
                 "CAS mount-lease: key '{}' vanished while adopting our own mount slot", key);
     }
-    const std::optional<Incarnation> incarnation
+    const std::optional<Etag> incarnation
         = orThrow(std::move(adopted), fmt::format("CAS mount-lease adoption of key '{}'", key));
 
     emitMountEvent(
@@ -1409,7 +1409,7 @@ uint64_t MountLeaseKeeper::start(Liveness liveness)
     /// admitted under it would be refused on every request. What makes the claim safe is that every
     /// write below is conditional.
     CasOperation op = open_requests.admit(std::move(liveness));
-    const Incarnation incarnation = claim(op, body);
+    const Etag incarnation = claim(op, body);
 
     seq = 1;
     last_incarnation = incarnation;

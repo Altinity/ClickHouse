@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -41,7 +41,7 @@ struct OutcomeEntry
 {
     ObjectKind kind = ObjectKind::Blob;
     BlobRef ref{};
-    PersistedIncarnation token;
+    PersistedEtag token;
     OutcomeKind outcome = OutcomeKind::Spared;
 };
 

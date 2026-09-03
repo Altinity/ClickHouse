@@ -4,7 +4,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
@@ -634,9 +633,9 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     /// `encodePartManifest` is canonical/deterministic), so the engine's resolve read can prove whether
     /// an ambiguous attempt landed. Still NO preliminary HEAD.
     WriteResult staged = store->stagingPutIfAbsent(key, encoded);
-    const Incarnation manifest_incarnation = std::visit(detail::Overload{
-        [](Committed & committed) -> Incarnation { return std::move(committed.incarnation); },
-        [&](Conflict & conflict) -> Incarnation
+    const Etag manifest_incarnation = std::visit(detail::Overload{
+        [](Committed & committed) -> Etag { return std::move(committed.incarnation); },
+        [&](Conflict & conflict) -> Etag
         {
             /// Our own bytes under our own `ManifestId` name this same body, whoever wrote them; a
             /// DIFFERENT object under an id this build minted is a ManifestId collision, fail-closed
@@ -647,12 +646,12 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
                 "stageManifest: part-manifest key '{}' already holds {} that is not this manifest's body "
                 "-- a ManifestId collision", key, detail::renderObservation(conflict.seen));
         },
-        [&](Declined &) -> Incarnation
+        [&](Declined &) -> Etag
         {
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "stageManifest: the part-manifest create at '{}' declined; a create has nothing to decline", key);
         },
-        [&](Refused & refused) -> Incarnation
+        [&](Refused & refused) -> Etag
         {
             throwCasWriteRetryLater(fmt::format(
                 "stageManifest: part-manifest PUT at '{}' definitively failed ({}); "
@@ -661,7 +660,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
         /// Unlike the ref-log lane there is nothing to wedge: this id was never named by any owner
         /// transition (`next_manifest_ordinal` is already past it, so no re-stage ever reuses the key),
         /// and a late-landing body is inert unreferenced debris for the orphan-manifest sweep.
-        [&](GaveUp &) -> Incarnation
+        [&](GaveUp &) -> Etag
         {
             throwCasWriteRetryLater(fmt::format(
                 "stageManifest: part-manifest PUT at '{}' is UNCERTAIN (retry budget exhausted) — "

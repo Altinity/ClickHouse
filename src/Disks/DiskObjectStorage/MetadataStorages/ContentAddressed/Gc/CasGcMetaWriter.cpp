@@ -27,8 +27,8 @@ namespace
 {
 
 /// The registry key for one condemned incarnation: the persisted pair rendered the way a live
-/// `Incarnation` renders itself, so two dialects can never collide on a shared value.
-String condemnMarkerKey(const PersistedIncarnation & token)
+/// `Etag` renders itself, so two dialects can never collide on a shared value.
+String condemnMarkerKey(const PersistedEtag & token)
 {
     return token.dialect + ":" + token.value;
 }
@@ -144,14 +144,14 @@ void GcMetaWriter::submit(std::function<void()> op)
     }
 }
 
-void GcMetaWriter::scheduleCondemnMarkerWrite(const BlobRef & ref, const PersistedIncarnation & token,
+void GcMetaWriter::scheduleCondemnMarkerWrite(const BlobRef & ref, const PersistedEtag & token,
                                               uint64_t condemn_round, uint64_t size)
 {
     /// The job admits its OWN operation: a `CasOperation` carries per-call state and belongs to one
     /// task, while several of these run concurrently on the pool.
     submit([st = state, ref, token, condemn_round, size]()
     {
-        CasOperation op = st->store->gcRequests().admit();
+        CasOperation op = st->store->openRequests().admit();
         if (writeCondemnedMeta(op, st->store->layout(), ref, condemn_round, size))
             st->noteCondemnMarkerDurable(ref, token);
     });
@@ -161,7 +161,7 @@ void GcMetaWriter::scheduleConfirmedMetaDelete(const BlobRef & ref)
 {
     submit([st = state, ref]()
     {
-        CasOperation op = st->store->gcRequests().admit();
+        CasOperation op = st->store->openRequests().admit();
         deleteConfirmedMeta(op, st->store->layout(), ref);
     });
 }
@@ -201,35 +201,35 @@ uint64_t GcMetaWriter::completed() const
     return state->completed.load(std::memory_order_relaxed);
 }
 
-void GcMetaWriter::State::noteCondemnMarkerDurable(const BlobRef & ref, const PersistedIncarnation & token)
+void GcMetaWriter::State::noteCondemnMarkerDurable(const BlobRef & ref, const PersistedEtag & token)
 {
     std::lock_guard lock(condemn_marker_mutex);
     condemn_markers_confirmed.emplace(ref, condemnMarkerKey(token));
 }
 
-bool GcMetaWriter::State::condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedIncarnation & token)
+bool GcMetaWriter::State::condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedEtag & token)
 {
     std::lock_guard lock(condemn_marker_mutex);
     return condemn_markers_confirmed.contains({ref, condemnMarkerKey(token)});
 }
 
-void GcMetaWriter::State::forgetCondemnMarker(const BlobRef & ref, const PersistedIncarnation & token)
+void GcMetaWriter::State::forgetCondemnMarker(const BlobRef & ref, const PersistedEtag & token)
 {
     std::lock_guard lock(condemn_marker_mutex);
     condemn_markers_confirmed.erase({ref, condemnMarkerKey(token)});
 }
 
-void GcMetaWriter::noteCondemnMarkerDurable(const BlobRef & ref, const PersistedIncarnation & token)
+void GcMetaWriter::noteCondemnMarkerDurable(const BlobRef & ref, const PersistedEtag & token)
 {
     state->noteCondemnMarkerDurable(ref, token);
 }
 
-bool GcMetaWriter::condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedIncarnation & token)
+bool GcMetaWriter::condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedEtag & token)
 {
     return state->condemnMarkerConfirmedInProcess(ref, token);
 }
 
-void GcMetaWriter::forgetCondemnMarker(const BlobRef & ref, const PersistedIncarnation & token)
+void GcMetaWriter::forgetCondemnMarker(const BlobRef & ref, const PersistedEtag & token)
 {
     state->forgetCondemnMarker(ref, token);
 }

@@ -350,7 +350,7 @@ NamespaceProtection activeManifestKeys(
 
 NamespaceFoldView namespaceFoldView(Pool & store, const RootNamespace & ns)
 {
-    CasOperation op = store.gcRequests().admit();
+    CasOperation op = store.openRequests().admit();
     NamespaceFoldView view;
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, store.layout());
     catalog_cut.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
@@ -498,7 +498,7 @@ bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamesp
 
 bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
 {
-    CasOperation op = store.gcRequests().admit();
+    CasOperation op = store.openRequests().admit();
     return prefixEligibleOn(op, store.layout(), ns, prefix);
 }
 
@@ -506,7 +506,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
                         std::vector<String> * warnings)
 {
     const Layout & layout = store.layout();
-    CasOperation op = store.gcRequests().admit();
+    CasOperation op = store.openRequests().admit();
     if (!prefixEligibleOn(op, layout, ns, prefix))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
 
@@ -622,7 +622,7 @@ ManifestSweepResult planManifestCursorPage(
         return result;
 
     const Layout & layout = store.layout();
-    CasOperation op = store.gcRequests().admit();
+    CasOperation op = store.openRequests().admit();
     const KeyPage page = op.list(layout.casManifestsPrefix(), cursor, list_budget, Retry::standard());
     /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
     /// call), so the metric increments once per call, not once per listed key.
@@ -916,7 +916,7 @@ ManifestSweepResult planManifestCursorPage(
         ManifestSweepResult::Nomination nomination{
             .id = id,
             .key = parsed->key,
-            .token = PersistedIncarnation::capture(got->incarnation),
+            .token = PersistedEtag::capture(got->incarnation),
             .source_retirements = {}};
         for (const ManifestEntry & entry : body->entries)
             if (entry.placement == EntryPlacement::Blob)

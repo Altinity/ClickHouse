@@ -29,7 +29,7 @@ GcMaintenanceReadResult readGcMaintenanceState(CasOperation & op, const Layout &
 }
 
 WriteResult casGcMaintenanceState(
-    CasOperation & op, const Layout & layout, const std::optional<Incarnation> & expected,
+    CasOperation & op, const Layout & layout, const std::optional<Etag> & expected,
     const GcMaintenanceState & next, const Retry & policy)
 {
     const String key = layout.gcMaintenanceStateKey();

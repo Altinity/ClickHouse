@@ -55,7 +55,7 @@ A second waste rides along: `get` issues a `HEAD` and a `GET` though a `GET` ret
 
 ## The contract {#the-contract}
 
-> **An `Incarnation` is minted only by `CasRequests`, from a transport response, of one key, and names
+> **An `Etag` is minted only by `CasRequests`, from a transport response, of one key, and names
 > exactly one version.** Nothing else can produce one, and nothing can apply it to another key.
 >
 > **`Backend` is transport: one physical request per call, strings in and strings out, and no call can
@@ -91,7 +91,7 @@ A second waste rides along: `get` issues a `HEAD` and a `GET` though a `GET` ret
 ## One type {#one-type}
 
 ```cpp
-class Incarnation;   // opaque; operator==; created only by CasRequests; no default constructor
+class Etag;   // opaque; operator==; created only by CasRequests; no default constructor
                      // privately {backend id, key, dialect, value}; render() -> "dialect:value"
 ```
 
@@ -101,13 +101,13 @@ incarnation of another key or of another backend throws `LOGICAL_ERROR`: a progr
 store answer. "Backend identity" is a per-instance counter id, never the address; the mount plane, the
 GC plane and the tools each hold a `CasRequests` over the same `Pool`-owned backend, and their
 incarnations are interchangeable by design (the mount observation map and GC's manifest-cleanup map
-cross planes). A holder that keeps an `Incarnation` across calls — `MountLeaseKeeper::last_token`, the
+cross planes). A holder that keeps an `Etag` across calls — `MountLeaseKeeper::last_token`, the
 mount observation map, GC's manifest-cleanup map, `CasBlobInDegree`'s condemned rows — must not
 outlive the backend; all of them are owned by the `Pool` that owns it.
 
 ```cpp
-static_assert(!std::is_default_constructible_v<Incarnation>);
-static_assert(!std::is_constructible_v<Incarnation, String>);
+static_assert(!std::is_default_constructible_v<Etag>);
+static_assert(!std::is_constructible_v<Etag, String>);
 static_assert(!std::is_default_constructible_v<TransportAccess>);
 static_assert(!std::is_copy_constructible_v<TransportAccess>);
 ```
@@ -125,7 +125,7 @@ dialect it knows from the backend it wraps:
 
 A value that fails is not an incarnation: `CORRUPTED_DATA` naming the key on a read; the anomaly in
 [the write anomaly](#write-anomaly) on a write. `list` mints through the same path where it surfaces
-per-key values. `mintingTypeMatches` is deleted. "Not yet" is spelled `std::optional<Incarnation>`;
+per-key values. `mintingTypeMatches` is deleted. "Not yet" is spelled `std::optional<Etag>`;
 the sites that default-construct a `Token` today become optionals or are restructured.
 
 ## Two layers {#two-layers}
@@ -187,9 +187,9 @@ Overrides may sit under any access specifier; the production backends and the te
 **signatures** (`Token` → `String`, `GetResult` → `Raw`), not access.
 
 Why strings: the backend must consume the expected value on `write` and `remove` and produce the
-observed one on every read, and if it did that in `Incarnation`s it would need to mint — a protected
+observed one on every read, and if it did that in `Etag`s it would need to mint — a protected
 minter every subclass inherits, which is the string-to-incarnation door under another name. So the
-transport never sees the type. `CasRequests` extracts the value from an `Incarnation` it has verified
+transport never sees the type. `CasRequests` extracts the value from an `Etag` it has verified
 belongs to this key and this backend, and mints the response's value under the grammar above. The
 type exists on one side of the key.
 
@@ -254,19 +254,19 @@ public:
     std::optional<Meta>         head  (key, const Retry &);
     ListPage                    list  (prefix, cursor, limit, const Retry &);
     void                        forEachListedKey(prefix, Fn, const Retry & per_page, page_limit = 1000, on_page_fetched = {});   // Fn returns bool: false stops the walk
-    Removal                     remove(key, Incarnation seen, const Retry &);
+    Removal                     remove(key, Etag seen, const Retry &);
     Removal                     removeCurrent(key, const Retry &);           // head → remove(seen), re-head on Mismatch
     SentinelProbe               probeSentinel(key, const Retry &);
     std::unique_ptr<ReadBuffer> stream(key, const Retry &);                  // the OPEN is under policy; the body is the SDK's
     void                        publish(BlobPublishRequest, const Retry &);  // the INITIATION is under policy
 
     WriteResult create (key, bytes,                   const Retry &);
-    WriteResult replace(key, bytes, Incarnation seen, const Retry &);
+    WriteResult replace(key, bytes, Etag seen, const Retry &);
     WriteResult readModifyWrite          (key, DecideOnObject, const Retry &);   // reads the body
     WriteResult readModifyWriteOnPresence(key, DecideOnMeta,   const Retry &);   // HEAD only; one site
 };
-struct Object { String bytes;  Incarnation incarnation; };
-struct Meta   { uint64_t size; Incarnation incarnation; };
+struct Object { String bytes;  Etag incarnation; };
+struct Meta   { uint64_t size; Etag incarnation; };
 enum class Removal { Removed, Gone, Mismatch };                       // a delete marker throws CAS_DELETE_MARKER, carrying the store's answer
 ```
 
@@ -321,7 +321,7 @@ struct NotObserved {};                 // no read happened: admission was refuse
 struct ProvenAbsent {};                // the resolve read completed and found no object
 using Observation = std::variant<NotObserved, ProvenAbsent, Meta, Object>;   // Meta from a presence-only resolve, Object from a body read
 
-struct Committed { Incarnation incarnation; uint32_t attempts_sent; bool resolved_by_read; };
+struct Committed { Etag incarnation; uint32_t attempts_sent; bool resolved_by_read; };
 struct Declined  { Observation seen; };                      // readModifyWrite only: decide returned nullopt
 struct Conflict  { Observation seen; };
 struct Refused   { int store_error; String message; };      // the store proved this write never applied (the definite-failure whitelist)
@@ -333,7 +333,7 @@ struct GaveUp
     Observation last_seen;
 };
 using WriteResult = std::variant<Committed, Declined, Conflict, Refused, GaveUp>;
-std::optional<Incarnation> orThrow(WriteResult &&);          // Committed → its incarnation; Declined → nullopt; the rest throw, table below
+std::optional<Etag> orThrow(WriteResult &&);          // Committed → its incarnation; Declined → nullopt; the rest throw, table below
 ```
 
 `orThrow` throws, per alternative: `Conflict` → `ABORTED` with the observation rendered;
@@ -346,7 +346,7 @@ A controlled write has three outcomes today, and the third is consumed as a **pr
 diagnostic: `CasRefLedger::commitRefChunk` releases the transaction id only when the unresolved
 reason proves nothing was sent and wedges otherwise; the recovery walk and the wedge retry act on the
 same bit; `MountLeaseKeeper::renew` classifies `Committed` / `Conflict` / `NotAttempted` / `Vanished`
-from the controller's fields. `std::expected<Incarnation, Conflict>` could express none of it and
+from the controller's fields. `std::expected<Etag, Conflict>` could express none of it and
 would have collapsed "gave up" into an exception — precisely the bare-`Unresolved` collapse the ref
 lane guards against. `sent_any` is the bit the wedge decision needs (today's
 `unresolvedProvesNothingWasSent`, whose header says adding a member is a protocol decision — it stays
@@ -723,10 +723,10 @@ GC must remember which publication it condemned — a republished blob is payloa
 condemned one and byte-different only by its envelope's `incarnation_tag`, which is what makes a
 content-derived ETag differ. It persists the two strings the `cas_run` format already carries,
 `token_type` and `token`, and the type those fields have today is `Token`, which this design deletes.
-Their type becomes `PersistedIncarnation { String dialect; String value; }` — the target for
+Their type becomes `PersistedEtag { String dialect; String value; }` — the target for
 `TokenFields::build` and `writeTokenFields` in the wire vocabulary, the record-stream and outcomes
 formats, and `CasBlobInDegree`'s condemned rows —
-with one operation, comparison against a `render()`, and **no path to an `Incarnation`**; the
+with one operation, comparison against a `render()`, and **no path to an `Etag`**; the
 "no inverse" rule lives in that type. The persisted pair is compared, as text, against the rendering
 of a live observation of the same key:
 
@@ -832,7 +832,7 @@ safe are these.
 3. **`CasRequests`, `CasOperation`, `Retry`, `WriteResult` and `TransportAccess` beside the old,
    independent of it.** The new engine is today's controller's algorithm with three changes — jitter,
    reads, the deadline as the only bound — under the new verbs, minting from the transport's strings.
-   The old controller is **not** rewired onto it: delegation would need a `Token`→`Incarnation`
+   The old controller is **not** rewired onto it: delegation would need a `Token`→`Etag`
    conversion, which is the door, so two engines coexist for the length of the migration and the old
    one is deleted whole at step 5. The `Backend` interface gains the new string-and-key signatures
    here, and the production backends implement both sets until step 5. **The new methods are the
@@ -870,7 +870,7 @@ needed immediately — and the retries on step 3.
 
 ## Verification {#verification}
 
-**Compile time.** The four `static_assert`s; no valued `Incarnation` construction outside
+**Compile time.** The four `static_assert`s; no valued `Etag` construction outside
 `CasRequests`; a `Backend` transport method called from anywhere without a `TransportAccess` does
 not compile, including from a test and from code holding the concrete backend type; a verb without a
 `Retry` does not compile; a verb outside an operation does not exist.
@@ -972,7 +972,7 @@ every step; `Cas::Probe` passes on every supported writable store.
 7. Every control-plane request is one physical attempt (a `list` verb may be several
    `ListObjectsV2` pages, prefetched off-thread) and credential rotation recovers on every verb within
    one engine reissue; no needless `HEAD` and no needless `GET`; `read` throws on drift and on the bound; no
-   string becomes an `Incarnation` anywhere; `remove` never reports `Mismatch` for any reason other
+   string becomes an `Etag` anywhere; `remove` never reports `Mismatch` for any reason other
    than the store's own; `attempt_timeout_ms` and `lease_safety_margin_ms` are parsed disk settings.
 8. Existing lanes and gates green at every step.
 
@@ -1024,7 +1024,7 @@ slice bodies had no refresh; admitted the farewell under the mount fence that a 
 trips; left the two hand-written loops with no shared bound; carried a `Cancelled` nothing produced;
 and deleted `Token` without naming the persisted pair's new type. Revision 10 stated the lease
 guarantee on the start side, admitted the farewell against an open fence, gave the hand-written loops
-one `Retry` and the engine's sleep, dropped `Cancelled`, named `PersistedIncarnation`, and let a list
+one `Retry` and the engine's sleep, dropped `Cancelled`, named `PersistedEtag`, and let a list
 walk stop. **Revision 10** still had an expired credential on both sides of the classification
 (today's shared access-denied helper names it, so the write path treats it as definite), stated
 "every conflict is resolved" only for `once` while the renewer's `Vanished` needs it everywhere,

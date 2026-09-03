@@ -16,7 +16,7 @@ namespace DB::Cas
 struct LoadedMeta
 {
     BlobMeta meta;
-    Incarnation incarnation;
+    Etag incarnation;
 };
 
 /// Shared lifecycle operations for the blob freshness marker used by the writer and GC. The key is
@@ -47,12 +47,12 @@ WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const Blob
 /// A competing write is reported as `Conflict` carrying what the resolve read observed, never thrown,
 /// so the caller's own reload-and-retry reconciliation decides what to do about it.
 WriteResult casMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,
-                    const Incarnation & expected, const BlobMeta & meta);
+                    const Etag & expected, const BlobMeta & meta);
 
 /// Deletes only the marker incarnation named by `expected`. `Mismatch` leaves the current marker
 /// untouched and is distinct from `Gone`, so callers can tell absence from a raced replacement. A
 /// versioned bucket that archives instead of reclaiming raises `CAS_DELETE_MARKER`.
 Removal deleteMetaExact(CasOperation & op, const Layout & layout, const BlobRef & ref,
-                        const Incarnation & expected);
+                        const Etag & expected);
 
 }

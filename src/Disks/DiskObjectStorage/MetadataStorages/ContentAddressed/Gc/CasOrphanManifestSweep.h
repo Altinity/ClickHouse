@@ -138,7 +138,7 @@ struct ManifestSweepResult
     {
         ManifestId id;
         String key;
-        PersistedIncarnation token;
+        PersistedEtag token;
         std::vector<BlobSourceRetirement> source_retirements;
     };
     std::vector<Nomination> nominations;

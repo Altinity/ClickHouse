@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
@@ -33,7 +33,7 @@ public:
     /// pair is recorded in the in-process confirmation registry, which the graduation gate reads. A
     /// refused write or a thrown error leaves the pair UNCONFIRMED: the gate then carries the entry and
     /// a later round retries the write.
-    void scheduleCondemnMarkerWrite(const BlobRef & ref, const PersistedIncarnation & token,
+    void scheduleCondemnMarkerWrite(const BlobRef & ref, const PersistedEtag & token,
                                     uint64_t condemn_round, uint64_t size);
 
     /// Drop the freshness meta of a blob whose body is confirmed deleted or absent.
@@ -53,12 +53,12 @@ public:
 
     /// The in-process condemn-marker confirmation registry, keyed (blob, rendered incarnation). It is
     /// keyed by the PERSISTED pair because every entry that consults it arrives from a durable
-    /// condemned row; a live observation enters through `PersistedIncarnation::capture`. Pool
+    /// condemned row; a live observation enters through `PersistedEtag::capture`. Pool
     /// completions insert concurrently with the round thread's reads, and the round thread also
     /// inserts directly when it re-checks a marker synchronously.
-    void noteCondemnMarkerDurable(const BlobRef & ref, const PersistedIncarnation & token);
-    bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedIncarnation & token);
-    void forgetCondemnMarker(const BlobRef & ref, const PersistedIncarnation & token);
+    void noteCondemnMarkerDurable(const BlobRef & ref, const PersistedEtag & token);
+    bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedEtag & token);
+    void forgetCondemnMarker(const BlobRef & ref, const PersistedEtag & token);
 
 private:
     /// Everything a job reaches. Held by `shared_ptr` and captured by value into every job.
@@ -71,9 +71,9 @@ private:
         std::mutex condemn_marker_mutex;
         std::set<std::pair<BlobRef, String>> condemn_markers_confirmed;
 
-        void noteCondemnMarkerDurable(const BlobRef & ref, const PersistedIncarnation & token);
-        bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedIncarnation & token);
-        void forgetCondemnMarker(const BlobRef & ref, const PersistedIncarnation & token);
+        void noteCondemnMarkerDurable(const BlobRef & ref, const PersistedEtag & token);
+        bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedEtag & token);
+        void forgetCondemnMarker(const BlobRef & ref, const PersistedEtag & token);
     };
 
     /// Catch each meta-operation exception, count the job, and put it on the pool -- running it

@@ -26,7 +26,7 @@ struct RetiredEntry
 {
     ObjectKind kind = ObjectKind::Blob;
     BlobRef ref{};
-    PersistedIncarnation token;   /// the exact incarnation GC observed; the delete re-heads and compares it
+    PersistedEtag token;   /// the exact incarnation GC observed; the delete re-heads and compares it
     uint64_t size = 0;
     uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (round-paced
                                   /// graduation: an entry graduates only once condemn_round < the
@@ -79,11 +79,11 @@ void assertValidSourceEdgeId(const UInt128 & source_id);
 struct CondemnedRow
 {
     bool delete_pending = false;
-    PersistedIncarnation token;   // the incarnation the exact-token delete must re-observe
+    PersistedEtag token;   // the incarnation the exact-token delete must re-observe
     uint64_t size = 0;
     uint64_t condemn_round = 0;
     bool marker_confirmed = false;   // durable Condemned meta confirmed (graduation gate)
-    /// Spelled out rather than defaulted because `PersistedIncarnation` carries no equality of its
+    /// Spelled out rather than defaulted because `PersistedEtag` carries no equality of its
     /// own. A field added above belongs here too.
     bool operator==(const CondemnedRow & o) const
     {
@@ -215,7 +215,7 @@ struct BlobCandidate
 struct ReplacedEntry
 {
     RetiredEntry fresh;   /// the freshly condemned CURRENT incarnation (also pushed into still_retired byte-identically)
-    PersistedIncarnation old_token;   /// the superseded (stale) entry's — what republication replaced
+    PersistedEtag old_token;   /// the superseded (stale) entry's — what republication replaced
 };
 
 /// One example of an unmatched-remove delta, kept for the caller's single once-per-round WARNING

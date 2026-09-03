@@ -12,7 +12,7 @@ struct GcMaintenanceReadResult
 {
     GcMaintenanceReadStatus status;
     std::optional<GcMaintenanceState> state;
-    std::optional<Incarnation> incarnation;
+    std::optional<Etag> incarnation;
     String diagnostic;
 };
 
@@ -22,7 +22,7 @@ GcMaintenanceReadResult readGcMaintenanceState(CasOperation & op, const Layout &
 /// already-failed step (a reset after a failed enumeration) must send at most one attempt rather than
 /// spend the round's remaining time retrying a write nothing downstream is waiting on.
 WriteResult casGcMaintenanceState(
-    CasOperation & op, const Layout & layout, const std::optional<Incarnation> & expected,
+    CasOperation & op, const Layout & layout, const std::optional<Etag> & expected,
     const GcMaintenanceState & next, const Retry & policy);
 
 }

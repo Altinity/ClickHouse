@@ -64,7 +64,7 @@ uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vecto
     {
         try
         {
-            std::optional<Incarnation> incarnation = listed.incarnation;
+            std::optional<Etag> incarnation = listed.incarnation;
             if (!incarnation)
             {
                 const std::optional<Meta> head = op.head(listed.key, Retry::standard());
@@ -96,7 +96,7 @@ uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vecto
 /// Delete one slot control object by an incarnation captured at the protocol-defined fence point. Slot
 /// retirement is fail-closed: unlike the debris drains above, any non-`Removed` outcome or exception
 /// stops the tail before it can touch the next control object.
-bool deleteSlotObject(CasOperation & op, const String & key, const Incarnation & incarnation, std::vector<String> & warnings)
+bool deleteSlotObject(CasOperation & op, const String & key, const Etag & incarnation, std::vector<String> & warnings)
 {
     try
     {

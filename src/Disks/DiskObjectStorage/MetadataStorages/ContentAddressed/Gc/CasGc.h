@@ -454,7 +454,7 @@ public:
         String key;
         uint64_t size = 0;
         String reason;          /// "unreachable" | "delete_pending" | "awaiting_graduation"
-        PersistedIncarnation token;   /// stored condemn-time incarnation (empty for "unreachable")
+        PersistedEtag token;   /// stored condemn-time incarnation (empty for "unreachable")
         uint64_t condemn_round = 0;
     };
 
@@ -513,7 +513,7 @@ private:
     /// committed gc/state (with our lease) and `state_incarnation` the incarnation that write created.
     /// `allow_steal=false` suppresses only the steal (see runRegularRound's doc comment) — acquiring a
     /// free lease and renewing our own are unaffected.
-    bool acquireOrRenewLease(GcState & state, std::optional<Incarnation> & state_incarnation, bool allow_steal);
+    bool acquireOrRenewLease(GcState & state, std::optional<Etag> & state_incarnation, bool allow_steal);
 
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
@@ -538,7 +538,7 @@ private:
     {
         CasFoldSeal fold_seal;
         std::vector<std::pair<RootNamespace, uint64_t>> root_shards;
-        std::map<ManifestId, Incarnation> mf_cleanup;
+        std::map<ManifestId, Etag> mf_cleanup;
         /// Bounded orphan candidates exact-read before reduce. Their source retirements ride this
         /// fold's runs; their manifest tokens become deletable only after the round CAS adopts them.
         ManifestSweepResult orphan_sweep;
@@ -696,7 +696,7 @@ private:
     /// in-memory; the SINGLE round CAS commits them.
     /// `walk_plan` owns the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`) and
     /// its catalog cut; the fold regroups those keys strictly rather than listing the prefix again.
-    FoldResult fold(GcState & state, std::optional<Incarnation> & state_incarnation,
+    FoldResult fold(GcState & state, std::optional<Etag> & state_incarnation,
                     RoundReport & report, uint64_t current_round,
                     const RefPlan & walk_plan, UniversePolicy policy,
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
@@ -786,7 +786,7 @@ private:
     /// `txn_ordinal` stamps every delta this call pushes with the round-local ordinal of the ref
     /// transaction that emitted it (probe B2 — see `TxnApplyLedger`).
     bool foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
-                           std::map<ManifestId, Incarnation> & mf_cleanup, uint32_t txn_ordinal);
+                           std::map<ManifestId, Etag> & mf_cleanup, uint32_t txn_ordinal);
 
 
 

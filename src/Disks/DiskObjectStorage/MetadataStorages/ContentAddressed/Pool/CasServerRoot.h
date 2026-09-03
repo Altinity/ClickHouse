@@ -244,7 +244,7 @@ struct MountClaimResult
     /// loop would otherwise re-read the mount key just to recover what `claimMount` had already read
     /// one line earlier and thrown away -- one wasted read per iteration. Empty for every other
     /// `Kind` (nothing to compare against).
-    std::optional<Incarnation> incarnation;
+    std::optional<Etag> incarnation;
 };
 
 /// Thrown when a mount operation observes that OUR OWN (uuid, epoch) slot was `gc_fenced` by the GC
@@ -267,7 +267,7 @@ public:
 /// attempt with no such proof.
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
-    uint64_t now_ms, uint64_t ttl_ms, const std::optional<Incarnation> & proven_dead_incarnation = {},
+    uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation = {},
     const CasEventSink & sink = {});
 
 /// Format the operator-actionable startup error shown when the mount lease is held by a genuinely
@@ -321,7 +321,7 @@ MountClaimResult claimMountAwaitingExpiry(
 /// tight poll loop.
 struct MountIncarnationObservation
 {
-    Incarnation incarnation;
+    Etag incarnation;
     uint64_t first_seen_mono_ms = 0;
 };
 
@@ -533,10 +533,10 @@ private:
     String encodeBody(uint64_t seq_, uint64_t wall_ms, uint64_t min_active_build_sequence, UInt128 write_attempt_id) const;
     /// The incarnation every guarded write of this slot names. Engaged for exactly the states that
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
-    const Incarnation & precondition() const;
+    const Etag & precondition() const;
     /// One renewal admitted on `plane`; `renew` and `renewForRemount` differ only in which they pass.
     MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment);
-    Incarnation claim(CasOperation & op, const String & body);
+    Etag claim(CasOperation & op, const String & body);
     [[noreturn]] void throwRenewConflict(const Observation & seen) const;
     MountRenewResult terminalResult(MountRenewResult result);
     void terminate(CasOperation & op);
@@ -560,7 +560,7 @@ private:
     uint64_t seq = 0;
     /// The incarnation our last landed write created; every renewal and the farewell name it as the
     /// precondition. Unset only before `start` has landed one.
-    std::optional<Incarnation> last_incarnation;
+    std::optional<Etag> last_incarnation;
     uint64_t confirmed_deadline_boot_ms = 0;
     uint64_t last_committed_attempt_start_boot_ms = 0;
 };

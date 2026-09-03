@@ -103,7 +103,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
         if (ambiguous || suppress_deletes || catalog_cut.life_index.resolve(*life_id))
             continue;
 
-        std::optional<Incarnation> incarnation = listed.incarnation;
+        std::optional<Etag> incarnation = listed.incarnation;
         if (!incarnation)
         {
             try
