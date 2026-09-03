@@ -50,7 +50,8 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
 {
-    return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
+    DB::Cas::tests::OperationForTest op(b);
+    return (*op).head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)}), Retry::standard()).has_value();
 }
 
 /// A committed `RefOwnerBinding` for a raw `owner_transition` op. The raw appender is now
