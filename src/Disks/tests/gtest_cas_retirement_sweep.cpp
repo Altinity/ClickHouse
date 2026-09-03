@@ -154,14 +154,21 @@ public:
 
 /// GC's fence-out applied directly to the mount lease: preserve the body, set `gc_fenced`, bump `seq`
 /// (token-guarded). A subsequent `tryRemountOnce` then reclaims a fresh incarnation.
+bool headExists(Backend & backend, const String & key)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    return (*op).head(key, Retry::standard()).has_value();
+}
+
 void fenceOutMount(Backend & backend, const String & mount_key)
 {
-    const auto got = backend.get(mount_key);
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto got = (*op).read(mount_key, Retry::standard());
     ASSERT_TRUE(got.has_value());
     MountLease m = decodeMountLease(got->bytes);
     m.gc_fenced = true;
     m.seq += 1;
-    ASSERT_EQ(backend.putOverwrite(mount_key, encodeMountLease(m), got->token).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(mount_key, encodeMountLease(m), got->incarnation, Retry::standard())));
 }
 
 /// Publish one part `ref` with a single content blob whose payload is `payload`.
@@ -188,12 +195,13 @@ ManifestId publishOneBlobPart(const PoolPtr & s, const RootNamespace & ns, const
 /// Every ref-log key of `ns` currently listed, in key order.
 std::set<String> listRefLogKeys(Backend & b, const Layout & l, const RootNamespace & ns)
 {
+    DB::Cas::tests::OperationForTest op(b);
     std::set<String> out;
     String cursor;
     while (true)
     {
-        const ListPage page = b.list(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
-        for (const ListedKey & k : page.keys)
+        const KeyPage page = (*op).list(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
+        for (const KeyEntry & k : page.keys)
             if (const auto parsed = l.parseRefObjectKey(k.key); parsed && parsed->kind == RefObjectKind::Log)
                 out.insert(k.key);
         if (page.next_cursor.empty())
@@ -254,7 +262,7 @@ TEST(CASRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
     store->renewWatermarkOnce();
     const String blob_key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128,
                                                    BlobDigest::fromU128(u128Of(payload))});
-    ASSERT_TRUE(backend->head(blob_key).exists);
+    ASSERT_TRUE(headExists(*backend, blob_key));
 
     const std::set<String> before_drop = listRefLogKeys(*backend, layout, ns);
     store->dropRef(ns, "part_a");
@@ -276,7 +284,7 @@ TEST(CASRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
     }
     ASSERT_TRUE(backend->holeServed()) << "the sabotage never fired";
 
-    EXPECT_FALSE(backend->head(blob_key).exists)
+    EXPECT_FALSE(headExists(*backend, blob_key))
         << "the removal was hidden from one enumeration and never folded -- the retention half of the "
            "skipped-transaction class, which arithmetic intake is supposed to close";
 }
@@ -332,7 +340,6 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
 {
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
@@ -377,7 +384,7 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     const RefTxnId greatest = greatestLoggedId(*backend, layout, ns);
     ASSERT_EQ(greatest.writer_epoch, 1u);
     const RefTxnId straggler_slot{greatest.writer_epoch, greatest.ref_sequence + 1};
-    ASSERT_FALSE(backend->head(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot)).exists)
+    ASSERT_FALSE(headExists(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot)))
         << "the slot must be empty before recovery -- otherwise this test proves nothing about who won";
 
     /// Fence and remount. No wait: this is the case that used to cost 30 seconds.
@@ -393,13 +400,15 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     /// landed, which is precisely the state that leaves a straggler outstanding.
     backend->fault_key_substr.clear();
     EXPECT_EQ(store->listRefs(ns).size(), 1u);
-    ASSERT_TRUE(backend->head(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot)).exists)
+    ASSERT_TRUE(headExists(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot)))
         << "recovery did not seal the dead epoch at the slot a straggler would take -- without that "
            "seal there is nothing for the straggler's create to lose to";
 
     /// THE STRAGGLER ARRIVES. Its conditional create is refused, whenever it happens to land.
-    const PutResult put = backend->putIfAbsent(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot), "ghost-body");
-    EXPECT_EQ(put.outcome, PutOutcome::PreconditionFailed)
+    DB::Cas::tests::OperationForTest straggler_op(backend);
+    const WriteResult put = (*straggler_op).create(
+        layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot), "ghost-body", Retry::once());
+    EXPECT_TRUE(std::holds_alternative<Conflict>(put))
         << "the dying epoch's straggler overwrote (or joined) a slot the successor had already sealed";
 }
 
