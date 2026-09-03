@@ -201,7 +201,7 @@ void writeFsckCheckpoint(Backend & backend, const Layout & layout, const RootNam
         .last_epoch_seal = std::nullopt});
     const auto current = op.head(key, Retry::once());
     const WriteResult put = current
-        ? op.replace(key, body, current->incarnation, Retry::once())
+        ? op.replace(key, body, current->etag, Retry::once())
         : op.create(key, body, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(put));
 }
@@ -254,9 +254,9 @@ void replaceCatalogLife(Backend & backend, const Layout & layout, const RootName
     it->state = NsState::Live;
     it->creator.reset();
     it->removal_started_round.reset();
-    ASSERT_TRUE(current.incarnation.has_value());
+    ASSERT_TRUE(current.etag.has_value());
     ASSERT_TRUE(std::holds_alternative<Committed>(
-        op.replace(layout.refCatalogKey(), encodeRefCatalog(current.catalog), *current.incarnation, Retry::standard())));
+        op.replace(layout.refCatalogKey(), encodeRefCatalog(current.catalog), *current.etag, Retry::standard())));
 }
 
 FsckReport runFsckWithListingMode(FsckListingMode mode, std::string_view suffix)
@@ -349,7 +349,7 @@ FsckReport runCheckpointBaseFsckWithListingMode(
         const auto head = op.head(base_snapshot_key, Retry::once());
         EXPECT_TRUE(head.has_value());
         if (head)
-            EXPECT_EQ(op.remove(base_snapshot_key, head->incarnation, Retry::once()), Removal::Removed);
+            EXPECT_EQ(op.remove(base_snapshot_key, head->etag, Retry::once()), Removal::Removed);
     }
     else
     {
@@ -495,7 +495,7 @@ TEST(CASFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
         const auto catalog_head = op.head(store->layout().refCatalogKey(), Retry::once());
         ASSERT_TRUE(catalog_head.has_value());
         ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(store->layout().refCatalogKey(), encodeRefCatalog(snapshot.catalog),
-            catalog_head->incarnation, Retry::once())));
+            catalog_head->etag, Retry::once())));
     }
 
     FsckReport rep;
@@ -630,7 +630,7 @@ TEST(CASFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgr
         [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
     const auto catalog_head = op.head(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(catalog_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(layout.refCatalogKey(), encodeRefCatalog(snapshot.catalog), catalog_head->incarnation, Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(layout.refCatalogKey(), encodeRefCatalog(snapshot.catalog), catalog_head->etag, Retry::once())));
 
     FsckReport report;
     ASSERT_NO_THROW(report = runFsck(*store, /*detail=*/true));
@@ -675,7 +675,7 @@ TEST(CASFsck, AmbiguousLifeUnderAPhysicalKeyIsRecordedNotAborted)
         [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
     const auto catalog_head = op.head(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(catalog_head.has_value());
-    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(layout.refCatalogKey(), encodeRefCatalog(snapshot.catalog), catalog_head->incarnation, Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(layout.refCatalogKey(), encodeRefCatalog(snapshot.catalog), catalog_head->etag, Retry::once())));
 
     FsckReport report;
     ASSERT_NO_THROW(report = runFsck(*store, /*detail=*/true))
@@ -1024,7 +1024,7 @@ TEST(CASFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
             .life_epoch = 1,
             .committed_through = std::nullopt,
             .checkpoint_snapshot_id = std::nullopt,
-            .last_epoch_seal = std::nullopt}), head->incarnation, Retry::once())));
+            .last_epoch_seal = std::nullopt}), head->etag, Retry::once())));
     });
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
@@ -1401,7 +1401,7 @@ TEST(CASFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
         OperationForTest nested_op(*backend);
         const auto head = (*nested_op).head(old_key, Retry::once());
         ASSERT_TRUE(head.has_value());
-        (*nested_op).remove(old_key, head->incarnation, Retry::once());   /// legitimate GC delete of the now-unreferenced blob
+        (*nested_op).remove(old_key, head->etag, Retry::once());   /// legitimate GC delete of the now-unreferenced blob
     });
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
@@ -1435,7 +1435,7 @@ TEST(CASFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
         OperationForTest nested_op(*backend);
         const auto head = (*nested_op).head(old_key, Retry::once());
         ASSERT_TRUE(head.has_value());
-        (*nested_op).remove(old_key, head->incarnation, Retry::once());   /// legitimate GC delete after the drop folds
+        (*nested_op).remove(old_key, head->etag, Retry::once());   /// legitimate GC delete after the drop folds
     });
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
@@ -1463,7 +1463,7 @@ TEST(CASFsck, RealDanglingStillCaughtAfterReresolve)
     OperationForTest op(*backend);
     const auto head = (*op).head(key, Retry::once());
     ASSERT_TRUE(head.has_value());
-    (*op).remove(key, head->incarnation, Retry::once());   /// genuine loss — the ref is UNCHANGED, still names this blob
+    (*op).remove(key, head->etag, Retry::once());   /// genuine loss — the ref is UNCHANGED, still names this blob
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_EQ(rep.dangling, 1u);
@@ -1504,7 +1504,7 @@ TEST(CASFsck, PhantomDanglingManifestFromRepublishedRefIsReresolvedAway)
         OperationForTest nested_op(*backend);
         const auto head = (*nested_op).head(m1_key, Retry::once());
         ASSERT_TRUE(head.has_value());
-        (*nested_op).remove(m1_key, head->incarnation, Retry::once());   /// legitimate GC delete of the superseded manifest
+        (*nested_op).remove(m1_key, head->etag, Retry::once());   /// legitimate GC delete of the superseded manifest
     });
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
