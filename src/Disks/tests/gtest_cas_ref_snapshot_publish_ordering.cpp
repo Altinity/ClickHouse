@@ -363,7 +363,6 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     /// backoff decisions on is a DIFFERENT clock, and stays frozen between steps.
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
 
     uint64_t fake_now = 1'000'000;
@@ -489,7 +488,6 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
     /// so the budget only has to keep the mount lease admitting.
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
 
     uint64_t fake_now = 2'000'000;
