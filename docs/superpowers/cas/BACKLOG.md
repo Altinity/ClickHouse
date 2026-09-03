@@ -77,11 +77,6 @@ branches return the observed body), 3 design-accepted, 2 rejected, 2 prose. What
   `Committed`; `Conflict::seen` may be `NotObserved`); one extra `GET` on the pool-meta union path and on its
   lost-create path (the steady-state open stays one `GET`); one extra `GET` on the lost marker-create path of
   blob publication.
-- **Comments to rewrite** (code-comment half of Task 25): the `Backend/` bullet of
-  `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md` names the deleted
-  `CasRequestControl` and the deleted token-aware verbs; `CasBackend.h`'s `ProbeOutcome` comment claims
-  ordinary reads flatten container, permission and transport faults into absence, which `isObjectNotFound`
-  does not do (only an authoritative key miss becomes absence; everything else propagates to the engine).
 
 Append new items here — quick adds and concurrent-agent findings land in this section, unformatted
 is fine. They get triaged into the topic files above during the next grooming pass. Do not delete
@@ -100,18 +95,53 @@ Closed by the request-contract spec revision 13 and the operator-docs update
 - SPEC DRIFT (engine fix round): the `Why::Unresolved` `last_seen` enumeration now includes the precondition-unchanged `Object`/`Meta` case; the resolve order for `replace` (unchanged precondition first, byte equality only once it has moved) is corrected; ambiguity is stated as scoped to one inner write of a `readModifyWrite`, with the other `WriteState` fields call-wide.
 - CP4′ fixer calibration note: the engine reserves `Backend::attemptTimeoutMs()` per attempt, not `CasRequestBudget::attempt_timeout_ms`; stated in the spec's reservation paragraph (the `~Pool` destructor policy this bullet also carried is an architecture note, not a docs claim, and is recorded as-is in the rulings doc).
 
+### Resolved 2026-09-03 — source-comment pass (Task 25) {#inbox-resolved-2026-09-03-source-comments}
+Closed by the code-comment half of Task 25 (`26b9ba8a495`). Each item was verified against the current
+code before being touched; comments now state the reason and drop plan/review provenance.
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md`'s `Backend/` bullet named the
+  deleted `CasRequestControl` and the deleted token-aware verbs; rewritten to name `CasBackend`'s
+  transport primitives and `CasRequests`.
+- `Backend/CasBackend.h`'s `ProbeOutcome` comment claimed ordinary `head`/`read` flatten container,
+  permission and transport faults into absence; `isObjectNotFound` only flattens an authoritative key
+  miss, so the comment is corrected to say every other fault propagates as an exception.
+- `Backend/CasBackend.h`'s `checkConditionalWriteSingleAttemptSupport` comment said the capability probe
+  checks it; `Pool::open` asks it directly through `backendForCapabilityPredicates()` before the probe
+  operation is admitted — corrected (also closes U1-review.md's Prose P7).
+- `src/Disks/tests/gtest_cas_pool.cpp`'s `WriteCountingBackend`/`ProbeWatchingBackend` instrumentation
+  comments: already correct, no longer cite `probeSentinelRaw` — checked, no change.
+- `src/Disks/tests/gtest_cas_forget.cpp`'s `ForgetRacingActiveRemountThreadCompletesBounded` mechanism
+  comment: already correct — `ToggleableTransportFaultBackend`'s fault already sits on the `head`/`read`/
+  `list` primitives now that U1 has landed, so "keeps every attempt at `StayTransient`" holds. Checked,
+  no change.
+- `Pool/CasRefProtocol.cpp`'s `crossEpochFromSeal` doc comment (the checkpoint-snapshot reader) still
+  cited "review NEW-3" / "review C3" after its header twin (`CasRefProtocol.h`) was already cleaned — the
+  citations are dropped, the reason kept.
+- U1-review.md's Prose: P3 (`CasPool.h`'s `farewellRequests()` doc described only the lease-release half
+  of a plane the mount-lease renewer's claim/adopt also shares) and P4
+  (`ContentAddressedTransaction.cpp`'s staging write buffer comment claimed a live operation ties two
+  generation reads together, when `admit().generation()` is a plain value off a temporary) are fixed; P7
+  is the `checkConditionalWriteSingleAttemptSupport` fix above. P6 (`CasRequestBudget.cpp`'s logger tag)
+  already reads `"CasRequestBudget"`, checked, no change. P8 names only a workspace report file, not
+  applicable here.
+- U10-review.md's P1–P6: none names a source comment worth changing — P1/P3/P4/P6 are about the U10 task
+  report or an already-correct call site, P2 is already fixed (`CasMountRuntime.cpp` derives the renewal
+  counters on every outcome, not only `Committed`), P5 is a ruling-doc item. P7 remains open below.
+- U9-rereview.md's NEW-2: `gtest_cas_part_write.cpp`'s `HeadThenDeleteOnceBackend` inline comment still
+  claimed the HEAD-to-GET window its class doc had already dropped; fixed. NEW-3 remains open below.
+- U6-rereview.md's F2: `CatalogLifecycleReconciler::reconcile`'s header doc is already correct — the
+  refresh runs unconditionally before the drain-complete verdict, including when there is no eligible
+  row to erase. Checked, no change. F4: the ten internal-document-reference sites in
+  `Pool/CasRefCatalog.h`, and the matching sites in `gtest_cas_ref_catalog_birth_wiring.cpp` and
+  `gtest_cas_ref_ckpt.cpp`, are cleaned (kept the reason, dropped the `Task N` / review citations).
+  `Pool/CasRefCatalog.cpp`'s two sites remain open below.
+
 ### From the CP3 (Task 7) review, 2026-09-03 — prose only {#inbox-cp3-review-prose}
-- `src/Disks/tests/gtest_cas_pool.cpp`, `WriteCountingBackend` and `ProbeWatchingBackend` instrumentation comments: they cite `Backend::probeSentinelRaw` as the reason for instrumenting `write`/`remove`/`publish`, but its default body performs only `head` and `read`; the instrumentation is forward-looking (the pool's own writes moving onto `CasRequests`), not restorative. Same sentence in the message of `5df0da61cf1`.
-- `src/Disks/tests/gtest_cas_forget.cpp`, `ForgetRacingActiveRemountThreadCompletesBounded`: the mechanism comment ("keeps every attempt at `StayTransient`") is false until the double's fault moves onto the primitives (wave unit U1 does that); re-check after U1 lands.
 - `task-7-report.md` (workspace only): "no caller reaches them yet" — legacy write verbs reach `write`/`remove` through the forwarders; the accurate claim is that no assertion needs a per-key write counter.
-- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp` (definition of the checkpoint-snapshot reader, ~line 873): the doc comment mirrors the header and still cites "review NEW-3" / "review C3" — keep the reason, drop the provenance (the header copy was cleaned in the U3 fix round).
-- `Backend/CasBackend.h`, `checkConditionalWriteSingleAttemptSupport` comment: "Checked by the capability probe alongside checkPoolPreconditions" — neither is any more; both are asked by `Pool::open` through `backendForCapabilityPredicates()` before the probe operation is admitted.
-- U1 review prose batch (units/U1-review.md, "Prose"): five FALSE / three IMPRECISE comments around the pool wiring; three are fixed in U1's fix round (`CasPool.h` ×2, `CasRequestBudget.h`), the remaining five go to the source-comment pass — read the review file for the list.
-- U10 review prose batch (units/U10-review.md P1–P7): the unreachable `Conflict{Meta}` claim; header/report comments asserting `GaveUp` has no count (now false); the under-counting re-sourcing snippet; "the system table renders no Etag"; ruling R2's omitted third silent case of `terminate`; the unverified-mutation framing; the `PLANES` doc promising a `Liveness` no production caller passes (U1's `startKeeper` fix makes one).
-- U9 prose (units/U9-rereview.md NEW-2/NEW-3): the injected-delete comment inside `HeadThenDeleteOnceBackend` still claims the HEAD-to-GET window; the create-first gate comment over-states what an absent observation implies (an absent body does not imply an absent marker).
-- LOCK TASK item: delete the callerless `stagingPutIfAbsentMutable` and `stagingConditionalOverwrite` on `Pool` and `CasRefLedger` (the mount-plane doors the U9 fix closed).
-- U6 re-review prose (units/U6-rereview.md F2/F4): `CatalogLifecycleReconciler::reconcile`'s header says the drain-complete exit reports from its last erase's reading — with no eligible row there was no erase and the reading is fresh; pre-existing task-number/review citations in `CasRefCatalog.{h,cpp}` and the touched tests dangle once the plan directory leaves the branch (comment policy: keep the reason, drop the provenance).
-- Engine test seam (if the checkpoint shows jitter-dependent reds): `Retry::backoff` draws full jitter with no test seam, so a test driving an ambiguity under `untilLeaseSafe` with a short remaining lease is a coin flip; a `setBackoffFnForTest` on `CasRequests` (used by `pauseAndReissue`) would make it deterministic. `MountLeaseKeeper::renewOn`'s `catch (...)` arm reports `attempts_sent = 0` — an exception that escaped the engine carries no count; document at the field.
+- U10 review prose batch (units/U10-review.md P7): the `PLANES` doc in `Pool/CasServerRoot.h` promising a `Liveness` no production caller passes — `CasMountRuntime::installRenewer` (renamed from `installKeeper`) supplies none either. `CasServerRoot.h` is a forbidden file for the source-comment pass; left for the engine-defect pass.
+- U9 prose (units/U9-rereview.md NEW-3): `Pool/CasPartWriteTxn.cpp`'s `reconcileMetaClean` create-first gate comment over-states what an absent observation implies (an absent body does not imply an absent marker). Forbidden file for the source-comment pass; left for the engine-defect pass.
+- LOCK TASK item: delete the callerless `stagingPutIfAbsentMutable` and `stagingConditionalOverwrite` on `Pool` and `CasRefLedger` (the mount-plane doors the U9 fix closed). Not a comment or a requested rename, and `Pool` is defined in the forbidden `Pool/CasPool.cpp`; left for a task authorized to touch it.
+- U6 re-review prose (units/U6-rereview.md F4, `Pool/CasRefCatalog.cpp`): its two internal-document-reference sites (the header and test-file sweep did not reach `.cpp`, a forbidden file for the source-comment pass); left for the engine-defect pass.
+- Engine test seam (if the checkpoint shows jitter-dependent reds): `Retry::backoff` draws full jitter with no test seam, so a test driving an ambiguity under `untilLeaseSafe` with a short remaining lease is a coin flip; a `setBackoffFnForTest` on `CasRequests` (used by `pauseAndReissue`) would make it deterministic. `MountLeaseRenewer::renewOn`'s (renamed from `MountLeaseKeeper`) `catch (...)` arm reports `attempts_sent = 0` — an exception that escaped the engine carries no count; document at the field. `Pool/CasServerRoot.h` is a forbidden file for the source-comment pass; left for the engine-defect pass.
 - Product question from the lock (2026-09-03): `CAS_WRITE_UNATTRIBUTED` is unreachable on the Native/S3 write path now — its only throw site was the deleted legacy minter, and the request engine settles a 2xx whose value fits no grammar by a resolve read (`GaveUp{Unresolved}` at the deadline). Decide whether a distinct unattributed-write signal is wanted (an event/counter) or the error code is retired; the three tests that pinned the throw now pin the give-up. (Spec revision 13 records this as an open product question rather than deciding it — see [the rulings doc](2026-09-03-request-contract-rulings.md).)
 
 ### From the engine fix round review, 2026-09-03 — prose and spec drift {#inbox-engine-fix-prose}
