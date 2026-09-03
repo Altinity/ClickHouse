@@ -247,35 +247,40 @@ bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & 
     /// exception the transport raises is a `Poco::Exception`, `DB::Exception` included.
     if (!dynamic_cast<const Poco::Exception *>(&e))
         return true;
-    /// ONE refresh per call. The storage hands back a fresh client every time it is asked, so a denial
-    /// that fresh credentials do not fix would otherwise refresh-and-reissue until the deadline instead
-    /// of surfacing on the second look.
-    if (!refresh_attempted && isRefreshableCredentialError(e))
+    /// A credential failure gets ONE refresh per call -- the storage hands back a fresh client every
+    /// time it is asked, so refreshing per attempt would reissue a permanent denial to the deadline.
+    /// Without new credentials nothing would sign differently, so a read propagates rather than
+    /// spending its policy on a request that cannot start succeeding.
+    if (isRefreshableCredentialError(e))
     {
+        if (refresh_attempted)
+            return true;
         refresh_attempted = true;
-        if (owner.backend->refreshCredentials())
-            return false;
+        return !owner.backend->refreshCredentials();
     }
-    /// No credentials were installed, so the store's own answer decides: a definite one would replay
-    /// identically, and everything else -- an unmodeled name an S3-compatible store reports, a
-    /// throttle, a 5xx -- may still be transient and is reissued.
-    return isDefiniteStoreRefusal(e);
+    /// The store's own answer decides. A definite refusal replays identically whether the store proved
+    /// the request never applied or merely named an error it will keep naming; everything else -- a
+    /// throttle, a 5xx, an unmodeled name an S3-compatible store reports -- may still be transient.
+    return isDefinitelyRefusedWrite(e) || isDefiniteStoreRefusal(e);
 }
 
-void CasOperation::giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when) const
+void CasOperation::giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when)
 {
+    last_read_stop = ReadStop::FenceLost;
     throwCasTransientUnavailable(fmt::format("CAS {} of '{}'", verb, subject),
                                  fmt::format("mount fence tripped {}", when));
 }
 
-void CasOperation::giveUpReadNoBudget(std::string_view verb, const String & subject, std::string_view what) const
+void CasOperation::giveUpReadNoBudget(std::string_view verb, const String & subject, std::string_view what)
 {
+    last_read_stop = ReadStop::NoBudgetLease;
     throwCasWriteRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, what));
 }
 
 void CasOperation::giveUpReadDeadline(std::string_view verb, const String & subject,
-                                      const Retry::Bound & bound, uint32_t attempts_made) const
+                                      const Retry::Bound & bound, uint32_t attempts_made)
 {
+    last_read_stop = ReadStop::PolicyExhausted;
     throwCasWriteRetryLater(fmt::format("{} of '{}': gave up at the {} deadline after {} attempt(s)",
                                         verb, subject, bound.lease_bound ? "lease" : "policy", attempts_made));
 }
@@ -460,10 +465,17 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
 
         const uint64_t pause_ms = Retry::backoff(attempt);
         const uint64_t needed = reservedFor(pause_ms, 1);
-        /// Once a probe HAS run, its inconclusive outcome is the answer, whichever of the three ends
-        /// the loop -- a lost fence, a spent lease budget, or the deadline. Reporting what was seen
-        /// says more than a give-up exception, and every consumer treats `Indeterminate` fail-closed.
-        if (gate(needed) != Gate::Ok || !fits(needed, bound))
+        /// A lost fence and a spent lease budget are not things the store said, so they are reported the
+        /// way every other read verb reports them rather than being dressed up as an outcome.
+        switch (gate(needed))
+        {
+            case Gate::FenceLost: giveUpReadFenceLost("probeSentinel", key, "before the reissue");
+            case Gate::NoBudget:  giveUpReadNoBudget("probeSentinel", key, "for the reissue");
+            case Gate::Ok: break;
+        }
+        /// Only the policy's own bound ends the loop with a value: a probe DID run, and what it saw is
+        /// more than a give-up exception could say. Every consumer treats `Indeterminate` fail-closed.
+        if (!fits(needed, bound))
             return result;
         detail::recordReissue();
         owner.sleep_ms(pause_ms);
@@ -488,48 +500,56 @@ void CasOperation::publish(const BlobPublishRequest & request, const Retry & pol
     });
 }
 
-Observation CasOperation::observe(const String & key, const Retry & policy, const Retry::Bound & bound)
+CasOperation::Resolved CasOperation::observe(const String & key, const Retry & policy, const Retry::Bound & bound)
 {
+    last_read_stop.reset();
     try
     {
         auto got = readUnder(key, policy, bound);
         if (!got)
-            return ProvenAbsent{};
-        return std::move(*got);
+            return {ProvenAbsent{}, std::nullopt};
+        return {std::move(*got), std::nullopt};
     }
     catch (const Exception & e)
     {
         /// A local bug replays identically on every reissue, so it is never swallowed into "nothing
-        /// observed". Everything else -- including the read giving up at the deadline -- is exactly
-        /// that: the resolve settled nothing.
+        /// observed". Anything else settled nothing -- and `last_read_stop` says whether a bound
+        /// refused the read or the transport itself failed, which the exception cannot.
         if (isDeterministicLocalFailure(e.code()))
             throw;
-        return NotObserved{};
+        return {NotObserved{}, last_read_stop};
     }
-    catch (const std::exception &)
+    catch (const std::exception & e)
     {
-        return NotObserved{};
+        /// A failure that is not the transport's is not an observation: it is the same local bug the
+        /// read loop refuses to reissue, and swallowing it here would hide it just as thoroughly.
+        if (!dynamic_cast<const Poco::Exception *>(&e))
+            throw;
+        return {NotObserved{}, last_read_stop};
     }
 }
 
-Observation CasOperation::observePresence(const String & key, const Retry & policy, const Retry::Bound & bound)
+CasOperation::Resolved CasOperation::observePresence(const String & key, const Retry & policy, const Retry::Bound & bound)
 {
+    last_read_stop.reset();
     try
     {
         auto got = headUnder(key, policy, bound);
         if (!got)
-            return ProvenAbsent{};
-        return std::move(*got);
+            return {ProvenAbsent{}, std::nullopt};
+        return {std::move(*got), std::nullopt};
     }
     catch (const Exception & e)
     {
         if (isDeterministicLocalFailure(e.code()))
             throw;
-        return NotObserved{};
+        return {NotObserved{}, last_read_stop};
     }
-    catch (const std::exception &)
+    catch (const std::exception & e)
     {
-        return NotObserved{};
+        if (!dynamic_cast<const Poco::Exception *>(&e))
+            throw;
+        return {NotObserved{}, last_read_stop};
     }
 }
 
@@ -539,12 +559,29 @@ WriteResult CasOperation::gaveUp(GaveUp::Why why, GaveUp::Source source, WriteSt
     return GaveUp{why, source, state.sent_any, state.last_seen};
 }
 
-WriteResult CasOperation::gaveUpAfterFailedObservation(WriteState & state, const Retry::Bound & bound)
+WriteResult CasOperation::gaveUpForReadStop(ReadStop stop, WriteState & state, const Retry::Bound & bound) const
 {
-    /// A lost generation never comes back, so if the fence still admits us the read ran out of time.
-    if (gate(0) == Gate::FenceLost)
-        return gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), state);
-    return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
+    switch (stop)
+    {
+        case ReadStop::FenceLost:
+            return gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), state);
+        case ReadStop::NoBudgetLease:
+            /// The fence's budget IS the mount lease, so the lease is the bound that ended this call.
+            return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
+        case ReadStop::PolicyExhausted:
+            return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
+    }
+    UNREACHABLE();
+}
+
+WriteResult CasOperation::gaveUpAfterFailedObservation(std::optional<ReadStop> stop, WriteState & state,
+                                                       const Retry::Bound & bound) const
+{
+    if (stop)
+        return gaveUpForReadStop(*stop, state, bound);
+    /// No bound refused; the read itself failed. That is what `Unresolved` names, and it is the honest
+    /// answer -- claiming a deadline the clock never reached would misreport which bound to widen.
+    return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
 }
 
 WriteResult CasOperation::postCommit(Incarnation inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound)
@@ -664,9 +701,14 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// presence-only caller settles it with a HEAD; proving an ambiguous attempt landed needs the
         /// bytes, and there the body read is unavoidable.
         ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
-        state.last_seen = resolve_refusal_with == ResolveWith::Presence && !state.any_ambiguous
+        const Resolved resolved = resolve_refusal_with == ResolveWith::Presence && !state.any_ambiguous
             ? observePresence(key, policy, bound)
             : observe(key, policy, bound);
+        state.last_seen = resolved.seen;
+        /// A bound refused the resolve, so say WHICH. Erasing it here is what let a lost fence be
+        /// reported as an ordinary conflict and a lease refusal as a policy deadline.
+        if (resolved.stop)
+            return gaveUpForReadStop(*resolved.stop, state, bound);
         if (const auto * obj = std::get_if<Object>(&state.last_seen))
         {
             /// Our own bytes prove an earlier ambiguous attempt landed. Without an ambiguity there was
@@ -702,12 +744,13 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
     const Retry::Bound bound = policy.bind(owner.now_ms());
     WriteState state;
 
-    state.last_seen = observe(key, policy, bound);
+    Resolved resolved = observe(key, policy, bound);
+    state.last_seen = resolved.seen;
     std::optional<Object> current;
     if (const auto * obj = std::get_if<Object>(&state.last_seen))
         current = *obj;
     else if (!std::holds_alternative<ProvenAbsent>(state.last_seen))
-        return gaveUpAfterFailedObservation(state, bound);
+        return gaveUpAfterFailedObservation(resolved.stop, state, bound);
 
     for (;;)
     {
@@ -739,13 +782,14 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
         /// what the store held.
         if (std::holds_alternative<NotObserved>(state.last_seen))
         {
-            state.last_seen = observe(key, policy, bound);
+            resolved = observe(key, policy, bound);
+            state.last_seen = resolved.seen;
             if (const auto * obj = std::get_if<Object>(&state.last_seen))
                 current = *obj;
             else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
                 current.reset();
             else
-                return gaveUpAfterFailedObservation(state, bound);
+                return gaveUpAfterFailedObservation(resolved.stop, state, bound);
         }
     }
 }
@@ -755,12 +799,13 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
     const Retry::Bound bound = policy.bind(owner.now_ms());
     WriteState state;
 
-    state.last_seen = observePresence(key, policy, bound);
+    Resolved resolved = observePresence(key, policy, bound);
+    state.last_seen = resolved.seen;
     std::optional<Meta> current;
     if (const auto * meta = std::get_if<Meta>(&state.last_seen))
         current = *meta;
     else if (!std::holds_alternative<ProvenAbsent>(state.last_seen))
-        return gaveUpAfterFailedObservation(state, bound);
+        return gaveUpAfterFailedObservation(resolved.stop, state, bound);
 
     for (;;)
     {
@@ -789,13 +834,14 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
 
         if (std::holds_alternative<NotObserved>(state.last_seen))
         {
-            state.last_seen = observePresence(key, policy, bound);
+            resolved = observePresence(key, policy, bound);
+            state.last_seen = resolved.seen;
             if (const auto * meta = std::get_if<Meta>(&state.last_seen))
                 current = *meta;
             else if (std::holds_alternative<ProvenAbsent>(state.last_seen))
                 current.reset();
             else
-                return gaveUpAfterFailedObservation(state, bound);
+                return gaveUpAfterFailedObservation(resolved.stop, state, bound);
         }
     }
 }

@@ -204,6 +204,22 @@ private:
         bool refresh_attempted = false;
     };
 
+    /// Why a read-class request stopped without an answer. Every give-up below throws the same
+    /// `NETWORK_ERROR`, so a caller that SWALLOWS the exception -- only the resolve read does -- cannot
+    /// recover from it which bound refused, and reporting a lease refusal as a policy deadline is the
+    /// confusion `GaveUp::Source` exists to prevent. `PolicyExhausted` names the `Retry` bound, whose
+    /// own source is `Bound::lease_bound`.
+    enum class ReadStop : uint8_t { FenceLost, NoBudgetLease, PolicyExhausted };
+
+    /// What the resolve read saw, and why it stopped when it saw nothing. `stop` is set ONLY when a
+    /// bound refused; a read that failed at the transport leaves it empty, and that is the one case
+    /// `NotObserved` is still the whole story.
+    struct Resolved
+    {
+        Observation seen;
+        std::optional<ReadStop> stop;
+    };
+
     /// One read-class request under the policy: admission, attempt, classification, jittered reissue.
     /// Returns whatever `once` returns, or throws -- the read surface reports failure by exception.
     template <typename Fn>
@@ -227,16 +243,20 @@ private:
     WriteResult writeLoop(const String & key, const String & bytes, const std::optional<Incarnation> & expected,
                           const Retry & policy, const Retry::Bound & bound, WriteState & state,
                           ResolveWith resolve_refusal_with);
-    /// The resolve read: an exact read under the same policy and deadline. `NotObserved` when it gave
-    /// up or failed -- the caller's terminal branch decides what that means.
-    Observation observe(const String & key, const Retry & policy, const Retry::Bound & bound);
+    /// The resolve read: an exact read under the same policy and deadline, reporting what it saw and,
+    /// when it saw nothing, which bound stopped it.
+    Resolved observe(const String & key, const Retry & policy, const Retry::Bound & bound);
     /// The presence-only sibling, for the one loop that must not fetch a body.
-    Observation observePresence(const String & key, const Retry & policy, const Retry::Bound & bound);
+    Resolved observePresence(const String & key, const Retry & policy, const Retry::Bound & bound);
 
     WriteResult postCommit(Incarnation inc, bool resolved_by_read, WriteState & state, const Retry::Bound & bound);
     WriteResult gaveUp(GaveUp::Why why, GaveUp::Source source, WriteState & state) const;
-    /// An observation reports only WHAT it saw, so this asks the fence what STOPPED it.
-    WriteResult gaveUpAfterFailedObservation(WriteState & state, const Retry::Bound & bound);
+    /// The bound that refused the resolve read, reported as the outcome it actually is.
+    WriteResult gaveUpForReadStop(ReadStop stop, WriteState & state, const Retry::Bound & bound) const;
+    /// A resolve read that produced nothing. The fence is NOT resampled: a second sample reports a
+    /// state the read never saw, which is how a lease refusal used to be reported as a policy deadline.
+    WriteResult gaveUpAfterFailedObservation(std::optional<ReadStop> stop, WriteState & state,
+                                             const Retry::Bound & bound) const;
     /// Admission, then the jittered sleep. A value means the call ended during it; nullopt means the
     /// caller may send another attempt.
     std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry::Bound & bound);
@@ -253,14 +273,18 @@ private:
     /// TRUE means the failure must surface unchanged.
     bool refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted);
 
-    [[noreturn]] void giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when) const;
-    [[noreturn]] void giveUpReadNoBudget(std::string_view verb, const String & subject, std::string_view what) const;
+    /// Each records its cause in `last_read_stop` before throwing, so the resolve read can report it.
+    [[noreturn]] void giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when);
+    [[noreturn]] void giveUpReadNoBudget(std::string_view verb, const String & subject, std::string_view what);
     [[noreturn]] void giveUpReadDeadline(std::string_view verb, const String & subject,
-                                         const Retry::Bound & bound, uint32_t attempts_made) const;
+                                         const Retry::Bound & bound, uint32_t attempts_made);
 
     CasRequests & owner;
     uint64_t admitted_generation;
     Liveness liveness;
+    /// Written immediately before a read-class give-up throws, cleared and read only by the resolve
+    /// read that swallows it. Every other caller lets the exception carry the verdict.
+    std::optional<ReadStop> last_read_stop;
 };
 
 template <typename Fn>
