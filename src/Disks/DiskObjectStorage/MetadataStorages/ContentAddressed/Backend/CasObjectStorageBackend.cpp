@@ -671,12 +671,18 @@ std::unique_ptr<ReadBuffer> ObjectStorageBackend::stream(const String & key, Tra
     /// issues nothing by itself, so the first GET is forced HERE -- otherwise the request that finds
     /// the object absent, or fails, would happen after the call returned and be accounted to no
     /// attempt at all. A present but empty object still yields a buffer; only a not-found is null.
+    ///
+    /// The buffer carries the storage's ORDINARY read settings, not this mount's control-plane
+    /// profile. `ReadBufferFromS3::nextImpl` re-reads `max_single_read_retries` on every `next()`, so
+    /// opening under SingleAttempt would strip the SDK's retries from the whole BODY -- which the
+    /// caller reads at its own pace, long after this attempt returned -- and stretch a single
+    /// attempt's timeout across the entire transfer. Only the open is the caller's to bound. Nor is
+    /// the request marked NativeConditional: a stream observes no incarnation to answer with.
     try
     {
         std::unique_ptr<ReadBufferFromFileBase> buf;
         if (mode == Mode::Native)
-            buf = object_storage->readObject(
-                StoredObject(key), readSettingsFor(controlPlaneProfile(), attempt_timeout_ms), /*read_hint=*/std::nullopt);
+            buf = object_storage->readObject(StoredObject(key), getReadSettings(), /*read_hint=*/std::nullopt);
         else
         {
             /// Same lock the other emulated paths take, held across the open alone: there is no token
