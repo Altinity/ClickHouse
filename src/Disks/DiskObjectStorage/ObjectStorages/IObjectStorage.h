@@ -272,15 +272,17 @@ public:
         bool with_tags,
         const std::optional<std::string> & start_after) const;
 
-    /// Same, under a chosen retry profile. A storage that cannot execute the profile must refuse:
-    /// a caller that asked for one attempt has its own deadline, and a transparently retried request
+    /// Same, under a chosen retry profile, with `request_timeout_ms` bounding one attempt of it
+    /// (0 = the storage's own timeout). A storage that cannot execute the profile must refuse: a
+    /// caller that asked for one attempt has its own deadline, and a transparently retried request
     /// would outlive it.
     virtual ObjectStorageIteratorPtr iterate(
         const std::string & path_prefix,
         size_t max_keys,
         bool with_tags,
         const std::optional<std::string> & start_after,
-        ObjectStorageRetryProfile profile) const;
+        ObjectStorageRetryProfile profile,
+        uint64_t request_timeout_ms) const;
 
     /// Get object metadata if supported. It should be possible to receive at least size of object
     virtual ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const = 0;
@@ -298,7 +300,7 @@ public:
 
     /// Same, under a chosen retry profile; see the note on `iterate`.
     virtual std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(
-        const std::string & path, bool with_tags, ObjectStorageRetryProfile profile) const;
+        const std::string & path, bool with_tags, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) const;
 
     /// Read single object
     virtual std::unique_ptr<ReadBufferFromFileBase> readObject( /// NOLINT
@@ -368,7 +370,7 @@ public:
 
     /// Same, under a chosen retry profile; see the note on `iterate`.
     virtual ConditionalRemoveResult removeObjectIfTokenMatches(
-        const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile);
+        const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms);
 
     /// Copy object with different attributes if required
     virtual void copyObject( /// NOLINT

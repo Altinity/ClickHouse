@@ -21,12 +21,17 @@
 
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/s3/S3Errors.h>
+#include <aws/s3/model/DeleteObjectRequest.h>
+#include <aws/s3/model/DeleteObjectResult.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/GetObjectResult.h>
+#include <aws/s3/model/HeadObjectRequest.h>
+#include <aws/s3/model/HeadObjectResult.h>
 
 #include <Poco/Net/HTTPBasicStreamBuf.h>
 
 #include <cstring>
+#include <functional>
 #include <istream>
 #include <mutex>
 #include <vector>
@@ -36,6 +41,7 @@ namespace DB::ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
 #if USE_AWS_S3
+    extern const int CANNOT_READ_ALL_DATA;
     extern const int NETWORK_ERROR;
 #endif
 }
@@ -84,21 +90,21 @@ TEST(CASUpstreamSlice, HeadListRemoveOverloadsRefuseSingleAttemptOnTheBaseStorag
 
     expectThrowsNotImplementedSaying(
         "single-attempt metadata requests",
-        [&] { local->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::SingleAttempt); });
+        [&] { local->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::SingleAttempt, 0); });
     expectThrowsNotImplementedSaying(
         "single-attempt listing requests",
-        [&] { local->iterate("", 1, false, {}, DB::ObjectStorageRetryProfile::SingleAttempt); });
+        [&] { local->iterate("", 1, false, {}, DB::ObjectStorageRetryProfile::SingleAttempt, 0); });
     expectThrowsNotImplementedSaying(
         "single-attempt removal requests",
-        [&] { local->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::SingleAttempt); });
+        [&] { local->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::SingleAttempt, 0); });
 
     /// `Default` must keep reaching the ordinary implementation. For removal that is still a refusal,
     /// but the pre-existing one — matching its wording proves the profile overload forwarded.
-    EXPECT_NO_THROW(local->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::Default));
-    EXPECT_NO_THROW(local->iterate("", 1, false, {}, DB::ObjectStorageRetryProfile::Default));
+    EXPECT_NO_THROW(local->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::Default, 0));
+    EXPECT_NO_THROW(local->iterate("", 1, false, {}, DB::ObjectStorageRetryProfile::Default, 0));
     expectThrowsNotImplementedSaying(
         "Conditional (token-exact) object removal",
-        [&] { local->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::Default); });
+        [&] { local->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::Default, 0); });
 }
 
 #if USE_AWS_S3
@@ -150,6 +156,34 @@ ScriptedGetObjectStep expiredTokenStep()
         .etag = "",
         .body = "",
         .fail_mid_body = false};
+}
+
+/// One scripted answer to a control-plane request (HEAD or conditional DELETE). `retryable` is what
+/// the SDK's retry strategy consults, so it is what decides whether the client's own attempt loop
+/// reissues the request — which is how a single-attempt clone is told apart from the disk client.
+struct ScriptedControlStep
+{
+    bool ok = true;
+    Aws::S3::S3Errors error = Aws::S3::S3Errors::SLOW_DOWN;
+    std::string exception_name;
+    bool retryable = false;
+};
+
+ScriptedControlStep controlOk()
+{
+    return ScriptedControlStep{.ok = true, .error = Aws::S3::S3Errors::SLOW_DOWN, .exception_name = "", .retryable = false};
+}
+
+ScriptedControlStep controlExpiredToken()
+{
+    return ScriptedControlStep{
+        .ok = false, .error = Aws::S3::S3Errors::ACCESS_DENIED, .exception_name = "ExpiredToken", .retryable = false};
+}
+
+ScriptedControlStep controlThrottle()
+{
+    return ScriptedControlStep{
+        .ok = false, .error = Aws::S3::S3Errors::SLOW_DOWN, .exception_name = "SlowDown", .retryable = true};
 }
 
 /// `ReadBufferFromIStream` reads through `Poco::Net::HTTPBasicStreamBuf::readFromDevice`, so a fake
@@ -206,8 +240,20 @@ private:
     struct State
     {
         std::vector<ScriptedGetObjectStep> script;
+        std::vector<ScriptedControlStep> head_script;
+        std::vector<ScriptedControlStep> delete_script;
+
         size_t get_object_calls = 0;
         std::vector<bool> native_conditional_marks;
+
+        /// The `requestTimeoutMs` of the client each request was actually issued through, which is
+        /// what proves a request rode the clone built for the bound its caller asked for.
+        std::vector<long> head_request_timeouts_ms;
+        std::vector<long> delete_request_timeouts_ms;
+        /// Every configuration this client was asked to clone with — a request-free way to see which
+        /// client a verb selected.
+        std::vector<long> clone_request_timeouts_ms;
+
         std::mutex mutex;
     };
 
@@ -219,13 +265,16 @@ public:
     static DB::S3::PocoHTTPClientConfiguration GetClientConfiguration()
     {
         DB::RemoteHostFilter remote_host_filter;
+        /// max_retries is deliberately nonzero: it is the disk client's own attempt loop, and the
+        /// only thing that distinguishes it from the single-attempt clone. The two slow-down flags
+        /// are off so that loop spins without waiting out a real backoff.
         return DB::S3::ClientFactory::instance().createClientConfiguration(
             "some-region",
             remote_host_filter,
             /* s3_max_redirects = */ 100,
-            DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 0},
-            /* s3_slow_all_threads_after_network_error = */ true,
-            /* s3_slow_all_threads_after_retryable_error = */ true,
+            DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 2},
+            /* s3_slow_all_threads_after_network_error = */ false,
+            /* s3_slow_all_threads_after_retryable_error = */ false,
             /* enable_s3_requests_logging = */ true,
             /* for_disk_s3 = */ false,
             /* opt_disk_name = */ {},
@@ -250,9 +299,43 @@ public:
         return state->native_conditional_marks;
     }
 
+    void scriptHead(std::vector<ScriptedControlStep> steps) const
+    {
+        std::lock_guard lock(state->mutex);
+        state->head_script = std::move(steps);
+    }
+
+    void scriptDelete(std::vector<ScriptedControlStep> steps) const
+    {
+        std::lock_guard lock(state->mutex);
+        state->delete_script = std::move(steps);
+    }
+
+    std::vector<long> headRequestTimeouts() const
+    {
+        std::lock_guard lock(state->mutex);
+        return state->head_request_timeouts_ms;
+    }
+
+    std::vector<long> deleteRequestTimeouts() const
+    {
+        std::lock_guard lock(state->mutex);
+        return state->delete_request_timeouts_ms;
+    }
+
+    std::vector<long> cloneRequestTimeouts() const
+    {
+        std::lock_guard lock(state->mutex);
+        return state->clone_request_timeouts_ms;
+    }
+
     std::unique_ptr<DB::S3::Client> cloneWithConfigurationOverride(
         const DB::S3::PocoHTTPClientConfiguration & client_configuration_override) const override
     {
+        {
+            std::lock_guard lock(state->mutex);
+            state->clone_request_timeouts_ms.push_back(client_configuration_override.requestTimeoutMs);
+        }
         return std::unique_ptr<DB::S3::Client>(new ScriptedGetObjectClient(state, client_configuration_override));
     }
 
@@ -284,7 +367,54 @@ public:
         return Aws::S3::Model::GetObjectOutcome(std::move(result));
     }
 
+    Aws::S3::Model::HeadObjectOutcome HeadObject(const Aws::S3::Model::HeadObjectRequest & /*request*/) const override
+    {
+        std::lock_guard lock(state->mutex);
+        state->head_request_timeouts_ms.push_back(getClientConfiguration().requestTimeoutMs);
+
+        const auto step = nextControlStep(state->head_script, state->head_request_timeouts_ms.size());
+        if (!step.ok)
+            return Aws::S3::Model::HeadObjectOutcome(makeError(step));
+
+        Aws::S3::Model::HeadObjectResult result;
+        /// Any nonzero size: tryGetObjectMetadataImpl reads an all-zero HeadObjectResult as a miss.
+        result.SetContentLength(scripted_head_object_size);
+        result.SetETag(scripted_head_object_etag);
+        return Aws::S3::Model::HeadObjectOutcome(std::move(result));
+    }
+
+    Aws::S3::Model::DeleteObjectOutcome DeleteObject(const Aws::S3::Model::DeleteObjectRequest & /*request*/) const override
+    {
+        std::lock_guard lock(state->mutex);
+        state->delete_request_timeouts_ms.push_back(getClientConfiguration().requestTimeoutMs);
+
+        const auto step = nextControlStep(state->delete_script, state->delete_request_timeouts_ms.size());
+        if (!step.ok)
+            return Aws::S3::Model::DeleteObjectOutcome(makeError(step));
+
+        Aws::S3::Model::DeleteObjectResult result;
+        result.SetDeleteMarker(false);
+        return Aws::S3::Model::DeleteObjectOutcome(std::move(result));
+    }
+
 private:
+    static constexpr long long scripted_head_object_size = 7;
+    static constexpr const char * scripted_head_object_etag = "\"h1\"";
+
+    /// A script shorter than the number of requests keeps answering with its last step, so a test
+    /// that means "this error, however many attempts the client makes" says it in one entry.
+    static ScriptedControlStep nextControlStep(const std::vector<ScriptedControlStep> & script, size_t call_number)
+    {
+        if (script.empty())
+            return controlOk();
+        return script[std::min(call_number - 1, script.size() - 1)];
+    }
+
+    static Aws::Client::AWSError<Aws::S3::S3Errors> makeError(const ScriptedControlStep & step)
+    {
+        return Aws::Client::AWSError<Aws::S3::S3Errors>(step.error, step.exception_name, "scripted error", step.retryable);
+    }
+
     ScriptedGetObjectClient(std::shared_ptr<State> state_, const DB::S3::PocoHTTPClientConfiguration & client_configuration)
         : DB::S3::Client(
             100,
@@ -327,7 +457,7 @@ std::shared_ptr<DB::S3ObjectStorage> makeScriptedS3ObjectStorage(
 }
 
 template <typename F>
-void expectThrowsMessageContaining(const std::string & needle, F && fn)
+void expectThrowsCodeSaying(int expected_code, const std::string & needle, F && fn)
 {
     try
     {
@@ -336,8 +466,27 @@ void expectThrowsMessageContaining(const std::string & needle, F && fn)
     }
     catch (const DB::Exception & e)
     {
+        EXPECT_EQ(e.code(), expected_code);
         EXPECT_NE(e.message().find(needle), std::string::npos) << "actual message: " << e.message();
     }
+}
+
+/// Builds the storage over a refresh callback that vends one fresh scripted client, so a test can
+/// both script that client up front and assert the storage ended up holding that exact object.
+std::shared_ptr<DB::S3ObjectStorage> makeScriptedS3ObjectStorageWithRefresh(
+    ScriptedGetObjectClient *& out_client,
+    ScriptedGetObjectClient *& out_refreshed,
+    std::function<void(const ScriptedGetObjectClient &)> script_refreshed)
+{
+    return makeScriptedS3ObjectStorage(
+        out_client,
+        [&out_refreshed, script_refreshed]() -> std::unique_ptr<const DB::S3::Client>
+        {
+            auto fresh = std::make_unique<ScriptedGetObjectClient>();
+            script_refreshed(*fresh);
+            out_refreshed = fresh.get();
+            return fresh;
+        });
 }
 
 }
@@ -382,7 +531,8 @@ TEST(CASUpstreamSlice, ReadSmallObjectThrowsWhenAReissueAnswersWithADifferentETa
     DB::ReadSettings read_settings;
     read_settings.object_storage_request_mode = DB::ObjectStorageRequestMode::NativeConditional;
     /// Default profile here: the buffer's own multi-attempt loop is what straddles the replacement.
-    expectThrowsMessageContaining(
+    expectThrowsCodeSaying(
+        DB::ErrorCodes::CANNOT_READ_ALL_DATA,
         "response identity changed",
         [&] { storage->readSmallObjectAndGetObjectMetadata(DB::StoredObject("k"), read_settings, 1 << 20); });
 
@@ -468,6 +618,126 @@ TEST(CASUpstreamSlice, ExpiredTokenOnSingleAttemptReadInstallsTheRefreshedClient
     ASSERT_NE(refreshed_client, nullptr);
     EXPECT_NE(storage->getS3StorageClient().get(), client_before);
     EXPECT_EQ(storage->getS3StorageClient().get(), refreshed_client);
+}
+
+/// `refreshAndRetryOnExpiredCredentials` on the HEAD path: the vended credentials expire, the callback
+/// hands over a fresh client, and the request is reissued through it. Installing that client into the
+/// storage is what stops the next request repeating the failure.
+TEST(CASUpstreamSlice, NativeTokenHeadRecoversFromAnExpiredTokenAndInstallsTheRefreshedClient)
+{
+    (void)getContext();
+
+    ScriptedGetObjectClient * expired = nullptr;
+    ScriptedGetObjectClient * refreshed = nullptr;
+    auto storage = makeScriptedS3ObjectStorageWithRefresh(
+        expired, refreshed, [](const ScriptedGetObjectClient & fresh) { fresh.scriptHead({controlOk()}); });
+    /// Installing the refreshed client drops the storage's last reference to this one, so the raw
+    /// pointer would dangle before the assertions below read its counters.
+    const auto expired_owner = storage->getS3StorageClient();
+    expired->scriptHead({controlExpiredToken()});
+
+    const auto metadata = storage->tryGetObjectMetadataWithNativeToken(
+        "k", /*with_tags=*/false, DB::ObjectStorageRetryProfile::Default, /*request_timeout_ms=*/0);
+
+    ASSERT_TRUE(metadata.has_value());
+    ASSERT_NE(refreshed, nullptr);
+    EXPECT_EQ(storage->getS3StorageClient().get(), refreshed);
+    EXPECT_EQ(expired->headRequestTimeouts().size(), 1u);
+    EXPECT_EQ(refreshed->headRequestTimeouts().size(), 1u);
+}
+
+/// The same for the conditional DELETE, which is the other verb that issues inline.
+TEST(CASUpstreamSlice, ConditionalRemoveRecoversFromAnExpiredTokenAndInstallsTheRefreshedClient)
+{
+    (void)getContext();
+
+    ScriptedGetObjectClient * expired = nullptr;
+    ScriptedGetObjectClient * refreshed = nullptr;
+    auto storage = makeScriptedS3ObjectStorageWithRefresh(
+        expired, refreshed, [](const ScriptedGetObjectClient & fresh) { fresh.scriptDelete({controlOk()}); });
+    /// See the HEAD test: the storage's last reference to this client goes away when the refreshed
+    /// one is installed.
+    const auto expired_owner = storage->getS3StorageClient();
+    expired->scriptDelete({controlExpiredToken()});
+
+    const auto result = storage->removeObjectIfTokenMatches(
+        DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::Default, /*request_timeout_ms=*/0);
+
+    EXPECT_EQ(result.outcome, DB::ConditionalRemoveOutcome::Removed);
+    ASSERT_NE(refreshed, nullptr);
+    EXPECT_EQ(storage->getS3StorageClient().get(), refreshed);
+    EXPECT_EQ(expired->deleteRequestTimeouts().size(), 1u);
+    EXPECT_EQ(refreshed->deleteRequestTimeouts().size(), 1u);
+}
+
+/// The client the conditional DELETE selects is what decides whether the SDK reissues a throttled
+/// request. The `Default` half is what makes "exactly one" mean something: the disk client here does
+/// retry a throttle, so a single attempt is a property of the clone, not of the fake.
+///
+/// Only the DELETE is counted. `S3::Client::HeadObject` does not use the SDK attempt loop at all — it
+/// calls the virtual once and returns — so a HEAD is one request under either profile, and what the
+/// profile changes for it is the transport bound, which the timeout test below pins.
+TEST(CASUpstreamSlice, SingleAttemptConditionalRemoveIssuesExactlyOneRequestOnThrottle)
+{
+    (void)getContext();
+
+    ScriptedGetObjectClient * retrying = nullptr;
+    auto retrying_storage = makeScriptedS3ObjectStorage(retrying);
+    retrying->scriptDelete({controlThrottle()});
+
+    EXPECT_ANY_THROW(retrying_storage->removeObjectIfTokenMatches(
+        DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::Default, 0));
+    EXPECT_EQ(retrying->deleteRequestTimeouts().size(), 3u);   /// max_retries = 2, so three attempts
+
+    ScriptedGetObjectClient * client = nullptr;
+    auto storage = makeScriptedS3ObjectStorage(client);
+    client->scriptDelete({controlThrottle()});
+
+    EXPECT_ANY_THROW(storage->removeObjectIfTokenMatches(
+        DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::SingleAttempt, 0));
+    EXPECT_EQ(client->deleteRequestTimeouts().size(), 1u);
+}
+
+/// The reservation the caller budgets for an attempt is only real if the transport is built to it, so
+/// the two verbs must ride a clone carrying the timeout they asked for — and two different bounds must
+/// coexist, or every alternation between verbs would rebuild a whole S3 client.
+TEST(CASUpstreamSlice, HeadAndRemoveUnderSingleAttemptRideTheClientBoundToTheRequestedTimeout)
+{
+    (void)getContext();
+
+    ScriptedGetObjectClient * client = nullptr;
+    auto storage = makeScriptedS3ObjectStorage(client);
+
+    storage->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::SingleAttempt, 4321);
+    ASSERT_EQ(client->headRequestTimeouts().size(), 1u);
+    EXPECT_EQ(client->headRequestTimeouts().at(0), 4321);
+
+    storage->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::SingleAttempt, 8765);
+    ASSERT_EQ(client->deleteRequestTimeouts().size(), 1u);
+    EXPECT_EQ(client->deleteRequestTimeouts().at(0), 8765);
+
+    EXPECT_EQ(client->cloneRequestTimeouts(), (std::vector<long>{4321, 8765}));
+
+    /// Asking again for a bound already built must reuse that clone rather than evict the other one.
+    storage->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::SingleAttempt, 4321);
+    EXPECT_EQ(client->cloneRequestTimeouts(), (std::vector<long>{4321, 8765}));
+    EXPECT_EQ(client->headRequestTimeouts().at(1), 4321);
+}
+
+/// `iterate` issues nothing itself, so its client selection is observed through the clone it causes.
+/// The async iterator fetches its first batch lazily, so constructing one sends no request.
+TEST(CASUpstreamSlice, IterateUnderSingleAttemptSelectsTheClientBoundToTheRequestedTimeout)
+{
+    (void)getContext();
+
+    ScriptedGetObjectClient * client = nullptr;
+    auto storage = makeScriptedS3ObjectStorage(client);
+
+    (void)storage->iterate("p", 1, false, {}, DB::ObjectStorageRetryProfile::Default, 0);
+    EXPECT_TRUE(client->cloneRequestTimeouts().empty());
+
+    (void)storage->iterate("p", 1, false, {}, DB::ObjectStorageRetryProfile::SingleAttempt, 4321);
+    EXPECT_EQ(client->cloneRequestTimeouts(), (std::vector<long>{4321}));
 }
 
 #endif

@@ -706,7 +706,7 @@ TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPut
     EXPECT_NO_THROW(backend.casPut("p/gen/under-cap", small, std::nullopt, ObjectMeta{}));
     EXPECT_EQ(client->put_object_calls, 1u);
     EXPECT_EQ(client->create_multipart_calls, 0u);
-    const auto single_attempt_client = storage->getSingleAttemptClient();
+    const auto single_attempt_client = storage->getSingleAttemptClient(/*request_timeout_ms=*/0);
     EXPECT_NE(dynamic_cast<const FakeGenerationS3Client *>(single_attempt_client.get()), nullptr);
     EXPECT_NE(
         dynamic_cast<const DB::S3::SingleAttemptRetryStrategy *>(

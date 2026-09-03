@@ -72,7 +72,8 @@ ObjectStorageIteratorPtr IObjectStorage::iterate(
     size_t max_keys,
     bool with_tags,
     const std::optional<std::string> & start_after,
-    ObjectStorageRetryProfile profile) const
+    ObjectStorageRetryProfile profile,
+    uint64_t /*request_timeout_ms*/) const
 {
     if (profile == ObjectStorageRetryProfile::SingleAttempt)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt listing requests", getName());
@@ -80,7 +81,7 @@ ObjectStorageIteratorPtr IObjectStorage::iterate(
 }
 
 std::optional<ObjectMetadata> IObjectStorage::tryGetObjectMetadataWithNativeToken(
-    const std::string & path, bool with_tags, ObjectStorageRetryProfile profile) const
+    const std::string & path, bool with_tags, ObjectStorageRetryProfile profile, uint64_t /*request_timeout_ms*/) const
 {
     if (profile == ObjectStorageRetryProfile::SingleAttempt)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt metadata requests", getName());
@@ -88,7 +89,7 @@ std::optional<ObjectMetadata> IObjectStorage::tryGetObjectMetadataWithNativeToke
 }
 
 ConditionalRemoveResult IObjectStorage::removeObjectIfTokenMatches(
-    const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile)
+    const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile, uint64_t /*request_timeout_ms*/)
 {
     if (profile == ObjectStorageRetryProfile::SingleAttempt)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt removal requests", getName());
