@@ -22,6 +22,7 @@
 
 namespace DB::ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
@@ -397,6 +398,15 @@ public:
         auto raw = read(key, access);
         if (!raw)
             return std::nullopt;
+        /// `read` hands back the store's value unvalidated, because deciding what a malformed one
+        /// means belongs to the caller that can resolve it. A LEGACY caller has no such judgement: it
+        /// puts the `Token` straight into its next conditional operation, which refuses a malformed
+        /// value as a caller bug -- one layer too late, and with the key no longer in hand. Refuse it
+        /// here, the same way `head` does.
+        if (!isIncarnationValue(dialect(), raw->value))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS backend: the store answered for '{}' with a value '{}' that is not a valid incarnation",
+                key, raw->value);
         return GetResult{std::move(raw->bytes), Token{std::move(raw->value), dialect()}, {}};
     }
     std::optional<GetResult> get(const String & key) { return get(key, {}); }

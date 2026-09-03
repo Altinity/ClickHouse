@@ -706,6 +706,8 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key, T
         {
             /// `read` already answers the key-absent half of the store's 404 family (see
             /// `isObjectNotFound`), so what reaches here is what it deliberately does not flatten.
+            /// The limit of the one-read shape: every case below classifies an error a GET raised, so
+            /// a store whose HEAD and GET answer differently for the same key is classified by its GET.
             switch (e.getS3ErrorCode())
             {
                 case Aws::S3::S3Errors::NO_SUCH_BUCKET:

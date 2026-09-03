@@ -16,6 +16,7 @@
 namespace DB::ErrorCodes
 {
 extern const int ABORTED;
+extern const int CORRUPTED_DATA;
 extern const int S3_ERROR;
 extern const int NETWORK_ERROR;
 }
@@ -178,6 +179,19 @@ TEST(CASBackendPrimitives, LegacyOverridesStillFireWhenTheNewPrimitiveIsCalled)
     auto b = std::make_shared<Counting>();
     b->putIfAbsent("k", "v");                 /// legacy call
     EXPECT_EQ(b->writes, 1u);
+}
+
+TEST(CASBackendPrimitives, LegacyGetRefusesAValueThatIsNotAnIncarnation)
+{
+    /// `read` hands back whatever the store said, malformed included -- settling that is the caller's.
+    /// The legacy forwarder has no caller to settle it: it would hand the value on as a `Token` that
+    /// the next conditional operation refuses as a caller bug, one layer too late to name the key.
+    struct EmptyValueBackend : InMemoryBackend
+    {
+        std::optional<Raw> read(const String &, TransportAccess &) override { return Raw{"body", ""}; }
+    };
+    auto b = std::make_shared<EmptyValueBackend>();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { b->get("k"); });
 }
 
 TEST(CASBackendPrimitives, RefreshCredentialsIsOffUntilAskedFor)
