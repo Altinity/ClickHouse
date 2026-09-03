@@ -1271,12 +1271,36 @@ bool Pool::tryRemountOnce()
     {
         step = "pool_identity_probe";
         /// The open plane: this runs with the mount fence latched lost -- that is what a remount is
-        /// recovering from -- so an operation admitted under the fence could never issue the probe. An
-        /// open fence never refuses, so the terminal check is the only thing that can end the probe: a
-        /// FORGET publishing its intent must not have to wait one out.
-        CasOperation probe_op = gc_requests.admit([this] { return !mount_runtime.remountTerminal(); });
-        const LifecycleGate gate = probePoolLifecycleGate(
-            probe_op, pool_layout, config.server_root_id, meta.pool_id, meta.blob_header_len);
+        /// recovering from -- so an operation admitted under the fence could never issue the probe.
+        ///
+        /// Admitted with NO liveness predicate. Refusing the probe once the pool is already terminal
+        /// would be circular -- this probe is what establishes terminality -- and it would make the
+        /// verdicts below unreachable in exactly the states they exist for, the mid-FORGET `Replaced`
+        /// bail among them. A predicate is also the wrong instrument for ending it: the engine samples
+        /// one before the first request and reports a refusal as a THROWN fence loss, which is not how
+        /// a remount step reports anything. Both sentinel reads are `once`, so the probe is at most two
+        /// physical requests and cannot outlast a shutdown.
+        CasOperation probe_op = gc_requests.admit();
+        LifecycleGate gate{LifecycleGateVerdict::StayTransient, {}};
+        try
+        {
+            gate = probePoolLifecycleGate(
+                probe_op, pool_layout, config.server_root_id, meta.pool_id, meta.blob_header_len);
+        }
+        catch (...)
+        {
+            /// The same contract as the startup-protocol steps below: a remount attempt reports failure
+            /// by returning false, never by throwing at whoever called it. A probe that could not reach
+            /// the store proved nothing, so the pool stays where it was and the loop retries.
+            try
+            {
+                error = getCurrentExceptionMessage(/*with_stacktrace*/ false);
+            }
+            catch (...)   // NOLINT(bugprone-empty-catch)
+            {
+            }
+            return false;
+        }
         switch (gate.verdict)
         {
             case LifecycleGateVerdict::Recover:
