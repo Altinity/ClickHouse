@@ -139,17 +139,23 @@ public:
         armed = true;
     }
 
-    HeadResult head(const String & key) override
+    /// The primitive `head` override below hides every base overload of that name.
+    using CountingBackend::head;
+
+    /// Both seams hang off the transport primitives, so they fire whichever surface the cleanup pass
+    /// reaches the store through.
+    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
     {
-        HeadResult result = CountingBackend::head(key);
+        auto result = CountingBackend::head(key, access);
         if (armed && timing == Timing::BeforeFirstDelete && key == first_cleanup_key)
             moveAuthority();
         return result;
     }
 
-    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
+                                        DB::Cas::TransportAccess & access) override
     {
-        DeleteOutcome result = CountingBackend::deleteExact(key, token);
+        auto result = CountingBackend::remove(key, expected_value, access);
         if (armed && timing == Timing::AfterFirstDelete && key == first_cleanup_key)
             moveAuthority();
         return result;
@@ -551,13 +557,15 @@ TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
 
     EXPECT_TRUE(backend->head(layout.refLogKey(life, seal_id)).exists)
         << "cleanup must retain the predecessor seal that proves the checkpoint base's epoch transition";
-    const CasRefCatalog::Snapshot cut = CasRefCatalog::read(*backend, layout);
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    const CasRefCatalog::Snapshot cut = CasRefCatalog::read(op, layout);
     const auto entry = std::find_if(cut.catalog.entries.begin(), cut.catalog.entries.end(),
         [&](const CatalogEntry & candidate) { return candidate.ns == ns; });
     ASSERT_NE(entry, cut.catalog.entries.end());
-    const std::optional<CkptSample> checkpoint = readCkpt(*backend, layout, life);
+    const std::optional<CkptSample> checkpoint = readCkpt(op, layout, life);
     ASSERT_TRUE(checkpoint);
-    EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(*backend, layout, *entry, checkpoint->ckpt));
+    EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(op, layout, *entry, checkpoint->ckpt));
 }
 
 TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
@@ -713,16 +721,18 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
 
     /// The writer's compaction: a snapshot of ns_a covering its greatest log (va2), the same
     /// deterministic bytes the oracle recomputes.
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     const RefTableState sa = recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, catalog_cut, ns_a).state;
     writeRefSnapshotRaw(*backend, layout, snapshotOf(sa, ns_a.string()));
     const NamespaceLifeId life_a = store->namespaceLife(ns_a);
-    const CkptSample before_snapshot_publish = *readCkpt(*backend, layout, life_a);
+    const CkptSample before_snapshot_publish = *readCkpt(op, layout, life_a);
     RefCkpt after_snapshot_publish = before_snapshot_publish.ckpt;
     after_snapshot_publish.checkpoint_snapshot_id = RefTxnId{1, va2};
-    ASSERT_EQ(backend->casPut(
-        layout.refCkptKey(life_a), encodeRefCkpt(after_snapshot_publish), before_snapshot_publish.token).outcome,
-        CasOutcome::Committed);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
+        layout.refCkptKey(life_a), encodeRefCkpt(after_snapshot_publish),
+        before_snapshot_publish.incarnation, Retry::standard())));
 
     Gc gc(store, kGc);
     runToFixpoint(store, gc);
@@ -973,7 +983,9 @@ TEST(CASRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
     const RootNamespace ns{"00/aa@cas@"};
     fixture::admitLive(*backend, layout, ns);
 
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     ASSERT_EQ(catalog_cut.catalog.entries.size(), 1u);
     const UInt128 life_id = catalog_cut.catalog.entries.front().incarnation;
 

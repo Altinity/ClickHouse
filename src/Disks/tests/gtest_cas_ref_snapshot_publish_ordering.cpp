@@ -118,7 +118,7 @@ TEST(CASRefSnapshotPublishOrdering, SnapshotBodyIsDurableBeforeCheckpointAdvance
     /// nothing about the publisher's own ordering.
     const size_t offset = backend->journalSize();
     const uint64_t put_before = backend->putCount(snapshot_key);
-    const uint64_t cas_before = backend->casPutCount(ckpt_key);
+    const uint64_t cas_before = backend->putOverwriteCount(ckpt_key);
 
     ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))
         << "a healthy Ready-lane table with an uncovered tail must publish";
@@ -126,10 +126,10 @@ TEST(CASRefSnapshotPublishOrdering, SnapshotBodyIsDurableBeforeCheckpointAdvance
     /// Positive control: this attempt touched each key exactly once (no retry, no redundant write) --
     /// which is what makes the index comparison below meaningful rather than an artifact of a busy log.
     EXPECT_EQ(backend->putCount(snapshot_key) - put_before, 1u);
-    EXPECT_EQ(backend->casPutCount(ckpt_key) - cas_before, 1u);
+    EXPECT_EQ(backend->putOverwriteCount(ckpt_key) - cas_before, 1u);
 
-    const auto body_index = backend->firstIndexFrom(OrderedFaultBackend::Op::Put, snapshot_key, offset);
-    const auto ckpt_index = backend->firstIndexFrom(OrderedFaultBackend::Op::Cas, ckpt_key, offset);
+    const auto body_index = backend->firstIndexFrom(snapshot_key, offset);
+    const auto ckpt_index = backend->firstIndexFrom(ckpt_key, offset);
     ASSERT_TRUE(body_index.has_value()) << "the snapshot body must have been PUT";
     ASSERT_TRUE(ckpt_index.has_value()) << "the checkpoint must have been CAS-advanced";
     EXPECT_LT(*body_index, *ckpt_index)
@@ -155,7 +155,7 @@ TEST(CASRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
     /// Fail every one of the (attempt-bounded) 100 `_ckpt` CAS attempts `publishCkpt` will make: the
     /// body PUT still commits (dedup: an identical, already-durable body resolves as `Committed` without
     /// re-sending), but the checkpoint never advances within this call.
-    backend->armCasConflict(ckpt_key, 100);
+    backend->armWriteConflict(ckpt_key, 100);
     EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))
         << "a persistently conflicting checkpoint CAS must not be reported as a successful publish";
 
@@ -224,12 +224,12 @@ TEST(CASRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPu
     /// for `missing_durable_txn` commits durably, but its checkpoint never advances within this call, and
     /// the lane is left `NeedsRecovery` rather than installing an uncertain result -- so the cached view
     /// still reflects `ref_1` present, while the durable log already reflects it removed.
-    backend->armCasConflict(ckpt_key, 100);
+    backend->armWriteConflict(ckpt_key, 100);
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "ref_1"); });
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     const uint64_t recovery_installs_before = store->recoveryInstallCountForTest();
-    backend->armCasConflict(ckpt_key, 0);   /// clear the fault so re-recovery's OWN catch-up CAN succeed
+    backend->armWriteConflict(ckpt_key, 0);   /// clear the fault so re-recovery's OWN catch-up CAN succeed
     const size_t offset = backend->journalSize();
 
     EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))
@@ -247,8 +247,8 @@ TEST(CASRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPu
     /// ORDER, not a global zero: recovery's OWN checkpoint catch-up CAS is the boundary marker. NO
     /// snapshot-publish effect (the new snapshot's body PUT, nor the publisher's own checkpoint-advance
     /// CAS) may appear at or before it.
-    const auto ckpt_cas_indices = backend->indicesFrom(OrderedFaultBackend::Op::Cas, ckpt_key, offset);
-    const auto snap_put_indices = backend->indicesFrom(OrderedFaultBackend::Op::Put, next_snapshot_key, offset);
+    const auto ckpt_cas_indices = backend->indicesFrom(ckpt_key, offset);
+    const auto snap_put_indices = backend->indicesFrom(next_snapshot_key, offset);
     ASSERT_GE(ckpt_cas_indices.size(), 2u)
         << "expected one checkpoint CAS from recovery's catch-up and one from the snapshot publisher";
     const size_t recovery_catchup_index = ckpt_cas_indices.front();
@@ -325,7 +325,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     /// exercising the snapshot-publish backoff this test targets). Exactly 3 failures: the next 3
     /// automatic dispatch attempts fail (arming, then doubling, then re-doubling the backoff); the 4th
     /// finds the fault disarmed and succeeds.
-    backend->armPutFailure("_snap/", 3);
+    backend->armWriteFailure("_snap/", 3);
 
     const auto dispatchCount = [&] { return global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(); };
 
@@ -393,7 +393,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     /// the INITIAL 1000ms interval rather than continuing from the 4000ms cap -- refused short of
     /// 1000ms, admitted at 1000ms -- which a no-op reset cannot produce (it would refuse both probes,
     /// since the stale deadline is still far in the future).
-    backend->armPutFailure("_snap/", 1);
+    backend->armWriteFailure("_snap/", 1);
     ASSERT_EQ(publishRef(store, ns, "ref_4", 4), (RefTxnId{store->writerEpoch(), 4}));
     store->waitForSnapshotPublishSettleForTest(ns);
     const uint64_t d2 = dispatchCount();

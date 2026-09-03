@@ -97,13 +97,11 @@ const LoggerPtr & confirmLogger()
 }
 
 /// Classifies whether an exception thrown out of a ref-table recovery attempt (checkpoint/snapshot/log
-/// GETs, or the seal PUT) is a TRANSIENT object-store transport failure worth retrying,
-/// vs. a terminal condition (corruption, decode failure, logic error, resource limit) that must fail
-/// fast. The recovery reads call the backend directly (not through `ref_request_controller`), so a
-/// transient blip surfaces as the object storage's native code -- `S3_ERROR` for the S3 backend, or a
-/// socket/timeout/Poco transport code -- NOT the `NETWORK_ERROR` that only the seal PUT's controller
-/// re-mints. Retrying only `NETWORK_ERROR` would leave the LIST/GET legs unprotected, which is exactly
-/// the exact-read path the recovery retry boundary protects.
+/// reads, or the seal write) is a TRANSIENT object-store transport failure worth retrying, vs. a
+/// terminal condition (corruption, decode failure, logic error, resource limit) that must fail fast.
+/// A read that exhausts its policy surfaces as `NETWORK_ERROR`, but a store's own transport failure
+/// can also reach here unclassified -- `S3_ERROR` for the S3 backend, or a socket/timeout/Poco code --
+/// so the set covers both rather than only the one the engine re-mints.
 bool isTransientRecoveryError(int code)
 {
     return code == ErrorCodes::NETWORK_ERROR
@@ -198,13 +196,12 @@ Occupant classifyRefLogOccupant(const RootNamespace & ns, const RefTxnId & id, c
 }
 
 CasRefLedger::CasRefLedger(
-    BackendPtr backend_ptr,
+    CasRequests & mount_requests_,
     const Layout & layout_,
     RefLedgerConfig config_,
     const CasEventSink & event_sink_,
     CasRequestBudget cas_request_budget_,
     String server_root_id_,
-    std::function<uint64_t()> controller_boot_ms_fn,
     std::function<uint64_t()> live_epoch_fn_,
     std::function<bool()> fence_ok_fn_,
     std::function<uint64_t()> fence_generation_fn_,
@@ -216,7 +213,7 @@ CasRefLedger::CasRefLedger(
     std::function<void()> publish_error_hook_,
     std::function<void(const RootNamespace &)> cancel_inflight_builds_,
     std::function<void()> recovery_pre_first_request_hook_for_test_)
-    : backend(*backend_ptr)
+    : mount_requests(mount_requests_)
     , layout(layout_)
     , config(std::move(config_))
     , event_sink(event_sink_)
@@ -234,18 +231,11 @@ CasRefLedger::CasRefLedger(
     , cancel_inflight_builds(std::move(cancel_inflight_builds_))
     , recovery_pre_first_request_hook_for_test(std::move(recovery_pre_first_request_hook_for_test_))
 {
-    /// The ref-log writer path uses the same retry controller and clock seam as the mount's local
-    /// write fence, so deadline-sensitive tests exercise both paths with one monotonic clock.
-    /// The raw mount `boot_ms_fn` -- the SAME fake-clock seam the local write fence uses -- is reused
-    /// here rather than adding a second clock knob; both are monotonic-ms clocks and tests that need
-    /// deterministic deadline behavior already inject it.
-    ref_request_controller = std::make_unique<CasRequestController>(backend_ptr, cas_request_budget, controller_boot_ms_fn);
-
     /// Default backoff sleep for the recovery retry loop (`ensureRefTableRecovered`): sleep in short
     /// slices and stop early if the mount fence drops (shutdown / lease loss), so teardown never waits
     /// out a full 30s backoff. This is deliberate, bounded backoff against external object-store I/O
-    /// failure -- NOT masking a race -- exactly like `CasRequestControl`'s own inter-attempt
-    /// `threadSleepMs`; the slice loop additionally makes it interruptible, which that one is not.
+    /// failure -- NOT masking a race -- exactly like the request engine's own inter-attempt sleep; the
+    /// slice loop additionally makes it interruptible, which that one is not.
     recovery_retry_sleep_fn = [this](uint64_t total_ms, const std::optional<DetachedStopToken> & token)
     {
         constexpr uint64_t slice_ms = 200;
@@ -259,28 +249,42 @@ CasRefLedger::CasRefLedger(
     };
 }
 
-CasWriteOutcome CasRefLedger::stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token)
+WriteResult CasRefLedger::stagingPutIfAbsent(const String & key, const String & bytes)
 {
-    /// The ref lane's mount predicate (`fence_ok_fn` == `Pool::refAppendFenceOk`, with no per-table
-    /// runtime term) gates every attempt, matching the other staged writes.
-    return ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok_fn, out_token);
+    /// Admitted under the mount fence's CURRENT generation: a staged write belongs to the caller in
+    /// front of it, not to a transaction admitted earlier, so there is nothing to resume under.
+    CasOperation op = mount_requests.admit();
+    return op.create(key, bytes, Retry::standard());
 }
 
-CasOverwriteResult CasRefLedger::stagingConditionalOverwrite(std::string_view key, std::string_view bytes, const Token & expected)
+WriteResult CasRefLedger::stagingConditionalOverwrite(const String & key, const String & bytes,
+                                                      const Incarnation & expected)
 {
-    /// The supplied write is controlled by the same retry and mount-fence policy as other staged
-    /// writes.
-    return ref_request_controller->putOverwriteControlled(key, bytes, expected, fence_ok_fn);
+    CasOperation op = mount_requests.admit();
+    return op.replace(key, bytes, expected, Retry::standard());
 }
 
-CasOverwriteResult CasRefLedger::stagingPutIfAbsentMutable(std::string_view key, std::string_view bytes)
+WriteResult CasRefLedger::stagingPutIfAbsentMutable(const String & key, const String & bytes)
 {
-    return ref_request_controller->putIfAbsentControlledMutable(key, bytes, fence_ok_fn);
+    CasOperation op = mount_requests.admit();
+    return op.create(key, bytes, Retry::standard());
+}
+
+void CasRefLedger::refuseUnlessAdmitted(const CasOperation & op, uint64_t admitted_generation,
+                                        std::string_view what) const
+{
+    if (op.admitted())
+        return;
+    check_fence_or_throw(admitted_generation);
+    throwCasTransientUnavailable(
+        fmt::format("content-addressed pool '{}'", server_root_id),
+        fmt::format("{}: the operation is no longer admitted -- the mount lease has too little time left "
+                    "for another request, or this table's runtime was detached", what));
 }
 
 void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
-    ref_request_controller->setSleepFnForTest(sleep_fn);
+    mount_requests.setSleepFnForTest(sleep_fn);
     recovery_retry_sleep_fn = [recovery_sleep_fn = std::move(sleep_fn)](
         uint64_t total_ms, const std::optional<DetachedStopToken> &)
     {
@@ -649,9 +653,9 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     }
 
     const uint64_t admitted_generation = fence_generation_fn();
-    check_fence_or_throw(admitted_generation);
-    const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(backend, layout);
-    check_fence_or_throw(admitted_generation);
+    CasOperation op = mount_requests.resume(admitted_generation);
+    const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
+    refuseUnlessAdmitted(op, admitted_generation, "cold readable runtime admission");
     first_catalog.life_index.throwIfAmbiguous("CAS cold readable runtime admission");
     const auto it = std::find_if(first_catalog.catalog.entries.begin(), first_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
@@ -670,8 +674,8 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     /// after this read are caught by `invalidateRemovedCatalogLife` exactly as before. This second GET
     /// is deliberately immediately before the queue-locked fence/slot recheck in
     /// `acquireRefTableRuntime`; the held-handle warm path above pays none.
-    const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(backend, layout);
-    check_fence_or_throw(admitted_generation);
+    const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(op, layout);
+    refuseUnlessAdmitted(op, admitted_generation, "cold readable runtime admission");
     /// The first read's ambiguity validation does not cover an aliasing incarnation admitted BETWEEN
     /// the reads; physical life-owned keys use only the incarnation, so an ambiguous second cut must
     /// refuse admission even when this namespace's own row is untouched.
@@ -802,16 +806,9 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
             "CAS ref-table recovery for namespace '{}': this cached table was superseded by a self-remount "
             "mid-recovery — retry against the fresh mount incarnation", ns.string()));
 
-    /// The FENCE is deliberately NOT checked here, and the omission is the point. `checkFenceOrThrow`
-    /// asks two things at once -- "is the fence held right now" and "is the generation still mine" -- and
-    /// the first has no business gating a READ. Most of this walk is reads, and a mount that has
-    /// transiently lost its lease can still honestly serve them from durable data; refusing at every GET
-    /// would turn a lease blip into "this table cannot be read at all".
-    ///
-    /// The fence gates exactly the three sites that spend it, which is the trio: every `slotOccupy`
-    /// (through its own `admitted_fence_ok`), the `_ckpt` CAS (inside `publishCkpt`), and the install.
-    /// A walk that keeps reading after the generation moved simply wastes its own I/O and is then refused
-    /// at the first of those -- bounded, and strictly better than refusing the reads themselves.
+    /// The FENCE is deliberately NOT checked here: the walk's own `CasOperation` carries the admitted
+    /// generation and refuses every request under a generation the fence has moved past, so a second
+    /// check would only report the same fact from a different sample.
 }
 
 std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
@@ -828,6 +825,17 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     /// under the predecessor even if the same logical name is concurrently rebound.
     const NamespaceLifeId life = rt.life;
 
+    /// ONE operation for the whole walk, resumed under the generation this recovery was admitted at:
+    /// its reads, its seal creates and its `_ckpt` publishes are all measured against that admission,
+    /// and a result returning after a fence bump can install nothing. The liveness terms are the ones
+    /// `checkRecoveryStillAdmitted` polls that the fence cannot see.
+    CasOperation op = mount_requests.resume(admitted_generation, [&rt, &token]
+    {
+        return !(token && token->stopping())
+            && !rt.catalog_life_invalidated.load(std::memory_order_acquire)
+            && !rt.superseded_by_remount.load(std::memory_order_acquire);
+    });
+
     /// ---- Step 2: immutable runtime authority and checkpoint ----
     /// The runtime was admitted for this exact life before entering recovery, so this walk must not take
     /// another catalog cut. Retirement invalidates the runtime through `catalog_life_invalidated`, which
@@ -839,7 +847,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     if (recovery_pre_first_request_hook_for_test)
         recovery_pre_first_request_hook_for_test();
     checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-    const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, life);
+    const std::optional<CkptSample> sampled_ckpt = readCkpt(op, layout, life);
     std::optional<CkptSample> accepted_ckpt_sample = sampled_ckpt;
     checkRecoveryStillAdmitted(ns, rt, cancelled, token);
 
@@ -858,16 +866,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         try
         {
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-            std::function<void()> admit_snapshot_base_request;
-            if (token)
-            {
-                admit_snapshot_base_request = [this, &ns, &rt, &cancelled, &token]
-                {
-                    checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-                };
-            }
-            CheckpointSnapshotBase base = readCheckpointSnapshotBase(
-                backend, layout, life, sampled_ckpt->ckpt, admit_snapshot_base_request);
+            CheckpointSnapshotBase base = readCheckpointSnapshotBase(op, layout, life, sampled_ckpt->ckpt);
             base_snapshot = std::move(base.snapshot);
             base_snapshot_bytes = base.bytes;
         }
@@ -881,9 +880,9 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             /// unchanged checkpoint turns every helper failure (missing, malformed, or seal) into the
             /// fail-closed corruption it describes.
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-            const std::optional<CkptSample> current = readCkpt(backend, layout, life);
-            if (classifyMissingSampledBase(sampled_ckpt->token,
-                                           current ? std::optional<Token>(current->token) : std::nullopt)
+            const std::optional<CkptSample> current = readCkpt(op, layout, life);
+            if (classifyMissingSampledBase(sampled_ckpt->incarnation,
+                                           current ? std::optional<Incarnation>(current->incarnation) : std::nullopt)
                 == MissingBaseVerdict::RestartRecovery)
                 return std::nullopt;
             throw;
@@ -920,24 +919,6 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         builder.applyOne(std::move(txn), encoded_bytes);
     };
 
-    const auto check_recovery_write_admitted = [this, &ns, &rt, &cancelled, &token](uint64_t expected_generation)
-    {
-        checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-        check_fence_or_throw(expected_generation);
-        if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
-            throwCasWriteRetryLater(fmt::format(
-                "CAS ref-table recovery for namespace '{}': catalog retirement invalidated life {} "
-                "before its checkpoint contribution",
-                rt.life.ns.string(), renderIncarnation(rt.life.incarnation)));
-    };
-    std::function<void()> admit_recovery_request;
-    if (token)
-    {
-        admit_recovery_request = [this, &ns, &rt, &cancelled, &token]
-        {
-            checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-        };
-    }
     const auto publish_recovered_frontier = [&](const RefLogTxn & txn)
     {
         const RefCkpt contribution{
@@ -947,9 +928,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             .last_epoch_seal = refLogTxnIsEpochSeal(txn)
                 ? std::optional<RefTxnId>{txn.txn_id} : txn.prev_epoch_seal};
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-        if (publishCkptContribution(
-                life, contribution, admitted_generation, check_recovery_write_admitted, admit_recovery_request)
-            == CkptPublishOutcome::FencedOut)
+        if (publishCkptContribution(op, life, contribution) == CkptPublishOutcome::FencedOut)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
                 "checkpoint could record recovered txn {}-{}; nothing is installed",
@@ -960,7 +939,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         /// one successor between lookahead and our CAS, restart from the exact newer checkpoint so the
         /// installed state covers every transaction its frontier certifies.
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-        std::optional<CkptSample> exact = readCkpt(backend, layout, life);
+        std::optional<CkptSample> exact = readCkpt(op, layout, life);
         if (!exact || !exact->ckpt.committed_through || *exact->ckpt.committed_through < txn.txn_id)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': exact checkpoint read after publishing "
@@ -969,7 +948,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         if (*exact->ckpt.committed_through != txn.txn_id)
             return false;
 
-        /// This recovery itself may advance `_ckpt`. The just-read token and decoded body are the
+        /// This recovery itself may advance `_ckpt`. The just-read incarnation and decoded body are the
         /// latest authority cut the private candidate has validated, so the final install boundary
         /// compares against this sample rather than the original one.
         accepted_ckpt_sample = std::move(exact);
@@ -995,7 +974,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
             const RefTxnId id{epoch, sequence};
 
-            if (const auto got = backend.get(layout.refLogKey(life, id)))
+            if (const auto got = op.read(layout.refLogKey(life, id), Retry::standard()))
             {
                 /// `runRecoveryWalkOnce` is the writer recovery entry point even after a process
                 /// restart, when no in-memory attempt survives. A readable birth checkpoint with no
@@ -1038,19 +1017,19 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                         ? RefTxnId{id.writer_epoch + 1, 1}
                         : RefTxnId{id.writer_epoch, id.ref_sequence + 1};
                     checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-                    if (backend.get(layout.refLogKey(life, following_id)))
+                    if (op.read(layout.refLogKey(life, following_id), Retry::standard()))
                     {
                         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-                        const std::optional<CkptSample> current = readCkpt(backend, layout, life);
-                        if (!sampled_ckpt || !current || current->token != sampled_ckpt->token)
+                        const std::optional<CkptSample> current = readCkpt(op, layout, life);
+                        if (!sampled_ckpt || !current || current->incarnation != sampled_ckpt->incarnation)
                             return std::nullopt;
                         const String frontier_description = sampled_frontier
                             ? fmt::format("{}-{}", sampled_frontier->writer_epoch, sampled_frontier->ref_sequence)
                             : "with only a life epoch";
                         throw Exception(ErrorCodes::CORRUPTED_DATA,
                             "CAS ref-table recovery for namespace '{}': exact checkpoint {} "
-                            "had two durable successors through {}-{} while its token remained unchanged; "
-                            "the append lane permits at most one unfrontiered transaction",
+                            "had two durable successors through {}-{} while its incarnation remained "
+                            "unchanged; the append lane permits at most one unfrontiered transaction",
                             ns.string(), frontier_description,
                             following_id.writer_epoch, following_id.ref_sequence);
                     }
@@ -1102,12 +1081,12 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                 /// re-read the exact mutable checkpoint to distinguish a concurrent frontier movement
                 /// from durable-data loss under an unchanged authority token.
                 checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-                const std::optional<CkptSample> current = readCkpt(backend, layout, life);
-                if (!current || current->token != sampled_ckpt->token)
+                const std::optional<CkptSample> current = readCkpt(op, layout, life);
+                if (!current || current->incarnation != sampled_ckpt->incarnation)
                     return std::nullopt;
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS ref-table recovery for namespace '{}': committed log id {}-{} is absent while "
-                    "the exact checkpoint frontier {}-{} and its token remain unchanged",
+                    "the exact checkpoint frontier {}-{} and its incarnation remain unchanged",
                     ns.string(), id.writer_epoch, id.ref_sequence,
                     sampled_frontier->writer_epoch, sampled_frontier->ref_sequence);
             }
@@ -1120,7 +1099,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             if (sampled_seal_is_after_hole)
             {
                 checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-                if (backend.get(layout.refLogKey(life, *sampled_ckpt->ckpt.last_epoch_seal)))
+                if (op.read(layout.refLogKey(life, *sampled_ckpt->ckpt.last_epoch_seal), Retry::standard()))
                 {
                     ProfileEvents::increment(ProfileEvents::CASRefRecoveryStreamHole);
                     hole_detail = fmt::format(
@@ -1178,92 +1157,91 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                 validateEpochSealGrammarContextual(seal_txn, *sampled_ckpt->ckpt.life_epoch);
             const String seal_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(seal_txn));
 
-            /// Presented on EVERY attempt: the generation this recovery was admitted under, never the
-            /// current one. A seal written by an incarnation that no longer owns the namespace is a write
-            /// from a dead mount, and refusing pre-attempt leaves the slot provably untouched.
-            const auto admitted_fence_ok = [this, &rt, admitted_generation, &token]
-            {
-                return fence_ok_fn()
-                    && !(token && token->stopping())
-                    && !rt.catalog_life_invalidated.load(std::memory_order_acquire)
-                    && !rt.superseded_by_remount.load(std::memory_order_acquire)
-                    && fence_generation_fn() == admitted_generation;
-            };
-
+            /// One bounded attempt under the generation this recovery was admitted at, never the
+            /// current one: a seal written by an incarnation that no longer owns the namespace is a
+            /// write from a dead mount, and refusing pre-attempt leaves the slot provably untouched.
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-            const SlotOccupyResult occupied =
-                ref_request_controller->slotOccupy(
-                    layout.refLogKey(life, id), seal_bytes, admitted_fence_ok);
+            const WriteResult sealed = op.create(layout.refLogKey(life, id), seal_bytes, Retry::once());
 
-            switch (occupied.kind)
+            if (const auto * conflict = std::get_if<Conflict>(&sealed))
             {
-                case SlotOccupyResult::Kind::Created:
+                const auto * occupant_object = std::get_if<Object>(&conflict->seen);
+                if (!occupant_object)
+                    /// The create lost the slot and the settling read could not say to what. Continuing
+                    /// would expose a dead epoch that may or may not be closed.
+                    throwCasWriteRetryLater(fmt::format(
+                        "CAS ref-table recovery for namespace '{}': the epoch seal at {}-{} lost its slot "
+                        "to an occupant the settling read could not observe; the table stays unrecovered "
+                        "rather than being exposed with a dead epoch that may or may not be closed",
+                        ns.string(), id.writer_epoch, id.ref_sequence));
+
+                /// Someone reached this slot first. A DECODE FAILURE here propagates: an object at a
+                /// key this namespace owns that is not a transaction of this namespace at this id is
+                /// corruption or a protocol breach, and the one thing recovery must not do is guess
+                /// past it.
+                RefLogTxn occupant = decodeRefLogTxn(
+                    openObject(FormatId::RefLog, occupant_object->bytes), ns.string(), id);
+                const bool occupant_is_seal = refLogTxnIsEpochSeal(occupant);
+                const RefLogTxn frontier_txn = occupant;
+                apply_one(std::move(occupant), occupant_object->bytes.size());
+                if (!publish_recovered_frontier(frontier_txn))
+                    return std::nullopt;
+                if (occupant_is_seal)
                 {
-                    /// The epoch is ours to close and now IS closed. Apply our own seal to the candidate:
-                    /// it is a durable transaction of this stream like any other, and the next recovery
-                    /// will read it back exactly where we put it.
-                    RefLogTxn applied = seal_txn;
-                    apply_one(std::move(applied), seal_bytes.size());
-                    ProfileEvents::increment(ProfileEvents::CASRefRecoveryEpochSealed);
-                    if (!publish_recovered_frontier(seal_txn))
-                        return std::nullopt;
+                    /// A concurrent recoverer closed this epoch (or our own earlier attempt did, and
+                    /// its acknowledgment was lost). Either way the epoch is closed by a seal that is
+                    /// as good as ours -- adopt it and continue. Contesting a peer's CORRECT write is
+                    /// how two recoverers of the same table turn a designed race into an incident.
+                    ProfileEvents::increment(ProfileEvents::CASRefRecoveryEpochSealAdopted);
                     ++epoch;
                     sequence = 1;
                     slot_attempts_this_epoch = 0;
-                    break;
                 }
-                case SlotOccupyResult::Kind::Occupied:
+                else
                 {
-                    /// Someone reached this slot first. A DECODE FAILURE here propagates: an object at a
-                    /// key this namespace owns that is not a transaction of this namespace at this id is
-                    /// corruption or a protocol breach, and the one thing recovery must not do is guess
-                    /// past it.
-                    RefLogTxn occupant = decodeRefLogTxn(
-                        openObject(FormatId::RefLog, occupied.occupant_bytes), ns.string(), id);
-                    const bool occupant_is_seal = refLogTxnIsEpochSeal(occupant);
-                    const RefLogTxn frontier_txn = occupant;
-                    apply_one(std::move(occupant), occupied.occupant_bytes.size());
-                    if (!publish_recovered_frontier(frontier_txn))
-                        return std::nullopt;
-                    if (occupant_is_seal)
-                    {
-                        /// A concurrent recoverer closed this epoch (or our own earlier attempt did, and
-                        /// its acknowledgment was lost). Either way the epoch is closed by a seal that is
-                        /// as good as ours -- adopt it and continue. Contesting a peer's CORRECT write is
-                        /// how two recoverers of the same table turn a designed race into an incident.
-                        ProfileEvents::increment(ProfileEvents::CASRefRecoveryEpochSealAdopted);
-                        ++epoch;
-                        sequence = 1;
-                        slot_attempts_this_epoch = 0;
-                    }
-                    else
-                    {
-                        /// A STRAGGLER: an ordinary transaction of the dead epoch landed at `T+1` between
-                        /// our read and our create. Adopt it, advance `T` by exactly ONE, and try the seal
-                        /// again at the NEW `T+1`. Never mint `T+2` around it: ids are state-derived
-                        /// (INV-1/INV-2), and writing past an occupied slot puts a hole in the durable
-                        /// stream that no later reader can distinguish from a lost object.
-                        ProfileEvents::increment(ProfileEvents::CASRefRecoveryStragglerAdopted);
-                        ++sequence;
-                    }
-                    break;
+                    /// A STRAGGLER: an ordinary transaction of the dead epoch landed at `T+1` between
+                    /// our read and our create. Adopt it, advance `T` by exactly ONE, and try the seal
+                    /// again at the NEW `T+1`. Never mint `T+2` around it: ids are state-derived
+                    /// (INV-1/INV-2), and writing past an occupied slot puts a hole in the durable
+                    /// stream that no later reader can distinguish from a lost object.
+                    ProfileEvents::increment(ProfileEvents::CASRefRecoveryStragglerAdopted);
+                    ++sequence;
                 }
-                case SlotOccupyResult::Kind::Unresolved:
-                {
-                    /// The store will not say whether our seal landed. There is no honest way to continue:
-                    /// exposing the table would publish a dead epoch that may or may not be closed, and
-                    /// re-deriving the slot later needs a fresh read anyway. Fail this attempt into the
-                    /// caller's transient-retry loop, which either succeeds on a later attempt or spends
-                    /// its budget and leaves the table unrecovered.
-                    throwCasWriteRetryLater(fmt::format(
-                        "CAS ref-table recovery for namespace '{}': the epoch seal at {}-{} is UNRESOLVED "
-                        "({}); the table stays unrecovered rather than being exposed with a dead epoch that "
-                        "may or may not be closed",
-                        ns.string(), id.writer_epoch, id.ref_sequence,
-                        unresolvedProvesNothingWasSent(occupied.unresolved_reason)
-                            ? "nothing was sent" : "the outcome of the attempt is unknown"));
-                }
+                continue;
             }
+
+            if (const auto * gave_up = std::get_if<GaveUp>(&sealed))
+                /// The store will not say whether our seal landed. There is no honest way to continue:
+                /// exposing the table would publish a dead epoch that may or may not be closed, and
+                /// re-deriving the slot later needs a fresh read anyway. Fail this attempt into the
+                /// caller's transient-retry loop, which either succeeds on a later attempt or spends
+                /// its budget and leaves the table unrecovered.
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': the epoch seal at {}-{} is UNRESOLVED "
+                    "({}); the table stays unrecovered rather than being exposed with a dead epoch that "
+                    "may or may not be closed",
+                    ns.string(), id.writer_epoch, id.ref_sequence,
+                    gave_up->sent_any ? "the outcome of the attempt is unknown" : "nothing was sent"));
+
+            if (const auto * refused = std::get_if<Refused>(&sealed))
+                /// The store proved this attempt never applied. The slot is untouched, so the epoch is
+                /// still unclosed and the table still may not be exposed.
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS ref-table recovery for namespace '{}': the store refused the epoch seal at "
+                    "{}-{} ({}); the table stays unrecovered with its dead epoch still open",
+                    ns.string(), id.writer_epoch, id.ref_sequence, refused->message));
+
+            /// The epoch is ours to close and now IS closed. Apply our own seal to the candidate:
+            /// it is a durable transaction of this stream like any other, and the next recovery
+            /// will read it back exactly where we put it.
+            RefLogTxn applied = seal_txn;
+            apply_one(std::move(applied), seal_bytes.size());
+            ProfileEvents::increment(ProfileEvents::CASRefRecoveryEpochSealed);
+            if (!publish_recovered_frontier(seal_txn))
+                return std::nullopt;
+            ++epoch;
+            sequence = 1;
+            slot_attempts_this_epoch = 0;
         }
     }
 
@@ -1277,16 +1255,14 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                                    .committed_through = last_epoch_seal,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
-        if (publishCkptContribution(
-                life, contribution, admitted_generation, check_recovery_write_admitted, admit_recovery_request)
-            == CkptPublishOutcome::FencedOut)
+        if (publishCkptContribution(op, life, contribution) == CkptPublishOutcome::FencedOut)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
                 "checkpoint could record the epoch seal {}-{}; nothing was written and nothing is installed",
                 ns.string(), last_epoch_seal->writer_epoch, last_epoch_seal->ref_sequence));
 
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-        const std::optional<CkptSample> exact = readCkpt(backend, layout, life);
+        const std::optional<CkptSample> exact = readCkpt(op, layout, life);
         if (!exact || exact->ckpt.committed_through != private_frontier || exact->ckpt.last_epoch_seal != last_epoch_seal)
             return std::nullopt;
         accepted_ckpt_sample = exact;
@@ -1294,12 +1270,12 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
 
     /// Final authority validation is the recovery linearization point. The last exact log probe fixed
     /// the private cut, but another actor could have changed `_ckpt` immediately afterwards. Install
-    /// only when both the exact object token and its complete decoded body remain equal to the latest
-    /// authority sample this private candidate accepted.
+    /// only when both the exact object incarnation and its complete decoded body remain equal to the
+    /// latest authority sample this private candidate accepted.
     checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-    const std::optional<CkptSample> final_ckpt = readCkpt(backend, layout, life);
+    const std::optional<CkptSample> final_ckpt = readCkpt(op, layout, life);
     if (!final_ckpt || !accepted_ckpt_sample
-        || final_ckpt->token != accepted_ckpt_sample->token
+        || final_ckpt->incarnation != accepted_ckpt_sample->incarnation
         || final_ckpt->ckpt != accepted_ckpt_sample->ckpt)
         return std::nullopt;
     checkRecoveryStillAdmitted(ns, rt, cancelled, token);
@@ -1337,12 +1313,12 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
     /// reconciling a stale creator) converges in a handful of rounds; this guards only against a
     /// pathologically un-converging sequence of them.
     static constexpr size_t kMaxResolveAttempts = 32;
-    const CkptDeadline deadline{boot_ms_now_fn, boot_ms_now_fn() + cas_request_budget.operation_deadline_ms};
     const CreatorFence our_fence{server_root_id, live_epoch, admitted_generation};
+    CasOperation op = mount_requests.resume(admitted_generation);
 
     for (size_t attempt = 0; attempt < kMaxResolveAttempts; ++attempt)
     {
-        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
         const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
             [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
 
@@ -1354,8 +1330,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             /// catalog on the next loop iteration to learn it -- one extra GET, paid once per birth,
             /// never per write.
             const auto outcome = CasRefCatalog::createNamespace(
-                backend, layout, config.gc_shards, ns, our_fence,
-                admitted_generation, check_fence_or_throw, deadline);
+                op, layout, config.gc_shards, ns, our_fence);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
@@ -1384,8 +1359,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// not dead), so this case is checked FIRST and unconditionally, before any terminality probe.
         if (it->creator->server_root_id == server_root_id && it->creator->writer_epoch == live_epoch)
         {
-            const auto outcome = CasRefCatalog::completeCreation(
-                backend, layout, *it, admitted_generation, check_fence_or_throw, deadline);
+            const auto outcome = CasRefCatalog::completeCreation(op, layout, *it);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
@@ -1398,9 +1372,8 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// fresh read -- never busy-loop this instant) or provably dead, in which case reconciliation
         /// steals it onto our own fence and this open resumes `completeCreation` itself.
         const auto reconcile_outcome = CasRefCatalog::reconcileStaleCreator(
-            backend, layout, *it, our_fence,
-            [this](const CreatorFence & f) { return isCreatorFenceTerminal(backend, layout, f.server_root_id, f.writer_epoch); },
-            admitted_generation, check_fence_or_throw);
+            op, layout, *it, our_fence,
+            [&](const CreatorFence & f) { return isCreatorFenceTerminal(op, layout, f.server_root_id, f.writer_epoch); });
         switch (reconcile_outcome)
         {
             case CasRefCatalog::ReconcileCreatorOutcome::FencedOut:
@@ -1414,8 +1387,7 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             {
                 CatalogEntry resumed = *it;
                 resumed.creator = our_fence;
-                const auto outcome = CasRefCatalog::completeCreation(
-                    backend, layout, resumed, admitted_generation, check_fence_or_throw, deadline);
+                const auto outcome = CasRefCatalog::completeCreation(op, layout, resumed);
                 if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                     throwCasWriteRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
@@ -1482,10 +1454,10 @@ void CasRefLedger::ensureRefTableRecovered(
     });
 
     /// ---- Step 1: capture the admitted generation, ONCE ----
-    /// The trio (spec §3, codex finding 7): this ONE value is what the walk's every `slotOccupy` and its
-    /// `_ckpt` CAS present, and what the install below presents one final time. One capture point, three
-    /// checks, no re-derivation -- a value re-read midway would let a recovery that lost the mount
-    /// "recover" its right to write by observing a fresh incarnation it was never admitted under.
+    /// The trio (spec §3, codex finding 7): this ONE value admits the walk's operation, so every
+    /// request it makes is measured against it, and the install below presents it one final time. One
+    /// capture point, no re-derivation -- a value re-read midway would let a recovery that lost the
+    /// mount "recover" its right to write by observing a fresh incarnation it was never admitted under.
     ///
     /// Captured for the WHOLE call, not per attempt, for the same reason: the transient-retry loop below
     /// exists for object-store blips, and a generation that moved is not one. The loop refuses to
@@ -1626,9 +1598,9 @@ void CasRefLedger::ensureRefTableRecovered(
                 || fence_generation_fn() != admitted_generation)
                 throw;
 
-            /// Saturating `initial << recovery_retry_num` (mirrors `CasRequestController::backoffBefore
-            /// Attempt`): `initial > cap >> n` implies the unshifted product already exceeds the cap, so
-            /// return the cap without ever computing an overflowing/UB shift for large retry counts.
+            /// Saturating `initial << recovery_retry_num`: `initial > cap >> n` implies the unshifted
+            /// product already exceeds the cap, so return the cap without ever computing an
+            /// overflowing/UB shift for large retry counts.
             const uint64_t init_backoff = cas_request_budget.recovery_retry_initial_backoff_ms;
             const uint64_t cap_backoff = cas_request_budget.recovery_retry_max_backoff_ms;
             const uint64_t backoff_ms = (recovery_retry_num >= 63 || init_backoff > (cap_backoff >> recovery_retry_num))
@@ -2271,7 +2243,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         CatalogLifeRetired,     /// exact catalog retirement detached this immutable life
         Superseded,             /// a self-remount detached this runtime
         WedgeReplaced,          /// the result belongs to a wedge that is no longer installed
-        RefusedPreAttempt,      /// `slotOccupy` sent nothing
+        RefusedPreAttempt,      /// the bounded attempt sent nothing
         ResolveFoundNothing,    /// it sent an attempt and the follow-up read came up empty
         StaleState,             /// the table advanced under a proven-durable object we cannot install
     };
@@ -2338,47 +2310,62 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     /// lease incarnation is a write from an incarnation that never admitted this transaction. Refusing
     /// pre-attempt leaves the key provably untouched, which is the only state a later recovery can
     /// reason about.
-    const auto admitted_fence_ok = [this, &rt, admitted = wedge.admitted_fence_generation]
+    CasOperation op = mount_requests.resume(wedge.admitted_fence_generation, [&rt]
     {
-        return fence_ok_fn()
-            && !rt->catalog_life_invalidated.load(std::memory_order_acquire)
-            && !rt->superseded_by_remount.load(std::memory_order_acquire)
-            && fence_generation_fn() == admitted;
-    };
+        return !rt->catalog_life_invalidated.load(std::memory_order_acquire)
+            && !rt->superseded_by_remount.load(std::memory_order_acquire);
+    });
 
-    SlotOccupyResult occupied;
+    std::optional<WriteResult> attempted;
     try
     {
         if (wedge_before_slot_occupy_hook_for_test)
             wedge_before_slot_occupy_hook_for_test();
-        occupied = ref_request_controller->slotOccupy(wedge.key, wedge.bytes, admitted_fence_ok);
+        attempted = op.create(wedge.key, wedge.bytes, Retry::once());
     }
     catch (...)
     {
-        /// `ambiguous-then-definite`, the model-proven control. `slotOccupy` rethrows only a definite
-        /// refusal of THIS attempt (a whitelisted synchronous rejection, or a deterministic local
-        /// failure) -- and a definite refusal of a LATER attempt proves nothing whatsoever about the
-        /// EARLIER ambiguous one, which may still be in flight or may already have landed. So the lane
-        /// stays wedged: unwedging here is exactly how an acked-then-lost transaction gets written
-        /// around. The id is not consumed either, so the next attempt re-derives the SAME one.
+        /// `ambiguous-then-definite`, the model-proven control. A deterministic local failure surfaces
+        /// unchanged, and it proves nothing whatsoever about the EARLIER ambiguous attempt, which may
+        /// still be in flight or may already have landed. So the lane stays wedged: unwedging here is
+        /// exactly how an acked-then-lost transaction gets written around. The id is not consumed
+        /// either, so the next attempt re-derives the SAME one.
         result.kind = WedgeResolution::StillWedged;
         result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
-            "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {}-{} was definitively "
-            "refused ({}), which says nothing about the earlier ambiguous attempt — the lane stays wedged",
+            "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {}-{} failed ({}), "
+            "which says nothing about the earlier ambiguous attempt — the lane stays wedged",
             ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence,
             getCurrentExceptionMessage(/*with_stacktrace*/ false)));
         return result;
     }
 
+    /// A store refusal is the same control as the throw above: it proves only its OWN attempt never
+    /// applied, and the earlier ambiguous one is what the wedge is about.
+    if (const auto * refused = std::get_if<Refused>(&*attempted))
+    {
+        result.kind = WedgeResolution::StillWedged;
+        result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {}-{} was definitively "
+            "refused ({}), which says nothing about the earlier ambiguous attempt — the lane stays wedged",
+            ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence, refused->message));
+        return result;
+    }
+
     /// ---- Classify the occupant OFF the lock: pure, and the decode allocates ----
     /// The three-way `mine | successor's seal | foreign` adjudication is the CALLER's job by
-    /// construction (`slotOccupy` never compares bytes), and "mine" means BYTE EQUALITY -- never a
-    /// shape or generation match, which is the aliasing the phase-0 model rejected.
-    const Occupant occupant = occupied.kind == SlotOccupyResult::Kind::Occupied
-        ? classifyRefLogOccupant(ns, wedge.txn_id, occupied.occupant_bytes, wedge.bytes)
+    /// construction (the engine never compares bytes for meaning), and "mine" means BYTE EQUALITY --
+    /// never a shape or generation match, which is the aliasing the phase-0 model rejected.
+    const auto * conflict = std::get_if<Conflict>(&*attempted);
+    const auto * occupant_object = conflict ? std::get_if<Object>(&conflict->seen) : nullptr;
+    const auto * gave_up = std::get_if<GaveUp>(&*attempted);
+    /// A conflict whose settling read observed nothing is as unresolved as a give-up: the key holds
+    /// something this call could not name, so nothing may be adopted or unwedged from it.
+    const bool unresolved = gave_up || (conflict && !occupant_object);
+    const Occupant occupant = occupant_object
+        ? classifyRefLogOccupant(ns, wedge.txn_id, occupant_object->bytes, wedge.bytes)
         : Occupant::NotOccupied;
     const bool exact_attempt_is_durable
-        = occupied.kind == SlotOccupyResult::Kind::Created || occupant == Occupant::Ours;
+        = std::holds_alternative<Committed>(*attempted) || occupant == Occupant::Ours;
     /// Caller holds `state_mutex`. Keeping the identity predicate in one place is part of the safety
     /// rule: adding a frontier must not create yet another subtly different notion of "same attempt".
     const auto same_wedge_under_lock = [&]
@@ -2402,26 +2389,6 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     }
     if (exact_attempt_is_durable && same_wedge_before_frontier)
     {
-        const auto check_wedge_admitted = [this, &rt, &same_wedge_under_lock](uint64_t expected_generation)
-        {
-            check_fence_or_throw(expected_generation);
-            if (rt->catalog_life_invalidated.load(std::memory_order_acquire)
-                || rt->superseded_by_remount.load(std::memory_order_acquire))
-                throwCasWriteRetryLater(fmt::format(
-                    "CAS namespace '{}': its captured runtime was retired before wedged-frontier publication",
-                    rt->life.ns.string()));
-
-            bool same_wedge = false;
-            {
-                std::lock_guard lock(rt->state_mutex);
-                same_wedge = same_wedge_under_lock();
-            }
-            if (!same_wedge)
-                throwCasWriteRetryLater(fmt::format(
-                    "CAS namespace '{}': the captured wedge changed before frontier publication",
-                    rt->life.ns.string()));
-        };
-
         const RefCkpt frontier{
             .life_epoch = std::nullopt,
             .committed_through = wedge.txn_id,
@@ -2432,8 +2399,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
         try
         {
-            frontier_outcome = publishCkptContribution(
-                rt->life, frontier, wedge.admitted_fence_generation, check_wedge_admitted);
+            frontier_outcome = publishCkptContribution(op, rt->life, frontier);
         }
         catch (...)
         {
@@ -2467,20 +2433,11 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     {
         std::lock_guard lock(rt->state_mutex);
 
-        /// The generation this attempt was admitted under, presented back. `checkFenceOrThrow` reports a
-        /// moved incarnation by throwing; it is CAUGHT here rather than propagated, because the caller's
-        /// retry classification keys on the retry-later error class and a routine lease blip must not
-        /// reach it as a hard failure. Nothing is installed and nothing is unwedged either way, which is
-        /// the whole meaning of INERT here.
-        bool fence_moved = false;
-        try
-        {
-            check_fence_or_throw(wedge.admitted_fence_generation);
-        }
-        catch (...)
-        {
-            fence_moved = true;
-        }
+        /// The generation this attempt was admitted under, presented back. A moved incarnation is a
+        /// verdict here, not an exception: the caller's retry classification keys on the retry-later
+        /// error class and a routine lease blip must not reach it as a hard failure. Nothing is
+        /// installed and nothing is unwedged either way, which is the whole meaning of INERT here.
+        const bool fence_moved = !op.admitted();
 
         /// The remount half of the same question, checked separately because the two are independent
         /// facts even though today's ordering makes one imply the other: `quiesceRefTablesForRemount`
@@ -2510,14 +2467,14 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                 : (superseded ? Reason::Superseded : Reason::WedgeReplaced));
             result.kind = WedgeResolution::StillWedged;
         }
-        else if (occupied.kind == SlotOccupyResult::Kind::Unresolved)
+        else if (unresolved)
         {
             /// Still uncertain. Do NOT clear the wedge: it describes an object that may well be durable,
             /// and clearing it on a failed read is the one thing this path must never do. There is no
             /// deadline reset and no background loop -- the next caller of this namespace, or a remount,
             /// retries. That is register R6's ACCEPTED behaviour: a permanently quiet wedged namespace
             /// waits, which costs nothing, because the wedged operation was never acknowledged.
-            reason = unresolvedProvesNothingWasSent(occupied.unresolved_reason)
+            reason = gave_up && !gave_up->sent_any
                 ? Reason::RefusedPreAttempt : Reason::ResolveFoundNothing;
             result.kind = WedgeResolution::StillWedged;
         }
@@ -2712,10 +2669,8 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
                         ns.string(), txn, wedge.key);
                     break;
                 case Reason::ResolveFoundNothing:
-                    /// Never a bare `describeUnresolvedReason` for this primitive (the `SlotOccupyResult`
-                    /// doc's explicit call-site rule): `AttemptsExhausted` reads "the retry budget ran
-                    /// out", which is nonsense for a primitive with no retry budget, and it folds two very
-                    /// different observations together. Both are named instead.
+                    /// The two observations behind this one verdict are named rather than collapsed into
+                    /// a generic "unresolved": they call for very different investigations.
                     why = fmt::format(
                         "CAS ref-log append for namespace '{}': the bounded retry of wedged txn {} was sent "
                         "and the resolve read found NOTHING at slot '{}' — either the read itself failed, "
@@ -3360,9 +3315,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
 {
     /// Reconstructed locally so this arm has the SAME completion + fence semantics as when it lived
     /// inline in `flushRefBatch`: `complete_error` wakes a chunk's waiters under `ref_queue_mutex`, and
-    /// `fence_ok` folds `superseded_by_remount` into the append fence so a self-remount landing between a
-    /// leader's pre-allocate re-check and its `PUT` reports Unresolved rather than committing against a
-    /// stale cache.
+    /// `runtime_live` folds `superseded_by_remount` into the append operation's liveness so a
+    /// self-remount landing between a leader's pre-allocate re-check and its write ends the operation
+    /// rather than committing against a stale cache.
     auto complete_error = [&](const std::vector<std::shared_ptr<RefMutationItem>> & items, std::exception_ptr e)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -3373,10 +3328,11 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         rt->cv.notify_all();
     };
-    const auto fence_ok = [this, &rt]
+    /// Everything the append fence cannot see. The generation term is the operation's own, so it is
+    /// deliberately absent here.
+    const auto runtime_live = [&rt]
     {
-        return fence_ok_fn()
-            && !rt->catalog_life_invalidated.load(std::memory_order_acquire)
+        return !rt->catalog_life_invalidated.load(std::memory_order_acquire)
             && !rt->superseded_by_remount.load(std::memory_order_acquire);
     };
 
@@ -3410,8 +3366,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             }
 
             const uint64_t admitted_generation = rt->admitted_fence_generation;
-            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
-            check_fence_or_throw(admitted_generation);
+            CasOperation catalog_op = mount_requests.resume(admitted_generation, runtime_live);
+            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
+            refuseUnlessAdmitted(catalog_op, admitted_generation, "terminal removal append");
             catalog.life_index.throwIfAmbiguous("CAS terminal removal append");
             const auto entry_it = std::find_if(
                 catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
@@ -3440,8 +3397,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         try
         {
             const uint64_t admitted_generation = rt->admitted_fence_generation;
-            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
-            check_fence_or_throw(admitted_generation);
+            CasOperation catalog_op = mount_requests.resume(admitted_generation, runtime_live);
+            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
+            refuseUnlessAdmitted(catalog_op, admitted_generation, "removal-class append");
             const NamespaceLifeId & life = rt->life;
             const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
                 [&](const CatalogEntry & entry)
@@ -3591,7 +3549,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     ///
     /// THE PLACEMENT IS THE CORRECTNESS ARGUMENT, and it has to hold for BOTH chunk shapes, because
     /// `commitRefChunk` has two different first durable effects. An ordinary chunk's is the ref-log
-    /// `putIfAbsentControlled` far below; a `NamespaceBirth` chunk's is the `_ckpt` publish, which is
+    /// create far below; a `NamespaceBirth` chunk's is the `_ckpt` publish, which is
     /// EARLIER. This call therefore sits above both, and every statement between here and the lock above
     /// is in-memory only. A "pure" preparation that published the `_ckpt` itself would be a lie, and
     /// moving that publish later would change fault semantics the directive says to preserve.
@@ -3620,6 +3578,12 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// the same place, for the same reason (releasing bases whose `use_count()` the fold then reads). The
     /// move is COW-pointer-only and happens here, while nothing is durable.
     std::optional<RefTableState> candidate{std::move(prepared->candidate)};
+
+    /// ONE operation for this chunk's whole durable phase -- the birth `_ckpt`, the log create and the
+    /// committed-frontier publish -- resumed under the generation the transaction was admitted at. The
+    /// engine refuses every one of them once that generation moves, so a chunk admitted by an
+    /// incarnation this mount no longer holds can make nothing durable.
+    CasOperation op = mount_requests.resume(admitted_fence_generation, runtime_live);
 
     /// INV-4's FIRST `_ckpt` writer, and the ONLY writer anywhere that knows this namespace's
     /// `life_epoch`: it is the writer epoch of its `namespace_birth`, which is this transaction. No
@@ -3660,8 +3624,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         try
         {
-            if (publishCkptContribution(rt->life, *prepared->birth_contribution,
-                                        admitted_fence_generation, check_fence_or_throw)
+            if (publishCkptContribution(op, rt->life, *prepared->birth_contribution)
                 == CkptPublishOutcome::FencedOut)
             {
                 complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
@@ -3725,7 +3688,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// append for this table already advanced applied state. That other append can be the birth
         /// itself, whose `_ckpt` a cleanup call here would then delete out from under it -- the same harm
         /// class the ambiguous `Writing -> Wedged` branch is deliberately excluded to avoid, against an
-        /// object with no repair path (BACKLOG `{#ckpt-damage-no-repair-path}`). "`putIfAbsentControlled`
+        /// object with no repair path (BACKLOG `{#ckpt-damage-no-repair-path}`). "the ref-log create
         /// was never reached" is true of THIS attempt; it says nothing about whether a DIFFERENT attempt
         /// for this same namespace already made the birth durable. Now that Critical B removed the other
         /// call sites too, `_ckpt` debris from a never-born namespace is reclaimed only by the future
@@ -3738,34 +3701,30 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     }
     const RefAppendAttempt & active_attempt = *rt->append_attempt;
 
-    CasWriteOutcome outcome{};
-    /// WHY an Unresolved came back. Two jobs (finding #37 defect 3): the wedge message stops claiming an
-    /// exhausted retry budget when in fact no request was ever sent, and -- see the `Unresolved` arm --
-    /// the one reason that PROVES nothing was sent decides whether the lane wedges at all.
-    CasUnresolvedReason unresolved_reason = CasUnresolvedReason::NotUnresolved;
+    std::optional<WriteResult> written;
     try
     {
-        outcome = ref_request_controller->putIfAbsentControlled(
-            active_attempt.key, active_attempt.bytes, fence_ok, /*out_token=*/nullptr, &unresolved_reason);
+        written = op.create(active_attempt.key, active_attempt.bytes, Retry::standard());
     }
     catch (...)
     {
+        /// Every classified outcome comes back as a value, so an exception here is a deterministic
+        /// local failure raised at a point where an attempt may already have been sent. That is
+        /// ambiguous, and it therefore transfers ownership from `Writing` to `Wedged`; the exact
+        /// attempt remains installed.
         const std::exception_ptr write_error = std::current_exception();
-        /// `putIfAbsentControlled` throws CORRUPTED_DATA when resolve-before-reissue observes a DIFFERENT
-        /// object already at this txn's key -- a proven different-object conflict, not an unresolved PUT.
-        /// Any other exception after the send boundary is ambiguous and therefore transfers ownership
-        /// from `Writing` to `Wedged`; the exact attempt remains installed.
-        if (getCurrentExceptionCode() != ErrorCodes::CORRUPTED_DATA)
         {
-            {
-                std::lock_guard lock(rt->state_mutex);
-                if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
-                    && rt->append_attempt->txn_id == id)
-                    rt->lane_state = RefLaneState::Wedged;
-            }
-            complete_error(chunk_survivors, write_error);
-            return false;
+            std::lock_guard lock(rt->state_mutex);
+            if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
+                && rt->append_attempt->txn_id == id)
+                rt->lane_state = RefLaneState::Wedged;
         }
+        complete_error(chunk_survivors, write_error);
+        return false;
+    }
+
+    if (const auto * conflict = std::get_if<Conflict>(&*written))
+    {
         /// THREE-WAY ADJUDICATION, the same one the wedge resolution owes [review HIGH-2]. "A different
         /// object at our derived key" is not one situation but two, and they call for opposite
         /// reactions. One of them is EXPECTED: a successor that sealed our epoch put its epoch-closing
@@ -3774,23 +3733,23 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// foreign interference would fence the mount and raise an anomaly alarm on the designed path.
         /// The other is a genuine breach of write-exclusivity and must be exactly as loud as before.
         ///
-        /// The occupant is read once, by exact key, here -- `putIfAbsentControlled` proved the mismatch
-        /// but does not hand back what it saw. One extra request on a path that is already exceptional
-        /// and already fatal to this attempt.
+        /// The occupant arrives WITH the conflict: the write's own settling read already observed the
+        /// key, so no second request is issued here.
+        const auto * occupant_object = std::get_if<Object>(&conflict->seen);
         Occupant occupant = Occupant::Foreign;
         bool classified = false;
         try
         {
-            if (const auto got = backend.get(active_attempt.key))
+            if (occupant_object)
             {
-                occupant = classifyRefLogOccupant(ns, id, got->bytes, active_attempt.bytes);
+                occupant = classifyRefLogOccupant(ns, id, occupant_object->bytes, active_attempt.bytes);
                 classified = true;
             }
         }
         catch (...)   // NOLINT(bugprone-empty-catch)
         {
-            /// Left unclassified deliberately -- see below. The original conflict is what the survivors
-            /// are told about; this read's own failure is not their business.
+            /// Left unclassified deliberately -- see below. The conflict itself is what the survivors
+            /// are told about; the decode's own failure is not their business.
         }
         if (!classified)
         {
@@ -3801,8 +3760,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// classifies again -- deferring costs one round trip and decides nothing wrongly.
             ///
             /// It must be COUNTED, because deferring is the one arm here that is quiet by construction:
-            /// the loud interference report is only reached once the occupant can be read, so a real
-            /// breach whose occupant keeps failing to read would otherwise show up as nothing but a
+            /// the loud interference report is only reached once the occupant can be named, so a real
+            /// breach whose occupant keeps failing to decode would otherwise show up as nothing but a
             /// throttled log line under load. Sustained growth on this counter is the signal that the
             /// loud path is being starved.
             ProfileEvents::increment(ProfileEvents::CASRefAppendOccupantUnreadable);
@@ -3814,9 +3773,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             complete_error(chunk_survivors, std::make_exception_ptr(Exception(
                 ErrorCodes::CORRUPTED_DATA,
                 "CAS ref-log append for namespace '{}': a DIFFERENT object occupies the id {}-{} this table "
-                "derived, and reading it to tell a successor's epoch seal from foreign interference did not "
-                "succeed — the lane is faulted until remount recovery adjudicates durable state",
-                ns.string(), id.writer_epoch, id.ref_sequence)));
+                "derived, and telling a successor's epoch seal from foreign interference did not succeed "
+                "(observed {}) — the lane is faulted until remount recovery adjudicates durable state",
+                ns.string(), id.writer_epoch, id.ref_sequence, detail::renderObservation(conflict->seen))));
             return false;
         }
         if (occupant == Occupant::SuccessorSeal)
@@ -3840,205 +3799,88 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 ns.string(), id.writer_epoch, id.writer_epoch, id.ref_sequence)));
             return false;
         }
-        /// A genuine breach. This table's appends are now BLOCKED, and that is the intended contract:
-        /// under mount-lease exclusivity this key is exclusively ours, so a foreign object at it is
-        /// corruption or a protocol breach, not a race. The id is not consumed, so the next attempt
-        /// derives the SAME id and hits the SAME conflict, loudly, until a remount-level recovery (a
-        /// fresh writer epoch is a fresh key namespace) clears it. Advancing past the occupant, which is
-        /// what the pool-wide allocator did, would have written this table's stream around a foreign
-        /// object and hidden the violation -- and produced the hole INV-1 exists to forbid.
-        ///
-        /// Route it through the anomaly policy, exactly as the wedge-resolution site does for the
-        /// identical observation [review I5]. Failing closed is right, but failing closed FOREVER is
-        /// not: without this the mount stays blocked on this table until somebody notices and remounts
-        /// by hand. One impossibility, one reaction. The report is deliberately BEFORE the survivors are
-        /// completed, so the fence is closed by the time any caller wakes and can retry.
-        const String attempt_key = active_attempt.key;
+        if (occupant != Occupant::Ours)
         {
-            std::lock_guard lock(rt->state_mutex);
-            rt->append_attempt.reset();
-            rt->lane_state = RefLaneState::Faulted;
-        }
-        on_impossible_interference(attempt_key,
-            fmt::format("ref-log append for namespace '{}' txn {}-{} observed a DIFFERENT object already at "
-                "the id it derived, and it is not an epoch seal of this namespace ({})",
-                ns.string(), id.writer_epoch, id.ref_sequence,
-                getCurrentExceptionMessage(/*with_stacktrace*/ false)),
-            ns.string());
-        complete_error(chunk_survivors, write_error);
-        return false;
-    }
-    switch (outcome)
-    {
-        case CasWriteOutcome::Committed:
-        {
-            /// A durable log object is not yet admitted to logical history. Publish its exact frontier
-            /// under the SAME admission generation before any local consequence can make a later id
-            /// observable or wake a waiter. `Published` and `IdenticalSkip` both prove the contribution
-            /// durable. `FencedOut`, contention exhaustion, decode failure, or any other unresolved
-            /// publication leaves the log known durable but uninstalled, which is exactly
-            /// `NeedsRecovery`; recovery owns resolution of that window.
-            const auto check_commit_admitted = [this, &rt](uint64_t expected_generation)
-            {
-                check_fence_or_throw(expected_generation);
-                if (rt->catalog_life_invalidated.load(std::memory_order_acquire)
-                    || rt->superseded_by_remount.load(std::memory_order_acquire))
-                    throwCasWriteRetryLater(fmt::format(
-                        "CAS namespace '{}': its captured runtime was retired before committed-frontier publication",
-                        rt->life.ns.string()));
-            };
-            CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
-            try
-            {
-                frontier_outcome = publishCkptContribution(
-                    rt->life, prepared->commit_contribution, admitted_fence_generation, check_commit_admitted);
-            }
-            catch (...)
-            {
-                const std::exception_ptr frontier_error = std::current_exception();
-                {
-                    std::lock_guard lock(rt->state_mutex);
-                    requireRecovery(*rt, ns, "committed-frontier publication");
-                }
-                complete_error(chunk_survivors, frontier_error);
-                return false;
-            }
-            if (frontier_outcome == CkptPublishOutcome::FencedOut)
-            {
-                {
-                    std::lock_guard lock(rt->state_mutex);
-                    requireRecovery(*rt, ns, "committed-frontier publication fence");
-                }
-                complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                    "CAS ref-log append for namespace '{}': txn {}-{} is durable, but the mount fence "
-                    "moved before its checkpoint frontier was published; the lane needs recovery",
-                    ns.string(), id.writer_epoch, id.ref_sequence)));
-                return false;
-            }
-
-            if (carve_hook_for_test)
-                carve_hook_for_test(CarvePhaseForTest::PostDurableInstall);
-            bool install_refused = false;
-            std::exception_ptr install_admission_error;
+            /// A genuine breach. This table's appends are now BLOCKED, and that is the intended contract:
+            /// under mount-lease exclusivity this key is exclusively ours, so a foreign object at it is
+            /// corruption or a protocol breach, not a race. The id is not consumed, so the next attempt
+            /// derives the SAME id and hits the SAME conflict, loudly, until a remount-level recovery (a
+            /// fresh writer epoch is a fresh key namespace) clears it. Advancing past the occupant, which is
+            /// what the pool-wide allocator did, would have written this table's stream around a foreign
+            /// object and hidden the violation -- and produced the hole INV-1 exists to forbid.
+            ///
+            /// Route it through the anomaly policy, exactly as the wedge-resolution site does for the
+            /// identical observation [review I5]. Failing closed is right, but failing closed FOREVER is
+            /// not: without this the mount stays blocked on this table until somebody notices and remounts
+            /// by hand. One impossibility, one reaction. The report is deliberately BEFORE the survivors are
+            /// completed, so the fence is closed by the time any caller wakes and can retry.
+            const String attempt_key = active_attempt.key;
             {
                 std::lock_guard lock(rt->state_mutex);
-                /// The checkpoint CAS can succeed and the fence can move before the state lock is
-                /// reached. Re-present the same admission INSIDE the install hold, immediately before
-                /// inspecting and swapping the candidate. A stale runtime may leave both log and
-                /// frontier durable, but it must neither install nor acknowledge them.
-                try
-                {
-                    check_commit_admitted(admitted_fence_generation);
-                }
-                catch (...)
-                {
-                    install_admission_error = std::current_exception();
-                    requireRecovery(*rt, ns, "post-frontier install admission");
-                }
-                /// Only this leader mutates `rt->state`, so the candidate's base snapshot is still the
-                /// current one: there is one append-lane leader per table at a time (the `leader_active`
-                /// baton), the wedge-resolution apply ran earlier in this same flush on this same thread,
-                /// recovery installs a state exactly once per runtime and has already completed for this
-                /// table, and every other consumer (readers, the snapshot publisher) only COPIES the
-                /// state under this mutex. Evaluated here, one statement before the install, and
-                /// asserted inside it: the comparison allocates nothing, and the identifier is short
-                /// enough that even the failure path's message is inline-buffered rather than heap
-                /// allocated, so no build can turn the assert itself into an allocation in the region.
-                const bool state_unchanged
-                    = !install_admission_error
-                    && rt->lane_state == RefLaneState::Writing
-                    && rt->append_attempt
-                    && rt->append_attempt->txn_id == id
-                    && rt->append_attempt->bytes == active_attempt.bytes
-                    && rt->state.getGreatestApplied() == candidate_base_id;
-                if (!install_admission_error && !state_unchanged)
-                {
-                    /// RELEASE-mode counterpart of the `chassert` inside the region below, which is a
-                    /// no-op in a release build and therefore no guard at all for a window that spans a
-                    /// full network round trip. Swapping the candidate in anyway would DISCARD whatever
-                    /// advanced the table. The object is durable and this runtime cannot record it,
-                    /// `LOGICAL_ERROR` here, where the wedge site's identical refusal reports the
-                    /// retry-later class, and the asymmetry is deliberate: THIS one is reachable only by
-                    /// a second writer inside one process -- a bug in this build, which a debug build
-                    /// should abort on and shout about. The wedge site's is reachable by an ordinary
-                    /// remount racing a slow resolution, which is a retryable fact about the world, not a
-                    /// bug. Same refusal, different provenance, so different loudness.
-                    requireRecovery(*rt, ns, "commitRefChunk install");
-                    install_refused = true;
-                }
-                else if (!install_admission_error)
-                {
-                    std::optional<RefAppendAttempt> completed_attempt;
-                    try
-                    {
-                        DENY_ALLOCATIONS_IN_SCOPE;
-                        if (install_region_probe_for_test)
-                            install_region_probe_for_test();
-                        chassert(state_unchanged);
-                        rt->state.swap(*candidate);
-                        rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
-                        rt->tail_bytes_since_snapshot.fetch_add(active_attempt.bytes.size(), std::memory_order_relaxed);
-                        rt->append_attempt.swap(completed_attempt);
-                        rt->lane_state = RefLaneState::Ready;
-                    }
-                    catch (...)
-                    {
-                        requireRecovery(*rt, ns, "commitRefChunk install");
-                        throw;
-                    }
-                    candidate.reset();
-                    completed_attempt.reset();
-                    try
-                    {
-                        rt->state.materializeCommitted();
-                    }
-                    catch (...)
-                    {
-                        tryLogCurrentException(getLogger("CasPool"), fmt::format(
-                            "CAS ref-log append for namespace '{}': committed txn {}-{} was applied durably, but "
-                            "the post-commit overlay fold failed and was retained coherently for the next flush",
-                            ns.string(), id.writer_epoch, id.ref_sequence));
-                    }
-                }
+                rt->append_attempt.reset();
+                rt->lane_state = RefLaneState::Faulted;
             }
-            if (install_admission_error)
-            {
-                complete_error(chunk_survivors, install_admission_error);
-                return false;
-            }
-            if (install_refused)
-            {
-                complete_error(chunk_survivors, std::make_exception_ptr(Exception(
-                    ErrorCodes::LOGICAL_ERROR,
-                    "CAS ref-log append for namespace '{}': txn {}-{} is durable but this table changed "
-                    "before installation; the lane needs recovery and refuses later writes until replay",
-                    ns.string(), id.writer_epoch, id.ref_sequence)));
-                return false;
-            }
-            if (carve_hook_for_test)
-                carve_hook_for_test(CarvePhaseForTest::PostInstallPreAck);
-            ProfileEvents::increment(ProfileEvents::CASRefBatchFlushes);
-            ProfileEvents::increment(ProfileEvents::CASRefBatchedMutations, chunk_survivors.size());
-            {
-                std::lock_guard<std::mutex> g(ref_queue_mutex);
-                for (const auto & it : chunk_survivors)
-                {
-                    it->committed_id = id;
-                    it->done = true;
-                }
-                rt->cv.notify_all();
-            }
-            /// The threshold trigger -- off the lane,
-            /// dispatched AFTER waking every waiter above so this commit's own callers are never
-            /// delayed by it. Per chunk (spec §3): each committed chunk schedules its own publication,
-            /// and settlement coalesces the triggers so a mid-tenure publisher never suppresses a later
-            /// chunk (`settleSnapshotPublish`).
-            maybeScheduleSnapshotPublish(ns, rt);
-            return true;
+            const String interference_detail = fmt::format(
+                "ref-log append for namespace '{}' txn {}-{} observed a DIFFERENT object already at the id it "
+                "derived, and it is not an epoch seal of this namespace (observed {})",
+                ns.string(), id.writer_epoch, id.ref_sequence, detail::renderObservation(conflict->seen));
+            on_impossible_interference(attempt_key, interference_detail, ns.string());
+            complete_error(chunk_survivors, std::make_exception_ptr(Exception(
+                ErrorCodes::CORRUPTED_DATA, "CAS {}", interference_detail)));
+            return false;
         }
-        case CasWriteOutcome::DefiniteFailure:
+        /// `Occupant::Ours`: our OWN bytes at the id we derived, so an earlier attempt of this exact
+        /// transaction is already durable and byte equality is the proof (never a shape or generation
+        /// match). This lane's state machine does not produce it -- an attempt that may have landed
+        /// leaves the lane `Wedged`, and resolving that wedge advances the id -- but it is decided here
+        /// rather than left to the arm above, because reporting this table's own content as foreign
+        /// interference would fence the mount. The commit path below installs it, exactly as the wedge
+        /// site's identical observation does.
+    }
+    else if (const auto * refused = std::get_if<Refused>(&*written))
+    {
+        /// Proof that nothing became durable returns the exact attempt to `Ready`.
         {
-            /// Proof that nothing became durable returns the exact attempt to `Ready`.
+            std::lock_guard lock(rt->state_mutex);
+            if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
+                && rt->append_attempt->txn_id == id)
+            {
+                rt->append_attempt.reset();
+                rt->lane_state = RefLaneState::Ready;
+            }
+        }
+        ProfileEvents::increment(ProfileEvents::CASRefAppendDefiniteFailure);
+        complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log append for namespace '{}' definitively failed ({}); "
+            "cached state is unchanged and txn id {}-{} was never used (a retry re-derives it)",
+            ns.string(), refused->message, id.writer_epoch, id.ref_sequence)));
+        return false;
+    }
+    else if (const auto * gave_up = std::get_if<GaveUp>(&*written))
+    {
+        /// The ONE give-up shape that must NOT wedge. The wedge exists because an unresolved write MAY
+        /// HAVE LANDED: the durable log may or may not contain this transaction, only a read of that
+        /// exact key can settle it, and until it does, minting a later id would build on a state that
+        /// may be missing a landed transaction. All of that presupposes an attempt was SENT.
+        ///
+        /// `sent_any` is the whole call's, not its last attempt's: it is false only when every gate
+        /// refused before the first request reached the network, so the key is provably unwritten,
+        /// there is nothing for a wedge to resolve, and wedging is pointless.
+        ///
+        /// It is no longer HARMFUL, and the difference is worth stating because the old comment here
+        /// rested on it: a wedge over a never-written key used to be unclearable, because resolution
+        /// was a bare read and a read can only ever report absent. The every-attempt rule replaced
+        /// that with a conditional CREATE, so such a wedge now clears on the next caller's flush by
+        /// landing the transaction. What remains is that this lane would be blocked until then for no
+        /// reason at all -- a transient fence blip in the pre-attempt gate would cost the table its
+        /// write availability, and buy nothing, since there is provably nothing to resolve.
+        ///
+        /// The counterexample this argument deliberately excludes: a fence lost or a deadline reached
+        /// AFTER at least one attempt, and an attempt that COMMITTED but returned under a dropped
+        /// fence, both report `sent_any` true. Each may have left a durable object, so each keeps
+        /// wedging.
+        if (!gave_up->sent_any)
+        {
             {
                 std::lock_guard lock(rt->state_mutex);
                 if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
@@ -4048,90 +3890,205 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     rt->lane_state = RefLaneState::Ready;
                 }
             }
-            ProfileEvents::increment(ProfileEvents::CASRefAppendDefiniteFailure);
+            /// Count it. Before this arm existed these refusals bumped `CASRefAppendWedged`, so
+            /// removing the wedge also removed the only signal they were happening at all -- and a
+            /// soak oracle watching that counter fall could not tell "the fix works" from "nothing
+            /// happened". A separate event keeps both readings available: the wedge counter now means
+            /// only genuinely ambiguous appends, and this one means availability preserved.
+            ProfileEvents::increment(ProfileEvents::CASRefAppendPreAttemptRefused);
+            /// The id is not consumed (INV-1): it was derived from `greatest_applied`, which this
+            /// refusal leaves exactly as it was, so the next caller on this table derives the SAME id
+            /// and the durable stream keeps no trace of the refusal. That is the free half of the
+            /// every-attempt rule -- an attempt that provably sent nothing owes nothing.
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}' definitively failed (non-retryable rejection); "
-                "cached state is unchanged and txn id {}-{} was never used (a retry re-derives it)",
+                "CAS ref-log append for namespace '{}' txn {}-{} was refused BEFORE any request was "
+                "sent — the append lane is NOT wedged (nothing can be durable, so there is "
+                "nothing to resolve) and the txn id is not consumed (a retry re-derives it)",
                 ns.string(), id.writer_epoch, id.ref_sequence)));
             return false;
         }
-        case CasWriteOutcome::Unresolved:
         {
-            /// The ONE `Unresolved` shape that must NOT wedge (finding #37 defect 3). The wedge exists
-            /// because an `Unresolved` PUT MAY HAVE LANDED: the durable log may or may not contain this
-            /// transaction, only `resolveByExactGet` on that exact key can settle it, and until it does,
-            /// minting a later id would build on a state that may be missing a landed transaction. All of
-            /// that presupposes an attempt was SENT.
-            ///
-            /// `unresolvedProvesNothingWasSent` is true only for `NoAttemptSent`, which
-            /// `putIfAbsentControlled` reports only when a pre-attempt gate -- the mount fence or the
-            /// operation deadline -- rejected while `attempts_sent == 0`, i.e. strictly before the first
-            /// `backend->putIfAbsent`. Nothing reached the network, so the key is provably unwritten:
-            /// there is nothing for a wedge to resolve, and wedging is pointless.
-            ///
-            /// It is no longer HARMFUL, and the difference is worth stating because the old comment here
-            /// rested on it: a wedge over a never-written key used to be unclearable, because resolution
-            /// was a bare read and a read can only ever report absent. The every-attempt rule replaced
-            /// that with a conditional CREATE, so such a wedge now clears on the next caller's flush by
-            /// landing the transaction. What remains is that this lane would be blocked until then for no
-            /// reason at all -- a transient fence blip in the pre-attempt gate would cost the table its
-            /// write availability, and buy nothing, since there is provably nothing to resolve.
-            ///
-            /// The counterexample this argument deliberately excludes: a fence lost or a deadline reached
-            /// AFTER at least one attempt is `FenceLostMidWay`/`DeadlineMidWay`, and an attempt that
-            /// COMMITTED but returned under a dropped fence is `FenceLostPostWrite`. Each of those may
-            /// have left a durable object, so each keeps wedging -- as does anything a future contributor
-            /// adds to the enum without classifying it (see the predicate's allow-list construction).
-            if (unresolvedProvesNothingWasSent(unresolved_reason))
-            {
-                {
-                    std::lock_guard lock(rt->state_mutex);
-                    if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
-                        && rt->append_attempt->txn_id == id)
-                    {
-                        rt->append_attempt.reset();
-                        rt->lane_state = RefLaneState::Ready;
-                    }
-                }
-                /// Count it. Before this arm existed these refusals bumped `CASRefAppendWedged`, so
-                /// removing the wedge also removed the only signal they were happening at all -- and a
-                /// soak oracle watching that counter fall could not tell "the fix works" from "nothing
-                /// happened". A separate event keeps both readings available: the wedge counter now means
-                /// only genuinely ambiguous appends, and this one means availability preserved.
-                ProfileEvents::increment(ProfileEvents::CASRefAppendPreAttemptRefused);
-                /// The id is not consumed (INV-1): it was derived from `greatest_applied`, which this
-                /// refusal leaves exactly as it was, so the next caller on this table derives the SAME id
-                /// and the durable stream keeps no trace of the refusal. That is the free half of the
-                /// every-attempt rule -- an attempt that provably sent nothing owes nothing.
-                /// The installed attempt is retired below; no request was sent.
-                /// and is what makes the genuinely ambiguous path below allocation-free.
-                complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                    "CAS ref-log append for namespace '{}' txn {}-{} was refused BEFORE any request was "
-                    "sent ({}) — the append lane is NOT wedged (nothing can be durable, so there is "
-                    "nothing to resolve) and the txn id is not consumed (a retry re-derives it)",
-                    ns.string(), id.writer_epoch, id.ref_sequence,
-                    describeUnresolvedReason(unresolved_reason))));
-                return false;
-            }
+            std::lock_guard lock(rt->state_mutex);
+            if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
+                && rt->append_attempt->txn_id == id)
+                rt->lane_state = RefLaneState::Wedged;
+        }
+        ProfileEvents::increment(ProfileEvents::CASRefAppendWedged);
+        complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+            "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN (last observed {}) — "
+            "the append lane is wedged until the SAME key resolves durable or a conclusive rejection "
+            "is observed; this outcome is unproven, not failure",
+            ns.string(), id.writer_epoch, id.ref_sequence, detail::renderObservation(gave_up->last_seen))));
+        return false;
+    }
+
+    {
+        /// The log object is durable -- this call's own attempt committed it, or the conflict above
+        /// proved an earlier attempt of this exact transaction already had. Either way it is not yet
+        /// admitted to logical history. Publish its exact frontier
+        /// under the SAME admission generation before any local consequence can make a later id
+        /// observable or wake a waiter. `Published` and `IdenticalSkip` both prove the contribution
+        /// durable. `FencedOut`, contention exhaustion, decode failure, or any other unresolved
+        /// publication leaves the log known durable but uninstalled, which is exactly
+        /// `NeedsRecovery`; recovery owns resolution of that window.
+        const auto refuse_unless_still_admitted = [&]
+        {
+            if (op.admitted())
+                return;
+            check_fence_or_throw(admitted_fence_generation);
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}': its captured runtime was retired, or the mount lease has too "
+                "little time left, before committed-frontier publication",
+                rt->life.ns.string()));
+        };
+        CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
+        try
+        {
+            frontier_outcome = publishCkptContribution(op, rt->life, prepared->commit_contribution);
+        }
+        catch (...)
+        {
+            const std::exception_ptr frontier_error = std::current_exception();
             {
                 std::lock_guard lock(rt->state_mutex);
-                if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
-                    && rt->append_attempt->txn_id == id)
-                    rt->lane_state = RefLaneState::Wedged;
+                requireRecovery(*rt, ns, "committed-frontier publication");
             }
-            ProfileEvents::increment(ProfileEvents::CASRefAppendWedged);
-            complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN ({}) — "
-                "the append lane is wedged until the SAME key resolves durable or a conclusive rejection "
-                "is observed; this outcome is unproven, not failure",
-                ns.string(), id.writer_epoch, id.ref_sequence,
-                describeUnresolvedReason(unresolved_reason))));
+            complete_error(chunk_survivors, frontier_error);
             return false;
         }
+        if (frontier_outcome == CkptPublishOutcome::FencedOut)
+        {
+            {
+                std::lock_guard lock(rt->state_mutex);
+                requireRecovery(*rt, ns, "committed-frontier publication fence");
+            }
+            complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': txn {}-{} is durable, but the mount fence "
+                "moved before its checkpoint frontier was published; the lane needs recovery",
+                ns.string(), id.writer_epoch, id.ref_sequence)));
+            return false;
+        }
+
+        if (carve_hook_for_test)
+            carve_hook_for_test(CarvePhaseForTest::PostDurableInstall);
+        bool install_refused = false;
+        std::exception_ptr install_admission_error;
+        {
+            std::lock_guard lock(rt->state_mutex);
+            /// The checkpoint CAS can succeed and the fence can move before the state lock is
+            /// reached. Re-present the same admission INSIDE the install hold, immediately before
+            /// inspecting and swapping the candidate. A stale runtime may leave both log and
+            /// frontier durable, but it must neither install nor acknowledge them.
+            try
+            {
+                refuse_unless_still_admitted();
+            }
+            catch (...)
+            {
+                install_admission_error = std::current_exception();
+                requireRecovery(*rt, ns, "post-frontier install admission");
+            }
+            /// Only this leader mutates `rt->state`, so the candidate's base snapshot is still the
+            /// current one: there is one append-lane leader per table at a time (the `leader_active`
+            /// baton), the wedge-resolution apply ran earlier in this same flush on this same thread,
+            /// recovery installs a state exactly once per runtime and has already completed for this
+            /// table, and every other consumer (readers, the snapshot publisher) only COPIES the
+            /// state under this mutex. Evaluated here, one statement before the install, and
+            /// asserted inside it: the comparison allocates nothing, and the identifier is short
+            /// enough that even the failure path's message is inline-buffered rather than heap
+            /// allocated, so no build can turn the assert itself into an allocation in the region.
+            const bool state_unchanged
+                = !install_admission_error
+                && rt->lane_state == RefLaneState::Writing
+                && rt->append_attempt
+                && rt->append_attempt->txn_id == id
+                && rt->append_attempt->bytes == active_attempt.bytes
+                && rt->state.getGreatestApplied() == candidate_base_id;
+            if (!install_admission_error && !state_unchanged)
+            {
+                /// RELEASE-mode counterpart of the `chassert` inside the region below, which is a
+                /// no-op in a release build and therefore no guard at all for a window that spans a
+                /// full network round trip. Swapping the candidate in anyway would DISCARD whatever
+                /// advanced the table. The object is durable and this runtime cannot record it,
+                /// `LOGICAL_ERROR` here, where the wedge site's identical refusal reports the
+                /// retry-later class, and the asymmetry is deliberate: THIS one is reachable only by
+                /// a second writer inside one process -- a bug in this build, which a debug build
+                /// should abort on and shout about. The wedge site's is reachable by an ordinary
+                /// remount racing a slow resolution, which is a retryable fact about the world, not a
+                /// bug. Same refusal, different provenance, so different loudness.
+                requireRecovery(*rt, ns, "commitRefChunk install");
+                install_refused = true;
+            }
+            else if (!install_admission_error)
+            {
+                std::optional<RefAppendAttempt> completed_attempt;
+                try
+                {
+                    DENY_ALLOCATIONS_IN_SCOPE;
+                    if (install_region_probe_for_test)
+                        install_region_probe_for_test();
+                    chassert(state_unchanged);
+                    rt->state.swap(*candidate);
+                    rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+                    rt->tail_bytes_since_snapshot.fetch_add(active_attempt.bytes.size(), std::memory_order_relaxed);
+                    rt->append_attempt.swap(completed_attempt);
+                    rt->lane_state = RefLaneState::Ready;
+                }
+                catch (...)
+                {
+                    requireRecovery(*rt, ns, "commitRefChunk install");
+                    throw;
+                }
+                candidate.reset();
+                completed_attempt.reset();
+                try
+                {
+                    rt->state.materializeCommitted();
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(getLogger("CasPool"), fmt::format(
+                        "CAS ref-log append for namespace '{}': committed txn {}-{} was applied durably, but "
+                        "the post-commit overlay fold failed and was retained coherently for the next flush",
+                        ns.string(), id.writer_epoch, id.ref_sequence));
+                }
+            }
+        }
+        if (install_admission_error)
+        {
+            complete_error(chunk_survivors, install_admission_error);
+            return false;
+        }
+        if (install_refused)
+        {
+            complete_error(chunk_survivors, std::make_exception_ptr(Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "CAS ref-log append for namespace '{}': txn {}-{} is durable but this table changed "
+                "before installation; the lane needs recovery and refuses later writes until replay",
+                ns.string(), id.writer_epoch, id.ref_sequence)));
+            return false;
+        }
+        if (carve_hook_for_test)
+            carve_hook_for_test(CarvePhaseForTest::PostInstallPreAck);
+        ProfileEvents::increment(ProfileEvents::CASRefBatchFlushes);
+        ProfileEvents::increment(ProfileEvents::CASRefBatchedMutations, chunk_survivors.size());
+        {
+            std::lock_guard<std::mutex> g(ref_queue_mutex);
+            for (const auto & it : chunk_survivors)
+            {
+                it->committed_id = id;
+                it->done = true;
+            }
+            rt->cv.notify_all();
+        }
+        /// The threshold trigger -- off the lane,
+        /// dispatched AFTER waking every waiter above so this commit's own callers are never
+        /// delayed by it. Per chunk (spec §3): each committed chunk schedules its own publication,
+        /// and settlement coalesces the triggers so a mid-tenure publisher never suppresses a later
+        /// chunk (`settleSnapshotPublish`).
+        maybeScheduleSnapshotPublish(ns, rt);
+        return true;
     }
-    /// Unreachable: the switch above covers every `CasWriteOutcome`. Kept explicit so the function has a
-    /// defined return on all control-flow paths.
-    return false;
 }
 
 bool CasRefLedger::hasStateBearingSnapshotCandidateUnderStateLock(const RefTableRuntime & rt) const
@@ -4408,17 +4365,10 @@ void clampedCounterSub(std::atomic<uint64_t> & counter, uint64_t amount)
 }
 
 
-CkptPublishOutcome CasRefLedger::publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
-                                                         uint64_t admitted_generation,
-                                                         const std::function<void(uint64_t)> & check_admission,
-                                                         const std::function<void()> & admit_request)
+CkptPublishOutcome CasRefLedger::publishCkptContribution(CasOperation & op, const NamespaceLifeId & life,
+                                                         const RefCkpt & contribution)
 {
-    /// The retry window is the SAME budget every other CAS operation of this ledger rides, measured on
-    /// the ledger's own injectable boot clock -- so a test drives the exhaustion arm without sleeping,
-    /// and a VM suspend cannot shorten it.
-    const CkptDeadline deadline{boot_ms_now_fn, boot_ms_now_fn() + cas_request_budget.operation_deadline_ms};
-    const CkptPublishOutcome outcome = publishCkpt(
-        backend, layout, life, contribution, admitted_generation, check_admission, deadline, admit_request);
+    const CkptPublishOutcome outcome = publishCkpt(op, layout, life, contribution);
     if (outcome == CkptPublishOutcome::Published)
         ProfileEvents::increment(ProfileEvents::CASRefCheckpointPublished);
     else if (outcome == CkptPublishOutcome::IdenticalSkip)
@@ -4453,13 +4403,12 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
     /// recheck discipline -- the same value at every site), so a publish admitted under an incarnation
     /// that has since been replaced can advance nothing.
     const uint64_t admitted_generation = rt->admitted_fence_generation;
-    const auto runtime_still_admitted = [this, &rt, admitted_generation]
+    CasOperation op = mount_requests.resume(admitted_generation, [&rt]
     {
         return !rt->catalog_life_invalidated.load(std::memory_order_acquire)
-            && !rt->superseded_by_remount.load(std::memory_order_acquire)
-            && fence_ok_fn()
-            && fence_generation_fn() == admitted_generation;
-    };
+            && !rt->superseded_by_remount.load(std::memory_order_acquire);
+    });
+    const auto runtime_still_admitted = [&op] { return op.admitted(); };
 
     /// ONE copy of the live state, at a transaction boundary -- no
     /// replay, no per-entry retention. The tail counters are captured in the SAME critical section so
@@ -4546,11 +4495,22 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
         return false;
     }
     const String key = layout.refSnapshotKey(rt->life, candidate_x);
-    const CasWriteOutcome outcome
-        = ref_request_controller->putIfAbsentControlled(key, bytes, runtime_still_admitted);
-    if (outcome != CasWriteOutcome::Committed)
+    const WriteResult put = op.create(key, bytes, Retry::standard());
+    if (const auto * conflict = std::get_if<Conflict>(&put))
     {
-        /// DefiniteFailure/Unresolved: DO NOT prune (no durable covering snapshot -- pruning the tail
+        /// A snapshot key names the exact state it encodes, so a re-run of this publish -- and only a
+        /// re-run -- can find its own identical body already there. DIFFERENT bytes under this mount's
+        /// exclusive lease are corruption, and the publisher must not paper over them with a backoff.
+        const auto * occupant = std::get_if<Object>(&conflict->seen);
+        if (!occupant || occupant->bytes != bytes)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS ref table '{}': a DIFFERENT object occupies snapshot {}-{} (observed {})",
+                ns.string(), candidate_x.writer_epoch, candidate_x.ref_sequence,
+                detail::renderObservation(conflict->seen));
+    }
+    else if (!std::holds_alternative<Committed>(put))
+    {
+        /// Refused or unresolved: DO NOT prune (no durable covering snapshot -- pruning the tail
         /// without one is data loss). Arm the bounded per-table backoff so the read path does not
         /// re-dispatch this full-snapshot encode+PUT until it elapses -- the read-triggered PUT-storm
         /// latch breaker. A later trigger past the deadline retries.
@@ -4580,25 +4540,16 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
     bool ckpt_advanced = false;
     if (!runtime_still_admitted())
         return false;
-    const auto check_runtime_admission = [this, &rt](uint64_t generation)
-    {
-        if (snapshot_before_ckpt_cas_hook_for_test)
-            snapshot_before_ckpt_cas_hook_for_test();
-        check_fence_or_throw(generation);
-        if (rt->catalog_life_invalidated.load(std::memory_order_acquire)
-            || rt->superseded_by_remount.load(std::memory_order_acquire))
-            throwCasWriteRetryLater(fmt::format(
-                "CAS namespace '{}': its captured runtime was retired before checkpoint publication",
-                rt->life.ns.string()));
-    };
+    if (snapshot_before_ckpt_cas_hook_for_test)
+        snapshot_before_ckpt_cas_hook_for_test();
     try
     {
-        ckpt_advanced = publishCkptContribution(rt->life, RefCkpt{.life_epoch = std::nullopt,
-                                                            .committed_through = candidate_x,
-                                                            .checkpoint_snapshot_id = candidate_x,
-                                                            .last_epoch_seal = std::nullopt},
-                                                admitted_generation,
-                                                check_runtime_admission) != CkptPublishOutcome::FencedOut;
+        ckpt_advanced = publishCkptContribution(op, rt->life,
+                                                RefCkpt{.life_epoch = std::nullopt,
+                                                        .committed_through = candidate_x,
+                                                        .checkpoint_snapshot_id = candidate_x,
+                                                        .last_epoch_seal = std::nullopt})
+            != CkptPublishOutcome::FencedOut;
     }
     catch (...)
     {
@@ -4934,7 +4885,8 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         {
             /// A lost erase response can leave only the detached predecessor's close bit. Reconcile
             /// before refusing so an absent/replaced row frees the logical name without rebinding it.
-            reconcileCatalogCut(CasRefCatalog::read(backend, layout));
+            CasOperation reconcile_op = mount_requests.resume(rt->admitted_fence_generation);
+            reconcileCatalogCut(CasRefCatalog::read(reconcile_op, layout));
             const auto refreshed = lookupRefTableRuntime(ns);
             if (refreshed == rt)
                 throwCasWriteRetryLater(fmt::format(
@@ -4951,9 +4903,9 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
 
     /// A cold mutation observes or births the durable identity before allocating any local state.
     const uint64_t admitted_generation = fence_generation_fn();
-    check_fence_or_throw(admitted_generation);
-    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
-    check_fence_or_throw(admitted_generation);
+    CasOperation op = mount_requests.resume(admitted_generation);
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
+    refuseUnlessAdmitted(op, admitted_generation, "cold mutable namespace admission");
     const auto entry_it = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (entry_it != catalog.catalog.entries.end() && entry_it->state == NsState::Removing)
@@ -5018,9 +4970,9 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// the one answer that must never be manufactured by a race, so it alone is re-confirmed by a
     /// second read of this namespace's row before being trusted.
     const uint64_t admitted_generation = fence_generation_fn();
-    check_fence_or_throw(admitted_generation);
-    const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(backend, layout);
-    check_fence_or_throw(admitted_generation);
+    CasOperation op = mount_requests.resume(admitted_generation);
+    const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
+    refuseUnlessAdmitted(op, admitted_generation, "namespace presence probe");
     if (namespace_presence_probe_after_first_read_hook_for_test)
         namespace_presence_probe_after_first_read_hook_for_test();
     const auto find_entry = [&ns](const CasRefCatalog::Snapshot & snap) -> const CatalogEntry *
@@ -5040,8 +4992,8 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
         /// continuously) while adding nothing to this row's proof. A row that appears in between
         /// answers present: `true` is always the safe direction, and the caller's next poll runs the
         /// full state dispatch against a fresh observation.
-        const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(backend, layout);
-        check_fence_or_throw(admitted_generation);
+        const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(op, layout);
+        refuseUnlessAdmitted(op, admitted_generation, "namespace presence probe");
         if (find_entry(second_catalog))
             return true;
         return false;   /// no catalog row in two atomic observations: proven absent
@@ -5075,8 +5027,8 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     if (namespace_presence_probe_after_terminal_proven_hook_for_test)
         namespace_presence_probe_after_terminal_proven_hook_for_test();
 
-    check_fence_or_throw(admitted_generation);
-    const CasRefCatalog::Snapshot post_terminal_catalog = CasRefCatalog::read(backend, layout);
+    const CasRefCatalog::Snapshot post_terminal_catalog = CasRefCatalog::read(op, layout);
+    refuseUnlessAdmitted(op, admitted_generation, "namespace presence probe");
     const CatalogEntry * post_terminal_entry = find_entry(post_terminal_catalog);
     if (!post_terminal_entry || post_terminal_entry->incarnation == entry->incarnation)
         return false;   /// terminal durably proven and nothing has since occupied `ns` under a new life
@@ -5101,7 +5053,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// class shares the bigger complete-table byte budget (encodeRefLogTxn's own `checkBudget`, keyed
     /// off the presence of a `RemoveNamespace` op) and is exempt from the ordinary per-op admission
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
-    const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(backend, layout);
+    CasOperation initial_op = mount_requests.admit();
+    const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(initial_op, layout);
     const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (initial_it == initial_catalog.catalog.entries.end())
@@ -5114,15 +5067,14 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     if (initial_it->state == NsState::Creating)
     {
         const CatalogEntry & observed = *initial_it;
-        const uint64_t admitted_generation = fence_generation_fn();
+        CasOperation cancel_op = mount_requests.resume(fence_generation_fn());
         switch (CasRefCatalog::cancelStalledCreating(
-            backend, layout, observed,
-            [this](const CreatorFence & creator)
+            cancel_op, layout, observed,
+            [&](const CreatorFence & creator)
             {
                 return isCreatorFenceTerminal(
-                    backend, layout, creator.server_root_id, creator.writer_epoch);
-            },
-            admitted_generation, check_fence_or_throw))
+                    cancel_op, layout, creator.server_root_id, creator.writer_epoch);
+            }))
         {
             case CasRefCatalog::StalledCreatingCancelOutcome::Cancelled:
                 invalidateRemovedCatalogLife(NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation));
@@ -5171,13 +5123,14 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     }
 
     const uint64_t admitted_generation = fence_generation_fn();
+    CasOperation removal_op = mount_requests.resume(admitted_generation);
     std::optional<CatalogEntry> observed_live;
     if (initial_it->state == NsState::Live)
         observed_live = *initial_it;
     bool removing_durable = false;
     try
     {
-        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(backend, layout);
+        const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(removal_op, layout);
         const auto entry_it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns == ns; });
         if (entry_it == snapshot.catalog.entries.end())
@@ -5199,12 +5152,11 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         {
             observed_live = *entry_it;
             uint64_t removal_started_round = 0;
-            if (const auto got = backend.get(layout.gcStateKey()))
+            if (const auto got = removal_op.read(layout.gcStateKey(), Retry::standard()))
                 removal_started_round = decodeGcState(got->bytes).round;
 
             switch (CasRefCatalog::beginRemoving(
-                backend, layout, *observed_live, removal_started_round,
-                admitted_generation, check_fence_or_throw))
+                removal_op, layout, *observed_live, removal_started_round))
             {
                 case CasRefCatalog::BeginRemovingOutcome::Transitioned:
                 case CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving:
@@ -5235,7 +5187,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         /// changed or fenced case remains closed (fail-close) and propagates the original error.
         try
         {
-            const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(backend, layout);
+            const CasRefCatalog::Snapshot fresh = CasRefCatalog::read(removal_op, layout);
             const auto fresh_it = std::find_if(fresh.catalog.entries.begin(), fresh.catalog.entries.end(),
                 [&](const CatalogEntry & entry) { return entry.ns == ns; });
             if (observed_live
@@ -5247,7 +5199,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
             }
             else if (observed_live && fresh_it != fresh.catalog.entries.end() && *fresh_it == *observed_live)
             {
-                check_fence_or_throw(admitted_generation);
+                refuseUnlessAdmitted(removal_op, admitted_generation, "reopening the removal lane");
                 std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
                 rt->removal_admission_closed = false;
                 rt->cv.notify_all();

@@ -83,22 +83,18 @@ namespace
 class RecoveryLatchBackend : public CountingBackend
 {
 public:
-    using CountingBackend::get;
     using CountingBackend::getStream;
-    using CountingBackend::putIfAbsent;
-    using CountingBackend::putOverwrite;
-    using CountingBackend::casPut;
 
-    /// Set before the driving call; consumed by the first matching recovery GET.
+    /// Set before the driving call; consumed by the first matching recovery read.
     String fail_get_once_key;
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         if (!fail_get_once_key.empty() && key == fail_get_once_key)
         {
             fail_get_once_key.clear();
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "RecoveryLatchBackend: simulated non-transient exact GET failure");
+                "RecoveryLatchBackend: simulated non-transient exact read failure");
         }
         {
             std::unique_lock lk(m);
@@ -110,7 +106,7 @@ public:
                 cv.wait_for(lk, std::chrono::seconds(20), [&] { return block_key.empty(); });
             }
         }
-        return CountingBackend::get(key, range);
+        return CountingBackend::read(key, access);
     }
 
     void armBlockedGet(const String & key)

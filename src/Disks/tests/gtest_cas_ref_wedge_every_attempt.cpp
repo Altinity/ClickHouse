@@ -132,24 +132,21 @@ class WedgeTestBackend : public CountingBackend
 {
 public:
     using CountingBackend::putIfAbsent;
-    using CountingBackend::get;
 
     /// One-shot ambiguity that writes NOTHING: the response is lost and the key stays absent, which is
-    /// the input that makes a later `slotOccupy` report `Created`.
+    /// the input that makes a later bounded create commit.
     String ambiguous_substr;
     int ambiguous_count = 0;
 
     /// One-shot DETERMINISTIC LOCAL failure (`BAD_ARGUMENTS`, in `isDeterministicLocalFailure`'s set),
-    /// which `slotOccupy` rethrows unchanged -- a definite refusal of THIS attempt. Portable stand-in
-    /// for the S3 `DefiniteFailure` shape, which needs `USE_AWS_S3`; both are "proven never applied".
+    /// which every loop surfaces unchanged -- an exception out of the write, not an outcome.
     String definite_substr;
     int definite_count = 0;
 
-    /// One-shot WHITELISTED SYNCHRONOUS REJECTION: the ONLY shape `classifyConditionalWriteResult`
-    /// answers `DefiniteFailure` for, and therefore the only way to drive the append lane's definite
-    /// arm. Distinct from `definite_substr` above on purpose -- that one is a deterministic LOCAL
-    /// failure, which `slotOccupy` rethrows but `putIfAbsentControlled` (no such special case) merely
-    /// classifies Unresolved, so it cannot script this arm at all.
+    /// One-shot WHITELISTED SYNCHRONOUS REJECTION: the shape `isDefinitelyRefusedWrite` answers TRUE
+    /// for, and therefore the only way to drive the append lane's `Refused` arm. Distinct from
+    /// `definite_substr` above on purpose -- that one is a local bug the engine rethrows, while this one
+    /// is the store's own answer and comes back as a value.
     String s3_definite_substr;
     int s3_definite_count = 0;
 
@@ -169,7 +166,7 @@ public:
     String fail_cas_substr;
     int fail_cas_count = 0;
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         if (fail_get_count > 0 && !fail_get_substr.empty() && key.find(fail_get_substr) != String::npos)
         {
@@ -178,21 +175,28 @@ public:
             else
             {
                 --fail_get_count;
-                throw Poco::TimeoutException("WedgeTestBackend: simulated lost GET (read response never arrived)");
+                throw Poco::TimeoutException("WedgeTestBackend: simulated lost read (response never arrived)");
             }
         }
-        return CountingBackend::get(key, range);
+        return CountingBackend::read(key, access);
     }
 
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    /// Every write fault hangs off the ONE keyed primitive; which of them applies is decided by whether
+    /// the write carries a precondition, which is what used to separate a replace from a create.
+    std::expected<String, DB::Cas::Backend::RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        DB::Cas::TransportAccess & access) override
     {
-        if (fail_cas_count > 0 && !fail_cas_substr.empty() && key.find(fail_cas_substr) != String::npos)
+        if (expected_value)
         {
-            --fail_cas_count;
-            throw Poco::TimeoutException("WedgeTestBackend: simulated ambiguous checkpoint CAS");
+            if (fail_cas_count > 0 && !fail_cas_substr.empty() && key.find(fail_cas_substr) != String::npos)
+            {
+                --fail_cas_count;
+                throw Poco::TimeoutException("WedgeTestBackend: simulated ambiguous checkpoint replace");
+            }
+            return CountingBackend::write(key, bytes, expected_value, access);
         }
-        return CountingBackend::casPut(key, bytes, expected, meta);
+        return createForTest(key, bytes, access);
     }
 
     /// Park a matching PUT until `releaseBlock()`, notifying `awaitBlockEntered()` on arrival, so a
@@ -229,7 +233,8 @@ public:
         return CountingBackend::putIfAbsent(key, bytes, ObjectMeta{});
     }
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    std::expected<String, DB::Cas::Backend::RawConflict> createForTest(
+        const String & key, const String & bytes, DB::Cas::TransportAccess & access)
     {
         if (ambiguous_count > 0 && !ambiguous_substr.empty() && key.find(ambiguous_substr) != String::npos)
         {
@@ -257,7 +262,7 @@ public:
         if (conflict_count > 0 && !conflict_substr.empty() && key.find(conflict_substr) != String::npos)
         {
             --conflict_count;
-            CountingBackend::putIfAbsent(key, conflict_bytes, meta);
+            (void)CountingBackend::write(key, conflict_bytes, std::nullopt, access);
             throw Poco::TimeoutException("WedgeTestBackend: a successor's object landed; our response was lost");
         }
         {
@@ -270,7 +275,7 @@ public:
                 block_cv.wait_for(lk, std::chrono::seconds(20), [&] { return !block_armed; });
             }
         }
-        return CountingBackend::putIfAbsent(key, bytes, meta);
+        return CountingBackend::write(key, bytes, std::nullopt, access);
     }
 
 private:
@@ -287,9 +292,11 @@ String logPrefix(const PoolPtr & store, const RootNamespace & ns)
     return store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
 }
 
-CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const RootNamespace & ns)
+CatalogEntry catalogEntryOrThrow(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
 {
-    const RefCatalog catalog = CasRefCatalog::read(backend, layout).catalog;
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    const RefCatalog catalog = CasRefCatalog::read(op, layout).catalog;
     const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
     {
         return entry.ns == ns;
@@ -302,34 +309,38 @@ CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const
 /// Wedge tests address raw ref-log keys at Stage A's deterministic sentinel identity, but their
 /// catalog fixture must still use production's `Creating -> _ckpt -> Live` birth order. A fixed
 /// creator identity makes the durable genesis checkpoint deterministic too.
-void admitProperlyBornEntry(Backend & backend, const Layout & layout, const RootNamespace & ns)
+void admitProperlyBornEntry(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
 {
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
     const CatalogEntry creating{
         .ns = ns,
         .state = NsState::Creating,
         .incarnation = DB::Cas::tests::fixture::fixtureLife(ns).incarnation,
         .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1},
     };
-    CasRefCatalog::casAdmitEntry(backend, layout, /*gc_shards=*/1, creating);
+    CasRefCatalog::casAdmitEntry(op, layout, /*gc_shards=*/1, creating);
 
-    const CkptDeadline deadline{.now_ms = [] { return uint64_t{1000}; }, .deadline_ms = 60000};
-    ASSERT_EQ(
-        CasRefCatalog::completeCreation(
-            backend, layout, creating, /*admitted_generation=*/1, [](uint64_t) {}, deadline),
-        CasRefCatalog::NamespaceCreationOutcome::Live);
+    ASSERT_EQ(CasRefCatalog::completeCreation(op, layout, creating),
+              CasRefCatalog::NamespaceCreationOutcome::Live);
 }
 
 CatalogEntry replaceCatalogLifeForWedgeRace(
-    Backend & backend, const Layout & layout, const CatalogEntry & predecessor, UInt128 successor_incarnation)
+    const BackendPtr & backend, const Layout & layout, const CatalogEntry & predecessor,
+    UInt128 successor_incarnation)
 {
-    const CasRefCatalog::Snapshot before_delete = CasRefCatalog::read(backend, layout);
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    const CasRefCatalog::Snapshot before_delete = CasRefCatalog::read(op, layout);
     RefCatalog without_predecessor = before_delete.catalog;
     std::erase_if(without_predecessor.entries, [&](const CatalogEntry & entry)
     {
         return entry.ns == predecessor.ns && entry.incarnation == predecessor.incarnation;
     });
-    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(without_predecessor), before_delete.token).outcome
-        != CasOutcome::Committed)
+    if (!before_delete.incarnation
+        || !std::holds_alternative<Committed>(op.replace(
+               layout.refCatalogKey(), encodeRefCatalog(without_predecessor), *before_delete.incarnation,
+               Retry::standard())))
         throw std::runtime_error("test failed to retire exact predecessor catalog life");
 
     CatalogEntry successor{
@@ -337,11 +348,12 @@ CatalogEntry replaceCatalogLifeForWedgeRace(
         .state = NsState::Live,
         .incarnation = successor_incarnation,
         .creator = std::nullopt};
-    const CasRefCatalog::Snapshot after_delete = CasRefCatalog::read(backend, layout);
+    const CasRefCatalog::Snapshot after_delete = CasRefCatalog::read(op, layout);
     RefCatalog reborn = after_delete.catalog;
     reborn.entries.push_back(successor);
-    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(reborn), after_delete.token).outcome
-        != CasOutcome::Committed)
+    if (!after_delete.incarnation
+        || !std::holds_alternative<Committed>(op.replace(
+               layout.refCatalogKey(), encodeRefCatalog(reborn), *after_delete.incarnation, Retry::standard())))
         throw std::runtime_error("test failed to publish successor catalog life");
     return successor;
 }
@@ -415,7 +427,7 @@ TEST(CASRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     /// Stage B (Task 4-C): `logPrefix` below computes its fault-injection match at the sentinel;
     /// pinning `ns` there BEFORE the first real touch keeps the real production birth landing on the
     /// same key the fault targets.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -447,7 +459,7 @@ TEST(CASRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCan
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_created_frontier_failed"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -480,10 +492,10 @@ TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdop
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge-retired-before-retry"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
-    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, store->layout(), ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, store->layout(), ns);
     const NamespaceLifeId predecessor_life
         = NamespaceLifeId::fromCatalogEntry(predecessor.ns, predecessor.incarnation);
 
@@ -524,7 +536,7 @@ TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdop
     }
 
     const CatalogEntry successor
-        = replaceCatalogLifeForWedgeRace(*backend, store->layout(), predecessor, UInt128{0x71f2});
+        = replaceCatalogLifeForWedgeRace(backend, store->layout(), predecessor, UInt128{0x71f2});
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
     ASSERT_EQ(backend->putIfAbsent(store->layout().refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
@@ -565,7 +577,7 @@ TEST(CASRefWedgeEveryAttempt, OwnLandedAttemptIsAdoptedFromOccupiedWithoutDouble
     const RootNamespace ns{"srv1/wedge_occupied_mine"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
     /// its fault at that key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -599,7 +611,7 @@ TEST(CASRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
     const RootNamespace ns{"srv1/wedge_ambiguous_then_definite"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -696,7 +708,7 @@ TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
     const RootNamespace ns{"srv1/wedge_one_call_ambiguous_then_definite"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
     /// its fault at that key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -745,7 +757,7 @@ TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     auto store = openPool(backend, singleAttemptBudget());
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_sealed"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -812,7 +824,7 @@ TEST(CASRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTh
     const RootNamespace ns{"srv1/prev_epoch_seal_roundtrip"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `readRefLogTxn` above
     /// reads that exact key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
 
     const uint64_t epoch = store->liveWriterEpoch();
     publishEmptyPart(store, ns, "x");
@@ -846,7 +858,7 @@ TEST(CASRefWedgeEveryAttempt, GenesisBirthAtAHighEpochCarriesNoPrevEpochSeal)
     const RootNamespace ns{"srv1/genesis_at_five"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `readRefLogTxn` above
     /// reads that exact key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
 
     bumpFenceGeneration(store, 5);
     ASSERT_EQ(store->liveWriterEpoch(), 5u);
@@ -874,7 +886,7 @@ TEST(CASRefWedgeEveryAttempt, ForeignNonSealOccupantIsCorruptedDataAndSchedulesA
     const RootNamespace ns{"srv1/wedge_foreign"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
     /// its fault at that key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -906,7 +918,7 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteProvenDifferentObjectAlsoSchedulesARemou
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/append_site_foreign"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     /// Occupy the id the next append will derive with a foreign object, so its create conflicts and
@@ -937,7 +949,7 @@ TEST(CASRefWedgeEveryAttempt, RetryUnderAnOlderAdmissionGenerationSendsNothing)
     const RootNamespace ns{"srv1/wedge_old_generation"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
     /// its fault at that key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -976,7 +988,7 @@ TEST(CASRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsIne
     const RootNamespace ns{"srv1/wedge_blocked_io"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
     /// its fault at that key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -1028,7 +1040,7 @@ TEST(CASRefWedgeEveryAttempt, ResultReleasedAfterTheWedgeIdentityChangedIsInert)
     const RootNamespace ns{"srv1/wedge_identity_changed"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
     /// its fault at that key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -1071,7 +1083,7 @@ TEST(CASRefWedgeEveryAttempt, KnownDurableInstallFailureMovesDirectlyToRecovery)
     const RootNamespace ns{"srv1/wedge_floor"};
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `logPrefix` below matches
     /// its fault at that key.
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
@@ -1116,7 +1128,7 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/append_site_seal"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     const uint64_t epoch = store->liveWriterEpoch();
@@ -1166,7 +1178,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesAConclusiveFirstRefLogRejectio
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_debris"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
@@ -1201,7 +1213,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesALaterConclusiveRejection)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_survives_live"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     /// ONE `publishEmptyPart` reaches sequence 2 (the precommit-add chunk at seq 1 carries the first
     /// `NamespaceBirth`, the promote chunk lands at seq 2), so `next`
     /// below is the SAME `{epoch, 3}` the sibling `AppendSiteMeetingASuccessorSealIsAConclusiveRejectionNotInterference`
@@ -1241,7 +1253,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthIsAm
     auto store = openPool(backend, singleAttemptBudget());
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_ambiguous"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
     const auto ckpt_before = backend->get(ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
@@ -1276,7 +1288,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthOccu
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_occupant_unreadable"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
@@ -1309,7 +1321,7 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesFirstNamespaceBirthForeignInte
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_foreign_interference"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);
+    admitProperlyBornEntry(backend, store->layout(), ns);
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
     const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
@@ -1343,7 +1355,7 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteFaultsWhenTheOccupantCannotBeRead)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/append_site_unreadable"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     const RefTxnId next{store->liveWriterEpoch(), 3};
@@ -1381,7 +1393,7 @@ TEST(CASRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/append_site_wellformed_foreign"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     const RefTxnId next{store->liveWriterEpoch(), 3};
@@ -1414,7 +1426,7 @@ TEST(CASRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/live_epoch_seal"};
-    admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    admitProperlyBornEntry(backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     publishEmptyPart(store, ns, "x");
 
     const uint64_t epoch = store->liveWriterEpoch();
@@ -1473,4 +1485,124 @@ TEST(CASRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     /// scheduling a remount from here would turn every ordinary deposition into a self-inflicted
     /// re-claim storm.
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before);
+}
+
+/// ================================================================================================
+/// The ref lane's four write arms, after the append moved onto an admitted operation. Each of these
+/// pins one arm the old outcome enum could not express, and each is reachable only through the whole
+/// pool, because what the arm decides is a LANE TRANSITION, not a return value.
+/// ================================================================================================
+
+/// The store's own proven refusal returns the exact attempt to `Ready`. It is the one non-commit that
+/// must NOT wedge: the request never applied, so there is nothing at the key for a wedge to resolve,
+/// and the txn id stays underived. Guarded to `USE_AWS_S3` builds, where alone the refusal class is
+/// recognised -- without it the same fault is an ambiguity, which is a different arm.
+#if USE_AWS_S3
+TEST(CASRefLane, RefusedReturnsTheAttemptToReadyAndDoesNotWedge)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend, singleAttemptBudget());
+    const RootNamespace ns{"srv1/ref_lane_refused"};
+    admitProperlyBornEntry(backend, store->layout(), ns);
+    publishEmptyPart(store, ns, "x");
+
+    backend->s3_definite_substr = logPrefix(store, ns);
+    backend->s3_definite_count = 1;
+
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
+    const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns))
+        << "a proven refusal wrote nothing, so there is nothing for a wedge to resolve";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load(), definite_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before);
+    EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the refused drop applied nothing";
+
+    /// And the id was never consumed: the next caller re-derives it and lands the same transaction.
+    EXPECT_NO_THROW(store->dropRef(ns, "x"));
+    EXPECT_FALSE(store->resolveRef(ns, "x").has_value());
+}
+#endif
+
+/// A ref-log create that COMMITS and only then loses its admission is reported unresolved, and the
+/// lane wedges over an object that is in fact durable. That is the conservative half of the contract:
+/// the call may not claim a commit it can no longer stand behind, and the wedge is what makes the next
+/// flush settle the key rather than write around it.
+TEST(CASRefLane, PostCommitFenceLossWedges)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend, singleAttemptBudget());
+    const RootNamespace ns{"srv1/ref_lane_post_commit_fence_loss"};
+    admitProperlyBornEntry(backend, store->layout(), ns);
+    publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
+
+    /// The fence is lost INSIDE the write window, so the object lands and the call may not claim it.
+    backend->armBlock(logPrefix(store, ns));
+    std::exception_ptr caller_error;
+    std::thread writer([&]
+    {
+        try { store->dropRef(ns, "x"); }
+        catch (...) { caller_error = std::current_exception(); }
+    });
+    backend->awaitBlockEntered();
+    store->tripMountLost();
+    backend->releaseBlock();
+    writer.join();
+
+    ASSERT_TRUE(caller_error != nullptr) << "no acknowledgement: the caller must not be told this succeeded";
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns))
+        << "the object is durable, so the lane must not be returned to Ready";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before + 1);
+    EXPECT_TRUE(backend->get(store->wedgedKeyForTest(ns)).has_value())
+        << "the write landed -- what was refused is the CLAIM, not the object";
+}
+
+/// The liveness the ledger hands its operations carries the runtime's own facts and NOT a generation
+/// term -- the generation is the operation's, presented once at admission. This pins the half that is
+/// easy to lose in that split: a runtime retired while the fence generation never MOVES must still end
+/// the operation, and it must end it as an unresolved write rather than an installed commit.
+TEST(CASRefLane, LivenessPredicateWithoutGenerationTermStillRefusesARetiredRuntime)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend, singleAttemptBudget());
+    const RootNamespace ns{"srv1/ref_lane_retired_runtime"};
+    admitProperlyBornEntry(backend, store->layout(), ns);
+    publishEmptyPart(store, ns, "x");
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
+    const uint64_t generation_before = store->fenceGeneration();
+    const uint64_t writes_before = backend->writeTotal();
+
+    backend->armBlock(logPrefix(store, ns));
+    std::exception_ptr caller_error;
+    std::thread writer([&]
+    {
+        try { store->dropRef(ns, "x"); }
+        catch (...) { caller_error = std::current_exception(); }
+    });
+    /// The append's own create is parked, which is what makes the retirement below land INSIDE the
+    /// write window rather than before the lane ever armed an attempt.
+    backend->awaitBlockEntered();
+    /// The mount fence is untouched throughout, so the runtime term is the only thing that can end this
+    /// operation. Retirement also detaches the cache slot, so the lane state is no longer observable --
+    /// what this pins is that the CALLER is refused, which is the property the term exists for.
+    store->invalidateRemovedCatalogLife(life);
+    backend->releaseBlock();
+    writer.join();
+
+    EXPECT_EQ(store->fenceGeneration(), generation_before)
+        << "the fence never moved -- a generation term could not have produced this refusal";
+    EXPECT_GT(backend->writeTotal(), writes_before) << "the parked create did reach the store";
+    ASSERT_TRUE(caller_error != nullptr) << "a retired runtime must not be told its append succeeded";
+    /// The retry-safe class, not a hard failure: a retirement racing a write is an ordinary fact about
+    /// the world, and the caller retries against a fresh observation.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { std::rethrow_exception(caller_error); });
 }

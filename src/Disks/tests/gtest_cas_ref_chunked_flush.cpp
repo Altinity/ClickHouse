@@ -431,7 +431,9 @@ TEST(CASRefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
         .checkpoint_snapshot_id = RefTxnId{epoch, 1},
         .last_epoch_seal = std::nullopt,
     });
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, ns).value();
+    CasRequests catalog_requests(backend, Fence::open());
+    CasOperation catalog_op = catalog_requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).value();
     backend->resetCounts();
     ASSERT_EQ(store->listRefs(ns).size(), kTotalRefs);
     EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{epoch, 1})), 1u);
@@ -440,7 +442,7 @@ TEST(CASRefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
     DropNamespaceStats stats;
     EXPECT_NO_THROW(stats = store->dropNamespace(ns));
     EXPECT_EQ(stats.committed_refs, kTotalRefs);
-    EXPECT_EQ(CasRefCatalog::read(*backend, layout).catalog.entries.front().state, NsState::Removing);
+    EXPECT_EQ(CasRefCatalog::read(catalog_op, layout).catalog.entries.front().state, NsState::Removing);
 }
 
 /// Test 11, second leg: `WholeShard` scope ALONE is not the removal-class discriminator -- the

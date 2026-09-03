@@ -290,18 +290,20 @@ TEST(CASRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
 
 TEST(CASPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
 {
-    InMemoryBackend backend;
+    auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
     const PoolMeta created = PoolMeta::createOrValidate(
-        backend, layout, /*blob_header_len=*/256, /*gc_shards=*/4,
+        op, layout, /*blob_header_len=*/256, /*gc_shards=*/4,
         BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
     EXPECT_EQ(created.gc_shards, 4u);
 
     const PoolMeta reopened = PoolMeta::createOrValidate(
-        backend, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
+        op, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
         BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/false);
     EXPECT_EQ(reopened.gc_shards, 4u);
-    EXPECT_EQ(decodePoolMeta(backend.get(layout.poolMetaKey())->bytes).gc_shards, 4u);
+    EXPECT_EQ(decodePoolMeta(op.read(layout.poolMetaKey(), Retry::standard())->bytes).gc_shards, 4u);
 }
 
 /// The one path where "an attempt that provably sent nothing consumes nothing" does not hold, and the
@@ -347,7 +349,9 @@ TEST(CASRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
     /// The durable stream itself is dense: `1`, `2`, `3` all exist as objects. `ns` was born through
     /// the REAL append lane (Stage B Task 4-C), so its objects sit at a real catalog-minted incarnation,
     /// not the Stage-A sentinel -- resolve it the same way production discovery does.
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
+    CasRequests catalog_requests(backend, Fence::open());
+    CasOperation catalog_op = catalog_requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns).value();
     for (uint64_t seq = 1; seq <= 3; ++seq)
         EXPECT_TRUE(backend->head(store->layout().refLogKey(life, RefTxnId{epoch, seq})).exists)
             << "log object " << epoch << "-" << seq << " must exist: the durable stream has no hole";
