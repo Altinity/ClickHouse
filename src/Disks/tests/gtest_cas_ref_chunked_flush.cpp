@@ -99,7 +99,7 @@ PoolPtr openPool(const BackendPtr & backend)
 /// production birth mints a random incarnation and those computed keys land nowhere real.
 void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
-    DB::Cas::tests::casAdmitRecoverableEntry(s->backend(), s->layout(), ns, s->liveWriterEpoch());
+    DB::Cas::tests::casAdmitRecoverableEntry(*s->poolBackendPtr(), s->layout(), ns, s->liveWriterEpoch());
     PartWriteInfo info;
     info.intended_namespace = ns;
     info.intended_ref = ns.string() + "/" + ref;
@@ -534,12 +534,13 @@ std::vector<RefOp> addRemovePrecommitPairs(const String & ref, size_t num_pairs,
 /// breaks the inventory. Reads the backend directly (no Pool cache).
 std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const RootNamespace & ns)
 {
+    DB::Cas::tests::OperationForTest operation(backend);
     std::vector<RefTxnId> ids;
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
-        for (const ListedKey & lk : page.keys)
+        const KeyPage page = (*operation).list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
+        for (const KeyEntry & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
             if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation
@@ -554,7 +555,7 @@ std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::La
     std::vector<RefLogTxn> txns;
     for (const RefTxnId & id : ids)
     {
-        const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id));
+        const auto got = (*operation).read(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id), Retry::standard());
         if (!got)
             continue;
         try
@@ -820,7 +821,6 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
     /// stays armed for the whole call while the injected clock carries the call to its own deadline.
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
     auto store = openPoolWith(backend, cfg);
