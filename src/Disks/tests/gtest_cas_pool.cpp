@@ -65,23 +65,10 @@ public:
     explicit WriteCountingBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
     size_t writes = 0;
 
-    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
-    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
-    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { ++writes; return inner->putIfAbsent(k, b, meta); }
-    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
-    {
-        ++writes;
-        inner->publishBlob(request);
-    }
-    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { ++writes; return inner->putOverwrite(k, b, e, meta); }
-    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { ++writes; return inner->casPut(k, b, e, meta); }
-    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { ++writes; return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
-    /// The primitives count too: `Backend::probeSentinelRaw` reaches the store through them, so a
-    /// write that took the primitive path would otherwise go unseen by `writes`.
+    /// Every write reaches the store through these primitives, so `writes` sees it whichever verb
+    /// (`create`/`replace`/`remove`/`publish`) issued it.
     std::optional<Raw> read(const String & key, TransportAccess & access) override { return inner->read(key, access); }
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
@@ -106,6 +93,27 @@ public:
 private:
     std::shared_ptr<DB::Cas::Backend> inner;
 };
+
+/// A one-shot `create`, asserting it committed (mirrors the retired `backend.putIfAbsent(key, bytes)`).
+void createObj(Backend & backend, const String & key, const String & bytes)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
+}
+
+/// An exact read (mirrors the retired `backend.get(key)`).
+std::optional<Object> readObj(Backend & backend, const String & key)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    return (*op).read(key, Retry::standard());
+}
+
+/// A HEAD (mirrors the retired `backend.head(key)`).
+std::optional<Meta> headObj(Backend & backend, const String & key)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    return (*op).head(key, Retry::standard());
+}
 
 /// Publish one part `ref` through the REAL PartWriteTxn write path: stage a manifest holding a single content
 /// blob whose payload is `payload`, precommit-add into the owning shard, then promote precommit ->
@@ -167,7 +175,7 @@ ManifestId publishPartWithEntries(
         {
             /// Materialize the blob body so the promote-time HEAD revalidation succeeds, then record the
             /// tokenless W-EVIDENCE dep (the gate re-observes the current token at promote).
-            DB::Cas::tests::writeBlobBody(s->backend(), s->layout(), e.ref.digest.toU128());
+            DB::Cas::tests::writeBlobBody(*s->poolBackendPtr(), s->layout(), e.ref.digest.toU128());
             build->adoptEvidence(e);
         }
     const ManifestId id = build->stageManifest(std::move(entries));
@@ -207,23 +215,10 @@ public:
     explicit ProbeWatchingBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
     bool probe_touched = false;
 
-    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
-    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
-    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m) override { note(k); return inner->putIfAbsent(k, b, m); }
-    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
-    {
-        note(request.destination_key);
-        inner->publishBlob(request);
-    }
-    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { note(k); return inner->putOverwrite(k, b, e, m); }
-    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { note(k); return inner->casPut(k, b, e, m); }
-    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { note(k); return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
-    /// The primitives note too: `Backend::probeSentinelRaw` reaches the store through them, so a
-    /// probe-key mutation on the primitive path would otherwise go unseen.
+    /// Every mutation reaches the store through these primitives, so a probe-key touch is noted
+    /// whichever verb (`create`/`replace`/`remove`/`publish`) issued it.
     std::optional<Raw> read(const String & key, TransportAccess & access) override { return inner->read(key, access); }
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
@@ -300,22 +295,9 @@ class ForwardingBackend : public DB::Cas::Backend
 public:
     explicit ForwardingBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
 
-    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
-    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
-    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, b, m); }
-    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
-    {
-        inner->publishBlob(request);
-    }
-    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, b, e, m); }
-    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, b, e, m); }
-    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
-    /// The transport primitives forward to `inner`; the legacy overrides above are what this
-    /// double injects through. Declared because `Backend` declares them pure.
+    /// The transport primitives forward to `inner`. Declared because `Backend` declares them pure.
     std::optional<Raw> read(const String & key, TransportAccess & access) override { return inner->read(key, access); }
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
@@ -597,7 +579,7 @@ TEST(CASPoolMeta, FailClosed)
     /// (createOrValidate path). The future-version fail-closed (v > G_BUILD => UNKNOWN_FORMAT_VERSION)
     /// is exercised at the codec level by the battery's per-row v+1 gate.
     auto b2 = std::make_shared<InMemoryBackend>();
-    b2->putIfAbsent(layout.poolMetaKey(), "garbage");
+    createObj(*b2, layout.poolMetaKey(), "garbage");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { PoolMeta::createOrValidate(*DB::Cas::tests::OperationForTest(b2), layout, 256); });
 }
@@ -642,7 +624,7 @@ TEST(CASPoolMeta, RejectsBadConstantsAtCreation)
         [&] { PoolMeta::createOrValidate(*DB::Cas::tests::OperationForTest(b), layout, 17 * 1024); });
 
     /// A creation that fails config validation must not have written anything.
-    EXPECT_FALSE(b->get(layout.poolMetaKey()).has_value());
+    EXPECT_FALSE(readObj(*b, layout.poolMetaKey()).has_value());
 }
 
 TEST(CASPoolMeta, RejectsBadConstantsOnDecode)
@@ -654,7 +636,7 @@ TEST(CASPoolMeta, RejectsBadConstantsOnDecode)
     bad_pm.pool_id = hexToU128("00000000000000000000000000000001");
     bad_pm.blob_header_len = 100;   /// violates 8-alignment invariant
     bad_pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
-    b->putIfAbsent(layout.poolMetaKey(), encodePoolMeta(bad_pm));
+    createObj(*b, layout.poolMetaKey(), encodePoolMeta(bad_pm));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { PoolMeta::createOrValidate(*DB::Cas::tests::OperationForTest(b), layout, 256); });
 }
@@ -679,7 +661,7 @@ TEST(CASPoolMeta, ConcurrentCreateRace)
     foreign_pm.pool_id = foreign;
     foreign_pm.blob_header_len = 256;
     foreign_pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
-    b->putIfAbsent(layout.poolMetaKey(), encodePoolMeta(foreign_pm));
+    createObj(*b, layout.poolMetaKey(), encodePoolMeta(foreign_pm));
 
     PoolMeta result = PoolMeta::createOrValidate(*DB::Cas::tests::OperationForTest(b), layout, /*blob_header_len*/ 512);
     EXPECT_EQ(result.pool_id, foreign);
@@ -689,12 +671,12 @@ TEST(CASPoolMeta, ConcurrentCreateRace)
 TEST(CASPoolMeta, CasConflictReReadsWinner)
 {
     /// The subtlest branch: the initial GET sees ABSENT, so createOrValidate proceeds to the
-    /// create-if-absent casPut — and loses, because a racing creator committed in between. The loser
+    /// create-if-absent write — and loses, because a racing creator committed in between. The loser
     /// must then re-read and return the WINNER's pool identity, not LOGICAL_ERROR. A single-threaded
     /// `refuseNextWrite` alone cannot exercise this: it returns Conflict without leaving the object
     /// readable, so the re-read would fire the LOGICAL_ERROR guard. We model the real interleaving
-    /// with a backend whose casPut commits the winner's object (via the public putIfAbsent) and THEN
-    /// reports Conflict — exactly what the loser observes.
+    /// with a backend whose write primitive commits the winner's object and THEN reports Conflict --
+    /// exactly what the loser observes.
     class RacingBackend : public InMemoryBackend
     {
     public:
@@ -832,7 +814,7 @@ TEST(CASPool, ResolveReturnsManifestId)
     EXPECT_EQ(loc.offset, s->poolMeta().blob_header_len);
     EXPECT_EQ(loc.length, payload.size());
 
-    auto bytes = b->get(loc.key);
+    auto bytes = readObj(*b, loc.key);
     ASSERT_TRUE(bytes.has_value());
     /// The located window holds exactly the payload: the envelope header is outside it.
     EXPECT_EQ(bytes->bytes.substr(static_cast<size_t>(loc.offset), static_cast<size_t>(loc.length)), payload);
@@ -866,7 +848,7 @@ TEST(CASPool, ReadManifestValidatesBodyAndFailsClosed)
         body.root_namespace_id = RootNamespace{"srv1/other"};  /// namespace does NOT
         body.entries = {blobEntryFor("f", u128Of("x"), 1)};
         body.payload_digest = computePayloadDigest(body);
-        b->putIfAbsent(layout.manifestKey(addressed), encodePartManifest(body));
+        createObj(*b, layout.manifestKey(addressed), encodePartManifest(body));
 
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readManifest(addressed); });
     }
@@ -882,7 +864,7 @@ TEST(CASPool, ReadManifestValidatesBodyAndFailsClosed)
         body.root_namespace_id = ns;                        /// namespace matches
         body.entries = {blobEntryFor("f", u128Of("y"), 1)};
         body.payload_digest = computePayloadDigest(body);
-        b->putIfAbsent(layout.manifestKey(addressed), encodePartManifest(body));
+        createObj(*b, layout.manifestKey(addressed), encodePartManifest(body));
 
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readManifest(addressed); });
     }
@@ -1252,7 +1234,7 @@ TEST(CASPool, ListRefsSkipsForeignKeys)
 
     /// A stray key directly under the namespace's ref-object prefix that is not `_log`/
     /// `_snap` shaped (also covers the legacy shard-number layout GC/dropNamespace still write).
-    b->putIfAbsent(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "garbage", "not-a-ref-object");
+    createObj(*b, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "garbage", "not-a-ref-object");
 
     std::map<String, Resolved> refs;
     EXPECT_NO_THROW(refs = s->listRefs(ns));
@@ -1273,7 +1255,7 @@ TEST(CASPool, ReadManifestFailsClosed)
     {
         const ManifestRef ref = manifestRefFor("garbage-body");
         const ManifestId id{.root_namespace = ns, .ref = ref};
-        b->putIfAbsent(layout.manifestKey(id), "not a valid manifest body");
+        createObj(*b, layout.manifestKey(id), "not a valid manifest body");
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s->readManifest(id); });
     }
 
@@ -1413,8 +1395,7 @@ TEST(CASPool, ListNamespacesDoesNotMintLogicalNamesFromFileKeys)
     s->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "format_version.txt", "1\n");
     /// A second life of the SAME name, written by exact key because no helper mints two lives yet.
     const NamespaceLifeId other = NamespaceLifeId::fromCatalogEntry(ns, DB::UInt128(0x5eed));
-    ASSERT_EQ(b->putIfAbsent(s->layout().namespaceFileKey(other, "format_version.txt"), "1\n").outcome,
-              PutOutcome::Done);
+    createObj(*b, s->layout().namespaceFileKey(other, "format_version.txt"), "1\n");
 
     const NamespaceListing listing = s->listNamespaces("");
     EXPECT_TRUE(listing.skipped.empty());
@@ -1438,8 +1419,8 @@ TEST(CASPool, ListNamespacesDoesNotTreatPhysicalDebrisAsCatalogAuthority)
     const String lifeless_ref = s->layout().casRefsPrefix() + ns.string() + "/_log/"
         + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
     const String lifeless_file = s->layout().rootsPrefix() + ns.string() + "/_files/format_version.txt";
-    ASSERT_EQ(b->putIfAbsent(lifeless_ref, "garbage").outcome, PutOutcome::Done);
-    ASSERT_EQ(b->putIfAbsent(lifeless_file, "garbage").outcome, PutOutcome::Done);
+    createObj(*b, lifeless_ref, "garbage");
+    createObj(*b, lifeless_file, "garbage");
 
     NamespaceListing listing;
     ASSERT_NO_THROW(listing = s->listNamespaces(""))
@@ -1451,8 +1432,8 @@ TEST(CASPool, ListNamespacesDoesNotTreatPhysicalDebrisAsCatalogAuthority)
     EXPECT_EQ(listing.namespaces[0], ns.string());
 
     EXPECT_TRUE(listing.skipped.empty());
-    EXPECT_TRUE(b->head(lifeless_ref).exists);
-    EXPECT_TRUE(b->head(lifeless_file).exists);
+    EXPECT_TRUE(headObj(*b, lifeless_ref).has_value());
+    EXPECT_TRUE(headObj(*b, lifeless_file).has_value());
 }
 
 TEST(CASPool, ListMirroredChildren)
@@ -1485,18 +1466,6 @@ public:
     explicit FenceInAdoptWindowBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
     String fence_key;   /// empty = fault disarmed; set to the mount key to arm the one-shot fence
 
-    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
-    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
-    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, b, m); }
-    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
-    {
-        inner->publishBlob(request);
-    }
-    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, b, e, m); }
-    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, b, e, m); }
-    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
     /// The fault sits on the READ PRIMITIVE: the keeper's adopt reads the mount slot through it.
@@ -1559,7 +1528,7 @@ TEST(CASPoolMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
 
     /// The final live lease is unfenced and at a HIGHER writer_epoch than the first attempt (a fence
     /// costs an epoch): the first claim took epoch 1, got fenced, the retry took epoch 2 and mounted.
-    const auto got = inner->get(layout.mountKey("test"));
+    const auto got = readObj(*inner, layout.mountKey("test"));
     ASSERT_TRUE(got.has_value());
     const MountLease final_lease = decodeMountLease(got->bytes);
     EXPECT_FALSE(final_lease.gc_fenced);
@@ -1605,13 +1574,14 @@ namespace
 /// GC's fence-out, applied directly: preserve the body, set gc_fenced, bump seq (token-guarded).
 void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
 {
-    const auto got = backend.get(mount_key);
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto got = (*op).read(mount_key, Retry::standard());
     ASSERT_TRUE(got.has_value());
     MountLease m = decodeMountLease(got->bytes);
     m.gc_fenced = true;
     m.seq += 1;
-    ASSERT_EQ(backend.putOverwrite(mount_key, encodeMountLease(m), got->token).outcome,
-              DB::Cas::PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(mount_key, encodeMountLease(m), got->incarnation, Retry::standard())));
 }
 
 }
@@ -1621,7 +1591,7 @@ TEST(CASPoolRemount, FenceOutThenSelfRemountRestoresWrites)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
     const String mount_key = store->layout().mountKey("test");
-    const uint64_t epoch_before = decodeMountLease(backend->get(mount_key)->bytes).writer_epoch;
+    const uint64_t epoch_before = decodeMountLease(readObj(*backend, mount_key)->bytes).writer_epoch;
     EXPECT_EQ(store->liveWriterEpoch(), epoch_before);
 
     fenceOutMount(*backend, mount_key);
@@ -1631,7 +1601,7 @@ TEST(CASPoolRemount, FenceOutThenSelfRemountRestoresWrites)
 
     /// Self-remount claims a FRESH incarnation: epoch bumped, gc_fenced cleared, writes restored.
     ASSERT_TRUE(store->tryRemountOnce());
-    const MountLease after = decodeMountLease(backend->get(mount_key)->bytes);
+    const MountLease after = decodeMountLease(readObj(*backend, mount_key)->bytes);
     EXPECT_EQ(after.writer_epoch, epoch_before + 1);
     EXPECT_FALSE(after.gc_fenced);
     EXPECT_EQ(store->liveWriterEpoch(), epoch_before + 1);
@@ -1673,16 +1643,17 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
     const String mount_key = store->layout().mountKey("test");
 
     /// A genuinely foreign uuid holds the mount (live or not — foreign is terminal for the claim).
-    const auto got = backend->get(mount_key);
+    DB::Cas::tests::OperationForTest overwrite_op(*backend);
+    const auto got = (*overwrite_op).read(mount_key, Retry::standard());
     MountLease foreign = decodeMountLease(got->bytes);
     foreign.server_uuid = foreign.server_uuid + DB::UInt128(1);
     foreign.seq += 1;
-    ASSERT_EQ(backend->putOverwrite(mount_key, encodeMountLease(foreign), got->token).outcome,
-              DB::Cas::PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*overwrite_op).replace(mount_key, encodeMountLease(foreign), got->incarnation, Retry::standard())));
 
     EXPECT_FALSE(store->tryRemountOnce());
     /// The foreign body is untouched (no takeover, ever).
-    EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).server_uuid, foreign.server_uuid);
+    EXPECT_EQ(decodeMountLease(readObj(*backend, mount_key)->bytes).server_uuid, foreign.server_uuid);
 
     /// Move the parent fixture to the production-recognized fenced terminal state before explicitly
     /// destroying its superseded keeper. The unfenced foreign-release guard is covered separately below.
@@ -1697,15 +1668,15 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
     auto foreign_backend = std::make_shared<InMemoryBackend>();
     auto invalid_store = DB::Cas::tests::openPoolForTest(foreign_backend);
     const String foreign_mount_key = invalid_store->layout().mountKey("test");
-    const auto foreign_got = foreign_backend->get(foreign_mount_key);
+    DB::Cas::tests::OperationForTest foreign_overwrite_op(*foreign_backend);
+    const auto foreign_got = (*foreign_overwrite_op).read(foreign_mount_key, Retry::standard());
     ASSERT_TRUE(foreign_got.has_value());
     MountLease foreign_lease = decodeMountLease(foreign_got->bytes);
     foreign_lease.server_uuid = foreign_lease.server_uuid + DB::UInt128(1);
     foreign_lease.seq += 1;
-    ASSERT_EQ(
-        foreign_backend->putOverwrite(foreign_mount_key, encodeMountLease(foreign_lease), foreign_got->token).outcome,
-        DB::Cas::PutOutcome::Done);
-    const auto occupant_before = foreign_backend->get(foreign_mount_key);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*foreign_overwrite_op).replace(
+        foreign_mount_key, encodeMountLease(foreign_lease), foreign_got->incarnation, Retry::standard())));
+    const auto occupant_before = readObj(*foreign_backend, foreign_mount_key);
     ASSERT_TRUE(occupant_before.has_value());
 
     EXPECT_FALSE(invalid_store->tryRemountOnce()) << "a foreign owner is never taken over at remount";
@@ -1717,7 +1688,7 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
               violations_before + 1)
         << "the release must report the broken single-writer guarantee rather than dying on it";
-    const auto occupant_after = foreign_backend->get(foreign_mount_key);
+    const auto occupant_after = readObj(*foreign_backend, foreign_mount_key);
     ASSERT_TRUE(occupant_after.has_value()) << "nor is it taken over at release";
     EXPECT_EQ(occupant_after->bytes, occupant_before->bytes)
         << "the slot must be left byte-for-byte as the foreign owner wrote it";
@@ -1900,7 +1871,7 @@ public:
     }
 };
 
-CasRequestBudget runtimeRenewBudget(uint32_t max_attempts);
+CasRequestBudget runtimeRenewBudget();
 
 /// A directly-constructed `CasMountRuntime` plus the two request planes it needs. `Pool` builds those
 /// from its own members; a test has no `Pool`, so the mount plane's fence reaches the runtime through
@@ -2003,7 +1974,7 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
         },
         server_root_id,
         sink,
-        runtimeRenewBudget(1),
+        runtimeRenewBudget(),
         [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime_ptr = &runtime;
@@ -2011,13 +1982,15 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     const uint64_t anchor = runtime.startKeeper();
     runtime.armMountFence(uuid, 1, anchor + 1000);
 
-    auto ours = backend->get(key);
+    DB::Cas::tests::OperationForTest successor_op(*backend);
+    auto ours = (*successor_op).read(key, Retry::standard());
     ASSERT_TRUE(ours.has_value());
     MountLease successor = decodeMountLease(ours->bytes);
     successor.server_uuid = UInt128{2};
     successor.writer_epoch = 9;
     successor.seq += 1;
-    ASSERT_EQ(backend->putOverwrite(key, encodeMountLease(successor), ours->token).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*successor_op).replace(key, encodeMountLease(successor), ours->incarnation, Retry::standard())));
     const uint64_t skipped_before
         = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
     const uint64_t violations_before
@@ -2063,7 +2036,7 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     if (failed != events.end())
         EXPECT_EQ(failed->detail.at("classification"), "conflict");
 
-    const auto successor_before_teardown = backend->get(key);
+    const auto successor_before_teardown = readObj(*backend, key);
     ASSERT_TRUE(successor_before_teardown.has_value());
     const uint64_t heads_before_teardown = backend->headCount(key);
     const uint64_t gets_before_teardown = backend->getCount(key);
@@ -2077,7 +2050,7 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
               skipped_before_teardown);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(), violations_before);
-    const auto successor_after_teardown = backend->get(key);
+    const auto successor_after_teardown = readObj(*backend, key);
     ASSERT_TRUE(successor_after_teardown.has_value());
     EXPECT_EQ(successor_after_teardown->bytes, successor_before_teardown->bytes);
 }
@@ -2214,15 +2187,15 @@ private:
     uint64_t exits = 0;
 };
 
-CasRequestBudget runtimeRenewBudget(uint32_t max_attempts = 1)
+/// The budget every runtime-renewal test uses. `attempt_timeout_ms`/`lease_safety_margin_ms` bound the
+/// mount lease's own admission arithmetic; a renewal write's own attempt count and backoff are the
+/// request engine's fence-derived `Retry::standard()` policy now, not a budget knob -- every caller of
+/// this helper used to pass `max_attempts=1` and no other value, so that parameter carried nothing.
+CasRequestBudget runtimeRenewBudget()
 {
     return CasRequestBudget{
         .attempt_timeout_ms = 10,
-        .operation_deadline_ms = 500,
-        .max_attempts = max_attempts,
         .lease_safety_margin_ms = 20,
-        .retry_initial_backoff_ms = 0,
-        .retry_max_backoff_ms = 0,
     };
 }
 }
@@ -2236,7 +2209,7 @@ TEST(CASPoolShutdown, CleanStopDrainsAndWritesFarewell)
     const String mount_key = store->layout().mountKey("test");
     store.reset();   /// drives ~Pool(): with no in-flight ref-log PUT, the drain must succeed.
 
-    const auto got = backend->get(mount_key);
+    const auto got = readObj(*backend, mount_key);
     ASSERT_TRUE(got.has_value());
     const MountLease lease = decodeMountLease(got->bytes);
     EXPECT_EQ(lease.min_active_build_sequence, std::numeric_limits<uint64_t>::max())
@@ -2246,9 +2219,7 @@ TEST(CASPoolShutdown, CleanStopDrainsAndWritesFarewell)
 TEST(CASPoolShutdown, UnresolvedWedgeSkipsFarewell)
 {
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
@@ -2280,7 +2251,7 @@ TEST(CASPoolShutdown, UnresolvedWedgeSkipsFarewell)
     const String mount_key = store->layout().mountKey("test");
     store.reset();   /// drives ~Pool(): the still-wedged lane must skip the farewell marker.
 
-    const auto got = backend->get(mount_key);
+    const auto got = readObj(*backend, mount_key);
     ASSERT_TRUE(got.has_value());
     const MountLease lease = decodeMountLease(got->bytes);
     EXPECT_NE(lease.min_active_build_sequence, std::numeric_limits<uint64_t>::max())
@@ -2318,13 +2289,13 @@ TEST(CASMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
     /// A real predecessor at epoch 7 durably minted it first (`allocateWriterEpoch` always runs
     /// before the mount claim); seed that durable epoch object here too, or the successor's own
     /// `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
-    b->putIfAbsent(l.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+    createObj(*b, l.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
 
     /// A 500ms lease TTL is far below the default `cas_request_budget` (RFC
     /// cas-s3-timeout-retry-control §required-timeout-model requires attempt_timeout + safety_margin <
     /// lease TTL), so scale the budget down to fit -- mirrors `CasMountStartup::StaleSelfMountReclaimedAfterWait`.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
 
     uint64_t fake_boot = 0;
     std::vector<uint64_t> waits;
@@ -2386,14 +2357,14 @@ TEST(CASMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
     /// A real predecessor at epoch 7 durably minted it first (`allocateWriterEpoch` always runs
     /// before the mount claim); seed that durable epoch object here too, or the successor's own
     /// `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
-    b->putIfAbsent(l.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+    createObj(*b, l.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
     /// Predecessor lease carries gc_fenced=true: fence it directly, exactly as `computeHeartbeatFloor`'s
     /// fence-out does (preserve the body, gc_fenced = true, seq + 1, token-guarded).
     fenceOutMount(*b, l.mountKey("test"));
 
     /// See UncleanOpenPaysOnlyTheObservationWindow above: a 500ms TTL needs a scaled-down budget too.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = 500, .max_attempts = 1, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
 
     std::vector<uint64_t> waits;
     PoolPtr store;
@@ -2433,8 +2404,8 @@ public:
 
     /// The hook sits on the WRITE PRIMITIVE: both the reclaim and the keeper's adopt reach the mount
     /// slot through it. It counts only CONDITIONAL overwrites, which is what every production mount-slot
-    /// write is -- the legacy `putIfAbsent` that seeds the predecessor lease forwards through this same
-    /// virtual, and counting it would shift the stall onto the reclaim instead of the adopt.
+    /// write is -- the unconditional create that seeds the predecessor lease reaches this same virtual
+    /// too, and counting it would shift the stall onto the reclaim instead of the adopt.
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
         const std::optional<String> & expected_value, DB::Cas::TransportAccess & access) override
     {
@@ -2478,12 +2449,12 @@ TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
         prior.expires_at_ms = 1;      /// long expired
         prior.gc_fenced = true;
         prior.write_attempt_id = DB::UInt128{7};
-        backend->putIfAbsent(layout.mountKey(srid), DB::Cas::encodeMountLease(prior));
+        createObj(*backend, layout.mountKey(srid), DB::Cas::encodeMountLease(prior));
     }
     /// A real predecessor at epoch 7 durably minted it first (`allocateWriterEpoch` always runs
     /// before the mount claim); seed that durable epoch object here too, or `Pool::open`'s own
     /// `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
-    backend->putIfAbsent(layout.epochKey(srid), DB::Cas::encodeServerEpoch(DB::Cas::ServerEpoch{.next_writer_epoch = 8}));
+    createObj(*backend, layout.epochKey(srid), DB::Cas::encodeServerEpoch(DB::Cas::ServerEpoch{.next_writer_epoch = 8}));
     uint64_t fake_boot_ms = 10'000;
     DB::Cas::PoolConfig cfg;
     cfg.pool_prefix = "pool";
@@ -2549,9 +2520,7 @@ TEST(CASRemountWaits, DrainedRemountPaysNoWait)
 TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
 {
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
@@ -2617,9 +2586,7 @@ TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
 TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredecessorsDied)
 {
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
@@ -2679,12 +2646,12 @@ TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load(), sealed_before + 2)
         << "both dead epochs must be closed -- the chain link is what a later reader needs to tell an "
            "EMPTY epoch from a LOST one, and that is independent of how each mount ended";
-    EXPECT_TRUE(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 2})).has_value())
+    EXPECT_TRUE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 2})).has_value())
         << "epoch 1 closes at the slot right after its last durable id, in-band";
-    EXPECT_TRUE(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{2, 1})).has_value())
+    EXPECT_TRUE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{2, 1})).has_value())
         << "empty epoch 2 closes at its own sequence 1, chained to the epoch-1 seal";
     const RefTxnId retired_sentinel_id{2, std::numeric_limits<uint64_t>::max()};
-    EXPECT_FALSE(backend->get(layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns2), retired_sentinel_id)).has_value())
+    EXPECT_FALSE(readObj(*backend, layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns2), retired_sentinel_id)).has_value())
         << "and NO synthetic seal snapshot is written: that shape is retired";
 }
 
@@ -2777,14 +2744,16 @@ TEST(CASPool, StaleSnapshotServesCachedManifestAndBlobAbsenceSurfacesOnRead)
     /// What GC does after the owner is removed and the decrement is adopted: exact-token deletes of
     /// the body and of the now-unreferenced blob.
     {
-        const HeadResult h = b->head(manifest_key);
-        ASSERT_TRUE(h.exists);
-        b->deleteExact(manifest_key, h.token);
+        DB::Cas::tests::OperationForTest op(*b);
+        const auto h = (*op).head(manifest_key, Retry::standard());
+        ASSERT_TRUE(h.has_value());
+        (*op).remove(manifest_key, h->incarnation, Retry::once());
     }
     {
-        const HeadResult h = b->head(blob_key);
-        ASSERT_TRUE(h.exists);
-        b->deleteExact(blob_key, h.token);
+        DB::Cas::tests::OperationForTest op(*b);
+        const auto h = (*op).head(blob_key, Retry::standard());
+        ASSERT_TRUE(h.has_value());
+        (*op).remove(blob_key, h->incarnation, Retry::once());
     }
     b->resetCounts();
 
@@ -2797,7 +2766,7 @@ TEST(CASPool, StaleSnapshotServesCachedManifestAndBlobAbsenceSurfacesOnRead)
     const BlobLocation location = s->locate(m2->entries[0]);
     EXPECT_EQ(location.key, blob_key);
     EXPECT_EQ(b->getCount(blob_key), 0u);          /// locate is pure: no I/O until the read
-    EXPECT_FALSE(b->get(location.key).has_value());   /// the read observes the absence
+    EXPECT_FALSE(readObj(*b, location.key).has_value());   /// the read observes the absence
 }
 
 /// The scoped contract for mutation evidence, executable. A carry-forward from a committed source
@@ -2825,9 +2794,10 @@ TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
     /// Out of band: both objects gone, the committed source ref untouched.
     for (const String & key : {src_manifest_key, blob_key})
     {
-        const HeadResult h = b->head(key);
-        ASSERT_TRUE(h.exists);
-        b->deleteExact(key, h.token);
+        DB::Cas::tests::OperationForTest op(*b);
+        const auto h = (*op).head(key, Retry::standard());
+        ASSERT_TRUE(h.has_value());
+        (*op).remove(key, h->incarnation, Retry::once());
     }
     b->resetCounts();
 
@@ -3074,7 +3044,7 @@ TEST(CASPoolRemount, TeardownJoinsBothWorkersBeforeRelease)
     runtime.stopBackgroundWorkers();
     EXPECT_EQ(worker_exits.load(), 2u);
     runtime.finishTeardown(true);
-    EXPECT_EQ(decodeMountLease(backend->get(layout.mountKey("test"))->bytes).min_active_build_sequence,
+    EXPECT_EQ(decodeMountLease(readObj(*backend, layout.mountKey("test"))->bytes).min_active_build_sequence,
               std::numeric_limits<uint64_t>::max());
 }
 
@@ -3796,7 +3766,7 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
             runtime.stopBackgroundWorkers();
         }
         runtime.finishTeardown(true);
-        return decodeMountLease(backend->get(layout.mountKey("test"))->bytes).min_active_build_sequence;
+        return decodeMountLease(readObj(*backend, layout.mountKey("test"))->bytes).min_active_build_sequence;
     };
 
     EXPECT_EQ(run(false), std::numeric_limits<uint64_t>::max());
