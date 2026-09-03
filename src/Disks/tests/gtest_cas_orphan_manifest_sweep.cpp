@@ -28,6 +28,12 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
     return ManifestRef{.writer_epoch = kWriterEpoch, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
 
+bool headExists(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).head(key, Retry::standard()).has_value();
+}
+
 /// The §6 deletion premise (`manifestDeletionPremise`) is a SECOND precondition on every deletion below,
 /// alongside the watermark eligibility these tests are about: a manifest of an epoch-`E` build is
 /// deletable only once the namespace's sealed fold cursor sits in an epoch strictly above `E`. Tests
@@ -51,11 +57,11 @@ void seedEmptyRecoveryAuthority(InMemoryBackend & backend, const Layout & layout
         [&](const CatalogEntry & candidate) { return candidate.ns == ns; });
     ASSERT_NE(entry, catalog.catalog.entries.end());
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-    ASSERT_EQ(backend.putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = std::optional<uint64_t>{kWriterEpoch},
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt}), Retry::standard())));
 }
 
 /// Replaces the catalog row immediately before its second read after arming. The legacy orphan path
@@ -169,7 +175,7 @@ TEST(CASOrphanManifestSweep, EligibleAndUnownedIsDeleted)
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
-    EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
 /// The orphan sweep must not turn a forged same-id snapshot at an OLDER `EpochSeal` into an empty owner
@@ -205,11 +211,11 @@ TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
     applyRefLogTxn(through_seal, birth);
     applyRefLogTxn(through_seal, seal_txn);
     writeRefSnapshotRaw(*backend, layout, snapshotOf(through_seal, ns.string()));
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{2, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
-        .last_epoch_seal = RefTxnId{2, 1}})).outcome, PutOutcome::Done);
+        .last_epoch_seal = RefTxnId{2, 1}}), Retry::standard())));
 
     const ManifestRef candidate = ref(5, 0xAC);
     const String candidate_key = layout.manifestKey(ManifestId{ns, candidate});
@@ -219,7 +225,7 @@ TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
 
     std::vector<String> warnings;
     EXPECT_EQ(sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, &warnings), 0u);
-    EXPECT_TRUE(backend->head(candidate_key).exists);
+    EXPECT_TRUE(headExists(*backend, candidate_key));
     ASSERT_FALSE(warnings.empty());
 }
 
@@ -235,7 +241,7 @@ TEST(CASOrphanManifestSweep, OwnedBodyIsSkipped)
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
 /// GC-WEDGE regression (2026-07-10): a COMMITTED ref that has been DROPPED but whose removal `-1` is NOT
@@ -265,7 +271,7 @@ TEST(CASOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);   // 6 > 5 => prefix eligible
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists)
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
         << "a dropped-but-unsealed committed manifest body must survive the sweep (delete-after-sealed-"
            "decrements) — else the removal-fold clamps forever on the missing body (GC-WEDGE-2026-07-10)";
 }
@@ -322,7 +328,7 @@ TEST(CASOrphanManifestSweep, NoWatermarkIsNotAuthority)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     // No setWatermarkMinActive — no durable fact => not eligible.
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
 TEST(CASOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
@@ -340,7 +346,7 @@ TEST(CASOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_GE(result.listed, 1u);
     EXPECT_EQ(result.deleted, 1u);
-    EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
 TEST(CASOrphanManifestSweep, CursorPageRespectsDeleteBudget)
@@ -359,8 +365,8 @@ TEST(CASOrphanManifestSweep, CursorPageRespectsDeleteBudget)
 
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(result.deleted, 1u);
-    const bool first_exists = backend->head(store->layout().manifestKey(ManifestId{ns, r1})).exists;
-    const bool second_exists = backend->head(store->layout().manifestKey(ManifestId{ns, r2})).exists;
+    const bool first_exists = headExists(*backend, store->layout().manifestKey(ManifestId{ns, r1}));
+    const bool second_exists = headExists(*backend, store->layout().manifestKey(ManifestId{ns, r2}));
     EXPECT_NE(first_exists, second_exists);
 }
 
@@ -380,7 +386,7 @@ TEST(CASOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamesp
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_EQ(result.deleted, 1u);
-    EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
 /// The candidate body and token must be frozen before the later catalog cut. A concurrent same-key
@@ -403,7 +409,7 @@ TEST(CASOrphanManifestSweep, CursorPageCannotDeleteManifestReplacedAfterObservat
 
     EXPECT_TRUE(backend->didReplace());
     EXPECT_EQ(result.deleted, 0u);
-    EXPECT_TRUE(backend->head(key).exists);
+    EXPECT_TRUE(headExists(*backend, key));
 }
 
 /// Any duplicate current life id makes the catalog-to-physical join ambiguous. The cursor page is
@@ -435,7 +441,7 @@ TEST(CASOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10); });
-    EXPECT_TRUE(backend->head(key).exists);
+    EXPECT_TRUE(headExists(*backend, key));
 }
 
 TEST(CASOrphanManifestSweep, CursorPageSkipsOwnedBody)
@@ -450,7 +456,7 @@ TEST(CASOrphanManifestSweep, CursorPageSkipsOwnedBody)
 
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(result.deleted, 0u);
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
 /// A catalog-named life cannot be treated as an empty table merely because its mandatory recovery
@@ -473,7 +479,7 @@ TEST(CASOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecis
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
 
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists)
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
         << "without the exact _ckpt required by a Live catalog row, the sweep must retain rather than "
            "derive an empty owner set";
 }
@@ -505,27 +511,27 @@ TEST(CASOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccess
     writeSealAt(*backend, store->layout(), ns, RefTxnId{5, 1}, RefTxnId{4, 1});
     writeSealAt(*backend, store->layout(), ns, RefTxnId{6, 1}, RefTxnId{5, 1});
     for (uint64_t epoch = 3; epoch <= 6; ++epoch)
-        ASSERT_TRUE(backend->head(store->layout().refLogKey(life, RefTxnId{epoch, 1})).exists)
+        ASSERT_TRUE(headExists(*backend, store->layout().refLogKey(life, RefTxnId{epoch, 1})))
             << "fixture must deposit every intermediate exact successor in the catalog life";
     writeTxnAt(*backend, store->layout(), ns, RefTxnId{7, 1},
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "dropped", removed}, std::nullopt)},
         RefTxnId{6, 1});
     writeSealAt(*backend, store->layout(), ns, RefTxnId{7, 2});
     writeManifestRaw(*backend, store->layout(), ns, unowned, {blobEntryFor("unowned", DB::UInt128(0xA2))});
-    ASSERT_EQ(backend->putIfAbsent(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{7, 2},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{7, 2}})).outcome, PutOutcome::Done);
+        .last_epoch_seal = RefTxnId{7, 2}}), Retry::standard())));
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 7);
     seedFoldCursorForTest(*backend, store->layout(), ns, RefTxnId{2, 2});
 
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_EQ(result.deleted, 1u);
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, removed})).exists)
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, removed})))
         << "the exact successor of the folded epoch seal contains this body's unconsumed -1";
-    EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, unowned})).exists)
+    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, unowned})))
         << "an unrelated eligible body must still drain; retaining it would mask a geometry failure";
 }
 
@@ -544,10 +550,9 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
 
     const RefTxnId cursor{2, 2};
     writeSealAt(*backend, store->layout(), ns, cursor);
-    const HeadResult cursor_head = backend->head(store->layout().refLogKey(life, cursor));
-    ASSERT_TRUE(cursor_head.exists);
-    ASSERT_EQ(classifyDeleteOutcome(
-        backend->deleteExact(store->layout().refLogKey(life, cursor), cursor_head.token)), DeleteClass::Deleted);
+    const auto cursor_head = op.head(store->layout().refLogKey(life, cursor), Retry::standard());
+    ASSERT_TRUE(cursor_head.has_value());
+    ASSERT_EQ(op.remove(store->layout().refLogKey(life, cursor), cursor_head->incarnation, Retry::standard()), Removal::Removed);
 
     const ManifestRef phantom{.writer_epoch = 7, .build_sequence = 1, .manifest_ordinal = 1};
     /// The codec refuses this skipped predecessor when a writer tries to create it. Inject the malformed
@@ -563,19 +568,18 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
     ASSERT_NE(predecessor_pos, String::npos);
     malformed_later_link.replace(
         predecessor_pos, encoded_predecessor.size(), R"("!prev_epoch":"2")");
-    ASSERT_EQ(backend->putIfAbsent(
-        store->layout().refLogKey(life, RefTxnId{7, 1}), sealObject(FormatId::RefLog, malformed_later_link)).outcome,
-        PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(
+        store->layout().refLogKey(life, RefTxnId{7, 1}), sealObject(FormatId::RefLog, malformed_later_link), Retry::standard())));
     writeRefSnapshotRaw(*backend, store->layout(), RefTableSnapshot{
         .ns = ns.string(),
         .snapshot_id = RefTxnId{7, 1},
         .committed = {committedRow("phantom", phantom)},
         .precommits = {}});
-    ASSERT_EQ(backend->putIfAbsent(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{7, 1},
         .checkpoint_snapshot_id = RefTxnId{7, 1},
-        .last_epoch_seal = RefTxnId{6, 1}})).outcome, PutOutcome::Done);
+        .last_epoch_seal = RefTxnId{6, 1}}), Retry::standard())));
 
     const ManifestRef victim{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
     writeManifestRaw(*backend, store->layout(), ns, victim, {blobEntryFor("victim", DB::UInt128(0xC1))});
@@ -585,7 +589,7 @@ TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_EQ(result.deleted, 0u);
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, victim})).exists);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, victim})));
 }
 
 /// Control for the cleaned-cursor path: the exact immediately-next epoch head exists and names the
@@ -605,10 +609,9 @@ TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
 
     const RefTxnId cursor{2, 2};
     writeSealAt(*backend, store->layout(), ns, cursor);
-    const HeadResult cursor_head = backend->head(store->layout().refLogKey(life, cursor));
-    ASSERT_TRUE(cursor_head.exists);
-    ASSERT_EQ(classifyDeleteOutcome(
-        backend->deleteExact(store->layout().refLogKey(life, cursor), cursor_head.token)), DeleteClass::Deleted);
+    const auto cursor_head = op.head(store->layout().refLogKey(life, cursor), Retry::standard());
+    ASSERT_TRUE(cursor_head.has_value());
+    ASSERT_EQ(op.remove(store->layout().refLogKey(life, cursor), cursor_head->incarnation, Retry::standard()), Removal::Removed);
 
     const ManifestRef removed{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
     writeTxnAt(*backend, store->layout(), ns, RefTxnId{3, 1},
@@ -618,11 +621,11 @@ TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "absent-anchor", absent_anchor}, std::nullopt)});
     writeRefSnapshotRaw(*backend, store->layout(), RefTableSnapshot{
         .ns = ns.string(), .snapshot_id = RefTxnId{3, 2}, .committed = {}, .precommits = {}});
-    ASSERT_EQ(backend->putIfAbsent(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{3, 2},
         .checkpoint_snapshot_id = RefTxnId{3, 2},
-        .last_epoch_seal = cursor})).outcome, PutOutcome::Done);
+        .last_epoch_seal = cursor}), Retry::standard())));
 
     const ManifestRef unowned{.writer_epoch = 1, .build_sequence = 6, .manifest_ordinal = 1};
     writeManifestRaw(*backend, store->layout(), ns, removed, {blobEntryFor("removed", DB::UInt128(0xC2))});
@@ -633,8 +636,8 @@ TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_EQ(result.deleted, 1u);
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, removed})).exists);
-    EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, unowned})).exists);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, removed})));
+    EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, unowned})));
 }
 
 /// The catalog row used to obtain coverage and the life used to recover ownership must be ONE frozen
@@ -663,7 +666,7 @@ TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
 
     EXPECT_FALSE(backend->didSwitch())
         << "the sweep must not resolve a second catalog cut after it starts using the frozen entry";
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists)
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
         << "the committed predecessor manifest must remain protected by the same frozen authority cut";
 }
 
