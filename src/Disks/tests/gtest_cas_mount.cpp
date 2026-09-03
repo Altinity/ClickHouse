@@ -350,7 +350,10 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         uint64_t boot_ms = 100;
         auto store = open_store(backend, boot_ms, "renewal-log-fenced");
         ScopedRenewalLogCapture capture("information");
-        boot_ms = 1071;
+        /// The lease was claimed at boot 100 with the 1000 ms TTL above, so it expires at 1100. The
+        /// fence admits only while the remaining time is strictly above the safety margin, and this
+        /// backend declares no attempt timeout, so the engine reserves nothing on top of that margin.
+        boot_ms = 1100 - renewalLogBudget().lease_safety_margin_ms;
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
         const String output = capture.captured();
         EXPECT_EQ(countRenewalLogText(output, "CAS mount renewal"), 1u) << output;

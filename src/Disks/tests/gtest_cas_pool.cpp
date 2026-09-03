@@ -3443,6 +3443,11 @@ TEST(CASPoolRemount, TerminalDepositionDoesNotTouchKeeperAfterReplacement)
     const uint64_t anchor = runtime.startKeeper();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
+    /// Expire the lease from inside the attempt. The fault alone no longer ends a renewal: the engine
+    /// settles the ambiguity by reading and then reissues, and the reissue commits. With the clock past
+    /// the deadline the renewal was admitted under, neither the settling read nor the reissue is
+    /// admitted, so the renewal ends terminal -- which is what this test deposits.
+    backend->before_throw = [&, deadline = anchor + 1000] { boot_ms = deadline; };
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
     terminal_deposited.waitUntilArrived();
     EXPECT_TRUE(replaced.load(std::memory_order_acquire));
@@ -3528,6 +3533,10 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
                 runtime_ptr->noteRemounted();
                 boot_ms = 2'000;
                 backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
+                /// Expire the fresh lease from inside the attempt, so the ambiguity can be neither
+                /// settled by a read nor reissued: otherwise the engine reissues and the renewal
+                /// commits, and there is no dropped failure to catch up on.
+                backend->before_throw = [&, deadline = fresh_anchor + 10'000] { boot_ms = deadline; };
                 first.arriveAndWait();
                 return true;
             }
@@ -3926,6 +3935,9 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     const uint64_t anchor = runtime.startKeeper();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
+    /// Expire the lease from inside the attempt, so the ambiguity can be neither settled by a read nor
+    /// reissued: without that the engine reissues and the renewal commits, and this worker never fences.
+    backend->before_throw = [&, deadline = anchor + 1000] { boot_ms = deadline; };
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
     remount_entered.waitUntilArrived();
     EXPECT_FALSE(runtime.mayMutate());
@@ -3953,6 +3965,10 @@ TEST(CASPool, RenewWatermarkOnceRefreshesFenceAndDepositsOneFailure)
     EXPECT_TRUE(store->mayMutate()) << "direct success must refresh the local fence from attempt start";
 
     backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
+    /// The renewal that succeeded at 500 anchored the lease for its 1000 ms TTL, so it expires at 1500.
+    /// Expire it from inside the attempt: the fault alone no longer ends a renewal, because the engine
+    /// settles the ambiguity by reading and reissues, and the reissue commits.
+    backend->before_throw = [&] { fake_boot = 1500; };
     const uint64_t schedules_before = store->scheduleRemountCallCountForTest();
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->renewWatermarkOnce(); });
     EXPECT_FALSE(store->mayMutate());
