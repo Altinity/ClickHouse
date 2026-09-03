@@ -16,6 +16,9 @@
 #include <Common/ThreadPool.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <map>
 #include <stdexcept>
 #include <thread>
@@ -444,6 +447,93 @@ private:
 
 }
 
+namespace
+{
+
+/// Proves OVERLAP, which no equality test can: it releases a read only once `k_overlap` reads are
+/// inside the backend at the same time. If the fold's reads were still strictly one after another the
+/// count could never reach two, so the round would block until the bounded wait expires and the flag
+/// below would stay false. The wait is bounded and the last arrival wakes everyone, so nothing here can
+/// hang the suite: a fold with no overlap finishes late, it does not finish never.
+class OverlapWitnessBackend : public CountingBackend
+{
+public:
+    explicit OverlapWitnessBackend(size_t k_overlap_) : k_overlap(k_overlap_) {}
+
+    /// ARMED ONLY FOR THE ROUND. Holding reads is fatal to a WRITER: its checkpoint publication is a
+    /// CAS with a bounded retry budget, and a latch on every read exhausts it long before the round
+    /// under test ever starts.
+    void arm() { armed.store(true); }
+
+    bool sawOverlap() const { return saw_overlap.load(); }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (!armed.load())
+            return CountingBackend::read(key, access);
+        {
+            std::unique_lock lock(mutex);
+            ++in_flight;
+            peak = std::max(peak, in_flight);
+            if (in_flight >= k_overlap)
+            {
+                saw_overlap.store(true);
+                gate.notify_all();
+            }
+            else
+            {
+                gate.wait_for(lock, std::chrono::milliseconds(250),
+                              [&] { return in_flight >= k_overlap || saw_overlap.load(); });
+            }
+        }
+        /// The count stays raised ACROSS the read, so what it measures is requests genuinely in the
+        /// backend together. Releasing it before the read would leave a window of a few instructions
+        /// that two threads would have to hit simultaneously to be seen -- which is a measurement of
+        /// luck, not of overlap.
+        std::optional<DB::Cas::Backend::Raw> raw = CountingBackend::read(key, access);
+        {
+            std::lock_guard lock(mutex);
+            --in_flight;
+        }
+        return raw;
+    }
+
+    size_t peakInFlight() const
+    {
+        std::lock_guard lock(mutex);
+        return peak;
+    }
+
+private:
+    const size_t k_overlap;
+    std::atomic<bool> armed{false};
+    mutable std::mutex mutex;
+    std::condition_variable gate;
+    size_t in_flight = 0;
+    size_t peak = 0;
+    std::atomic<bool> saw_overlap{false};
+};
+
+}
+
+TEST(CASGCReadAhead, TheFoldsReadsActuallyOverlap)
+{
+    auto backend = std::make_shared<OverlapWitnessBackend>(/*k_overlap*/ 2);
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                   .gc_fold_max_defer_rounds = 0, .gc_read_concurrency = 8});
+    populate(store);
+
+    Gc gc(store, kGc);
+    backend->arm();
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+
+    EXPECT_TRUE(backend->sawOverlap())
+        << "no two of the fold's reads were ever in the backend at the same time; peak in flight was "
+        << backend->peakInFlight();
+    EXPECT_GT(backend->peakInFlight(), 1u);
+}
+
 TEST(CASGCReadAhead, WorkerReadFaultFailsTheRoundAndTheNextRoundRecovers)
 {
     auto backend = std::make_shared<WorkerReadFaultBackend>();
@@ -461,3 +551,5 @@ TEST(CASGCReadAhead, WorkerReadFaultFailsTheRoundAndTheNextRoundRecovers)
     const RoundReport recovered = gc.runRegularRound();
     EXPECT_TRUE(recovered.acquired_lease);
 }
+
+// temporary diagnostic appended to the suite
