@@ -361,6 +361,10 @@ TEST(CASNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
     ASSERT_EQ(backend->putIfAbsent(first, "first").outcome, PutOutcome::Done);
     ASSERT_EQ(backend->putIfAbsent(second, "second").outcome, PutOutcome::Done);
 
+    /// The seeding above (the catalog + the two checkpoints) lands through the same write primitive
+    /// CountingBackend counts, so reset before measuring what the suppressed page itself does.
+    backend->resetCounts();
+
     NamespaceJanitor janitor(requests, layout, 1);
     EXPECT_EQ(janitor.runOnePage(true, [] { return true; }).deleted, 0u);
     EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent)
