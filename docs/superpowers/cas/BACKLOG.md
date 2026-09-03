@@ -731,7 +731,7 @@ continuing the ID series, not renumbering anything above.
 - **[system-md-missing-cas-verbs] `SYSTEM CAS` verbs missing from `docs/en/sql-reference/statements/system.md`** — DOC — Found during Task 12 (operations runbooks): `SYSTEM CAS FSCK`/`FORGET`/`GC STOP`/`GC START` (and siblings) are documented in the CAS-specific pages but absent from the generic `SYSTEM` statement reference, where a user would naturally look first.
 - **[casrequestcontrol-comment-settings-stale] `CasRequestControl` header comments cite settings that do not exist** — DOC — Found during the Task 12 fix round: the header comments name `cas_s3_retry_initial_backoff_ms`/`cas_s3_retry_max_backoff_ms` as if they were configurable settings; they exist only in the comment text — the real budget is hardcoded in `CasRequestBudget`. Either implement the settings or fix the comments to stop implying a configuration surface that isn't there.
 - **[s3cache-config-comment-stale] stale comment in `utils/ca-soak/configs/storage_conf_s3cache_ch1.xml`** — MINOR — The comment claims cache-over-CA fails with `NOT_IMPLEMENTED`; this was fixed by `3ed0e5f5030` (2026-07-08) and the cache-over-CA path is now live-validated (see the quick-start cache example, `380688e8a66`). Remove the stale comment.
-- **[part-folder-validate-never-gating] `part_folder_validate=never` needs a gate, not a silent accept** — HARD (user settings-policy direction) — `PartFolderAccess.h:135-138` accepts `never` (skip the `ForceFresh` body re-proof entirely) with no acknowledgment of the risk. Either remove the `never` value or require an explicit risk-acknowledgment setting alongside it. Docs already carry a strong warning on this value (`configuration.md`); the code should not make it this easy to select silently.
+- **[part-folder-validate-never-gating] ✅ CLOSED by the retirement of `part_folder_validate` (`66b480241b7`, 2026-09-03)** — HARD (user settings-policy direction) — The setting this item demanded a gate for no longer exists: the manifest-cache-by-id work retired `part_folder_validate` entirely, so there is no `never` value left to silently accept. `RetiredPartFolderValidateIsRejected` pins that loading the retired name now throws `UNKNOWN_SETTING`.
 - **[gc-enabled-false-silent] `gc_enabled=false` accumulates garbage silently** — HARD (user settings-policy direction) — Disabling the background GC scheduler produces no ongoing signal that reclamation has stopped. Add a periodic warning log line plus a metric while `gc_enabled=false` and the pool has reclaimable debris, so an operator who disabled GC for a legitimate reason (or by mistake) finds out before the pool grows unbounded.
 - **[dedup-presence-only-window-recheck] ✅ CLOSED by the unconditional blob-publication rewrite (2026-08-23); kept for provenance** — The presence cache was deleted. Every blob decision now begins with an exact blob `HEAD`, validates the observed envelope-adjusted size, and only then adopts or publishes. The surviving local-store atomic-install debt is tracked in `BACKLOG/formats-and-storage.md`; it can fail publication or leave a bad object that the size check refuses, but cannot silently admit a truncated body.
 
@@ -1557,3 +1557,63 @@ specifically rather than whole-server RSS, which is a different verdict and need
 
 **Caveat on the trace evidence:** 139 samples, with 43% landing in generic thread-pool frames that were
 not decomposed. Enough to show where the bulk sits, not enough to apportion precisely.
+
+## `[manifest-cache-by-id-prose-batch]` manifest-cache-by-id: prose and naming batch {#manifest-cache-by-id-prose-batch}
+
+Found by the final whole-branch review of the manifest-cache-by-id work (branch `cas-gc-rebuild`,
+`docs/superpowers/specs/2026-09-02-cas-manifest-cache-by-id-design.md`). All prose or a single
+identifier rename, none blocking; batched here per the standing batch-prose directive rather than run
+as their own fix rounds. Each item names its file, line, the current text, and the exact replacement.
+
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.cpp:450`,
+  `CachedPartFolderAccess::prepareEntries`. Current: "No pool HEAD/GET is performed before precommit;
+  the promote path re-proves each dependency fail-closed." False: `promote` re-checks no `Materialized`
+  leaf and probes no `TrustedManifest` leaf. Replace with: "the promote gate requires a dependency
+  proof for every blob leaf and a live precommit owner; it probes no blob, a missing adopted body is
+  fsck's to report."
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp:1210`,
+  `createHardLink`'s carry-forward comment. Current: "record a TOKENLESS W-EVIDENCE dep for its blob
+  (no HEAD before precommit; promote re-proves it)." Same false claim as the `prepareEntries` one
+  above. Replace with: "record a TOKENLESS W-EVIDENCE dep for its blob (no HEAD before precommit; the
+  promote gate requires a dependency proof for every blob leaf and a live precommit owner — it probes
+  no blob, a missing body is fsck's to report)."
+- `src/Disks/tests/gtest_cas_pool.cpp:131`, the `publishPartWithEntries` helper comment. Current: "Each
+  Blob entry's body MUST be present at promote: the promote gate revalidates EVERY blob leaf with a
+  HEAD and fails closed on an absent body." False: promote's `TrustedManifest` arm issues no probe.
+  Replace with: "Each Blob entry's body MUST be present at promote: the promote gate requires a
+  dependency proof for every blob leaf and fails closed if one is missing — it does not itself HEAD or
+  GET the body."
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h:66`, the
+  `Freshness::StrictValidate` enumerator comment. Current: "fsck/debug: bypass retained views entirely;
+  fresh resolve + validated read." Overclaims: `StrictValidate` now does nothing beyond a `ForceFresh`
+  resolve except skip the retained-view cache. Replace with: "fsck/debug: fresh resolve that bypasses
+  the retained view cache entirely, populating nothing; otherwise identical to `ForceFresh`."
+- `src/Disks/tests/gtest_cas_part_folder_access.cpp:230`,
+  `HitPathJournalEmptyAndCheapWhenExplainDisabled`. Current: "Same request oracle as
+  `RetainedHitCostsNoRequest` — one cold build, then retained hits." Stale since `5973676fbad`, which
+  moved `RetainedHitCostsNoRequest` to five zero totals excluding the cold build; this test still
+  asserts `getCount == 1` over the cold build plus hits. Replace with: "One body GET across the cold
+  build and five hits; the full no-request oracle is `RetainedHitCostsNoRequest`."
+- `docs/en/antalya/cas/operations/troubleshooting.md:28`, the "Stale-looking part metadata" row's cause
+  cell. Current: "The part-folder view cache may be serving a retained (not re-validated) view." A
+  retained view is validated by manifest id against a fresh resolve on every hit; the snapshot that can
+  now outlive an out-of-band change is the manifest decode cache, which the row's fix cell already
+  names. Replace with: "The part-folder view cache or the manifest decode cache may be serving a
+  snapshot taken before the out-of-band change."
+- `src/Common/ProfileEvents.cpp:929`, `CASPartFolderManifestGets`'s description. Current: "Number of
+  part-manifest body GET requests used to build or validate folder views. High values indicate cache
+  misses or validation work." No GET validates anything now; the counter increments once per manifest
+  decode-cache miss. Replace with: "Number of part-manifest body GET requests, one per manifest
+  decode-cache miss."
+- `docs/superpowers/cas/BACKLOG/performance.md`, `{#hardlink-per-file-forcefresh-head}` (lines
+  ~306-322). Under the `✅ CLOSED` banner the body still asserts, present tense, that `ForceFresh`
+  "never serves a retained view" and the reader's `HEAD` "is mandatory even on a decode-cache hit" —
+  both now false, and the sibling `{#dedup-cache-weight-constant-64}` keeps only its banner under a
+  closed heading. Past-tense the first sentence, or trim the body to the banner, to match that sibling.
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp:1619-1627`
+  (`unlinkFile`'s `already_proven` memo) and
+  `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h:166`
+  (`force_fresh_validated_refs`). The surrounding comments were rewritten from "re-proven" to
+  "resolved" while the identifiers still say proven/validated — the memo now saves a fresh RESOLVE, not
+  a proof. Rename `force_fresh_validated_refs` to `force_fresh_resolved_refs` and `already_proven` to
+  `already_resolved` (or fold into the memo's removal, if that happens first).
