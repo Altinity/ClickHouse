@@ -546,6 +546,9 @@ disk-level and server-level settings surface.
 - `cas_gc_meta_pool_size` — `16` by default. Bounded thread-pool size for the GC's per-hash freshness-meta
   writes (condemn/spare/delete), so a mass `DROP` condemning millions of blobs does not run fully
   sequentially.
+- `cas_gc_read_concurrency` — `16` by default. Bounded thread-pool size for the GC fold's read-ahead of
+  checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s. The fold's decisions stay on the
+  round thread in their original order; only the fetches overlap. `1` disables read-ahead.
 - `skip_access_check` — `false` by default. Skips the disk's `CAS` capability probe ("start now,
   fix later"). The server-level `skip_access_check` flag skips the generic disk access check;
   this disk key governs the `CAS` capability probe.

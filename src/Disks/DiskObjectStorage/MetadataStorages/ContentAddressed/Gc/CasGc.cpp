@@ -29,6 +29,13 @@
 #include <set>
 #include <variant>
 
+namespace CurrentMetrics
+{
+    extern const Metric LocalThread;
+    extern const Metric LocalThreadActive;
+    extern const Metric LocalThreadScheduled;
+}
+
 namespace ProfileEvents
 {
     extern const Event CASGCClampSuppressedPasses;
@@ -332,6 +339,14 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     /// `store->poolConfig()` AFTER the null check above.
     meta_writer = std::make_unique<GcMetaWriter>(
         store, logger, static_cast<size_t>(store->poolConfig().gc_meta_pool_size));
+    /// The fold's read-ahead pool, built here for the same reason. The queue is UNBOUNDED because the
+    /// hinting sites throttle themselves against `GcReadAhead::window`; a bounded queue would only
+    /// move the throttle into `scheduleOrThrowOnError`, blocking the round thread instead of the
+    /// hint loop that already knows how much it wants in flight.
+    const size_t read_concurrency = std::max<size_t>(1, store->poolConfig().gc_read_concurrency);
+    read_pool = std::make_unique<ThreadPool>(
+        CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled,
+        /*max_threads*/ read_concurrency, /*max_free_threads*/ read_concurrency, /*queue_size*/ 0);
 }
 
 void Gc::runNamespaceJanitorPage(
@@ -1180,7 +1195,7 @@ void Gc::reportStuckRemovals(const RefPlan & plan, uint64_t current_round)
     }
 }
 
-bool Gc::foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
+bool Gc::foldManifestEdges(GcReadAhead & reads, const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
                            std::map<ManifestId, Etag> & mf_cleanup, uint32_t txn_ordinal)
 {
     const Layout & layout = store->layout();
@@ -1192,7 +1207,11 @@ bool Gc::foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, s
     /// absent outcome the missing HEAD used to produce -- record-and-continue, and the caller decides
     /// what an absent body means for that edge (a missing-body precommit is a barrier; a committed one
     /// fails closed). Never a throw: a 404 during the fold is an observation, not an error.
-    const auto got = op.read(key, Retry::standard());
+    ///
+    /// The bytes may already have been fetched when the log that named this edge was decoded (all of
+    /// that log's edges are hinted together, since one decode names them all). The absence signal, the
+    /// decode and every decision below still happen HERE, in edge order, exactly as they always did.
+    const auto got = reads.takeRead(key);
     if (!got)
         return false;   /// absent body: caller decides (missing-body precommit OK; committed => fail closed)
     ProfileEvents::increment(ProfileEvents::CASRefManifestBodyFoldGets);   /// one body GET per manifest fold
@@ -1262,7 +1281,8 @@ bool Gc::foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, s
     return true;
 }
 
-Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
+Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(GcReadAhead & reads,
+                                                    const std::map<String, RefTableListing> & ref_tables,
                                                     const CasRefCatalog::Snapshot & catalog_cut)
 {
     /// Read the checkpoint of every namespace in the round's catalog cut, every namespace `ref_tables`
@@ -1274,7 +1294,12 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     /// not show a `_ckpt` would make the second witness a function of the first, which is precisely the
     /// dependency it exists to break: the listing is a SNAPSHOT, and a `_ckpt` that became durable after
     /// the enumeration is exactly the one whose namespace has records the same enumeration also missed.
-    CasOperation op = store->openRequests().admit();
+    ///
+    /// READS UNDER THE CALLER'S ADMISSION, not one of its own. This function used to admit a fresh
+    /// operation, which meant that a fence moving mid-round would hand it a NEWER generation than the
+    /// round holds and let it read on regardless; taking the caller's read-ahead makes the same fence
+    /// movement fail this read the way it fails every other read of the round. Strictly the
+    /// fail-closed direction, and it is why there is no `admit` here any more.
     const Layout & layout = store->layout();
 
     std::set<String> witness_namespaces;
@@ -1284,7 +1309,16 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     for (const auto & [ns_str, listing] : ref_tables)
         witness_namespaces.insert(ns_str);
 
-    CheckpointWitnesses out;
+    /// WHICH KEYS, decided before any of them is read. Nothing here depends on a body, so the whole
+    /// set is known up front and the fetches can overlap; the decisions below still run in the
+    /// `std::set` order they always ran in, one namespace at a time.
+    struct WitnessKey
+    {
+        String ns;
+        String ckpt_key;
+    };
+    std::vector<WitnessKey> witness_keys;
+    witness_keys.reserve(witness_namespaces.size());
     for (const String & ns_str : witness_namespaces)
     {
         const RootNamespace ns{ns_str};
@@ -1297,13 +1331,30 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
         if (entry_it == catalog_cut.catalog.entries.end() || entry_it->ns != ns
             || (entry_it->state != NsState::Live && entry_it->state != NsState::Removing))
             continue;
-        const String ckpt_key = layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation));
+        witness_keys.push_back(
+            {ns_str, layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation))});
+    }
+
+    size_t next_hint = 0;
+    const auto topUpWitnessHints = [&]
+    {
+        while (next_hint < witness_keys.size() && reads.pending() < reads.window())
+            reads.hintRead(witness_keys[next_hint++].ckpt_key);
+    };
+
+    CheckpointWitnesses out;
+    for (const WitnessKey & witness_key : witness_keys)
+    {
+        const String & ns_str = witness_key.ns;
+        const String & ckpt_key = witness_key.ckpt_key;
+        topUpWitnessHints();
         /// THE GET AND THE DECODE ARE SPLIT HERE, rather than taken together through `readCkpt`, so the
         /// catch below can scope to the DECODE ALONE. Wrapping the read too would turn a transport
         /// failure -- which says nothing about this object and everything about the round's ability to
         /// read anything -- into a per-namespace hold, silently narrowing a pool-wide outage to one
-        /// namespace. A backend throw still propagates and fails the round, exactly as it always did.
-        const std::optional<Object> got = op.read(ckpt_key, Retry::standard());
+        /// namespace. A backend throw still propagates and fails the round, exactly as it always did --
+        /// a read-ahead worker's failure is rethrown by the take below, at this same site.
+        const std::optional<Object> got = reads.takeRead(ckpt_key);
         /// ABSENT IS NORMAL AND IS NOT A WITNESS: a namespace has no `_ckpt` until its first snapshot
         /// publication commits, and one that 404s mid-round is a namespace being reclaimed. Neither says
         /// anything about which ids exist, so neither may hold the walk -- and neither may throw
@@ -1560,6 +1611,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
 {
     CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
+    /// The fold's read-ahead. It fetches through `op`'s own admitted generation and hands every result
+    /// back at the site that would otherwise have read inline, so the walk's order, its counters, its
+    /// holds and its events are what they were; only the moment of the fetch moves. At
+    /// `gc_read_concurrency` 1 it hints nothing and every take IS the original inline read.
+    GcReadAhead reads(op, store->openRequests(), *read_pool, store->poolConfig().gc_read_concurrency);
     FoldResult result;
 
     /// 1. Group the round's one enumeration of `cas/ns/stream/` (taken before the defer decision) into
@@ -1687,9 +1743,33 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     const uint64_t condemn_round = state.round + 1;
     result.retired_merge.resize(state.gc_shards);
 
+    /// HEAD READ-AHEAD FOR THE REDUCE PHASE. `head_candidates[shard]` is filled in that phase with the
+    /// blobs the merge can bring to in-degree zero, in the merge's own ascending key order; `head_blob`
+    /// below tops the hints up a window deep before each take. It is EMPTY everywhere else, the whole of
+    /// intake included, so every take outside that phase is the plain inline HEAD.
+    ///
+    /// Hints are issued from INSIDE the lambda rather than in one burst at phase start, so the requests
+    /// this can ever add are bounded by one window past the last candidate the merge actually reaches.
+    /// A superset that overshoots badly therefore costs a window, not its own size -- which matters
+    /// because nothing bounds a round's condemnation count.
+    std::vector<std::vector<BlobRef>> head_candidates(state.gc_shards);
+    size_t head_hint_shard = 0;
+    size_t next_head_hint = 0;
+    const auto topUpHeadHints = [&]
+    {
+        const std::vector<BlobRef> & shard_candidates = head_candidates[head_hint_shard];
+        while (next_head_hint < shard_candidates.size() && reads.pending() < reads.window())
+            reads.hintHead(layout.blobKey(shard_candidates[next_head_hint++]));
+    };
+
     /// Condemn-time observation: ONE HEAD per new zero-transition captures the exact incarnation token
     /// the eventual delete carries (absent => a prior landed delete => nothing to condemn). Emits the
     /// Candidate trail (IndegZero / GcRetireObserve / BlobRetire) exactly where the decision is made.
+    ///
+    /// THE READ-AHEAD NEVER RUNS THIS LAMBDA, only feeds it. Everything below the HEAD is
+    /// side-effecting -- the trail, the counters, the condemn-marker write -- and running it over a
+    /// SUPERSET would stamp `Condemned` on blobs this round never condemns, forcing a live writer to
+    /// republish each one. The prefetch is a bare HEAD; the decision stays here.
     const auto head_blob = [&](const BlobRef & ref) -> std::optional<Meta>
     {
         EventEmitter{*store}.emit([&](CasEvent & e)
@@ -1701,7 +1781,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             e.gen = state.snap_generation + 1;
             e.reason = "last folded owner edge dropped; in-degree reached 0";
         });
-        const std::optional<Meta> observed = op.head(layout.blobKey(ref), Retry::standard());
+        topUpHeadHints();
+        const std::optional<Meta> observed = reads.takeHead(layout.blobKey(ref));
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::GcRetireObserve;
@@ -1748,6 +1829,15 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// hook is `head_blob` above, reserved for a genuinely NEW zero-in-degree candidate. A supersede's
     /// own event is `blob_retire_replaced`, emitted once below from `merge.replaced`. Plain HEAD, no
     /// events, no counters.
+    ///
+    /// AND IT IS NOT READ AHEAD, deliberately, unlike `head_blob`'s. This HEAD is not data handed to a
+    /// decision made elsewhere -- it IS the decision: `hr && !stale.token.matches(hr->etag)` is the
+    /// supersede branch itself, so observing earlier narrows the window in which a republication can be
+    /// seen and would genuinely change which entries supersede. The consequence of a missed supersede is
+    /// benign (the stale entry graduates and its exact-token delete mismatches, so reclamation is
+    /// delayed, never wrong), but "only the moment of the fetch moves, never a decision" is the property
+    /// this whole read-ahead is worth trusting for, and it is not worth spending on the rare blob that
+    /// carries a condemned row AND is touched again in the same round.
     const auto peek_head = [&](const BlobRef & ref) -> std::optional<Meta>
     {
         std::optional<Meta> hr = op.head(layout.blobKey(ref), Retry::standard());
@@ -1892,6 +1982,15 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// It also carries probe B1's two numbers -- reported on EVERY healthy round, so
     /// "logs_accounted always equals logs_applied" becomes an observable property of the table rather than
     /// a claim in a comment.
+    ///
+    /// THE REQUESTS ARE THE SAME ONES; ONLY THEIR TIMING MOVED. Four sites below hand their keys to the
+    /// round's `GcReadAhead` before the walk reaches them -- the checkpoints, each namespace's first walk
+    /// position, this epoch's next positions, and a decoded log's manifest edges -- so the phase's round
+    /// trips overlap instead of running strictly one after another. Every take happens where the inline
+    /// read happened, in the same order, and increments the same counters, which is why this row's
+    /// semantic metrics are identical at any `gc_read_concurrency`. Its S3 VERB counts are not: a request
+    /// a worker performed lands on that worker's ProfileEvents, the same gap `meta_pool_wait` has always
+    /// had. Read `CASGCReadAheadHit`/`Miss`/`Wasted` on this row for the read-ahead's own behaviour.
     std::optional<GcPhaseTimer> intake_timer;
     intake_timer.emplace(phase_sink, "fold_ref_intake");
     uint64_t intake_tables_changed = 0;
@@ -1910,7 +2009,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// The round's SECOND witness source, independent of the listing -- see `readCheckpointWitnesses`
     /// for what it decides and why a listing alone cannot decide it. Its `undecodable` half names the
     /// namespaces whose `_ckpt` is present and unreadable; each of those is HELD below, and only those.
-    const CheckpointWitnesses checkpoints = readCheckpointWitnesses(ref_tables, catalog_snapshot);
+    const CheckpointWitnesses checkpoints = readCheckpointWitnesses(reads, ref_tables, catalog_snapshot);
     const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
@@ -2031,12 +2130,75 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             ++intake_tails_below_cursor;
     }
 
+    /// READ-AHEAD OF EACH NAMESPACE'S FIRST WALK POSITION, in walk order, kept a window deep. On a wide
+    /// pool this is the phase's shape: many namespaces, one read each, previously taken strictly one
+    /// after another.
+    ///
+    /// The key is recomputed from exactly the inputs the walk below uses -- the sealed cursor, the
+    /// catalog entry and the checkpoint grounding -- and ONLY where the walk will actually read it. A
+    /// namespace whose first position sits above `committed_through` is refused by the ceiling test
+    /// before any read (this is the ordinary QUIET namespace: its frontier is proved by the ceiling,
+    /// and it costs no request at all today), so hinting it would ADD a request the round never makes.
+    /// A namespace whose checkpoint is unusable is held without reading, and is skipped here for the
+    /// same reason.
+    std::vector<String> first_walk_keys;
+    first_walk_keys.reserve(walk_targets.size());
+    for (const WalkTarget & target : walk_targets)
+    {
+        if (checkpoints.undecodable.contains(target.ns))
+            continue;
+        const RootNamespace target_ns{target.ns};
+        const auto target_entry_it = std::lower_bound(
+            catalog_snapshot.catalog.entries.begin(), catalog_snapshot.catalog.entries.end(), target_ns,
+            [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
+        if (target_entry_it == catalog_snapshot.catalog.entries.end() || target_entry_it->ns != target_ns)
+            continue;
+
+        std::optional<RefCkpt> target_checkpoint;
+        if (const auto it = checkpoints.recovery_checkpoints.find(target.ns);
+            it != checkpoints.recovery_checkpoints.end())
+            target_checkpoint = it->second;
+
+        std::optional<RecoveryGrounding> target_grounding;
+        try
+        {
+            target_grounding = chooseRecoveryGrounding(std::optional<CatalogEntry>{*target_entry_it}, target_checkpoint);
+        }
+        catch (const Exception &)
+        {
+            continue;   /// the walk below holds this namespace without reading; so does the hint pass
+        }
+        if (!target_grounding->committed_through)
+            continue;
+
+        const auto target_cursor_it = parent_ref_lives.find(target.life_id);
+        const RefTxnId target_cursor = target_cursor_it != parent_ref_lives.end()
+            ? target_cursor_it->second.coverage.last_folded_ref_id : RefTxnId{};
+        std::optional<RefTxnId> target_expected;
+        if (target_cursor != RefTxnId{})
+            target_expected = RefTxnId{target_cursor.writer_epoch, target_cursor.ref_sequence + 1};
+        else if (target_checkpoint && target_checkpoint->life_epoch)
+            target_expected = RefTxnId{*target_checkpoint->life_epoch, 1};
+        if (!target_expected || *target_grounding->committed_through < *target_expected)
+            continue;
+
+        first_walk_keys.push_back(layout.refLogKey(
+            NamespaceLifeId::fromCatalogEntry(target_ns, target.life_id), *target_expected));
+    }
+    size_t next_first_walk_hint = 0;
+    const auto topUpFirstWalkHints = [&]
+    {
+        while (next_first_walk_hint < first_walk_keys.size() && reads.pending() < reads.window())
+            reads.hintRead(first_walk_keys[next_first_walk_hint++]);
+    };
+
     for (const WalkTarget & target : walk_targets)
     {
         const String & ns_str = target.ns;
         const RefTableListing & listing = *target.listing;
         if (ref_folding_aborted)
             break;
+        topUpFirstWalkHints();
         const RootNamespace ns{ns_str};
         /// Every walk target came out of this round's own catalog read, so its incarnation is the REAL
         /// one and the life below is minted from a catalog entry rather than guessed from a key.
@@ -2319,7 +2481,21 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             /// GET + decode the expected record. Absence is the decision point of the whole walk, and
             /// an invalid body is a per-namespace hold: the key belongs to exactly one namespace, so it
             /// can never be grounds for discarding another namespace's fold.
-            const auto got = op.read(layout.refLogKey(life, *expected), Retry::standard());
+            ///
+            /// LOOKAHEAD over this epoch's next arithmetic positions, and never past the ceiling the
+            /// test above enforces: `committed_through` was snapshotted before the walk and bounds
+            /// what this round may read at all, so every position hinted here is one this walk goes on
+            /// to read unless something stops it first. A hold or an epoch crossing stops it, leaving
+            /// at most a window's worth of bodies fetched and untaken -- bounded, counted, and never a
+            /// read the sequential walk would not have made.
+            for (uint64_t ahead_k = 1; ahead_k <= reads.window(); ++ahead_k)
+            {
+                const RefTxnId ahead{expected->writer_epoch, expected->ref_sequence + ahead_k};
+                if (*grounding->committed_through < ahead)
+                    break;
+                reads.hintRead(layout.refLogKey(life, ahead));
+            }
+            const auto got = reads.takeRead(layout.refLogKey(life, *expected));
             if (!got)
             {
                 ++intake_absent_probes;
@@ -2410,12 +2586,21 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             /// re-fold would then clamp on that missing body forever. A missing manifest body is a per-table
             /// CLAMP (barrier), never a round abort: keep the cursor below THIS log and re-read it next
             /// round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
+            ///
+            /// The decode above named every manifest key this log folds, so they are fetched together
+            /// here and taken one at a time in edge order below. A log with a single edge gains
+            /// nothing; a merge or a mutation log with dozens turns dozens of serial round trips into
+            /// one. A clamp mid-log leaves the rest of this log's bodies fetched and untaken, which is
+            /// the bounded waste the read-ahead counts.
+            for (const RefManifestEdge & edge : edges)
+                reads.hintRead(layout.manifestKey(edge.manifest_id));
+
             std::vector<BlobDelta> log_deltas;
             std::map<ManifestId, Etag> log_mf_cleanup;
             for (const RefManifestEdge & edge : edges)
             {
                 ProfileEvents::increment(ProfileEvents::CASRefEmittedEdges);   /// one manifest-edge event
-                if (foldManifestEdges(op, edge.manifest_id, edge.change, log_deltas, log_mf_cleanup,
+                if (foldManifestEdges(reads, edge.manifest_id, edge.change, log_deltas, log_mf_cleanup,
                                       txn_ordinal))
                     continue;
 
@@ -3023,6 +3208,39 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 nomination.source_retirements.end());
     }
 
+    /// WHICH BLOBS THE MERGE CAN CLOSE AT ZERO. `closeBlob` HEADs under `cur_edges == 0 && cur_touched`:
+    /// no key of the blob ended present, and at least one was touched. Every prior-run edge that survives
+    /// increments `cur_edges`, so reaching zero requires each of them to be killed at its own key by a
+    /// `-1` delta or a source retirement -- which puts a removal-last verdict in the map below -- while
+    /// any activation-last verdict leaves an edge standing and is the exclusion clause. Retirements are
+    /// folded in AFTER the deltas because the merge applies them that way, unconditionally: a key whose
+    /// deltas end in an activation but which a retirement then clears is a candidate too.
+    ///
+    /// IT IS A SUPERSET, AND NOTHING MAY COME TO DEPEND ON IT BEING EXACT. A blob named here that keeps
+    /// an untouched prior edge costs one HEAD the merge never takes; a candidate this set misses is
+    /// HEADed inline, which is simply the behaviour with no read-ahead at all. Both are counted, and
+    /// neither is asserted.
+    ///
+    /// PLACED HERE, not at the top of the phase: `orphan_source_retirements` is decided just above by
+    /// the sweep, and a retirement is a removal like any other. The round's cut is frozen well before
+    /// this point -- intake has finished and `deltas` has taken its final form -- so no HEAD is issued
+    /// before the round knows what it folded.
+    {
+        std::map<std::pair<BlobRef, UInt128>, bool> last_verdict_is_remove;
+        for (const BlobDelta & delta : deltas)
+            last_verdict_is_remove[{delta.ref, delta.source_id}] = delta.remove;
+        for (const BlobSourceRetirement & retirement : orphan_source_retirements)
+            last_verdict_is_remove[{retirement.ref, retirement.source_id}] = true;
+
+        std::set<BlobRef> removed;
+        std::set<BlobRef> surviving_add;
+        for (const auto & [edge, is_remove] : last_verdict_is_remove)
+            (is_remove ? removed : surviving_add).insert(edge.first);
+        for (const BlobRef & ref : removed)
+            if (!surviving_add.contains(ref))
+                head_candidates[blobShard(ref, state.gc_shards)].push_back(ref);
+    }
+
     if (state.gc_shards == 1)
     {
         /// SINGLE-SHARD PATH (gc_shards == 1). Every blob routes to shard 0, so the entire delta stream
@@ -3038,6 +3256,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         {
             /// Either a real delta or a non-empty retired input: run the merge (empty deltas still settle
             /// the RunMarker::Condemned rows riding the parent run). The prior runs are the parent seal's shard-0 refs.
+            head_hint_shard = 0;
+            next_head_hint = 0;
             foldDeltasIntoGeneration(op, layout, priorRunsFor(0),
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
@@ -3080,6 +3300,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             /// A reducer owns exactly one disjoint shard. Two replicas may run reducers for DIFFERENT
             /// shards concurrently (CasGcScheduler ownership); their run-key namespaces never collide.
             std::vector<RunRef> shard_runs;
+            head_hint_shard = shard;
+            next_head_hint = 0;
             foldDeltasIntoGeneration(
                 op, layout, priorRunsFor(shard), new_generation, attempt, shard,
                 std::move(buckets[shard]), shard_runs,
@@ -3747,6 +3969,17 @@ RebuildReport Gc::rebuildBaseline(bool force)
     RebuildReport rep;
     CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
+    /// The rebuild reads through the same seam the fold does, so the two share one implementation of
+    /// "read this key" rather than growing a second.
+    ///
+    /// WHAT THAT MEANS HERE, exactly: `readCheckpointWitnesses` hints its own keys and does not ask who
+    /// called it, so the rebuild's checkpoint reads ARE fetched ahead, on the same pool and by the same
+    /// rule as the fold's. That is a gain and not an accident -- a rebuild reads every namespace's
+    /// checkpoint too. Nothing on THIS path hints a manifest key, so `foldManifestEdges` below takes
+    /// them one at a time, exactly as it did before: a rebuild walks a plan it already holds rather
+    /// than discovering its next key from the body it just read, so a lookahead would have nothing to
+    /// hide behind.
+    GcReadAhead reads(op, store->openRequests(), *read_pool, store->poolConfig().gc_read_concurrency);
 
     /// Read bookkeeping health before the lease (the lease acquire on an absent state CREATES a
     /// bootstrap body, which must not make scenario (а) look healthy). A generation-0 ref-baseline
@@ -3926,7 +4159,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// universe. `recoverRefTableDetailedFromAuthority` deliberately has no internal catalog or
     /// checkpoint read: a later cut could admit a different life or frontier than the one every other
     /// part of this rebuild is using.
-    const CheckpointWitnesses rebuild_checkpoints = readCheckpointWitnesses({}, rebuild_walk_plan.catalogCut());
+    const CheckpointWitnesses rebuild_checkpoints = readCheckpointWitnesses(reads, {}, rebuild_walk_plan.catalogCut());
 
     if (validate_generation_zero_ref_baseline)
     {
@@ -4096,7 +4329,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         {
             const ManifestId id{ns, row.manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
-            if (!foldManifestEdges(op, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
+            if (!foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
             {
                 rep.refusal = "committed ref '" + ns.string() + "/" + ref_name
                     + "' names a missing or invalid part manifest — that is DATA LOSS the rebuild "
@@ -4112,7 +4345,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         {
             const ManifestId id{ns, manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
-            if (foldManifestEdges(op, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
+            if (foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
                 ++rep.live_precommits;
             else
             {
@@ -4184,7 +4417,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
                 return true;   /// provably dead — the orphan sweep's territory, never an edge
             const ManifestId id{ns, mref};
-            if (foldManifestEdges(op, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
+            if (foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
             {
                 ++rep.unowned_alive_manifests;
                 route_deltas(deltas);
