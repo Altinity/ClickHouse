@@ -168,7 +168,7 @@ void fenceOutMount(Backend & backend, const String & mount_key)
     MountLease m = decodeMountLease(got->bytes);
     m.gc_fenced = true;
     m.seq += 1;
-    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(mount_key, encodeMountLease(m), got->incarnation, Retry::standard())));
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(mount_key, encodeMountLease(m), got->etag, Retry::standard())));
 }
 
 /// Publish one part `ref` with a single content blob whose payload is `payload`.
@@ -200,8 +200,8 @@ std::set<String> listRefLogKeys(Backend & b, const Layout & l, const RootNamespa
     String cursor;
     while (true)
     {
-        const KeyPage page = (*op).list(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
-        for (const KeyEntry & k : page.keys)
+        const ListPage page = (*op).list(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
+        for (const ListedKey & k : page.keys)
             if (const auto parsed = l.parseRefObjectKey(k.key); parsed && parsed->kind == RefObjectKind::Log)
                 out.insert(k.key);
         if (page.next_cursor.empty())
