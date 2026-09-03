@@ -1038,6 +1038,12 @@ public:
     /// sleeps for real. Call before driving traffic; empty restores the real sleep.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
 
+    /// Test-only: replace the request engine's clock on all three planes. A test driving a PERSISTENT
+    /// transient fault must run the retry window on a clock it advances; the sleep seam alone cannot
+    /// bound it, because a read the engine keeps reissuing is bounded by the policy deadline and the
+    /// deadline is read from this clock.
+    void setCasRequestNowFnForTest(std::function<uint64_t()> now_fn);
+
     /// Test-only: replace only ref-table recovery's token-aware retry delay seam.
     void setRefRecoveryRetrySleepForTest(
         std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn);

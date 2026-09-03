@@ -1859,6 +1859,13 @@ void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
     ref_ledger.setCasRetrySleepForTest(std::move(sleep_fn));
 }
 
+void Pool::setCasRequestNowFnForTest(std::function<uint64_t()> now_fn)
+{
+    mount_requests.setNowFnForTest(now_fn);
+    farewell_requests.setNowFnForTest(now_fn);
+    gc_requests.setNowFnForTest(std::move(now_fn));
+}
+
 void Pool::setRefRecoveryRetrySleepForTest(
     std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn)
 {

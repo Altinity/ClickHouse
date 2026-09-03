@@ -525,7 +525,13 @@ uint64_t CasMountRuntime::renewKeeperOnce(
     /// whole-chain finalizer to deliver after `remount_mutex` is released.
     configureMountRenewObservability(
         &server_root_id, &event_sink, active == RenewalDriverState::RemountCall);
-    const MountRenewResult result = call.keeper->renew(renewalEnvironment(worker_call));
+    /// The remount redo re-anchors the lease BEFORE `armMountFence`, with the fence still latched lost,
+    /// so it renews on the keeper's open plane: admitted under the mount fence it could only ever give
+    /// up, and every remount would fail at this step. `RemountCall` is reached from
+    /// `renewKeeperForRemountOnce` alone.
+    const MountRenewResult result = active == RenewalDriverState::RemountCall
+        ? call.keeper->renewForRemount(renewalEnvironment(worker_call))
+        : call.keeper->renew(renewalEnvironment(worker_call));
     const RenewalDriverState destination = active == RenewalDriverState::WorkerCall
         ? RenewalDriverState::WorkerIdle
         : (active == RenewalDriverState::RemountCall ? RenewalDriverState::Parked : RenewalDriverState::Dormant);
