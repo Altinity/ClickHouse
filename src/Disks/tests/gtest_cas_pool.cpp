@@ -2566,6 +2566,12 @@ TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     });
     ASSERT_TRUE(store);
     EXPECT_TRUE(waits.empty()) << "a fresh mount (no predecessor) pays no wait at open";
+    /// `dropRef` below drives the fault through `ensureRefTableRecovered`'s own recovery-retry loop,
+    /// which sleeps via `recovery_retry_sleep_fn` (a REAL 200ms-slice sleep by default) while measuring
+    /// elapsed time against `boot_ms_now_fn` -- the frozen `fake_boot` this fixture already injects.
+    /// Without also virtualizing the sleep, that elapsed check never advances and the loop spins for
+    /// real until the harness times the test out.
+    store->setCasRetrySleepForTest([&fake_boot](uint64_t ms) { fake_boot += ms; });
 
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv/remount_wedge"};
