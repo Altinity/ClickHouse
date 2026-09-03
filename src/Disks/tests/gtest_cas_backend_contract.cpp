@@ -27,12 +27,12 @@ TEST_P(CASBackendContract, PutIfAbsentAndGet)
     auto op = requests.admit();
     const auto put = op.create("k", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(put));
-    const Etag t1 = std::get<Committed>(put).incarnation;
+    const Etag t1 = std::get<Committed>(put).etag;
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k", "clobber", Retry::once())));
     auto g = op.read("k", Retry::once());
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "v1");
-    EXPECT_EQ(g->incarnation, t1);
+    EXPECT_EQ(g->etag, t1);
     EXPECT_FALSE(op.read("absent", Retry::once()).has_value());
 }
 
@@ -47,17 +47,17 @@ TEST_P(CASBackendContract, OverwriteIsTokenExactAndMintsFreshToken)
     auto op = requests.admit();
     const auto created = op.create("k", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(created));
-    const Etag t1 = std::get<Committed>(created).incarnation;
+    const Etag t1 = std::get<Committed>(created).etag;
     const auto warmup = op.replace("k", "v1b", t1, Retry::once());   // mints a second incarnation, so t1 goes stale
     ASSERT_TRUE(std::holds_alternative<Committed>(warmup));
-    const Etag t2 = std::get<Committed>(warmup).incarnation;
+    const Etag t2 = std::get<Committed>(warmup).etag;
 
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("k", "v2", t1, Retry::once())));
     expectBytes(b, "k", "v1b");                                 // untouched on mismatch
 
     const auto overwrite = op.replace("k", "v2", t2, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(overwrite));
-    EXPECT_NE(std::get<Committed>(overwrite).incarnation, t2);  // incarnations never repeat
+    EXPECT_NE(std::get<Committed>(overwrite).etag, t2);  // etags never repeat
     expectBytes(b, "k", "v2");
 }
 
@@ -68,13 +68,13 @@ TEST_P(CASBackendContract, CasPutCreateAndSwap)
     auto op = requests.admit();
     const auto create = op.create("m", "s1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(create));                     // create-if-absent
-    const Etag t1 = std::get<Committed>(create).incarnation;
+    const Etag t1 = std::get<Committed>(create).etag;
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("m", "s1x", Retry::once())));   // exists now
 
     /// Mint a second real incarnation so `t1` becomes a genuinely stale (never fabricated) wrong swap.
     const auto warmup = op.replace("m", "s1y", t1, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(warmup));
-    const Etag t2 = std::get<Committed>(warmup).incarnation;
+    const Etag t2 = std::get<Committed>(warmup).etag;
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("m", "s2", t1, Retry::once())));
     expectBytes(b, "m", "s1y");
 
@@ -89,13 +89,13 @@ TEST_P(CASBackendContract, DeleteExactnessAndSurvival)
     auto op = requests.admit();
     const auto created = op.create("k", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(created));
-    const Etag t1 = std::get<Committed>(created).incarnation;
+    const Etag t1 = std::get<Committed>(created).etag;
 
     /// A real but stale incarnation, minted by a legitimate overwrite (see the comment on
     /// `OverwriteIsTokenExactAndMintsFreshToken`).
     const auto warmup = op.replace("k", "v1b", t1, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(warmup));
-    const Etag t2 = std::get<Committed>(warmup).incarnation;
+    const Etag t2 = std::get<Committed>(warmup).etag;
 
     EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Mismatch);
     EXPECT_TRUE(op.read("k", Retry::once()).has_value());       // SURVIVES wrong-incarnation delete
@@ -110,7 +110,7 @@ TEST_P(CASBackendContract, DeleteNotFound)
     auto op = requests.admit();
     const auto created = op.create("k", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(created));
-    const Etag t1 = std::get<Committed>(created).incarnation;
+    const Etag t1 = std::get<Committed>(created).etag;
     EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Removed);
     EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Gone);
 }
@@ -161,14 +161,14 @@ TEST_P(CASBackendContract, ReadAfterWrite)
     auto op = requests.admit();
     const auto created = op.create("rw", "payload", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(created));
-    const Etag t1 = std::get<Committed>(created).incarnation;
+    const Etag t1 = std::get<Committed>(created).etag;
     auto g = op.read("rw", Retry::once());
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "payload");
-    EXPECT_EQ(g->incarnation, t1);
+    EXPECT_EQ(g->etag, t1);
     auto h = op.head("rw", Retry::once());
     ASSERT_TRUE(h.has_value());
-    EXPECT_EQ(h->incarnation, t1);
+    EXPECT_EQ(h->etag, t1);
 }
 
 /// After an object is created then deleted (key absent again), a conditional update against the
@@ -184,7 +184,7 @@ TEST_P(CASBackendContract, OverwriteAndCasOnMissingKey)
     auto op = requests.admit();
     const auto created = op.create("k", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(created));
-    const Etag t1 = std::get<Committed>(created).incarnation;
+    const Etag t1 = std::get<Committed>(created).etag;
     EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Removed);
     ASSERT_FALSE(op.read("k", Retry::once()).has_value());     // key is absent
 
