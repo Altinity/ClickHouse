@@ -74,6 +74,11 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
         const std::optional<CatalogEntry> eligible = selectEligible(catalog);
         if (!eligible)
         {
+            /// The verdict gets its own refresh, not just each erase: a deposition landing after the
+            /// last erase is invisible to the reading that erase took, so without this the drain hands
+            /// a deposed leader `Authoritative` and the round only learns better at its `gc/state`
+            /// commit -- after a ref walk and a fold seal it never had the authority to build.
+            refresh_authority();
             if (!op.admitted())
             {
                 result.authority_status = AuthorityStatus::FencedOut;
