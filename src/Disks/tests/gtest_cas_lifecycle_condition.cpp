@@ -41,7 +41,7 @@ String deleteKeyReturningBody(Backend & backend, const String & key)
     EXPECT_TRUE(got.has_value()) << "expected '" << key << "' to exist before deletion";
     if (!got)
         return {};
-    (*op).remove(key, got->incarnation, Retry::once());
+    (*op).remove(key, got->etag, Retry::once());
     return got->bytes;
 }
 
@@ -56,7 +56,7 @@ void fenceOutMount(Backend & backend, const String & mount_key)
     MountLease m = decodeMountLease(got->bytes);
     m.gc_fenced = true;
     m.seq += 1;
-    const auto put = (*op).replace(mount_key, encodeMountLease(m), got->incarnation, Retry::once());
+    const auto put = (*op).replace(mount_key, encodeMountLease(m), got->etag, Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(put));
 }
 
@@ -174,7 +174,7 @@ TEST(CASLifecycleCondition, PoolMetaForeignPoolIdEntersVanishedReplacedImmediate
     ASSERT_TRUE(got.has_value());
     PoolMeta foreign = decodePoolMeta(got->bytes);
     foreign.pool_id = foreign.pool_id + DB::UInt128(1);
-    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(meta_key, encodePoolMeta(foreign), got->incarnation, Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(meta_key, encodePoolMeta(foreign), got->etag, Retry::once())));
 
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedReplaced);
@@ -200,7 +200,7 @@ TEST(CASLifecycleCondition, PoolMetaAlgosUsedDifferIsNotReplacementRecoveryProce
     ASSERT_FALSE(std::binary_search(mutated.algos_used.begin(), mutated.algos_used.end(), extra));
     mutated.algos_used.push_back(extra);
     std::sort(mutated.algos_used.begin(), mutated.algos_used.end());
-    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(meta_key, encodePoolMeta(mutated), got->incarnation, Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(meta_key, encodePoolMeta(mutated), got->etag, Retry::once())));
 
     /// Fence out the mount so the (correctly non-replacement) recovery cleanly reclaims a fresh incarnation.
     fenceOutMount(*backend, store->layout().mountKey(kSrid));
