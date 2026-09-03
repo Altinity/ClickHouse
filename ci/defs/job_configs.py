@@ -1039,11 +1039,15 @@ class JobConfigs:
     functional_tests_jobs_azure = common_ft_job_config.set_allow_failure(
         True
     ).parametrize(
-        Job.ParamSet(
-            parameter="arm_asan_ubsan, azure, parallel",
-            runs_on=RunnerLabels.ARM_LARGE,  # ~2h on medium
-            requires=[ArtifactNames.CH_ARM_ASAN_UBSAN_GH],
-        ),
+        *[
+            Job.ParamSet(
+                parameter=f"arm_asan_ubsan, azure, parallel, {batch}/{total_batches}",
+                runs_on=RunnerLabels.ARM_LARGE,
+                requires=[ArtifactNames.CH_ARM_ASAN_UBSAN_GH],
+            )
+            for total_batches in (4,)
+            for batch in range(1, total_batches + 1)
+        ],
         *[
             Job.ParamSet(
                 parameter=f"arm_asan_ubsan, azure, sequential, {batch}/{total_batches}",
