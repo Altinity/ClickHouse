@@ -640,7 +640,7 @@ String GlueCatalog::resolveMetadataPathFromTableLocation(const String & table_lo
     }
 }
 
-void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name) const
+void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, const String & /*location*/) const
 {
     Aws::Glue::Model::CreateDatabaseRequest create_request;
     Aws::Glue::Model::DatabaseInput db_input;
@@ -649,7 +649,14 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name) cons
 
     ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogCreateDatabase);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogCreateDatabaseMicroseconds);
-    glue_client->CreateDatabase(create_request);
+    auto outcome = glue_client->CreateDatabase(create_request);
+    if (!outcome.IsSuccess() && outcome.GetError().GetErrorType() != Aws::Glue::GlueErrors::ALREADY_EXISTS)
+    {
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+            "Exception calling CreateDatabase for namespace {}: {}",
+            namespace_name, outcome.GetError().GetMessage());
+    }
 }
 
 void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*metadata_content*/) const
@@ -658,8 +665,6 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
-
-    createNamespaceIfNotExists(namespace_name);
 
     Aws::Glue::Model::CreateTableRequest request;
     request.SetDatabaseName(namespace_name);
