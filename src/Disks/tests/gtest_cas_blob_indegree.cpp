@@ -153,8 +153,9 @@ TEST(CASBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
 #if USE_AWS_S3
 namespace
 {
-/// Refuses to serve one key's body. An access denial is the class the request engine surfaces
-/// unchanged instead of reissuing, so the write's resolve read ends having observed nothing.
+/// Refuses to serve one key's body. An access denial gets one credential refresh first; it surfaces on
+/// the first attempt only because `InMemoryBackend::refreshCredentials` answers false by default, so the
+/// write's resolve read ends having observed nothing.
 class ReadRefusingBackend : public InMemoryBackend
 {
 public:
@@ -674,9 +675,11 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
     ASSERT_GT(gen1_run_bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
 
     /// Reset counters and fold gen 2 with a small delta: remove one edge and add another. The prior
-    /// gen-1 run must be consumed via the streaming cursor (head + tail get + body getStream + per-seq
-    /// head probe), NEVER a whole-object get.
+    /// gen-1 run must be consumed via one streaming open per prior segment, NEVER a whole-object get.
     backend.resetCounts();
+    /// Arm a window smaller than the run so the fold's output is proven correct under chunked delivery,
+    /// not merely served in one piece: an unarmed recorder hands back the whole object as its one chunk.
+    backend.setStreamChunkForTest(kLegacyBlockSize / 4);
     std::vector<BlobDelta> gen2{{bh(0), s(1), true}, {bh(19999), s(2), false}};
     std::vector<RunRef> runs2_c;
     std::vector<RunRef> runs2_o;
@@ -699,6 +702,11 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
     EXPECT_EQ(backend.getCount(gen1_run_key), 0u);
     /// The cursor opened the prior run's segment through the streaming reader.
     EXPECT_GE(backend.getStreamCount(gen1_run_key), 1u);
+    /// The other half of the evidence: byte-parity above held even though the stream delivered the prior
+    /// run in windows smaller than the run itself, not in one piece. An unarmed recorder could not
+    /// produce a chunk larger than its own buffer, so this comparison would be true by construction
+    /// without the armed window and the byte-parity check above.
+    EXPECT_LT(backend.largestStreamChunk(gen1_run_key), gen1_run_bytes.size());
     /// This does NOT bound how much the stream buffers per request: the streaming primitive carries no
     /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }
@@ -743,6 +751,10 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
     ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
 
     backend.resetCounts();
+    /// Arm a window smaller than the run so the candidate set below is proven correct under chunked
+    /// delivery, not merely served in one piece: an unarmed recorder hands back the whole object as its
+    /// one chunk.
+    backend.setStreamChunkForTest(kLegacyBlockSize / 4);
     const auto zero_c = zeroInDegree(*backend_req, runs2_c);
     const auto zero_o = zeroInDegree(*oracle_req, runs2_o);
 
@@ -757,6 +769,11 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
     EXPECT_EQ(backend.getCount(gen2_run_key), 0u);
     /// The scan opened the run through the streaming reader.
     EXPECT_GE(backend.getStreamCount(gen2_run_key), 1u);
+    /// The other half of the evidence: the candidate set above matched the oracle even though the stream
+    /// delivered the run in windows smaller than the run itself, not in one piece. An unarmed recorder
+    /// could not produce a chunk larger than its own buffer, so this comparison would be true by
+    /// construction without the armed window and the candidate-set check above.
+    EXPECT_LT(backend.largestStreamChunk(gen2_run_key), gen2_run->bytes.size());
     /// This does NOT bound how much the stream buffers per request: the streaming primitive carries no
     /// window for the seam to measure, so resident memory inside the open stream is out of its reach.
 }

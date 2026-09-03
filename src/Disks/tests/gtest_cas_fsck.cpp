@@ -9,6 +9,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include "cas_test_helpers.h"
+#include "config.h"
+#if USE_AWS_S3
+#include <IO/S3Common.h>
+#endif
 
 #include <algorithm>
 #include <filesystem>
@@ -150,8 +154,12 @@ private:
     FsckListingMode mode = FsckListingMode::Full;
 };
 
+#if USE_AWS_S3
 /// Fail one exact GET without disturbing LIST or any other object read. This keeps the checkpoint
 /// authority stable while proving that fsck distinguishes a transport failure from durable corruption.
+/// An access denial is the class the request engine surfaces on the first attempt instead of reissuing
+/// (`InMemoryBackend::refreshCredentials` answers false by default), so the failure needs no retry
+/// budget and the caller sees the injected message unchanged.
 class FailExactGetBackend : public InMemoryBackend
 {
 public:
@@ -163,13 +171,14 @@ public:
     std::optional<Raw> read(const String & requested_key, TransportAccess & access) override
     {
         if (requested_key == key)
-            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected exact GET failure");
+            throw DB::S3Exception("injected access denial on exact GET", Aws::S3::S3Errors::ACCESS_DENIED);
         return InMemoryBackend::read(requested_key, access);
     }
 
 private:
     String key;
 };
+#endif
 
 /// Publish the exact `_ckpt` authority an ordinary Live test life would have after its first committed
 /// record. Raw ref-log helpers deliberately do not do this: several protocol tests need malformed or
@@ -949,8 +958,11 @@ TEST(CASFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
         "names an EpochSeal, not a snapshot base");
 }
 
-/// An unstable transport failure while exact-reading the same valid checkpoint base proves neither
-/// presence nor absence. It remains the honest third answer and must not become a hard finding.
+#if USE_AWS_S3
+/// A transport failure while exact-reading the same valid checkpoint base proves neither presence nor
+/// absence. It remains the honest third answer and must not become a hard finding. The fault is armed
+/// as an access denial so it surfaces on the read's first attempt (see `FailExactGetBackend`), which
+/// keeps this test's cost at one request instead of a run through `Retry::standard()`'s deadline.
 TEST(CASFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
 {
     auto backend = std::make_shared<FailExactGetBackend>();
@@ -972,28 +984,12 @@ TEST(CASFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
     writeFsckCheckpointWithBase(*backend, layout, ns, base);
     backend->fail(layout.refLogKey(life, base));
 
-    /// The injected fault is PERMANENT and the read runs under `Retry::standard()`, so the reissue
-    /// loop would otherwise burn the policy's ninety seconds of gate wall-clock. Drive the plane fsck
-    /// admits from off a counter the sleeps advance. The extra millisecond stands for the attempt that
-    /// preceded each sleep: full jitter can draw a zero pause, and a clock that only ever moved by the
-    /// pause would then never reach the deadline.
-    uint64_t virtual_now_ms = 0;
-    uint64_t sleeps_taken = 0;
-    store->gcRequests().setNowFnForTest([&virtual_now_ms] { return virtual_now_ms; });
-    store->gcRequests().setSleepFnForTest([&virtual_now_ms, &sleeps_taken](uint64_t ms)
-    {
-        virtual_now_ms += ms + 1;
-        ++sleeps_taken;
-    });
-
     const FsckReport report = runFsck(*store, /*detail=*/true);
-    /// Without this the test still reaches the right verdict while silently serving the whole window
-    /// off the wall clock, which is how a ninety-second unit test hides in a green gate.
-    EXPECT_GT(sleeps_taken, 0u) << "the retry loop must have paced on the injected clock, not wall time";
     EXPECT_EQ(report.ref_records_walked, 0u);
     expectCheckpointBaseVerdict(
-        report, layout.refSnapshotKey(life, base), FsckClass::Unchecked, "injected exact GET failure");
+        report, layout.refSnapshotKey(life, base), FsckClass::Unchecked, "injected access denial on exact GET");
 }
+#endif
 
 /// The sampled checkpoint is immutable input, but cleanup may advance `_ckpt` after that sample and
 /// retire its old base before fsck exact-reads it. The miss is then authority instability, not evidence

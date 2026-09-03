@@ -136,7 +136,8 @@ private:
 
 /// Open a typed source-edge run. The NDJSON header must identify a `cas_run` of kind `source_edge`;
 /// otherwise opening fails closed. The memory overload borrows caller-owned bytes. The backend overload
-/// streams the write-once object, retaining only one record-sized buffer.
+/// streams the write-once object: the reader itself holds one record-sized buffer, but the open stream
+/// underneath it buffers on its own terms, unbounded and unmeasured here.
 SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
 SourceEdgeRunView openSourceEdgeRun(CasOperation & op, const String & key);
 
