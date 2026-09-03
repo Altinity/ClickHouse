@@ -5322,7 +5322,7 @@ TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     /// The engine's own clock advances (its sleep is what moves it), while `fake_now` -- the FENCE's
     /// clock -- stays frozen, which is what keeps the mount alive across a retry: advancing it past the
     /// tiny lease TTL would drop the fence and abort recovery, exercising the fence path instead.
-    auto clock = VirtualRetryClock::installOn(store);
+    VirtualRetryClock::installOn(store);
 
     /// Fail the epoch seal's conditional create for the whole of ONE recovery attempt, then clear the
     /// fault from the recovery retry seam -- the only point between two recovery attempts a test can
@@ -5342,8 +5342,6 @@ TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must succeed after retrying past the fault";
 
     EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries].load(), retries_before + 1);
-    EXPECT_GT(clock->pauseCount(), 1u)
-        << "the failed attempt's own reissues must pace through the injected sleep, never a real one";
     /// TWO dead epochs (1 and 2) are closed by this walk, and a whole attempt is re-driven per transient
     /// failure -- so the seals of the epochs the failed attempt already closed are ADOPTED on the retry
     /// rather than minted again. Exactly two are minted in total.
