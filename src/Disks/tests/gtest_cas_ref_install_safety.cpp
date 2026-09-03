@@ -174,13 +174,15 @@ public:
 ///   `refAppendFenceOk`  -- additionally `attempt_timeout_ms + lease_safety_margin_ms < deadline - now`,
 ///                          i.e. "there is room for one whole controlled attempt"; the `fence_ok`
 ///                          `commitRefChunk` hands to `putIfAbsentControlled`.
-/// With `openPoolFenceControlled`'s budget below that margin is 100 + 100 = 200 ms, so a 100 ms
-/// remaining lease sits BETWEEN them: the flush is admitted and then its very first pre-attempt gate
-/// refuses. That is
-/// exactly the production shape of a lease too short to start a write, not a lost
-/// one), and it needs no fault injection at all -- which is the point: nothing is sent.
+/// A THIRD checkpoint sits strictly between them: every call to `CasOperation::admitted` reached on the
+/// way in (e.g. `namespaceLife`'s "resident namespace life" guard) asks the same fence for
+/// `needed_ms=0`, so it needs only `lease_safety_margin_ms < deadline - now` -- room for the margin
+/// alone, no whole attempt. With `openPoolFenceControlled`'s budget that zero-needed guard already
+/// refuses at `deadline - now <= 100`, and the attempt-sized guard admits at `deadline - now >= 200`; a
+/// "pre-attempt refusal" test wants the flush admitted and the zero-needed guards clear while no whole
+/// attempt fits, which is strictly between those two, e.g. 150 ms.
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
-constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 100;
+constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 150;
 
 /// A legal blob-free part: stage an empty manifest, precommit, promote -- enough to drive real
 /// ref-log transactions through the append lane.
