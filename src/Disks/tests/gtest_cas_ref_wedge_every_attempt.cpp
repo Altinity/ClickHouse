@@ -492,7 +492,6 @@ void wedgeLaneOnUnresolvedAppend(VirtualRetryClock & clock, WedgeTestBackend & b
 {
     const size_t pauses_before = clock.pauseCount();
     const uint64_t clock_before = clock.nowMs();
-    const uint64_t writes_before = backend.writeTotal();
 
     backend.ambiguous_substr = logPrefix(store, ns);
     backend.ambiguous_latched = true;
@@ -501,8 +500,9 @@ void wedgeLaneOnUnresolvedAppend(VirtualRetryClock & clock, WedgeTestBackend & b
     backend.ambiguous_substr.clear();
 
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
-    ASSERT_GT(backend.writeTotal(), writes_before + 1)
-        << "one attempt cannot exhaust the retry window: the fault must have outlasted every reissue";
+    /// `writeTotal` cannot prove "more than one attempt": the ambiguous fault throws before ever
+    /// reaching the counted primitive, so a latched reissue never moves it. The pacing below is what
+    /// proves multiple reissues happened.
     ASSERT_GT(clock.pauseCount(), pauses_before + 1)
         << "the reissues must pace through the injected sleep, never a real one";
     ASSERT_LE(clock.longestPause(), 5000u) << "each pause is the engine's own capped full jitter";
@@ -1466,8 +1466,10 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteWedgesWhenTheSettlingReadNamesNoOccupant
 
     /// RECOVERABLE, and this is the half a terminal `Faulted` forecloses: with the store answering
     /// normally again, the next flush's bounded create lands the wedged transaction and adopts it.
+    /// Triggered by a DIFFERENT ref (not another drop of "x"): the wedge's own adopted drop already
+    /// removes "x", so a second "drop x" from this same call would find it already gone.
     backend->refuse_precondition_substr.clear();
-    EXPECT_NO_THROW(store->dropRef(ns, "x"));
+    EXPECT_NO_THROW(publishEmptyPart(store, ns, "y"));
     EXPECT_FALSE(store->refLaneWedgedForTest(ns));
     EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "the adopted wedge applied its drop";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
@@ -1502,9 +1504,12 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteWedgesWhenTheSettlingReadItselfIsRefused
     EXPECT_TRUE(store->refLaneWedgedForTest(ns));
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged);
 
+    /// Triggered by a DIFFERENT ref (not another drop of "x"): the wedge's own adopted drop already
+    /// removes "x", so a second "drop x" from this same call would find it already gone.
     backend->refuse_read_after_precondition = false;
     backend->refuse_precondition_substr.clear();
-    EXPECT_NO_THROW(store->dropRef(ns, "x"));
+    EXPECT_NO_THROW(publishEmptyPart(store, ns, "y"));
+    EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "the adopted wedge applied its drop";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 }
 #endif
