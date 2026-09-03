@@ -436,8 +436,10 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                         /// must not be reported as a hard failure when the write actually landed.
                         /// Unchanged incarnation means the write never applied (legitimately retryable
                         /// within budget); matching bytes means this exact tombstone already landed
-                        /// (`Committed`, not a failure); anything else is a genuine successor reclaim
-                        /// (`Conflict`).
+                        /// (`Committed`, not a failure); a genuine successor reclaim is `Conflict`;
+                        /// `Refused` is the store's own definite answer (a denial, a malformed
+                        /// request, an expired credential) and carries its own code and message,
+                        /// which is worth more here than the generic retry advice below.
                         WriteResult result = op.replace(owner_key, encodeOwner(tombstoned), owner->incarnation, Retry::standard());
                         if (std::holds_alternative<Committed>(result))
                             report.slot_removed = true;
@@ -445,6 +447,10 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                             report.warnings.push_back(
                                 "slot tombstone failed: " + owner_key
                                 + ": successor reclaimed the owner anchor before this decommission's tombstone write");
+                        else if (const Refused * refused = std::get_if<Refused>(&result))
+                            report.warnings.push_back(
+                                "slot tombstone failed: " + owner_key + ": the store refused the write ("
+                                + std::to_string(refused->store_error) + "): " + refused->message);
                         else
                             report.warnings.push_back(
                                 "slot tombstone failed: " + owner_key

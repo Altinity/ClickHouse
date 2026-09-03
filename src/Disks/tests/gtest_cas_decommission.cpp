@@ -253,11 +253,14 @@ public:
 private:
     /// Counts on the `write` PRIMITIVE: the owner tombstone write this test asserts is never
     /// attempted (`CasDecommission.cpp`'s `op.replace`) reaches the store through here, not through
-    /// the legacy `putOverwrite`.
+    /// the legacy `putOverwrite`. Guarded on `expected_value`: the primitive also sees the owner
+    /// anchor's own CREATE during this fixture's `openVictim`, which `putOverwrite` (a conditional
+    /// REPLACE only) never did -- counting it would start this counter at 1 before the interesting
+    /// part of the test begins.
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {
-        if (key == owner_key)
+        if (key == owner_key && expected_value)
             ++owner_rewrite_attempts;
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
@@ -351,36 +354,6 @@ private:
     String successor_owner_bytes;
 };
 
-/// Models an "ambiguous success" on the final owner tombstone write: the conditional overwrite
-/// actually lands (InMemoryBackend applies it), but the response is then lost (a transient
-/// exception is thrown on the SAME call, exactly as a real SDK timeout after a landed write would
-/// look). Before the fix, decommission caught any exception here and reported failure
-/// unconditionally; the controlled overwrite must resolve this via a GET (the current bytes match
-/// what was intended) and report Committed instead.
-class AmbiguousOwnerTombstoneBackend : public InMemoryBackend
-{
-public:
-    void armForAmbiguousTombstone() { armed = true; }
-
-    /// Injects on the `write` PRIMITIVE: the owner tombstone write (`CasDecommission.cpp`'s
-    /// `op.replace`) goes through `CasOperation::replace`, not the legacy `putOverwrite`.
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value, TransportAccess & access) override
-    {
-        const auto result = InMemoryBackend::write(key, bytes, expected_value, access);
-        if (armed && !fired && key == owner_key && result.has_value())
-        {
-            fired = true;
-            throw std::runtime_error("ambiguous-tombstone fixture: response lost after the write landed");
-        }
-        return result;
-    }
-
-private:
-    inline static const String owner_key = "p/gc/server-roots/victim/owner";
-    bool armed = false;
-    bool fired = false;
-};
 
 /// Seed one victim table with `committed` committed refs and `precommits` dangling precommit bindings,
 /// via the raw ref-log seeding helpers (fixture idiom of e.g. `gtest_cas_gc_fold.cpp`: `writeManifestRaw`
@@ -1040,7 +1013,7 @@ TEST(CASDecommission, SuccessorReclaimFencesSlotRetirementTail)
     EXPECT_FALSE(report.slot_removed);
     ASSERT_EQ(report.warnings.size(), 1u);
     EXPECT_NE(report.warnings.front().find("p/gc/server-roots/victim/mount"), String::npos);
-    EXPECT_NE(report.warnings.front().find("replaced"), String::npos);
+    EXPECT_NE(report.warnings.front().find("mismatch"), String::npos);
 
     const auto mount = backend->get("p/gc/server-roots/victim/mount");
     ASSERT_TRUE(mount.has_value());
@@ -1113,12 +1086,13 @@ TEST(CASDecommission, FencedSlotRetirementTailRetiresUncontendedSlot)
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
 
-/// Decommission builds its own always-admitted engine over an open fence rather than routing through
-/// any of `Pool`'s fenced planes: unlike the mount and GC planes, which only exist while their `Pool`
-/// does, this engine must serve requests spanning the WHOLE operation -- the pre-impersonation catalog
-/// cut, taken before any `Pool` exists, through the final owner tombstone, taken after `admin.reset()`
-/// destroys the `Pool`. A namespace-bearing victim exercises both a namespace drop's own request and
-/// the full retirement tail across that boundary in one run, on the same engine instance throughout.
+/// One decommission command spans several requests on the SAME open-fence engine: the
+/// pre-impersonation catalog cut (before any `Pool` exists), the namespace drop's own catalog re-read,
+/// and -- once the row it dropped is no longer owned -- the full retirement tail's reads, deletes and
+/// final owner tombstone, all issued after `admin.reset()` destroys the `Pool`. Catalog-row deletion
+/// is GC's job (`dropNamespace` only reaches `Removing`), so this is necessarily two commands: the
+/// first proves the drop and its catalog read landed, the second (after GC folds the row) proves the
+/// retirement tail's requests landed past the `Pool`'s own lifetime.
 TEST(CASDecommission, RunsOnAnOpenFence)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -1127,15 +1101,18 @@ TEST(CASDecommission, RunsOnAnOpenFence)
         makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
     }
 
-    const auto report = decommissionPoolMember(
+    const auto pending = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    EXPECT_EQ(pending.namespaces_removed, 1u);
+    EXPECT_FALSE(pending.slot_removed);
+    EXPECT_FALSE(pending.warnings.empty());
 
+    drainCompletedNamespaceRemovals(backend);
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
     EXPECT_TRUE(report.warnings.empty());
-    EXPECT_EQ(report.namespaces_removed, 1u);
-    EXPECT_TRUE(report.slot_removed)
-        << "the retirement tail's reads, deletes and the final owner tombstone all landed after "
-           "admin.reset() destroyed the Pool -- proof the engine does not depend on the Pool's own "
-           "fenced planes";
+    EXPECT_TRUE(report.slot_removed);
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
     const auto owner = backend->get("p/gc/server-roots/victim/owner");
@@ -1187,14 +1164,18 @@ TEST(CASDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
 }
 
 /// Final whole-branch review finding (Important):
-/// a transient exception on the owner tombstone write must not be reported as a hard failure when the
-/// write actually landed -- the controlled overwrite resolves this via GET (current bytes already
-/// match the intended tombstone) instead of the old bare putOverwrite's "any exception = failure".
+/// an ambiguous outcome on the owner tombstone write -- the write lands but its response is lost, the
+/// same shape as a real SDK timeout after a landed write -- must not be reported as a hard failure.
+/// `op.replace`'s own resolve read settles this (current bytes already match the intended tombstone)
+/// and reports `Committed`. `injectAmbiguousLandedWrite` throws `Poco::TimeoutException` after
+/// applying the write: the engine's write loop treats a `Poco::Exception` as a transport fault (never
+/// a caller bug), which is exactly the class this scenario models -- a bare `std::runtime_error` here
+/// would propagate unchanged instead of being resolved.
 TEST(CASDecommission, OwnerTombstoneAmbiguousSuccessResolvesToCommitted)
 {
-    auto backend = std::make_shared<AmbiguousOwnerTombstoneBackend>();
+    auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }
-    backend->armForAmbiguousTombstone();
+    backend->injectAmbiguousLandedWrite("p/gc/server-roots/victim/owner");
 
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
@@ -1248,7 +1229,6 @@ public:
     {
         return inner->casPut(key, bytes, expected, meta);
     }
-    DeleteOutcome deleteExact(const String & key, const Token & token) override { return inner->deleteExact(key, token); }
     ListPage list(const String & prefix, const String & cursor, size_t limit) override { return inner->list(prefix, cursor, limit); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
@@ -1260,7 +1240,11 @@ public:
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
         if (armed && key.starts_with(fail_prefix))
-            throw Exception(ErrorCodes::S3_ERROR, "injected transient delete failure for {}", key);
+            /// A caller-bug-shaped exception (never `Poco::Exception`), so the engine surfaces it on
+            /// the first attempt instead of reissuing it for the whole policy window -- this fixture
+            /// models a single per-object failure the drain must warn on and move past, not a
+            /// transport fault the retry loop should absorb.
+            throw std::runtime_error("injected transient delete failure for " + key);
         return inner->remove(key, expected_value, access);
     }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
