@@ -375,8 +375,7 @@ TEST(CASRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyR
         const CatalogEntry live{.ns = ns, .state = NsState::Live, .incarnation = 9};
         CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, live);
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(live.ns, live.incarnation);
-        ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), "not a sealed checkpoint").outcome,
-                  PutOutcome::Done);
+        ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.create(layout.refCkptKey(life), "not a sealed checkpoint", Retry::once())));
         expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
     }
     {
@@ -386,18 +385,18 @@ TEST(CASRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyR
         CatalogEntry creating{.ns = ns, .state = NsState::Creating, .incarnation = 7,
             .creator = CreatorFence{"srv1", 1, 1}};
         CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, creating);
-        backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(creating.ns, creating.incarnation)),
+        catalog_op.create(layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(creating.ns, creating.incarnation)),
             encodeRefCkpt(RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
-                                  .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+                                  .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}), Retry::once());
         expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::INVALID_STATE);
     }
     {
         auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
         CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
         CasOperation catalog_op = catalog_requests.admit();
-        backend->putIfAbsent(layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)),
+        catalog_op.create(layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)),
             encodeRefCkpt(RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
-                                  .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+                                  .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}), Retry::once());
         expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::INVALID_STATE);
     }
 }
@@ -523,11 +522,11 @@ TEST(CASRecoveryGrounding, SemanticallyMalformedCheckpointSnapshotIsCorruptionAf
 
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns);
     const String snapshot_key = layout.refSnapshotKey(life, {1, 1});
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = RefTxnId{1, 1},
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt}), Retry::once())));
 
     backend->resetCounts();
     try
@@ -608,7 +607,7 @@ TEST(CASRecoveryGrounding, SameEpochFrontierAfterDecodedEpochSealIsCorruption)
     const size_t frontier_sequence = malformed_ckpt.find(R"("committed_seq":"2")");
     ASSERT_NE(frontier_sequence, String::npos);
     malformed_ckpt.replace(frontier_sequence, String{R"("committed_seq":"2")"}.size(), R"("committed_seq":"3")");
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), malformed_ckpt).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.create(layout.refCkptKey(life), malformed_ckpt, Retry::once())));
 
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
 }
@@ -679,7 +678,7 @@ TEST(CASRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
     const size_t frontier_epoch = malformed_ckpt.find(R"("committed_epoch":"1")");
     ASSERT_NE(frontier_epoch, String::npos);
     malformed_ckpt.replace(frontier_epoch, String{R"("committed_epoch":"1")"}.size(), R"("committed_epoch":"2")");
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), malformed_ckpt).outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.create(layout.refCkptKey(life), malformed_ckpt, Retry::once())));
 
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
 }
@@ -703,11 +702,11 @@ TEST(CASRecoveryGrounding, LaterEpochCheckpointBaseRequiresItsContextualBacklink
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
 
         const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns);
-        ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
             .life_epoch = 1,
             .committed_through = base_id,
             .checkpoint_snapshot_id = base_id,
-            .last_epoch_seal = seal_id})).outcome, PutOutcome::Done);
+            .last_epoch_seal = seal_id}), Retry::once())));
 
         expectCode(
             [&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); },
@@ -726,11 +725,11 @@ TEST(CASRecoveryGrounding, LaterEpochCheckpointBaseRequiresItsContextualBacklink
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
 
         const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns);
-        ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        ASSERT_TRUE(std::holds_alternative<Committed>(catalog_op.create(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
             .life_epoch = 1,
             .committed_through = base_id,
             .checkpoint_snapshot_id = base_id,
-            .last_epoch_seal = seal_id})).outcome, PutOutcome::Done);
+            .last_epoch_seal = seal_id}), Retry::once())));
 
         expectCode(
             [&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); },
