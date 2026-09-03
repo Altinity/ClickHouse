@@ -127,7 +127,7 @@ TEST(CASWriteResult, OrThrowMapsEveryAlternative)
     auto op = requests.admit();
     WriteResult committed = op.create("k", "v", Retry::standard());
     ASSERT_TRUE(std::holds_alternative<Committed>(committed));
-    const Etag landed = std::get<Committed>(committed).incarnation;
+    const Etag landed = std::get<Committed>(committed).etag;
     const auto returned = orThrow(std::move(committed), "create");
     ASSERT_TRUE(returned.has_value());
     EXPECT_EQ(*returned, landed);
@@ -174,12 +174,12 @@ TEST(CASBackendPrimitives, InMemoryWriteReadRemoveRoundTripThroughOneOperation)
     const std::optional<Object> r = op.read("k", Retry::once());
     ASSERT_TRUE(r);
     EXPECT_EQ(r->bytes, "v1");
-    EXPECT_EQ(r->incarnation, *w1);
+    EXPECT_EQ(r->etag, *w1);
 
     const std::optional<Meta> h = op.head("k", Retry::once());
     ASSERT_TRUE(h);
     EXPECT_EQ(h->size, 2u);
-    EXPECT_EQ(h->incarnation, *w1);
+    EXPECT_EQ(h->etag, *w1);
 
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k", "v2", Retry::once())));   /// must be absent
     const std::optional<Etag> w3 = orThrow(op.replace("k", "v2", *w1, Retry::once()), "replace");
@@ -204,18 +204,18 @@ TEST(CASBackendPrimitives, ListSurfacesTheIncarnationAndPaginates)
     orThrow(op.create("p/b", "xy", Retry::once()), "create");
     orThrow(op.create("q/c", "z", Retry::once()), "create");
 
-    const KeyPage page = op.list("p/", "", 10, Retry::once());
+    const ListPage page = op.list("p/", "", 10, Retry::once());
     ASSERT_EQ(page.keys.size(), 2u);                      /// sorted, prefix-scoped
     EXPECT_EQ(page.keys[0].key, "p/a");
     EXPECT_EQ(page.keys[0].size, 10u);
-    ASSERT_TRUE(page.keys[0].incarnation.has_value());
-    EXPECT_EQ(*page.keys[0].incarnation, *a);
+    ASSERT_TRUE(page.keys[0].etag.has_value());
+    EXPECT_EQ(*page.keys[0].etag, *a);
     EXPECT_TRUE(page.next_cursor.empty());
 
-    const KeyPage first = op.list("p/", "", 1, Retry::once());
+    const ListPage first = op.list("p/", "", 1, Retry::once());
     ASSERT_EQ(first.keys.size(), 1u);
     EXPECT_EQ(first.next_cursor, "p/a");
-    const KeyPage second = op.list("p/", first.next_cursor, 1, Retry::once());
+    const ListPage second = op.list("p/", first.next_cursor, 1, Retry::once());
     ASSERT_EQ(second.keys.size(), 1u);
     EXPECT_EQ(second.keys[0].key, "p/b");
 }
@@ -502,7 +502,7 @@ TEST(CASRequests, CreateThenReplaceThenRemove)
     const auto seen = op.read("k", Retry::standard());
     ASSERT_TRUE(seen.has_value());
     EXPECT_EQ(seen->bytes, "v1");
-    EXPECT_EQ(seen->incarnation, first);
+    EXPECT_EQ(seen->etag, first);
 
     const Etag second = *orThrow(op.replace("k", "v2", first, Retry::standard()), "replace");
     EXPECT_NE(second, first);
@@ -693,7 +693,7 @@ TEST(CASRequests, ForEachListedKeyStopsEarlyAndBudgetsPerPage)
 
     size_t seen = 0;
     size_t pages = 0;
-    op.forEachListedKey("p/", [&](const KeyEntry &) { return ++seen < 3; }, Retry::standard(),
+    op.forEachListedKey("p/", [&](const ListedKey &) { return ++seen < 3; }, Retry::standard(),
                         /*page_limit=*/10, [&] { ++pages; });
     EXPECT_EQ(seen, 3u);
     /// The walk stops where the caller stops it: the remaining two pages are never fetched.
@@ -1089,7 +1089,7 @@ TEST(CASRequests, AmbiguousReplaceOfIdenticalBytesIsReissuedNotClaimedByByteEqua
         /// never made; the reissue is what actually put these bytes there under a new incarnation.
         EXPECT_EQ(committed->attempts_sent, 2u);
         EXPECT_FALSE(committed->resolved_by_read);
-        EXPECT_NE(committed->incarnation, seen);
+        EXPECT_NE(committed->etag, seen);
         EXPECT_EQ(backend->writeTotal(), 2u);
         EXPECT_EQ(backend->getTotal(), 1u);
         EXPECT_EQ(clock.sleeps.size(), 1u);
@@ -1133,7 +1133,7 @@ TEST(CASRequests, AmbiguousReplaceWhoseResolveShowsAnotherIncarnationIsAConflict
     const auto * occupant = std::get_if<Object>(&conflict->seen);
     ASSERT_NE(occupant, nullptr);
     EXPECT_EQ(occupant->bytes, "theirs");
-    EXPECT_NE(occupant->incarnation, stale);
+    EXPECT_NE(occupant->etag, stale);
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getTotal(), 1u);
     /// The count the conflict reports is the count the transport saw, not a constant that happens to
@@ -1168,7 +1168,7 @@ TEST(CASRequests, ReadModifyWriteDoesNotClaimACompetitorsIdenticalBytesAfterAnEa
         {
             /// The bytes we are about to send, under an incarnation that is not ours.
             if (const auto current = rival.read("k", Retry::once()))
-                (void)rival.replace("k", "B", current->incarnation, Retry::once());
+                (void)rival.replace("k", "B", current->etag, Retry::once());
         }
         ++staged;
         inside = false;
@@ -1231,7 +1231,7 @@ TEST(CASRequests, ForEachListedKeyGivesEachPageItsOwnPolicyWindow)
     const uint64_t start = clock.now;
     /// A window that comfortably covers ONE page's refusal and its reissue, and could not have covered
     /// the walk: the policy governs each page, because a walk is an unbounded number of requests.
-    op.forEachListedKey("p/", [&](const KeyEntry &) { ++seen; return true; }, Retry::within(1'000),
+    op.forEachListedKey("p/", [&](const ListedKey &) { ++seen; return true; }, Retry::within(1'000),
                         /*page_limit=*/10, [&] { ++pages; });
     EXPECT_EQ(seen, 25u);
     EXPECT_EQ(pages, 3u);
@@ -1249,7 +1249,7 @@ TEST(CASRequests, ForEachListedKeyThrowsRatherThanTruncateWhenAPageNeverArrives)
     for (int i = 0; i < 25; ++i)
         orThrow(op.create("p/" + std::to_string(i), "v", Retry::standard()), "create");
 
-    const KeyPage first = op.list("p/", "", 10, Retry::within(1'000));
+    const ListPage first = op.list("p/", "", 10, Retry::within(1'000));
     ASSERT_FALSE(first.next_cursor.empty());
     backend->always_refuse_cursor = first.next_cursor;   /// the second page never arrives
     backend->refused_cursors.clear();
@@ -1260,7 +1260,7 @@ TEST(CASRequests, ForEachListedKeyThrowsRatherThanTruncateWhenAPageNeverArrives)
     /// reports the page it could not fetch instead of returning what it managed to read.
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
-        op.forEachListedKey("p/", [&](const KeyEntry &) { ++seen; return true; }, Retry::within(1'000),
+        op.forEachListedKey("p/", [&](const ListedKey &) { ++seen; return true; }, Retry::within(1'000),
                             /*page_limit=*/10, [&] { ++pages; });
     });
     EXPECT_EQ(pages, 1u);
@@ -1334,7 +1334,7 @@ TEST(CASRequests, ReadModifyWriteLosesNoIncrementUnderContentionAndBoundsAHotKey
             return;
         inside_hook = true;
         if (const auto current = rival.read("ctr", Retry::once()))
-            (void)rival.replace("ctr", "999", current->incarnation, Retry::once());
+            (void)rival.replace("ctr", "999", current->etag, Retry::once());
         inside_hook = false;
     });
 
