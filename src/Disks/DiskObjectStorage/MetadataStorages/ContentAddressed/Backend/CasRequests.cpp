@@ -574,7 +574,7 @@ CasOperation::Resolved CasOperation::observePresence(const String & key, const R
 WriteResult CasOperation::gaveUp(GaveUp::Why why, GaveUp::Source source, WriteState & state) const
 {
     ProfileEvents::increment(ProfileEvents::CASRequestGaveUp);
-    return GaveUp{why, source, state.sent_any, state.last_seen};
+    return GaveUp{why, source, state.sent_any, state.last_seen, state.attempts_sent};
 }
 
 WriteResult CasOperation::gaveUpForReadStop(ReadStop stop, WriteState & state, const Retry::Bound & bound) const

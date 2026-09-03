@@ -15,7 +15,6 @@
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
 #include <base/defines.h>
-#include <base/sleep.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
@@ -374,12 +373,12 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     for (int attempt = 0; attempt < max_publication_attempts; ++attempt)
     {
         requireAlive();
-        /// Pace the reissues the way the request engine paces its own: an ambiguous publication is most
-        /// often a store under load, and a large body republished eight times back to back is what
-        /// makes that worse. After `requireAlive`, so a cancelled or superseded build fails closed
-        /// instead of spending a backoff first.
+        /// Pace the reissues the way the request engine paces its own, and through the engine's own
+        /// clock: an ambiguous publication is most often a store under load, and a large body
+        /// republished eight times back to back is what makes that worse. After `requireAlive`, so a
+        /// cancelled or superseded build fails closed instead of spending a backoff first.
         if (attempt > 0)
-            sleepForMilliseconds(Retry::backoff(attempt));
+            op.pause(Retry::backoff(attempt));
         const std::optional<Meta> present = op.head(key, policy);
         BlobPublicationReason reason = BlobPublicationReason::Absent;
 

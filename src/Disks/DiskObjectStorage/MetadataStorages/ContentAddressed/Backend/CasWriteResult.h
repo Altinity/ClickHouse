@@ -51,6 +51,11 @@ struct GaveUp
     enum class Why : uint8_t { Deadline, FenceLost, Unresolved };
     enum class Source : uint8_t { Policy, Lease };
     Why why; Source deadline_source; bool sent_any; Observation last_seen;
+    /// The HTTP attempts this call made, the same count `Committed` carries. Operator counters -- the
+    /// mount renewal's attempt and retry counters among them -- have to count the attempts of a write
+    /// that GAVE UP as well as of one that committed, and `sent_any` cannot say how many. It stays
+    /// beside this because the readers that only branch on "was anything sent" branch on it by name.
+    uint32_t attempts_sent = 0;
 };
 using WriteResult = std::variant<Committed, Declined, Conflict, Refused, GaveUp>;
 

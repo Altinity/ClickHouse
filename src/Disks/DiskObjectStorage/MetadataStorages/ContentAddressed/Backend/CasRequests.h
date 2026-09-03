@@ -149,6 +149,10 @@ public:
     CasOperation & operator=(const CasOperation &) = delete;
 
     uint64_t generation() const { return admitted_generation; }
+    /// A caller's own inter-iteration wait, paced through the same clock the engine's own sleeps use --
+    /// so a test that replaces the sleep sees no real time pass in either. For the hand-written loops
+    /// that reissue something the engine must not reissue for them.
+    void pause(uint64_t ms) { owner.sleep_ms(ms); }
     /// The verdict point: is this operation still admitted? For the sites that guard a decision rather
     /// than a request.
     bool admitted() const { return gate(0) == Gate::Ok; }

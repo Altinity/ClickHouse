@@ -875,6 +875,27 @@ public:
 
 }
 
+/// A give-up reports the attempts it actually SENT, not merely whether it sent any. An operator
+/// counting a write's retries has to count one that gave up as well as one that committed, and
+/// `sent_any` cannot say how many.
+TEST(CASPartWriteTxn, AGiveUpReportsHowManyAttemptsItSent)
+{
+    auto b = std::make_shared<AmbiguousMetaWriteBackend>();
+    auto s = openPool(b);
+    useVirtualMountRequestClock(s, /*step_ms=*/10'000);
+    b->attempts = 0;
+
+    const BlobRef ref = idOf("give-up-attempt-count");
+    const WriteResult result = putMetaIfAbsent(*s, ref, BlobMeta{.state = MetaState::Clean, .size = 7});
+
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr) << "every attempt was ambiguous and none landed";
+    EXPECT_TRUE(gave_up->sent_any);
+    EXPECT_GT(gave_up->attempts_sent, 1u) << "the write reissued before it gave up";
+    EXPECT_EQ(gave_up->attempts_sent, static_cast<uint32_t>(b->attempts))
+        << "every attempt the store saw must be in the count the give-up reports";
+}
+
 /// A persistently-failing freshness-meta write must surface as a controlled retry-later signal, not
 /// silently succeed with the marker left stale. The blob body publication itself is unaffected (only
 /// `.meta` keys are faulted) -- only the meta reconciliation exhausts, and that exhaustion must reach
