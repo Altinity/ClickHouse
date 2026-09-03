@@ -106,7 +106,7 @@ TEST(CASGCBaselineGuard, AbsentAdoptedSealFailsClosed)
     const String seal_key = store->layout().foldSealKey(st.snap_generation, st.snap_attempt);
     const auto sh = headObj(*backend, seal_key);
     ASSERT_TRUE(sh.has_value());
-    ASSERT_EQ(removeExact(*backend, seal_key, sh->incarnation), Removal::Removed);
+    ASSERT_EQ(removeExact(*backend, seal_key, sh->etag), Removal::Removed);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.runRegularRound(); });
 }
@@ -146,7 +146,7 @@ TEST(CASGCRebuild, RecoversLostStateAndConverges)
     const auto pre_rebuild_got = readObj(*backend, store->layout().gcStateKey());
     ASSERT_TRUE(pre_rebuild_got.has_value());
     const uint64_t pre_rebuild_round = decodeGcState(pre_rebuild_got->bytes).round;
-    ASSERT_EQ(removeExact(*backend, store->layout().gcStateKey(), pre_rebuild_got->incarnation), Removal::Removed);
+    ASSERT_EQ(removeExact(*backend, store->layout().gcStateKey(), pre_rebuild_got->etag), Removal::Removed);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000003"));
     /// A fresh GC over the orphaned generation artifacts fails closed: re-folding from a fresh gc/state
@@ -210,7 +210,7 @@ TEST(CASGCRebuild, RecoversLostGenerationArtifact)
     const String run_key = seal.blob_target_runs.front().key;
     const auto rh = headObj(*backend, run_key);
     ASSERT_TRUE(rh.has_value());
-    ASSERT_EQ(removeExact(*backend, run_key, rh->incarnation), Removal::Removed);
+    ASSERT_EQ(removeExact(*backend, run_key, rh->etag), Removal::Removed);
 
     /// A pure ref-carry round would not read the lost run; land a REAL delta so the fold's
     /// three-cursor merge must stream the prior run — and fails closed on its absence.
@@ -447,11 +447,11 @@ TEST(CASGCRebuild, MissingCommittedManifestRefuses)
     /// Disaster pair: gc/state lost AND tbl_b's manifest body lost.
     const auto st = headObj(*backend, store->layout().gcStateKey());
     ASSERT_TRUE(st.has_value());
-    removeExact(*backend, store->layout().gcStateKey(), st->incarnation);
+    removeExact(*backend, store->layout().gcStateKey(), st->etag);
     const String mkey = store->layout().manifestKey(ManifestId{ns, b});
     const auto mh = headObj(*backend, mkey);
     ASSERT_TRUE(mh.has_value());
-    removeExact(*backend, mkey, mh->incarnation);
+    removeExact(*backend, mkey, mh->etag);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000004"));
     const RebuildReport rep = gc2.rebuildBaseline(/*force*/ false);
@@ -528,7 +528,7 @@ TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
     gc.runRegularRound();
     const auto st = headObj(*backend, store->layout().gcStateKey());
     ASSERT_TRUE(st.has_value());
-    removeExact(*backend, store->layout().gcStateKey(), st->incarnation);
+    removeExact(*backend, store->layout().gcStateKey(), st->etag);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000006"));
     /// Every shard has `edge_budget + 1` live edges, so each independently crosses the flush budget;
