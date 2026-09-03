@@ -261,7 +261,9 @@ TEST(CASRecoveryStreaming, LongTailReplaysUnderMemoryBound)
     setRecoveryReplayMemoryProbeForTest(tracker.probe());
     SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
 
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(catalog_op, layout);
     const RefTableState state = recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, catalog_cut, ns).state;
     EXPECT_EQ(state.getPrecommits().size(), kTxns * kOpsPerTxn) << "the whole tail must have replayed";
     EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
@@ -477,7 +479,9 @@ TEST(CASRecoveryStreaming, OrphanSweepAndFsckSameBound)
         PeakTracker tracker;
         setRecoveryReplayMemoryProbeForTest(tracker.probe());
         SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
-        const CasRefCatalog::Snapshot sweep_catalog_cut = CasRefCatalog::read(*backend, layout);
+        CasRequests sweep_requests = DB::Cas::tests::openRequestsForTest(backend);
+        CasOperation sweep_op = sweep_requests.admit();
+        const CasRefCatalog::Snapshot sweep_catalog_cut = CasRefCatalog::read(sweep_op, layout);
         const RecoveredRefTable recovered =
             recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, sweep_catalog_cut, ns_sweep);
         EXPECT_EQ(recovered.state.getPrecommits().size(), kTxns * kOpsPerTxn);

@@ -55,31 +55,35 @@ const CatalogEntry * findEntryForTest(const RefCatalog & catalog, const RootName
 /// point of the creation sequence: once this namespace's `_ckpt` is durable (step 2 landed, step 3 has
 /// not run), or inside step 3's own read-then-write window. The `_ckpt` key carries an incarnation a
 /// test cannot know before the creation mints it, so that arm names the object kind rather than a key.
+///
+/// The read arm fires BEFORE the store is consulted, so the body the caller's `decide` receives already
+/// carries whatever the hook wrote. That is what lets a test make the observed body stale on BOTH axes
+/// -- a changed entry and a withdrawn admission -- inside ONE `decide` invocation, which is the only
+/// place the two can be told apart.
 class CreationHookBackend : public InMemoryBackend
 {
 public:
     bool admitted = true;
     /// Withdraw once any `_ckpt` key has been written.
     bool withdraw_after_ckpt_write = false;
-    /// Fires once after this key has been read, before `withdraw_on_read` is applied.
-    String hook_after_read_of;
+    /// Fires once before this key is read, then `withdraw_on_read` is applied.
+    String hook_before_read_of;
     std::function<void()> on_read;
     bool withdraw_on_read = false;
 
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        auto result = InMemoryBackend::read(key, access);
-        if (!hook_after_read_of.empty() && key == hook_after_read_of && !hook_fired)
+        if (!hook_before_read_of.empty() && key == hook_before_read_of && !hook_fired)
         {
-            /// Latched before running: the hook writes through this same backend, and an unguarded
-            /// re-entry would run the test's concurrent actor again against its own result.
+            /// Latched before running: the hook reads and writes through this same backend, and an
+            /// unguarded re-entry would run the test's concurrent actor again against its own result.
             hook_fired = true;
             if (on_read)
                 on_read();
             if (withdraw_on_read)
                 admitted = false;
         }
-        return result;
+        return InMemoryBackend::read(key, access);
     }
 
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
@@ -353,13 +357,13 @@ TEST(CASNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndL
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(42), .creator = original_creator};
     CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
 
-    /// A REAL concurrent write, smuggled into step 3's own read-then-write window: the catalog read
-    /// this hook fires on is the first one `completeCreation` performs, since step 2 touches only the
-    /// `_ckpt`. The steal itself must succeed (asserted), so the mismatch `completeCreation` sees below
-    /// is the entry ACTUALLY changing, not a contrived stub. It runs on its own operation, because it
-    /// is a different actor.
+    /// A REAL concurrent write, smuggled in just before step 3's own catalog read -- the first one
+    /// `completeCreation` performs, since step 2 touches only the `_ckpt`. `decide` therefore receives
+    /// the POST-steal body and refuses it without sending anything, which is what the entry check is
+    /// for. The steal itself must succeed (asserted), so the mismatch is the entry ACTUALLY changing,
+    /// not a contrived stub. It runs on its own operation, because it is a different actor.
     CasOperation thief_op = requests.admit();
-    backend->hook_after_read_of = layout.refCatalogKey();
+    backend->hook_before_read_of = layout.refCatalogKey();
     backend->on_read = [&]
     {
         ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(thief_op, layout, entry, thief, fixedTerminality(true)),
@@ -400,14 +404,19 @@ TEST(CASNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheck
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(42), .creator = original_creator};
     CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
 
-    /// The same steal as the test above, in the same window, but this one ALSO withdraws admission
-    /// there -- so both axes are stale by the time step 3's `mutate` runs. `completeCreation` consults
-    /// admission before it compares the entry (documented ordering), so this is reported `FencedOut`;
-    /// the assertions below confirm the entry ALSO changed, so the test is not merely re-proving the
-    /// admission-only case.
+    /// The same steal as the test above and in the same window, but this one ALSO withdraws admission
+    /// there. Because the hook runs BEFORE the read, the single `decide` invocation that follows sees a
+    /// body that is stale on both axes at once -- and that is the only situation in which the two
+    /// checks are distinguishable. `completeCreation` consults admission before it compares the entry,
+    /// so the answer is `FencedOut`.
+    ///
+    /// This is what makes the test discriminate rather than merely pass: delete the `op.admitted()`
+    /// check from that `mutate` and the entry check answers `Superseded` instead, because `decide`
+    /// refuses the stale entry before any write is sent and the engine's own gate never speaks. The
+    /// assertions below confirm the entry really did change too.
     CasOperation thief_op = requests.admit();
     CasOperation creator_op = requests.admit([&backend] { return backend->admitted; });
-    backend->hook_after_read_of = layout.refCatalogKey();
+    backend->hook_before_read_of = layout.refCatalogKey();
     backend->withdraw_on_read = true;
     backend->on_read = [&]
     {

@@ -138,6 +138,12 @@ struct CatalogCreatorStillLiveMarker : std::exception {};
 /// Live-lock brake for the ONE loop below that is written by hand rather than driven by the engine:
 /// the catalog is a single object mutated by every lifecycle transition of every namespace in the
 /// pool, so persistent contention is a real, not theoretical, exit condition to plan for.
+///
+/// It bounds ATTEMPTS, not time. Each iteration binds its own window per verb and pauses between
+/// iterations, so the aggregate wall clock of one call is this cap times a backoff plus two verb
+/// windows -- hours in the worst case. That is accepted because the only caller is the GC pre-fold
+/// drain: a background round that may take as long as it takes, and whose next round re-derives
+/// everything anyway. A foreground path must not adopt this loop without a wall-clock bound.
 constexpr size_t kMaxCatalogCasAttempts = 100;
 
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
@@ -554,7 +560,9 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
 
     /// Step 2 (spec §3): INV-4's first `_ckpt` writer for this incarnation, and the only writer that
     /// will ever know its genesis epoch -- see `Pool/CasRefCkpt.h`'s `publishCkpt` doc for the merge
-    /// discipline this rides on unchanged. `FencedOut` here ends the attempt: nothing durable changed.
+    /// discipline this rides on unchanged. `FencedOut` here ends the attempt without step 3; the
+    /// `_ckpt` itself may or may not have become durable, which is why the entry is left `Creating`
+    /// for whichever actor next reconciles it rather than cleaned up here.
     const RefCkpt contribution{.life_epoch = std::optional<uint64_t>{observed.creator->writer_epoch},
                                 .committed_through = std::nullopt,
                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};

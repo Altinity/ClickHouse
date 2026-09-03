@@ -78,16 +78,18 @@ TEST(CASNsFileIncarnation, ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval)
     ASSERT_TRUE(store->listNamespaceFiles(*old_life).empty())
         << "precondition: enumeration omits the file, so no cleanup pass can ever find it";
     const size_t holes_before_gc = backend->holesServed();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
 
     store->dropNamespace(ns);
-    ASSERT_TRUE(CasRefCatalog::lifeIfCataloged(*backend, layout, ns));
+    ASSERT_TRUE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns));
 
     Gc gc(store, kGcId);
     ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred) << "N: the production terminal must fold";
-    ASSERT_TRUE(CasRefCatalog::lifeIfCataloged(*backend, layout, ns))
+    ASSERT_TRUE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns))
         << "the terminal fold alone must not erase its catalog row";
     (void)runRegularRoundReclaiming(gc);
-    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, ns))
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns))
         << "N+1: the pre-fold drain must erase the exact completed Removing row";
     ASSERT_GT(backend->holesServed(), holes_before_gc)
         << "the GC janitor must observe the injected LIST hole after the explicit precondition LIST";
@@ -130,17 +132,19 @@ TEST(CASNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
     const RootNamespace live{"00/live@cas@"};
     const RootNamespace removing{"00/removing@cas@"};
     const RootNamespace absent{"00/absent@cas@"};
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
 
-    CasRefCatalog::casAdmitEntry(*backend, layout, 1, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, CatalogEntry{
         .ns = creating,
         .state = NsState::Creating,
         .incarnation = UInt128{31},
         .creator = CreatorFence{.server_root_id = "foreign", .writer_epoch = 7, .fence_generation = 1}});
-    CasRefCatalog::casAdmitEntry(*backend, layout, 1, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, CatalogEntry{
         .ns = live, .state = NsState::Live, .incarnation = UInt128{32}});
-    CasRefCatalog::casAdmitEntry(*backend, layout, 1, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(catalog_op, layout, 1, CatalogEntry{
         .ns = removing, .state = NsState::Live, .incarnation = UInt128{33}});
-    CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
+    CasRefCatalog::casUpdate(catalog_op, layout, [&](const RefCatalog & current)
     {
         RefCatalog next = current;
         const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
@@ -198,7 +202,9 @@ TEST(CASNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
         remove_op.kind = RefOpKind::RemoveNamespace;
         appendRefLogSeed(*backend, layout, ns, {remove_op});
     }
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, ns).value();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).value();
     writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},

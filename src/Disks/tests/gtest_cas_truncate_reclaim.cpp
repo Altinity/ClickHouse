@@ -276,7 +276,9 @@ TEST(CASTruncateReclaim, DropNamespaceLeavesSharedBlobDebrisForPerpetualSweep)
             << "an emptied pool must drain instead of standing still; the sweep owned these blobs and "
                "reclaimed them within " << rounds << " GC rounds";
         EXPECT_EQ(after.reachable, 0u);
-        EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(s->backend(), s->layout(), ns))
+        DB::Cas::CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(s->backend());
+        DB::Cas::CasOperation catalog_op = catalog_requests.admit();
+        EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(catalog_op, s->layout(), ns))
             << "physical debris must not keep the logical namespace life cataloged";
     }
 }

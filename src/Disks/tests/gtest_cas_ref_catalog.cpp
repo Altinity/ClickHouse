@@ -60,6 +60,7 @@ namespace DB::ErrorCodes
     extern const int LIMIT_EXCEEDED;
     extern const int NETWORK_ERROR;
     extern const int BAD_ARGUMENTS;
+    extern const int S3_ERROR;
 }
 
 namespace
@@ -1424,6 +1425,170 @@ TEST(CASRefCatalogRemoval, AConflictingEraseBacksOffBeforeItsRetry)
     EXPECT_LE(clock.sleeps.front(), 200u) << "the first reissue's full-jitter ceiling";
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
         << "the seed, the refused erase, and the retry that landed";
+}
+
+/// The loop iterates on ONE alternative and one only: a refused precondition. Every other non-committed
+/// answer is terminal for the call and leaves through the same throw, so a future retry added for any
+/// of them would be retrying a write whose fate the store already settled. `Refused` is the alternative
+/// a test can construct exactly; `GaveUp{FenceLost}` cannot reach this arm at all, because the
+/// admission probe immediately after the write returns `FencedOut` first.
+#if USE_AWS_S3
+TEST(CASRefCatalogRemoval, AStoreRefusalEndsTheEraseLoopInsteadOfRetryingIt)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    requests.setSleepFnForTest(clock.sleepFn());
+    CasOperation op = requests.admit();
+    const Layout layout("erase-refused");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
+
+    /// A malformed request is one of the answers that prove the write never applied, so the engine
+    /// reports it as a refusal rather than settling it by a read.
+    backend->failNextWriteWith(layout.refCatalogKey(), std::make_exception_ptr(
+        DB::S3Exception("injected malformed erase request", Aws::S3::S3Errors::UNKNOWN, "MalformedXML")));
+
+    /// The store's own code, not a class of this module's choosing: `orThrow` re-raises a refusal
+    /// under the code the store gave, so an operator sees what the store actually said.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&]
+    {
+        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent);
+    });
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed + 1)
+        << "a refusal is terminal: the loop must not send a second erase";
+    EXPECT_TRUE(clock.sleeps.empty()) << "and must not pace a retry it is not going to make";
+    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing})
+        << "the refused erase changed nothing";
+}
+#endif
+
+/// The response to a conditional erase is not authority for what became durable, and this is the case
+/// that makes that concrete: the attempt commits, a concurrent writer puts the row back, and the
+/// mandatory resolution read contradicts the commit. Believing the response would report a namespace
+/// deleted while its row is still cataloged, so the call fails retry-later instead.
+TEST(CASRefCatalogRemoval, ACommitTheResolutionReadContradictsFailsRetryLaterInsteadOfReportingDeleted)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    CasOperation restorer = requests.admit();
+    const Layout layout("erase-contradicted");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    const String seeded_catalog = encodeRefCatalog(RefCatalog{.entries = {removing}});
+    seedObject(op, layout.refCatalogKey(), seeded_catalog);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    /// Fires once the erase is durable and before its answer is returned, so the call really does see
+    /// `Committed` and really does find the row back when it resolves.
+    bool restored = false;
+    backend->onWriteCommitted(layout.refCatalogKey(), [&]
+    {
+        if (restored)
+            return;
+        restored = true;
+        (void)restorer.readModifyWrite(layout.refCatalogKey(),
+            [&](const std::optional<Object> &) -> std::optional<String> { return seeded_catalog; },
+            Retry::standard());
+    });
+
+    String message;
+    try
+    {
+        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent);
+        ADD_FAILURE() << "a commit the resolution read contradicts must not be reported as a deletion";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        message = e.message();
+    }
+    EXPECT_TRUE(restored) << "the concurrent restore never ran, so nothing was contradicted";
+    EXPECT_NE(message.find("reported committed"), String::npos) << message;
+    EXPECT_NE(message.find(u128ToHex(removing.incarnation)), String::npos)
+        << "the message must name the life still observed: " << message;
+}
+
+/// After the migration this cap is the ONLY bound the hand-written loop has of its own, so it is worth
+/// proving it ends the call rather than letting a permanently contended catalog spin. Every erase is
+/// refused, the injected clock absorbs every paced retry, and the loop stops on its attempt count --
+/// which the message says, and which is what tells it apart from a deadline.
+TEST(CASRefCatalogRemoval, PerpetualConflictEndsAtTheAttemptCapAndSaysSo)
+{
+    class AlwaysRefusesCatalogWrites final : public WriteCountingBackend
+    {
+    public:
+        String refused_key;
+
+        std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                                   const std::optional<String> & expected_value,
+                                                                   DB::Cas::TransportAccess & access) override
+        {
+            if (key == refused_key)
+            {
+                /// Counted, then refused: the count is what the assertions below compare against.
+                (void)WriteCountingBackend::write(key, bytes, expected_value, access);
+                return std::unexpected(DB::Cas::Backend::RawConflict{});
+            }
+            return WriteCountingBackend::write(key, bytes, expected_value, access);
+        }
+    };
+
+    auto backend = std::make_shared<AlwaysRefusesCatalogWrites>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    requests.setSleepFnForTest(clock.sleepFn());
+    CasOperation op = requests.admit();
+    const Layout layout("erase-cap");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
+    backend->refused_key = layout.refCatalogKey();
+
+    String message;
+    try
+    {
+        (void)CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent);
+        ADD_FAILURE() << "a permanently refused erase must not return an outcome";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        message = e.message();
+    }
+    EXPECT_NE(message.find("did not converge"), String::npos)
+        << "the cap, not a deadline, is what ended this call: " << message;
+    /// One erase per iteration and one pause after each, so these agree exactly -- and both being
+    /// greater than one is what proves the loop iterated rather than failing on its first attempt.
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, clock.sleeps.size());
+    EXPECT_GT(clock.sleeps.size(), 1u);
+    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing});
 }
 
 TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)

@@ -269,9 +269,11 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
     }
     if (const auto * gave_up = std::get_if<GaveUp>(&result))
     {
-        /// A lost fence is an expected, transient control signal, and the engine refuses the write
-        /// before sending it; every other give-up leaves the contribution unpublished, and the caller
-        /// must be told rather than left to assume it landed.
+        /// A lost fence is an expected, transient control signal, so it is a value rather than a
+        /// throw. It says nothing about the object: the engine reports it both before an attempt is
+        /// sent and after one is proven durable, so the caller must re-read rather than assume.
+        /// Every other give-up leaves the contribution unpublished, and the caller must be told that
+        /// rather than left to assume it landed.
         if (gave_up->why == GaveUp::Why::FenceLost)
             return CkptPublishOutcome::FencedOut;
         throwCasWriteRetryLater("CAS _ckpt for namespace '" + life.ns.string()

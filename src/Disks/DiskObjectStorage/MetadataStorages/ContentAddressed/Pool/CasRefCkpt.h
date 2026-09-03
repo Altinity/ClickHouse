@@ -55,9 +55,12 @@ RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b);
 /// What one `publishCkpt` call did.
 enum class CkptPublishOutcome : uint8_t
 {
-    Published,      /// the contribution is durable, and this call sent at least one write to get there
+    Published,      /// the contribution is durable, and this call sent at least one write before it
+                    /// was; which write made it durable -- this one or a competitor's -- is not claimed
     IdenticalSkip,  /// the contribution added nothing to what was already there; NO write was issued
-    FencedOut,      /// admission was lost before the write; NOTHING was written
+    FencedOut,      /// this actor's admission is gone. Whether its last attempt landed is UNRESOLVED:
+                    /// admission can be lost before the write is sent, and equally after the write is
+                    /// proven durable. Re-read before assuming either way
 };
 
 /// Merge `contribution` into `life`'s `_ckpt` and make the result durable, as ONE read-modify-write
@@ -69,10 +72,11 @@ enum class CkptPublishOutcome : uint8_t
 /// That is the whole reason each field is optional rather than defaulted.
 ///
 /// Both DECLINE-TIME verdicts consult `op.admitted()` before they speak, because a writer the fence is
-/// about to refuse has landed nothing anywhere: it is told `FencedOut` rather than `IdenticalSkip` or a
-/// corruption verdict. `FencedOut` is returned rather than thrown because it is an expected, transient
-/// control signal, and the snapshot publisher that calls this sits after a durable PUT where an
-/// exception would be worse than a value.
+/// about to refuse has landed nothing AT THAT POINT: it is told `FencedOut` rather than `IdenticalSkip`
+/// or a corruption verdict. `FencedOut` is returned rather than thrown because it is an expected,
+/// transient control signal, and the snapshot publisher that calls this sits after a durable PUT where
+/// an exception would be worse than a value. It does NOT promise the object is unchanged -- a lost
+/// admission is also reported for a write already proven durable.
 ///
 /// FAILS CLOSED, never open:
 ///   - an existing `_ckpt` that does not decode PROPAGATES `CORRUPTED_DATA` and is never overwritten.

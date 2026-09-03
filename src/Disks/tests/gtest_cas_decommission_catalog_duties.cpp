@@ -24,9 +24,9 @@ PoolPtr openVictim(const std::shared_ptr<InMemoryBackend> & backend)
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
 }
 
-CatalogEntry catalogEntry(Backend & backend, const Layout & layout, const RootNamespace & ns)
+CatalogEntry catalogEntry(CasOperation & op, const Layout & layout, const RootNamespace & ns)
 {
-    const RefCatalog catalog = CasRefCatalog::read(backend, layout).catalog;
+    const RefCatalog catalog = CasRefCatalog::read(op, layout).catalog;
     const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     if (it == catalog.entries.end())
@@ -34,9 +34,9 @@ CatalogEntry catalogEntry(Backend & backend, const Layout & layout, const RootNa
     return *it;
 }
 
-void makeRemoving(Backend & backend, const Layout & layout, const CatalogEntry & live)
+void makeRemoving(CasOperation & op, const Layout & layout, const CatalogEntry & live)
 {
-    CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & current)
+    CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & current)
     {
         RefCatalog next = current;
         const auto it = std::find(next.entries.begin(), next.entries.end(), live);
@@ -67,8 +67,10 @@ public:
         if (armed && !added && prefix == "p/roots/victim/" && cursor.empty())
         {
             added = true;
+            CasRequests requests = DB::Cas::tests::openRequestsForTest(*this);
+            CasOperation op = requests.admit();
             CasRefCatalog::casAdmitEntry(
-                *this, Layout("p"), 1,
+                op, Layout("p"), 1,
                 CatalogEntry{
                     .ns = RootNamespace("victim/db/late"),
                     .state = NsState::Live,
@@ -113,8 +115,10 @@ public:
             else
             {
                 added = true;
+                CasRequests requests = DB::Cas::tests::openRequestsForTest(*this);
+                CasOperation op = requests.admit();
                 CasRefCatalog::casAdmitEntry(
-                    *this, Layout("p"), 1,
+                    op, Layout("p"), 1,
                     CatalogEntry{
                         .ns = RootNamespace("victim/db/late"),
                         .state = NsState::Live,
@@ -134,6 +138,8 @@ private:
 TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeepsSlot)
 {
     auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
     {
         auto victim = openVictim(backend);
         const CatalogEntry live{
@@ -141,9 +147,9 @@ TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeeps
             .state = NsState::Live,
             .incarnation = UInt128{701}};
         CasRefCatalog::casAdmitEntry(
-            *backend, victim->layout(), victim->poolConfig().gc_shards,
+            catalog_op, victim->layout(), victim->poolConfig().gc_shards,
             live);
-        makeRemoving(*backend, victim->layout(), live);
+        makeRemoving(catalog_op, victim->layout(), live);
     }
 
     expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&]
@@ -155,20 +161,22 @@ TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeeps
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
     EXPECT_TRUE(slotObjectExists(*backend, "epoch"));
     EXPECT_TRUE(slotObjectExists(*backend, "mount"));
-    EXPECT_EQ(catalogEntry(*backend, Layout("p"), RootNamespace("victim/db/missing_ckpt")).state,
+    EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), RootNamespace("victim/db/missing_ckpt")).state,
         NsState::Removing);
 }
 
 TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeepsSlotForGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
     const RootNamespace ns("victim/db/pending_terminal");
     std::optional<NamespaceLifeId> life;
     {
         auto victim = openVictim(backend);
         life = victim->namespaceLife(ns);
-        const CatalogEntry live = catalogEntry(*backend, victim->layout(), ns);
-        makeRemoving(*backend, victim->layout(), live);
+        const CatalogEntry live = catalogEntry(catalog_op, victim->layout(), ns);
+        makeRemoving(catalog_op, victim->layout(), live);
         ASSERT_TRUE(backend->head(victim->layout().refCkptKey(*life)).exists);
         ASSERT_TRUE(backend->list(victim->layout().namespaceStreamPrefix(*life), "", 100).keys.empty());
     }
@@ -200,22 +208,24 @@ TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeeps
 TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNamespaceFails)
 {
     auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
     const RootNamespace progressed_ns("victim/db/a_progressed");
     const RootNamespace broken_ns("victim/db/z_missing_ckpt");
     std::optional<NamespaceLifeId> progressed_life;
     {
         auto victim = openVictim(backend);
         progressed_life = victim->namespaceLife(progressed_ns);
-        const CatalogEntry progressed_live = catalogEntry(*backend, victim->layout(), progressed_ns);
-        makeRemoving(*backend, victim->layout(), progressed_live);
+        const CatalogEntry progressed_live = catalogEntry(catalog_op, victim->layout(), progressed_ns);
+        makeRemoving(catalog_op, victim->layout(), progressed_live);
 
         const CatalogEntry broken_live{
             .ns = broken_ns,
             .state = NsState::Live,
             .incarnation = UInt128{713}};
         CasRefCatalog::casAdmitEntry(
-            *backend, victim->layout(), victim->poolConfig().gc_shards, broken_live);
-        makeRemoving(*backend, victim->layout(), broken_live);
+            catalog_op, victim->layout(), victim->poolConfig().gc_shards, broken_live);
+        makeRemoving(catalog_op, victim->layout(), broken_live);
         ASSERT_FALSE(backend->head(victim->layout().refCkptKey(
             NamespaceLifeId::fromCatalogEntry(broken_ns, broken_live.incarnation))).exists);
     }
@@ -239,6 +249,8 @@ TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
 TEST(CASDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeepsSlot)
 {
     auto backend = std::make_shared<AddVictimEntryDuringRootDrainBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
     { auto victim = openVictim(backend); }
     backend->arm();
 
@@ -251,12 +263,14 @@ TEST(CASDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeep
     EXPECT_NE(report.warnings.front().find("pool member decommission underway: 1 namespace(s)"), String::npos)
         << report.warnings.front();
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
-    EXPECT_EQ(catalogEntry(*backend, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
+    EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
 }
 
 TEST(CASDecommissionCatalogDuties, CatalogTokenMovedBetweenOwnershipCutAndRetirementKeepsSlot)
 {
     auto backend = std::make_shared<MutateCatalogBetweenRetirementReadsBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
     { auto victim = openVictim(backend); }
     backend->arm();
 
@@ -269,12 +283,14 @@ TEST(CASDecommissionCatalogDuties, CatalogTokenMovedBetweenOwnershipCutAndRetire
     EXPECT_NE(report.warnings.front().find("catalog changed after the victim ownership check"), String::npos)
         << report.warnings.front();
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
-    EXPECT_EQ(catalogEntry(*backend, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
+    EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
 }
 
 TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAnotherRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
     const RootNamespace ns("victim/db/folded_terminal");
     std::optional<NamespaceLifeId> life;
     std::vector<String> stream_before;
@@ -291,7 +307,7 @@ TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
 
         Gc gc(victim, UInt128{811});
         ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
-        ASSERT_EQ(catalogEntry(*backend, victim->layout(), ns).state, NsState::Removing);
+        ASSERT_EQ(catalogEntry(catalog_op, victim->layout(), ns).state, NsState::Removing);
         for (const ListedKey & key : backend->list(victim->layout().namespaceStreamPrefix(*life), "", 100).keys)
             stream_before.push_back(key.key);
         ASSERT_FALSE(stream_before.empty());
@@ -305,7 +321,7 @@ TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
     EXPECT_EQ(wake_requests.load(), 1u);
     EXPECT_EQ(report.namespaces_already_removed, 1u);
     EXPECT_FALSE(report.slot_removed);
-    EXPECT_EQ(catalogEntry(*backend, Layout("p"), ns).state, NsState::Removing);
+    EXPECT_EQ(catalogEntry(catalog_op, Layout("p"), ns).state, NsState::Removing);
     std::vector<String> stream_after;
     for (const ListedKey & key : backend->list(Layout("p").namespaceStreamPrefix(*life), "", 100).keys)
         stream_after.push_back(key.key);
@@ -316,6 +332,8 @@ TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
 TEST(CASDecommissionCatalogDuties, OpaqueLifeDebrisWithoutCatalogOwnershipDoesNotBlockRetirement)
 {
     auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
     { auto victim = openVictim(backend); }
     const Layout layout("p");
     const NamespaceLifeId dead_life

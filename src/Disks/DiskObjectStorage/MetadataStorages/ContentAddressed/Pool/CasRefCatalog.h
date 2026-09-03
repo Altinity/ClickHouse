@@ -134,9 +134,11 @@ public:
         /// Present only when a mandatory fresh catalog read proves that the exact observed life is no
         /// longer cataloged, whether this actor's erase committed or another actor removed/replaced it.
         std::optional<NamespaceLifeId> invalidated_life;
-        /// The complete mandatory resolution snapshot after an attempted erase. The GC drain feeds
-        /// this directly into its next deterministic selection; proof refusal performs no read and
-        /// leaves it absent.
+        /// The catalog cut this call ends on. After an attempted erase it is the mandatory resolution
+        /// read's snapshot, which the GC drain feeds directly into its next deterministic selection.
+        /// On `FencedOut` it is instead the cut the call was GIVEN: an operation whose admission is
+        /// gone cannot issue the resolution read, so the erase's own effect is left unreported. Proof
+        /// refusal performs no read at all and leaves this absent.
         std::optional<Snapshot> catalog_snapshot;
 
         bool operator==(CompletedRemovingDeleteOutcome expected) const { return outcome == expected; }
@@ -183,9 +185,11 @@ public:
     {
         Live,        /// the entry reached `Live`; `_ckpt` is durable with this creator's `writer_epoch`
                       /// as `life_epoch` (spec INV-4: the genesis epoch, recorded nowhere else).
-        FencedOut,   /// this caller's OWN admission was lost before the `_ckpt` publish or the
-                      /// `Creating -> Live` write. Nothing more was written; the caller's own mount
-                      /// incarnation is gone, so it cannot be the one to retry.
+        FencedOut,   /// this caller's OWN admission was lost, at the `_ckpt` publish or at the
+                      /// `Creating -> Live` write. Whether the step it was running landed is
+                      /// UNRESOLVED -- admission is reported lost both before an attempt is sent and
+                      /// after one is proven durable, so a resumer re-reads rather than assumes. The
+                      /// caller's own mount incarnation is gone, so it cannot be the one to retry.
         Superseded,  /// the catalog entry no longer equals what this caller observed -- a concurrent
                       /// reconciler stole it, or a race already carried it to `Live`/`Removing`. Nothing
                       /// was written; a DIFFERENT actor now owns whatever happens to this namespace next.
@@ -206,9 +210,9 @@ public:
         EntryChanged,         /// the catalog's current entry for `observed.ns` no longer equals
                               /// `observed` -- token-exactness failed. Not written; the caller must
                               /// re-read the catalog before trying again.
-        FencedOut,            /// this caller's OWN admission was lost before the write -- nothing was
-                              /// written, and the caller's own mount incarnation is gone, so it cannot
-                              /// be the one to retry. Mirrors `NamespaceCreationOutcome::FencedOut`;
+        FencedOut,            /// this caller's OWN admission was lost, and whether its write landed is
+                              /// unresolved; its mount incarnation is gone either way, so it cannot be
+                              /// the one to retry. Mirrors `NamespaceCreationOutcome::FencedOut`;
                               /// without this check a deposed mount could still steal a `Creating`
                               /// entry onto its own dead fence before the following `completeCreation`
                               /// refuses it -- the catalog would be mutated by an actor this subsystem

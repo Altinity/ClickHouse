@@ -177,7 +177,9 @@ public:
               {},
               [](const RootNamespace &) {})
     {
-        CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
+        CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+        CasOperation op = requests.admit();
+        CasRefCatalog::initializeEmptyForNewPool(op, layout);
     }
 
     std::function<void(DetachedStopToken)> takeDetachedTask()
@@ -319,7 +321,9 @@ void preparePendingRecoveryPublisher(
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
     first_publisher_captured->wait();
 
-    const auto life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const auto life = CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns);
     ASSERT_TRUE(life);
     ckpt_key = store->layout().refCkptKey(*life);
 
@@ -769,7 +773,9 @@ TEST(CASDetachedWork, StopBetweenSnapshotBaseRequestsPreventsThePredecessorGet)
     preparePendingRecoveryPublisher(
         store, backend, ns, first_publisher_captured, release_first_publisher, ckpt_key);
 
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns).value();
     const String base_log_key = store->layout().refLogKey(life, base_id);
     const String predecessor_key = store->layout().refLogKey(life, predecessor_seal_id);
     auto first_get_completed = std::make_shared<Gate>();
@@ -798,7 +804,9 @@ TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
     const RootNamespace ns{"srv1/stop_before_recovery_install"};
     ASSERT_NO_THROW(publishRef(fixture.ledger, ns, "ref_1", 1));
 
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*fixture.backend, fixture.layout, ns).value();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(fixture.backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, fixture.layout, ns).value();
     const String ckpt_key = fixture.layout.refCkptKey(life);
     fixture.backend->armCasConflict(ckpt_key, 100);
     EXPECT_ANY_THROW(fixture.ledger.dropRef(ns, "ref_1"));
