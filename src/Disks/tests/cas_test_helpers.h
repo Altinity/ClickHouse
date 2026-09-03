@@ -1874,38 +1874,56 @@ public:
                                              const std::optional<String> & expected_value,
                                              DB::Cas::TransportAccess & access) override
     {
-        record(key);
-        if (key == conflict_key && conflict_count > 0)
+        switch (claimFault(key))
         {
-            --conflict_count;
-            /// A refusal (not a thrown/ambiguous response): the caller's own re-read-and-merge loop
-            /// treats this exactly like a concurrent writer that landed first, and exhausts its bound
-            /// without ever committing -- deterministically, with no wall-clock wait.
-            return std::unexpected(RawConflict{});
-        }
-        if (failure_count > 0 && !failure_substr.empty() && key.find(failure_substr) != String::npos)
-        {
-            --failure_count;
-            throw Poco::TimeoutException("OrderedFaultBackend: simulated write response lost, nothing landed");
+            case Fault::Conflict:
+                /// A refusal (not a thrown/ambiguous response): the caller's own re-read-and-merge loop
+                /// treats this exactly like a concurrent writer that landed first.
+                return std::unexpected(RawConflict{});
+            case Fault::ResponseLost:
+                throw Poco::TimeoutException("OrderedFaultBackend: simulated write response lost, nothing landed");
+            case Fault::None:
+                break;
         }
         return CountingBackend::write(key, bytes, expected_value, access);
     }
 
-    /// Arms a persistent refusal at `key` for the next `count` writes.
+    /// Arms a refusal at `key` for the next `count` writes. A COUNT cannot wedge one logical write:
+    /// the engine reissues an unresolved or refused write until its own retry window closes, so a
+    /// count the reissues outlive lets the call commit in the end. Use it to bound how much contention
+    /// a call meets, and `armLatchedWriteConflict` when the call must not commit at all.
     void armWriteConflict(const String & key, size_t count)
     {
+        std::lock_guard lock(mutex);
         conflict_key = key;
         conflict_count = count;
     }
 
-    /// Arms a persistent, never-committed write failure for the next `count` writes whose key contains
-    /// `substr`: the object is never actually written (unlike a real ambiguous response, which may or
-    /// may not have landed), so a resolve read always finds the key absent and classifies the attempt a
-    /// definite, non-committed failure -- deterministically, with no wall-clock wait.
+    /// Refuses EVERY write of `key` until disarmed with an empty key, so a call meets the refusal on
+    /// every one of its reissues and reaches its retry deadline without committing.
+    void armLatchedWriteConflict(const String & key)
+    {
+        std::lock_guard lock(mutex);
+        latched_conflict_key = key;
+    }
+
+    /// Arms a never-committed write failure for the next `count` writes whose key contains `substr`:
+    /// the object is never actually written (unlike a real ambiguous response, which may or may not
+    /// have landed), so a resolve read always finds the key absent and classifies the attempt a
+    /// definite, non-committed failure. The same count caveat as `armWriteConflict` applies.
     void armWriteFailure(const String & substr, int count)
     {
+        std::lock_guard lock(mutex);
         failure_substr = substr;
         failure_count = count;
+    }
+
+    /// Loses the response of EVERY write whose key contains `substr` until disarmed with an empty
+    /// substring -- the latched form of `armWriteFailure`, for a call that must never commit.
+    void armLatchedWriteFailure(const String & substr)
+    {
+        std::lock_guard lock(mutex);
+        latched_failure_substr = substr;
     }
 
     /// The current length of the journal -- a caller's baseline for `indicesFrom` below, so a query can
@@ -1936,18 +1954,40 @@ public:
     }
 
 private:
-    void record(const String & key)
+    enum class Fault : uint8_t { None, Conflict, ResponseLost };
+
+    /// Journals the write and consumes at most one armed fault, all under one hold: a publisher and a
+    /// synchronous caller write concurrently in these fixtures, and a counted fault read outside the
+    /// lock would be handed to both.
+    Fault claimFault(const String & key)
     {
         std::lock_guard lock(mutex);
         journal.push_back(key);
+        if (!latched_conflict_key.empty() && key == latched_conflict_key)
+            return Fault::Conflict;
+        if (key == conflict_key && conflict_count > 0)
+        {
+            --conflict_count;
+            return Fault::Conflict;
+        }
+        if (!latched_failure_substr.empty() && key.find(latched_failure_substr) != String::npos)
+            return Fault::ResponseLost;
+        if (failure_count > 0 && !failure_substr.empty() && key.find(failure_substr) != String::npos)
+        {
+            --failure_count;
+            return Fault::ResponseLost;
+        }
+        return Fault::None;
     }
 
     mutable std::mutex mutex;
     std::vector<String> journal;
     String conflict_key;
     size_t conflict_count = 0;
+    String latched_conflict_key;
     String failure_substr;
     int failure_count = 0;
+    String latched_failure_substr;
 };
 
 /// A backend whose LIST permanently omits every key under a chosen prefix while those keys stay fully
@@ -2428,6 +2468,56 @@ private:
         hook = nullptr;
         once();
     }
+};
+
+/// The engine reissues an unresolved write until its OWN retry window closes, and that window is
+/// measured on a clock the engine reads. Both seams here share one counter -- the sleep the engine
+/// performs is what advances the clock -- so a fault that stays armed ends the call at its deadline
+/// with no real time passing. Installed on the whole pool, because the ref-lane write, its settling
+/// read and the recovery retry loop all pace through the same seam. The pool owns the closures and the
+/// closures own the clock, so it outlives everything that can still read it.
+class VirtualRetryClock
+{
+public:
+    static std::shared_ptr<VirtualRetryClock> installOn(const PoolPtr & store)
+    {
+        auto clock = std::make_shared<VirtualRetryClock>();
+        store->setCasRequestNowFnForTest([clock] { return clock->nowMs(); });
+        store->setCasRetrySleepForTest([clock](uint64_t ms) { clock->advance(ms); });
+        return clock;
+    }
+
+    uint64_t nowMs() const
+    {
+        std::lock_guard lock(mutex);
+        return now_ms;
+    }
+    size_t pauseCount() const
+    {
+        std::lock_guard lock(mutex);
+        return pauses;
+    }
+    uint64_t longestPause() const
+    {
+        std::lock_guard lock(mutex);
+        return longest_pause;
+    }
+
+    void advance(uint64_t ms)
+    {
+        std::lock_guard lock(mutex);
+        /// Plus one millisecond, because full jitter can draw a ZERO pause: a clock that does not move
+        /// would leave the loop reissuing for ever against a fault that never clears.
+        now_ms += ms + 1;
+        ++pauses;
+        longest_pause = std::max(longest_pause, ms);
+    }
+
+private:
+    mutable std::mutex mutex;
+    uint64_t now_ms = 0;
+    size_t pauses = 0;
+    uint64_t longest_pause = 0;
 };
 
 /// Expect a DB::Exception with EXACTLY `expected_code` AND a message containing `expected_substring`.

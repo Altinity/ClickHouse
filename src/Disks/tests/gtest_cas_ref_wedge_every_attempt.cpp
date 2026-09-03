@@ -70,6 +70,7 @@ extern const int NETWORK_ERROR;
 }
 
 using namespace DB::Cas;
+using DB::Cas::tests::VirtualRetryClock;
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::expectThrowsCode;
 
@@ -86,7 +87,7 @@ PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
 /// (`attempt_timeout_ms` is what one attempt reserves, `lease_safety_margin_ms` the room kept past it)
 /// and nothing else: a write's ATTEMPT COUNT is the `Retry` policy's, so no budget field can make an
 /// injected fault conclusive. What makes a fault conclusive here is that it stays armed for the whole
-/// call while `VirtualRetryClock` below carries the call to its own deadline.
+/// call while `VirtualRetryClock` carries the call to its own deadline.
 CasRequestBudget wedgeTestBudget()
 {
     CasRequestBudget budget;
@@ -96,55 +97,6 @@ CasRequestBudget wedgeTestBudget()
     return budget;
 }
 
-/// The engine reissues an unresolved write until its OWN retry window closes, and that window is
-/// measured on a clock the engine reads. Both seams here share one counter -- the sleep the engine
-/// performs is what advances the clock -- so a fault that stays armed ends the call at its deadline
-/// with no real time passing. Installed on the whole pool, because the ref-lane write, its settling
-/// read and the recovery retry loop all pace through the same seam. The pool owns the closures and the
-/// closures own the clock, so it outlives everything that can still read it.
-class VirtualRetryClock
-{
-public:
-    static std::shared_ptr<VirtualRetryClock> installOn(const PoolPtr & store)
-    {
-        auto clock = std::make_shared<VirtualRetryClock>();
-        store->setCasRequestNowFnForTest([clock] { return clock->nowMs(); });
-        store->setCasRetrySleepForTest([clock](uint64_t ms) { clock->advance(ms); });
-        return clock;
-    }
-
-    uint64_t nowMs() const
-    {
-        std::lock_guard lock(mutex);
-        return now_ms;
-    }
-    size_t pauseCount() const
-    {
-        std::lock_guard lock(mutex);
-        return pauses;
-    }
-    uint64_t longestPause() const
-    {
-        std::lock_guard lock(mutex);
-        return longest_pause;
-    }
-
-    void advance(uint64_t ms)
-    {
-        std::lock_guard lock(mutex);
-        /// Plus one millisecond, because full jitter can draw a ZERO pause: a clock that does not move
-        /// would leave the loop reissuing for ever against a fault that never clears.
-        now_ms += ms + 1;
-        ++pauses;
-        longest_pause = std::max(longest_pause, ms);
-    }
-
-private:
-    mutable std::mutex mutex;
-    uint64_t now_ms = 0;
-    size_t pauses = 0;
-    uint64_t longest_pause = 0;
-};
 
 PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
