@@ -238,20 +238,21 @@ TEST(CASRefReadContract, StaleLifeDropRefusesAfterRebirthAndNeverTouchesSuccesso
     publishCommittedTransition(*backend, layout, ns, ref_name, std::nullopt, life2_ref);
     const ManifestId life2_manifest{ns, life2_ref};
 
-    const HeadResult catalog_head_before = backend->head(layout.refCatalogKey());
-    ASSERT_TRUE(catalog_head_before.exists);
-    const auto catalog_get_before = backend->get(layout.refCatalogKey());
+    OperationForTest catalog_probe(*backend);
+    const auto catalog_head_before = (*catalog_probe).head(layout.refCatalogKey(), Retry::standard());
+    ASSERT_TRUE(catalog_head_before.has_value());
+    const auto catalog_get_before = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_get_before.has_value());
 
     /// The held life-1 handle names an incarnation the catalog no longer carries: refused, not
     /// resolved against the current (life-2) row.
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(life1); });
 
-    const HeadResult catalog_head_after = backend->head(layout.refCatalogKey());
-    ASSERT_TRUE(catalog_head_after.exists);
-    EXPECT_EQ(catalog_head_after.token, catalog_head_before.token)
+    const auto catalog_head_after = (*catalog_probe).head(layout.refCatalogKey(), Retry::standard());
+    ASSERT_TRUE(catalog_head_after.has_value());
+    EXPECT_EQ(catalog_head_after->incarnation, catalog_head_before->incarnation)
         << "a refused stale-life drop must not touch the catalog object at all";
-    const auto catalog_get_after = backend->get(layout.refCatalogKey());
+    const auto catalog_get_after = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_get_after.has_value());
     EXPECT_EQ(catalog_get_after->bytes, catalog_get_before->bytes);
 
