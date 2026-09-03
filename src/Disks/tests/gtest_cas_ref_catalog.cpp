@@ -360,7 +360,7 @@ TEST(CASRefCatalogLifeIndex, AmbiguityStopsCatalogMutationButNotUnrelatedPointLo
     EXPECT_THROW(CasRefCatalog::casUpdate(op, layout, [](const RefCatalog & current) { return current; }), DB::Exception);
     const auto after = op.read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->incarnation, before->incarnation);
+    EXPECT_EQ(after->etag, before->etag);
     EXPECT_EQ(after->bytes, before->bytes);
 
     const auto unique = CasRefCatalog::lifeIfCataloged(op, layout, RootNamespace{"c"});
@@ -1020,13 +1020,13 @@ TEST(CASRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
     CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(op, layout);
-    ASSERT_TRUE(seeded.incarnation.has_value());
+    ASSERT_TRUE(seeded.etag.has_value());
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
         CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & cur)
         {
-            EXPECT_EQ(op.remove(layout.refCatalogKey(), *seeded.incarnation, Retry::standard()), Removal::Removed);
+            EXPECT_EQ(op.remove(layout.refCatalogKey(), *seeded.etag, Retry::standard()), Removal::Removed);
             RefCatalog next = cur;
             next.entries[0].state = NsState::Removing;
             next.entries[0].removal_started_round = 1;
@@ -1050,13 +1050,13 @@ TEST(CASRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
     CasRefCatalog::initializeEmptyForNewPool(op, layout);
     CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("a", 1));
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(op, layout);
-    ASSERT_TRUE(seeded.incarnation.has_value());
+    ASSERT_TRUE(seeded.etag.has_value());
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
             CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & cur)
             {
-                EXPECT_EQ(op.remove(layout.refCatalogKey(), *seeded.incarnation, Retry::standard()), Removal::Removed);
+                EXPECT_EQ(op.remove(layout.refCatalogKey(), *seeded.etag, Retry::standard()), Removal::Removed);
                 RefCatalog next = cur;
                 next.entries[0].state = NsState::Removing;
                 next.entries[0].removal_started_round = 1;
@@ -1281,7 +1281,7 @@ TEST(CASRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
     seedObject(op, "unrelated", "sentinel");
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
         layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {current}}),
-        *CasRefCatalog::read(op, layout).incarnation, Retry::standard())));
+        *CasRefCatalog::read(op, layout).etag, Retry::standard())));
 
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
@@ -1709,7 +1709,7 @@ TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
             .removal_started_round = 8},
     };
     const CasRefCatalog::Snapshot cut{
-        .catalog = catalog, .incarnation = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
+        .catalog = catalog, .etag = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
 
     RefScanSummary ordinary_scan;
     ordinary_scan.parent_ref_lives.emplace(UInt128{1}, RefLifeFoldState{
@@ -1878,7 +1878,7 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     ASSERT_TRUE(catalog);
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
         layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}),
-        catalog->incarnation, Retry::standard())));
+        catalog->etag, Retry::standard())));
 
     CasFoldSeal seal;
     seal.generation = 1;
@@ -1939,7 +1939,7 @@ TEST(CASGCRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
         hexToU128("fedcba98765432100123456789abcdef");
     RefCatalog catalog{.entries = {liveEntry("live", 2)}};
     const CasRefCatalog::Snapshot cut{
-        .catalog = catalog, .incarnation = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
+        .catalog = catalog, .etag = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
     RefScanSummary scan;
     scan.parent_ref_lives.emplace(current_life, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{2, 3}}});
@@ -1975,7 +1975,7 @@ TEST(CASGCRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
     RefCatalog catalog;
     catalog.entries = {liveEntry("live", 2)};
     CasRefCatalog::Snapshot cut{
-        .catalog = catalog, .incarnation = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
+        .catalog = catalog, .etag = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
 
     RefScanSummary observations;
     observations.max_log_by_life.emplace(UInt128{2}, RefTxnId{2, 7});
