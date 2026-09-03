@@ -400,6 +400,23 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openWiringStorage()
     return storage;
 }
 
+/// The current meta of a present key, read through the request engine over an open fence — the
+/// sanctioned way for a fixture to observe a `Pool`'s backend without owning it (`Pool::backend()` is
+/// gone; `poolBackendPtr()` is the surviving accessor).
+DB::Cas::Meta headMetaOf(const DB::Cas::PoolPtr & pool, const String & key)
+{
+    DB::Cas::tests::OperationForTest op(*pool->poolBackendPtr());
+    const auto h = (*op).head(key, DB::Cas::Retry::standard());
+    if (!h.has_value())
+        throw std::runtime_error("headMetaOf: key '" + key + "' is absent");
+    return *h;
+}
+
+DB::Cas::Etag headIncarnationOf(const DB::Cas::PoolPtr & pool, const String & key)
+{
+    return headMetaOf(pool, key).incarnation;
+}
+
 /// One part with a content blob, a projection file, and the small per-part files (uuid.txt,
 /// metadata_version.txt — ordinary Inline entries now, all-tree-part-files Task 6/9), published
 /// through the real PartWriteTxn into `ns` under `ref`.
@@ -601,9 +618,9 @@ TEST(CASWiringRead, DeletedBlobUnderStaleViewFailsTypedNotEmpty)
     auto pool = storage->store();
     const String blob_key = pool->layout().blobKey(DB::Cas::tests::idOf("payload-A"));
     {
-        const DB::Cas::HeadResult h = pool->backend().head(blob_key);
-        ASSERT_TRUE(h.exists);
-        pool->backend().deleteExact(blob_key, h.token);
+        const DB::Cas::Etag incarnation = headIncarnationOf(pool, blob_key);
+        DB::Cas::tests::OperationForTest op(*pool->poolBackendPtr());
+        ASSERT_EQ((*op).remove(blob_key, incarnation, DB::Cas::Retry::standard()), DB::Cas::Removal::Removed);
     }
 
     /// Planning still succeeds from the cached manifest and names the same object.
@@ -1713,8 +1730,8 @@ TEST(CASWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
     /// the receiver never overwrites or re-creates the blobs — their head tokens are unchanged.
     const auto data_key = storage->store()->layout().blobKey(idOf("payload-A"));
     const auto proj_key = storage->store()->layout().blobKey(idOf("payload-B"));
-    const auto data_tok_before = storage->store()->backend().head(data_key).token;
-    const auto proj_tok_before = storage->store()->backend().head(proj_key).token;
+    const auto data_tok_before = headIncarnationOf(storage->store(), data_key);
+    const auto proj_tok_before = headIncarnationOf(storage->store(), proj_key);
 
     /// Adopt into a DIFFERENT table (a22a22a2-2222-4222-8222-222222222222). The transferred body's root_namespace_id is the sender's
     /// (a11a11a1-1111-4111-8111-111111111111) — the receiver must IGNORE it and use a22a22a2-2222-4222-8222-222222222222.
@@ -1738,9 +1755,9 @@ TEST(CASWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
     EXPECT_FALSE(receiver_ns.string() == sender_ns.string());
 
     /// NO blob body was uploaded: the shared blobs' incarnations are untouched by the adopt.
-    EXPECT_EQ(storage->store()->backend().head(data_key).token, data_tok_before)
+    EXPECT_EQ(headIncarnationOf(storage->store(), data_key), data_tok_before)
         << "adopt-from-manifest must not re-upload a blob already in the shared pool";
-    EXPECT_EQ(storage->store()->backend().head(proj_key).token, proj_tok_before);
+    EXPECT_EQ(headIncarnationOf(storage->store(), proj_key), proj_tok_before);
 }
 
 /// B7 fail-closed: if a referenced blob is absent/condemned in the pool, adoptPartFromManifest must
@@ -1768,10 +1785,11 @@ TEST(CASWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
     /// Artificially delete a referenced pool blob — the live-sender invariant excludes this on the real
     /// path; §4 promote does not re-probe it, so adopt trusts the manifest edge and publishes.
     const auto data_key = storage->store()->layout().blobKey(idOf("payload-A"));
-    const auto h = storage->store()->backend().head(data_key);
-    ASSERT_TRUE(h.exists);
-    ASSERT_EQ(storage->store()->backend().deleteExact(data_key, h.token).kind,
-              DB::Cas::DeleteOutcome::Kind::Deleted);
+    {
+        const DB::Cas::Etag incarnation = headIncarnationOf(storage->store(), data_key);
+        DB::Cas::tests::OperationForTest op(*storage->store()->poolBackendPtr());
+        ASSERT_EQ((*op).remove(data_key, incarnation, DB::Cas::Retry::standard()), DB::Cas::Removal::Removed);
+    }
 
     /// §4: promote trusts the adopted leaves — no re-probe — so adopt SUCCEEDS (returns true) and publishes.
     const bool ok = adoptPartFromManifestAndPromote(*exchange, kReceiverTmpFetchPath, bytes);
@@ -2887,17 +2905,18 @@ DB::Cas::PoolPtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> & 
 /// meta, which is what the writer's condemned decision ACTUALLY point-reads (spec §meta-protocols v3).
 /// Bumps the round so the retirement is a fresh one; leaves the object itself in place (condemn, NOT delete).
 void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,
-                          [[maybe_unused]] const DB::Cas::Token & token, [[maybe_unused]] uint64_t size)
+                          [[maybe_unused]] const DB::Cas::Etag & token, [[maybe_unused]] uint64_t size)
 {
     using namespace DB::Cas;
-    Backend & b = store.backend();
+    Backend & b = *store.poolBackendPtr();
     const Layout & layout = store.layout();
+    DB::Cas::tests::OperationForTest op(b);
 
     GcState state;
-    const HeadResult head = b.head(layout.gcStateKey());
-    if (head.exists)
+    const auto head = (*op).head(layout.gcStateKey(), Retry::standard());
+    if (head.has_value())
     {
-        const auto got = b.get(layout.gcStateKey());
+        const auto got = (*op).read(layout.gcStateKey(), Retry::standard());
         state = decodeGcState(got->bytes);
     }
     state.round += 1;
@@ -2906,10 +2925,10 @@ void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,
     /// GC snapshot runs, which this writer-side edge-protection test does not exercise. The writer's
     /// condemned decision point-reads the per-hash freshness meta (condemned below), so bumping the round
     /// and condemning the meta is enough.
-    if (head.exists)
-        b.putOverwrite(layout.gcStateKey(), encodeGcState(state), head.token);
+    if (head.has_value())
+        (void)(*op).replace(layout.gcStateKey(), encodeGcState(state), head->incarnation, Retry::standard());
     else
-        b.putIfAbsent(layout.gcStateKey(), encodeGcState(state));
+        (void)(*op).create(layout.gcStateKey(), encodeGcState(state), Retry::standard());
 
     /// The writer's fresh upload (putBlob) already wrote a Clean meta for `hash` (Task 3), so this is a
     /// plain Clean -> Condemned CAS — exactly what GC's real condemn path does.
@@ -2942,12 +2961,11 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
 
     /// Condemn the freshly-uploaded blob's CURRENT token (GC condemning the not-yet-folded fresh incarnation).
     const String blob_key = store->layout().blobKey(idOf(P));
-    const HeadResult h1 = store->backend().head(blob_key);
-    ASSERT_TRUE(h1.exists);
-    const Token t0 = h1.token;
+    const Meta h1 = headMetaOf(store, blob_key);
+    const Etag t0 = h1.incarnation;
     seedCondemnBlobToken(*store, u128Of(P), t0, h1.size);
     {
-        const auto lm = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
+        const auto lm = DB::Cas::tests::loadMetaForTest(*store->poolBackendPtr(), store->layout(), u128Of(P));
         ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
             << "precondition: the putBlob'd token must be condemned before promote";
     }
@@ -2958,9 +2976,7 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
     /// The ref is committed and the blob's token is unchanged — no replacement PUT ran (`Materialized` leaves are
     /// not re-validated: EDGE-BEFORE-OBSERVE guarantees the condemnation is doomed, not the blob).
     EXPECT_TRUE(store->resolveRef(ns, ref).has_value()) << "the ref must resolve after promote";
-    const HeadResult h2 = store->backend().head(blob_key);
-    ASSERT_TRUE(h2.exists);
-    EXPECT_EQ(h2.token, t0)
+    EXPECT_EQ(headIncarnationOf(store, blob_key), t0)
         << "materialized leaf is edge-protected: promote must not re-upload it (token unchanged)";
 }
 
@@ -2998,18 +3014,17 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     /// Physical publication through `putBlob` requires that durable edge, while this test deliberately
     /// needs the owner binding absent when `promote` runs.
     DB::Cas::tests::writeBlobRaw(
-        store->backend(), store->layout(), P, store->poolMeta().blob_header_len, store->poolMeta().pool_id);
-    DB::Cas::tests::writeMetaClean(store->backend(), store->layout(), u128Of(P), P.size());
+        *store->poolBackendPtr(), store->layout(), P, store->poolMeta().blob_header_len, store->poolMeta().pool_id);
+    DB::Cas::tests::writeMetaClean(*store->poolBackendPtr(), store->layout(), u128Of(P), P.size());
     const ManifestId id = build->stageManifest({wiringBlobEntry("data.bin", P)});
 
     const String blob_key = store->layout().blobKey(idOf(P));
-    const HeadResult h1 = store->backend().head(blob_key);
-    ASSERT_TRUE(h1.exists);
+    const Meta h1 = headMetaOf(store, blob_key);
     /// Condemn the leaf so that, were the blob gate reached, promote would republish it — proving the abort
     /// happens strictly BEFORE any blob work.
-    seedCondemnBlobToken(*store, u128Of(P), h1.token, h1.size);
+    seedCondemnBlobToken(*store, u128Of(P), h1.incarnation, h1.size);
     {
-        const auto lm = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
+        const auto lm = DB::Cas::tests::loadMetaForTest(*store->poolBackendPtr(), store->layout(), u128Of(P));
         ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned);
     }
 
@@ -3026,11 +3041,9 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
 
     /// No blob work ran before the abort: the leaf's token is UNCHANGED (still the condemned one) and its
     /// metadata is still Condemned — the owner check aborts before any blob publication.
-    const HeadResult h2 = store->backend().head(blob_key);
-    ASSERT_TRUE(h2.exists);
-    EXPECT_EQ(h2.token, h1.token)
+    EXPECT_EQ(headIncarnationOf(store, blob_key), h1.incarnation)
         << "the aborting path must perform no PUT — the materialized leaf is untouched";
-    const auto lm_after = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
+    const auto lm_after = DB::Cas::tests::loadMetaForTest(*store->poolBackendPtr(), store->layout(), u128Of(P));
     EXPECT_TRUE(lm_after.has_value() && lm_after->meta.state == MetaState::Condemned)
         << "no republication before the owner check — the token is still the condemned one";
 }
