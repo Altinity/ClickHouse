@@ -307,7 +307,7 @@ TEST(CASHeartbeat, SameEpochUnfencedTouchIsUncertainNotFatal)
     advanced.writer_epoch = 9;
     advanced.seq = 99;
     advanced.write_attempt_id = UInt128{99};
-    mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(advanced), observed->incarnation,
+    mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(advanced), observed->etag,
                               Retry::standard()), "advanced slot");
 
     try
@@ -353,7 +353,7 @@ TEST(CASHeartbeat, SupersededTouchIsFailClosedNotFatal)
     successor.writer_epoch = 10;
     successor.seq = 1;
     successor.write_attempt_id = UInt128{1};
-    mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(successor), observed->incarnation,
+    mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(successor), observed->etag,
                               Retry::standard()), "successor slot");
 
     try
@@ -407,7 +407,7 @@ TEST(CASHeartbeat, ForeignUuidTouchFailsClosedWithoutAborting)
     foreign.writer_epoch = 1;
     foreign.seq = 1;
     foreign.write_attempt_id = UInt128{1};
-    mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(foreign), observed->incarnation,
+    mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(foreign), observed->etag,
                               Retry::standard()), "foreign slot");
 
     /// Restored on every exit: this flag is process-global and every later test in this binary would
@@ -555,7 +555,7 @@ TEST(CASMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
         MountLease fenced = decodeMountLease(got->bytes);
         fenced.gc_fenced = true;
         fenced.seq += 1;
-        mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(fenced), got->incarnation,
+        mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(fenced), got->etag,
                                   Retry::standard()), "fence-out");
     }
 
@@ -617,7 +617,7 @@ TEST(CASHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
         MountLease fenced = decodeMountLease(got->bytes);
         fenced.gc_fenced = true;
         fenced.seq += 1;
-        mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(fenced), got->incarnation,
+        mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(fenced), got->etag,
                                   Retry::standard()), "fence-out");
     }
 
@@ -863,7 +863,7 @@ TEST(CASHeartbeat, SamePairTwinAndForeignOrSuccessorStayTerminal)
         current.writer_epoch = current_epoch;
         current.write_attempt_id = current_attempt;
         ++current.seq;
-        mustCommit(ops.op.replace(layout.mountKey("test"), encodeMountLease(current), got->incarnation,
+        mustCommit(ops.op.replace(layout.mountKey("test"), encodeMountLease(current), got->etag,
                                   Retry::standard()), "competing slot");
         backend->read_calls = 0;
         const MountRenewResult result = keeper.renew(renewalEnvironment(boot_ms));
@@ -923,13 +923,13 @@ TEST(CASHeartbeat, GcFenceAndVanishedMountStayTerminal)
         const String key = layout.mountKey("test");
         auto got = ops.op.read(key, Retry::standard());
         if (vanish)
-            ASSERT_EQ(ops.op.remove(key, got->incarnation, Retry::standard()), Removal::Removed);
+            ASSERT_EQ(ops.op.remove(key, got->etag, Retry::standard()), Removal::Removed);
         else
         {
             MountLease fenced = decodeMountLease(got->bytes);
             fenced.gc_fenced = true;
             ++fenced.seq;
-            mustCommit(ops.op.replace(key, encodeMountLease(fenced), got->incarnation, Retry::standard()),
+            mustCommit(ops.op.replace(key, encodeMountLease(fenced), got->etag, Retry::standard()),
                        "fence-out");
         }
         const DB::Exception failure = terminalException(keeper.renew(renewalEnvironment(boot_ms)));
@@ -982,7 +982,7 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
         /// The incarnation the about-to-be-terminal renewal names as its precondition: a late delivery
         /// of that attempt can only ever be replayed against exactly this one.
         const Etag delayed_precondition
-            = ops.op.read(layout.mountKey("after-successor"), Retry::standard())->incarnation;
+            = ops.op.read(layout.mountKey("after-successor"), Retry::standard())->etag;
 
         backend->actions = {RenewalScriptBackend::Action::ThrowBefore};
         const MountRenewResult result = keeper.renew(renewalEnvironment(boot_ms));
@@ -995,7 +995,7 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
         MountLease fenced = decodeMountLease(current->bytes);
         fenced.gc_fenced = true;
         ++fenced.seq;
-        mustCommit(ops.op.replace(delayed.key, encodeMountLease(fenced), current->incarnation, Retry::standard()),
+        mustCommit(ops.op.replace(delayed.key, encodeMountLease(fenced), current->etag, Retry::standard()),
                    "fence-out");
         ASSERT_EQ(claimMount(ops.op, layout, "after-successor", UInt128{1}, 10, wall_ms, 1000).kind,
                   MountClaimResult::Claimed);
