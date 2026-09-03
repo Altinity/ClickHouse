@@ -643,53 +643,48 @@ TEST(CASRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
 }
 
 /// The SAME rule one level down, and the level where it was actually broken. The test above splits the
-/// two attempts across two CALLS, which the wedge already handles. Inside ONE call the controller used
-/// to report the LAST attempt's outcome: an ambiguous attempt followed by a definitively refused reissue
-/// came back `DefiniteFailure` -- the verdict that means "the key is provably unwritten". It is not. The
-/// refusal proves only that the SECOND request never applied; the first may still be in flight and may
-/// still land, and `unresolvedProvesNothingWasSent` is false for exactly that reason. So the CALL is
-/// unresolved, and a definite verdict is only ever the whole call's.
+/// two attempts across two CALLS, which the wedge already handles. Inside ONE call the verdict used to
+/// be the LAST attempt's: an ambiguous attempt followed by a definitively refused reissue came back as
+/// a proven refusal -- the verdict that means "the key is provably unwritten". It is not. The refusal
+/// proves only that the SECOND request never applied; the first may still be in flight and may still
+/// land. So the CALL gives up, and a refusal is only ever reported when NO attempt of the call was
+/// ambiguous.
 ///
-/// The new reason lands on the fail-close side of the predicate the ledger acts on. Asserted at compile
-/// time, beside the behaviour, because a member added to the enum without classifying it is precisely
-/// how the wedge would silently stop happening.
-static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::DefiniteFailureAfterAmbiguity));
-
+/// Driven on an injected clock: the reissue schedule is what makes the two attempts happen, and a real
+/// one would make this test sleep.
 TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalCannotSpeakForAnEarlierAmbiguousAttemptOfTheSameCall)
 {
 #if !USE_AWS_S3
-    GTEST_SKIP() << "DefiniteFailure classification requires S3 error types (USE_AWS_S3 off)";
+    GTEST_SKIP() << "the store-refusal classification requires S3 error types (USE_AWS_S3 off)";
 #else
     auto backend = std::make_shared<WedgeTestBackend>();
-    CasRequestController controller(backend, twoAttemptBudget());
-    const std::function<bool()> fence_ok = [] { return true; };
+    uint64_t clock = 0;
+    CasRequests requests(backend, Fence::open(),
+                         [&clock]() -> uint64_t { return clock; }, [&clock](uint64_t ms) { clock += ms; });
+    CasOperation op = requests.admit();
 
-    /// One call, two attempts: ambiguous, then definitively refused.
+    /// One call, two attempts: ambiguous, then refused by the store.
     backend->ambiguous_substr = "key/";
     backend->ambiguous_count = 1;
     backend->s3_definite_substr = "key/";
     backend->s3_definite_count = 1;
 
-    CasUnresolvedReason reason = CasUnresolvedReason::NotUnresolved;
-    const CasWriteOutcome outcome =
-        controller.putIfAbsentControlled("key/haunted", "bytes", fence_ok, /*out_token=*/nullptr, &reason);
-
-    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved)
-        << "a definite refusal of the SECOND attempt cannot retire the first attempt's ambiguity";
-    EXPECT_EQ(reason, CasUnresolvedReason::DefiniteFailureAfterAmbiguity);
-    EXPECT_FALSE(unresolvedProvesNothingWasSent(reason))
+    const WriteResult haunted = op.create("key/haunted", "bytes", Retry::within(30'000));
+    const auto * gave_up = std::get_if<GaveUp>(&haunted);
+    ASSERT_TRUE(gave_up != nullptr)
+        << "a store refusal of the SECOND attempt cannot retire the first attempt's ambiguity";
+    EXPECT_TRUE(gave_up->sent_any)
         << "the caller must keep protecting itself: an earlier attempt was sent and may yet land";
-    EXPECT_FALSE(backend->get("key/haunted").has_value())
+    CasOperation reader = requests.admit();
+    EXPECT_FALSE(reader.head("key/haunted", Retry::within(30'000)).has_value())
         << "and the key is still empty -- which is exactly why an absent read settles nothing";
 
-    /// THE CONTROL. Aggregation must not soften a definite refusal that speaks for the whole call: with
-    /// no ambiguous predecessor, the first attempt's whitelisted rejection is still `DefiniteFailure`,
-    /// and the ledger may still free the id on it.
+    /// THE CONTROL. Aggregation must not soften a refusal that speaks for the whole call: with no
+    /// ambiguous predecessor, the first attempt's rejection is still `Refused`, and the ledger may
+    /// still free the id on it.
     backend->s3_definite_count = 1;
-    CasUnresolvedReason clean_reason = CasUnresolvedReason::NotUnresolved;
-    EXPECT_EQ(controller.putIfAbsentControlled("key/clean", "bytes", fence_ok, /*out_token=*/nullptr, &clean_reason),
-              CasWriteOutcome::DefiniteFailure);
-    EXPECT_EQ(clean_reason, CasUnresolvedReason::NotUnresolved);
+    CasOperation clean = requests.admit();
+    EXPECT_TRUE(std::holds_alternative<Refused>(clean.create("key/clean", "bytes", Retry::within(30'000))));
 #endif
 }
 
