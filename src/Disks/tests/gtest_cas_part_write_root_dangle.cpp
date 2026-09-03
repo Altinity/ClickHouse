@@ -120,7 +120,8 @@ TEST(CASPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
         << "B171: PartWriteTxn B's promote must succeed — the precommit should have kept P alive";
 
     /// The blob B references must still be present (no dangle), and refB must resolve.
-    ASSERT_TRUE(backend->head(s->layout().blobKey(idOf(P))).exists)
+    DB::Cas::tests::OperationForTest dangle_op(*backend);
+    ASSERT_TRUE((*dangle_op).head(s->layout().blobKey(idOf(P)), Retry::once()).has_value())
         << "B171-dangle: GC deleted the shared blob P that PartWriteTxn B adopted — its cas_owner was the "
         << "retired PartWriteTxn A and the stub precommit published no build-root edge, so inDeg(P) hit 0 "
         << "and the single content-delete site removed it. refB now dangles.";
@@ -173,18 +174,19 @@ TEST(CASPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
     /// RAW removal append would collide with the writer's own `RefTxnId` sequence allocation on the next
     /// flush; the property under test is the COMMIT gate's fail-closed behavior against a missing
     /// dependency, not the reclaim mechanics -- so we go straight to the reclaimed state.)
+    DB::Cas::tests::OperationForTest reclaim_op(*backend);
     {
         const String pkey = s->layout().blobKey(idOf(P));
-        const HeadResult h = backend->head(pkey);
-        ASSERT_TRUE(h.exists) << "P must be present before the simulated reclaim";
-        ASSERT_EQ(backend->deleteExact(pkey, h.token).kind, DeleteOutcome::Kind::Deleted);
+        const auto h = (*reclaim_op).head(pkey, Retry::once());
+        ASSERT_TRUE(h.has_value()) << "P must be present before the simulated reclaim";
+        ASSERT_EQ((*reclaim_op).remove(pkey, h->incarnation, Retry::once()), Removal::Removed);
     }
     /// Drop the source ref too (the state a real premature reclaim leaves: P unprotected and gone).
     s->dropRef(ns, "refA");
     s->renewWatermarkOnce();
 
     /// The shared blob must be GONE (the premature reclaim collected it).
-    ASSERT_FALSE(backend->head(s->layout().blobKey(idOf(P))).exists)
+    ASSERT_FALSE((*reclaim_op).head(s->layout().blobKey(idOf(P)), Retry::once()).has_value())
         << "premature-reclaim setup invalid: P should have been collected after losing its precommit";
 
     /// §4 manifest-trust (test name is legacy — B171 INV-COMMIT-FAILCLOSED for an ADOPTED leaf now moves to
@@ -199,7 +201,7 @@ TEST(CASPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
         << "§4: an adopted leaf is trusted at promote — a missing dependency is not re-observed here";
 
     /// Trust never fabricates the missing blob (it never touches P); refB IS committed (naming absent P).
-    ASSERT_FALSE(backend->head(s->layout().blobKey(idOf(P))).exists)
+    ASSERT_FALSE((*reclaim_op).head(s->layout().blobKey(idOf(P)), Retry::once()).has_value())
         << "trust never fabricates the missing blob — P stays absent";
     ASSERT_TRUE(s->resolveRef(ns, "refB").has_value())
         << "§4: refB commits under trust (the D4 trade-off); the dangle is caught by fsck, below";
@@ -247,7 +249,8 @@ TEST(CASPartWriteTxnRoot, LivePrecommitNotReclaimed)
     runGcToFixpoint(gc);
 
     /// Q must still be present (the live precommit's +1 edge pins it across GC).
-    ASSERT_TRUE(backend->head(s->layout().blobKey(idOf(Q))).exists)
+    DB::Cas::tests::OperationForTest live_op(*backend);
+    ASSERT_TRUE((*live_op).head(s->layout().blobKey(idOf(Q)), Retry::once()).has_value())
         << "B8 conservatism: the live precommit must keep its blob alive across GC";
 
     /// B can still commit (the precommit is intact).
