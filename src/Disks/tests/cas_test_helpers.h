@@ -893,8 +893,8 @@ inline void condemnMeta(DB::Cas::Backend & backend, const DB::Cas::Layout & layo
     DB::Cas::BlobMeta c = lm->meta;
     c.state = DB::Cas::MetaState::Condemned;
     c.condemn_round = condemn_round;
-    (*operation).replace(layout.blobMetaKey(ref), DB::Cas::encodeBlobMeta(c), lm->incarnation,
-                         DB::Cas::Retry::standard());
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(
+        DB::Cas::casMeta(*operation, layout, ref, lm->incarnation, c)));
 }
 
 /// Load the meta descriptor for `hash` via the shared ops layer (nullopt = absent).
@@ -2159,9 +2159,10 @@ private:
     bool block_entered = false;
 };
 
-/// Fault decorator for the condemn-marker gate tests (codex-review triage 2026-07-17 §3.4): while
-/// armed, every conditional-write attempt against a blob `.meta` key throws. The request controller
-/// exhausts its budget and reports `Unresolved`, so `writeCondemnedMeta` returns false while the round
+/// Fault decorator for the condemn-marker gate tests: while armed, every write against a blob `.meta`
+/// key throws. `Poco::TimeoutException` and not a plain `std::runtime_error`, because the engine
+/// rethrows a non-`Poco::Exception` unchanged instead of settling it by a read -- only a timeout models
+/// the ambiguity that exhausts as `Unresolved`, so `writeCondemnedMeta` reports failure while the round
 /// still commits the unconfirmed retired entry. Every other write passes through. Armed by default;
 /// disarm (`fail_meta_writes = false`) to model the backend healing.
 class MetaWriteFaultBackend : public DB::Cas::InMemoryBackend
@@ -2172,7 +2173,7 @@ public:
                                              DB::Cas::TransportAccess & access) override
     {
         if (fail_meta_writes.load() && key.ends_with(".meta"))
-            throw std::runtime_error("injected fault: blob meta write lost");
+            throw Poco::TimeoutException("injected fault: blob meta write lost");
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
@@ -2325,4 +2326,14 @@ void expectThrowsCodeWithMessage(int expected_code, const String & expected_subs
     }
 }
 
+}
+
+/// The mount and GC suites call these two unqualified, under `using namespace DB::Cas;`. Argument-
+/// dependent lookup does not reach `DB::Cas::tests` from a `shared_ptr<InMemoryBackend>`, so the names
+/// are re-exported here rather than moved: the qualified `DB::Cas::tests::` spelling the rest of the
+/// tree uses keeps working, and there is still one definition.
+namespace DB::Cas
+{
+using tests::OperationForTest;
+using tests::openRequestsForTest;
 }

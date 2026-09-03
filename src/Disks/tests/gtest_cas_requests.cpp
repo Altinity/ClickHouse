@@ -135,9 +135,19 @@ TEST(CASWriteResult, OrThrowMapsEveryAlternative)
 
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { orThrow(WriteResult{Conflict{ProvenAbsent{}}}, "t"); });
     expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { orThrow(WriteResult{Refused{DB::ErrorCodes::S3_ERROR, "denied"}}, "t"); });
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::Deadline, GaveUp::Source::Policy, true, NotObserved{}}}, "t"); });
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::Unresolved, GaveUp::Source::Policy, true, ProvenAbsent{}}}, "t"); });
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{GaveUp{GaveUp::Why::FenceLost, GaveUp::Source::Lease, false, NotObserved{}}}, "t"); });
+    /// Designated rather than positional: `GaveUp` grows fields at its end, and a positional list is
+    /// the form a field inserted anywhere else would silently re-interpret.
+    const GaveUp deadline{
+        .why = GaveUp::Why::Deadline, .deadline_source = GaveUp::Source::Policy,
+        .sent_any = true, .last_seen = NotObserved{}};
+    const GaveUp unresolved{
+        .why = GaveUp::Why::Unresolved, .deadline_source = GaveUp::Source::Policy,
+        .sent_any = true, .last_seen = ProvenAbsent{}};
+    const GaveUp fence_lost{
+        .why = GaveUp::Why::FenceLost, .deadline_source = GaveUp::Source::Lease,
+        .sent_any = false, .last_seen = NotObserved{}};
+    for (const GaveUp & gave_up : {deadline, unresolved, fence_lost})
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{gave_up}, "t"); });
 }
 
 TEST(CASFence, OpenFenceAdmitsEverythingAndNeverMoves)
@@ -1478,46 +1488,23 @@ TEST(CASRequests, DeadlineIsTheOnlyBoundUnderZeroLatencyThrottling)
 
 TEST(CASRequests, LeaseBoundPolicyIssuesNothingPastTheBoundary)
 {
-    {
-        FakeClock clock;
-        auto throttled = std::make_shared<ThrottlingBackend>(
-            std::make_shared<InMemoryBackend>(), ThrottlingBackend::Mode::EveryNth, 1, 429);
-        auto requests = makeRequests(throttled, clock);
-        requests.setAttemptReservationForTest(1'000);
+    FakeClock clock;
+    auto throttled = std::make_shared<ThrottlingBackend>(
+        std::make_shared<InMemoryBackend>(), ThrottlingBackend::Mode::EveryNth, 1, 429);
+    auto requests = makeRequests(throttled, clock);
+    requests.setAttemptReservationForTest(1'000);
 
-        const uint64_t lease_deadline = clock.now + 10'000;
-        auto op = requests.admit();
-        WriteResult result = op.create("k", "v", Retry::untilLeaseSafe(lease_deadline, 2'000));
-        const auto * gave_up = std::get_if<GaveUp>(&result);
-        ASSERT_NE(gave_up, nullptr);
-        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
-        /// The lease was the smaller of the two bounds, and the give-up names it rather than the policy.
-        EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
-        /// Nothing is STARTED that could not finish inside the bound: the last request began at least one
-        /// attempt reservation before lease minus margin.
-        EXPECT_LE(clock.now, lease_deadline - 2'000 - 1'000);
-    }
-    {
-        /// The boundary itself. Exactly ONE attempt reservation is left before lease minus margin, and a
-        /// write reserves TWO -- the attempt and the read that settles it -- so nothing may be started.
-        /// An engine that reserved only the attempt would find room here and send one.
-        FakeClock clock;
-        auto backend = std::make_shared<CountingBackend>();
-        auto requests = makeRequests(backend, clock);
-        requests.setAttemptReservationForTest(1'000);
-
-        const uint64_t lease_deadline = clock.now + 2'000 + 1'000;
-        auto op = requests.admit();
-        WriteResult result = op.create("k", "v", Retry::untilLeaseSafe(lease_deadline, 2'000));
-        const auto * gave_up = std::get_if<GaveUp>(&result);
-        ASSERT_NE(gave_up, nullptr);
-        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
-        EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
-        EXPECT_FALSE(gave_up->sent_any);
-        EXPECT_EQ(backend->writeTotal(), 0u);
-        EXPECT_EQ(backend->getTotal(), 0u);
-        EXPECT_TRUE(clock.sleeps.empty());
-    }
+    const uint64_t lease_deadline = clock.now + 10'000;
+    auto op = requests.admit();
+    WriteResult result = op.create("k", "v", Retry::untilLeaseSafe(lease_deadline, 2'000));
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    /// The lease was the smaller of the two bounds, and the give-up names it rather than the policy.
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+    /// Nothing is STARTED that could not finish inside the bound: the last request began at least one
+    /// attempt reservation before lease minus margin.
+    EXPECT_LE(clock.now, lease_deadline - 2'000 - 1'000);
 }
 
 TEST(CASRequests, AMalformedRequestIsRefusedWithoutAReissue)
@@ -1736,3 +1723,28 @@ TEST(CASRequests, AnUnmodeledStoreErrorOnAReadIsReissuedNotSurfaced)
 }
 
 #endif
+
+/// A write reserves TWO request envelopes, not one: the attempt, and the read that settles it if the
+/// attempt comes back ambiguous. At exactly one reservation of surplus before lease minus margin there
+/// is room for the attempt alone, and an engine that reserved only the attempt would start one it
+/// could not settle inside the bound. Nothing may be sent.
+TEST(CASRequests, AWriteReservesTwoEnvelopesSoOneOfSurplusStartsNothing)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(1'000);
+
+    const uint64_t lease_deadline = clock.now + 2'000 + 1'000;
+    auto op = requests.admit();
+    WriteResult result = op.create("k", "v", Retry::untilLeaseSafe(lease_deadline, 2'000));
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Lease);
+    EXPECT_FALSE(gave_up->sent_any);
+    EXPECT_EQ(backend->writeTotal(), 0u);
+    EXPECT_EQ(backend->getTotal(), 0u);
+    EXPECT_TRUE(clock.sleeps.empty());
+}
+
