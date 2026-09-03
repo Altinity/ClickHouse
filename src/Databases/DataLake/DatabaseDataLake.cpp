@@ -990,6 +990,16 @@ void DatabaseDataLake::createTable(
     const auto compression_method_str = context_->getSettingsRef()[Setting::iceberg_metadata_compression_method].value;
     const auto compression_method = chooseCompressionMethod(compression_method_str, compression_method_str);
 
+    /// Register the namespace before `createTable`, which requires it to exist and, for catalogs that
+    /// write the initial metadata file themselves, must not be preceded by any file written to storage
+    /// (see `ICatalog::createTable`). Do it after all local validation, so a rejected `CREATE` leaves no
+    /// trace in the catalog. The namespace's default location must be the namespace base, not this first
+    /// table's directory, or later tables created without an explicit location would land under it.
+    String namespace_location = location;
+    if (const String table_suffix = "/" + table_name; namespace_location.ends_with(table_suffix))
+        namespace_location.resize(namespace_location.size() - table_suffix.size());
+    catalog->createNamespaceIfNotExists(namespace_name, namespace_location);
+
     const bool created = catalog->createTable(
         namespace_name, table_name, /* metadata_path */ "", metadata_content, compression_method, create.if_not_exists);
     if (!created)

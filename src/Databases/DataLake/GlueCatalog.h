@@ -101,8 +101,10 @@ public:
         const String & column_name,
         const String & glue_column_type);
 
+    /// Glue namespaces carry no default location, so `location` is ignored.
+    void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
+
 private:
-    void createNamespaceIfNotExists(const String & namespace_name) const;
 
     std::unique_ptr<Aws::Glue::GlueClient> glue_client;
     const LoggerPtr log;

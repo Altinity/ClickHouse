@@ -33,6 +33,7 @@ namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int DATALAKE_DATABASE_ERROR;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace DB::Setting
@@ -214,9 +215,24 @@ ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfiguratio
     };
 }
 
-void S3TablesCatalog::dropTable(
-    const String & namespace_name, const String & table_name, bool /*delete_data*/, bool /*if_exists*/) const
+void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, bool delete_data, bool if_exists) const
 {
+    /// The API only offers a purging delete, so keeping the data is not expressible here; refuse rather
+    /// than delete data the `DROP TABLE` asked to keep.
+    /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-delete.html
+    if (!delete_data)
+    {
+        /// A table that is not there is nothing to refuse, so `IF EXISTS` still means a no-op.
+        if (if_exists && !existsTable(namespace_name, table_name))
+            return;
+
+        throw DB::Exception(
+            DB::ErrorCodes::SUPPORT_IS_DISABLED,
+            "S3 Tables cannot drop table {}.{} without deleting its data, and `data_lake_delete_data_on_drop` is disabled. "
+            "Enable `data_lake_delete_data_on_drop` to drop the table together with its data",
+            namespace_name, table_name);
+    }
+
     const std::string endpoint
         = (base_url / config.prefix / "namespaces" / namespace_name / "tables" / table_name).string()
         + "?purgeRequested=True";

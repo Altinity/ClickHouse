@@ -934,6 +934,30 @@ void IcebergMetadata::createInitial(
         : fmt::format("v1{}.metadata.json", compression_suffix);
     auto filename = fmt::format("{}metadata/{}", configuration_ptr->getRawPath().path, metadata_file_name);
 
+    if (catalog)
+    {
+        /// The namespace default location must be the namespace base, not this table's directory, or
+        /// later tables created in the same namespace without an explicit location would land under it.
+        /// The engine clause names an arbitrary path, so the base is only derivable when that path ends
+        /// with `<namespace>/<table>`; otherwise there is no base to offer and the location stays empty.
+        String namespace_location = location_path;
+        while (namespace_location.ends_with('/'))
+            namespace_location.pop_back();
+
+        String namespace_path = namespace_name;
+        std::replace(namespace_path.begin(), namespace_path.end(), '.', '/');
+        if (namespace_location.ends_with("/" + namespace_path + "/" + table_name))
+            namespace_location.resize(namespace_location.size() - table_name.size() - 1);
+        else
+            namespace_location.clear();
+
+        /// Register the namespace before any file is written (but after all local validation, so a
+        /// rejected `CREATE` leaves no trace in the catalog): a catalog that shares its storage view
+        /// with the data (e.g. SeaweedFS) refuses to create a namespace over the plain directory
+        /// those files would leave behind.
+        catalog->createNamespaceIfNotExists(namespace_name, namespace_location);
+    }
+
     try
     {
         writeMessageToFile(metadata_content, filename, object_storage, local_context, "*", "", compression_method);

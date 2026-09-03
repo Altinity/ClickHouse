@@ -384,6 +384,11 @@ bool ICatalog::updateSchema(
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateSchema is not implemented");
 }
 
+void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/) const
+{
+    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createNamespaceIfNotExists is not implemented");
+}
+
 void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/, bool /*purge*/, bool /*if_exists*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,

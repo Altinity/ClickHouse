@@ -1695,8 +1695,6 @@ bool RestCatalog::createTable(
 
     const String location = metadata_content->getValue<String>("location");
 
-    createNamespaceIfNotExists(namespace_name, location);
-
     const std::string endpoint = (base_url / config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables").generic_string();
 
     Poco::JSON::Object::Ptr request_body = new Poco::JSON::Object;

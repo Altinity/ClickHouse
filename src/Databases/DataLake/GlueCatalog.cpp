@@ -646,7 +646,7 @@ String GlueCatalog::resolveMetadataPathFromTableLocation(const String & table_lo
     }
 }
 
-void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name) const
+void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, const String & /*location*/) const
 {
     /// `CreateDatabase` may be denied to a principal that is still allowed to create tables in a
     /// pre-provisioned namespace, so it must not be called when there is nothing to create.
@@ -687,8 +687,6 @@ bool GlueCatalog::createTable(
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
-
-    createNamespaceIfNotExists(namespace_name);
 
     String effective_metadata_path = new_metadata_path;
 

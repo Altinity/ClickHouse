@@ -229,6 +229,12 @@ public:
         Int32 new_last_column_id,
         Poco::JSON::Object::Ptr metadata = nullptr) const;
 
+    /// Register `namespace_name` if the catalog does not have it yet. `location` is the namespace's
+    /// default location (its base directory), and is empty when the caller has no base to offer - a
+    /// table's own directory must never be used, or later tables created in the namespace without an
+    /// explicit location would land inside that first table.
+    virtual void createNamespaceIfNotExists(const String & namespace_name, const String & location) const;
+
     /// Drop table from catalog.
     /// If `purge`, the catalog is also asked to delete the underlying data files.
     virtual void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const;

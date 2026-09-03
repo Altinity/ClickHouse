@@ -112,6 +112,8 @@ public:
 
     void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const override;
 
+    void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
+
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
 
     String getClientId() const { return client_id; }
@@ -128,8 +130,6 @@ protected:
         bool oauth_server_use_request_body_,
         const std::string & namespaces_,
         DB::ContextPtr context_);
-
-    void createNamespaceIfNotExists(const String & namespace_name, const String & location) const;
 
     struct Config
     {
