@@ -36,9 +36,12 @@
 using namespace DB::Cas;
 
 using DB::Cas::tests::expectBytes;
+using DB::Cas::tests::openRequestsForTest;
+using DB::Cas::tests::OperationForTest;
 
 namespace DB::ErrorCodes
 {
+extern const int CAS_DELETE_MARKER;
 extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
 extern const int LOGICAL_ERROR;
@@ -113,10 +116,10 @@ BlobPublishRequest countedLongPublication(
 class PublishCountingInMemoryBackend final : public InMemoryBackend
 {
 public:
-    void publishBlob(const BlobPublishRequest & request) override
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override
     {
         ++publish_calls;
-        InMemoryBackend::publishBlob(request);
+        InMemoryBackend::publish(request, access);
     }
 
     size_t publish_calls = 0;
@@ -124,120 +127,14 @@ public:
 
 }
 
-/// Minimal concrete implementation that overrides every pure virtual with trivial defaults.
-/// Purpose: verify the interface compiles, is overridable, and result-type defaults are sane.
-struct NullBackend final : Backend
-{
-    std::optional<GetResult> get(const String & /*key*/, Range /*range*/) override
-    {
-        return std::nullopt;
-    }
-
-    std::optional<GetStreamResult> getStream(const String & /*key*/, Range /*range*/) override
-    {
-        return std::nullopt;
-    }
-
-    HeadResult head(const String & /*key*/) override
-    {
-        return HeadResult{};
-    }
-
-    PutResult putIfAbsent(const String & /*key*/, const String & /*bytes*/, const ObjectMeta & /*meta*/) override
-    {
-        return {PutOutcome::Done, {}};
-    }
-
-    void publishBlob(const BlobPublishRequest & /*request*/) override
-    {
-    }
-
-    PutResult putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, const ObjectMeta & /*meta*/) override
-    {
-        return {PutOutcome::PreconditionFailed, {}};
-    }
-
-    CasResult casPut(const String & /*key*/, const String & /*bytes*/, const std::optional<Token> & /*expected*/, const ObjectMeta & /*meta*/) override
-    {
-        return {CasOutcome::Conflict, {}};
-    }
-
-    DeleteOutcome deleteExact(const String & /*key*/, const Token & /*token*/) override
-    {
-        return DeleteOutcome{};
-    }
-
-    ListPage list(const String & /*prefix*/, const String & /*cursor*/, size_t /*limit*/) override
-    {
-        return ListPage{};
-    }
-
-    /// The primitives, equally trivial. The legacy overrides above still answer the legacy calls --
-    /// that is what this double is for -- so these exist to make the class concrete and to pin that
-    /// implementing the primitive surface alone is enough.
-    std::optional<Raw> read(const String & /*key*/, TransportAccess &) override { return std::nullopt; }
-    std::optional<RawMeta> head(const String & /*key*/, TransportAccess &) override { return std::nullopt; }
-    RawListPage list(const String & /*prefix*/, const String & /*cursor*/, size_t /*limit*/, TransportAccess &) override
-    {
-        return RawListPage{};
-    }
-    RawRemoval remove(const String & /*key*/, const String & /*expected_value*/, TransportAccess &) override
-    {
-        return RawRemoval::Gone;
-    }
-    std::expected<String, RawConflict> write(const String & /*key*/, const String & /*bytes*/,
-                                             const std::optional<String> &, TransportAccess &) override
-    {
-        return std::unexpected(RawConflict{});
-    }
-    std::unique_ptr<DB::ReadBuffer> stream(const String & /*key*/, TransportAccess &) override { return nullptr; }
-    void publish(const BlobPublishRequest & /*request*/, TransportAccess &) override {}
-    Dialect dialect() const override { return Dialect::Emulated; }
-
-    bool supportsListTokens() const override { return false; }
-};
-
-TEST(CASBackend, PublishBlobReturnsNoIncarnationToken)
-{
-    static_assert(std::is_same_v<
-        decltype(std::declval<Backend &>().publishBlob(std::declval<const BlobPublishRequest &>())),
-        void>);
-}
-
-TEST(CASBackend, NullBackendShapeAndDefaults)
-{
-    NullBackend b;
-    // Use the base-class reference so virtual dispatch uses base-class default args.
-    Backend & ref = b;
-
-    // get returns absent
-    EXPECT_FALSE(ref.get("k").has_value());
-
-    // head returns non-existent
-    HeadResult h = b.head("k");
-    EXPECT_FALSE(h.exists);
-    EXPECT_EQ(h.size, 0u);
-    EXPECT_TRUE(h.token.empty());
-
-    // putIfAbsent returns Done
-    EXPECT_EQ(ref.putIfAbsent("k", "v").outcome, PutOutcome::Done);
-
-    // putOverwrite returns PreconditionFailed
-    EXPECT_EQ(ref.putOverwrite("k", "v", Token{}).outcome, PutOutcome::PreconditionFailed);
-
-    // casPut returns Conflict
-    EXPECT_EQ(ref.casPut("k", "v", std::nullopt).outcome, CasOutcome::Conflict);
-
-    // deleteExact default kind is NotFound
-    DeleteOutcome d = b.deleteExact("k", Token{});
-    EXPECT_EQ(d.kind, DeleteOutcome::Kind::NotFound);
-    EXPECT_FALSE(d.created_delete_marker);
-
-    // list returns empty page
-    ListPage page = b.list("p/", "", 10);
-    EXPECT_TRUE(page.keys.empty());
-    EXPECT_TRUE(page.next_cursor.empty());
-}
+/// `NullBackend` and its two tests (`PublishBlobReturnsNoIncarnationToken`,
+/// `NullBackendShapeAndDefaults`) are deleted here: their entire subject was the shape and defaults of
+/// the legacy Token-typed forwarders (get/head/putIfAbsent/putOverwrite/casPut/deleteExact/list), which
+/// no longer exist -- `Backend` now declares only the primitives, all pure virtual, with no default
+/// bodies to pin. The primitive surface's own shape is exercised by every concrete-backend test below
+/// (`CASInMemory`, `CASObjectStorageBackend`) through `CasRequests`/`CasOperation`, and the request
+/// engine's own default behaviour (a `create` finding the key occupied, a `replace` losing its
+/// precondition, a `remove` of an absent key) is pinned in `gtest_cas_requests.cpp`.
 
 // =====================================================================
 // Task 3: CasInMemoryBackend — enforcing token semantics
@@ -246,89 +143,112 @@ TEST(CASBackend, NullBackendShapeAndDefaults)
 TEST(CASInMemory, PutIfAbsentAndGet)
 {
     InMemoryBackend b;
-    const auto put = b.putIfAbsent("k", "v1");
-    const Token t1 = put.token;
-    EXPECT_EQ(put.outcome, PutOutcome::Done);
-    EXPECT_FALSE(t1.empty());
-    EXPECT_EQ(b.putIfAbsent("k", "clobber").outcome, PutOutcome::PreconditionFailed);
-    auto g = b.get("k");
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
+
+    const WriteResult put = op.create("k", "v1", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(put));
+    const Etag t1 = std::get<Committed>(put).incarnation;
+
+    const WriteResult clobber = op.create("k", "clobber", Retry::once());
+    EXPECT_TRUE(std::holds_alternative<Conflict>(clobber));
+
+    auto g = op.read("k", Retry::once());
     ASSERT_TRUE(g.has_value());
     EXPECT_EQ(g->bytes, "v1");
-    EXPECT_EQ(g->token, t1);
-    EXPECT_FALSE(b.get("absent").has_value());
+    EXPECT_EQ(g->incarnation, t1);
+    EXPECT_FALSE(op.read("absent", Retry::once()).has_value());
 }
 
 TEST(CASInMemory, OverwriteIsTokenExactAndMintsFreshToken)
 {
     InMemoryBackend b;
-    const Token t1 = b.putIfAbsent("k", "v1").token;
-    EXPECT_EQ(b.putOverwrite("k", "v2", Token{"wrong", Dialect::Emulated}).outcome, PutOutcome::PreconditionFailed);
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
+
+    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    const WriteResult wrong_token = op.create("k2", "v2", Retry::once());   /// a fresh key to mint a foreign token
+    const Etag foreign = std::get<Committed>(wrong_token).incarnation;
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("k", "v2", foreign, Retry::once())));
     expectBytes(b, "k", "v1");                                // untouched on mismatch
-    const auto overwrite = b.putOverwrite("k", "v2", t1);
-    EXPECT_EQ(overwrite.outcome, PutOutcome::Done);
-    EXPECT_NE(overwrite.token, t1);                           // tokens never repeat
+
+    const WriteResult overwrite = op.replace("k", "v2", t1, Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(overwrite));
+    EXPECT_NE(std::get<Committed>(overwrite).incarnation, t1);   // tokens never repeat
     expectBytes(b, "k", "v2");
 }
 
 TEST(CASInMemory, CasPutCreateAndSwap)
 {
     InMemoryBackend b;
-    const auto create = b.casPut("m", "s1", std::nullopt);
-    const Token t1 = create.token;
-    EXPECT_EQ(create.outcome, CasOutcome::Committed);                             // create-if-absent
-    EXPECT_EQ(b.casPut("m", "s1x", std::nullopt).outcome, CasOutcome::Conflict);  // exists now
-    EXPECT_EQ(b.casPut("m", "s2", Token{"stale", Dialect::Emulated}).outcome, CasOutcome::Conflict);
-    EXPECT_EQ(b.get("m")->bytes, "s1");
-    EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Committed);
-    EXPECT_EQ(b.get("m")->bytes, "s2");
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
+
+    const WriteResult create = op.create("m", "s1", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(create));                     // create-if-absent
+    const Etag t1 = std::get<Committed>(create).incarnation;
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("m", "s1x", Retry::once())));   // exists now
+
+    const WriteResult foreign_write = op.create("other", "stale", Retry::once());
+    const Etag foreign = std::get<Committed>(foreign_write).incarnation;
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("m", "s2", foreign, Retry::once())));
+    EXPECT_EQ(op.read("m", Retry::once())->bytes, "s1");
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("m", "s2", t1, Retry::once())));
+    EXPECT_EQ(op.read("m", Retry::once())->bytes, "s2");
 }
 
 TEST(CASInMemory, DeleteExactEnforced)
 {
     InMemoryBackend b;
-    const Token t1 = b.putIfAbsent("k", "v1").token;
-    auto d1 = b.deleteExact("k", Token{"wrong", Dialect::Emulated});
-    EXPECT_EQ(d1.kind, DeleteOutcome::Kind::TokenMismatch);
-    EXPECT_TRUE(b.get("k").has_value());                      // SURVIVES wrong-token delete
-    auto d2 = b.deleteExact("k", t1);
-    EXPECT_EQ(d2.kind, DeleteOutcome::Kind::Deleted);
-    EXPECT_FALSE(d2.created_delete_marker);
-    EXPECT_FALSE(b.get("k").has_value());
-    EXPECT_EQ(b.deleteExact("k", t1).kind, DeleteOutcome::Kind::NotFound);
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
+
+    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    const Etag foreign = std::get<Committed>(op.create("k2", "v2", Retry::once())).incarnation;
+    EXPECT_EQ(op.remove("k", foreign, Retry::once()), Removal::Mismatch);
+    EXPECT_TRUE(op.read("k", Retry::once()).has_value());     // SURVIVES wrong-token delete
+    EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Removed);
+    EXPECT_FALSE(op.read("k", Retry::once()).has_value());
+    EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Gone);
 }
 
 TEST(CASInMemory, GetAndHeadAndList)
 {
     InMemoryBackend b;
-    b.putIfAbsent("p/a", "0123456789");
-    b.putIfAbsent("p/b", "xy");
-    b.putIfAbsent("q/c", "z");
-    EXPECT_EQ(b.get("p/a")->bytes, "0123456789");
-    auto h = b.head("p/a");
-    EXPECT_TRUE(h.exists);
-    EXPECT_EQ(h.size, 10u);
-    auto page = b.list("p/", "", 10);
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
+
+    op.create("p/a", "0123456789", Retry::once());
+    op.create("p/b", "xy", Retry::once());
+    op.create("q/c", "z", Retry::once());
+    EXPECT_EQ(op.read("p/a", Retry::once())->bytes, "0123456789");
+    auto h = op.head("p/a", Retry::once());
+    ASSERT_TRUE(h.has_value());
+    EXPECT_EQ(h->size, 10u);
+    auto page = op.list("p/", "", 10, Retry::once());
     ASSERT_EQ(page.keys.size(), 2u);                          // sorted, prefix-scoped
     EXPECT_EQ(page.keys[0].key, "p/a");
     EXPECT_EQ(page.keys[1].key, "p/b");
     EXPECT_TRUE(page.next_cursor.empty());
-    auto page1 = b.list("p/", "", 1);                         // pagination
+    auto page1 = op.list("p/", "", 1, Retry::once());         // pagination
     EXPECT_EQ(page1.keys.size(), 1u);
     EXPECT_EQ(page1.keys[0].key, "p/a");
     EXPECT_EQ(page1.next_cursor, "p/a");
     EXPECT_FALSE(page1.next_cursor.empty());
-    auto page2 = b.list("p/", page1.next_cursor, 1);
+    auto page2 = op.list("p/", page1.next_cursor, 1, Retry::once());
     EXPECT_EQ(page2.keys[0].key, "p/b");
 }
 
 TEST(CASInMemory, PublishBlobStreamingWritesFreshEnvelopeAndExactPayload)
 {
     InMemoryBackend backend;
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const auto request = streamingPublication("blob", "fresh-envelope", "payload", 7);
 
-    backend.publishBlob(request);
+    op.publish(request, Retry::once());
 
-    const auto result = backend.get("blob");
+    const auto result = op.read("blob", Retry::once());
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->bytes, "fresh-envelopepayload");
 }
@@ -336,8 +256,10 @@ TEST(CASInMemory, PublishBlobStreamingWritesFreshEnvelopeAndExactPayload)
 TEST(CASInMemory, PublishBlobRejectsShortAndLongStreamingSourcesWithoutVisibility)
 {
     InMemoryBackend backend;
-    ASSERT_EQ(backend.putIfAbsent("short", "old-short").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend.putIfAbsent("long", "old-long").outcome, PutOutcome::Done);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("short", "old-short", Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("long", "old-long", Retry::once())));
 
     for (const auto & [key, payload, declared_size] : std::vector<std::tuple<String, String, uint64_t>>{
              {"short", "abc", 4},
@@ -346,7 +268,7 @@ TEST(CASInMemory, PublishBlobRejectsShortAndLongStreamingSourcesWithoutVisibilit
         const auto request = streamingPublication(key, "fresh", payload, declared_size);
         try
         {
-            backend.publishBlob(request);
+            op.publish(request, Retry::once());
             FAIL() << "expected a source-size mismatch for " << key;
         }
         catch (const DB::Exception & e)
@@ -355,19 +277,21 @@ TEST(CASInMemory, PublishBlobRejectsShortAndLongStreamingSourcesWithoutVisibilit
         }
     }
 
-    EXPECT_EQ(backend.get("short")->bytes, "old-short");
-    EXPECT_EQ(backend.get("long")->bytes, "old-long");
+    EXPECT_EQ(op.read("short", Retry::once())->bytes, "old-short");
+    EXPECT_EQ(op.read("long", Retry::once())->bytes, "old-long");
 }
 
 TEST(CASInMemory, PublishBlobLongSourceReadsOnlyDeclaredPayloadAndOneProbeByte)
 {
     InMemoryBackend backend;
-    ASSERT_EQ(backend.putIfAbsent("long", "old-complete-body").outcome, PutOutcome::Done);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("long", "old-complete-body", Retry::once())));
     auto state = std::make_shared<CountingSourceState>();
 
     try
     {
-        backend.publishBlob(countedLongPublication("long", "fresh", 3, 1024, state));
+        op.publish(countedLongPublication("long", "fresh", 3, 1024, state), Retry::once());
         FAIL() << "expected a long-source mismatch";
     }
     catch (const DB::Exception & e)
@@ -376,8 +300,9 @@ TEST(CASInMemory, PublishBlobLongSourceReadsOnlyDeclaredPayloadAndOneProbeByte)
     }
 
     EXPECT_EQ(state->bytes_exposed, 4u);
-    ASSERT_TRUE(backend.get("long").has_value());
-    EXPECT_EQ(backend.get("long")->bytes, "old-complete-body");
+    const auto still_present = op.read("long", Retry::once());
+    ASSERT_TRUE(still_present.has_value());
+    EXPECT_EQ(still_present->bytes, "old-complete-body");
 }
 
 TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteBodyIsReady)
@@ -385,7 +310,9 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
     using namespace std::chrono_literals;
 
     InMemoryBackend backend;
-    ASSERT_EQ(backend.putIfAbsent("blob", "old-complete-body").outcome, PutOutcome::Done);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("blob", "old-complete-body", Retry::once())));
 
     std::promise<void> source_opened;
     std::promise<void> release_source;
@@ -402,10 +329,10 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
                 return std::make_unique<DB::ReadBufferFromOwnString>(String("payload"));
             }}};
 
-    auto publication = std::async(std::launch::async, [&] { backend.publishBlob(request); });
+    auto publication = std::async(std::launch::async, [&] { op.publish(request, Retry::once()); });
     source_opened.get_future().wait();
 
-    auto observation = std::async(std::launch::async, [&] { return backend.get("blob"); });
+    auto observation = std::async(std::launch::async, [&] { return op.read("blob", Retry::once()); });
     const auto observation_status = observation.wait_for(2s);
     EXPECT_EQ(observation_status, std::future_status::ready)
         << "publication must not hold the visibility lock while draining its source";
@@ -418,24 +345,28 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
 
     release_source.set_value();
     EXPECT_NO_THROW(publication.get());
-    ASSERT_TRUE(backend.get("blob").has_value());
-    EXPECT_EQ(backend.get("blob")->bytes, "fresh-envelopepayload");
+    const auto after = op.read("blob", Retry::once());
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->bytes, "fresh-envelopepayload");
 }
 
 TEST(CASInMemory, PublishBlobCopiesStagedObjectBytesVerbatim)
 {
     InMemoryBackend backend;
-    ASSERT_EQ(backend.putIfAbsent("stage", "staged-envelopepayload").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend.putIfAbsent("blob", "old-body").outcome, PutOutcome::Done);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("stage", "staged-envelopepayload", Retry::once())));
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("blob", "old-body", Retry::once())));
 
-    backend.publishBlob(BlobPublishRequest{
+    op.publish(BlobPublishRequest{
         .destination_key = "blob",
         .publication = VerbatimStagedBlobPublication{
             .object_key = "stage",
-            .object_size = 22}});
+            .object_size = 22}}, Retry::once());
 
-    ASSERT_TRUE(backend.get("blob").has_value());
-    EXPECT_EQ(backend.get("blob")->bytes, "staged-envelopepayload");
+    const auto after = op.read("blob", Retry::once());
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->bytes, "staged-envelopepayload");
 }
 
 // =====================================================================
@@ -445,62 +376,78 @@ TEST(CASInMemory, PublishBlobCopiesStagedObjectBytesVerbatim)
 TEST(CASInMemoryFaults, HeldDeleteLandsLater)
 {
     InMemoryBackend b;
-    const Token t1 = b.putIfAbsent("k", "v1").token;
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
+    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
     b.setHoldDeletes(true);
-    auto d = b.deleteExact("k", t1);                  // message "sent", not landed
-    EXPECT_EQ(d.kind, DeleteOutcome::Kind::Deleted);  // caller sees the send accepted
-    EXPECT_TRUE(b.get("k").has_value());              // ... but nothing landed yet
+    EXPECT_EQ(op.remove("k", t1, Retry::once()), Removal::Removed);   // message "sent", not landed
+    EXPECT_TRUE(op.read("k", Retry::once()).has_value());             // ... but nothing landed yet
     ASSERT_EQ(b.pendingDeletes(), 1u);
     // the object is recreated before the zombie lands:
-    b.putOverwrite("k", "v1'", t1);
+    op.replace("k", "v1'", t1, Retry::once());
     auto landed = b.landPendingDelete(0);             // the zombie lands NOW
-    EXPECT_EQ(landed.kind, DeleteOutcome::Kind::TokenMismatch);   // 412 — INV-NO-RETURN in miniature
+    EXPECT_EQ(landed, DB::Cas::Backend::RawRemoval::Mismatch);   // 412 — INV-NO-RETURN in miniature
     expectBytes(b, "k", "v1'");
 }
 
 TEST(CASInMemoryFaults, InjectedCasConflictFiresOnce)
 {
     InMemoryBackend b;
-    const Token t1 = b.casPut("m", "s1", std::nullopt).token;
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
+    const Etag t1 = std::get<Committed>(op.create("m", "s1", Retry::once())).incarnation;
     b.refuseNextWrite("m");
-    EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Conflict);     // injected
-    EXPECT_EQ(b.get("m")->bytes, "s1");
-    EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Committed);    // next attempt is real
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("m", "s2", t1, Retry::once())));   // injected
+    EXPECT_EQ(op.read("m", Retry::once())->bytes, "s1");
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("m", "s2", t1, Retry::once())));  // next attempt is real
 }
 
 TEST(CASInMemoryFaults, NonEnforcingModeMimicsBadBackend)
 {
     InMemoryBackend b;
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
     b.setEnforceTokens(false);                        // MinIO-OSS-shaped backend
-    b.putIfAbsent("k", "v1");
-    auto d = b.deleteExact("k", Token{"totally-wrong", Dialect::Emulated});
-    EXPECT_EQ(d.kind, DeleteOutcome::Kind::Deleted);  // silently deletes anyway — the dangerous behavior
-    EXPECT_FALSE(b.get("k").has_value());
+    op.create("k", "v1", Retry::once());
+    const Etag foreign = std::get<Committed>(op.create("k2", "totally-wrong", Retry::once())).incarnation;
+    EXPECT_EQ(op.remove("k", foreign, Retry::once()), Removal::Removed);   // silently deletes anyway — the dangerous behavior
+    EXPECT_FALSE(op.read("k", Retry::once()).has_value());
 }
 
 TEST(CASInMemoryFaults, VersioningMarkerMode)
 {
     InMemoryBackend b;
     b.setSimulateDeleteMarkers(true);
-    const Token t1 = b.putIfAbsent("k", "v1").token;
-    EXPECT_TRUE(b.deleteExact("k", t1).created_delete_marker);    // probe must reject this pool
+    CasRequests requests = openRequestsForTest(b);
+    CasOperation op = requests.admit();
+    const Etag t1 = std::get<Committed>(op.create("k", "v1", Retry::once())).incarnation;
+    /// A removal that only archives (never reclaims) is not an ordinary Removed: the engine reports it
+    /// as CAS_DELETE_MARKER so the capability probe can reject a versioned pool.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_DELETE_MARKER, [&] { op.remove("k", t1, Retry::once()); });
 }
 
 // =====================================================================
-// getStream seam (forward-only reads of write-once objects)
+// stream seam (forward-only reads of write-once objects)
 // =====================================================================
 
-TEST(CASBackendStream, StreamsBodyWindow)
+/// The legacy getStream's byte-range window is retired along with it: the primitive `stream` takes no
+/// Range, and every consumer (RunFileReader) already bounds its own consumption client-side rather than
+/// relying on a server-side window. What survives here is presence: a present key opens a readable
+/// stream, an absent one opens none.
+TEST(CASBackendStream, StreamsWholeBodyOrNullWhenAbsent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    backend->putIfAbsent("k", "0123456789");
-    auto got = backend->getStream("k", DB::Cas::Range{.offset = 2, .length = 5});
-    ASSERT_TRUE(got.has_value());
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    op.create("k", "0123456789", Retry::once());
+
+    auto got = op.stream("k", Retry::once());
+    ASSERT_TRUE(got != nullptr);
     String out;
-    DB::readStringUntilEOF(out, *got->stream);
-    EXPECT_EQ(out, "23456");
-    EXPECT_FALSE(got->token.empty());
-    EXPECT_FALSE(backend->getStream("absent").has_value());
+    DB::readStringUntilEOF(out, *got);
+    EXPECT_EQ(out, "0123456789");
+
+    EXPECT_EQ(op.stream("absent", Retry::once()), nullptr);
 }
 
 // =====================================================================
@@ -513,7 +460,7 @@ extern const Event CASBlobPut;
 extern const Event CASBlobPutDeduplicated;
 extern const Event CASBlobHead;
 extern const Event CASBlobHeadMiss;
-extern const Event CASGCCompareSwap;
+extern const Event CASGCPut;
 }
 
 TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
@@ -538,27 +485,29 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_EQ(classifyCasNs("pool/cas/manifests/0/srv/store/d18/uuid@cas@/24/1/000001.proto"), CasNs::Manifest);
 
     auto inner = std::make_shared<InMemoryBackend>();
-    InstrumentedBackend b(inner);
+    auto instrumented = std::make_shared<InstrumentedBackend>(inner);
+    CasRequests requests = openRequestsForTest(instrumented);
+    CasOperation op = requests.admit();
 
     using ProfileEvents::global_counters;
     const auto blob_put_before   = global_counters[ProfileEvents::CASBlobPut].load();
     const auto blob_dedup_before = global_counters[ProfileEvents::CASBlobPutDeduplicated].load();
     const auto blob_head_before  = global_counters[ProfileEvents::CASBlobHead].load();
     const auto blob_miss_before  = global_counters[ProfileEvents::CASBlobHeadMiss].load();
-    const auto gc_cas_before     = global_counters[ProfileEvents::CASGCCompareSwap].load();
+    const auto gc_put_before     = global_counters[ProfileEvents::CASGCPut].load();
 
     const String blob_key = "pool/blobs/ab/abcdef0123456789";
 
-    /// First put of a blob ⇒ Put.
-    EXPECT_EQ(b.putIfAbsent(blob_key, "payload").outcome, PutOutcome::Done);
-    /// Second put of the same key ⇒ PutDeduplicated (content already exists).
-    EXPECT_EQ(b.putIfAbsent(blob_key, "payload").outcome, PutOutcome::PreconditionFailed);
+    /// First create of a blob ⇒ Put.
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create(blob_key, "payload", Retry::once())));
+    /// Second create of the same key ⇒ PutDeduplicated (content already exists).
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.create(blob_key, "payload", Retry::once())));
     /// head of an absent blob key ⇒ HeadMiss (the 404 signal).
-    EXPECT_FALSE(b.head("pool/blobs/zz/absent").exists);
+    EXPECT_FALSE(op.head("pool/blobs/zz/absent", Retry::once()).has_value());
     /// head of the present blob key ⇒ Head.
-    EXPECT_TRUE(b.head(blob_key).exists);
-    /// casPut create on a gc key ⇒ Gc Cas.
-    EXPECT_EQ(b.casPut("pool/gc/state", "g1", std::nullopt).outcome, CasOutcome::Committed);
+    EXPECT_TRUE(op.head(blob_key, Retry::once()).has_value());
+    /// create on a gc key ⇒ Gc Put.
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("pool/gc/state", "g1", Retry::once())));
     /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
     /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
 #if !WITH_COVERAGE
@@ -566,27 +515,32 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobPutDeduplicated].load() - blob_dedup_before, 1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobHead].load()     - blob_head_before,  1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobHeadMiss].load() - blob_miss_before,  1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CASGCCompareSwap].load()        - gc_cas_before,     1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASGCPut].load()        - gc_put_before,     1u);
 #else
     (void)blob_put_before; (void)blob_dedup_before; (void)blob_head_before;
-    (void)blob_miss_before; (void)gc_cas_before;
+    (void)blob_miss_before; (void)gc_put_before;
 #endif
 }
 
 TEST(CASInstrumentedBackend, PublishBlobDelegatesOnceAndRecordsOnePhysicalBlobWrite)
 {
     auto inner = std::make_shared<PublishCountingInMemoryBackend>();
-    InstrumentedBackend backend(inner);
+    auto backend = std::make_shared<InstrumentedBackend>(inner);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
 
     using ProfileEvents::global_counters;
     const auto blob_put_before = global_counters[ProfileEvents::CASBlobPut].load();
 
     const auto request = streamingPublication("pool/blobs/ab/published", "fresh", "payload", 7);
-    backend.publishBlob(request);
+    op.publish(request, Retry::once());
 
     EXPECT_EQ(inner->publish_calls, 1u);
-    ASSERT_TRUE(inner->get("pool/blobs/ab/published").has_value());
-    EXPECT_EQ(inner->get("pool/blobs/ab/published")->bytes, "freshpayload");
+    CasRequests inner_requests = openRequestsForTest(inner);
+    CasOperation inner_op = inner_requests.admit();
+    const auto published = inner_op.read("pool/blobs/ab/published", Retry::once());
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ(published->bytes, "freshpayload");
 #if !WITH_COVERAGE
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut].load() - blob_put_before, 1u);
 #else
@@ -639,22 +593,24 @@ TEST(CASSizedReadSettings, CapsToKnownSizePlusSlackButNeverAboveBase)
 }
 
 /// The CountingBackend recorders the streaming-memory gates consume: per-key and total stream counts.
-/// A window is no longer part of the shape -- a materialized read is always whole, so only `getStream`
-/// still carries one, and it is not what the gates measure.
+/// A window is no longer part of the shape -- a materialized read is always whole, so `stream` no
+/// longer carries one either, and it is not what the gates measure.
 TEST(CASCountingBackendShape, RecordsStreamOpensPerKeyAndInTotal)
 {
-    DB::Cas::tests::CountingBackend backend;
-    backend.putIfAbsent("k", String(1000, 'x'));
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    op.create("k", String(1000, 'x'), Retry::once());
 
-    backend.getStream("k", DB::Cas::Range{.offset = 2, .length = 5});
-    backend.getStream("k");
-    backend.getStream("absent");
-    EXPECT_EQ(backend.getStreamCount("k"), 2u);
-    EXPECT_EQ(backend.getStreamTotal(), 3u);
+    op.stream("k", Retry::once());
+    op.stream("k", Retry::once());
+    op.stream("absent", Retry::once());
+    EXPECT_EQ(backend->getStreamCount("k"), 2u);
+    EXPECT_EQ(backend->getStreamTotal(), 3u);
 
-    backend.resetCounts();
-    EXPECT_EQ(backend.getStreamCount("k"), 0u);
-    EXPECT_EQ(backend.getStreamTotal(), 0u);
+    backend->resetCounts();
+    EXPECT_EQ(backend->getStreamCount("k"), 0u);
+    EXPECT_EQ(backend->getStreamTotal(), 0u);
 }
 
 /// Armed chunking makes this backend serve a stream the way a network-backed store does, in bounded
@@ -665,25 +621,27 @@ TEST(CASCountingBackendShape, AnArmedChunkBoundsTheWindowAStreamHandsOut)
 {
     const String body(10'000, 'x');
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-    ASSERT_EQ(backend->putIfAbsent("run", body).outcome, PutOutcome::Done);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("run", body, Retry::once())));
 
     /// Unarmed: the whole object arrives as one window, which is what this backend's materialization
     /// makes of any stream and exactly what the bound exists to remove.
     {
-        auto opened = backend->getStream("run");
-        ASSERT_TRUE(opened);
+        auto opened = op.stream("run", Retry::once());
+        ASSERT_TRUE(opened != nullptr);
         String drained;
-        readStringUntilEOF(drained, *opened->stream);
+        readStringUntilEOF(drained, *opened);
         EXPECT_EQ(drained, body);
         EXPECT_EQ(backend->largestStreamChunk("run"), 0u) << "nothing records a window while chunking is off";
     }
 
     backend->setStreamChunkForTest(4096);
     {
-        auto opened = backend->getStream("run");
-        ASSERT_TRUE(opened);
+        auto opened = op.stream("run", Retry::once());
+        ASSERT_TRUE(opened != nullptr);
         String drained;
-        readStringUntilEOF(drained, *opened->stream);
+        readStringUntilEOF(drained, *opened);
         EXPECT_EQ(drained, body) << "chunking changes the window, never the bytes";
         EXPECT_EQ(backend->largestStreamChunk("run"), 4096u);
         EXPECT_LT(backend->largestStreamChunk("run"), body.size())
@@ -693,47 +651,47 @@ TEST(CASCountingBackendShape, AnArmedChunkBoundsTheWindowAStreamHandsOut)
     /// The mode outlives a counter reset, and the recorded window does not.
     backend->resetCounts();
     EXPECT_EQ(backend->largestStreamChunk("run"), 0u);
-    auto reopened = backend->getStream("run");
-    ASSERT_TRUE(reopened);
+    auto reopened = op.stream("run", Retry::once());
+    ASSERT_TRUE(reopened != nullptr);
     String again;
-    readStringUntilEOF(again, *reopened->stream);
+    readStringUntilEOF(again, *reopened);
     EXPECT_EQ(backend->largestStreamChunk("run"), 4096u);
 }
 
-/// What makes every request-profile gate in this tree trustworthy: a counter names a PHYSICAL request,
-/// so the same request counts once whichever surface issued it. Before the counters moved onto the
-/// transport primitives a legacy call and a `CasOperation` call landed on different counters, and a
-/// gate written against one was blind to the other.
+/// What makes every request-profile gate in this tree trustworthy: a counter names a PHYSICAL request.
+/// The transport primitives are the only surface left that can issue one, so this now pins that a
+/// create/head/read/replace/remove issued through `CasOperation` counts exactly once each.
 TEST(CASCountingBackendShape, OneRequestIsCountedOnceWhicheverSurfaceIssuedIt)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     DB::Cas::CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     DB::Cas::CasOperation op = requests.admit();
 
-    EXPECT_EQ(backend->putIfAbsent("k", "v").outcome, PutOutcome::Done);   /// legacy create
-    EXPECT_TRUE(std::holds_alternative<Committed>(
-        op.create("k2", "v", Retry::standard())));                        /// the same request, admitted
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k", "v", Retry::standard())));
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k2", "v", Retry::standard())));
     EXPECT_EQ(backend->putCount("k"), 1u);
     EXPECT_EQ(backend->putCount("k2"), 1u);
     EXPECT_EQ(backend->writeTotal(), 2u);
     EXPECT_EQ(backend->putOverwriteTotal(), 0u) << "neither write carried a precondition";
 
-    const Token seen = backend->head("k").token;                          /// legacy head
-    EXPECT_TRUE(op.head("k", Retry::standard()));                         /// admitted head
-    EXPECT_EQ(backend->headCount("k"), 2u);
+    const std::optional<Meta> k_meta = op.head("k", Retry::standard());
+    ASSERT_TRUE(k_meta);
+    EXPECT_EQ(backend->headCount("k"), 1u);
 
-    expectBytes(*backend, "k", "v");                                      /// legacy read
-    EXPECT_TRUE(op.read("k", Retry::standard()));                         /// admitted read
+    expectBytes(*backend, "k", "v");
+    EXPECT_TRUE(op.read("k", Retry::standard()));
     EXPECT_EQ(backend->getCount("k"), 2u);
 
-    EXPECT_EQ(backend->putOverwrite("k", "w", seen).outcome, PutOutcome::Done);
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("k", "w", k_meta->incarnation, Retry::standard())));
     EXPECT_EQ(backend->putOverwriteCount("k"), 1u) << "a write with a precondition is the replace shape";
     EXPECT_EQ(backend->writeCount("k"), 2u);
 
     const std::optional<Meta> k2_meta = op.head("k2", Retry::standard());
     ASSERT_TRUE(k2_meta);
     EXPECT_EQ(op.remove("k2", k2_meta->incarnation, Retry::standard()), Removal::Removed);
-    EXPECT_EQ(backend->deleteExact("k", backend->head("k").token).kind, DeleteOutcome::Kind::Deleted);
+    const std::optional<Meta> k_meta_after = op.head("k", Retry::standard());
+    ASSERT_TRUE(k_meta_after);
+    EXPECT_EQ(op.remove("k", k_meta_after->incarnation, Retry::standard()), Removal::Removed);
     EXPECT_EQ(backend->deleteCount("k"), 1u);
     EXPECT_EQ(backend->deleteCount("k2"), 1u);
     EXPECT_EQ(backend->deleteTotal(), 2u);
@@ -914,12 +872,14 @@ String readStorageObject(const DB::ObjectStoragePtr & storage, const String & ke
 TEST(CASObjectStorageBackend, PublishBlobStreamingUsesOrdinaryDefaultWriteTransport)
 {
     auto storage = makePublicationRecordingStorage();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-    backend.setNativeTokenTypeForTest(Dialect::Generation);
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    backend->setNativeTokenTypeForTest(Dialect::Generation);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/streaming");
 
     const auto request = streamingPublication(destination, "fresh-envelope", "payload", 7);
-    backend.publishBlob(request);
+    op.publish(request, Retry::once());
 
     ASSERT_EQ(storage->write_calls, 1u);
     ASSERT_TRUE(storage->last_write_mode.has_value());
@@ -941,7 +901,9 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedKeepsDestinationCompleteUntilAt
     using namespace std::chrono_literals;
 
     auto storage = makePublicationRecordingStorage();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String key = "publish/emulated-atomic";
     const String physical_key = DB::Cas::tests::nativeKeyUnder(storage, key);
 
@@ -958,7 +920,7 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedKeepsDestinationCompleteUntilAt
     auto opened = barrier->opened.get_future();
     auto publication = std::async(std::launch::async, [&]
     {
-        backend.publishBlob(streamingPublication(key, "fresh-envelope", "payload", 7));
+        op.publish(streamingPublication(key, "fresh-envelope", "payload", 7), Retry::once());
     });
 
     const auto opened_status = opened.wait_for(2s);
@@ -975,7 +937,9 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedKeepsDestinationCompleteUntilAt
 TEST(CASObjectStorageBackend, PublishBlobEmulatedWriteFailurePreservesDestinationAndCleansTemporary)
 {
     auto storage = makePublicationRecordingStorage();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String key = "publish/emulated-failure";
     const String physical_key = DB::Cas::tests::nativeKeyUnder(storage, key);
 
@@ -985,24 +949,26 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedWriteFailurePreservesDestinatio
         DB::writeString(String("old-complete-body"), *out);
         out->finalize();
     }
-    const Token old_token = backend.head(key).token;
+    const Etag old_token = op.head(key, Retry::once())->incarnation;
 
     storage->throw_after_open = true;
     EXPECT_THROW(
-        backend.publishBlob(streamingPublication(key, "fresh-envelope", "payload", 7)),
+        op.publish(streamingPublication(key, "fresh-envelope", "payload", 7), Retry::once()),
         std::runtime_error);
     storage->throw_after_open = false;
 
     EXPECT_NE(storage->last_opened_key, physical_key);
     EXPECT_FALSE(storage->exists(DB::StoredObject(storage->last_opened_key)));
     EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
-    EXPECT_EQ(backend.head(key).token, old_token);
+    EXPECT_EQ(op.head(key, Retry::once())->incarnation, old_token);
 }
 
 TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBeforeVisibility)
 {
     auto storage = makePublicationRecordingStorage();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/mismatch");
 
     {
@@ -1016,7 +982,7 @@ TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBefo
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        backend.publishBlob(streamingPublication(destination, "fresh", "abc", 4));
+        op.publish(streamingPublication(destination, "fresh", "abc", 4), Retry::once());
     });
     EXPECT_EQ(storage->cancel_calls, 1u);
     EXPECT_EQ(storage->finalize_calls, 0u);
@@ -1026,7 +992,7 @@ TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBefo
     auto state = std::make_shared<CountingSourceState>();
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        backend.publishBlob(countedLongPublication(destination, "fresh", 3, 1024, state));
+        op.publish(countedLongPublication(destination, "fresh", 3, 1024, state), Retry::once());
     });
     EXPECT_EQ(state->bytes_exposed, 4u);
     EXPECT_EQ(storage->cancel_calls, 2u);
@@ -1038,7 +1004,9 @@ TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBefo
 TEST(CASObjectStorageBackend, PublishBlobEmulatedLongSourceReadsOnlyDeclaredPayloadAndOneProbeByte)
 {
     auto storage = makePublicationRecordingStorage();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String key = "publish/emulated-long";
     const String physical_key = DB::Cas::tests::nativeKeyUnder(storage, key);
 
@@ -1052,7 +1020,7 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedLongSourceReadsOnlyDeclaredPayl
     auto state = std::make_shared<CountingSourceState>();
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        backend.publishBlob(countedLongPublication(key, "fresh", 3, 1024, state));
+        op.publish(countedLongPublication(key, "fresh", 3, 1024, state), Retry::once());
     });
 
     EXPECT_EQ(state->bytes_exposed, 4u);
@@ -1062,7 +1030,9 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedLongSourceReadsOnlyDeclaredPayl
 TEST(CASObjectStorageBackend, PublishBlobCopiesStagedBytesWithNativeOnlyDefaultRequestMode)
 {
     auto storage = makePublicationRecordingStorage();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String staging = DB::Cas::tests::nativeKeyUnder(storage, "publish/staging");
     const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/copied");
 
@@ -1074,11 +1044,11 @@ TEST(CASObjectStorageBackend, PublishBlobCopiesStagedBytesWithNativeOnlyDefaultR
     }
     storage->resetRecording();
 
-    backend.publishBlob(BlobPublishRequest{
+    op.publish(BlobPublishRequest{
         .destination_key = destination,
         .publication = VerbatimStagedBlobPublication{
             .object_key = staging,
-            .object_size = 22}});
+            .object_size = 22}}, Retry::once());
 
     ASSERT_EQ(storage->copy_calls, 1u);
     ASSERT_TRUE(storage->last_copy_settings.has_value());
@@ -1093,7 +1063,9 @@ TEST(CASObjectStorageBackend, PublishBlobCopiesStagedBytesWithNativeOnlyDefaultR
 TEST(CASObjectStorageBackend, PublishBlobRefusesVerbatimCopyWithoutNativeTransport)
 {
     auto storage = makePublicationRecordingStorage();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String staging = DB::Cas::tests::nativeKeyUnder(storage, "publish/unsupported-staging");
     const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/unsupported-copy");
 
@@ -1108,11 +1080,11 @@ TEST(CASObjectStorageBackend, PublishBlobRefusesVerbatimCopyWithoutNativeTranspo
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]
     {
-        backend.publishBlob(BlobPublishRequest{
+        op.publish(BlobPublishRequest{
             .destination_key = destination,
             .publication = VerbatimStagedBlobPublication{
                 .object_key = staging,
-                .object_size = 22}});
+                .object_size = 22}}, Retry::once());
     });
 
     EXPECT_EQ(storage->copy_calls, 0u);
@@ -1170,17 +1142,17 @@ TEST(CASS3Signal, FinalizeClassifierMapsPreconditionLossExactly)
     };
 
     EXPECT_EQ(classify(DB::S3Exception("412", Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed")),
-              PutOutcome::PreconditionFailed);
+              DB::Cas::detail::ConditionalWriteOutcome::PreconditionLost);
     EXPECT_EQ(classify(DB::S3Exception("404 gone under If-Match", Aws::S3::S3Errors::UNKNOWN, "NoSuchKey")),
-              PutOutcome::PreconditionFailed);
+              DB::Cas::detail::ConditionalWriteOutcome::PreconditionLost);
     EXPECT_EQ(classify(DB::S3Exception("retries exhausted, no name attached", Aws::S3::S3Errors::NO_SUCH_KEY)),
-              PutOutcome::PreconditionFailed);
+              DB::Cas::detail::ConditionalWriteOutcome::PreconditionLost);
 
     ThrowOnFinalizeBuffer unrelated(DB::S3Exception("503", Aws::S3::S3Errors::UNKNOWN, "SlowDown"));
     EXPECT_THROW(finalizeConditionalWrite(unrelated), DB::S3Exception);
 
     ThrowOnFinalizeBuffer clean;
-    EXPECT_EQ(finalizeConditionalWrite(clean), PutOutcome::Done);
+    EXPECT_EQ(finalizeConditionalWrite(clean), DB::Cas::detail::ConditionalWriteOutcome::Applied);
 }
 
 namespace
@@ -1264,18 +1236,17 @@ TEST(CASObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
     /// logical key IS the physical one the fixture wrote and armed.
     const auto fixture = makeThrowOnReadStorageForTest("pool/blobs/ab/abcdef0123456789abcdef0123456789");
 
-    ObjectStorageBackend backend(fixture.storage, ObjectStorageBackend::Mode::Native);
+    auto backend = std::make_shared<ObjectStorageBackend>(fixture.storage, ObjectStorageBackend::Mode::Native);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
 
-    /// `get` HEADs before it reads and answers nullopt for an absent key, so without this the nullopt
-    /// below would be satisfied by an object the fixture failed to place — the mid-GET race would go
-    /// untested and the case would still pass.
-    Backend & iface = backend;
-    ASSERT_TRUE(iface.head(fixture.key).exists);
+    /// `head` answers present for a key the fixture failed to place, so without this the nullopt below
+    /// would be satisfied vacuously — the mid-read race would go untested and the case would still pass.
+    ASSERT_TRUE(op.head(fixture.key, Retry::once()).has_value());
 
     /// HEAD reports the key present; readObject then throws NO_SUCH_KEY.
-    /// Contract: get must return std::nullopt, not propagate the S3Exception.
-    /// Call through the base-class interface so the default `Range{}` arg is available.
-    const auto result = iface.get(fixture.key);
+    /// Contract: read must return std::nullopt, not propagate the S3Exception.
+    const auto result = op.read(fixture.key, Retry::once());
     EXPECT_FALSE(result.has_value());
 }
 
@@ -1291,54 +1262,66 @@ TEST(CASObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
     auto storage = tests::makeLocalObjectStorageForTest();
 
     auto backend1 = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests1 = openRequestsForTest(backend1);
+    CasOperation op1 = requests1.admit();
     /// A throwaway prior mutation on a DIFFERENT key: with the old counter this advances backend1's
     /// process-wide op counter to 1, so "k/restart"'s own mint below lands on 2 — chosen so it collides
     /// with backend2's post-restart recreate mint further down (also its SECOND op; see there).
-    ASSERT_EQ(backend1->putIfAbsent("k/other", "junk").outcome, PutOutcome::Done);
-    ASSERT_EQ(backend1->putIfAbsent("k/restart", "v1").outcome, PutOutcome::Done);
-    const Token stale_token = backend1->head("k/restart").token;
+    ASSERT_TRUE(std::holds_alternative<Committed>(op1.create("k/other", "junk", Retry::once())));
+    const WriteResult restart_create = op1.create("k/restart", "v1", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(restart_create));
+    const Etag stale_token = std::get<Committed>(restart_create).incarnation;
 
     /// Simulate a process restart: a brand-new `ObjectStorageBackend` instance (fresh emu state) over
     /// the SAME underlying storage — exactly what happens when the CAS process restarts.
     auto backend2 = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests2 = openRequestsForTest(backend2);
+    CasOperation op2 = requests2.admit();
 
     /// Delete and recreate the key through the NEW instance — a fresh incarnation with a fresh mtime.
     /// This is backend2's first-ever op (op 1) then a delete (no mint) then the recreate (op 2) — the
     /// same op-index as `stale_token` above under the old counter, so the two textually collide there.
-    const Token current = backend2->head("k/restart").token;
-    ASSERT_EQ(backend2->deleteExact("k/restart", current).kind, DeleteOutcome::Kind::Deleted);
-    ASSERT_EQ(backend2->putIfAbsent("k/restart", "v2-after-restart").outcome, PutOutcome::Done);
+    const auto current = op2.head("k/restart", Retry::once());
+    ASSERT_TRUE(current.has_value());
+    ASSERT_EQ(op2.remove("k/restart", current->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op2.create("k/restart", "v2-after-restart", Retry::once())));
 
-    /// The pre-restart token must NEVER match the post-restart incarnation, however coincidentally a
-    /// process-local counter would have re-minted the identical textual value.
-    const auto stale_delete = backend2->deleteExact("k/restart", stale_token);
-    EXPECT_EQ(stale_delete.kind, DeleteOutcome::Kind::TokenMismatch);
+    /// The pre-restart incarnation must NEVER be usable as a precondition against the post-restart
+    /// backend instance, however coincidentally a process-local counter would have re-minted the
+    /// identical textual value: an `Etag` carries the identity of the backend that observed it, and the
+    /// engine refuses one minted elsewhere before it ever reaches the store (LOGICAL_ERROR), which is a
+    /// STRONGER guarantee than the old bare-value comparison this test used to pin. The underlying
+    /// same-instance mtime-quantum disambiguation this fixture was ALSO probing is covered directly by
+    /// `EmuTokenDisambiguatesSameEtagRewrite`, within one backend instance where the engine's own
+    /// cross-backend check cannot pre-empt it.
+    EXPECT_THROW(op2.remove("k/restart", stale_token, Retry::once()), DB::Exception);
 
     /// The live (post-restart) incarnation must be untouched by the rejected stale delete.
-    EXPECT_TRUE(backend2->head("k/restart").exists);
+    EXPECT_TRUE(op2.head("k/restart", Retry::once()).has_value());
 }
 
-/// codex-review-triage §3.18, finding №18: `list`'s `EmulatedSingleProcess` branch minted its per-key
-/// token via `tokenForList`, which always stamps `native_token_type` (ETag) REGARDLESS of `mode` --
-/// while `head`/`get` mint `Dialect::Emulated`. `Token::operator==` compares type AND value, so a
-/// list-derived token could never satisfy an emulated `deleteExact`/`putOverwrite` expectation: a
-/// fail-safe leak (never a wrong delete), but every consumer of listed tokens (GC namespace cleanup,
-/// `deletePrefixWholesale`, orphan sweep, decommission drain) always saw `TokenMismatch` against a
-/// LOCAL pool. `list` must surface the SAME (type, value) as `head` for the same key.
+/// `list`'s `EmulatedSingleProcess` branch must surface the SAME incarnation value `head` would for the
+/// same key. An earlier defect minted the listed value under the wrong dialect regardless of `mode`,
+/// so a list-derived value could never satisfy an emulated `remove`/`replace` precondition: a
+/// fail-safe leak (never a wrong delete), but every consumer of listed values (GC namespace cleanup,
+/// `deletePrefixWholesale`, orphan sweep, decommission drain) always saw a mismatch against a LOCAL pool.
 TEST(CASObjectStorageBackend, EmulatedListTokenMatchesHeadToken)
 {
     auto backend = std::make_shared<ObjectStorageBackend>(
         tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
 
-    ASSERT_EQ(backend->putIfAbsent("k/listed", "body").outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("k/listed", "body", Retry::once())));
 
-    const Token head_token = backend->head("k/listed").token;
-    ASSERT_EQ(head_token.type, Dialect::Emulated);
+    const auto head = op.head("k/listed", Retry::once());
+    ASSERT_TRUE(head.has_value());
+    ASSERT_EQ(head->incarnation.dialect(), Dialect::Emulated);
 
-    const ListPage page = backend->list("k/", "", /*limit=*/10);
+    const KeyPage page = op.list("k/", "", /*limit=*/10, Retry::once());
     ASSERT_EQ(page.keys.size(), 1u);
-    ASSERT_TRUE(page.keys.front().token.has_value());
-    EXPECT_EQ(*page.keys.front().token, head_token);
+    ASSERT_TRUE(page.keys.front().incarnation.has_value());
+    EXPECT_EQ(*page.keys.front().incarnation, head->incarnation);
 }
 
 namespace
@@ -1384,42 +1367,50 @@ DB::ObjectStoragePtr makeFixedEtagStorageForTest()
 /// the second.
 TEST(CASObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
 {
-    ObjectStorageBackend backend(makeFixedEtagStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    auto backend = std::make_shared<ObjectStorageBackend>(makeFixedEtagStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
 
-    const auto put1 = backend.putIfAbsent("k/tick", "v1");
-    ASSERT_EQ(put1.outcome, PutOutcome::Done);
-    const auto put2 = backend.putOverwrite("k/tick", "v2", put1.token);
-    ASSERT_EQ(put2.outcome, PutOutcome::Done);
+    const WriteResult put1 = op.create("k/tick", "v1", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(put1));
+    const Etag inc1 = std::get<Committed>(put1).incarnation;
+    const WriteResult put2 = op.replace("k/tick", "v2", inc1, Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(put2));
+    const Etag inc2 = std::get<Committed>(put2).incarnation;
 
-    EXPECT_NE(put1.token.value, put2.token.value);
-    EXPECT_EQ(put1.token.type, Dialect::Emulated);
-    EXPECT_EQ(put2.token.type, Dialect::Emulated);
+    EXPECT_NE(inc1, inc2);
+    EXPECT_EQ(inc1.dialect(), Dialect::Emulated);
+    EXPECT_EQ(inc2.dialect(), Dialect::Emulated);
 
-    /// A stale delete using the FIRST incarnation's token must not match the live (second) one.
-    EXPECT_EQ(backend.deleteExact("k/tick", put1.token).kind, DeleteOutcome::Kind::TokenMismatch);
-    EXPECT_TRUE(backend.head("k/tick").exists);
+    /// A stale delete using the FIRST incarnation must not match the live (second) one.
+    EXPECT_EQ(op.remove("k/tick", inc1, Retry::once()), Removal::Mismatch);
+    EXPECT_TRUE(op.head("k/tick", Retry::once()).has_value());
 }
 
 TEST(CASObjectStorageBackend, PublishBlobEmulatedDisambiguatesSameEtagFromStaleDelete)
 {
-    ObjectStorageBackend backend(makeFixedEtagStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    auto backend = std::make_shared<ObjectStorageBackend>(makeFixedEtagStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const String key = "k/publish-tick";
 
-    ASSERT_EQ(backend.putIfAbsent(key, "old-complete-body").outcome, PutOutcome::Done);
-    const Token stale_token = backend.head(key).token;
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create(key, "old-complete-body", Retry::once())));
+    const auto stale = op.head(key, Retry::once());
+    ASSERT_TRUE(stale.has_value());
+    const Etag stale_token = stale->incarnation;
 
-    backend.publishBlob(streamingPublication(key, "fresh-envelope", "payload", 7));
+    op.publish(streamingPublication(key, "fresh-envelope", "payload", 7), Retry::once());
 
-    const HeadResult published = backend.head(key);
-    ASSERT_TRUE(published.exists);
-    EXPECT_NE(published.token, stale_token);
-    EXPECT_EQ(published.token.type, Dialect::Emulated);
-    EXPECT_EQ(backend.deleteExact(key, stale_token).kind, DeleteOutcome::Kind::TokenMismatch);
+    const auto published = op.head(key, Retry::once());
+    ASSERT_TRUE(published.has_value());
+    EXPECT_NE(published->incarnation, stale_token);
+    EXPECT_EQ(published->incarnation.dialect(), Dialect::Emulated);
+    EXPECT_EQ(op.remove(key, stale_token, Retry::once()), Removal::Mismatch);
 
-    const auto live = backend.get(key);
+    const auto live = op.read(key, Retry::once());
     ASSERT_TRUE(live.has_value());
     EXPECT_EQ(live->bytes, "fresh-envelopepayload");
-    EXPECT_EQ(live->token, published.token);
+    EXPECT_EQ(live->incarnation, published->incarnation);
 }
 
 namespace
@@ -1511,17 +1502,20 @@ TEST(CASObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfor
     /// etag, no disambiguator) rather than a same-quantum tie with the just-consumed delete token.
     {
         const String old_etag = "1000000000000000000";
-        ObjectStorageBackend backend(makeFixedNumericEtagStorageForTest(old_etag), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+        auto backend = std::make_shared<ObjectStorageBackend>(makeFixedNumericEtagStorageForTest(old_etag), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
 
-        const auto put1 = backend.putIfAbsent("k/old", "v1");
-        ASSERT_EQ(put1.outcome, PutOutcome::Done);
-        ASSERT_EQ(put1.token.value, old_etag);
-        ASSERT_EQ(backend.deleteExact("k/old", put1.token).kind, DeleteOutcome::Kind::Deleted);
+        const WriteResult put1 = op.create("k/old", "v1", Retry::once());
+        ASSERT_TRUE(std::holds_alternative<Committed>(put1));
+        ASSERT_EQ(PersistedEtag::capture(std::get<Committed>(put1).incarnation).value, old_etag);
+        ASSERT_EQ(op.remove("k/old", std::get<Committed>(put1).incarnation, Retry::once()), Removal::Removed);
 
-        const auto put2 = backend.putIfAbsent("k/old", "v2");
-        ASSERT_EQ(put2.outcome, PutOutcome::Done);
-        EXPECT_EQ(put2.token.value, old_etag) << "entry should have been erased on delete (etag comfortably old), "
-                                                  "so the recreate mints the bare etag, not a disambiguated one";
+        const WriteResult put2 = op.create("k/old", "v2", Retry::once());
+        ASSERT_TRUE(std::holds_alternative<Committed>(put2));
+        EXPECT_EQ(PersistedEtag::capture(std::get<Committed>(put2).incarnation).value, old_etag)
+            << "entry should have been erased on delete (etag comfortably old), "
+               "so the recreate mints the bare etag, not a disambiguated one";
     }
 
     /// An etag within the safety margin of "now": delete must RETAIN the entry, so the same
@@ -1530,17 +1524,20 @@ TEST(CASObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfor
         const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         const String recent_etag = std::to_string(now_ns);
-        ObjectStorageBackend backend(makeFixedNumericEtagStorageForTest(recent_etag), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+        auto backend = std::make_shared<ObjectStorageBackend>(makeFixedNumericEtagStorageForTest(recent_etag), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+        CasRequests requests = openRequestsForTest(backend);
+        CasOperation op = requests.admit();
 
-        const auto put1 = backend.putIfAbsent("k/fresh", "v1");
-        ASSERT_EQ(put1.outcome, PutOutcome::Done);
-        ASSERT_EQ(put1.token.value, recent_etag);
-        ASSERT_EQ(backend.deleteExact("k/fresh", put1.token).kind, DeleteOutcome::Kind::Deleted);
+        const WriteResult put1 = op.create("k/fresh", "v1", Retry::once());
+        ASSERT_TRUE(std::holds_alternative<Committed>(put1));
+        ASSERT_EQ(PersistedEtag::capture(std::get<Committed>(put1).incarnation).value, recent_etag);
+        ASSERT_EQ(op.remove("k/fresh", std::get<Committed>(put1).incarnation, Retry::once()), Removal::Removed);
 
-        const auto put2 = backend.putIfAbsent("k/fresh", "v2");
-        ASSERT_EQ(put2.outcome, PutOutcome::Done);
-        EXPECT_EQ(put2.token.value, recent_etag + "#1") << "entry should have been RETAINED on delete (etag recent), "
-                                                            "so the recreate is disambiguated against it";
+        const WriteResult put2 = op.create("k/fresh", "v2", Retry::once());
+        ASSERT_TRUE(std::holds_alternative<Committed>(put2));
+        EXPECT_EQ(PersistedEtag::capture(std::get<Committed>(put2).incarnation).value, recent_etag + "#1")
+            << "entry should have been RETAINED on delete (etag recent), "
+               "so the recreate is disambiguated against it";
     }
 }
 
@@ -1552,160 +1549,52 @@ TEST(CASObjectStorageBackend, EmuTokenStateEventuallyPrunesDistinctShortLivedKey
     constexpr size_t expected_recent_key_bound = 24;
 
     auto now_ns = std::make_shared<std::atomic<uint64_t>>(start_ns);
-    ObjectStorageBackend backend(makeClockEtagStorageForTest(now_ns), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    auto backend = std::make_shared<ObjectStorageBackend>(makeClockEtagStorageForTest(now_ns), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
 
     for (size_t i = 0; i < key_count; ++i)
     {
         const uint64_t current_ns = start_ns + i * step_ns;
         now_ns->store(current_ns);
-        backend.setEmuNowNsForTest(current_ns);
+        backend->setEmuNowNsForTest(current_ns);
 
         const String key = "k/short-lived-" + std::to_string(i);
-        const auto put = backend.putIfAbsent(key, "body");
-        ASSERT_EQ(put.outcome, PutOutcome::Done);
-        ASSERT_EQ(backend.deleteExact(key, put.token).kind, DeleteOutcome::Kind::Deleted);
+        const WriteResult put = op.create(key, "body", Retry::once());
+        ASSERT_TRUE(std::holds_alternative<Committed>(put));
+        ASSERT_EQ(op.remove(key, std::get<Committed>(put).incarnation, Retry::once()), Removal::Removed);
     }
 
     const uint64_t sweep_ns = start_ns + key_count * step_ns + 2'000'000'000ULL;
     now_ns->store(sweep_ns);
-    backend.setEmuNowNsForTest(sweep_ns);
-    const auto trigger = backend.putIfAbsent("k/sweep-trigger", "body");
-    ASSERT_EQ(trigger.outcome, PutOutcome::Done);
-    ASSERT_EQ(backend.deleteExact("k/sweep-trigger", trigger.token).kind, DeleteOutcome::Kind::Deleted);
+    backend->setEmuNowNsForTest(sweep_ns);
+    const WriteResult trigger = op.create("k/sweep-trigger", "body", Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(trigger));
+    ASSERT_EQ(op.remove("k/sweep-trigger", std::get<Committed>(trigger).incarnation, Retry::once()), Removal::Removed);
 
-    EXPECT_LE(backend.emuTokenStateSizeForTest(), expected_recent_key_bound)
+    EXPECT_LE(backend->emuTokenStateSizeForTest(), expected_recent_key_bound)
         << "token state should track only the bounded recent-key window, not all " << key_count << " deleted keys";
 }
 
-namespace
-{
 
-/// A `LocalObjectStorage` that counts `writeObject`/`removeObjectIfTokenMatches` calls -- used to
-/// prove that a wrong-dialect expected token is rejected LOCALLY, before anything reaches the wire.
-class CallCountingObjectStorage final : public DB::LocalObjectStorage
-{
-public:
-    using DB::LocalObjectStorage::LocalObjectStorage;
-
-    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
-        const DB::StoredObject & object,
-        DB::WriteMode mode,
-        std::optional<DB::ObjectAttributes> attributes,
-        size_t buf_size,
-        const DB::WriteSettings & write_settings) override
-    {
-        ++write_calls;
-        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
-    }
-
-    DB::ConditionalRemoveResult removeObjectIfTokenMatches(const DB::StoredObject & object, const std::string & etag) override
-    {
-        ++remove_if_matches_calls;
-        return DB::LocalObjectStorage::removeObjectIfTokenMatches(object, etag);
-    }
-
-    std::atomic<int> write_calls{0};
-    std::atomic<int> remove_if_matches_calls{0};
-};
-
-DB::ObjectStoragePtr makeCallCountingStorageForTest()
-{
-    static std::atomic<uint64_t> counter{0};
-    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
-    const auto root = (std::filesystem::temp_directory_path() / ("cas_call_counting_unit_" + unique)).string();
-
-    std::error_code ec;
-    std::filesystem::remove_all(root, ec);
-    std::filesystem::create_directories(root, ec);
-
-    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<CallCountingObjectStorage>(std::move(settings));
-}
-
-}
-
-/// codex-review-triage §3.18, finding №19: Native-mode conditional mutations forward only
-/// `Token::value` to the wire (`object_storage_write_if_match` / `removeObjectIfTokenMatches`),
-/// blind to `Token::type`. A wrong-dialect token whose VALUE happens to equal the live incarnation's
-/// must be rejected LOCALLY -- before any wire call is made -- never merely rely on the remote
-/// backend to reject a foreign-dialect value it was never designed to compare.
-TEST(CASObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWire)
-{
-    auto storage = std::static_pointer_cast<CallCountingObjectStorage>(makeCallCountingStorageForTest());
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-
-    /// Placed through the object storage rather than through the backend: a Native write over a local
-    /// storage has no response incarnation to attribute itself to. Native passes the key to the
-    /// storage verbatim, so this is the same object the backend reads below -- anchored under the
-    /// storage's own root, since a bare relative key would resolve beside the test process.
-    const String key = DB::Cas::tests::nativeKeyUnder(storage, "k/dialect");
-    {
-        auto out = storage->writeObject(
-            DB::StoredObject(key), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
-        DB::writeString(String("v1"), *out);
-        out->finalize();
-    }
-    const Token live = backend.head(key).token;
-    ASSERT_EQ(live.type, Dialect::ETag);
-
-    storage->write_calls = 0;
-    storage->remove_if_matches_calls = 0;
-
-    /// Same wire VALUE, wrong dialect TYPE (Emulated instead of this backend's native ETag dialect).
-    const Token wrong_type_token{live.value, Dialect::Emulated};
-
-    EXPECT_EQ(backend.putOverwrite(key, "v2", wrong_type_token).outcome, PutOutcome::PreconditionFailed);
-    EXPECT_EQ(backend.casPut(key, "v2", wrong_type_token).outcome, CasOutcome::Conflict);
-    EXPECT_EQ(backend.deleteExact(key, wrong_type_token).kind, DeleteOutcome::Kind::TokenMismatch);
-
-    EXPECT_EQ(storage->write_calls.load(), 0);
-    EXPECT_EQ(storage->remove_if_matches_calls.load(), 0);
-
-    /// The live incarnation must be untouched by all three rejected attempts.
-    EXPECT_EQ(backend.head(key).token, live);
-}
-
-/// The incarnation grammar: an empty, wildcard or list token would turn a conditional mutation into
-/// an unconditional one, so every mutation refuses it as a caller bug (LOGICAL_ERROR) rather than
-/// forwarding it to the wire or the emu compare -- distinct from a WRONG-dialect token (see
-/// NativeRejectsWrongDialectTokenBeforeTouchingTheWire above), which is a graceful non-match, not a
-/// malformed value. Under a debug or sanitizer build, constructing a LOGICAL_ERROR exception ABORTS
-/// at construction (Exception::handle_error_code), so the same table is asserted as a death
-/// expectation there instead; the contract ("a malformed token is refused") is what both forms pin.
-#ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CASBackendGrammar, RejectsEmptyStarAndListTokensOnEveryMutation)
-{
-    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-
-    const DB::Cas::Token empty{"", DB::Cas::Dialect::ETag};
-    const DB::Cas::Token star{"*", DB::Cas::Dialect::ETag};
-    const DB::Cas::Token list{"\"a\", \"b\"", DB::Cas::Dialect::ETag};
-    for (const auto & bad : {empty, star, list})
-    {
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { backend.putOverwrite("k", "v", bad); });
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { backend.casPut("k", "v", bad); });
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { backend.deleteExact("k", bad); });
-    }
-}
-#endif
-
-#if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CASBackendGrammarDeathTest, RejectsEmptyStarAndListTokensOnEveryMutation)
-{
-    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
-
-    const DB::Cas::Token empty{"", DB::Cas::Dialect::ETag};
-    const DB::Cas::Token star{"*", DB::Cas::Dialect::ETag};
-    const DB::Cas::Token list{"\"a\", \"b\"", DB::Cas::Dialect::ETag};
-    for (const auto & bad : {empty, star, list})
-    {
-        EXPECT_DEATH({ (void)backend.putOverwrite("k", "v", bad); }, "");
-        EXPECT_DEATH({ (void)backend.casPut("k", "v", bad); }, "");
-        EXPECT_DEATH({ (void)backend.deleteExact("k", bad); }, "");
-    }
-}
-#endif
+/// `NativeRejectsWrongDialectTokenBeforeTouchingTheWire` is deleted here: it built a `Token{value,
+/// Dialect::Emulated}` holding a NATIVE backend's live wire value under the WRONG dialect tag, to prove
+/// the mismatch was caught locally rather than forwarded to the wire. `Etag` no longer admits that
+/// construction -- it is minted ONLY by `CasRequests::mint`/`tryMint`, always from `backend->dialect()`,
+/// so a caller can never hold an `Etag` tagged with a dialect other than the backend that observed it.
+/// The property this test pinned ("a value observed under one dialect can never be mistaken for another
+/// backend's incarnation") is now enforced by the type itself rather than by a runtime comparison; see
+/// `CasRequests::valueFor`'s backend-identity check (also exercised, from the other side, by
+/// `EmuTokenSurvivesProcessRestartAcrossRecreate` above).
+///
+/// `CASBackendGrammar.RejectsEmptyStarAndListTokensOnEveryMutation` and its
+/// `CASBackendGrammarDeathTest` sibling are deleted for the same reason: they built literal
+/// `Token{"", ...}` / `Token{"*", ...}` / `Token{"\"a\", \"b\"", ...}` values to drive `putOverwrite`/
+/// `casPut`/`deleteExact` into the primitive's `LOGICAL_ERROR` grammar guard. `Etag::mint`/`tryMint`
+/// refuse to construct an `Etag` from a malformed value in the first place (`CORRUPTED_DATA`), so no
+/// caller reaching the primitives through `CasOperation` can ever hold one -- the grammar guard inside
+/// `ObjectStorageBackend::write`/`removeUnder` is unreachable from the public engine surface and stays
+/// as defense in depth only. The grammar predicate itself remains directly pinned by
+/// `CASBackendGrammar.GenerationDialectAcceptsOnlyCanonicalPositiveDecimal` above.
 
 #endif
