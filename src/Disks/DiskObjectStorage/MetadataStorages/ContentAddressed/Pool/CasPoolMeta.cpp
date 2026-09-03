@@ -118,10 +118,17 @@ PoolMeta PoolMeta::createOrValidate(
     const String key = layout.poolMetaKey();
 
     /// Present => the pool is authoritative; ignore the passed config's blob_header_len and run the
-    /// flag-gated admission check rather than the old single-value fail-close. `admitOrValidate` reads
-    /// the key itself, so this probe only needs to know whether it exists.
-    if (op.read(key, Retry::standard()))
+    /// flag-gated admission check rather than the old single-value fail-close. The steady state (the
+    /// configured algo is already admitted) is decided from THIS read, so the common open costs one
+    /// GET; only a union or a `!allow_new` refusal falls through to `admitOrValidate`, which re-reads
+    /// the key itself as part of its own conditional write.
+    if (auto existing = op.read(key, Retry::standard()))
+    {
+        PoolMeta pm = decodePoolMeta(existing->bytes);
+        if (isAlgoAdmittedIn(pm, blob_hash_algo))
+            return pm;
         return admitOrValidate(op, key, blob_hash_algo, allow_new);
+    }
 
     /// Absent => mint a pool id and try to create the object with `algos_used = {blob_hash_algo}`.
     /// Every pool this build creates is schema-3-shaped from birth (schemas 1/2 do not exist in this

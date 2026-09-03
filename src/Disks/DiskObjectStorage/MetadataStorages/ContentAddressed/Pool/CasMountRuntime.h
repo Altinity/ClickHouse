@@ -1,5 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
@@ -98,8 +100,9 @@ struct MountConfig
     std::function<void()> terminal_publication_driver_lock_acquired_hook_for_test = {};
     /// Deterministic failure injection at the vanished-reason preparation boundary.
     std::function<void()> vanished_reason_prepare_hook_for_test = {};
-    /// Test-only override for exact pre/post-send controller gate interleavings.
-    std::function<CasOverwriteStopCause()> renewal_stop_cause_for_test = {};
+    /// Test-only override of the renewal's liveness predicate, for exact pre/post-send gate
+    /// interleavings. FALSE ends the renewal exactly as a lost fence does.
+    std::function<bool()> renewal_live_for_test = {};
 };
 
 /// Local, in-memory write fence. It is deliberately not checked by reading the object store for every
@@ -136,6 +139,10 @@ class CasMountRuntime
 public:
     CasMountRuntime(
         BackendPtr backend_ptr_,
+        /// The two planes the `MountLeaseKeeper` runs on: renewals under the mount fence, the farewell
+        /// on an open one. Owned by `Pool` and outliving this runtime.
+        CasRequests & mount_requests_,
+        CasRequests & farewell_requests_,
         const Layout & layout_,
         MountConfig config_,
         String server_root_id_,
@@ -295,6 +302,13 @@ public:
     /// it cannot plausibly finish before the fence expires.
     bool refAppendFenceOk() const;
 
+    /// The mount fence's admission verdict, as `Fence::admit` expects it: may a request admitted under
+    /// `admitted_generation`, still expected to be running `needed_ms` from now, proceed?
+    /// `LostOrRearmed` when the fence is latched lost or a fresh lease incarnation replaced the one the
+    /// caller was admitted under; `NoBudget` when the live lease has no room left for `needed_ms` plus
+    /// the safety margin, so nothing is begun that could land after this node's fence may be gone.
+    Fence::Admit admit(uint64_t admitted_generation, uint64_t needed_ms) const;
+
     /// The `writer_epoch` of the live mount incarnation. Bumped by `tryRemountOnce` (self-remount after a
     /// GC fence-out) — a `PartWriteTxn` minted under an older epoch fails closed on its next step.
     uint64_t liveWriterEpoch() const { return live_writer_epoch.load(std::memory_order_acquire); }
@@ -398,8 +412,12 @@ private:
     void renewalLoop();
     void remountLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
-    CasOverwriteStopCause renewalStopCause(bool worker_call) const;
-    bool waitForRetry(uint64_t wait_ms, bool worker_call);
+    /// The renewal's liveness: facts the mount fence cannot see -- a shutdown request, a parked or
+    /// park-requested driver, a pool that left `Live`. FALSE ends the renewal.
+    bool renewalLive(bool worker_call) const;
+    /// Whether this node has already been asked to stop. Sampled ONCE, before the write, so a refusal
+    /// caused by the stop cannot be mistaken for one that preceded it.
+    bool renewalCancelled() const;
     void tripFenceWithoutOperationalLoss();
     std::unique_lock<std::mutex> lockTerminalPublication();
 
@@ -418,6 +436,8 @@ private:
 
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     BackendPtr backend_ptr;
+    CasRequests & mount_requests;
+    CasRequests & farewell_requests;
     const Layout & layout;
     MountConfig config;
     String server_root_id;

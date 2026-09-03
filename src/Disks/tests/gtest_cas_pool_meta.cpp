@@ -7,10 +7,19 @@
 #include <utility>
 #include <vector>
 
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int NETWORK_ERROR;
+}
+}
+
 using namespace DB::Cas;
 
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::FakeClock;
+using DB::Cas::tests::expectThrowsCode;
 
 namespace
 {
@@ -39,6 +48,7 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
     /// content, so the object's incarnation moves under every attempt and admission of a new algo
     /// never lands. `putOverwrite` mints a fresh incarnation even though the bytes are unchanged.
     const String key = layout.poolMetaKey();
+    EXPECT_TRUE(clock.sleeps.empty());   /// nothing paced yet -- the trailing check below is about THIS call
     bool inside_hook = false;
     backend->onBeforeWrite(key, [&]
     {
@@ -50,12 +60,17 @@ TEST(CASPoolMeta, AdmitOrValidateEndsAtTheDeadlineUnderPerpetualConflict)
         inside_hook = false;
     });
 
+    /// `orThrow`'s `GaveUp{Deadline}` arm throws exactly `NETWORK_ERROR` (`throwCasWriteRetryLater`),
+    /// pinning the deadline outcome apart from the two failures a wrong migration could also throw as
+    /// a `DB::Exception` here: `LOGICAL_ERROR` (the absence branch) or `BAD_ARGUMENTS` (`allow_new`
+    /// plumbing regressed).
     auto admit_op = requests.admit();
-    EXPECT_THROW(
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
         (void)PoolMeta::createOrValidate(
             admit_op, layout, 256, /*gc_shards=*/1,
-            BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*allow_mint=*/false),
-        DB::Exception);
+            BlobHashAlgo::XXH3_128, /*allow_new=*/true, /*allow_mint=*/false);
+    });
     /// Bounded by the deadline, not a live-lock: it paced its retries rather than spinning.
     EXPECT_FALSE(clock.sleeps.empty());
 }

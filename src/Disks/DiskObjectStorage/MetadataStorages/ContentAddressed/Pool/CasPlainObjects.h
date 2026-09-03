@@ -66,14 +66,15 @@ public:
     /// attempting to read a directory as an object.
     bool mountpointObjectExists(const String & key);
 
-    /// Removes the current path-mirrored mountpoint-object incarnation, if present, using exact-token
-    /// deletion so a concurrent rewrite remains intact.
+    /// Removes the current path-mirrored mountpoint-object incarnation, if present, using
+    /// `removeCurrent`'s re-head-and-retry so a concurrent rewrite remains intact.
     void removeMountpointObject(const String & key);
 
 private:
     /// Creates or conditionally replaces one raw object. The write always sends `bytes` regardless of
-    /// what is currently there (HEAD only, never a body read) and retries a lost precondition under the
-    /// engine's own bound; an exhausted retry or a store refusal is propagated as an exception.
+    /// what is currently there, settling a refused precondition with a HEAD; only an ambiguous attempt
+    /// reads the body, because only the bytes can prove it landed. Retries a lost precondition under
+    /// the engine's own bound; an exhausted retry or a store refusal is propagated as an exception.
     void casPutObject(const String & full_key, const String & bytes);
 
     /// Reads one raw object by its complete backend key and returns `nullopt` when it is absent.

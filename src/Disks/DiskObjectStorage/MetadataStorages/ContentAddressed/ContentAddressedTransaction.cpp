@@ -289,7 +289,8 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
             const uint64_t payload_size = pb.size;
             source.open = [store, staging_key, header_len, payload_size]() -> std::unique_ptr<ReadBuffer>
             {
-                auto staged = store->backend().getStream(staging_key);
+                Cas::CasOperation op = store->mountRequests().admit();
+                auto staged = op.stream(staging_key, Cas::Retry::standard());
                 if (!staged)
                     throw Exception(
                         ErrorCodes::FILE_DOESNT_EXIST,
@@ -297,7 +298,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
                         staging_key);
 
                 String encoded_header(header_len, '\0');
-                staged->stream->readStrict(encoded_header.data(), encoded_header.size());
+                staged->readStrict(encoded_header.data(), encoded_header.size());
                 const Cas::EnvelopeHeader decoded = Cas::decodeEnvelopeHeader(
                     encoded_header,
                     header_len + payload_size,
@@ -309,7 +310,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
                         staging_key,
                         decoded.header_len,
                         header_len);
-                return std::move(staged->stream);
+                return staged;
             };
         }
         else
@@ -906,10 +907,12 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// buffer writes this header first, UNHASHED and excluded from the reported size, so the
             /// content key stays the pool's hash of `payload` and `blob_size` stays the payload size.
             std::string envelope_header = buildS3StagingBlobHeader(*r);
-            /// rev.7 [C2]: capture the fence generation now, re-checked immediately before the durable
-            /// `sink->finalize()` in `finalizeImpl` (the streaming upload becomes durable there).
+            /// The staged upload becomes durable in `sink->finalize()`, outside this request contract by
+            /// design, so its admission is re-checked there through the callback below. The generation
+            /// comes off the operation that admitted it, so the two can never name different
+            /// incarnations.
             const Cas::PoolPtr pool = metadata_storage.store();
-            const uint64_t admitted_generation = pool->fenceGeneration();
+            const uint64_t admitted_generation = pool->mountRequests().admit().generation();
             return std::make_unique<Cas::CaContentWriteBuffer>(
                 std::move(object_sink),
                 staging_key,

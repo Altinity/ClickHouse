@@ -10,6 +10,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasManifestReader.h>
@@ -709,22 +710,36 @@ public:
     const PoolMeta & poolMeta() const { return meta; }
     const Layout & layout() const { return pool_layout; }
     Backend & backend() { return *pool_backend; }
+
+    /// ---- the three request planes ----
+    /// The mount plane: the durable writes whose right to land IS this node's mount lease. An
+    /// operation admitted here is refused the moment the fence trips, is re-armed under a fresh lease
+    /// incarnation, or runs out of room before the lease expires.
+    CasRequests & mountRequests() { return mount_requests; }
+    /// The farewell plane, on an open fence. Releasing the lease is the last thing a departing mount
+    /// does, and refusing it because the mount fence has already run down would leave the slot looking
+    /// live until GC fences it out.
+    CasRequests & farewellRequests() { return farewell_requests; }
+    /// The open-fence plane: GC, the offline tools, this pool's own reads, and the bootstrap-control
+    /// claims. None of them hold a mount lease -- the claims are what ESTABLISHES one, so gating them
+    /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
+    /// reclaim.
+    CasRequests & gcRequests() { return gc_requests; }
     /// The owning `BackendPtr` itself (not just a reference into it): the decommission slot-retirement
     /// decommission step (`CasDecommission.cpp`) must keep the backend alive across `admin.reset()` -- the graceful
     /// close that stamps the mount's farewell -- to physically delete the control objects afterward. A
     /// bare `Backend &` from `backend()` would dangle the instant the owning `Pool` is destroyed.
     BackendPtr poolBackendPtr() const { return pool_backend; }
 
-    /// Staging PUT surface for `PartWriteTxn`: the methods wrap the ref-ledger's retry controller
-    /// AND the ref-lane fence predicate, so `PartWriteTxn` reaches neither directly (the `friend` is gone).
-    /// Behavior-identical to the previously-inlined controller+fence at CasPartWriteTxn.cpp stageManifest /
-    /// mutable marker writes; thin delegates to `ref_ledger`.
-    CasWriteOutcome stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token = nullptr);
-    /// Same retry/fence policy as `stagingPutIfAbsent`, for a mutable If-Match overwrite.
-    CasOverwriteResult stagingConditionalOverwrite(std::string_view key, std::string_view bytes, const Token & expected);
+    /// Staging write surface for `PartWriteTxn`: thin delegates onto the ref ledger, so a staging write
+    /// is admitted on the same plane and under the same policy as a ref-lane write and `PartWriteTxn`
+    /// reaches neither directly.
+    WriteResult stagingPutIfAbsent(const String & key, const String & bytes);
+    /// Same retry/fence policy as `stagingPutIfAbsent`, for a mutable exact-incarnation overwrite.
+    WriteResult stagingConditionalOverwrite(const String & key, const String & bytes, const Incarnation & expected);
     /// Same retry/fence policy as `stagingPutIfAbsent`, for a mutable marker where an existing
-    /// DIFFERENT value at the key is a normal Conflict outcome, not corruption.
-    CasOverwriteResult stagingPutIfAbsentMutable(std::string_view key, std::string_view bytes);
+    /// DIFFERENT value at the key is a normal `Conflict`, not corruption.
+    WriteResult stagingPutIfAbsentMutable(const String & key, const String & bytes);
 
     /// CAS mixed-algo pools:
     /// the NODE-LOCAL algo this Pool mints NEW content with (`PoolConfig::blob_hash_algo` -- never
@@ -1111,6 +1126,13 @@ private:
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
+
+    /// The three planes' engines, declared before every component that is handed one and after the
+    /// config they take their clock from. `mutable` because issuing a request is not a change to the
+    /// pool: a `const` observer still has to read the store.
+    mutable CasRequests mount_requests;
+    mutable CasRequests farewell_requests;
+    mutable CasRequests gc_requests;
 
     std::shared_ptr<DetachedRegistryState> detached_work = std::make_shared<DetachedRegistryState>();
 
