@@ -140,7 +140,8 @@ void assertPartReads(
     const auto * entry = findEntry(manifest.entries, path);
     ASSERT_TRUE(entry != nullptr);
     auto loc = s->locate(*entry);
-    auto got = b->get(loc.key);
+    DB::Cas::tests::OperationForTest op(*b);
+    auto got = (*op).read(loc.key, Retry::once());
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->bytes.substr(static_cast<size_t>(loc.offset), static_cast<size_t>(loc.length)), payload);
 }
@@ -392,8 +393,11 @@ TEST(CASProtocol, AbandonLeavesDebrisAndDisables)
 
     /// Both bodies remain as debris: once the manifest has named a durable precommit edge, its body
     /// must survive until GC folds the matching owner removal.
-    EXPECT_TRUE(b->head(s->layout().blobKey(blob.ref)).exists);
-    EXPECT_TRUE(b->head(s->layout().manifestKey(id)).exists);
+    {
+        DB::Cas::tests::OperationForTest op(*b);
+        EXPECT_TRUE((*op).head(s->layout().blobKey(blob.ref), Retry::once()).has_value());
+        EXPECT_TRUE((*op).head(s->layout().manifestKey(id), Retry::once()).has_value());
+    }
     EXPECT_TRUE(s->listRefs(ns).empty());
 
     /// Further build ops ⇒ LOGICAL_ERROR (requireAlive).
@@ -538,15 +542,16 @@ TEST(CASProtocol, NewNamespacePublishGatedByShardFenceFloor)
     build_a.reset();
     s->renewWatermarkOnce();
     Gc gc(s, hexToU128("00000000000000000000000000000001"));
+    DB::Cas::tests::OperationForTest blob_op(*b);
     for (size_t r = 0; r < 16; ++r)
     {
         const RoundReport rep = DB::Cas::tests::runRegularRoundReclaiming(gc);
         s->renewWatermarkOnce();
-        if (!b->head(blob_key).exists)
+        if (!(*blob_op).head(blob_key, Retry::once()).has_value())
             break;
     }
     /// The blob (unreachable) was deleted at t0.
-    EXPECT_FALSE(b->head(blob_key).exists);
+    EXPECT_FALSE((*blob_op).head(blob_key, Retry::once()).has_value());
 
     /// 4. build B publishes into a BRAND-NEW namespace. §4 manifest-trust: the adopted leaf is trusted at
     /// promote (no probe) ⇒ promote SUCCEEDS and commits a manifest naming the deleted blob (the dangle).
