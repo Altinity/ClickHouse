@@ -48,7 +48,8 @@ public:
         if (!ca->isReadOnly())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: open the CA disk read-only");
 
-        const auto got = ca->store()->backend().get(key);
+        Cas::CasOperation op = ca->store()->openRequests().admit();
+        const auto got = op.read(key, Cas::Retry::standard());
         if (!got)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: key '{}' does not exist", key);
 
@@ -61,7 +62,7 @@ public:
             life_id = *parsed_ckpt;
         if (life_id)
         {
-            const Cas::CasRefCatalog::Snapshot cut = Cas::CasRefCatalog::read(ca->store()->backend(), layout);
+            const Cas::CasRefCatalog::Snapshot cut = Cas::CasRefCatalog::read(op, layout);
             resolved_life = cut.life_index.resolve(*life_id);
         }
 
