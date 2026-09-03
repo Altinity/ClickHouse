@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
@@ -23,8 +24,6 @@
 #if USE_AWS_S3
 #include <IO/S3Common.h>
 #endif
-
-#include <boost/algorithm/string/trim.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -136,26 +135,7 @@ void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 
 bool ObjectStorageBackend::isValidTokenValue(TokenType type, const String & value)
 {
-    switch (type)
-    {
-        case TokenType::Generation:
-        {
-            if (value.empty() || value == "0")
-                return false;
-            if (value.size() > 1 && value.front() == '0')
-                return false;
-            return std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; });
-        }
-        case TokenType::ETag:
-        {
-            String trimmed = value;
-            boost::algorithm::trim(trimmed);
-            return !trimmed.empty() && trimmed != "*" && trimmed.find(',') == String::npos;
-        }
-        case TokenType::Emulated:
-            return !value.empty();
-    }
-    return false;
+    return isIncarnationValue(type, value);
 }
 
 std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
