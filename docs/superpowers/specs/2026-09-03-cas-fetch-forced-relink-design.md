@@ -9,12 +9,14 @@ doc_type: 'design'
 
 # CAS forced relink on fetch design {#cas-fetch-forced-relink-design}
 
-Status: revision 2 of 2026-09-03. Revision 1 was the design agreed in the brainstorming interview;
-revision 2 folds in the codex review of the same day (`tmp/codex_review_forced_relink.md`, verdict
-"approve with changes"): the candidate predicate is a content-addressed liveness snapshot rather than
-`isBroken`, the TTL test's SQL and choreography are corrected, the byte-fallback and read-only
-claims are qualified, aliases of one mount are deduplicated, and the verification plan gains unit
-vectors and three cheap integration cases. Line references are against `cas-gc-rebuild` at
+Status: revision 3 of 2026-09-03. Revision 1 was the design agreed in the brainstorming interview;
+revision 2 folded in the codex review of the same day (`tmp/codex_review_forced_relink.md`, verdict
+"approve with changes"): the TTL test's SQL and choreography corrected, the byte-fallback and
+read-only claims qualified, aliases of one mount deduplicated, unit vectors and three cheap
+integration cases added. Revision 3 is the user's answer to the one question revision 2 had decided
+on its own: a pool disk that is not live is NOT excluded from placement — the fetch fails closed and
+is retried, exactly as a single-disk policy behaves today — so the liveness predicate revision 2
+proposed (`canAcceptRelink`) is gone, and the sender-side alias dedupe is confirmed in scope. Line references are against `cas-gc-rebuild` at
 `9be5befc3ec`. Backlog items this closes or touches: `[relink-advertises-only-first-ca-pool]`
 (CAS-134) in [`BACKLOG/replication.md`](/superpowers/cas/backlog/replication) is closed by it;
 `[mixed-ca-tiered-topology]` in `BACKLOG/formats-and-storage.md` gets its fetch-path answer; the two
@@ -50,7 +52,7 @@ The interview settled these; the design below follows from them and does not reo
 | Relink versus the policy's own placement (volume order, JBOD balancing, `max_data_part_size_bytes`)? | Relink wins outright. If the policy has a candidate disk on the sender's pool, the part goes there. |
 | Relink versus a `TTL ... TO DISK\|VOLUME` rule that names somewhere else? | Relink wins. The part lands on the pool's disk at zero byte cost; `MergeTreePartsMover::selectPartsForMove` sees `!isPartInTTLDestination` and moves it to the TTL destination afterwards (`MergeTreePartsMover.cpp:145-179`, `MergeTreeData.cpp:9169`). The bytes then travel once, as a `GET` from the pool on the receiver instead of a stream from the sender, and the sender is not loaded at all. Precedent: `perform_ttl_move_on_insert=0` already places first and moves later. |
 | A caller-supplied `dest_disk`? | Authoritative, untouched. The only external caller is zero-copy `MOVE` (`MergeTreePartsMover::clonePart` → `tryToFetchIfShared` → `fetchExistsPart`, `StorageReplicatedMergeTree.cpp:5945`, `:6010`), which asserts the part landed on that disk (`LOGICAL_ERROR` otherwise) and renames it into `moving/`. A content-addressed disk never enters that path — `supportZeroCopyReplication()` is `false` for `MetadataStorageType::CAS` (`DiskObjectStorage.h:53-57`), and a cache wrapper over a CA disk is still a `DiskObjectStorage` with CAS metadata — so this is another feature's invariant that this one must not break, not a placement rule of its own. |
-| Which disks on the right pool are candidates? | Only a disk whose content-addressed storage can publish a ref right now: not read-only, started, and with its pool lifecycle `Live`. That is a snapshot taken without I/O; a change after the snapshot fails closed and the replication queue retries (below). `IDisk::isBroken` is NOT the predicate — nothing in `DiskObjectStorage` overrides it, and content-addressed health lives in the pool lifecycle (`ContentAddressedMetadataStorage::checkOpAdmitted`, `ContentAddressedMetadataStorage.cpp:1178-1229`). |
+| Which disks on the right pool are candidates? | Every content-addressed disk of the policy that is not read-only and has a pool id. Read-only is a static property of the disk's configuration, not a failure, so it is the one exclusion. Whether the pool is LIVE is deliberately NOT consulted: a disk whose pool is `TransientNotLive`, `IdentityLost`, `Vanished*` or shut down (`ContentAddressedMetadataStorage::checkOpAdmitted`, `ContentAddressedMetadataStorage.cpp:1178-1229`) is still the forced target, the relink's own write gate refuses it, the fetch fails, and the replication queue retries — the behaviour a single-disk content-addressed policy already has, and the project's fail-close rule (no fallback path that performs a consequential action; here, a full byte download onto another disk). The alternative — a liveness snapshot that diverts the part to a local disk during a content-addressed incident — was considered and rejected by the user for that reason. `IDisk::isBroken` is not consulted either: nothing in `DiskObjectStorage` overrides it. |
 | A new setting to turn the forcing off? | None. The rule is unconditional; the recursion brake (`allow_ca_relink`) stays the only internal switch. |
 
 ## Design {#design}
@@ -85,23 +87,31 @@ The argument is by construction and by the unit vectors in the verification sect
 interoperability test is NOT part of this design (it would need a released content-addressed build
 on the other side), and the rollout section says so.
 
-### Two small interface additions {#interfaces}
+### Pure helpers, so the routing is unit-testable {#helpers}
 
-- `IContentAddressedExchange::canAcceptRelink() const` — the candidate predicate. I/O-free, never
-  throws, evaluated under the storage's pointer mutex: `false` when the storage is read-only, has no
-  pool (not started, or shut down), or the pool lifecycle is anything but `Live`. It is the write-side
-  twin of what `confirmExactRef` already does for the read side (`ContentAddressedMetadataStorage.cpp:2097-2121`
-  answers `Unknown` for every non-live lifecycle without I/O). The pool id is set once at startup
-  (`:884`) and never cleared, so it stays readable after `shutdown` nulls the pool (`:896-920`) and a
-  non-empty `getPoolUUID` is deliberately not the predicate.
-- Three pure helpers declared in `DataPartsExchange.h` under `namespace DataPartsExchange`, so a
-  gtest can drive them without a disk: `encodeCasPoolAdvertise(Strings) -> String`,
-  `decodeCasPoolAdvertise(String) -> Strings`, and
-  `resolveForcedCaCandidate(const std::vector<CasRelinkCandidate> &, advertised, offered_cookie) -> std::optional<size_t>`
-  where `CasRelinkCandidate` is `{disk_name, pool_uuid, exchange_identity, can_accept_relink}` and
-  the result is the index of the chosen candidate. `fetchSelectedPart` builds the candidate list from
-  `data.getDisks()` and does nothing else with it. This is the same shape the zero-copy tokenizer has,
-  only nameable.
+No change to `IContentAddressedExchange`. The decisions that this design adds to the exchange are
+all pure functions of a few strings and booleans, so they live in a new small pair,
+`src/Storages/MergeTree/DataPartsExchangeCasRouting.{h,cpp}`, under `namespace DB::DataPartsExchange`,
+with no dependency on disks, storages or HTTP — a gtest drives them directly, and
+`DataPartsExchange.cpp` only builds their inputs from `data.getDisks()`:
+
+- `String encodeCasPoolAdvertise(Strings pool_uuids)` — sort, unique, join with `", "`; empty in,
+  empty out. `Strings decodeCasPoolAdvertise(const String &)` — the inverse, the same `", "`
+  splitter the zero-copy capability list uses; an empty string decodes to no pools.
+- `struct CasRelinkCandidate { String disk_name; String pool_uuid; bool read_only; }` and
+  `std::optional<size_t> resolveForcedCaCandidate(const std::vector<CasRelinkCandidate> & candidates,
+  const Strings & advertised_pools, const String & offered_pool_cookie)` — the receiver's placement:
+  the offered pool is the cookie, or the single advertised pool when the cookie is absent, or nothing;
+  the result is the index of the first candidate on that pool that is not read-only and has a pool id.
+- `struct CasConfirmRoutingCandidate { const void * exchange_identity; String pool_uuid; bool owns_namespace; }`
+  and `std::optional<size_t> resolveConfirmRoutingCandidate(const std::vector<CasConfirmRoutingCandidate> &,
+  const String & pool_uuid)` — the sender's confirm routing: among candidates on `pool_uuid` that own
+  the namespace, distinct by `exchange_identity`, exactly one may answer; zero or several distinct
+  identities give no answer, and aliases (equal identity) collapse to the first.
+
+The pool id read from a disk is set once at startup (`ContentAddressedMetadataStorage.cpp:884`) and
+never cleared, so it stays readable after `shutdown` nulls the pool; an empty pool id means only
+"never started", and such a disk is simply not advertised.
 
 ### Sender {#sender}
 
@@ -111,14 +121,16 @@ becomes "the pool id of the part's disk is in the decoded advertised set", and t
 `addLastSentPart` are untouched. The sender still looks only at its own part's disk; it does not care
 how many pools the receiver has.
 
-One adjacent change, flagged as a small scope extension: `resolveContentAddressedConfirm`
+One adjacent change, confirmed in scope by the user: `resolveContentAddressedConfirm`
 (`:227-244`) requires EXACTLY one policy disk to match `(pool, server_root_id, namespace)` and
 answers `Unknown` on a second match. A cache disk over a content-addressed disk reuses the base
 disk's `ContentAddressedMetadataStorage` (`DiskObjectStorageCache.cpp:21-41`), so a policy that lists
 both the base disk and its cache wrapper matches twice and can never confirm — today, independent of
-this design. The routing loop deduplicates by exchange identity (the `IContentAddressedExchange`
-pointer), which is one line and the same rule the receiver applies below. Two genuinely distinct mounts
-of one pool on one server keep answering `Unknown`, as designed.
+this design. The routing loop becomes a call to `resolveConfirmRoutingCandidate`, which deduplicates
+by exchange identity (the `IContentAddressedExchange` pointer). Two genuinely distinct mounts of one
+pool on one server keep answering `Unknown`, as designed. The shape is proven by unit vectors, not
+by an integration topology: a policy listing a base disk and its cache wrapper would also make
+`loadDataParts` see every part twice, so it is not a topology to stand up in a test.
 
 ### Receiver {#receiver}
 
@@ -127,9 +139,9 @@ explicit-disk branch is not modified.
 
 **Advertise.** With `allow_ca_relink` set and no `dest_disk`: the pool ids of every disk in
 `data.getDisks()` (the policy's disks, in policy order) for which `tryGetContentAddressedExchange`
-is non-null and `canAcceptRelink()` is true; deduplicated by exchange identity before by pool id, so
-a base disk and its cache wrapper count once. Today's `break` on the first content-addressed disk goes
-away. With a `dest_disk`: its own pool if it is content-addressed, otherwise nothing — unchanged.
+is non-null, `disk->isReadOnly()` is false and `getPoolUUID()` is non-empty; `encodeCasPoolAdvertise`
+deduplicates by pool id, so a base disk and its cache wrapper count once. Today's `break` on the
+first content-addressed disk goes away. With a `dest_disk`: its own pool if it is content-addressed, otherwise nothing — unchanged.
 With `allow_ca_relink` clear: no parameter — unchanged, this is the recursion brake.
 
 **Resolve the forced disk before the reservation.** The response cookies are readable right after
@@ -143,11 +155,11 @@ when `cas_relink` is present, so ordinary and zero-copy selection are untouched:
 
 1. `offered_pool` is the `cas_pool_uuid` cookie; if the cookie is absent and the advertised set has
    exactly one element, that element; otherwise empty.
-2. `forced_ca_disk` is the first candidate in policy order — built with the same predicate as the
-   advertise, i.e. a fresh `canAcceptRelink()` snapshot — whose pool id equals `offered_pool`;
-   null if none, or if `offered_pool` is empty. Aliases of one mount collapse to the first; two
-   genuinely distinct mounts of one pool in one policy also take the first, with a `DEBUG` line naming
-   the candidates — that shape is not designed for.
+2. `forced_ca_disk` is the first candidate in policy order — the same predicate as the advertise —
+   whose pool id equals `offered_pool`; null if none, or if `offered_pool` is empty. Both steps are
+   `resolveForcedCaCandidate` over the candidate list built from `data.getDisks()`. Aliases of one
+   mount collapse to the first; two genuinely distinct mounts of one pool in one policy also take the
+   first, with a `DEBUG` line naming the candidates — that shape is not designed for.
 
 **Reservation.** `if (forced_ca_disk) reservation = data.reserveSpace(sum_files_size,
 forced_ca_disk)` — the existing static `reserveSpace(UInt64, SpacePtr)` (`MergeTreeData.h:1237-1242`,
@@ -173,19 +185,20 @@ cannot emit both (its relink branch returns at `:429`, before the zero-copy bran
 
 - E1, an offer for a pool this policy has no candidate disk for (`cas_relink` set, `forced_ca_disk`
   null). A storage-policy reload cannot remove a disk (`StoragePolicy::checkCompatibleWith`,
-  `StoragePolicy.cpp:370-417`), so the realistic causes are a disk that went read-only or left
-  `Live` between the advertise and the answer, or a sender that is not honest. The reservation runs
+  `StoragePolicy.cpp:370-417`) and read-only is static, so the only real cause is a sender that is
+  not honest (or, with a multi-element advertise, one that omitted the cookie). The reservation runs
   the ordinary way and the relink block takes `fall_back_to_byte_fetch()` with the ordinarily reserved
   disk and `allow_ca_relink=false`. The manifest body is discarded with the response, exactly as
   today.
 - E2, the forced-disk reservation declined: `NOT_ENOUGH_SPACE`, queue retry. Named so that it is
   never mistaken for a fallback.
-- E3, the forced disk leaves `Live` AFTER resolution. `prepareAdoptFromManifest` maps the mount
-  fence's refusal (`ABORTED`/`NETWORK_ERROR`) to `MechanismFallbackAllowed`
-  (`ContentAddressedMetadataStorage.cpp:2346-2361`), the byte re-request below writes through the
-  same disk and is refused in turn, the fetch throws, and the queue retries. Fail-closed by
-  construction, and NOT a fallback to another disk: the snapshot is taken once, at advertise and at
-  resolution, and never re-evaluated mid-fetch.
+- E3, the forced disk's pool is not `Live` when the relink is staged — the deliberate decision above,
+  not a race. `prepareAdoptFromManifest` maps the mount fence's refusal (`ABORTED`/`NETWORK_ERROR`)
+  to `MechanismFallbackAllowed` (`ContentAddressedMetadataStorage.cpp:2346-2361`), the byte
+  re-request below writes through the same disk and is refused in turn, the fetch throws, and the
+  queue retries with its usual backoff. Fail-closed by construction, and NOT a fallback to another
+  disk. The cost per attempt is one relink offer (the sender resolves the manifest and mints a
+  token) and a byte re-request that is refused at its first write.
 
 **Byte fallback after a mechanism failure.** `relinkPartToDisk` returning null already re-requests
 through `fall_back_to_byte_fetch`, which passes `disk` and `allow_ca_relink=false` (`:907-914`; the
@@ -197,9 +210,9 @@ content-address and deduplicate against the pool, and the placement stays "the p
 TTL rule catching up by the mover as in the relink case. For the fence cause it is E3. No code changes
 here; only the provenance of `disk` does.
 
-**Read-only disks.** A read-only content-addressed disk is not a candidate (`canAcceptRelink` is
-false; `DiskObjectStorage::isReadOnly` delegates to the object storage, `DiskObjectStorage.cpp:716-719`,
-and `ContentAddressedMetadataStorage` derives its own `read_only` from the same backend at startup).
+**Read-only disks.** A read-only content-addressed disk is not a candidate (`DiskObjectStorage::isReadOnly`
+delegates to the object storage, `DiskObjectStorage.cpp:716-719`, and `ContentAddressedMetadataStorage`
+derives its own `read_only` from the same backend at startup, so the disk-level predicate is enough).
 Today such a disk in a mixed policy is advertised, draws an offer, fails the pool post-check after a
 local reservation and re-requests bytes — a pointless round trip that the exclusion removes. The
 exclusion does not make a fetch succeed on its own: the sender streams bytes and the ordinary
@@ -225,24 +238,28 @@ not a distinct event to count. The positive test signal stays the existing
   two internal same-sender re-requests pass the disk already chosen; they preserve the invariant
   rather than originate it.)
 - I2. After a relink the part is on a disk of the receiving table's storage policy whose pool id equals
-  the pool id of the part's disk on the sender, and that disk satisfied `canAcceptRelink` at
-  resolution time.
+  the pool id of the part's disk on the sender. Unconditional: a pool disk that cannot take the part
+  fails the fetch rather than yielding to another disk.
 - I3. At most one relink attempt per fetch (the recursion brake).
 
 ## Verification {#verification}
 
 ### Unit vectors {#unit}
 
-`src/Storages/tests/gtest_cas_relink_pool_advertise.cpp`, suite `CASRelinkPoolAdvertise` (the
-content-addressed gtest gate filter is exactly `CAS*`), over the three pure helpers:
+`src/Storages/tests/gtest_cas_relink_pool_routing.cpp`, suites `CASRelinkPoolAdvertise` and
+`CASRelinkConfirmRouting` (the content-addressed gtest gate filter is exactly `CAS*`), over the pure
+helpers:
 
-- encode: empty → no parameter; one id → that id verbatim (the byte-for-byte-today claim);
+- encode: empty → empty string; one id → that id verbatim (the byte-for-byte-today claim);
   duplicates collapse; several ids sort; decode is the inverse and tolerates a single id with no
-  delimiter.
-- resolve: cookie names an advertised pool with a candidate → that candidate; cookie absent, one
-  advertised pool → its candidate; cookie absent, two advertised pools → none; cookie names a pool
-  whose only candidate has `can_accept_relink=false` → none; two candidates with the same
-  `exchange_identity` → the first; two distinct candidates on one pool → the first.
+  delimiter and an empty string.
+- resolve (receiver): cookie names an advertised pool with a candidate → that candidate; cookie
+  absent, one advertised pool → its candidate; cookie absent, two advertised pools → none; cookie
+  names a pool whose only candidate is read-only → none; cookie names a pool with no candidate →
+  none; two candidates on one pool → the first; a candidate with an empty pool id never matches.
+- confirm routing (sender): one owning candidate on the pool → it; none → none; two owning
+  candidates with distinct identities → none; two with the same identity → the first; a candidate on
+  the pool that does not own the namespace is ignored.
 
 ### Integration {#tests}
 
@@ -276,10 +293,12 @@ The existing eleven tests do not change. `test_detached_fetch_cross_pool_falls_b
 sender) stay valid because the one-element wire form is unchanged; neither is a mixed-binary test,
 and this design adds none. The stateless content-addressed lane is single-disk and unaffected.
 
-What the plan does NOT test, stated so that it is not read as proven: a read-only or non-live
-content-addressed disk in a live topology (covered by the resolve vectors only), E3 (a lifecycle
-change mid-fetch; the fail-closed path is `prepareAdoptFromManifest`'s existing behaviour), and two
-genuinely distinct mounts of one pool in one policy (unsupported).
+What the plan does NOT test, stated so that it is not read as proven: a read-only content-addressed
+disk in a live topology (covered by the resolve vectors only), E3 (a non-live pool disk; the
+fail-closed path is `prepareAdoptFromManifest`'s existing behaviour, already exercised by the
+single-disk fixture whenever a mount is fenced), the sender-side alias dedupe in a live topology
+(unit vectors only, for the `loadDataParts` reason above), and two genuinely distinct mounts of one
+pool in one policy (unsupported).
 
 ## Documentation to change with the code {#docs}
 
@@ -288,7 +307,7 @@ genuinely distinct mounts of one pool in one policy (unsupported).
   the sequence diagram line that shows the advertise, and a new anchored section "Where a relinked
   part lands": the placement rule, what it overrides (volume order, JBOD balancing,
   `max_data_part_size_bytes`, TTL move rules), how a TTL rule catches up by the mover, and that a
-  fetch whose forced disk stops being live fails and is retried rather than re-placed. The zero-copy
+  fetch whose pool disk is not live fails and is retried rather than re-placed. The zero-copy
   `MOVE` path with an explicit disk is named as untouched.
 - `docs/superpowers/cas/BACKLOG/replication.md`: `{#relink-advertises-only-first-ca-pool}` (CAS-134)
   marked closed by this design, kept for provenance.
@@ -302,9 +321,9 @@ No protocol version change, no setting, no persisted format. A mixed-build pair 
 construction (the wire section above); that argument is checked by the unit vectors and the
 omit-cookie failpoint, not by a mixed-binary run. The behavioural changes operators see: a fetched
 part that is already in the pool now lands on the pool's disk even when the policy or a TTL rule
-would have placed it elsewhere, and the mover carries it to the TTL destination afterwards; and a
-fetch whose pool disk stops being live mid-fetch fails and is retried by the queue instead of
-quietly landing elsewhere.
+would have placed it elsewhere, and the mover carries it to the TTL destination afterwards; and in a
+mixed policy a fetch whose pool disk is not live fails and is retried by the queue instead of
+quietly landing on the local disk — the single-disk behaviour, now also the mixed-policy one.
 
 One known open item is exercised more by this design and is recorded rather than fixed here:
 CAS-020 (`{#move-out-copies-envelope-bytes}` in `BACKLOG/formats-and-storage.md`) — a move OUT of a
