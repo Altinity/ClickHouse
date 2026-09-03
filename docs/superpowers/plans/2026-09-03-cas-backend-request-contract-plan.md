@@ -472,6 +472,13 @@ MSG
 
 ### Task 3: The new types — `Incarnation`, `TransportAccess`, `Retry`, `WriteResult`, `Fence` {#task-3}
 
+**Amendments (second review, binding — supersede the conflicting lines below):**
+- `Retry` holds a *window*, not an absolute deadline: `struct Retry { uint64_t window_ms; std::optional<uint64_t> lease_deadline_ms /* absolute boot ms, already minus the margin */; bool single_attempt; static uint64_t backoff(uint32_t); static Retry within(uint64_t ms); static Retry standard(); static Retry untilLeaseSafe(uint64_t lease_deadline_ms, uint64_t margin_ms); static Retry once(); struct Bound { uint64_t deadline_ms; bool lease_bound; }; Bound bind(uint64_t now_ms) const; }` — `bind` (saturating) is called once at call entry with the engine's injected clock; `GaveUp::deadline_source` comes from `Bound::lease_bound`. No boot-clock dependency in `CasRetry`.
+- No `CasIncarnationTestAccess`, no test friend on `Incarnation` — tests obtain values through admitted writes (Task 6). `CASIncarnation.RenderAndPersistedCompare` and the Committed/Declined arms of the `orThrow` test move to Task 6.
+- `Incarnation::render()` ends its switch with `UNREACHABLE()`; no `"unknown:"`.
+- `PersistedIncarnation` gains forward-only `static PersistedIncarnation capture(const Incarnation &)`; add `static_assert(!std::is_constructible_v<Incarnation, PersistedIncarnation>)`.
+- All deadline arithmetic saturates (`now >= deadline → 0 remaining`; compare `needed <= remaining`, never `now + needed > deadline`).
+
 **Files:**
 - Create: `.../Backend/CasIncarnation.h`, `.../Backend/CasTransportAccess.h`, `.../Backend/CasRetry.h`, `.../Backend/CasRetry.cpp`, `.../Backend/CasWriteResult.h`, `.../Backend/CasFence.h`
 - Test: `src/Disks/tests/gtest_cas_requests.cpp` (new; this task writes the type-level tests; Task 5 adds the engine tests to the same file)
@@ -764,6 +771,14 @@ MSG
 
 ### Task 4: `Backend` gains the keyed string primitives; the three backends and the decorator implement them; `ThrottlingBackend` {#task-4}
 
+**Amendments (second review, binding — supersede the conflicting lines below):**
+- The legacy methods stay **virtual** in `Backend` with forwarding default bodies (`get`, `head(key)`, `putIfAbsent`, `putOverwrite`, `casPut`, `deleteExact`, `list(prefix,cursor,limit)`, `publishBlob`, `probeSentinelRaw(key)`); the three production backends delete their legacy overrides; test doubles' legacy overrides are left alone here and move to the primitive in the batch that migrates the production site they instrument (Task 7 converts nothing). The virtual forwarders die at the lock.
+- `getStream` is **not** forwarded and no `Token{}` is synthesized: the three backends keep their legacy `getStream` implementations (they may share a private helper with `stream`) until Tasks 8 and 9 migrate its two callers; Task 9 deletes it.
+- The S3 overloads from Task 2 take `(profile, request_timeout_ms)`: `ObjectStorageBackend` passes its `attempt_timeout_ms`. `ObjectStorageBackend`'s constructor gains `bool single_attempt_control_plane` and `uint64_t attempt_timeout_ms`, set in `ContentAddressedMetadataStorage::openPoolView` (`!read_only && mode == Native`, and the budget's `attempt_timeout_ms`) — not by `Pool::open`, which receives the backend already built.
+- `Backend` gains a non-transport capability method `virtual bool refreshCredentials()` (`ObjectStorageBackend` → `object_storage->tryRefreshCredentialsViaCallback()`; `InMemoryBackend` → the value of a new knob `setRefreshCredentialsResult(bool)`, default false). The façade uses it (Task 5).
+- `Backend::write` returns the store's raw value unvalidated; validation is the façade's (Task 5): an invalid value on a successful write is treated as an ambiguous attempt (the write may have landed), never `CORRUPTED_DATA`.
+- `CasBackend.h`'s new list types are `RawListedKey`/`RawListPage`; `CasRequests.h`'s are `KeyEntry`/`KeyPage` (renamed to `ListedKey`/`ListPage` at the lock).
+
 **Files:**
 - Modify: `.../Backend/CasBackend.h` (new pure virtuals beside the legacy ones; `migrationAccess`; legacy non-virtual conveniences forward)
 - Modify: `.../Backend/CasInMemoryBackend.h`, `.cpp` (implement the primitives; legacy overrides forward to them through the virtual)
@@ -985,6 +1000,31 @@ MSG
 ---
 
 ### Task 5: `CasRequests`, `CasOperation` and the engine {#task-5}
+
+**Amendments (second review, binding — supersede the conflicting code below where they differ):**
+- Only `CasRequests` constructs `TransportAccess`: a private `template <typename Fn> auto CasRequests::withTransportAccess(Fn && fn) { TransportAccess a; return fn(a); }` that `CasOperation` calls (it is a friend of `CasRequests`, or the method is befriended); `CasOperation` never names `TransportAccess` itself.
+- Every verb binds its policy once at entry: `const Retry::Bound bound = policy.bind(owner.now_ms());` and carries `bound.lease_bound` into every `GaveUp`.
+- One call-scoped `WriteState { uint32_t attempts_sent = 0; bool sent_any = false; bool any_ambiguous = false; Observation last_seen = NotObserved{}; uint32_t reissues = 0; }` is threaded through `writeLoop` and, for `readModifyWrite`, through every inner write of the same call; `GaveUp` is built from it (never from a fresh default).
+- `writeLoop` terminal structure after the attempt (the resolve read is made for EVERY `RawConflict` and EVERY ambiguous attempt):
+```cpp
+state.last_seen = observe(key, bound, state);            // exact read; NotObserved when the read itself gave up
+if (auto * obj = std::get_if<Object>(&state.last_seen))
+{
+    if (state.any_ambiguous && obj->bytes == bytes)
+        return postCommit(obj->incarnation, /*resolved_by_read=*/true, state, bound);
+    return Conflict{state.last_seen};                        // someone else's object: the answer, ambiguous or not
+}
+if (!state.any_ambiguous)
+    return Conflict{state.last_seen};                        // a plain refusal with absent/unobserved: the answer
+if (policy.single_attempt)
+    return gaveUp(GaveUp::Why::Unresolved, state, bound);
+return pauseAndReissue(state, bound);                        // gate(sleep + 2*reservation) then sleep; GaveUp carries state.last_seen
+```
+  `postCommit(inc, resolved, state, bound)` runs the post-commit admission: `Ok → Committed{inc, state.attempts_sent, resolved}`, `LostOrRearmed → GaveUp{FenceLost, sent_any = true}`, `NoBudget → GaveUp{Deadline, Lease, sent_any = true}`. A successful raw write whose value fails the grammar is treated as ambiguous (`state.any_ambiguous = true`, proceed to `observe`), never thrown.
+- Credential refresh is typed: on an `isAccessTokenExpiredError` (write or read) call `backend->refreshCredentials()`; if it returns true, the attempt is ambiguous and reissued under the deadline; if false, a read propagates the error and a write is `Refused` iff `isDefinitelyRefusedWrite(e)` (which, by construction, excludes the refresh class — so it becomes ambiguous and reissues; state it). `Refused` is reachable only with `!state.any_ambiguous` and no refresh performed.
+- `readModifyWrite`: the initial read goes through `observe` (a `GaveUp` is returned, not thrown); `decide` is called outside every classification `try` so its exception propagates unchanged; on `Conflict` adopt its observation as the next `current`, return the `Conflict` immediately under `once`, else `gate(Retry::backoff(++state.reissues) + 2*reservation)` then sleep, then re-decide; a fresh read after the sleep only when the observation is `NotObserved`; every gate failure maps to `GaveUp{FenceLost | Deadline(source from bound)}` with `state.last_seen`.
+- `readLoop` for reads/head/list/remove/probe/stream/publish: reservation 1×; the same typed refresh rule; `remove` maps `DeleteMarker` to the `CAS_DELETE_MARKER` exception.
+- Saturating arithmetic everywhere: `remaining = now >= deadline ? 0 : deadline - now; if (needed > remaining) → give up`.
 
 **Files:**
 - Create: `.../Backend/CasRequests.h`, `.../Backend/CasRequests.cpp`
@@ -1283,6 +1323,14 @@ MSG
 
 ### Task 6: Engine tests {#task-6}
 
+**Amendments (second review, binding):**
+- Add the tests moved from Task 3: `CASIncarnation.RenderAndPersistedCompare` (an `Incarnation` from `op.create`, `render()`, `PersistedIncarnation::capture` round trip, `matches`) and the Committed/Declined arms of `orThrow`.
+- `ReadModifyWriteLosesNoIncrementUnderContentionAndBoundsAHotKey`: two `std::thread`s each running 50 increments through their own `CasOperation` over the same backend (a real `CasRequests` with real clock/sleep, no fake clock), assert the final value is 100; the hot-key half uses a backend hook that overwrites the key immediately before EVERY replace (`onBeforeWrite` knob added to `InMemoryBackend`), asserts `GaveUp{Deadline}` on a fake clock and that `clock.sleeps` is non-empty.
+- `OnceSendsOneWriteAndAtMostOneResolveRead`: assert `CountingBackend` totals: writes == 1, gets == 1 (the resolve), and no sleep.
+- `AdmissionIsCheckedAtThreePoints` gains the before-sleep gate: flip the liveness predicate from inside the backend's resolve-read hook so the first attempt conflicts, the resolve read runs, and the gate before the sleep refuses — assert `GaveUp{FenceLost, sent_any = true}`, zero sleeps, and no second write.
+- `ExpiredToken` has two tests: refresh available (`setRefreshCredentialsResult(true)`) → `Committed` with `attempts_sent == 2`; refresh unavailable → the write reissues under the deadline (the error is in the refresh class, excluded from `Refused`) and a read propagates.
+- `Refused` test: an `AccessDenied`-class error that is NOT in the refresh class does not exist in S3's vocabulary (`isAccessDeniedError` ⊂ refresh class) — use `MalformedRequest`/`EntityTooLarge` (`isMalformedRequestError`) for the `Refused` test.
+
 **Files:**
 - Test: `src/Disks/tests/gtest_cas_requests.cpp` (append)
 
@@ -1537,6 +1585,8 @@ MSG
 
 ### Task 7: Checkpoint CP3 — build the new API, run everything {#task-7}
 
+**Amendments (second review, binding):** Task 7 converts NO test overrides (the legacy virtuals stay, so nothing breaks at CP3); it is build + gate + the compile fixes of Tasks 3-6 only. Test fault-injection overrides move with their production sites in Tasks 8-18.
+
 **Files:** whatever the compiler and the gate name; no new files.
 
 - [ ] **Step 1: Build**
@@ -1611,6 +1661,18 @@ The migration implementer is a narrow-case worker (Sonnet): one dispatch per tas
 
 ### Task 8: Batch 1a — pool wiring, sentinel probe, capability probe, plain objects, pool meta, manifest reader, pool reads {#task-8}
 
+**Amendments (second review, binding):**
+- `CasMountRuntime::admit` uses saturating arithmetic:
+```cpp
+if (lost || generation != admitted) return LostOrRearmed;
+if (now >= deadline) return NoBudget;
+const uint64_t remaining = deadline - now;
+if (needed_ms >= remaining || lease_safety_margin_ms >= remaining - needed_ms) return NoBudget;
+return Ok;
+```
+- `ObjectStorageBackend`'s `single_attempt_control_plane`/`attempt_timeout_ms` are set in `ContentAddressedMetadataStorage::openPoolView`, which constructs it; `Pool` only wires the three `CasRequests`.
+- Test overrides in the files census §5c maps to this task's production files move to the primitives here, in this commit, and the report names each and the test that shows the fault still fires.
+
 **Files:**
 - Modify: `Pool/CasPool.h`, `Pool/CasPool.cpp` — add the three `CasRequests` members and accessors: `CasRequests & mountRequests()` (over the mount fence: `Fence{[&]{ return mount_runtime.fenceGeneration(); }, [&](uint64_t g, uint64_t needed){ return mount_runtime.admit(g, needed); }, [&](uint64_t g){ mount_runtime.checkFenceOrThrow(g); }}`), `CasRequests & farewellRequests()` (open fence), `CasRequests & gcRequests()` (open fence); `CasMountRuntime` gains `Fence::Admit admit(uint64_t admitted_generation, uint64_t needed_ms) const` = `lost || generation != admitted → LostOrRearmed; needed_ms + lease_safety_margin_ms >= deadline − now → NoBudget; else Ok`. Migrate the `get`/`list` sites census §1 lists for `CasPool.cpp` (`get`: 256,847,1640,1687; `list`: 1767).
 - Modify: `Backend/CasSentinelProbe.h`, `.cpp` (`probeSentinel`, `probePoolBootstrapResidual`: census `get`: 91; `list`: 50; `probeSentinelRaw`: 11) → `op.probeSentinel`, `op.forEachListedKey` with an early stop, `op.read`.
@@ -1644,6 +1706,8 @@ MSG
 ---
 
 ### Task 9: Batch 1b — GC leaves and the tools {#task-9}
+
+**Amendments (second review, binding):** this task keeps only the sites with no persisted-token flow — `Gc/CasGcMaintenanceState`, `Gc/CasNamespaceJanitor`, `Tools/CasDecommission` (and the `getStream` caller in `Gc/CasBlobInDegree.cpp:openSourceEdgeRun` → `stream`, after which the legacy `getStream` is deleted from the three backends). `Gc/CasBlobInDegree`'s token-bearing structs (`RetiredEntry`, `CondemnedRow`, `SourceEdgeRecord`), `Gc/CasOrphanManifestSweep` (its nomination feeds a persisted compare), `Tools/CasFsck` and `Tools/CasInspect` (they render/compare persisted rows) move to Task 18 — the persisted-token component. Test overrides move with their sites.
 
 **Files:**
 - Modify: `Gc/CasBlobInDegree.h`, `.cpp` (`openSourceEdgeRun` → `stream`; `putDeterministicArtifact` → `create` with compare-adopt on `Conflict`'s `Object`; `foldDeltasIntoGeneration`, `zeroInDegree`, `PriorEdgeCursor` over `CasOperation &`; census `get`: 339; `getStream`: 281; `putIfAbsent`: 337; token fields at `.h` 29,77,202 → `Incarnation`/`PersistedIncarnation` as the struct dictates — the condemned-row byte layout keeps `token_type` as the persisted dialect byte and becomes `PersistedIncarnation` in Task 18).
@@ -1684,6 +1748,8 @@ MSG
 
 ### Task 12: Batch 2b — the GC core {#task-12}
 
+**Amendments (second review, binding):** this task migrates the GC core's LIVE paths only — `acquireOrRenewLease`, `pulseHeartbeat`, the round and rebuild commits, the folds' `forEachListedKey` walks and reads. The retirement/redelete/outcomes paths (`RetiredEntry`, `ReplacedEntry`, `OutcomeEntry::token`, the delete loops at 671/1061/1111/3330/3434/3438, `deleteConfirmedMeta`, `CasGcMetaWriter`'s condemn markers) stay on the legacy methods here and migrate in Task 18 with the formats, so no batch boundary needs a Token↔Incarnation conversion. Test overrides move with their sites.
+
 **Files:**
 - Modify: `Gc/CasGc.h`, `.cpp` — over `pool.gcRequests().admit()` (open fence); per the spec's table: `acquireOrRenewLease` (4373, 4397, 4418, 4472; reads 4363, 4382, 4430, 4481) → one `readModifyWrite` under `standard` whose decide is the steal machine (renew when ours; steal only when the lease tuple is unchanged across two observations AND the heartbeat pair is unchanged AND `allow_steal`; `nullopt` otherwise; its `gc/hb` read under `standard`; `CORRUPTED_DATA` on vanish-after-observe from inside decide); `pulseHeartbeat` (4365, 4376) → `read` under `standard` then `replace`/`create` under `once`, conflict ignored; the round commit (944) and the rebuild commit (4246) → `replace`, `standard`, conflict → today's `ABORTED`; every `deleteExact` (671, 1061, 1111, 3330, 3434, 3438) → `remove` with the persisted compare (`PersistedIncarnation::matches(meta->incarnation)` after a `head`, `standard`) or the live incarnation; every `forEachListedKey` (1347, 1470, 3654, 3918, 3955, 4151) → `op.forEachListedKey`; every `get`/`head` → `read`/`head`, `standard`; the `check_fence` callback body (4522, 4523) deleted (the catalog reads `op.admitted()` now). `Token` fields in `CasGc.h` (456, 515, 540, 700, 789) → `Incarnation` / `PersistedIncarnation` as each is live or persisted.
 - Modify: `Gc/CasGcMetaWriter.h`, `.cpp` (token fields 36, 57–59, 72–74; cpp 137, 190–218 → `Incarnation`; `deleteConfirmedMeta` (76) → `remove` after the confirmation registry's render compare).
@@ -1713,6 +1779,8 @@ As Task 10, logs `build_task13.log` / `test_task13_gate.log`; commit `ca-tests: 
 
 ### Task 15: Batch 3b — blob meta, part write, mount runtime {#task-15}
 
+**Amendments (second review, binding):** the five surviving budget fields (`attempt_timeout_ms`, `lease_safety_margin_ms`, the three `recovery_retry_*`) and `validateCasRequestBudget` (the surviving clause) move here into a new `Backend/CasRequestBudget.h`/`.cpp` (no controller include), so the lock can delete `CasRequestControl.h` without orphaning them; every includer of `CasRequestControl.h` that only needed the budget switches to the new header.
+
 **Files:**
 - Modify: `Pool/CasBlobMeta.h`, `.cpp` (`loadMeta` (16) → `read`; `deleteMetaExact` (39) → `remove`; token fields 23, 57, 63 → `Incarnation`; `casMeta` → `replace`).
 - Modify: `Pool/CasPartWriteTxn.cpp` — `ensureBlobPresent` (331 `head`, 417 `publishBlob`): the outer publication loop stays under ONE `Retry::standard()` with `Retry::backoff` between iterations; `head`/`publish`/`create` on the operation admitted at txn start (`pool.mountRequests().admit()` captured once, replacing the `fenceGeneration()` capture at 265); the seven fence checks: 392 and 445 (pre-request) deleted, 362/371/383/447/464 (verdict points) → `op.admitted()`; `reconcileMetaClean` → `readModifyWrite`, `standard`; `isDeterministicBlobPublicationFailure` (73) → over `isDefinitelyRefusedWrite` and moved out of the old controller's file if it lived there; `promote` (737 `get`) → `read`; `cleanupStagedManifestDebrisBestEffort` (1137 `head`, 1139 `deleteExact`) → `head` + `remove`; `stageManifest` compares the `Conflict{Object}` and throws its definite-failure message on `Refused`.
@@ -1732,6 +1800,8 @@ As Task 10, logs `build_task16.log` / `test_task16_gate.log`; commit `ca-tests: 
 
 ### Task 17: Batch 4a — the server root {#task-17}
 
+**Amendments (second review, binding):** add `Pool/CasMountRuntime.cpp`'s `consumeRenewResult` (it reads the renewal diagnostics — rewrite over the new result fields: `attempts_sent`, `resolved_by_read`, `deadline_source`, `sent_any`, the site's pre-sampled cancellation flag) and `src/Storages/System/StorageSystemContentAddressedMounts.cpp` (`read` consumes `listMounts`' result and mount diagnostics; its signature follows `listMounts`) to this task's files. Test overrides move with their sites.
+
 **Files:**
 - Modify: `Pool/CasServerRoot.h`, `.cpp` — `MountLeaseKeeper::renew` (1735 `putOverwriteControlled`) → `replace` under `Retry::untilLeaseSafe(confirmed_deadline_boot_ms, lease_safety_margin_ms)` on `pool.mountRequests().admit()`; its verdicts: `Committed` → as today; `Conflict{Object}` → `throwRenewConflict` over the observation; `Conflict{ProvenAbsent}` → `Vanished` (`FILE_DOESNT_EXIST`); `Conflict{NotObserved}` / `GaveUp{Deadline|Unresolved}` → retry-later; `GaveUp{FenceLost, sent_any=false}` with the pre-sampled cancellation flag true → `NotAttempted`, else terminal; `CASMountRenewalRecovered` from `Committed::attempts_sent > 1 || resolved_by_read`; `CASMountRenewalDeadlineExceeded` from `GaveUp{Deadline, Source::Lease}`. `MountLeaseKeeper::terminate` (1835 `putOverwrite`, 1838 `get`) → `replace` under `Retry::within(10'000)` on `pool.farewellRequests().admit()`; on `Conflict` the observation is the re-read (silent on `gc_fenced`, else `CASMountExclusivityViolation` + `ABORTED`). `MountLeaseKeeper::claim` (1462 `head`, 1465 `putIfAbsent`, 1476 `get`, 1513 `putOverwrite`, 1516 `get`) → `read` then `create`/`replace`, `standard`, conflict terminal — two requests on both paths. `claimMount` (909 `get`, 915 `putIfAbsent`, 950/982 `putOverwrite`), `claimMountAwaitingExpiry` (1083 `get`), `claimOwnerOrThrow` (682 `putIfAbsent`, 722 `get`) → the same shape. `allocateWriterEpoch` (803 `casPut`; 722 `get`; 745 `probeSentinelRaw`; `serverRootSubtreeEmpty` 63 `list`) → `readModifyWrite`, `standard`, the decide issuing the subtree walk and the sentinel probe under `standard` and carrying "my previous attempt was an absent-create that lost" in captured state. `computeHeartbeatFloor` (1141 `list`, 1164 `get`, 1215 `putOverwrite`) → `readModifyWrite`, `standard`, decide = the stability classification. `listMounts`, `probeNonTerminalMountSlots`, `isCreatorFenceTerminal`, `readOwnerObject`, `readOwnerUuid`, `prefixHasAnyKey` → reads/lists under `standard`. Token fields (h 238, 260, 314, 508, 532; cpp 725, 905, 1064, 1080, 1460, 1548, 1695) → `Incarnation`; `proven_dead_token` stays an `Incarnation` observed live. `MountRenewResult::diagnostics` is replaced by the fields the two counters need (`attempts_sent`, `resolved_by_read`, `deadline_source`, `sent_any`).
 - Modify: `Pool/CasPool.cpp`, `ContentAddressedMetadataStorage.cpp` (call sites; the budget struct's construction).
@@ -1742,6 +1812,8 @@ As Task 10, logs `build_task16.log` / `test_task16_gate.log`; commit `ca-tests: 
 ---
 
 ### Task 18: Batch 4b — the persisted pair and the formats {#task-18}
+
+**Amendments (second review, binding):** this task is the **persisted-token component**, one commit: the three wire formats; `Gc/CasBlobInDegree.{h,cpp}` (`RetiredEntry`, `CondemnedRow`, `SourceEdgeRecord` → `PersistedIncarnation` where persisted, `Incarnation` where live; the condemned-row byte layout); `Gc/CasOrphanManifestSweep` (nomination → persisted compare); `Gc/CasGc.cpp`'s retirement/redelete/outcomes paths (deferred from Task 12: the delete loops at 671/1061/1111/3330/3434/3438 → `head` + `PersistedIncarnation::matches` + `remove`; `OutcomeEntry::token` → `PersistedIncarnation`); `Gc/CasGcMetaWriter.{h,cpp}` (its confirmation registry compares a `PersistedIncarnation` or rendered text, never a live `Incarnation`; `deleteConfirmedMeta` → `head` + compare + `remove`); `Tools/CasFsck.cpp` (retirement check → `matches`); `Tools/CasInspect.cpp` (render persisted rows); `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp` (`makeSourceEdgeRecords` builds `PersistedIncarnation`). `PersistedIncarnation::capture` (Task 3) is the only way a live value enters a persisted field. Test overrides move with their sites.
 
 **Files:**
 - Modify: `Formats/CasWireVocab.h`, `.cpp` (`TokenFields::build` → returns `PersistedIncarnation`; `writeTokenFields(out, first, const PersistedIncarnation &)`; `tokenTypeFromWord` → `dialectWordFromString` producing the `"etag"|"generation"|"emulated"` word), `Formats/CasRecordStreamFormat.h`, `.cpp` (88; 201, 280), `Formats/CasGcOutcomesFormat.h`, `.cpp` (43; 58, 104), `Gc/CasBlobInDegree.h`, `.cpp` (the condemned-row byte layout: `token_type` byte encodes the dialect, `[token_len][token bytes]` the value; decode to `PersistedIncarnation`; 72; 207, 219), `Tools/CasInspect.cpp` (render persisted rows).
@@ -1760,6 +1832,8 @@ As Task 10, logs `build_task19.log` / `test_task19_gate.log`; commit `ca-tests: 
 ---
 
 ### Task 20: The lock (Step 5) {#task-20}
+
+**Amendments (second review, binding):** prerequisites checklist before deleting anything — (1) `Backend/CasRequestBudget.h` exists (Task 15) and no includer of `CasRequestControl.h` needs the controller; (2) `PersistedIncarnation::capture` exists (Task 3) and the four formats use it (Task 18); (3) `consumeRenewResult` and `StorageSystemContentAddressedMounts` are on the new fields (Task 17); (4) the benchmark builds (Task 18); (5) `grep -rn "getStream(" src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed` outside `Backend/` is empty (Task 9). Then delete the legacy virtual forwarders, `migrationAccess`, the `friend class Backend`, `Token`, the controller and its test file, `Pool::backend()`, and rename `KeyEntry`/`KeyPage` → `ListedKey`/`ListPage`, `TokenType` → `Dialect`.
 
 **Files:**
 - Modify: `Backend/CasBackend.h` — delete the legacy forwarders (`get`, `getStream`, `head(key)`, `putIfAbsent`, `publishBlob`, `putOverwrite`, `casPut`, `deleteExact`, `list(prefix,cursor,limit)`), `GetResult`, `GetStreamResult`, `HeadResult`, `PutOutcome`, `CasOutcome`, `WriteResultT`, `PutResult`, `CasResult`, `DeleteOutcome`, `ListedKey`(old), `ListPage`(old), the free `forEachListedKey`, `DeleteClass`/`classifyDeleteOutcome`/`deleteClassName` (their consumers switched on `Removal`), `migrationAccess`; `Backend/CasTransportAccess.h` — delete `friend class Backend;`.
