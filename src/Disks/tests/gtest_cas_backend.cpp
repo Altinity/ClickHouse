@@ -1276,7 +1276,7 @@ TEST(CASObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
     ASSERT_TRUE(std::holds_alternative<Committed>(op1.create("k/other", "junk", Retry::once())));
     const WriteResult restart_create = op1.create("k/restart", "v1", Retry::once());
     ASSERT_TRUE(std::holds_alternative<Committed>(restart_create));
-    const Etag stale_token = std::get<Committed>(restart_create).incarnation;
+    const Etag stale_token = std::get<Committed>(restart_create).etag;
 
     /// Simulate a process restart: a brand-new `ObjectStorageBackend` instance (fresh emu state) over
     /// the SAME underlying storage — exactly what happens when the CAS process restarts.
@@ -1289,7 +1289,7 @@ TEST(CASObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
     /// same op-index as `stale_token` above under the old counter, so the two textually collide there.
     const auto current = op2.head("k/restart", Retry::once());
     ASSERT_TRUE(current.has_value());
-    ASSERT_EQ(op2.remove("k/restart", current->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_EQ(op2.remove("k/restart", current->etag, Retry::once()), Removal::Removed);
     ASSERT_TRUE(std::holds_alternative<Committed>(op2.create("k/restart", "v2-after-restart", Retry::once())));
 
     /// The pre-restart incarnation must NEVER be usable as a precondition against the post-restart
