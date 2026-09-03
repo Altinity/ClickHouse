@@ -636,7 +636,13 @@ levers compose (concurrent batch calls) rather than compete, once/if the conditi
 this baseline never issued concurrent deletes and cannot rule that out. Full measurement:
 `docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md#opp-delete-concurrency`.
 
-## `[gc-fold-intake-readbuffer-head]` `fold_ref_intake`'s HEAD/GET pairing is the generic read-buffer size probe, not the HEAD Task 15 already removed {#gc-fold-intake-readbuffer-head}
+## `[gc-fold-intake-readbuffer-head]` ✅ CLOSED by the request contract's read path (`e272e18f02c`, 2026-09-03) {#gc-fold-intake-readbuffer-head}
+
+**Closed.** The backend's `read` no longer HEADs before it GETs: it goes through
+`readSmallObjectAndGetObjectMetadata`, one `GetObject` whose own response carries the etag. The
+2026-09-01 soak still shows the 1:1 pairing because its binary predates that commit; the first soak
+against a later build is the confirmation. The rest of this entry is kept as the record of how the
+pairing was found.
 
 T9's baseline found `fold_ref_intake` — the single largest wall-time phase in a destructive round
 (2303.0s of ch1's 4352.1s phase wall, 52.9%) — issuing `DiskS3GetObject` and `DiskS3HeadObject` in
@@ -654,6 +660,37 @@ what the real win would be, is unmeasured. **Falsification:** if the size-probe 
 for correctness on every generic S3 disk consumer (e.g. detecting a truncated/resized object
 mid-read), this is a ClickHouse-wide question and does not belong on this CAS backlog at all. Full
 measurement: `docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md#opp-fold-head-successor`.
+
+## `[gc-reduce-confirm-marker-read-ahead]` the graduation gate's meta re-check is the last serial read of `fold_reduce` {#gc-reduce-confirm-marker-read-ahead}
+
+The fold's read-ahead (`GcReadAhead`, `cas_gc_read_concurrency`) now covers the checkpoints, the ref
+logs, the manifest edges and the fresh zero-in-degree `HEAD`s. What remains serial in the reduce phase
+is the graduation gate's `loadMeta` re-check, issued per carried condemned entry that has no in-process
+confirmation — which, after a restart or a leadership change, is every entry graduating that round.
+Its candidates are known only from the prior run's condemned sentinel rows, which the merge streams, so
+hinting them needs a lookahead on the run cursor rather than a pre-pass over anything already in
+memory. **Not sized.** Read `CASGCReadAheadMiss` against the round's `graduated` count on a round
+following a restart before building it.
+
+## `[gc-phase-rows-lose-worker-requests]` phase rows do not see requests made on worker pools {#gc-phase-rows-lose-worker-requests}
+
+`GcPhaseTimer` diffs the round thread's `ProfileEvents`. Every request a read-ahead worker or a
+`meta_pool` job performs lands on that worker's counters instead, so the S3 verb counts on
+`fold_ref_intake` and `fold_reduce` now under-count by exactly the hinted requests — the same gap
+`meta_pool_wait` has always had. The semantic metrics on those rows are unaffected, and
+`CASGCReadAheadHit`/`Miss`/`Wasted` are on the row because they are incremented at the take site. The
+fix is attribution at the worker boundary, which is a `GcPhaseTimer` change and not a read-ahead one.
+
+## `[gc-reduce-zero-marker-dropped-on-carry]` a blob published during the reduce phase and then rolled back leaks until a rebuild {#gc-reduce-zero-marker-dropped-on-carry}
+
+Raised by the head read-ahead consults (`docs/superpowers/worklogs/2026-09-03-cas-gc-head-read-ahead-consult.md`)
+and NOT introduced by them. A blob observed absent when its `HEAD` is taken but present by the time the
+merge closes it is not condemned that round, and the zero marker recording that is per-generation and
+dropped on carry, so no later round re-examines the blob unless a delta touches it again. For ordinary
+garbage this is correct: present-at-the-merge implies a publisher and therefore an edge. The residue is
+a publication that lands mid-phase and then rolls back — that body has no edge and is never revisited.
+The read-ahead widens the window quantitatively; it does not open the class. **Not sized**, and the fix
+is a carried marker or a sweep concern rather than anything in the fold.
 
 ## `[decommission-waits-on-the-wrong-predicate]` `cas_mounts` liveness and `NoWait` decommission disagree about what "dead" means {#decommission-wrong-predicate}
 
