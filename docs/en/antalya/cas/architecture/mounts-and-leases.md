@@ -9,7 +9,7 @@ doc_type: 'reference'
 
 Page 4 of 4 in the CAS architecture set. Covers server identity, the mount lease that fences
 writers, and the server-scoped control-plane objects. No external coordinator is involved: there
-is no ZooKeeper/Keeper client anywhere in this protocol — `MountLeaseKeeper` is a local lease
+is no ZooKeeper/Keeper client anywhere in this protocol — `MountLeaseRenewer` is a local lease
 *renewer*, not a Keeper client.
 
 ## `cas_server_root_id` — the identity {#server-root-id}
@@ -75,7 +75,7 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   write_attempt_id)` tuple before I/O. Every physical retry repeats it byte-for-byte; a later GC
   fence preserves the observed ID, while reclaim and successor bodies mint new IDs.
 - **Resolve before retry.** A transient or ambiguous conditional `PUT` is followed by one exact
-  `GET`. The keeper adopts the result only when the complete body, including `write_attempt_id`,
+  `GET`. The renewer adopts the result only when the complete body, including `write_attempt_id`,
   equals its immutable request. If the predecessor token is still current, another identical `PUT`
   may follow bounded backoff. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
   body is never treated as this renewal.
@@ -97,7 +97,7 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   `attempt_timeout + safety_margin` fits inside the remaining lease, rejecting with
   `BAD_ARGUMENTS` at request-admission time rather than mid-flight.
 
-**Losing the lease is neither read-only mode nor a process abort.** `MountLeaseKeeper` is a
+**Losing the lease is neither read-only mode nor a process abort.** `MountLeaseRenewer` is a
 synchronous durable-slot state machine. A committed result advances its token, sequence, confirmed
 BOOTTIME deadline, and cadence anchor. Any admitted deterministic failure, confirmed conflict, or
 ambiguity left at the deadline/attempt limit moves it to `RenewalTerminal`; it cannot mint another
@@ -105,7 +105,7 @@ body or publish a clean farewell. Owner cancellation before any request is the o
 `NotAttempted` result and leaves clean release possible. Cancellation after a request was sent is
 terminal because that request may still land.
 
-After the keeper call returns, `CasMountRuntime` consumes the result. A terminal result trips the
+After the renewer call returns, `CasMountRuntime` consumes the result. A terminal result trips the
 local fence (latches `lost`, bumps the fence generation, moves the in-process runtime to
 `TransientNotLive`) and latches one self-remount generation. A confirmed foreign/successor or
 same-pair conflict remains a typed fail-closed error; it is never adopted. A real fence still costs
@@ -166,7 +166,7 @@ the claim outcomes above and is shown here as behavior, not as a type in the cod
 stateDiagram-v2
     [*] --> Absent
     Absent --> Live: claimMount putIfAbsent, seq=1
-    Live --> Live: keeper beat, putOverwrite seq+1
+    Live --> Live: renewer beat, putOverwrite seq+1
     Live --> Fenced: GC observes a stable token past threshold, gc_fenced=1, body preserved
     Live --> Terminated: certified drain, terminal farewell (expires_at=now, min_active_build_sequence=MAX)
     Fenced --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
@@ -202,7 +202,7 @@ under a live mount is an operator-level event.
 
 **Writable open** runs in a strict order: bootstrap-residual proof, capability probe under a
 random per-mount prefix, pool-meta create-or-validate, `validateServerRootId`, owner claim,
-`allocateWriterEpoch`, mount claim and synchronous keeper start, materialization grace if the
+`allocateWriterEpoch`, mount claim and synchronous renewer start, materialization grace if the
 predecessor was unclean (default 30 s), arm the fence, then create and release the runtime-owned
 renewal and remount workers before the writable pool becomes externally visible. If the grace period
 consumed the TTL, one fresh synchronous renewal re-anchors the deadline before the fence is armed.
@@ -211,15 +211,15 @@ open. No incident path constructs a thread.
 
 The renewal and remount workers are separate and long-lived under one stable `CasMountRuntime`.
 `scheduleRemount` increments a requested-generation latch and wakes the persistent remount worker,
-including while an older generation is active. Before keeper replacement, remount requests
-`ParkRequested` and waits for the renewal driver to report `Parked`, which proves that no keeper call
+including while an older generation is active. Before renewer replacement, remount requests
+`ParkRequested` and waits for the renewal driver to report `Parked`, which proves that no renewer call
 is in flight. A successful remount handles only its snapshotted generation; a newer request is
 processed before renewal resumes.
 
 **Clean unmount:** request stop and join both persistent workers, drain the ref lanes, and only if
-the drain *certified* quiescence call `MountLeaseKeeper::release` on an `Active` keeper to write the
+the drain *certified* quiescence call `MountLeaseRenewer::release` on an `Active` renewer to write the
 terminal farewell (`expires_at_ms` already expired, `min_active_build_sequence = UINT64_MAX`). That sentinel is what
-lets a successor reclaim instantly. A `RenewalTerminal` keeper, an unresolved ref write, or a sent
+lets a successor reclaim instantly. A `RenewalTerminal` renewer, an unresolved ref write, or a sent
 renewal ambiguity writes no farewell — an unearned farewell would let a successor start mutating
 while a stale conditional request from the predecessor is still in flight.
 

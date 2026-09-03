@@ -226,7 +226,7 @@ here for completeness, not because it changed anything.
   the probe throw uncaught on a terminal pool, which had made the documented `Replaced`-mid-`FORGET`
   path unreachable. Cost if wrong: none identified — the alternative (some liveness predicate) had no
   candidate.
-- **`TheKeeperRedoRenewsOnTheOpenPlane`'s admission requirement stands (`Parked`, not `Dormant`); the
+- **`TheRenewerRedoRenewsOnTheOpenPlane`'s admission requirement stands (`Parked`, not `Dormant`); the
   test is rewritten to reach the redo through the parked-worker path instead of relaxing the
   admission guard.** Reason: a workerless pool reaching `keeper_redo` was found to be a test gap, not
   a legitimate state the guard should admit — `StaleRemountAnchorPerformsParkedRedo` already proves
