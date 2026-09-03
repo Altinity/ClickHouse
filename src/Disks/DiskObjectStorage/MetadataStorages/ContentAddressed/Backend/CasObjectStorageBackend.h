@@ -141,7 +141,7 @@ public:
     Dialect nativeTokenType() const { return native_token_type; }
     void setNativeTokenTypeForTest(Dialect t) { native_token_type = t; }
 
-    /// ---- Token policy (single source of truth; see the .cpp) ----
+    /// ---- Incarnation value policy (single source of truth; see the .cpp) ----
     /// A GCS generation reaches this layer through the AWS SDK's ETag field, which the HTTP boundary
     /// fills with an ETag-shaped — that is, quoted — value. A generation is a number, and quotes are
     /// transport syntax that must not enter CAS protocol state, where token values are compared for

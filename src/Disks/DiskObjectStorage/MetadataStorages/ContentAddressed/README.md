@@ -81,7 +81,7 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
 
 - **`Primitives/`** — the vocabulary, zero outward dependencies: `CasBlobDigest`
   (`BlobHashAlgo` + `BlobDigest` + `DigestCodec` + `BlobRef` — blob identity),
-  `CasTypes.h` (the other identity types: `RootNamespace`, `Token`,
+  `CasTypes.h` (the other identity types: `RootNamespace`, `Dialect`,
   `ManifestId`, `RefTxnId`), `CasNamespaceLifeId` (`NamespaceLifeId` — one LIFE of
   a namespace's ref layer, the pair every ref key is built from),
   `CasBlobHashingWriteBuffer` (streaming
