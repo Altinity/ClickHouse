@@ -143,9 +143,13 @@ bool blobPresent(const std::shared_ptr<HoleyListBackend> & b, const Layout & lay
 /// than guessing a sequence number.
 std::set<String> listRefKeys(Backend & b, const Layout & layout, const RootNamespace & ns)
 {
-    /// Stage B (Task 4-C): `ns` is born through the REAL append lane here, so its objects sit at a
-    /// real catalog-minted incarnation, not the Stage-A sentinel.
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(b, layout, ns).value();
+    /// `ns` is born through the REAL append lane here, so its objects sit at a real catalog-minted
+    /// incarnation rather than a fixture-chosen one. The catalog read is made on an open-fence
+    /// operation of its own: this helper only observes, and shares no admission with the code
+    /// under test.
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(b);
+    CasOperation op = requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(op, layout, ns).value();
     std::set<String> keys;
     forEachListedKey(b, layout.namespaceStreamPrefix(life), [&](const ListedKey & k) { keys.insert(k.key); });
     return keys;
