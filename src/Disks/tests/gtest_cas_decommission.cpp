@@ -86,8 +86,8 @@ public:
 
     bool fired() const { return replacement_fired; }
 
-    /// Injects on the `read` PRIMITIVE rather than the legacy `get`: whichever caller reaches this
-    /// key -- through the legacy forwarder or through `CasOperation::read` -- funnels through here.
+    /// Injects on the `read` PRIMITIVE: every caller reaches this key through `CasOperation::read`,
+    /// which funnels through here.
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         auto got = InMemoryBackend::read(key, access);
@@ -116,20 +116,22 @@ private:
     bool replacement_fired = false;
 };
 
-std::vector<std::tuple<String, String, Token>> snapshotPrefixObjects(
+std::vector<std::tuple<String, String, Etag>> snapshotPrefixObjects(
     InMemoryBackend & backend, const String & prefix)
 {
-    std::vector<std::tuple<String, String, Token>> objects;
+    std::vector<std::tuple<String, String, Etag>> objects;
+    auto requests = openRequestsForTest(backend);
+    auto op = requests.admit();
     String cursor;
     while (true)
     {
-        const ListPage page = backend.list(prefix, cursor, 1000);
-        for (const ListedKey & listed : page.keys)
+        const KeyPage page = op.list(prefix, cursor, 1000, Retry::once());
+        for (const KeyEntry & listed : page.keys)
         {
-            const auto got = backend.get(listed.key);
+            const auto got = op.read(listed.key, Retry::once());
             if (!got)
                 throw std::runtime_error("prefix snapshot fixture: listed object disappeared");
-            objects.emplace_back(listed.key, got->bytes, got->token);
+            objects.emplace_back(listed.key, got->bytes, got->incarnation);
         }
         if (page.next_cursor.empty())
             return objects;
@@ -175,17 +177,17 @@ public:
     }
 
     bool successorInjected() const { return successor_injected; }
-    const Token & successorMountToken() const { return successor_mount_token; }
-    const Token & successorEpochToken() const { return successor_epoch_token; }
+    const String & successorMountValue() const { return successor_mount_value; }
+    const String & successorEpochValue() const { return successor_epoch_value; }
     const String & successorMountBytes() const { return successor_mount_bytes; }
     const String & successorEpochBytes() const { return successor_epoch_bytes; }
 
 private:
-    /// Every request here is issued on a PRIMITIVE. A legacy verb would be re-dispatched through the
-    /// virtual primitive it forwards to -- `get` through `read` -- which is this very hook, so the
-    /// injection would re-enter itself with `successor_injected` still false. The two `Token`s the
-    /// tests compare against are minted through `Backend`'s own minter, the one the legacy forwarders
-    /// use, so they are the values a legacy caller would have received.
+    /// Every request here is issued on the PRIMITIVE `write`, using the `access` token the caller's
+    /// own in-flight request already holds -- no `CasRequests`/`CasOperation` exists inside this
+    /// reentrant hook to mint one. The captured `successor_*_value` fields are the raw wire values
+    /// `write` returned, which the tests compare against a real incarnation's rendered value
+    /// (`PersistedEtag::capture`) taken through their own `CasOperation`.
     void injectSuccessor(TransportAccess & access)
     {
         const auto epoch = InMemoryBackend::read(epoch_key, access);
@@ -200,7 +202,7 @@ private:
         const auto epoch_written = InMemoryBackend::write(epoch_key, successor_epoch_bytes, epoch->value, access);
         if (!epoch_written)
             throw std::runtime_error("successor-reclaim fixture: epoch bump conflicted");
-        successor_epoch_token = legacyMintWritten(epoch_key, *epoch_written);
+        successor_epoch_value = *epoch_written;
 
         MountLease mount_value = decodeMountLease(mount->bytes);
         mount_value.writer_epoch = successor_writer_epoch;
@@ -213,7 +215,7 @@ private:
         const auto mount_written = InMemoryBackend::write(mount_key, successor_mount_bytes, mount->value, access);
         if (!mount_written)
             throw std::runtime_error("successor-reclaim fixture: mount reclaim conflicted");
-        successor_mount_token = legacyMintWritten(mount_key, *mount_written);
+        successor_mount_value = *mount_written;
         successor_injected = true;
     }
 
@@ -222,8 +224,8 @@ private:
     bool armed = false;
     bool farewell_seen = false;
     bool successor_injected = false;
-    Token successor_mount_token;
-    Token successor_epoch_token;
+    String successor_mount_value;
+    String successor_epoch_value;
     String successor_mount_bytes;
     String successor_epoch_bytes;
 };
@@ -248,8 +250,8 @@ public:
 
     bool successorInjected() const { return successor_injected; }
     uint64_t ownerRewriteAttempts() const { return owner_rewrite_attempts; }
-    const Token & successorMountToken() const { return successor_mount_token; }
-    const Token & successorEpochToken() const { return successor_epoch_token; }
+    const String & successorMountValue() const { return successor_mount_value; }
+    const String & successorEpochValue() const { return successor_epoch_value; }
     const String & successorMountBytes() const { return successor_mount_bytes; }
     const String & successorEpochBytes() const { return successor_epoch_bytes; }
 
@@ -268,16 +270,16 @@ private:
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
-    /// On the `write` PRIMITIVE, for the reason the sibling fixture above states: a legacy verb is
-    /// re-dispatched through the virtual primitive it forwards to, so it would re-enter this class's
-    /// own overrides instead of reaching the store directly.
+    /// On the `write` PRIMITIVE, using the caller's own in-flight `access`: this hook is reentrant
+    /// (called from inside another primitive override on the same object), so it reaches the store
+    /// directly through `InMemoryBackend::write` rather than admitting a fresh request of its own.
     void injectSuccessor(TransportAccess & access)
     {
         successor_epoch_bytes = encodeServerEpoch(ServerEpoch{.next_writer_epoch = 102});
         const auto epoch_written = InMemoryBackend::write(epoch_key, successor_epoch_bytes, std::nullopt, access);
         if (!epoch_written)
             throw std::runtime_error("late-successor fixture: epoch recreation conflicted");
-        successor_epoch_token = legacyMintWritten(epoch_key, *epoch_written);
+        successor_epoch_value = *epoch_written;
 
         successor_mount_bytes = encodeMountLease(MountLease{
             .server_uuid = UInt128(0x1234),
@@ -292,7 +294,7 @@ private:
         const auto mount_written = InMemoryBackend::write(mount_key, successor_mount_bytes, std::nullopt, access);
         if (!mount_written)
             throw std::runtime_error("late-successor fixture: mount recreation conflicted");
-        successor_mount_token = legacyMintWritten(mount_key, *mount_written);
+        successor_mount_value = *mount_written;
         successor_injected = true;
     }
 
@@ -302,8 +304,8 @@ private:
     bool armed = false;
     bool successor_injected = false;
     uint64_t owner_rewrite_attempts = 0;
-    Token successor_mount_token;
-    Token successor_epoch_token;
+    String successor_mount_value;
+    String successor_epoch_value;
     String successor_mount_bytes;
     String successor_epoch_bytes;
 };
@@ -330,7 +332,7 @@ public:
             const auto put = InMemoryBackend::write(owner_key, successor_owner_bytes, result->value, access);
             if (!put.has_value())
                 throw std::runtime_error("owner-successor fixture: owner rewrite conflicted");
-            successor_owner_token = legacyMintWritten(owner_key, *put);
+            successor_owner_value = *put;
             successor_injected = true;
         }
         return result;
@@ -347,7 +349,7 @@ public:
     }
 
     bool successorInjected() const { return successor_injected; }
-    const Token & successorOwnerToken() const { return successor_owner_token; }
+    const String & successorOwnerValue() const { return successor_owner_value; }
     const String & successorOwnerBytes() const { return successor_owner_bytes; }
 
 private:
@@ -356,7 +358,7 @@ private:
     bool armed = false;
     bool epoch_deleted = false;
     bool successor_injected = false;
-    Token successor_owner_token;
+    String successor_owner_value;
     String successor_owner_bytes;
 };
 
@@ -371,7 +373,7 @@ private:
 void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed, uint64_t precommits)
 {
     const RootNamespace ns(ns_str);
-    Backend & backend = victim.backend();
+    Backend & backend = *victim.poolBackendPtr();
     const Layout & layout = victim.layout();
 
     /// A throwaway open-fence operation, for the two `CasRefCatalog` calls below only: this fixture
@@ -433,10 +435,11 @@ ManifestId seedOrphanManifestBody(Pool & victim, const String & ns_str)
 {
     const RootNamespace ns(ns_str);
     const ManifestRef ref{.writer_epoch = victim.writerEpoch(), .build_sequence = 99, .manifest_ordinal = 1};
-    const ManifestId id = writeManifestRaw(victim.backend(), victim.layout(), ns, ref, {});
+    const ManifestId id = writeManifestRaw(*victim.poolBackendPtr(), victim.layout(), ns, ref, {});
     /// EXPECT, not ASSERT: this function returns a value now, and ASSERT_* expands to a bare `return;`
     /// -- invalid in a non-void function.
-    EXPECT_TRUE(victim.backend().head(victim.layout().manifestKey(id)).exists);
+    OperationForTest op(*victim.poolBackendPtr());
+    EXPECT_TRUE((*op).head(victim.layout().manifestKey(id), Retry::once()).has_value());
     return id;
 }
 
@@ -531,31 +534,32 @@ TEST(CASDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
             .incarnation = UInt128{77},
             .removal_started_round = 1},
     };
-    const auto empty_catalog = backend->get(layout.refCatalogKey());
+    OperationForTest raw_op(*backend);
+    const auto empty_catalog = (*raw_op).read(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(empty_catalog);
-    ASSERT_EQ(backend->putOverwrite(
-        layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->token).outcome, PutOutcome::Done);
-    const auto owner_before = backend->get(layout.ownerKey("victim"));
-    const auto epoch_before = backend->get(layout.epochKey("victim"));
-    const auto mount_before = backend->get(layout.mountKey("victim"));
+    ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).replace(
+        layout.refCatalogKey(), encodeRefCatalog(catalog), empty_catalog->incarnation, Retry::once())));
+    const auto owner_before = (*raw_op).read(layout.ownerKey("victim"), Retry::once());
+    const auto epoch_before = (*raw_op).read(layout.epochKey("victim"), Retry::once());
+    const auto mount_before = (*raw_op).read(layout.mountKey("victim"), Retry::once());
     ASSERT_TRUE(owner_before);
     ASSERT_TRUE(epoch_before);
     ASSERT_TRUE(mount_before);
 
     EXPECT_THROW(decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim"), DB::Exception);
-    const auto owner_after = backend->get(layout.ownerKey("victim"));
-    const auto epoch_after = backend->get(layout.epochKey("victim"));
-    const auto mount_after = backend->get(layout.mountKey("victim"));
+    const auto owner_after = (*raw_op).read(layout.ownerKey("victim"), Retry::once());
+    const auto epoch_after = (*raw_op).read(layout.epochKey("victim"), Retry::once());
+    const auto mount_after = (*raw_op).read(layout.mountKey("victim"), Retry::once());
     ASSERT_TRUE(owner_after);
     ASSERT_TRUE(epoch_after);
     ASSERT_TRUE(mount_after);
     EXPECT_EQ(owner_after->bytes, owner_before->bytes);
-    EXPECT_EQ(owner_after->token, owner_before->token);
+    EXPECT_EQ(owner_after->incarnation, owner_before->incarnation);
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
-    EXPECT_EQ(epoch_after->token, epoch_before->token);
+    EXPECT_EQ(epoch_after->incarnation, epoch_before->incarnation);
     EXPECT_EQ(mount_after->bytes, mount_before->bytes);
-    EXPECT_EQ(mount_after->token, mount_before->token);
+    EXPECT_EQ(mount_after->incarnation, mount_before->incarnation);
 }
 
 TEST(CASDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelection)
@@ -574,9 +578,10 @@ TEST(CASDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelect
             .removal_started_round = 1},
     };
 
-    const auto owner_before = backend->get(layout.ownerKey("victim"));
-    const auto epoch_before = backend->get(layout.epochKey("victim"));
-    const auto mount_before = backend->get(layout.mountKey("victim"));
+    OperationForTest raw_op(*backend);
+    const auto owner_before = (*raw_op).read(layout.ownerKey("victim"), Retry::once());
+    const auto epoch_before = (*raw_op).read(layout.epochKey("victim"), Retry::once());
+    const auto mount_before = (*raw_op).read(layout.mountKey("victim"), Retry::once());
     ASSERT_TRUE(owner_before);
     ASSERT_TRUE(epoch_before);
     ASSERT_TRUE(mount_before);
@@ -586,18 +591,18 @@ TEST(CASDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelect
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim"), DB::Exception);
     ASSERT_TRUE(backend->fired());
 
-    const auto owner_after = backend->get(layout.ownerKey("victim"));
-    const auto epoch_after = backend->get(layout.epochKey("victim"));
-    const auto mount_after = backend->get(layout.mountKey("victim"));
+    const auto owner_after = (*raw_op).read(layout.ownerKey("victim"), Retry::once());
+    const auto epoch_after = (*raw_op).read(layout.epochKey("victim"), Retry::once());
+    const auto mount_after = (*raw_op).read(layout.mountKey("victim"), Retry::once());
     ASSERT_TRUE(owner_after);
     ASSERT_TRUE(epoch_after);
     ASSERT_TRUE(mount_after);
     EXPECT_EQ(owner_after->bytes, owner_before->bytes);
-    EXPECT_EQ(owner_after->token, owner_before->token);
+    EXPECT_EQ(owner_after->incarnation, owner_before->incarnation);
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
-    EXPECT_EQ(epoch_after->token, epoch_before->token);
+    EXPECT_EQ(epoch_after->incarnation, epoch_before->incarnation);
     EXPECT_EQ(mount_after->bytes, mount_before->bytes);
-    EXPECT_EQ(mount_after->token, mount_before->token);
+    EXPECT_EQ(mount_after->incarnation, mount_before->incarnation);
 }
 
 TEST(CASDecommission, NamespaceSelectionUsesThePreImpersonationCut)
@@ -633,28 +638,26 @@ TEST(CASDecommission, SameNameRebirthAfterTheCutIsRefusedWithoutTouchingTheNewLi
     old_catalog.entries = {
         CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = old_life.incarnation},
     };
-    const auto empty_catalog = backend->get(layout.refCatalogKey());
+    OperationForTest raw_op(*backend);
+    const auto empty_catalog = (*raw_op).read(layout.refCatalogKey(), Retry::once());
     ASSERT_TRUE(empty_catalog);
-    ASSERT_EQ(backend->putOverwrite(
-        layout.refCatalogKey(), encodeRefCatalog(old_catalog), empty_catalog->token).outcome,
-        PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).replace(
+        layout.refCatalogKey(), encodeRefCatalog(old_catalog), empty_catalog->incarnation, Retry::once())));
 
     RefLogTxn new_birth;
     new_birth.ns = ns.string();
     new_birth.txn_id = RefTxnId{1, 1};
     new_birth.ops = {namespaceBirthOp()};
-    ASSERT_EQ(backend->putIfAbsent(
+    ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).create(
         layout.refLogKey(new_life, new_birth.txn_id),
-        sealObject(FormatId::RefLog, encodeRefLogTxn(new_birth))).outcome,
-        PutOutcome::Done);
+        sealObject(FormatId::RefLog, encodeRefLogTxn(new_birth)), Retry::once())));
     RefLogTxn new_seal;
     new_seal.ns = ns.string();
     new_seal.txn_id = RefTxnId{1, 2};
     new_seal.ops = {epochSealOp()};
-    ASSERT_EQ(backend->putIfAbsent(
+    ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).create(
         layout.refLogKey(new_life, new_seal.txn_id),
-        sealObject(FormatId::RefLog, encodeRefLogTxn(new_seal))).outcome,
-        PutOutcome::Done);
+        sealObject(FormatId::RefLog, encodeRefLogTxn(new_seal)), Retry::once())));
     const auto new_life_before = snapshotPrefixObjects(*backend, layout.namespaceStreamPrefix(new_life));
 
     RefCatalog replacement;
@@ -761,8 +764,8 @@ TEST(CASDecommission, CountsRealisticEpochPrecommit)
         /// -- a REAL build's `ManifestRef` is unique per build, and a colliding one would trip the ref
         /// state machine's "manifest already has a conflicting owner" guard.
         const ManifestRef ref{.writer_epoch = victim_epoch, .build_sequence = 2, .manifest_ordinal = 1};
-        writeManifestRaw(victim->backend(), victim->layout(), ns, ref, {});
-        addPrecommitTransition(victim->backend(), victim->layout(), ns, UInt128(1), "precommit_0", std::nullopt, ref);
+        writeManifestRaw(*victim->poolBackendPtr(), victim->layout(), ns, ref, {});
+        addPrecommitTransition(*victim->poolBackendPtr(), victim->layout(), ns, UInt128(1), "precommit_0", std::nullopt, ref);
     }
 
     const auto report = decommissionPoolMember(
@@ -817,9 +820,12 @@ TEST(CASDecommission, DrainsDebrisStagingAndRoots)
     /// Foreign staging + mountpoint objects, written raw (no writer machinery needed): the victim's
     /// writers are fenced by the claim before decommission ever gets here, so these are ordinary debris,
     /// not a live in-flight write.
-    backend->putIfAbsent("p/staging/victim/upload1.tmp", "x");
-    backend->putIfAbsent("p/staging/victim/upload2.tmp", "x");
-    backend->putIfAbsent("p/roots/victim/clickhouse_access_check_abc", "x");
+    {
+        OperationForTest seed_op(*backend);
+        (*seed_op).create("p/staging/victim/upload1.tmp", "x", Retry::once());
+        (*seed_op).create("p/staging/victim/upload2.tmp", "x", Retry::once());
+        (*seed_op).create("p/roots/victim/clickhouse_access_check_abc", "x", Retry::once());
+    }
 
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
@@ -835,8 +841,9 @@ TEST(CASDecommission, DrainsDebrisStagingAndRoots)
 
     /// Nothing of the victim remains under staging/ or roots/ (scoped LISTs are empty). Those two phases
     /// run to completion even though the debris phase retained -- the drain is per-phase, not all-or-nothing.
-    EXPECT_TRUE(backend->list("p/staging/victim/", "", 10).keys.empty());
-    EXPECT_TRUE(backend->list("p/roots/victim/", "", 10).keys.empty());
+    OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).list("p/staging/victim/", "", 10, Retry::once()).keys.empty());
+    EXPECT_TRUE((*raw_op).list("p/roots/victim/", "", 10, Retry::once()).keys.empty());
 }
 
 /// The §6 deletion premise applies to the decommission drain too, and this pins what that COSTS. With no
@@ -866,7 +873,8 @@ TEST(CASDecommission, RetainsDebrisWhoseEpochSealIsUnconsumed)
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
 
     EXPECT_EQ(report.manifest_debris_removed, 0u);
-    EXPECT_TRUE(backend->head(debris_key).exists)
+    OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value())
         << "the body is retained untouched, not deleted and not corrupted";
     ASSERT_FALSE(report.warnings.empty())
         << "a retained manifest is a visible decision -- the operator must be able to see why the drain "
@@ -892,9 +900,12 @@ TEST(CASDecommission, PerObjectFailureWarnsAndContinuesDrain)
         auto victim = openVictim(backend);
         makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
     }
-    backend->putIfAbsent("p/staging/victim/upload_ok.tmp", "x");
-    backend->putIfAbsent("p/staging/victim/upload_throws.tmp", "x");
-    backend->putIfAbsent("p/roots/victim/clickhouse_access_check_abc", "x");
+    {
+        OperationForTest seed_op(*backend);
+        (*seed_op).create("p/staging/victim/upload_ok.tmp", "x", Retry::once());
+        (*seed_op).create("p/staging/victim/upload_throws.tmp", "x", Retry::once());
+        (*seed_op).create("p/roots/victim/clickhouse_access_check_abc", "x", Retry::once());
+    }
     backend->failWithThrow("p/staging/victim/upload_throws.tmp");
     backend->failWithTokenMismatch("p/roots/victim/clickhouse_access_check_abc");
 
@@ -907,11 +918,12 @@ TEST(CASDecommission, PerObjectFailureWarnsAndContinuesDrain)
     EXPECT_EQ(report.warnings.size(), 2u)
         << "one warning for the thrown exception, one for the TokenMismatch outcome";
 
-    EXPECT_FALSE(backend->head("p/staging/victim/upload_ok.tmp").exists)
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head("p/staging/victim/upload_ok.tmp", Retry::once()).has_value())
         << "the healthy staging object was actually deleted, not merely skipped";
-    EXPECT_TRUE(backend->head("p/staging/victim/upload_throws.tmp").exists)
+    EXPECT_TRUE((*raw_op).head("p/staging/victim/upload_throws.tmp", Retry::once()).has_value())
         << "the failing object is left behind (untouched) so a re-run can retry it";
-    EXPECT_TRUE(backend->head("p/roots/victim/clickhouse_access_check_abc").exists)
+    EXPECT_TRUE((*raw_op).head("p/roots/victim/clickhouse_access_check_abc", Retry::once()).has_value())
         << "TokenMismatch means nothing was actually deleted -- the object survives";
 }
 
@@ -927,13 +939,15 @@ TEST(CASDecommission, LifelessPhysicalKeyCannotRedirectCatalogOwnedDecommission)
         /// Hand-built: no helper can mint the un-incarnated shape any more.
         lifeless = victim->layout().casRefsPrefix() + String("victim/db/t1/_log/")
             + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
-        ASSERT_EQ(backend->putIfAbsent(lifeless, "garbage").outcome, PutOutcome::Done);
+        OperationForTest seed_op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*seed_op).create(lifeless, "garbage", Retry::once())));
     }
 
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
     EXPECT_EQ(report.namespaces_removed, 1u);
-    EXPECT_TRUE(backend->head(lifeless).exists)
+    OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).head(lifeless, Retry::once()).has_value())
         << "decommission must neither adopt nor delete an unowned physical life key";
 }
 
@@ -952,7 +966,10 @@ TEST(CASDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
         debris_key = victim->layout().manifestKey(debris_id);
     }
     backend->failWithThrow(debris_key);
-    backend->putIfAbsent("p/staging/victim/upload_ok.tmp", "x");
+    {
+        OperationForTest seed_op(*backend);
+        (*seed_op).create("p/staging/victim/upload_ok.tmp", "x", Retry::once());
+    }
 
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
@@ -966,7 +983,8 @@ TEST(CASDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
         << "the staging phase still ran to completion after the manifest-debris phase's failures -- "
            "the whole command did not abort";
 
-    EXPECT_TRUE(backend->head(debris_key).exists)
+    OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value())
         << "the failing object is left behind (untouched) so a re-run can retry it";
 }
 
@@ -988,11 +1006,12 @@ TEST(CASDecommission, RemovesMutableSlotAndRefusesTombstonedRerun)
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
     EXPECT_TRUE(report.slot_removed);
     EXPECT_TRUE(report.warnings.empty());
-    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
-    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value());
+    const auto owner = (*raw_op).read("p/gc/server-roots/victim/owner", Retry::once());
     ASSERT_TRUE(owner.has_value());
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
-    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
+    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/epoch", Retry::once()).has_value());
 
     expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&]
     {
@@ -1021,16 +1040,17 @@ TEST(CASDecommission, SuccessorReclaimFencesSlotRetirementTail)
     EXPECT_NE(report.warnings.front().find("p/gc/server-roots/victim/mount"), String::npos);
     EXPECT_NE(report.warnings.front().find("mismatch"), String::npos);
 
-    const auto mount = backend->get("p/gc/server-roots/victim/mount");
+    OperationForTest raw_op(*backend);
+    const auto mount = (*raw_op).read("p/gc/server-roots/victim/mount", Retry::once());
     ASSERT_TRUE(mount.has_value());
-    EXPECT_EQ(mount->token, backend->successorMountToken());
+    EXPECT_EQ(PersistedEtag::capture(mount->incarnation).value, backend->successorMountValue());
     EXPECT_EQ(mount->bytes, backend->successorMountBytes());
 
-    const auto epoch = backend->get("p/gc/server-roots/victim/epoch");
+    const auto epoch = (*raw_op).read("p/gc/server-roots/victim/epoch", Retry::once());
     ASSERT_TRUE(epoch.has_value());
-    EXPECT_EQ(epoch->token, backend->successorEpochToken());
+    EXPECT_EQ(PersistedEtag::capture(epoch->incarnation).value, backend->successorEpochValue());
     EXPECT_EQ(epoch->bytes, backend->successorEpochBytes());
-    EXPECT_TRUE(backend->get("p/gc/server-roots/victim/owner").has_value());
+    EXPECT_TRUE((*raw_op).read("p/gc/server-roots/victim/owner", Retry::once()).has_value());
 
     ASSERT_FALSE(seen.empty());
     EXPECT_EQ(seen.back().outcome, "end");
@@ -1045,7 +1065,8 @@ TEST(CASDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
     { auto victim = openVictim(backend); }
 
     const String owner_key = "p/gc/server-roots/victim/owner";
-    const auto original_owner = backend->get(owner_key);
+    OperationForTest raw_op(*backend);
+    const auto original_owner = (*raw_op).read(owner_key, Retry::once());
     ASSERT_TRUE(original_owner.has_value());
     backend->armForSuccessorReclaim();
 
@@ -1057,19 +1078,19 @@ TEST(CASDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
     EXPECT_FALSE(report.warnings.empty());
     EXPECT_EQ(backend->ownerRewriteAttempts(), 0u);
 
-    const auto owner = backend->get(owner_key);
+    const auto owner = (*raw_op).read(owner_key, Retry::once());
     ASSERT_TRUE(owner.has_value());
-    EXPECT_EQ(owner->token, original_owner->token);
+    EXPECT_EQ(owner->incarnation, original_owner->incarnation);
     EXPECT_EQ(owner->bytes, original_owner->bytes);
 
-    const auto mount = backend->get("p/gc/server-roots/victim/mount");
+    const auto mount = (*raw_op).read("p/gc/server-roots/victim/mount", Retry::once());
     ASSERT_TRUE(mount.has_value());
-    EXPECT_EQ(mount->token, backend->successorMountToken());
+    EXPECT_EQ(PersistedEtag::capture(mount->incarnation).value, backend->successorMountValue());
     EXPECT_EQ(mount->bytes, backend->successorMountBytes());
 
-    const auto epoch = backend->get("p/gc/server-roots/victim/epoch");
+    const auto epoch = (*raw_op).read("p/gc/server-roots/victim/epoch", Retry::once());
     ASSERT_TRUE(epoch.has_value());
-    EXPECT_EQ(epoch->token, backend->successorEpochToken());
+    EXPECT_EQ(PersistedEtag::capture(epoch->incarnation).value, backend->successorEpochValue());
     EXPECT_EQ(epoch->bytes, backend->successorEpochBytes());
 }
 
@@ -1085,9 +1106,10 @@ TEST(CASDecommission, FencedSlotRetirementTailRetiresUncontendedSlot)
 
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_TRUE(report.slot_removed);
-    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
-    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
-    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value());
+    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/epoch", Retry::once()).has_value());
+    const auto owner = (*raw_op).read("p/gc/server-roots/victim/owner", Retry::once());
     ASSERT_TRUE(owner.has_value());
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
@@ -1119,9 +1141,10 @@ TEST(CASDecommission, RunsOnAnOpenFence)
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_TRUE(report.slot_removed);
-    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
-    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
-    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value());
+    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/epoch", Retry::once()).has_value());
+    const auto owner = (*raw_op).read("p/gc/server-roots/victim/owner", Retry::once());
     ASSERT_TRUE(owner.has_value());
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
@@ -1132,7 +1155,8 @@ TEST(CASDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
     { auto victim = openVictim(backend); }
 
     const String owner_key = "p/gc/server-roots/victim/owner";
-    const auto before = backend->get(owner_key);
+    OperationForTest raw_op(*backend);
+    const auto before = (*raw_op).read(owner_key, Retry::once());
     ASSERT_TRUE(before.has_value());
     EXPECT_FALSE(decodeOwner(before->bytes).retired_at_ms.has_value());
 
@@ -1141,9 +1165,9 @@ TEST(CASDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
 
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_TRUE(report.slot_removed);
-    const auto after = backend->get(owner_key);
+    const auto after = (*raw_op).read(owner_key, Retry::once());
     ASSERT_TRUE(after.has_value());
-    EXPECT_NE(after->token, before->token);
+    EXPECT_NE(after->incarnation, before->incarnation);
     EXPECT_EQ(decodeOwner(after->bytes).server_uuid, decodeOwner(before->bytes).server_uuid);
     EXPECT_TRUE(decodeOwner(after->bytes).retired_at_ms.has_value());
 }
@@ -1162,9 +1186,10 @@ TEST(CASDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
     ASSERT_EQ(report.warnings.size(), 1u);
     EXPECT_NE(report.warnings.front().find("successor reclaimed"), String::npos);
 
-    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    OperationForTest raw_op(*backend);
+    const auto owner = (*raw_op).read("p/gc/server-roots/victim/owner", Retry::once());
     ASSERT_TRUE(owner.has_value());
-    EXPECT_EQ(owner->token, backend->successorOwnerToken());
+    EXPECT_EQ(PersistedEtag::capture(owner->incarnation).value, backend->successorOwnerValue());
     EXPECT_EQ(owner->bytes, backend->successorOwnerBytes());
     EXPECT_FALSE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
@@ -1189,7 +1214,8 @@ TEST(CASDecommission, OwnerTombstoneAmbiguousSuccessResolvesToCommitted)
     EXPECT_TRUE(report.slot_removed) << "the ambiguous write actually landed and must resolve to Committed";
     EXPECT_TRUE(report.warnings.empty());
 
-    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    OperationForTest raw_op(*backend);
+    const auto owner = (*raw_op).read("p/gc/server-roots/victim/owner", Retry::once());
     ASSERT_TRUE(owner.has_value());
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
@@ -1203,12 +1229,6 @@ TEST(CASDecommission, OwnerTombstoneAmbiguousSuccessResolvesToCommitted)
 class FailDeletesUnderPrefixBackend : public Backend
 {
 public:
-    using Backend::get;
-    using Backend::getStream;
-    using Backend::putIfAbsent;
-    using Backend::putOverwrite;
-    using Backend::casPut;
-
     FailDeletesUnderPrefixBackend(std::shared_ptr<InMemoryBackend> inner_, String fail_prefix_)
         : inner(std::move(inner_)), fail_prefix(std::move(fail_prefix_))
     {
@@ -1216,26 +1236,6 @@ public:
 
     void disarm() { armed = false; }
 
-    std::optional<GetResult> get(const String & key, Range range) override { return inner->get(key, range); }
-    std::optional<GetStreamResult> getStream(const String & key, Range range) override { return inner->getStream(key, range); }
-    HeadResult head(const String & key) override { return inner->head(key); }
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
-    {
-        return inner->putIfAbsent(key, bytes, meta);
-    }
-    void publishBlob(const BlobPublishRequest & request) override
-    {
-        inner->publishBlob(request);
-    }
-    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
-    {
-        return inner->putOverwrite(key, bytes, expected, meta);
-    }
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta) override
-    {
-        return inner->casPut(key, bytes, expected, meta);
-    }
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override { return inner->list(prefix, cursor, limit); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
     /// The transport primitives forward to `inner`, except `remove`, which is what this double
@@ -1279,14 +1279,15 @@ TEST(CASDecommission, FailedDrainKeepsSlotThenResumes)
         auto victim = Pool::open(inner, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
         makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
     }
-    inner->putIfAbsent("p/roots/victim/loose_file", "x");
+    OperationForTest raw_op(*inner);
+    (*raw_op).create("p/roots/victim/loose_file", "x", Retry::once());
 
     auto failing = std::make_shared<FailDeletesUnderPrefixBackend>(inner, "p/roots/victim/");
     const auto first = decommissionPoolMember(
         failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
     EXPECT_FALSE(first.warnings.empty());
     EXPECT_FALSE(first.slot_removed);
-    EXPECT_TRUE(inner->get("p/gc/server-roots/victim/mount").has_value())
+    EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
         << "slot kept -- resume anchor";
 
     failing->disarm();
@@ -1325,9 +1326,10 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
     EXPECT_FALSE(first.warnings.empty());
     EXPECT_FALSE(first.slot_removed);
     EXPECT_EQ(first.manifest_debris_removed, 0u);
-    EXPECT_TRUE(backend->get("p/gc/server-roots/victim/mount").has_value())
+    OperationForTest raw_op(*backend);
+    EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
         << "slot kept -- resume anchor";
-    EXPECT_TRUE(backend->head(debris_key).exists)
+    EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value())
         << "the failing object is left behind (untouched) so a re-run can retry it";
 
     /// COVERAGE LOST HERE, DELIBERATELY NAMED. Before the §6 premise, clearing the injected failure let
@@ -1343,8 +1345,8 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
     EXPECT_EQ(second.namespaces_already_removed, 1u);
     EXPECT_EQ(second.manifest_debris_removed, 0u);
     EXPECT_FALSE(second.slot_removed);
-    EXPECT_TRUE(backend->head(debris_key).exists);
-    EXPECT_TRUE(backend->get("p/gc/server-roots/victim/mount").has_value())
+    EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value());
+    EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
         << "the slot is still the resume anchor -- nothing was retired against unreclaimed debris";
 }
 
@@ -1380,15 +1382,16 @@ TEST(CASDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
     }
 
     /// Manually strike epoch + owner, leaving the mount -- the legacy partial hand-cleanup shape.
+    OperationForTest raw_op(*backend);
     for (const String & key : {layout.epochKey("victim"), layout.ownerKey("victim")})
     {
-        const auto head = backend->head(key);
-        ASSERT_TRUE(head.exists);
-        backend->deleteExact(key, head.token);
+        const auto head = (*raw_op).head(key, Retry::once());
+        ASSERT_TRUE(head.has_value());
+        ASSERT_EQ((*raw_op).remove(key, head->incarnation, Retry::once()), Removal::Removed);
     }
-    ASSERT_FALSE(backend->get(layout.epochKey("victim")).has_value());
-    ASSERT_FALSE(backend->get(layout.ownerKey("victim")).has_value());
-    ASSERT_TRUE(backend->get(layout.mountKey("victim")).has_value())
+    ASSERT_FALSE((*raw_op).head(layout.epochKey("victim"), Retry::once()).has_value());
+    ASSERT_FALSE((*raw_op).head(layout.ownerKey("victim"), Retry::once()).has_value());
+    ASSERT_TRUE((*raw_op).head(layout.mountKey("victim"), Retry::once()).has_value())
         << "the mount lease must survive -- it is the resume anchor the fallback reads";
 
     const auto report = decommissionPoolMember(
@@ -1397,11 +1400,11 @@ TEST(CASDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_EQ(report.namespaces_removed, 0u);
     EXPECT_TRUE(report.slot_removed);
-    EXPECT_FALSE(backend->get(layout.epochKey("victim")).has_value());
-    const auto owner = backend->get(layout.ownerKey("victim"));
+    EXPECT_FALSE((*raw_op).head(layout.epochKey("victim"), Retry::once()).has_value());
+    const auto owner = (*raw_op).read(layout.ownerKey("victim"), Retry::once());
     ASSERT_TRUE(owner.has_value());
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
-    EXPECT_FALSE(backend->get(layout.mountKey("victim")).has_value());
+    EXPECT_FALSE((*raw_op).head(layout.mountKey("victim"), Retry::once()).has_value());
 
     expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&]
     {
