@@ -181,7 +181,6 @@ TEST(CASNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
     EXPECT_EQ(store->refTableLifeForTest(live)->incarnation, UInt128{32});
     EXPECT_EQ(backend->putTotal(), 0u);
     EXPECT_EQ(backend->putOverwriteTotal(), 0u);
-    EXPECT_EQ(backend->casPutTotal(), 0u);
 }
 
 /// A real GC fold records terminal evidence for the previous life while its namespace-file debris

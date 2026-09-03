@@ -149,16 +149,23 @@ public:
     /// id. The whole parent seal is consumed so a caller cannot separate the life id from its proof or
     /// reduce the proof to a caller-computed boolean. `op`'s admission is checked after every fresh
     /// catalog read and before every attempted erase.
+    ///
+    /// `refresh_authority` runs at the top of every attempt, before the checks that decide whether to
+    /// send one. It is not a verdict -- the verdict stays `op.admitted()` -- but that liveness may be
+    /// a cached flag its holder refreshes from a fact this loop cannot see, and one reading taken
+    /// before the first erase must not authorise the rest.
     static CompletedRemovingDeleteResult deleteCompletedRemoving(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-        const CasFoldSeal & authoritative_parent);
+        const CasFoldSeal & authoritative_parent,
+        const std::function<void()> & refresh_authority = {});
 
     /// Same exact deletion, using the caller's complete selected catalog snapshot and its incarnation
     /// for the one erase attempt. Its mandatory resolution snapshot is returned in the result so a
     /// catalog-only drain can select the next row without an intervening read.
     static CompletedRemovingDeleteResult deleteCompletedRemovingAtSnapshot(
         CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
-        const CatalogEntry & observed, const CasFoldSeal & authoritative_parent);
+        const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
+        const std::function<void()> & refresh_authority = {});
 
     /// Outcome of exact stalled-creation cancellation, the only other exported deletion shape.
     enum class StalledCreatingCancelOutcome : uint8_t

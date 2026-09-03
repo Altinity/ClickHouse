@@ -47,18 +47,23 @@ public:
 
     size_t list_calls = 0;
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    /// On the transport primitive, not the legacy verb: every enumeration a `CasOperation` makes
+    /// reaches the store through this, so a distortion left on the verb would never fire and the
+    /// `list_calls` assertions would read zero whatever recovery did.
+    DB::Cas::Backend::RawListPage list(const String & prefix, const String & cursor, size_t limit,
+                                       DB::Cas::TransportAccess & access) override
     {
         ++list_calls;
-        ListPage page = CountingBackend::list(prefix, cursor, limit);
+        DB::Cas::Backend::RawListPage page = CountingBackend::list(prefix, cursor, limit, access);
         if (mode == ListingMode::Empty)
             page.keys.clear();
         else if (mode == ListingMode::Partial)
         {
-            page.keys.erase(std::remove_if(page.keys.begin(), page.keys.end(), [](const ListedKey & key)
-            {
-                return key.key.find("/_log/") != String::npos;
-            }), page.keys.end());
+            page.keys.erase(std::remove_if(page.keys.begin(), page.keys.end(),
+                [](const DB::Cas::Backend::RawListedKey & key)
+                {
+                    return key.key.find("/_log/") != String::npos;
+                }), page.keys.end());
         }
         else if (mode == ListingMode::Reordered)
             std::reverse(page.keys.begin(), page.keys.end());

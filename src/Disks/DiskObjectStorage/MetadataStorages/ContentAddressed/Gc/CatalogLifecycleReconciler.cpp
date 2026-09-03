@@ -58,7 +58,8 @@ CatalogResolution CatalogLifecycleReconciler::resolveExactRow(
     return CatalogResolution::ExactRowStillPresent;
 }
 
-CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile()
+CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile(
+    const std::function<void()> & refresh_authority)
 {
     CatalogLifecycleReconcileResult result{
         .authority_status = AuthorityStatus::Authoritative,
@@ -70,6 +71,9 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile()
 
     for (;;)
     {
+        if (refresh_authority)
+            refresh_authority();
+
         const std::optional<CatalogEntry> eligible = selectEligible(catalog);
         if (!eligible)
         {
@@ -85,7 +89,7 @@ CatalogLifecycleReconcileResult CatalogLifecycleReconciler::reconcile()
 
         CasRefCatalog::CompletedRemovingDeleteResult delete_result
             = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
-                op, layout, std::move(catalog), *eligible, adopted_parent);
+                op, layout, std::move(catalog), *eligible, adopted_parent, refresh_authority);
         if (!delete_result.catalog_snapshot)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS catalog lifecycle reconciliation returned no catalog resolution snapshot");

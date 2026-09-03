@@ -390,7 +390,8 @@ CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
 
 CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemoving(
     CasOperation & op, const Layout & layout, const CatalogEntry & observed,
-    const CasFoldSeal & authoritative_parent)
+    const CasFoldSeal & authoritative_parent,
+    const std::function<void()> & refresh_authority)
 {
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
@@ -408,12 +409,13 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             .catalog_snapshot = std::nullopt};
 
     return deleteCompletedRemovingAtSnapshot(
-        op, layout, read(op, layout), observed, authoritative_parent);
+        op, layout, read(op, layout), observed, authoritative_parent, refresh_authority);
 }
 
 CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemovingAtSnapshot(
     CasOperation & op, const Layout & layout, Snapshot catalog_snapshot,
-    const CatalogEntry & observed, const CasFoldSeal & authoritative_parent)
+    const CatalogEntry & observed, const CasFoldSeal & authoritative_parent,
+    const std::function<void()> & refresh_authority)
 {
     if (observed.state != NsState::Removing || !observed.removal_started_round)
         return {
@@ -451,6 +453,10 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
 
     for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
     {
+        /// So the admission consulted below is not one reading taken before the first attempt.
+        if (refresh_authority)
+            refresh_authority();
+
         catalog_snapshot.life_index.throwIfAmbiguous("CAS completed-removal deletion");
         /// A caller-supplied cut without an incarnation cannot state a precondition, and an erase that
         /// fell back to an unconditional write would delete whatever a concurrent writer had put there.

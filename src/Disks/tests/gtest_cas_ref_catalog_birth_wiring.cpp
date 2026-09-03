@@ -201,7 +201,7 @@ TEST(CASRefCatalogBirthWiring, CatalogLossAfterMountCannotRecreateAOneRowAuthori
     EXPECT_THROW(publishBirth(store, RootNamespace{"srv1/new"}, "new"), DB::Exception);
     EXPECT_FALSE(op.head(layout.refCatalogKey(), Retry::standard()).has_value())
         << "runtime loss must not be repaired with a one-row replacement authority";
-    EXPECT_EQ(backend->writeRequests(), 0u)
+    EXPECT_EQ(backend->writeTotal(), 0u)
         << "the failed birth must not publish a catalog, a checkpoint or a ref-log body";
 }
 
@@ -255,7 +255,7 @@ TEST(CASRefCatalogBirthWiring, BootstrapConflictExactReadsTheCanonicalEmptyCatal
     const CasRefCatalog::Snapshot snap = CasRefCatalog::initializeEmptyForNewPool(op, layout);
     EXPECT_TRUE(snap.catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), 1u);
-    EXPECT_EQ(backend->readRequestCount(layout.refCatalogKey()), 1u)
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u)
         << "a concurrent bootstrap winner must be exact-read before acceptance";
 }
 
@@ -273,7 +273,7 @@ TEST(CASRefCatalogBirthWiring, BootstrapConflictRefusesANonemptyCatalog)
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { CasRefCatalog::initializeEmptyForNewPool(op, layout); });
-    EXPECT_EQ(backend->readRequestCount(layout.refCatalogKey()), 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
 }
 
 TEST(CASRefCatalogBirthWiring, ExistingPoolMetaWithMissingCatalogStillFailsClosed)
@@ -382,7 +382,7 @@ TEST(CASRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefu
     const CatalogEntry * still = findEntry(still_cut.catalog, ns);
     ASSERT_NE(still, nullptr);
     EXPECT_EQ(*still, entry) << "a refused resolution must write nothing";
-    EXPECT_EQ(backend->writeRequests(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 0u);
 }
 
 /// The mirror image, and Task 3's own deferred obligation ("wire `reconcileStaleCreator` and pin it
@@ -442,8 +442,8 @@ TEST(CASRefCatalogBirthWiring, DropRefusesLiveCreatingFenceWithZeroCatalogMutati
     backend->resetWriteCounts();
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
-    EXPECT_EQ(backend->writeRequests(), 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{creating});
 }
 
@@ -470,8 +470,7 @@ TEST(CASRefCatalogBirthWiring, DropDeletesTerminalCreatingExactlyAndLeavesCkptFo
 
     store->dropNamespace(ns);
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), 1u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_TRUE(op.head(ckpt_key, Retry::standard()).has_value());
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
 
@@ -511,7 +510,7 @@ TEST(CASRefCatalogBirthWiring, DropLosesExactCreatingRaceToReconciliationWithout
     backend->resetWriteCounts();
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_TRUE(op.head(ckpt_key, Retry::standard()).has_value());
     const CasRefCatalog::Snapshot after = CasRefCatalog::read(op, layout);
     ASSERT_EQ(after.catalog.entries.size(), 1u);
@@ -549,7 +548,7 @@ TEST(CASRefCatalogBirthWiring, FencedDropCannotCancelTerminalCreating)
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), 1u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{creating});
 }
 
@@ -575,8 +574,7 @@ TEST(CASRefCatalogBirthWiring, ExactOldLifeCannotCancelReplacementTerminalCreati
     backend->resetWriteCounts();
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(predecessor); });
-    EXPECT_EQ(backend->writeRequests(), 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{successor});
 }

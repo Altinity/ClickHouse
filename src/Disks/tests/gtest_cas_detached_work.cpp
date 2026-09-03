@@ -140,8 +140,9 @@ class ManualDetachedLedger
 public:
     ManualDetachedLedger()
         : backend(std::make_shared<FinalAuthorityBackend>())
+        , mount_requests(DB::Cas::tests::openRequestsForTest(backend))
         , ledger(
-              backend,
+              mount_requests,
               layout,
               RefLedgerConfig{
                   .server_root_id = "test",
@@ -153,7 +154,6 @@ public:
               event_sink,
               oneAttemptBudget(),
               "test",
-              [] { return uint64_t{0}; },
               [] { return uint64_t{1}; },
               [] { return true; },
               [] { return uint64_t{1}; },
@@ -177,8 +177,7 @@ public:
               {},
               [](const RootNamespace &) {})
     {
-        CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
-        CasOperation op = requests.admit();
+        CasOperation op = mount_requests.admit();
         CasRefCatalog::initializeEmptyForNewPool(op, layout);
     }
 
@@ -205,6 +204,9 @@ public:
     std::shared_ptr<DetachedRegistryState> registry = std::make_shared<DetachedRegistryState>();
     Gate final_install_reached;
     Gate release_final_install;
+    /// The mount plane the ledger admits every request on. Declared before it, and never moved: the
+    /// ledger holds a reference to this member.
+    CasRequests mount_requests;
     CasRefLedger ledger;
 
 private:
@@ -317,7 +319,7 @@ void preparePendingRecoveryPublisher(
             release_first_publisher->wait();
         });
 
-    backend->armPutFailure("_snap/", 1);
+    backend->armWriteFailure("_snap/", 1);
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
     first_publisher_captured->wait();
 
@@ -328,9 +330,9 @@ void preparePendingRecoveryPublisher(
     ckpt_key = store->layout().refCkptKey(*life);
 
     /// The log lands before the checkpoint conflict, leaving a real unfrontiered durable transaction.
-    backend->armCasConflict(ckpt_key, 100);
+    backend->armWriteConflict(ckpt_key, 100);
     EXPECT_ANY_THROW(store->dropRef(ns, "ref_1"));
-    backend->armCasConflict(ckpt_key, 0);
+    backend->armWriteConflict(ckpt_key, 0);
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 }
 
@@ -578,7 +580,7 @@ TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
 
     /// Arm the fault so the publisher's own PUT fails and its `catch` is entered. Use the same arming
     /// call the snapshot-ordering suite uses against this backend.
-    backend->armPutFailure("_snap/", 1);
+    backend->armWriteFailure("_snap/", 1);
 
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -613,7 +615,7 @@ TEST(CASDetachedWork, StopWakesRecoveryBackoffSleep)
         });
 
     /// Exhaust one checkpoint publication inside recovery so the outer retry loop enters backoff.
-    backend->armCasConflict(ckpt_key, 100);
+    backend->armWriteConflict(ckpt_key, 100);
     release_first_publisher->open();
     sleeping->wait();
 
@@ -808,9 +810,9 @@ TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
     CasOperation catalog_op = catalog_requests.admit();
     const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, fixture.layout, ns).value();
     const String ckpt_key = fixture.layout.refCkptKey(life);
-    fixture.backend->armCasConflict(ckpt_key, 100);
+    fixture.backend->armWriteConflict(ckpt_key, 100);
     EXPECT_ANY_THROW(fixture.ledger.dropRef(ns, "ref_1"));
-    fixture.backend->armCasConflict(ckpt_key, 0);
+    fixture.backend->armWriteConflict(ckpt_key, 0);
     ASSERT_EQ(fixture.ledger.laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     auto detached_publisher = fixture.takeDetachedTask();

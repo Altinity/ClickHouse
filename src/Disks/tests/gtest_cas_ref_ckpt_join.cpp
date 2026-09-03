@@ -404,7 +404,7 @@ TEST(CASRefCheckpointJoin, JoinDecreasingLifeEpochIsCorruptionAndPublishesNothin
     const RefCkpt durable{.life_epoch = 9, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(op, layout, life, durable), CkptPublishOutcome::Published);
     /// This suite writes one key only, so the backend's own total is that key's count.
-    const uint64_t writes_before = backend->writeRequests();
+    const uint64_t writes_before = backend->writeTotal();
 
     const RefCkpt superseded{.life_epoch = 3, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     String message;
@@ -433,7 +433,7 @@ TEST(CASRefCheckpointJoin, JoinDecreasingLifeEpochIsCorruptionAndPublishesNothin
 
     /// And nothing was written. The refusal is decided before the body is built, so the durable object
     /// is untouched and no write was even attempted.
-    EXPECT_EQ(backend->writeRequests(), writes_before) << "the publisher must not write on a refused publish";
+    EXPECT_EQ(backend->writeTotal(), writes_before) << "the publisher must not write on a refused publish";
     EXPECT_EQ(lifeEpochOrFail(op, layout, life), 9u) << "the durable value is unchanged";
 }
 
@@ -455,7 +455,7 @@ TEST(CASRefCheckpointJoin, ADecreasingLifeEpochFromAFencedOutWriterIsReportedFen
     const RefCkpt durable{.life_epoch = 9, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(reader, layout, life, durable), CkptPublishOutcome::Published);
     /// This suite writes one key only, so the backend's own total is that key's count.
-    const uint64_t writes_before = backend->writeRequests();
+    const uint64_t writes_before = backend->writeTotal();
 
     /// Admission survives the read and is gone by the time the decrease is classified -- the exact
     /// window in which the refusal must be reported as a control signal rather than as corruption.
@@ -465,7 +465,7 @@ TEST(CASRefCheckpointJoin, ADecreasingLifeEpochFromAFencedOutWriterIsReportedFen
     EXPECT_EQ(publishCkpt(superseded_writer, layout, life, superseded), CkptPublishOutcome::FencedOut);
     backend->withdraw_after_read_of.clear();
 
-    EXPECT_EQ(backend->writeRequests(), writes_before);
+    EXPECT_EQ(backend->writeTotal(), writes_before);
     EXPECT_EQ(lifeEpochOrFail(reader, layout, life), 9u);
 }
 

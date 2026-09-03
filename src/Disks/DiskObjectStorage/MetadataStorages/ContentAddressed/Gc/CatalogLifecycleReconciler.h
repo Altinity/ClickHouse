@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -44,7 +45,11 @@ public:
     CatalogLifecycleReconciler(
         CasOperation & op_, const Layout & layout_, const CasFoldSeal & adopted_parent_);
 
-    CatalogLifecycleReconcileResult reconcile();
+    /// `refresh_authority` runs at the top of every drain iteration and is forwarded to each erase. It
+    /// is a refresh, not a verdict: the verdict stays `op.admitted()`. A drain erases one row per
+    /// iteration, so without it a leader deposed between two erases would keep erasing, and would
+    /// report the drain complete rather than fenced out.
+    CatalogLifecycleReconcileResult reconcile(const std::function<void()> & refresh_authority = {});
 
 private:
     std::optional<CatalogEntry> selectEligible(const CasRefCatalog::Snapshot & catalog) const;

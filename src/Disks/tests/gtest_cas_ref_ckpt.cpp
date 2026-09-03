@@ -1387,7 +1387,7 @@ TEST(CASRefCheckpoint, AppendRequestCountUnchangedByExtraction)
     /// genesis position `_ckpt` now names and confirms it absent by exact key -- which is `log_key`
     /// itself, the position the birth chunk is about to occupy. That GET precedes the Committed PUT;
     /// the PUT itself still owes no read-back.
-    EXPECT_EQ(backend->readRequestCount(log_key), 1u) << "one grounding probe from recovery, before the birth write";
+    EXPECT_EQ(backend->getCount(log_key), 1u) << "one grounding probe from recovery, before the birth write";
     EXPECT_EQ(backend->writes(ckpt_key), 2u)
         << "the birth contributes `life_epoch` before its log and `committed_through` after the durable "
            "log; these are two different ordering obligations, not a duplicate publication";

@@ -1245,8 +1245,8 @@ TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndAd
         CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_before_erase + 1);
-    EXPECT_EQ(backend->listRequests(), 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->listTotal(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
 TEST(CASRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCarryRemoval)
@@ -1378,7 +1378,7 @@ TEST(CASRefCatalogRemoval, ATransientEraseFailureIsResolvedByAReadAndReissued)
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
-    const uint64_t reads_before = backend->readRequestCount(layout.refCatalogKey());
+    const uint64_t reads_before = backend->getCount(layout.refCatalogKey());
     backend->failNextWriteWith(layout.refCatalogKey(), std::make_exception_ptr(
         Poco::TimeoutException("injected erase failure whose outcome never reached the caller")));
 
@@ -1387,7 +1387,7 @@ TEST(CASRefCatalogRemoval, ATransientEraseFailureIsResolvedByAReadAndReissued)
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
         << "the seed, the attempt whose outcome was lost, and the reissue that landed";
-    EXPECT_GT(backend->readRequestCount(layout.refCatalogKey()), reads_before + 1)
+    EXPECT_GT(backend->getCount(layout.refCatalogKey()), reads_before + 1)
         << "the lost attempt was settled by an exact read before anything was concluded from it";
 }
 
@@ -1425,6 +1425,55 @@ TEST(CASRefCatalogRemoval, AConflictingEraseBacksOffBeforeItsRetry)
     EXPECT_LE(clock.sleeps.front(), 200u) << "the first reissue's full-jitter ceiling";
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
         << "the seed, the refused erase, and the retry that landed";
+}
+
+/// A caller's liveness need not be a fact this loop can read. The GC drain's is a cached
+/// leader-authority flag its owner refreshes by re-reading `gc/state`, so a leader deposed while an
+/// erase is in flight leaves that flag stale -- and on an unrecoverable delete path one reading taken
+/// before the first erase must not authorise the rest. Hence the refresh hook, run at the top of every
+/// attempt.
+///
+/// The winner here writes the SAME row back: the incarnation moves, so the erase is refused, and the
+/// row survives for the retry the loop would otherwise send. The cached flag still answers "admitted"
+/// at the post-write probe, deliberately -- that probe is not the subject, and leaving it stale is what
+/// makes this test about the refresh and nothing else.
+TEST(CASRefCatalogRemoval, TheEraseLoopRefreshesItsLivenessBeforeEveryAttempt)
+{
+    auto backend = std::make_shared<EraseWinnerBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    requests.setSleepFnForTest(clock.sleepFn());
+    CasOperation reader = requests.admit();
+    bool cached_authority = true;
+    CasOperation op = requests.admit([&cached_authority] { return cached_authority; });
+    const Layout layout("erase-refresh");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    seedObject(reader, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    backend->replaceOnNextCatalogWrite(layout.refCatalogKey(), removing);
+    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
+    size_t refreshes = 0;
+
+    const CasRefCatalog::CompletedRemovingDeleteResult result
+        = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+            op, layout, CasRefCatalog::read(reader, layout), removing, ready_parent,
+            [&] { ++refreshes; cached_authority = backend->admitted(); });
+
+    EXPECT_EQ(result.outcome, CasRefCatalog::CompletedRemovingDeleteOutcome::FencedOut);
+    EXPECT_EQ(refreshes, 2u) << "once before the attempt it sent, once before the one it did not";
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 1u)
+        << "the one refused erase; the paced retry was abandoned before it reached the store";
+    EXPECT_EQ(CasRefCatalog::read(reader, layout).catalog.entries, std::vector<CatalogEntry>{removing})
+        << "the row a deposed leader must not erase is still there";
 }
 
 /// The loop iterates on ONE alternative and one only: a refused precondition. Every other non-committed
@@ -1622,8 +1671,8 @@ TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreat
         CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed + 1);
-    EXPECT_EQ(backend->listRequests(), 0u);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->listTotal(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
 TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuildInputs)
@@ -1784,10 +1833,10 @@ TEST(CASGCStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
         .listed_hint = false,
         .checkpoint_observation = std::nullopt,
         .tail_observation = std::nullopt};
-    const uint64_t writes_before = backend->writeRequests();
+    const uint64_t writes_before = backend->writeTotal();
     EXPECT_TRUE(stuckRemovalWarning(row, 11, 10, layout));
-    EXPECT_EQ(backend->writeRequests(), writes_before);
-    EXPECT_EQ(backend->removeRequests(), 0u);
+    EXPECT_EQ(backend->writeTotal(), writes_before);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
 }
 
 TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
