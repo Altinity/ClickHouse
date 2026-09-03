@@ -126,6 +126,13 @@ const FormatTraits & traitsFor(FormatId id);
 /// because callers use this result to classify the input before decoding it.
 const FormatTraits * traitsForType(std::string_view type);
 std::span<const FormatId> allRegisteredFormatIds();
+
+/// The largest number of STORED bytes any materialized object may occupy: the largest whole-object
+/// cap in the registry, expanded by zstd's worst-case bound because the `Always` policy stores those
+/// objects compressed. A materialized read refuses anything larger rather than allocating it. A
+/// format with no whole-object cap is streamed rather than materialized, so it does not raise this
+/// bound.
+uint64_t casMaxStoredObjectBytes();
 /// Returns the storage-key suffix for `id`: `.zst` for `Always`, and an empty suffix otherwise.
 /// Key builders use this policy directly so a point lookup never has to inspect the object body or
 /// try multiple keys.

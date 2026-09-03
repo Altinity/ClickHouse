@@ -5,6 +5,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Disks/WriteMode.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 
 namespace DB
@@ -162,8 +164,14 @@ TEST(CASProbe, MissingSingleAttemptClientFailsCapabilityProbe)
     EXPECT_TRUE(b->list(probe_prefix, "", 10).keys.empty());
 
     /// The same LIST can see a key that IS under the prefix — otherwise the emptiness above would be
-    /// indistinguishable from a prefix this backend can never enumerate.
-    ASSERT_EQ(b->putIfAbsent(probe_prefix + "/token", "probe-v1").outcome, PutOutcome::Done);
+    /// indistinguishable from a prefix this backend can never enumerate. Placed through the object
+    /// storage: a Native write over a local storage has no response incarnation to attribute itself
+    /// to, and Native passes the key verbatim, so this lands exactly where the LIST looks.
+    {
+        auto out = storage->writeObject(DB::StoredObject(probe_prefix + "/token"), DB::WriteMode::Rewrite);
+        DB::writeString(String("probe-v1"), *out);
+        out->finalize();
+    }
     EXPECT_FALSE(b->list(probe_prefix, "", 10).keys.empty());
 }
 
@@ -314,6 +322,29 @@ public:
                 k.token->type = TokenType::ETag;
         return p;
     }
+
+    /// The transport primitives forward verbatim. Nothing in this suite calls them -- the capability
+    /// probe speaks the legacy Token-typed surface this double gates -- so they exist to make the
+    /// class concrete; the dialect gate above is what the tests exercise.
+    std::optional<Raw> read(const String & key, TransportAccess & a) override { return inner.read(key, a); }
+    std::optional<RawMeta> head(const String & key, TransportAccess & a) override { return inner.head(key, a); }
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & a) override
+    {
+        return inner.list(prefix, cursor, limit, a);
+    }
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & a) override
+    {
+        return inner.remove(key, expected_value, a);
+    }
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & a) override
+    {
+        return inner.write(key, bytes, expected_value, a);
+    }
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & a) override { return inner.stream(key, a); }
+    void publish(const BlobPublishRequest & request, TransportAccess & a) override { inner.publish(request, a); }
+    /// The dialect its legacy surface stamps every token with.
+    Dialect dialect() const override { return TokenType::ETag; }
 
     /// Number of times putOverwrite/casPut(with expected)/deleteExact actually delegated to `inner`
     /// (i.e. reached the real enforcement) rather than being short-circuited by the dialect gate.

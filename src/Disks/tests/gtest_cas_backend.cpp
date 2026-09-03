@@ -170,6 +170,28 @@ struct NullBackend final : Backend
         return ListPage{};
     }
 
+    /// The primitives, equally trivial. The legacy overrides above still answer the legacy calls --
+    /// that is what this double is for -- so these exist to make the class concrete and to pin that
+    /// implementing the primitive surface alone is enough.
+    std::optional<Raw> read(const String & /*key*/, TransportAccess &) override { return std::nullopt; }
+    std::optional<RawMeta> head(const String & /*key*/, TransportAccess &) override { return std::nullopt; }
+    RawListPage list(const String & /*prefix*/, const String & /*cursor*/, size_t /*limit*/, TransportAccess &) override
+    {
+        return RawListPage{};
+    }
+    RawRemoval remove(const String & /*key*/, const String & /*expected_value*/, TransportAccess &) override
+    {
+        return RawRemoval::Gone;
+    }
+    std::expected<String, RawConflict> write(const String & /*key*/, const String & /*bytes*/,
+                                             const std::optional<String> &, TransportAccess &) override
+    {
+        return std::unexpected(RawConflict{});
+    }
+    std::unique_ptr<DB::ReadBuffer> stream(const String & /*key*/, TransportAccess &) override { return nullptr; }
+    void publish(const BlobPublishRequest & /*request*/, TransportAccess &) override {}
+    Dialect dialect() const override { return Dialect::Emulated; }
+
     bool supportsListTokens() const override { return false; }
 };
 
@@ -213,13 +235,6 @@ TEST(CASBackend, NullBackendShapeAndDefaults)
     ListPage page = b.list("p/", "", 10);
     EXPECT_TRUE(page.keys.empty());
     EXPECT_TRUE(page.next_cursor.empty());
-
-    // Range::whole() helper
-    EXPECT_TRUE(Range{}.whole());
-    Range r1; r1.offset = 1;
-    EXPECT_FALSE(r1.whole());
-    Range r2; r2.length = 5u;
-    EXPECT_FALSE(r2.whole());
 }
 
 // =====================================================================
@@ -280,13 +295,13 @@ TEST(CASInMemory, DeleteExactEnforced)
     EXPECT_EQ(b.deleteExact("k", t1).kind, DeleteOutcome::Kind::NotFound);
 }
 
-TEST(CASInMemory, RangeGetAndHeadAndList)
+TEST(CASInMemory, GetAndHeadAndList)
 {
     InMemoryBackend b;
     b.putIfAbsent("p/a", "0123456789");
     b.putIfAbsent("p/b", "xy");
     b.putIfAbsent("q/c", "z");
-    EXPECT_EQ(b.get("p/a", Range{.offset = 2, .length = 3})->bytes, "234");
+    EXPECT_EQ(b.get("p/a")->bytes, "0123456789");
     auto h = b.head("p/a");
     EXPECT_TRUE(h.exists);
     EXPECT_EQ(h.size, 10u);
@@ -467,21 +482,6 @@ TEST(CASInMemoryFaults, VersioningMarkerMode)
     b.setSimulateDeleteMarkers(true);
     const Token t1 = b.putIfAbsent("k", "v1").token;
     EXPECT_TRUE(b.deleteExact("k", t1).created_delete_marker);    // probe must reject this pool
-}
-
-TEST(CASInMemoryBackend, RoundTripsUserMetadata)
-{
-    DB::Cas::InMemoryBackend backend;
-    const DB::Cas::ObjectMeta meta{{"cas_owner", "ab:7:42"}};
-    ASSERT_EQ(backend.putIfAbsent("k/key", "body", meta).outcome, DB::Cas::PutOutcome::Done);
-
-    const auto hr = backend.head("k/key");
-    ASSERT_TRUE(hr.exists);
-    ASSERT_EQ(hr.attributes.at("cas_owner"), "ab:7:42");
-
-    const auto gr = backend.get("k/key");
-    ASSERT_TRUE(gr.has_value());
-    ASSERT_EQ(gr->attributes.at("cas_owner"), "ab:7:42");
 }
 
 // =====================================================================
@@ -1043,97 +1043,6 @@ TEST(CASS3Signal, FinalizeClassifierMapsPreconditionLossExactly)
 namespace
 {
 
-/// A `LocalObjectStorage` that round-trips user metadata in-process. The production
-/// `LocalObjectStorage` deliberately drops the `attributes` argument of `writeObject` and never
-/// populates `ObjectMetadata::attributes` (local files carry no `x-amz-meta-*`), so it cannot stand
-/// in for S3/RustFS when verifying the metadata threading. This test-only subclass records the
-/// attributes passed on write, keyed by physical path, and injects them back on metadata reads —
-/// exactly what a real object store does for `x-amz-meta-*`. It exercises the `EmulatedSingleProcess`
-/// `ObjectStorageBackend` threading (`putIfAbsent` → `writeObject` attributes → `head` attributes)
-/// without a live S3 backend; the real S3/RustFS round trip is verified empirically out-of-band.
-class AttributePreservingLocalObjectStorage final : public DB::LocalObjectStorage
-{
-public:
-    using DB::LocalObjectStorage::LocalObjectStorage;
-
-    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
-        const DB::StoredObject & object,
-        DB::WriteMode mode,
-        std::optional<DB::ObjectAttributes> attributes,
-        size_t buf_size,
-        const DB::WriteSettings & write_settings) override
-    {
-        if (attributes.has_value())
-        {
-            std::lock_guard lock(mutex);
-            saved_attributes[object.remote_path] = *attributes;
-        }
-        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
-    }
-
-    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
-    {
-        auto metadata = DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
-        if (metadata)
-            inject(path, *metadata);
-        return metadata;
-    }
-
-    DB::ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
-    {
-        auto metadata = DB::LocalObjectStorage::getObjectMetadata(path, with_tags);
-        inject(path, metadata);
-        return metadata;
-    }
-
-private:
-    void inject(const std::string & path, DB::ObjectMetadata & metadata) const
-    {
-        std::lock_guard lock(mutex);
-        if (auto it = saved_attributes.find(path); it != saved_attributes.end())
-            metadata.attributes = it->second;
-    }
-
-    mutable std::mutex mutex;
-    mutable std::map<std::string, DB::ObjectAttributes> saved_attributes;
-};
-
-DB::ObjectStoragePtr makeAttributePreservingStorageForTest()
-{
-    static std::atomic<uint64_t> counter{0};
-    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
-    const auto root = (std::filesystem::temp_directory_path() / ("cas_meta_unit_" + unique)).string();
-
-    std::error_code ec;
-    std::filesystem::remove_all(root, ec);
-    std::filesystem::create_directories(root, ec);
-
-    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<AttributePreservingLocalObjectStorage>(std::move(settings));
-}
-
-}
-
-/// The `EmulatedSingleProcess` `ObjectStorageBackend` must thread user metadata through to the
-/// underlying object storage's `writeObject` attributes on `putIfAbsent` and read it back into
-/// `HeadResult::attributes` on `head`. Verified here over an attribute-preserving object storage
-/// (the production `LocalObjectStorage` drops attributes); the live S3/RustFS round trip is verified
-/// empirically out-of-band.
-TEST(CASObjectStorageBackend, EmulatedRoundTripsUserMetadata)
-{
-    ObjectStorageBackend backend(makeAttributePreservingStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
-
-    const DB::Cas::ObjectMeta meta{{"cas_owner", "ab:7:42"}};
-    ASSERT_EQ(backend.putIfAbsent("k/key", "body", meta).outcome, DB::Cas::PutOutcome::Done);
-
-    const auto hr = backend.head("k/key");
-    ASSERT_TRUE(hr.exists);
-    ASSERT_EQ(hr.attributes.at("cas_owner"), "ab:7:42");
-}
-
-namespace
-{
-
 /// A `LocalObjectStorage` whose `readObject` throws `S3Exception(NO_SUCH_KEY)` for a configured
 /// physical key, while `tryGetObjectMetadata` still reports that key as PRESENT.
 /// This simulates the HEAD→GET race window: the HEAD succeeds, then the object is deleted before
@@ -1225,31 +1134,6 @@ TEST(CASObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
     /// Call through the base-class interface so the default `Range{}` arg is available.
     const auto result = iface.get(fixture.key);
     EXPECT_FALSE(result.has_value());
-}
-
-/// A ranged `get` over a real `LocalObjectStorage` returns exactly the requested window, with the
-/// same clamping the old read-whole-then-substr path had: a window whose offset is at or past EOF
-/// yields an empty result. The only-the-window I/O property (no whole-object read) is enforced by
-/// the `readObjectRanged` rewrite and cross-checked by the request-size gate in a later task.
-TEST(CASObjectStorageBackend, RangedGetReadsOnlyTheWindow)
-{
-    auto backend = std::make_shared<ObjectStorageBackend>(
-        tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
-
-    const String payload = String(300000, 'a') + String(300000, 'b') + String(300000, 'c');
-    backend->putIfAbsent("p/obj", payload);
-
-    const auto mid = backend->get("p/obj", DB::Cas::Range{.offset = 300000, .length = 300000});
-    ASSERT_TRUE(mid.has_value());
-    EXPECT_EQ(mid->bytes, String(300000, 'b'));
-
-    const auto tail = backend->get("p/obj", DB::Cas::Range{.offset = 600000, .length = std::nullopt});
-    ASSERT_TRUE(tail.has_value());
-    EXPECT_EQ(tail->bytes, String(300000, 'c'));
-
-    const auto past = backend->get("p/obj", DB::Cas::Range{.offset = 1000000, .length = 10});
-    ASSERT_TRUE(past.has_value());
-    EXPECT_TRUE(past->bytes.empty());
 }
 
 /// codex-review-triage §3.18, finding 19c: the `EmulatedSingleProcess` adapter used to mint tokens
@@ -1607,8 +1491,18 @@ TEST(CASObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWir
     auto storage = std::static_pointer_cast<CallCountingObjectStorage>(makeCallCountingStorageForTest());
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
-    ASSERT_EQ(backend.putIfAbsent("k/dialect", "v1").outcome, PutOutcome::Done);
-    const Token live = backend.head("k/dialect").token;
+    /// Placed through the object storage rather than through the backend: a Native write over a local
+    /// storage has no response incarnation to attribute itself to. Native passes the key to the
+    /// storage verbatim, so this is the same object the backend reads below -- anchored under the
+    /// storage's own root, since a bare relative key would resolve beside the test process.
+    const String key = DB::Cas::tests::nativeKeyUnder(storage, "k/dialect");
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(key), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("v1"), *out);
+        out->finalize();
+    }
+    const Token live = backend.head(key).token;
     ASSERT_EQ(live.type, TokenType::ETag);
 
     storage->write_calls = 0;
@@ -1617,15 +1511,15 @@ TEST(CASObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWir
     /// Same wire VALUE, wrong dialect TYPE (Emulated instead of this backend's native ETag dialect).
     const Token wrong_type_token{live.value, TokenType::Emulated};
 
-    EXPECT_EQ(backend.putOverwrite("k/dialect", "v2", wrong_type_token).outcome, PutOutcome::PreconditionFailed);
-    EXPECT_EQ(backend.casPut("k/dialect", "v2", wrong_type_token).outcome, CasOutcome::Conflict);
-    EXPECT_EQ(backend.deleteExact("k/dialect", wrong_type_token).kind, DeleteOutcome::Kind::TokenMismatch);
+    EXPECT_EQ(backend.putOverwrite(key, "v2", wrong_type_token).outcome, PutOutcome::PreconditionFailed);
+    EXPECT_EQ(backend.casPut(key, "v2", wrong_type_token).outcome, CasOutcome::Conflict);
+    EXPECT_EQ(backend.deleteExact(key, wrong_type_token).kind, DeleteOutcome::Kind::TokenMismatch);
 
     EXPECT_EQ(storage->write_calls.load(), 0);
     EXPECT_EQ(storage->remove_if_matches_calls.load(), 0);
 
     /// The live incarnation must be untouched by all three rejected attempts.
-    EXPECT_EQ(backend.head("k/dialect").token, live);
+    EXPECT_EQ(backend.head(key).token, live);
 }
 
 /// The incarnation grammar: an empty, wildcard or list token would turn a conditional mutation into
@@ -1711,19 +1605,17 @@ TEST(CASSizedReadSettings, CapsToKnownSizePlusSlackButNeverAboveBase)
     EXPECT_EQ(unknown.remote_fs_settings.buffer_size, 1ULL << 20);
 }
 
-/// The CountingBackend request-shape recorders that the streaming-memory gates (Task 3/4) consume:
-/// per-key/total getStream counts, the max ranged-get window per key, and the whole-object get flag.
-TEST(CASCountingBackendShape, RecordsGetStreamAndRangeShape)
+/// The CountingBackend request-shape recorders that the streaming-memory gates consume: per-key and
+/// total getStream counts, and the whole-object get flag that marks a resident-memory violation for a
+/// run object. The ranged-window recorder is no longer exercised here: a materialized read is always
+/// whole now, so only `getStream` still carries a window.
+TEST(CASCountingBackendShape, RecordsGetStreamAndWholeGetShape)
 {
     DB::Cas::tests::CountingBackend backend;
     backend.putIfAbsent("k", String(1000, 'x'));
 
-    /// A whole-object get flags the resident-memory violation; a ranged get tracks the max window.
     backend.get("k");
-    backend.get("k", DB::Cas::Range{.offset = 0, .length = 100});
-    backend.get("k", DB::Cas::Range{.offset = 10, .length = 400});
     EXPECT_EQ(backend.wholeGetCount("k"), 1u);
-    EXPECT_EQ(backend.maxRangedGetLen("k"), 400u);
 
     /// getStream counters (per-key and total).
     backend.getStream("k", DB::Cas::Range{.offset = 2, .length = 5});
@@ -1734,7 +1626,6 @@ TEST(CASCountingBackendShape, RecordsGetStreamAndRangeShape)
 
     backend.resetCounts();
     EXPECT_EQ(backend.wholeGetCount("k"), 0u);
-    EXPECT_EQ(backend.maxRangedGetLen("k"), 0u);
     EXPECT_EQ(backend.getStreamTotal(), 0u);
 }
 

@@ -1,9 +1,16 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasTransportAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
+#include <Common/Exception.h>
+#include <base/defines.h>
 #include <base/types.h>
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <expected>
 #include <functional>
 #include <map>
 #include <memory>
@@ -13,16 +20,23 @@
 #include <variant>
 #include <vector>
 
+namespace DB::ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
+}
+
 namespace DB::Cas
 {
 
-/// User metadata carried alongside an object (S3 x-amz-meta-*). The CA store uses exactly one entry,
-/// "cas_owner" = "<server_id_hex>:<epoch>:<build_seq>" — the owner triple the GC watermark reads.
+/// User metadata carried alongside an object (S3 x-amz-meta-*). RETIRED: the transport neither
+/// writes nor reads attributes, and this alias survives only in the legacy signatures below.
 using ObjectMeta = std::map<String, String>;
 
 /// A byte window requested from an object. An absent length means that the window extends to EOF.
-/// Backends use the same semantics for materialized and forward-only reads: the offset is exact,
-/// while a backend may expose an advisory end when its underlying read buffer cannot enforce one.
+/// RETIRED for materialized reads: `get` accepts only a whole-object window. It survives on
+/// `getStream`, which is not a forwarder. The offset is exact, while a backend may expose an advisory
+/// end when its underlying read buffer cannot enforce one.
 struct Range
 {
     uint64_t offset = 0;
@@ -241,77 +255,108 @@ inline BlobPayloadCopyResult copyBlobPayloadBounded(ReadBuffer & from, WriteBuff
 class Backend
 {
 public:
+    Backend();
     virtual ~Backend() = default;
 
-    /// Reads the selected bytes and their token, or returns nullopt when the key is absent. For a
-    /// mutable object, callers must use this materialized form so the body is fixed before parsing.
-    virtual std::optional<GetResult> get(const String & key, Range range) = 0;
-    std::optional<GetResult> get(const String & key) { return get(key, {}); }
+    /// ---- The transport primitives ----
+    ///
+    /// These are the ONLY methods that reach the store. Each takes a `TransportAccess`, which nothing
+    /// outside `CasRequests` can construct, so no caller can reach the store without the request
+    /// contract's retry, deadline and fence rules. They deal in the store's own strings: an
+    /// incarnation VALUE means no more here than "what the store answered", and every grammar,
+    /// key-binding and dialect check on it belongs to `CasRequests`.
 
-    /// Forward-only stream over the object's `range` (default: whole object) for WRITE-ONCE objects
-    /// (runs, seals). The returned `stream` yields exactly the window's bytes and nothing is
-    /// materialized whole by the seam — the caller reads at its own pace. MUTABLE objects (root
-    /// shards, gc/state, mounts) MUST keep using `get`: their bytes can change under an open stream.
-    /// CAVEAT: the window END is advisory on storages where `setReadUntilPosition` is a hint
-    /// (LocalObjectStorage) — the stream may yield bytes past the window; consumers MUST bound their
-    /// own consumption (RunFileReader bounds to its data_end). The window START is always exact.
-    virtual std::optional<GetStreamResult> getStream(const String & key, Range range) = 0;
-    std::optional<GetStreamResult> getStream(const String & key) { return getStream(key, {}); }
+    /// An object's bytes together with the value naming the incarnation they were read from.
+    struct Raw     { String bytes; String value; };
+    /// One object's size and incarnation value, without its body.
+    struct RawMeta { uint64_t size; String value; };
+    /// One listed key; `value` is present only on a backend that surfaces per-key incarnations
+    /// through LIST -- see `supportsListTokens`.
+    struct RawListedKey { String key; uint64_t size; std::optional<String> value; };
+    struct RawListPage  { std::vector<RawListedKey> keys; String next_cursor; };
+    /// The store refused the write's precondition. Nothing was written; what the key holds now is
+    /// whatever a read finds. An expected outcome, never an error.
+    struct RawConflict {};
+    /// `DeleteMarker` is a removal that did NOT reclaim: a versioned bucket archived a noncurrent
+    /// version instead. Distinct from `Removed` because reclaiming the storage is the point.
+    enum class RawRemoval : uint8_t { Removed, Gone, Mismatch, DeleteMarker };
 
-    /// Returns the current incarnation's existence, size, token, and metadata without reading its
-    /// body. The result describes one point-in-time observation; a later operation must use the
-    /// returned token when it needs to protect against replacement.
-    virtual HeadResult head(const String & key) = 0;
+    /// Reads the whole object, or nullopt when the key is absent.
+    virtual std::optional<Raw>     read  (const String & key, TransportAccess &) = 0;
+    /// One point-in-time observation of the current incarnation's size and value; nullopt when absent.
+    virtual std::optional<RawMeta> head  (const String & key, TransportAccess &) = 0;
+    /// One page of keys under `prefix`, resuming strictly after `cursor`; an empty `next_cursor`
+    /// marks the end of the enumeration.
+    virtual RawListPage            list  (const String & prefix, const String & cursor, size_t limit, TransportAccess &) = 0;
+    /// Removes ONLY the incarnation whose value equals `expected_value`; a mismatch must leave the
+    /// object untouched.
+    virtual RawRemoval             remove(const String & key, const String & expected_value, TransportAccess &) = 0;
+    /// Creates the key (`expected_value == nullopt`) or replaces exactly the incarnation named by
+    /// `expected_value`. Returns the store's own value for what it just wrote, UNVALIDATED: a value
+    /// that fails the dialect grammar means the write may still have landed, which the caller settles
+    /// by reading the key back, and which this seam must never report as corruption.
+    virtual std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                                     const std::optional<String> & expected_value, TransportAccess &) = 0;
+    /// A forward-only read of a WRITE-ONCE object (runs, seals): nothing is materialized by the seam.
+    /// MUTABLE objects (root shards, gc/state, mounts) MUST use `read` -- their bytes may change
+    /// under an open stream. Null when the key is absent.
+    virtual std::unique_ptr<ReadBuffer> stream(const String & key, TransportAccess &) = 0;
+    /// Executes one unconditional blob publication and returns once the complete destination is
+    /// visible. Transport only: it observes no destination state and produces no incarnation.
+    virtual void publish(const BlobPublishRequest & request, TransportAccess &) = 0;
 
-    /// Creates `key` only when it is absent. `PreconditionFailed` leaves the existing object intact;
-    /// storage failures are reported as exceptions. On success, the returned token identifies the
-    /// newly created incarnation.
-    virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) = 0;
-    PutResult putIfAbsent(const String & key, const String & bytes) { return putIfAbsent(key, bytes, {}); }
-
-    /// Unconditionally publishes one complete blob body. The caller owns every lifecycle decision;
-    /// this method only executes the selected streaming or native-copy transport and returns after
-    /// the complete destination becomes visible.
-    virtual void publishBlob(const BlobPublishRequest & request) = 0;
-
-    /// Replaces the current object only when its token equals `expected`. A mismatch leaves the
-    /// object unchanged and returns `PreconditionFailed`; the returned token is meaningful only on
-    /// `Done`.
-    virtual PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
-                                   const ObjectMeta & meta) = 0;
-    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected)
+    /// Authoritative, cache-bypassing probe of one key -- see `ProbeOutcome`. DEFAULT (used by every
+    /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`read`
+    /// alone, so it can only distinguish `Present` from `KeyAbsent`, and ANY exception from either
+    /// call is `Indeterminate` -- never promoted to `KeyAbsent`. A backend able to surface real
+    /// container/permission evidence (the S3-native and Local paths of `ObjectStorageBackend`)
+    /// overrides this to sharpen the classification.
+    virtual SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access)
     {
-        return putOverwrite(key, bytes, expected, {});
-    }
-    /// expected == nullopt => create-if-absent CAS (the first write of a root manifest).
-    /// A non-null expected token conditionally replaces that exact current incarnation. Conflicts
-    /// leave the object unchanged and are returned as an outcome rather than an exception.
-    virtual CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                             const ObjectMeta & meta) = 0;
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected)
-    {
-        return casPut(key, bytes, expected, {});
+        try
+        {
+            const auto meta = head(key, access);
+            if (!meta)
+                return {ProbeOutcome::KeyAbsent, std::nullopt};
+            auto raw = read(key, access);
+            /// Vanished between the two: still a clean, authoritative miss, not an error.
+            if (!raw)
+                return {ProbeOutcome::KeyAbsent, std::nullopt};
+            return {ProbeOutcome::Present, std::move(raw->bytes)};
+        }
+        catch (...)
+        {
+            return {ProbeOutcome::Indeterminate, std::nullopt};
+        }
     }
 
-    /// Deletes only the current incarnation identified by `token`. A token mismatch must leave the
-    /// object untouched; the result distinguishes that case from an already absent key.
-    virtual DeleteOutcome deleteExact(const String & key, const Token & token) = 0;
+    /// The dialect this backend mints its incarnation values in.
+    virtual Dialect dialect() const = 0;
 
-    /// Lists one page of keys under `prefix`, starting after `cursor` and returning at most `limit`
-    /// entries. `ListPage::next_cursor` is the only supported continuation state.
-    virtual ListPage list(const String & prefix, const String & cursor, size_t limit) = 0;
+    /// Identifies this backend INSTANCE, so an incarnation observed elsewhere can be refused rather
+    /// than used as a precondition here. Assigned at construction and never reused in this process.
+    uint64_t backendId() const { return backend_id; }
+
+    /// The budget for one HTTP attempt in milliseconds; 0 when this backend has no such notion. The
+    /// request contract reserves it before every attempt it starts.
+    virtual uint64_t attemptTimeoutMs() const { return 0; }
+
+    /// Asks the storage to re-acquire credentials. TRUE when fresh ones were installed, so the
+    /// caller's reissue can sign with them; FALSE when this backend has no refresh mechanism, which
+    /// makes an expired-credential failure terminal for the caller's policy rather than retryable.
+    virtual bool refreshCredentials() { return false; }
 
     /// Capability fact about the LIST seam: TRUE iff this backend can surface a per-key incarnation
-    /// token through `list` (i.e. each `ListedKey` carries a token that uniquely identifies the
+    /// value through `list` (i.e. each `RawListedKey` carries a value that uniquely identifies the
     /// current incarnation of that key, matching what `head` would return).
     ///
     /// Why this matters: S3 ETags are content-derived and are returned in list responses; the
-    /// in-memory backend mints a monotonic token it can also surface through `list`. A backend that
-    /// cannot surface per-key tokens through `list` MUST return FALSE.
+    /// in-memory backend mints a monotonic value it can also surface through `list`. A backend that
+    /// cannot surface per-key values through `list` MUST return FALSE.
     ///
-    /// FALSE ⇒ GC `discover` must read every root-shard body to learn the current token (fail closed).
-    /// TRUE  ⇒ `discover` may skip an unchanged root-shard body read when the listed token equals
-    ///          the persisted folded token, saving a GET per unchanged shard.
+    /// FALSE ⇒ GC `discover` must read every root-shard body to learn the current incarnation (fail
+    /// closed). TRUE  ⇒ `discover` may skip an unchanged root-shard body read when the listed value
+    /// equals the persisted folded one, saving a GET per unchanged shard.
     virtual bool supportsListTokens() const = 0;
 
     /// Pool-level preconditions beyond per-op conditional semantics — checked by the capability
@@ -336,32 +381,158 @@ public:
     /// are not gated here — see ObjectStorageBackend's override for the one backend that is).
     virtual void checkConditionalWriteSingleAttemptSupport() {}
 
-    /// Authoritative, cache-bypassing probe of one key — see `ProbeOutcome`. DEFAULT (used by every
-    /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`get`
-    /// alone, so it can only distinguish `Present` from `KeyAbsent`, and ANY exception from either
-    /// call is `Indeterminate` — never promoted to `KeyAbsent`. A backend able to surface real
-    /// container/permission evidence (the S3-native and Local paths of `ObjectStorageBackend`)
-    /// overrides this to sharpen the classification.
-    virtual SentinelProbeResult probeSentinelRaw(const String & key)
+    /// ---- The legacy Token-typed surface ----
+    ///
+    /// Every one of these obtains the migration key and calls the primitive above, so a fault
+    /// injection written against a PRIMITIVE intercepts a legacy caller too. They stay virtual while
+    /// the migration runs, so a test double that overrides one of THESE keeps working until the site
+    /// it instruments moves; the whole block, and `migrationAccess` with it, is deleted at the lock.
+    /// `Range` and `ObjectMeta` are already retired: a non-whole window is refused, and object
+    /// attributes are neither written nor returned.
+    virtual std::optional<GetResult> get(const String & key, Range range)
     {
-        try
-        {
-            const HeadResult hr = head(key);
-            if (!hr.exists)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};
-            auto g = get(key);
-            /// Vanished between head and get: still a clean, authoritative miss, not an error.
-            if (!g)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};
-            return {ProbeOutcome::Present, std::move(g->bytes)};
-        }
-        catch (...)
-        {
-            return {ProbeOutcome::Indeterminate, std::nullopt};
-        }
+        if (!range.whole())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "CAS backend: a ranged get is retired; read the object whole");
+        auto access = migrationAccess();
+        auto raw = read(key, access);
+        if (!raw)
+            return std::nullopt;
+        return GetResult{std::move(raw->bytes), Token{std::move(raw->value), dialect()}, {}};
+    }
+    std::optional<GetResult> get(const String & key) { return get(key, {}); }
+
+    /// Forward-only stream over the object's `range` (default: whole object) for WRITE-ONCE objects
+    /// (runs, seals). Not a forwarder: `stream` returns no incarnation, and a forwarder would have to
+    /// fill `GetStreamResult::token` with a default-constructed `Token` that names nothing. Each
+    /// backend keeps its own implementation until the last caller moves onto `stream`.
+    /// CAVEAT: the window END is advisory on storages where `setReadUntilPosition` is a hint
+    /// (LocalObjectStorage) — the stream may yield bytes past the window; consumers MUST bound their
+    /// own consumption (RunFileReader bounds to its data_end). The window START is always exact.
+    virtual std::optional<GetStreamResult> getStream(const String & key, Range range) = 0;
+    std::optional<GetStreamResult> getStream(const String & key) { return getStream(key, {}); }
+
+    virtual HeadResult head(const String & key)
+    {
+        auto access = migrationAccess();
+        auto raw = head(key, access);
+        if (!raw)
+            return {};
+        return HeadResult{true, raw->size, Token{std::move(raw->value), dialect()}, {}};
     }
 
+    virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & /*meta*/)
+    {
+        auto access = migrationAccess();
+        auto r = write(key, bytes, std::nullopt, access);
+        if (!r)
+            return PutResult{PutOutcome::PreconditionFailed, {}};
+        return PutResult{PutOutcome::Done, Token{std::move(*r), dialect()}};
+    }
+    PutResult putIfAbsent(const String & key, const String & bytes) { return putIfAbsent(key, bytes, {}); }
+
+    virtual PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
+                                   const ObjectMeta & /*meta*/)
+    {
+        if (legacyTokenIsForeign(key, expected))
+            return PutResult{PutOutcome::PreconditionFailed, {}};
+        auto access = migrationAccess();
+        auto r = write(key, bytes, expected.value, access);
+        if (!r)
+            return PutResult{PutOutcome::PreconditionFailed, {}};
+        return PutResult{PutOutcome::Done, Token{std::move(*r), dialect()}};
+    }
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected)
+    {
+        return putOverwrite(key, bytes, expected, {});
+    }
+
+    virtual CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                             const ObjectMeta & /*meta*/)
+    {
+        if (expected && legacyTokenIsForeign(key, *expected))
+            return CasResult{CasOutcome::Conflict, {}};
+        auto access = migrationAccess();
+        auto r = write(key, bytes, expected ? std::optional<String>(expected->value) : std::nullopt, access);
+        if (!r)
+            return CasResult{CasOutcome::Conflict, {}};
+        return CasResult{CasOutcome::Committed, Token{std::move(*r), dialect()}};
+    }
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected)
+    {
+        return casPut(key, bytes, expected, {});
+    }
+
+    virtual DeleteOutcome deleteExact(const String & key, const Token & token)
+    {
+        if (legacyTokenIsForeign(key, token))
+            return DeleteOutcome{DeleteOutcome::Kind::TokenMismatch, false};
+        auto access = migrationAccess();
+        switch (remove(key, token.value, access))
+        {
+            case RawRemoval::Removed:      return {DeleteOutcome::Kind::Deleted, false};
+            case RawRemoval::Gone:         return {DeleteOutcome::Kind::NotFound, false};
+            case RawRemoval::Mismatch:     return {DeleteOutcome::Kind::TokenMismatch, false};
+            case RawRemoval::DeleteMarker: return {DeleteOutcome::Kind::Deleted, true};
+        }
+        UNREACHABLE();
+    }
+
+    virtual ListPage list(const String & prefix, const String & cursor, size_t limit)
+    {
+        auto access = migrationAccess();
+        auto raw = list(prefix, cursor, limit, access);
+        ListPage page;
+        page.next_cursor = std::move(raw.next_cursor);
+        page.keys.reserve(raw.keys.size());
+        for (auto & k : raw.keys)
+            page.keys.push_back(ListedKey{std::move(k.key), k.size,
+                k.value ? std::optional<Token>(Token{std::move(*k.value), dialect()}) : std::nullopt});
+        return page;
+    }
+
+    virtual void publishBlob(const BlobPublishRequest & request)
+    {
+        auto access = migrationAccess();
+        publish(request, access);
+    }
+
+    virtual SentinelProbeResult probeSentinelRaw(const String & key)
+    {
+        auto access = migrationAccess();
+        return probeSentinelRaw(key, access);
+    }
+
+protected:
+    /// The migration key. Every legacy forwarder above obtains one; nothing else may, and the whole
+    /// mechanism is deleted with the forwarders at the lock.
+    static TransportAccess migrationAccess() { return TransportAccess{}; }
+
+private:
+    /// The dialect half of the legacy token check: the primitives take a bare VALUE and cannot see
+    /// the dialect a `Token` declares, so a foreign-dialect token is answered here as an ordinary
+    /// non-match rather than being forwarded to a wire (or a value space) that was never designed to
+    /// discriminate it. A MALFORMED value is refused FIRST, under its own declared dialect, so a
+    /// token that is both malformed and foreign is still reported as the caller bug it is.
+    bool legacyTokenIsForeign(const String & key, const Token & token)
+    {
+        if (!isIncarnationValue(token.type, token.value))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
+                "an empty, wildcard or list token would turn the precondition into an unconditional write",
+                key, token.value, static_cast<int>(token.type));
+        return token.type != dialect();
+    }
+
+    uint64_t backend_id;
 };
+
+inline Backend::Backend()
+{
+    /// Per instance, monotonic, never reused: an incarnation carries the id of the backend that
+    /// observed it, so it can be refused anywhere else. Starts at 1, leaving 0 naming no backend.
+    static std::atomic<uint64_t> next_backend_id{1};
+    backend_id = next_backend_id.fetch_add(1, std::memory_order_relaxed);
+}
 
 using BackendPtr = std::shared_ptr<Backend>;
 

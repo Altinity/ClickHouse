@@ -48,13 +48,12 @@ PutOutcome finalizeConditionalWrite(WriteBuffer & buf);
 class ObjectStorageBackend final : public Backend
 {
 public:
-    /// Unhide the base convenience overloads (omitted Range/ObjectMeta/expected-token forms): the
-    /// overrides below would otherwise shadow them for callers holding a concrete backend type.
-    using Backend::get;
+    /// Unhide the base overloads this class's own declarations would otherwise shadow: the legacy
+    /// `head`/`list`/`probeSentinelRaw` names, and `getStream`'s omitted-`Range` convenience.
     using Backend::getStream;
-    using Backend::putIfAbsent;
-    using Backend::putOverwrite;
-    using Backend::casPut;
+    using Backend::head;
+    using Backend::list;
+    using Backend::probeSentinelRaw;
 
     enum class Mode { Native, EmulatedSingleProcess };
 
@@ -62,17 +61,51 @@ public:
     /// operations and native token dialect; `EmulatedSingleProcess` serializes operations locally for
     /// tests and local development. A Native generation-token store must use a single PUT because
     /// its multipart completion path does not enforce the precondition.
-    ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_);
+    ///
+    /// `single_attempt_control_plane` selects the SingleAttempt retry profile for the READ-class
+    /// requests below: a writable Native mount owns its own retry policy and a transparently retried
+    /// request would outlive the caller's deadline, while a read-only mount has no such deadline and
+    /// keeps the storage's default. `attempt_timeout_ms` bounds ONE attempt of those requests; 0
+    /// leaves the storage's own timeout in place. Both are supplied by the mount that opens the pool;
+    /// the defaults are what a narrow unit test constructing a bare backend gets.
+    ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_,
+                         bool single_attempt_control_plane_ = false, uint64_t attempt_timeout_ms_ = 0);
 
-    /// Read an object or return `nullopt` if it is absent. Native mode HEADs first so the returned
-    /// token identifies the incarnation whose bytes are read; a not-found race is also reported as
+    /// Read the whole object, or return `nullopt` if it is absent. Native mode reads the incarnation
+    /// value out of the GET response itself, so no HEAD precedes it; a not-found race is reported as
     /// `nullopt`, while unrelated storage errors propagate.
-    std::optional<GetResult> get(const String & key, Range range) override;
-    /// Open a forward-only ranged stream for a write-once object. The stream is not materialized in
-    /// memory; mutable objects must use `get` because their contents may change while it is open.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override;
+    /// Return the current size and incarnation value, or `nullopt` when the key is absent.
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override;
+    /// Return a page after `cursor`; the next cursor is the last returned key and is empty at the end.
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override;
+    /// Remove only the incarnation named by `expected_value`, preserving the object on a mismatch and
+    /// reporting a versioned bucket's delete marker as the non-reclaiming removal it is.
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override;
+    /// Create the key (`expected_value == nullopt`) or replace exactly the incarnation it names. The
+    /// returned value is the write response's own; a response that carries none at all is
+    /// `CAS_WRITE_UNATTRIBUTED`, never patched over by a follow-up read.
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override;
+    /// Open a forward-only whole-object stream for a write-once object, or null when the key is
+    /// absent. Nothing is materialized; mutable objects must use `read` because their contents may
+    /// change while the stream is open.
+    std::unique_ptr<ReadBuffer> stream(const String & key, TransportAccess & access) override;
+    /// Execute the selected unconditional blob transport without observing destination state or
+    /// returning a write-response value. Streaming uses ordinary write settings; staged bytes require
+    /// a native same-store copy.
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override;
+    /// Native mints its store's own dialect (ETag or GCS generation); the emulated adapter mints its
+    /// own values.
+    Dialect dialect() const override { return mode == Mode::Native ? native_token_type : Dialect::Emulated; }
+    /// The budget for one attempt of a read-class request, as configured by the mount.
+    uint64_t attemptTimeoutMs() const override { return attempt_timeout_ms; }
+    /// Ask the storage to re-acquire credentials through its refresh callback.
+    bool refreshCredentials() override { return object_storage->tryRefreshCredentialsViaCallback(); }
+
+    /// Open a forward-only ranged stream for a write-once object. Kept for the migration window: see
+    /// `Backend::getStream` for why it is not a forwarder.
     std::optional<GetStreamResult> getStream(const String & key, Range range) override;
-    /// Return the current size, attributes, and incarnation token, or an absent `HeadResult`.
-    HeadResult head(const String & key) override;
     /// S3 ETags are content-derived and surfaced in list responses — TRUE for ETag-token Native
     /// and EmulatedSingleProcess modes. FALSE on a generation-token store (GCS): the XML LIST
     /// surfaces MD5-style ETags in the response BODY, which the header-level response adaptation
@@ -81,27 +114,6 @@ public:
     /// Consumers already treat absent list tokens as Read/fail-closed (GC discover re-reads every
     /// shard — a cost, not a correctness change).
     bool supportsListTokens() const override { return native_token_type != TokenType::Generation; }
-
-    /// Create `key` only if it is absent. On a precondition failure the object is untouched and the
-    /// result has no token; on success the token identifies the newly written incarnation.
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override;
-
-    /// Execute the selected unconditional blob transport without observing destination state or
-    /// returning a write-response token. Streaming uses ordinary write settings; staged bytes require
-    /// a native same-store copy.
-    void publishBlob(const BlobPublishRequest & request) override;
-    /// Replace `key` only when its current token exactly equals `expected`; a mismatch leaves the
-    /// existing incarnation untouched. Storage exceptions propagate instead of being reported as a
-    /// successful or failed precondition.
-    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override;
-    /// Perform a compare-and-set: `expected == nullopt` means create-if-absent. A conflict leaves the
-    /// object untouched; a committed result carries the new incarnation token.
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta) override;
-    /// Remove only the incarnation matching `token`, preserving the object on a mismatch and exposing
-    /// whether the storage created a delete marker.
-    DeleteOutcome deleteExact(const String & key, const Token & token) override;
-    /// Return a page after `cursor`; the next cursor is the last returned key and is empty at the end.
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
     /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, reject the pool when
     /// object versioning is verified ENABLED; warn and continue when the probe cannot answer — see
@@ -120,11 +132,12 @@ public:
     /// `EmulatedSingleProcess`.
     void checkConditionalWriteSingleAttemptSupport() override;
 
-    /// See Backend::probeSentinelRaw. Native: a raw HEAD via `IObjectStorage::getObjectMetadata` (the
-    /// THROWING variant — unlike `tryGetObjectMetadata`/`nativeHead`, it never swallows the S3 error),
-    /// classified by S3 error code. EmulatedSingleProcess (Local): stats the configured container
-    /// directory (`emu_root`) first — `ContainerAbsent` if it is gone — then the key.
-    SentinelProbeResult probeSentinelRaw(const String & key) override;
+    /// See Backend::probeSentinelRaw. Native: ONE `read`, classified by the S3 error it throws. A GET
+    /// 404 carries a response body, so the SDK can parse its `<Code>` and tell `NoSuchKey` from
+    /// `NoSuchBucket` -- a distinction a bodyless HEAD 404 cannot make.
+    /// EmulatedSingleProcess (Local): stats the configured container directory (`emu_root`) first --
+    /// `ContainerAbsent` if it is gone -- then the key.
+    SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access) override;
 
     /// The token kind this backend's object storage mints: TokenType::ETag for AWS-compatible
     /// stores, TokenType::Generation when the storage mints GCS generations (the
@@ -193,11 +206,11 @@ public:
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(); }
     /// Convert a successful write/copy response's incarnation-identifying string into this backend's
     /// token -- the ONE place that decides how strictly to trust it ("Exact successful-write token").
-    /// Generation dialect (GCS): the response MUST carry a non-empty, purely numeric generation; a
-    /// missing or non-numeric value is an exception -- there is no follow-up HEAD, so a broken or
-    /// lying response can never be silently patched over by a later, unrelated read. Every other
-    /// dialect (ETag, and any backend with no write-time token at all, e.g. local files) keeps the
-    /// pre-existing behavior: an absent value falls back to a fresh HEAD of `key`.
+    /// Generation dialect (GCS): the response MUST carry a non-empty, purely numeric generation, and a
+    /// non-numeric one is CORRUPTED_DATA. Under every dialect, a response carrying NO incarnation at
+    /// all is `CAS_WRITE_UNATTRIBUTED`: the write may well have landed, and only the caller reading
+    /// the key back can settle that -- a follow-up HEAD here would attribute this call an incarnation
+    /// that some other writer may have created.
     Token tokenFromWriteResult(const String & key, const std::optional<String> & etag);
     /// Override the emulated backend's wall clock for deterministic expiry tests.
     void setEmuNowNsForTest(uint64_t now_ns);
@@ -208,6 +221,16 @@ private:
     const ObjectStoragePtr object_storage;
     const Mode mode;
     TokenType native_token_type = TokenType::ETag;
+    /// See the constructor: what the READ-class requests (read, head, list, remove) carry.
+    const bool single_attempt_control_plane;
+    const uint64_t attempt_timeout_ms;
+    ObjectStorageRetryProfile controlPlaneProfile() const
+    {
+        return single_attempt_control_plane ? ObjectStorageRetryProfile::SingleAttempt : ObjectStorageRetryProfile::Default;
+    }
+    /// The read settings every READ-class request carries: the native conditional dialect, this
+    /// mount's retry profile, and its per-attempt bound.
+    ReadSettings controlPlaneReadSettings() const;
     /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. A successfully
     /// deleted entry is retained only while its etag is recent enough that an immediate recreate could
     /// land in the same mtime quantum. `deleteExact` erases already-old entries immediately and queues
@@ -229,15 +252,15 @@ private:
     /// masquerading as a real etag-derived identity either.
     uint64_t emu_seq = 0;
 
-    /// Look up Native metadata and convert the storage ETag or generation to this backend's token. The
-    /// minted token is validated against isValidTokenValue before this returns it: a missing/malformed
-    /// response value on an otherwise-successful HEAD would otherwise mint an invalid token here with no
-    /// check at all, one layer before tokenFromWriteResult's own check on the write path.
-    std::optional<HeadResult> nativeHead(const String & key);
+    /// Look up Native metadata and normalize the storage ETag or generation into an incarnation
+    /// value. The value is validated against isValidTokenValue before this returns it: a
+    /// missing/malformed response value on an otherwise-successful HEAD would otherwise be handed to
+    /// the first conditional operation that trusts it.
+    std::optional<RawMeta> nativeHead(const String & key);
 
-    /// Write a body with the condition already encoded in `ws`, finalize it, classify a lost
-    /// precondition, and return the new token when the write succeeds.
-    PutResult nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, const ObjectMeta & meta);
+    /// Write a body with the condition already encoded in `ws`, finalize it, map a lost precondition
+    /// onto `RawConflict`, and return the write response's own incarnation value on success.
+    std::expected<String, RawConflict> nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws);
 
     /// §3.18 №19 hardening: whether `t` is the dialect this backend itself mints (native_token_type
     /// for Native mode, always TokenType::Emulated for EmulatedSingleProcess). Every conditional
@@ -258,10 +281,10 @@ private:
     /// The caller holds `emu_mutex` for all five helpers below, preserving the exists/read and
     /// observe/write checks as one process-local operation.
     bool emuExists(const String & key) const;
-    String emuRead(const String & key, Range range) const;
+    String emuRead(const String & key) const;
     /// Write a body as the new incarnation of `key` and return its freshly minted token (the
     /// object's own post-write etag — see emuMintToken).
-    Token emuWrite(const String & key, const String & bytes, const ObjectMeta & meta);
+    Token emuWrite(const String & key, const String & bytes);
     /// Write a complete blob body to a sibling temporary local object, then atomically replace `key`
     /// and advance any existing same-ETag disambiguator. A failure before the rename leaves the old
     /// destination and its token state untouched and cleans the temporary.

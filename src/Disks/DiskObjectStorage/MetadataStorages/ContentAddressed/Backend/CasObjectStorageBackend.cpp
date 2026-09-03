@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
@@ -44,9 +45,12 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_)
+ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_,
+                                           bool single_attempt_control_plane_, uint64_t attempt_timeout_ms_)
     : object_storage(std::move(object_storage_))
     , mode(mode_)
+    , single_attempt_control_plane(single_attempt_control_plane_)
+    , attempt_timeout_ms(attempt_timeout_ms_)
     , emu_root(object_storage->getCommonKeyPrefix())
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
@@ -138,28 +142,23 @@ bool ObjectStorageBackend::isValidTokenValue(TokenType type, const String & valu
     return isIncarnationValue(type, value);
 }
 
-std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
+std::optional<Backend::RawMeta> ObjectStorageBackend::nativeHead(const String & key)
 {
-    auto metadata = object_storage->tryGetObjectMetadataWithNativeToken(key, /*with_tags=*/false);
+    auto metadata = object_storage->tryGetObjectMetadataWithNativeToken(
+        key, /*with_tags=*/false, controlPlaneProfile(), attempt_timeout_ms);
     if (!metadata)
         return std::nullopt;
 
-    HeadResult hr;
-    hr.exists = true;
-    hr.size = metadata->size_bytes;
-    hr.token = tokenForHead(metadata->etag);
+    const Token token = tokenForHead(metadata->etag);
     /// The store guarantees a well-formed incarnation value under this backend's dialect on every
     /// successful HEAD; a missing or malformed value (a proxy dropping the header, a service
-    /// regression) means the response fell through unmapped. There is no follow-up HEAD to patch this
-    /// over, so surface the failure here rather than minting a token that would poison the first
-    /// conditional operation that trusts it -- exactly the contract tokenFromWriteResult already
-    /// enforces on the write path.
-    if (!isValidTokenValue(native_token_type, hr.token.value))
+    /// regression) means the response fell through unmapped. Surface that here rather than handing
+    /// the value to the first conditional operation that trusts it.
+    if (!isValidTokenValue(native_token_type, token.value))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS backend: the store answered for '{}' with a value '{}' that is not a valid {} incarnation",
             key, metadata->etag, native_token_type == TokenType::Generation ? "generation" : "ETag");
-    hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
-    return hr;
+    return RawMeta{metadata->size_bytes, token.value};
 }
 
 /// Finalize a conditional write (the condition rode on the buffer's WriteSettings) and map a
@@ -234,22 +233,19 @@ static PutOutcome finalizeConditionalWriteInstrumented(WriteBuffer & buf)
 /// Issue a conditional PUT (the condition rides on `ws`) and map a precondition loss — see
 /// finalizeConditionalWrite. The condition is checked by the backend when the object is completed,
 /// so the precondition loss always surfaces from the buffer's finalize, never from write.
-PutResult ObjectStorageBackend::nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, const ObjectMeta & meta)
+std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditionalPut(
+    const String & key, const String & bytes, const WriteSettings & ws)
 {
-    std::optional<ObjectAttributes> attrs;
-    if (!meta.empty())
-        attrs.emplace(meta.begin(), meta.end());   /// ObjectMeta is the same map type as ObjectAttributes
     auto buf = object_storage->writeObject(
-        StoredObject(key), WriteMode::Rewrite, attrs, DBMS_DEFAULT_BUFFER_SIZE, ws);
+        StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
     buf->write(bytes.data(), bytes.size());
     if (finalizeConditionalWriteInstrumented(*buf) == PutOutcome::PreconditionFailed)
-        return {PutOutcome::PreconditionFailed, {}};
+        return std::unexpected(RawConflict{});
 
-    /// Attribute the token of the incarnation WE just wrote (model WCreate) -- see
-    /// tokenFromWriteResult for the exact generation-vs-ETag policy. The S3 write returns its object
-    /// ETag/generation in the PutObject/CompleteMultipartUpload response, so no follow-up HEAD is
-    /// needed for most backends — this is ~73% of the CA backend's HEADs.
-    return {PutOutcome::Done, tokenFromWriteResult(key, buf->getResultObjectETag())};
+    /// Attribute the incarnation WE just wrote -- see tokenFromWriteResult for the exact
+    /// generation-vs-ETag policy. The S3 write returns its object ETag/generation in the
+    /// PutObject/CompleteMultipartUpload response, so no follow-up HEAD is needed.
+    return tokenFromWriteResult(key, buf->getResultObjectETag()).value;
 }
 
 namespace
@@ -257,20 +253,26 @@ namespace
 
 }
 
-/// True when an exception from `IObjectStorage::readObject` means "the object is simply not there".
+/// True when an exception from a read means "the KEY is simply not there".
 /// Two surfaces:
-///   1. S3/RustFS:        `S3Exception` with `S3Errors::NO_SUCH_KEY` (the modeled enum — the primary
-///      signal) or `getExceptionName() == "NoSuchKey"` (the canonical XML `<Code>` string, present
-///      when the SDK was able to parse it; mirrors `finalizeConditionalWrite`'s detection).
+///   1. S3/RustFS: `S3Exception` with `S3Errors::NO_SUCH_KEY` (the modeled enum — the primary
+///      signal), `getExceptionName() == "NoSuchKey"` (the canonical XML `<Code>` string, present when
+///      the SDK was able to parse it; mirrors `finalizeConditionalWrite`'s detection), or
+///      `RESOURCE_NOT_FOUND`, the generic code the SDK derives from a 404 whose body it could not
+///      parse into a name.
 ///   2. Local / emulated: `DB::Exception` with `ErrorCodes::FILE_DOESNT_EXIST` (from
 ///      `ReadBufferFromFile` when `open(2)` returns ENOENT).
 ///
+/// `NO_SUCH_BUCKET` is deliberately NOT here even though it is the third member of the store's own
+/// 404 family: a vanished CONTAINER is not an absent key, and answering "absent" for it would let a
+/// caller read an empty pool out of an outage. It propagates, and `probeSentinelRaw` classifies it.
 /// Any other error (network, auth, throttle, corruption) propagates unchanged — fail-closed.
 static bool isObjectNotFound(const std::exception & e)
 {
 #if USE_AWS_S3
     if (const auto * s3e = dynamic_cast<const S3Exception *>(&e))
         return s3e->getS3ErrorCode() == Aws::S3::S3Errors::NO_SUCH_KEY
+            || s3e->getS3ErrorCode() == Aws::S3::S3Errors::RESOURCE_NOT_FOUND
             || s3e->getExceptionName() == "NoSuchKey";
 #endif
     if (const auto * dbe = dynamic_cast<const Exception *>(&e))
@@ -278,54 +280,20 @@ static bool isObjectNotFound(const std::exception & e)
     return false;
 }
 
-/// Read `range` of the object at `path` as a TRUE ranged read: seek to the offset and bound the
-/// read window. Seek the storage buffer to the requested offset and bound the returned bytes instead
-/// of reading a whole snapshot run and slicing it afterward; snapshot runs can be gigabytes at scale,
-/// while the caller's memory budget is O(block).
-static String readObjectRanged(IObjectStorage & object_storage, const String & path, Range range,
-                               uint64_t known_size = 0)
+/// Read the whole object at `path`. A caller that already knows the size passes it so the read
+/// buffer is sized to the body instead of the storage's ~1 MiB default.
+static String readWholeObject(IObjectStorage & object_storage, const String & path, uint64_t known_size = 0)
 {
     auto buf = object_storage.readObject(
         StoredObject(path), casSizedReadSettings(getReadSettings(), known_size), /*read_hint=*/std::nullopt);
     String content;
-    if (range.whole())
-    {
-        readStringUntilEOF(content, *buf);
-        return content;
-    }
-
-    /// An offset at or past EOF yields an empty result, matching the range contract of the previous
-    /// whole-read implementation.
-    /// `seek` past the object size may throw depending on the storage, so fail-close the window
-    /// against the known size before touching the buffer position.
-    /// Native callers already HEAD the key, so passing its size avoids another metadata round trip.
-    /// A zero size means the caller does not know it and metadata must be fetched here.
-    const uint64_t object_size = known_size != 0 ? known_size
-        : object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes;
-    if (range.offset >= object_size)
-        return {};
-
-    /// The readable window, clamped to EOF. `setReadUntilPosition` is only a hint (not every object
-    /// storage honors it — LocalObjectStorage does not), so the exact byte count below is what bounds
-    /// the read; the hint lets storages that DO honor it avoid over-fetching.
-    const uint64_t available = object_size - range.offset;
-    const uint64_t to_read = range.length.has_value() ? std::min(*range.length, available) : available;
-
-    if (range.length.has_value())
-        buf->setReadUntilPosition(range.offset + *range.length);
-    buf->seek(static_cast<off_t>(range.offset), SEEK_SET);
-
-    content.resize(to_read);
-    const size_t got = buf->read(content.data(), to_read);
-    content.resize(got);
+    readStringUntilEOF(content, *buf);
     return content;
 }
 
 /// Open a forward-only stream over `range` of the object at `path`, positioned at the window's first
-/// byte and bounded to its last. Mirrors
-/// `readObjectRanged`'s seek + bound, but RETURNS the buffer instead of draining it — the caller reads
-/// at its own pace, so nothing is materialized whole. Returns nullptr when the offset is at or past EOF
-/// (the empty-window clamp), matching the ranged-get contract.
+/// byte and bounded to its last. Nothing is materialized whole: the caller reads at its own pace. An
+/// offset at or past EOF yields an empty stream rather than an error.
 static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & object_storage, const String & path, Range range,
                                                           uint64_t known_size = 0)
 {
@@ -334,11 +302,9 @@ static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & objec
     if (range.whole())
         return buf;
 
-    /// Clamp exactly like `readObjectRanged`: an offset at or past EOF yields an empty stream, and
     /// `seek` past the object size may throw depending on the storage, so fail-close against the known
-    /// size before touching the buffer position.
-    /// As in `readObjectRanged`, a caller-supplied size avoids another metadata round trip; zero means
-    /// that the size is unknown and must be fetched.
+    /// size before touching the buffer position. A caller-supplied size avoids another metadata round
+    /// trip; zero means that the size is unknown and must be fetched.
     const uint64_t object_size = known_size != 0 ? known_size
         : object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes;
     if (range.offset >= object_size)
@@ -463,17 +429,14 @@ bool ObjectStorageBackend::emuExists(const String & key) const
     return object_storage->exists(StoredObject(emuPath(key)));
 }
 
-String ObjectStorageBackend::emuRead(const String & key, Range range) const
+String ObjectStorageBackend::emuRead(const String & key) const
 {
-    return readObjectRanged(*object_storage, emuPath(key), range);
+    return readWholeObject(*object_storage, emuPath(key));
 }
 
-Token ObjectStorageBackend::emuWrite(const String & key, const String & bytes, const ObjectMeta & meta)
+Token ObjectStorageBackend::emuWrite(const String & key, const String & bytes)
 {
-    std::optional<ObjectAttributes> attrs;
-    if (!meta.empty())
-        attrs.emplace(meta.begin(), meta.end());   /// ObjectMeta is the same map type as ObjectAttributes
-    auto buf = object_storage->writeObject(StoredObject(emuPath(key)), WriteMode::Rewrite, attrs);
+    auto buf = object_storage->writeObject(StoredObject(emuPath(key)), WriteMode::Rewrite);
     buf->write(bytes.data(), bytes.size());
     buf->finalize();
 
@@ -486,7 +449,7 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
     if (object_storage->getType() != ObjectStorageType::Local)
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::publishBlob: atomic emulated publication requires local object storage");
+            "ObjectStorageBackend::publish: atomic emulated publication requires local object storage");
 
     const String destination_object = emuPath(key);
     const String temporary_object = destination_object + ".publish-" + toString(UUIDHelpers::generateV4()) + ".tmp";
@@ -510,7 +473,7 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
             out->cancel();
             throw Exception(
                 ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publishBlob: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
+                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
                 copy_result.has_excess ? "more than " : "",
                 copy_result.copied,
                 key,
@@ -588,43 +551,39 @@ Token ObjectStorageBackend::emuMintToken(const String & key, const String & etag
 /// Backend interface
 /// =========================================================================================
 
-std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range range)
+ReadSettings ObjectStorageBackend::controlPlaneReadSettings() const
+{
+    ReadSettings rs = getReadSettings();
+    /// Mark the request for the store's native conditional dialect, so a GCS read is answered with a
+    /// generation rather than an MD5-shaped ETag.
+    rs.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
+    rs.object_storage_retry_profile = controlPlaneProfile();
+    rs.object_storage_attempt_timeout_ms = attempt_timeout_ms;
+    return rs;
+}
+
+std::optional<Backend::Raw> ObjectStorageBackend::read(const String & key, TransportAccess &)
 {
     if (mode == Mode::Native)
     {
-        auto hr = nativeHead(key);
-        if (!hr)
-            return std::nullopt;
-
-        /// The object may be deleted between the HEAD above and the GET below (a GC or concurrent
-        /// writer racing the read window). Catch the not-found signal and honor the `optional`
-        /// contract — callers such as `Pool::loadShardDecoded` already handle a nullopt return and
-        /// treat it as "raced a deletion, absent". Any other error (network, auth, corruption)
-        /// propagates unchanged — fail-closed by construction.
-        ///
-        /// A REPLACEMENT racing the same window (HEAD observes token A, GET reads the bytes of a
-        /// subsequently-written incarnation B) is likewise not a hazard: HEAD strictly precedes GET, so
-        /// the returned token is never NEWER than the returned bytes — a mixed pair is always
-        /// (bytes_newer, token_older), never the reverse. Every consumer of this token uses it as a
-        /// conditional precondition (`casPut`/`putOverwrite`/`deleteExact`), which fails closed EXACTLY
-        /// in the mixed case, so a stale token costs a retry, never lets a caller act on a
-        /// bytes/token pair that never coexisted. This also covers `known_size`: content-addressed blob
-        /// bodies are byte-identical across incarnations (a "replacement" only rotates envelope/token),
-        /// mutable control objects are read-modify-CAS loops that re-validate on conflict, and write-once
-        /// objects self-validate their contents on decode.
-        GetResult gr;
+        /// ONE request: an S3 GET answers with the incarnation of the bytes it returned, so no HEAD
+        /// is needed to name them and no HEAD-to-GET window exists in which the two could disagree.
+        /// The value is returned UNVALIDATED -- `CasRequests` is where a response value becomes an
+        /// incarnation, and it is the one place that can decide what a malformed one means.
         try
         {
-            gr.bytes = readObjectRanged(*object_storage, key, range, hr->size);
+            auto got = object_storage->readSmallObjectAndGetObjectMetadata(
+                StoredObject(key), controlPlaneReadSettings(), casMaxStoredObjectBytes());
+            return Raw{std::move(got.data), normalizeTokenValue(got.metadata.etag)};
         }
         catch (const std::exception & e)
         {
+            /// The object is simply not there; every other error (network, auth, corruption)
+            /// propagates unchanged -- fail-closed by construction.
             if (isObjectNotFound(e))
                 return std::nullopt;
             throw;
         }
-        gr.token = hr->token;
-        return gr;
     }
 
     std::lock_guard lock(emu_mutex);
@@ -635,10 +594,10 @@ std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range ran
     /// caller in this process can delete the file in between. External deletion (e.g. a test teardown
     /// racing a read) is still handled: convert FILE_DOESNT_EXIST to nullopt rather than letting it
     /// escape as an unexplained exception.
-    GetResult gr;
+    Raw raw;
     try
     {
-        gr.bytes = emuRead(key, range);
+        raw.bytes = emuRead(key);
     }
     catch (const std::exception & e)
     {
@@ -646,8 +605,8 @@ std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range ran
             return std::nullopt;
         throw;
     }
-    gr.token = emuObserveToken(key);
-    return gr;
+    raw.value = emuObserveToken(key).value;
+    return raw;
 }
 
 std::optional<GetStreamResult> ObjectStorageBackend::getStream(const String & key, Range range)
@@ -658,9 +617,9 @@ std::optional<GetStreamResult> ObjectStorageBackend::getStream(const String & ke
         if (!hr)
             return std::nullopt;
 
-        /// Same HEAD-then-read race as `get`: the object may be deleted between the HEAD above and the
-        /// stream open below. Honor the `optional` contract on a not-found signal; any other error
-        /// (network, auth, corruption) propagates unchanged — fail-closed by construction.
+        /// The object may be deleted between the HEAD above and the stream open below. Honor the
+        /// `optional` contract on a not-found signal; any other error (network, auth, corruption)
+        /// propagates unchanged — fail-closed by construction.
         GetStreamResult sr;
         try
         {
@@ -672,7 +631,7 @@ std::optional<GetStreamResult> ObjectStorageBackend::getStream(const String & ke
                 return std::nullopt;
             throw;
         }
-        sr.token = hr->token;
+        sr.token = Token{hr->value, native_token_type};
         return sr;
     }
 
@@ -680,7 +639,7 @@ std::optional<GetStreamResult> ObjectStorageBackend::getStream(const String & ke
     if (!emuExists(key))
         return std::nullopt;
 
-    /// The emulated path holds emu_mutex across the exists-check and the stream open, matching `get`.
+    /// The emulated path holds emu_mutex across the exists-check and the stream open, matching `read`.
     /// External deletion still converts to nullopt rather than escaping as an unexplained exception.
     GetStreamResult sr;
     try
@@ -697,69 +656,58 @@ std::optional<GetStreamResult> ObjectStorageBackend::getStream(const String & ke
     return sr;
 }
 
-HeadResult ObjectStorageBackend::head(const String & key)
+std::unique_ptr<ReadBuffer> ObjectStorageBackend::stream(const String & key, TransportAccess &)
+{
+    /// Absence must be a null buffer, and a lazily-issued object-storage read cannot report it at
+    /// open, so this keeps `getStream`'s HEAD-then-open shape and folds that body in here once
+    /// `getStream`'s last caller is gone.
+    auto sr = getStream(key, Range{});
+    if (!sr)
+        return nullptr;
+    return std::move(sr->stream);
+}
+
+std::optional<Backend::RawMeta> ObjectStorageBackend::head(const String & key, TransportAccess &)
 {
     if (mode == Mode::Native)
-    {
-        auto hr = nativeHead(key);
-        return hr ? *hr : HeadResult{};
-    }
+        return nativeHead(key);
 
     std::lock_guard lock(emu_mutex);
     if (!emuExists(key))
-        return HeadResult{};
+        return std::nullopt;
 
     auto metadata = object_storage->tryGetObjectMetadata(emuPath(key), /*with_tags=*/false);
     /// A path that exists on the Local filesystem but yields no object metadata is a directory, not
     /// an object (`tryGetObjectMetadata` returns nullopt for a directory). HEAD must report it as
-    /// not-an-object (exists=false) — otherwise existsFile/getStorageObjects treat a pool sub-dir (e.g.
-    /// `store`, traversed by system.remote_data_paths) as a file and a later body read throws EISDIR.
+    /// not-an-object — otherwise existsFile/getStorageObjects treat a pool sub-dir (e.g. `store`,
+    /// traversed by system.remote_data_paths) as a file and a later body read throws EISDIR.
     if (!metadata)
-        return HeadResult{};
-    HeadResult hr;
-    hr.exists = true;
-    hr.size = metadata->size_bytes;
-    hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
-    hr.token = emuObserveToken(key);
-    return hr;
+        return std::nullopt;
+    return RawMeta{metadata->size_bytes, emuObserveToken(key).value};
 }
 
 /// See Backend::probeSentinelRaw / CasBackend.h's ProbeOutcome for the semantics this classifies.
-SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
+SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key, TransportAccess & access)
 {
     if (mode == Mode::Native)
     {
         try
         {
-            /// `getObjectMetadata` (unlike `tryGetObjectMetadata`/`nativeHead`) is the THROWING raw-HEAD
-            /// primitive — it does NOT collapse NO_SUCH_KEY/NO_SUCH_BUCKET/RESOURCE_NOT_FOUND into one
-            /// `nullopt` before we get a chance to classify the S3 error. Its result is discarded here;
-            /// only whether (and how) it throws matters — the body comes from `get` below.
-            object_storage->getObjectMetadata(key, /*with_tags=*/false);
-
-            /// The raw HEAD proved the key present. Delegate the body read to the existing `get`, which
-            /// already HEADs again and reads — an extra round trip this authoritative, low-rate probe can
-            /// afford, in exchange for reusing its already-correct HEAD→GET race handling. Kept INSIDE
-            /// this try: a transient failure here must also classify Indeterminate, never escape unclassified.
-            auto g = get(key);
-            if (!g)
-                return {ProbeOutcome::KeyAbsent, std::nullopt};   /// raced a deletion right after the raw HEAD
-            return {ProbeOutcome::Present, std::move(g->bytes)};
+            /// One `read`: unlike a bodyless HEAD 404, a GET 404 carries a response body, so the
+            /// SDK can parse its `<Code>` and a missing key and a missing bucket arrive as different
+            /// errors -- which is the whole distinction this probe exists to make.
+            auto raw = read(key, access);
+            if (!raw)
+                return {ProbeOutcome::KeyAbsent, std::nullopt};
+            return {ProbeOutcome::Present, std::move(raw->bytes)};
         }
 #if USE_AWS_S3
         catch (const S3Exception & e)
         {
+            /// `read` already answers the key-absent half of the store's 404 family (see
+            /// `isObjectNotFound`), so what reaches here is what it deliberately does not flatten.
             switch (e.getS3ErrorCode())
             {
-                case Aws::S3::S3Errors::NO_SUCH_KEY:
-                    return {ProbeOutcome::KeyAbsent, std::nullopt};
-                case Aws::S3::S3Errors::RESOURCE_NOT_FOUND:
-                    /// A HEAD response carries no body, so the SDK cannot parse a `NoSuchKey` `<Code>`
-                    /// and instead derives this generic code straight from the HTTP 404 status (see
-                    /// `isNotFoundError`, `src/IO/S3/getObjectInfo.cpp`) — this is what a REAL S3 HEAD
-                    /// on an absent key actually throws. The container/key distinction is deliberately
-                    /// NOT attempted here (a bodyless 404 cannot carry it).
-                    return {ProbeOutcome::KeyAbsent, std::nullopt};
                 case Aws::S3::S3Errors::NO_SUCH_BUCKET:
                     return {ProbeOutcome::ContainerAbsent, std::nullopt};
                 case Aws::S3::S3Errors::ACCESS_DENIED:
@@ -777,7 +725,7 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
         }
     }
 
-    /// EmulatedSingleProcess (Local): stat the configured container directory FIRST — `emuExists`/`get`
+    /// EmulatedSingleProcess (Local): stat the configured container directory FIRST — `emuExists`/`read`
     /// alone cannot distinguish "this key is absent" from "the whole pool directory is gone" (Local
     /// listing is best-effort and silently reports zero either way, see LocalObjectStorage::listObjects).
     try
@@ -785,10 +733,10 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
         if (!object_storage->existsOrHasAnyChild(emu_root))
             return {ProbeOutcome::ContainerAbsent, std::nullopt};
 
-        auto g = get(key);
-        if (!g)
+        auto raw = read(key, access);
+        if (!raw)
             return {ProbeOutcome::KeyAbsent, std::nullopt};
-        return {ProbeOutcome::Present, std::move(g->bytes)};
+        return {ProbeOutcome::Present, std::move(raw->bytes)};
     }
     catch (...)
     {
@@ -830,18 +778,11 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
 /// on BOTH of its success paths -- `makeSinglepartUpload` (WriteBufferFromS3.cpp) and
 /// `completeMultipartUpload` (WriteBufferFromS3.cpp) -- so a successful S3 write always leaves
 /// `getResultObjectETag()` holding a value, empty string included; `has_value()` is exactly "this was
-/// a real S3-style write response", the only case Step 7's "a missing x-goog-generation is an
-/// exception" rule is ABOUT. `S3ObjectStorage::writeObject` returns that `WriteBufferFromS3` directly,
-/// undecorated, so this holds for the whole CAS-over-S3 write path with no wrapping in between. A
-/// backend with no write-time-token concept at all (local files, or a non-S3 `IObjectStorage`
-/// exercising Generation dialect purely for a unit test, see
-/// `CASBackendGeneration.StampedTokenTypeFollowsNativeKind`) reports `nullopt` structurally, not a
-/// broken response, and keeps falling back to a fresh HEAD exactly like the ETag dialect. A future
-/// change that wraps the returned write buffer in a decorator would need to re-derive or preserve this
-/// chain -- `WriteBufferFromFileDecorator::getResultObjectETag` returns `nullopt` for a wrapped impl
-/// that is not itself a `WriteBufferFromFileBase`, which would silently turn a hard failure back into
-/// a HEAD fallback.
-///
+/// a real S3-style write response". `S3ObjectStorage::writeObject` returns that `WriteBufferFromS3`
+/// directly, undecorated, so this holds for the whole CAS-over-S3 write path with no wrapping in
+/// between. A storage with no write-time-token concept at all (local files) reports `nullopt`
+/// structurally rather than because anything broke -- but it still cannot attribute the write, which
+/// is why both cases end in the same refusal.
 Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::optional<String> & etag)
 {
     if (native_token_type == TokenType::Generation && etag.has_value())
@@ -860,45 +801,58 @@ Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::
         return token;
     }
 
-    /// ETag dialect (and any backend with no write-time token at all, e.g. local files): an ABSENT
-    /// value (etag == nullopt) is structural -- see the class comment above `tokenFromWriteResult` --
-    /// and still falls back to a fresh HEAD of `key`. A PRESENT but empty value is different: it is a
-    /// real S3-style write response that simply carried no incarnation, and there is no follow-up HEAD
-    /// that can attribute the write with certainty -- the object it would read back might not even be
-    /// the one this call just wrote.
     if (etag && !etag->empty())
         return tokenForHead(*etag);
-    if (etag.has_value())
-        throw Exception(ErrorCodes::CAS_WRITE_UNATTRIBUTED,
-            "CAS backend: the store accepted a write of '{}' but returned no incarnation; the write may "
-            "have committed and must be resolved by reading back", key);
 
-    auto hr = nativeHead(key);
-    if (!hr)
-        throw Exception(ErrorCodes::CAS_WRITE_UNATTRIBUTED,
-            "CAS backend: a write of '{}' reported no incarnation and the follow-up HEAD found "
-            "nothing either; the write may have committed and must be resolved by reading back",
-            key);
-    return hr->token;
+    /// No incarnation came back: an empty value from a real write response, or no value at all from a
+    /// storage that has no write-time token. Either way this call cannot say which incarnation it
+    /// created, and no follow-up read could either -- the object it read back might be someone
+    /// else's. The write may have committed, so the caller must resolve it, not this seam.
+    throw Exception(ErrorCodes::CAS_WRITE_UNATTRIBUTED,
+        "CAS backend: the store accepted a write of '{}' but returned no incarnation; the write may "
+        "have committed and must be resolved by reading back", key);
 }
 
-PutResult ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
+std::expected<String, Backend::RawConflict> ObjectStorageBackend::write(
+    const String & key, const String & bytes, const std::optional<String> & expected_value, TransportAccess &)
 {
+    /// An empty, wildcard or list value would turn the precondition into an unconditional write --
+    /// refuse it as a caller bug before anything else runs.
+    if (expected_value && !isValidTokenValue(dialect(), *expected_value))
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
+            "an empty, wildcard or list token would turn the precondition into an unconditional write",
+            key, *expected_value, static_cast<int>(dialect()));
+
     if (mode == Mode::Native)
     {
         WriteSettings ws = conditionalWriteSettings();
-        ws.object_storage_write_if_none_match = "*";
-        return nativeConditionalPut(key, bytes, ws, meta);
+        if (expected_value)
+            ws.object_storage_write_if_match = *expected_value;
+        else
+            ws.object_storage_write_if_none_match = "*";
+        return nativeConditionalPut(key, bytes, ws);
     }
 
     std::lock_guard lock(emu_mutex);
-    if (emuExists(key))
-        return {PutOutcome::PreconditionFailed, {}};
+    const bool exists = emuExists(key);
+    if (!expected_value)
+    {
+        if (exists)
+            return std::unexpected(RawConflict{});
+    }
+    else
+    {
+        if (!exists)
+            return std::unexpected(RawConflict{});
+        if (!tokenMatches(emuObserveToken(key), Token{*expected_value, TokenType::Emulated}))
+            return std::unexpected(RawConflict{});
+    }
 
-    return {PutOutcome::Done, emuWrite(key, bytes, meta)};
+    return emuWrite(key, bytes).value;
 }
 
-void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
+void ObjectStorageBackend::publish(const BlobPublishRequest & request, TransportAccess &)
 {
     if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
     {
@@ -906,7 +860,7 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
         if (!payload)
             throw Exception(
                 ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publishBlob: payload source for {} returned no reader",
+                "ObjectStorageBackend::publish: payload source for {} returned no reader",
                 request.destination_key);
 
         if (mode != Mode::Native)
@@ -941,7 +895,7 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
             out->cancel();
             throw Exception(
                 ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publishBlob: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
+                "ObjectStorageBackend::publish: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
                 copy_result.has_excess ? "more than " : "",
                 copy_result.copied,
                 request.destination_key,
@@ -955,14 +909,14 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
     if (mode != Mode::Native)
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::publishBlob: verbatim staged publication requires Native mode");
+            "ObjectStorageBackend::publish: verbatim staged publication requires Native mode");
 
     WriteSettings write_settings;
     write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
     if (!object_storage->supportsCopyMode(write_settings.object_storage_copy_mode))
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::publishBlob: object storage {} does not support native-only same-store copy",
+            "ObjectStorageBackend::publish: object storage {} does not support native-only same-store copy",
             object_storage->getName());
 
     object_storage->copyObject(
@@ -972,151 +926,47 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
         write_settings);
 }
 
-PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
+Backend::RawRemoval ObjectStorageBackend::remove(const String & key, const String & expected_value, TransportAccess &)
 {
-    /// An empty, wildcard or list token would turn the precondition into an unconditional write --
-    /// refuse it as a caller bug before anything else runs. Validated under the token's OWN declared
-    /// dialect (expected.type), not this backend's, so a malformed-AND-foreign-dialect token (e.g.
-    /// Token{} = empty value, ETag type, arriving at a Generation-dialect or EmulatedSingleProcess
-    /// backend) is still caught here rather than silently absorbed by the dialect check below.
-    if (!isValidTokenValue(expected.type, expected.value))
+    /// Same grammar guard as `write`, and for the same reason: an empty, wildcard or list value would
+    /// turn the condition into an unconditional delete.
+    if (!isValidTokenValue(dialect(), expected_value))
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
             "an empty, wildcard or list token would turn the precondition into an unconditional write",
-            key, expected.value, static_cast<int>(expected.type));
-
-    /// §3.18 №19: reject a wrong-dialect (but well-formed) expected token before it ever reaches the
-    /// wire (Native) or the emu compare (Emulated) — see mintingTypeMatches. A caller-visible
-    /// mismatch, answered like any other non-matching token, not a backend malfunction.
-    if (!mintingTypeMatches(expected.type))
-        return {PutOutcome::PreconditionFailed, {}};
+            key, expected_value, static_cast<int>(dialect()));
 
     if (mode == Mode::Native)
     {
-        WriteSettings ws = conditionalWriteSettings();
-        ws.object_storage_write_if_match = expected.value;
-        return nativeConditionalPut(key, bytes, ws, meta);
-    }
-
-    std::lock_guard lock(emu_mutex);
-    if (!emuExists(key))
-        return {PutOutcome::PreconditionFailed, {}};
-    if (!tokenMatches(emuObserveToken(key), expected))
-        return {PutOutcome::PreconditionFailed, {}};
-
-    return {PutOutcome::Done, emuWrite(key, bytes, meta)};
-}
-
-CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta)
-{
-    /// Same grammar guard as putOverwrite, and in the same order (see there for why): a create-if-
-    /// absent CAS (expected == nullopt) has no token to validate; only the swap form carries one, and
-    /// its VALUE is checked under its own declared dialect before the dialect-match check below.
-    if (expected.has_value() && !isValidTokenValue(expected->type, expected->value))
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
-            "an empty, wildcard or list token would turn the precondition into an unconditional write",
-            key, expected->value, static_cast<int>(expected->type));
-
-    /// §3.18 №19: the swap form's token must match this backend's own minting dialect before anything
-    /// else runs.
-    if (expected.has_value() && !mintingTypeMatches(expected->type))
-        return {CasOutcome::Conflict, {}};
-
-    if (mode == Mode::Native)
-    {
-        WriteSettings ws = conditionalWriteSettings();
-        if (expected.has_value())
-            ws.object_storage_write_if_match = expected->value;
-        else
-            ws.object_storage_write_if_none_match = "*";
-
-        /// The PUT-side outcomes (Done / PreconditionFailed) collapse onto CAS outcomes 1:1: a lost
-        /// condition — whether a mismatched If-Match or a 404 on an If-Match PUT — is a Conflict.
-        PutResult put = nativeConditionalPut(key, bytes, ws, meta);
-        return put.outcome == PutOutcome::Done
-            ? CasResult{CasOutcome::Committed, put.token}
-            : CasResult{CasOutcome::Conflict, {}};
-    }
-
-    std::lock_guard lock(emu_mutex);
-    const bool exists = emuExists(key);
-
-    if (!expected.has_value())
-    {
-        if (exists)
-            return {CasOutcome::Conflict, {}};
-    }
-    else
-    {
-        if (!exists)
-            return {CasOutcome::Conflict, {}};
-        if (!tokenMatches(emuObserveToken(key), *expected))
-            return {CasOutcome::Conflict, {}};
-    }
-
-    return {CasOutcome::Committed, emuWrite(key, bytes, meta)};
-}
-
-DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token & token)
-{
-    /// Same grammar guard as putOverwrite/casPut, and in the same order (see there for why): the
-    /// token's VALUE is checked under its own declared dialect before the dialect-match check below.
-    if (!isValidTokenValue(token.type, token.value))
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS backend: refusing a conditional mutation of '{}' with a malformed token '{}' (dialect {}): "
-            "an empty, wildcard or list token would turn the precondition into an unconditional write",
-            key, token.value, static_cast<int>(token.type));
-
-    /// §3.18 №19: same local dialect guard as putOverwrite/casPut — never forward a foreign-dialect
-    /// value as the removeObjectIfTokenMatches argument.
-    if (!mintingTypeMatches(token.type))
-    {
-        DeleteOutcome d;
-        d.kind = DeleteOutcome::Kind::TokenMismatch;
-        return d;
-    }
-
-    if (mode == Mode::Native)
-    {
-        /// `removeObjectIfTokenMatches` maps onto `DeleteOutcome` one-to-one. `NOT_IMPLEMENTED` from a
-        /// backend that does not enforce conditional removal propagates — fail-closed by construction.
-        auto result = object_storage->removeObjectIfTokenMatches(StoredObject(key), token.value);
-        DeleteOutcome d;
-        d.created_delete_marker = result.created_delete_marker;
+        /// `NOT_IMPLEMENTED` from a storage that does not enforce conditional removal propagates —
+        /// fail-closed by construction.
+        auto result = object_storage->removeObjectIfTokenMatches(
+            StoredObject(key), expected_value, controlPlaneProfile(), attempt_timeout_ms);
         switch (result.outcome)
         {
             case ConditionalRemoveOutcome::Removed:
-                d.kind = DeleteOutcome::Kind::Deleted;
-                break;
+                /// A delete marker means the storage archived a noncurrent version instead of
+                /// reclaiming the current object -- a removal that did not reclaim.
+                return result.created_delete_marker ? RawRemoval::DeleteMarker : RawRemoval::Removed;
             case ConditionalRemoveOutcome::TokenMismatch:
-                d.kind = DeleteOutcome::Kind::TokenMismatch;
-                break;
+                return RawRemoval::Mismatch;
             case ConditionalRemoveOutcome::NotFound:
-                d.kind = DeleteOutcome::Kind::NotFound;
-                break;
+                return RawRemoval::Gone;
         }
-        return d;
+        UNREACHABLE();
     }
 
     std::lock_guard lock(emu_mutex);
-    DeleteOutcome d;
     if (!emuExists(key))
-    {
-        d.kind = DeleteOutcome::Kind::NotFound;
-        return d;
-    }
-    if (!tokenMatches(emuObserveToken(key), token))
-    {
-        d.kind = DeleteOutcome::Kind::TokenMismatch;
-        return d;
-    }
+        return RawRemoval::Gone;
+    if (!tokenMatches(emuObserveToken(key), Token{expected_value, TokenType::Emulated}))
+        return RawRemoval::Mismatch;
 
     object_storage->removeObjectIfExists(StoredObject(emuPath(key)));
     /// Keep the deleted incarnation's last-minted etag around ONLY while a same-mtime-quantum
     /// collision with an immediate recreate is still possible (emuMintToken) — once it is
     /// comfortably old, erase it so `emu_token_state` does not grow for the lifetime of the backend
-    /// instance (codex-review-triage §3.18, Important #1).
+    /// instance.
     if (auto it = emu_token_state.find(key); it != emu_token_state.end())
     {
         const uint64_t now_ns = emuNowNs();
@@ -1125,11 +975,10 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
         else
             emu_token_expiry.push_back(EmuTokenExpiry{now_ns, key, it->second});
     }
-    d.kind = DeleteOutcome::Kind::Deleted;
-    return d;
+    return RawRemoval::Removed;
 }
 
-ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit)
+Backend::RawListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit, TransportAccess &)
 {
     /// Use the lazy object-storage iterator instead of `listObjects(..., max_keys=0)`: the latter
     /// materialized the whole prefix, then sliced client-side, so a paginated walk re-fetched the full
@@ -1148,32 +997,29 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         object_storage->listObjects(physical_prefix, children, /*max_keys=*/0);
 
         /// Hold emu_mutex across the whole scan: emuMintToken below reads/updates emu_token_state, the
-        /// same per-key state get/head/put*/delete* mutate under this lock (see the "caller holds
+        /// same per-key state read/head/write/remove mutate under this lock (see the "caller holds
         /// emu_mutex" contract on the private emu* helpers).
         std::lock_guard lock(emu_mutex);
 
-        std::vector<ListedKey> all;
+        std::vector<RawListedKey> all;
         all.reserve(children.size());
         for (const auto & child : children)
         {
             if (!child->relative_path.starts_with(physical_prefix))
                 continue;
-            ListedKey lk;
+            RawListedKey lk;
             lk.key = child->relative_path.substr(strip.size());
             lk.size = child->metadata ? child->metadata->size_bytes : 0;
-            /// §3.18 №18: mint DIRECTLY as TokenType::Emulated — do NOT call tokenForList, which always
-            /// stamps native_token_type (ETag/Generation) regardless of mode and would surface a token
-            /// of the wrong dialect for every Emulated consumer (head/get mint Emulated).
             if (child->metadata)
-                lk.token = emuMintToken(lk.key, child->metadata->etag, /*just_wrote=*/false);
+                lk.value = emuMintToken(lk.key, child->metadata->etag, /*just_wrote=*/false).value;
             all.push_back(std::move(lk));
         }
-        std::sort(all.begin(), all.end(), [](const ListedKey & a, const ListedKey & b) { return a.key < b.key; });
+        std::sort(all.begin(), all.end(), [](const RawListedKey & a, const RawListedKey & b) { return a.key < b.key; });
 
-        ListPage page;
+        RawListPage page;
         auto all_it = cursor.empty()
-            ? std::lower_bound(all.begin(), all.end(), prefix, [](const ListedKey & a, const String & s) { return a.key < s; })
-            : std::upper_bound(all.begin(), all.end(), cursor, [](const String & s, const ListedKey & a) { return s < a.key; });
+            ? std::lower_bound(all.begin(), all.end(), prefix, [](const RawListedKey & a, const String & s) { return a.key < s; })
+            : std::upper_bound(all.begin(), all.end(), cursor, [](const String & s, const RawListedKey & a) { return s < a.key; });
         while (all_it != all.end() && page.keys.size() < limit)
         {
             page.keys.push_back(*all_it);
@@ -1188,33 +1034,38 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         ? std::nullopt
         : std::optional<String>(cursor);
 
-    ListPage page;
-    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/0, /*with_tags=*/false, start_after);
+    RawListPage page;
+    auto it = object_storage->iterate(
+        physical_prefix, /*max_keys=*/0, /*with_tags=*/false, start_after, controlPlaneProfile(), attempt_timeout_ms);
     for (; it->isValid(); it->next())
     {
         const auto child = it->current();
         if (!child->relative_path.starts_with(physical_prefix))
             continue;
 
-        ListedKey lk;
+        RawListedKey lk;
         lk.key = child->relative_path.substr(strip.size());
         if (!cursor.empty() && lk.key <= cursor)
             continue;
 
         lk.size = child->metadata ? child->metadata->size_bytes : 0;
-        /// Surface the per-key incarnation token (matching what `head` would return, see above) so the
-        /// `supportsListTokens() == true` capability is honest. A listing without an etag leaves the
-        /// token unset, which GC discover treats as Read (fail closed). The supportsListTokens()+
-        /// empty-etag gate now lives in tokenForList.
+        /// Surface the per-key incarnation value (matching what `head` would return) so the
+        /// `supportsListTokens() == true` capability is honest. A listing without an etag leaves it
+        /// unset, which GC discover treats as Read (fail closed). The supportsListTokens()+
+        /// empty-etag gate lives in tokenForList, which is also why the check below names the ETag
+        /// dialect: a generation store surfaces no list value at all.
         if (child->metadata)
         {
-            lk.token = tokenForList(child->metadata->etag);
-            /// Same grammar check as nativeHead: a listed value that fails this backend's dialect
-            /// grammar is a broken response, not a token to hand a future conditional operation.
-            if (lk.token && !isValidTokenValue(lk.token->type, lk.token->value))
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS backend: the store answered for '{}' with a value '{}' that is not a valid {} incarnation",
-                    lk.key, lk.token->value, lk.token->type == TokenType::Generation ? "generation" : "ETag");
+            if (const auto token = tokenForList(child->metadata->etag))
+            {
+                /// Same grammar check as nativeHead: a listed value that fails this backend's dialect
+                /// grammar is a broken response, not a value to hand a future conditional operation.
+                if (!isValidTokenValue(token->type, token->value))
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS backend: the store answered for '{}' with a value '{}' that is not a valid ETag incarnation",
+                        lk.key, token->value);
+                lk.value = token->value;
+            }
         }
 
         if (page.keys.size() == limit)

@@ -1,6 +1,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Common/Exception.h>
 
+#include <zstd.h>
+
+#include <algorithm>
 #include <array>
 
 namespace DB
@@ -131,6 +134,18 @@ constexpr FormatTraits TRAITS[] =
     {FormatId::ServerEpoch,  "cas_epoch",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::MountLease,   "cas_mount_lease",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
 };
+}
+
+uint64_t casMaxStoredObjectBytes()
+{
+    static const uint64_t bound = []
+    {
+        uint64_t largest_uncompressed = 0;
+        for (const FormatTraits & t : TRAITS)
+            largest_uncompressed = std::max(largest_uncompressed, t.object_cap);
+        return static_cast<uint64_t>(ZSTD_compressBound(largest_uncompressed));
+    }();
+    return bound;
 }
 
 const FormatTraits & traitsFor(FormatId id)

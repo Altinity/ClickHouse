@@ -690,9 +690,10 @@ TEST(CASPool, ResolveReturnsManifestId)
     EXPECT_EQ(loc.offset, s->poolMeta().blob_header_len);
     EXPECT_EQ(loc.length, payload.size());
 
-    auto bytes = b->get(loc.key, Range{loc.offset, loc.length});
+    auto bytes = b->get(loc.key);
     ASSERT_TRUE(bytes.has_value());
-    EXPECT_EQ(bytes->bytes, payload);               /// ranged read, no header touch
+    /// The located window holds exactly the payload: the envelope header is outside it.
+    EXPECT_EQ(bytes->bytes.substr(static_cast<size_t>(loc.offset), static_cast<size_t>(loc.length)), payload);
 
     const auto * small = findEntry(manifest.entries, "small.txt");
     ASSERT_TRUE(small != nullptr);

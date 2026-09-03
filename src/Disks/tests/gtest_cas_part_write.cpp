@@ -1327,9 +1327,10 @@ TEST(CASPartWriteTxn, PublishHappyPathRoundTrip)
     const auto * entry = findEntry(manifest.entries, "data.bin");
     ASSERT_TRUE(entry != nullptr);
     const auto loc = s->locate(*entry);
-    auto got = b->get(loc.key, Range{loc.offset, loc.length});
+    /// The located window of the blob object, sliced by the test: the seam reads whole objects.
+    auto got = b->get(loc.key);
     ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->bytes, "hello world");
+    EXPECT_EQ(got->bytes.substr(static_cast<size_t>(loc.offset), static_cast<size_t>(loc.length)), "hello world");
 }
 
 TEST(CASPartWriteTxn, PromoteCrossNamespaceManifestFailsClosed)
@@ -1670,9 +1671,9 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
     const auto * entry = findEntry(manifest.entries, "f");
     ASSERT_TRUE(entry != nullptr);
     const auto loc = s->locate(*entry);
-    const auto got = b->get(loc.key, Range{loc.offset, loc.length});
+    const auto got = b->get(loc.key);
     ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->bytes, content);
+    EXPECT_EQ(got->bytes.substr(static_cast<size_t>(loc.offset), static_cast<size_t>(loc.length)), content);
 }
 
 /// BUG 1 (WPromote owner==bld): promote is a PURE owner MOVE (Δ=0 — it restores no blob in-degree). The

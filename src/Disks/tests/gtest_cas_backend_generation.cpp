@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Disks/WriteMode.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 
@@ -184,35 +186,49 @@ TEST(CASBackendGeneration, NativeHeadUsesNativeTokenMetadataApi)
     auto storage = makeRecordingObjectStorageForTest();
     auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
 
-    ASSERT_EQ(b->putIfAbsent("p/native-head/key", "v1").outcome, PutOutcome::Done);
+    /// Placed through the object storage: a Native write over a local storage has no response
+    /// incarnation to attribute itself to. Native passes the key verbatim, so this is the object the
+    /// HEAD below reads -- anchored under the storage's own root, since a bare relative key would
+    /// resolve beside the test process.
+    const String key = DB::Cas::tests::nativeKeyUnder(storage, "p/native-head/key");
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(key), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("v1"), *out);
+        out->finalize();
+    }
 
-    /// `putIfAbsent`'s HEAD-fallback stamping path calls the ordinary API;
-    /// reset the counters so only nativeHead's call, below, is observed.
+    /// Only nativeHead's own call may be observed.
     storage->ordinary_calls = 0;
     storage->native_calls = 0;
 
-    const auto hr = b->head("p/native-head/key");
+    const auto hr = b->head(key);
     ASSERT_TRUE(hr.exists);
     EXPECT_EQ(storage->native_calls, 1);
     EXPECT_EQ(storage->ordinary_calls, 0);
 }
 
-/// Every Token{...} the backend mints must carry native_token_type instead of a hardcoded
-/// TokenType::ETag (Task 5). Mode::Native over a LocalObjectStorage has no write-time ETag, so
-/// putIfAbsent's PutResult falls back to a HEAD internally — that HEAD is also a stamping site,
-/// so the assertion below exercises both the direct-etag and the HEAD-fallback mint paths.
+/// Every token the backend mints carries native_token_type rather than a hardcoded TokenType::ETag.
+/// The HEAD mint is the site exercised here; the write-response mint has its own tests over the fake
+/// S3 client below, which is the only place a Native write can produce a response incarnation.
 TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
 {
-    auto b = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
     b->setNativeTokenTypeForTest(TokenType::Generation);
 
-    const auto put = b->putIfAbsent("p/gen/tok", "v1");
-    EXPECT_EQ(put.token.type, TokenType::Generation);
+    /// A local file's etag is its mtime in nanoseconds, which is also a valid generation value.
+    const String key = DB::Cas::tests::nativeKeyUnder(storage, "p/gen/tok");
+    {
+        auto out = storage->writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite);
+        DB::writeString(String("v1"), *out);
+        out->finalize();
+    }
 
-    const auto hr = b->head("p/gen/tok");
+    const auto hr = b->head(key);
     ASSERT_TRUE(hr.exists);
     EXPECT_EQ(hr.token.type, TokenType::Generation);
+    EXPECT_EQ(b->dialect(), TokenType::Generation);
 }
 
 /// A generation-dialect (GCS) mount wants bucket versioning to be verifiably off: a token-exact

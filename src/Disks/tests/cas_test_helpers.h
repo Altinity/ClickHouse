@@ -1448,10 +1448,13 @@ inline std::vector<DB::Cas::RefOp> publishCommittedOps(const String & ref_name, 
 class CountingBackend : public DB::Cas::InMemoryBackend
 {
 public:
-    /// Unhide the base convenience overloads (omitted Range/ObjectMeta/expected-token forms): the
-    /// overrides below would otherwise shadow them for callers holding a concrete backend type.
+    /// Unhide the base overloads the legacy overrides below would otherwise shadow: the convenience
+    /// forms that omit Range/ObjectMeta/expected-token, and the transport primitives that share the
+    /// `head` and `list` names.
     using DB::Cas::Backend::get;
     using DB::Cas::Backend::getStream;
+    using DB::Cas::Backend::head;
+    using DB::Cas::Backend::list;
     using DB::Cas::Backend::putIfAbsent;
     using DB::Cas::Backend::putOverwrite;
     using DB::Cas::Backend::casPut;

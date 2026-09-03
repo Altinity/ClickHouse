@@ -21,6 +21,7 @@ namespace DB::ErrorCodes
 {
     extern const int NETWORK_ERROR;
     extern const int ABORTED;
+    extern const int CAS_WRITE_UNATTRIBUTED;
 }
 
 namespace ProfileEvents
@@ -192,16 +193,19 @@ TEST(CASRequestControl, CountersHookupIncrementsPerClass)
 
 /// Wiring smoke test: a real conditional write through ObjectStorageBackend (Native mode) counts one
 /// attempt and one Committed outcome via the SAME instrumented call site nativeConditionalPut uses —
-/// see finalizeConditionalWriteInstrumented in CasObjectStorageBackend.cpp.
+/// see finalizeConditionalWriteInstrumented in CasObjectStorageBackend.cpp. The write itself lands
+/// and is counted at that site; a local object storage then returns no incarnation for it, so the
+/// call refuses to attribute the write rather than reading one back. The counters are what this pins.
 TEST(CASRequestControl, NativeConditionalPutCountsOneAttemptAndCommitted)
 {
     using ProfileEvents::global_counters;
     const auto attempts_before = global_counters[ProfileEvents::CASConditionalWriteAttempts].load();
     const auto committed_before = global_counters[ProfileEvents::CASConditionalWriteCommitted].load();
 
-    auto b = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
-    EXPECT_EQ(b->putIfAbsent("p/rc/one", "v1").outcome, PutOutcome::Done);
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+    const String key = DB::Cas::tests::nativeKeyUnder(storage, "p/rc/one");
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED, [&] { b->putIfAbsent(key, "v1"); });
 
 #if !WITH_COVERAGE
     EXPECT_EQ(global_counters[ProfileEvents::CASConditionalWriteAttempts].load() - attempts_before, 1u);
