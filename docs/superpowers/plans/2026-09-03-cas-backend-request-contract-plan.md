@@ -1585,7 +1585,7 @@ MSG
 
 ### Task 7: Checkpoint CP3 — build the new API, run everything {#task-7}
 
-**Amendments (second review, binding):** Task 7 converts NO test overrides (the legacy virtuals stay, so nothing breaks at CP3); it is build + gate + the compile fixes of Tasks 3-6 only. Test fault-injection overrides move with their production sites in Tasks 8-18.
+**Amendments (second review, binding; narrowed by a Task 4 ruling):** Task 7 converts NO legacy fault-injection overrides (the legacy virtuals stay; overrides move with their production sites in Tasks 8-18). It DOES add implementations of the new pure primitives to the test doubles that derive from `Backend` directly and no longer instantiate — forwarding to an inner backend where one exists, trivial bodies otherwise — leaving their legacy overrides in place. Task 4's report lists those doubles by file. Otherwise Task 7 is build + gate + the compile fixes of Tasks 3-6.
 
 **Files:** whatever the compiler and the gate name; no new files.
 
