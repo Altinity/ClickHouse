@@ -68,8 +68,29 @@ Token InMemoryBackend::mintToken()
     return t;
 }
 
+std::exception_ptr InMemoryBackend::takeArmedFailure(ArmedFailures & armed, const String & key)
+{
+    std::lock_guard lock(mutex_);
+    const auto it = armed.find(key);
+    if (it == armed.end() || it->second.empty())
+        return nullptr;
+    std::exception_ptr error = it->second.front();
+    it->second.erase(it->second.begin());
+    return error;
+}
+
+std::function<void()> InMemoryBackend::hookFor(const Hooks & hooks, const String & key) const
+{
+    std::lock_guard lock(mutex_);
+    const auto it = hooks.find(key);
+    return it == hooks.end() ? std::function<void()>{} : it->second;
+}
+
 std::optional<Backend::Raw> InMemoryBackend::read(const String & key, TransportAccess &)
 {
+    if (auto armed = takeArmedFailure(read_failures_, key))
+        std::rethrow_exception(armed);
+
     std::lock_guard lock(mutex_);
     auto it = store_.find(key);
     if (it == store_.end())
@@ -117,6 +138,25 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::write(
     if (expected_value)
         checkExpectedValue(key, *expected_value);
 
+    if (auto armed = takeArmedFailure(write_failures_, key))
+        std::rethrow_exception(armed);
+
+    /// Both hooks run with NO lock held: a hook exists to read and write this backend from inside a
+    /// write, and `mutex_` is not recursive.
+    if (auto hook = hookFor(before_write_hooks_, key))
+        hook();
+
+    auto result = writeUnderLock(key, bytes, expected_value);
+
+    if (result.has_value())
+        if (auto hook = hookFor(write_committed_hooks_, key))
+            hook();
+    return result;
+}
+
+std::expected<String, Backend::RawConflict> InMemoryBackend::writeUnderLock(
+    const String & key, const String & bytes, const std::optional<String> & expected_value)
+{
     std::lock_guard lock(mutex_);
 
     if (!expected_value)
@@ -328,7 +368,38 @@ Backend::RawListPage InMemoryBackend::list(const String & prefix, const String &
 bool InMemoryBackend::refreshCredentials()
 {
     std::lock_guard lock(mutex_);
+    ++refresh_credentials_calls_;
     return refresh_credentials_result_;
+}
+
+size_t InMemoryBackend::refreshCredentialsCalls() const
+{
+    std::lock_guard lock(mutex_);
+    return refresh_credentials_calls_;
+}
+
+void InMemoryBackend::failNextWriteWith(const String & key, std::exception_ptr error)
+{
+    std::lock_guard lock(mutex_);
+    write_failures_[key].push_back(std::move(error));
+}
+
+void InMemoryBackend::failNextReadWith(const String & key, std::exception_ptr error)
+{
+    std::lock_guard lock(mutex_);
+    read_failures_[key].push_back(std::move(error));
+}
+
+void InMemoryBackend::onBeforeWrite(const String & key, std::function<void()> hook)
+{
+    std::lock_guard lock(mutex_);
+    before_write_hooks_[key] = std::move(hook);
+}
+
+void InMemoryBackend::onWriteCommitted(const String & key, std::function<void()> hook)
+{
+    std::lock_guard lock(mutex_);
+    write_committed_hooks_[key] = std::move(hook);
 }
 
 void InMemoryBackend::setHoldDeletes(bool hold)

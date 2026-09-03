@@ -1,5 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <exception>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -119,6 +121,28 @@ public:
     /// What `refreshCredentials` answers: TRUE models a storage that installed fresh credentials.
     void setRefreshCredentialsResult(bool result);
 
+    /// How many times `refreshCredentials` has been called on this backend.
+    size_t refreshCredentialsCalls() const;
+
+    /// The next `write` naming `key` throws `error` instead of applying it, and the store is left
+    /// exactly as it was. Each arming is consumed by one write, so arming twice fails two consecutive
+    /// attempts of the same call. An `exception_ptr` rather than a concrete type because a caller
+    /// classifies a failed attempt by its exception CLASS, and the classes worth exercising span
+    /// `S3Exception`, `DB::Exception`, `Poco::Exception` and plain `std::exception`.
+    void failNextWriteWith(const String & key, std::exception_ptr error);
+    /// The read-side sibling, for the read loop's own classification.
+    void failNextReadWith(const String & key, std::exception_ptr error);
+
+    /// Runs before a write of `key` is applied, with no backend lock held -- so a hook may itself read
+    /// and write this backend, which is what it exists for: a hook that replaces `key` models a
+    /// permanently hot key whose incarnation moves under every attempt. A hook that writes the same
+    /// key re-enters this callback, so a hook must guard its own recursion.
+    void onBeforeWrite(const String & key, std::function<void()> hook);
+    /// Runs after a write of `key` is durable and BEFORE its value is returned, with no backend lock
+    /// held. A hook that throws therefore models a LOST RESPONSE: the object exists, and the caller
+    /// never learned the incarnation it created.
+    void onWriteCommitted(const String & key, std::function<void()> hook);
+
 private:
     /// Complete in-memory incarnation state for one key. All fields are read or modified while
     /// `mutex_` is held; replacing `token` marks a new incarnation even when the bytes are unchanged.
@@ -144,6 +168,18 @@ private:
     /// `landPendingDelete` after its queue entry has been removed.
     DeleteOutcome applyDelete(const String & key, const Token & token);
 
+    using ArmedFailures = std::map<String, std::vector<std::exception_ptr>>;
+    using Hooks = std::map<String, std::function<void()>>;
+
+    /// Consumes and returns the next failure armed for `key`, or null when none is.
+    std::exception_ptr takeArmedFailure(ArmedFailures & armed, const String & key);
+    /// A copy of the hook registered for `key`, taken under the lock so the caller can run it without
+    /// one.
+    std::function<void()> hookFor(const Hooks & hooks, const String & key) const;
+    /// The whole of `write` that touches the store, run with `mutex_` held.
+    std::expected<String, RawConflict> writeUnderLock(const String & key, const String & bytes,
+                                                      const std::optional<String> & expected_value);
+
     mutable std::mutex mutex_;
     std::map<String, Object> store_;
     uint64_t token_seq_ = 0;
@@ -156,6 +192,11 @@ private:
     bool enforce_tokens_ = true;
     bool simulate_delete_markers_ = false;
     bool refresh_credentials_result_ = false;
+    size_t refresh_credentials_calls_ = 0;
+    ArmedFailures write_failures_;
+    ArmedFailures read_failures_;
+    Hooks before_write_hooks_;
+    Hooks write_committed_hooks_;
 };
 
 }
