@@ -868,19 +868,23 @@ class JobConfigs:
         runs_on=RunnerLabels.AMD_SMALL,
     )
     functional_tests_jobs = common_ft_job_config.parametrize(
-        Job.ParamSet(
-            parameter="amd_asan_ubsan, distributed plan, parallel",
-            # `--distributed-plan` fans each query across local parallel replicas,
-            # multiplying the server-side memory of every in-flight query, so the
-            # aggregate RSS of the parallel suite's co-scheduled queries is heavier
-            # than a normal ASan run and overruns the sanitizer memory cap on the
-            # default 64 GiB runner. Use a LARGE runner (same 32 vCPU as MEDIUM_CPU,
-            # but 128 GiB instead of 64 GiB RAM) so the suite keeps full concurrency
-            # and the default timeout instead of cutting workers - which barely
-            # moved peak RSS and only made the job slower.
-            runs_on=RunnerLabels.AMD_LARGE,
-            requires=[ArtifactNames.CH_AMD_ASAN_UBSAN],
-        ),
+        *[
+            Job.ParamSet(
+                parameter=f"amd_asan_ubsan, distributed plan, parallel, {batch}/{total_batches}",
+                # `--distributed-plan` fans each query across local parallel replicas,
+                # multiplying the server-side memory of every in-flight query, so the
+                # aggregate RSS of the parallel suite's co-scheduled queries is heavier
+                # than a normal ASan run and overruns the sanitizer memory cap on the
+                # default 64 GiB runner. Use a LARGE runner (same 32 vCPU as MEDIUM_CPU,
+                # but 128 GiB instead of 64 GiB RAM) so the suite keeps full concurrency
+                # and the default timeout instead of cutting workers - which barely
+                # moved peak RSS and only made the job slower.
+                runs_on=RunnerLabels.AMD_LARGE,
+                requires=[ArtifactNames.CH_AMD_ASAN_UBSAN],
+            )
+            for total_batches in (2,)
+            for batch in range(1, total_batches + 1)
+        ],
         *[
             Job.ParamSet(
                 parameter=f"amd_asan_ubsan, db disk, distributed plan, sequential, {batch}/{total_batches}",
@@ -956,7 +960,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.AMD_LARGE,
                 requires=[ArtifactNames.CH_AMD_TSAN_GH],
             )
-            for total_batches in (2,)
+            for total_batches in (4,)
             for batch in range(1, total_batches + 1)
         ],
         *[
@@ -974,7 +978,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.FUNC_TESTER_AMD,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
             )
-            for total_batches in (4,)
+            for total_batches in (5,)
             for batch in range(1, total_batches + 1)
         ],
         *[
