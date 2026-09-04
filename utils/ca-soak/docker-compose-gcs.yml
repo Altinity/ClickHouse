@@ -10,7 +10,9 @@
 #   2. docker compose --env-file configs/gcs.env -f docker-compose-gcs.yml -p ca-live-gcs up -d
 #      (--env-file feeds the ${GCS_*} interpolations below; ClickHouse itself reads the AWS_* names)
 #   3. Fresh-run cleanup (the bucket persists between runs, unlike `down -v` on RustFS); each
-#      run uses a UNIQUE prefix (bump the date/rN suffix in storage_conf_gcs_*.xml):
+#      run uses a UNIQUE prefix (bump the date/rN suffix in ALL THREE of storage_conf_gcs_ch1.xml,
+#      storage_conf_gcs_ch2.xml AND fsck_only_gcs.xml -- a stale fsck_only prefix makes every
+#      checkpoint's fsck list the previous run's pool, silently):
 #        gcloud storage rm -r gs://content-adressable-test-mfilimonov/ca_live_20260703_g2/
 #
 # NOTE: the CA capability probe runs on mount and is itself the FIRST validation step here — it

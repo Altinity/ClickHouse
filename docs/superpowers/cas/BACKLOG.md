@@ -145,6 +145,24 @@ so the epoch-crossing hypothesis is not the only mechanism that pins the shared 
 a mass-removal round; something else pins it too. Needs a local reproduction that isolates the
 mechanism without a crossing; the fix shape, once found, is still an epoch-crossing-style discard
 rule applied at the fold's own hinting site, `Gc/CasGc.cpp:2512`.
+A sibling of the same class, found at the final review of the write-once-key branch: the shared
+recovery walk (`Pool/CasRefProtocol.cpp`, `recoverRefTableDetailedFromAuthority`) discards hinted
+ref-log ids only at a seal, so its `CORRUPTED_DATA` and decode throws leave up to one window pinned,
+and `planManifestCursorPage` catches per-namespace throws and keeps using the same reader for the rest
+of the page. Throughput only; the `OutstandingHintGuard` shape the sweep's tail walk uses closes it.
+
+### `[gc-sweep-reads-the-committed-tail-twice]` The orphan sweep walks each namespace's committed tail twice per page (2026-09-04) {#gc-sweep-reads-the-committed-tail-twice}
+
+`activeManifestKeys` (`Gc/CasOrphanManifestSweep.cpp`) first recovers the table through
+`recoverRefTableDetailedFromAuthority`, which replays every log from the checkpoint base to the
+committed frontier, then walks the same range again itself to collect tail-removal targets. On the
+GCS soak both walks read each epoch-2 log once, so every ref log the sweep touches costs two GETs,
+and an epoch crossing costs two windows of read-ahead waste instead of one (the `wasted=127`
+rows). The recovery already decodes every transaction; collecting the `-1` manifest edges during that
+replay would remove the second walk. Small, GC-internal, no protocol change; measure with the sweep's
+`CASRootGet` on the reduce row (814 per round on the 2026-09-04 GCS soak before A to D, still two
+per log after).
+
 
 ### `[soak-harness-needsrecovery-after-near-ttl-pause]` The soak harness treats a near-TTL chaos pause's designed fence-then-recover as a fatal violation (2026-09-04) {#soak-harness-needsrecovery-after-near-ttl-pause}
 
