@@ -13,6 +13,11 @@ namespace DB::Parquet
 /// Namespace with structs generated from parquet.thrift
 namespace parq = parquet::format;
 
+/// Key-value metadata key under which ClickHouse records the names of column types that cannot be
+/// recovered from the parquet schema alone (aggregate states). The value is a JSON object mapping
+/// top-level column name to ClickHouse type name.
+constexpr const char * clickhouse_column_types_key = "clickhouse.column_types";
+
 /// All templates are explicitly instantiated, feel free to add more types.
 
 /// Returns number of bytes written.

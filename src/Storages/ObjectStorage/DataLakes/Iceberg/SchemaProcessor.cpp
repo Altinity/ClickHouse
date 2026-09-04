@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -22,6 +23,7 @@
 #include <base/scope_guard.h>
 #include <Core/Settings.h>
 
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -51,10 +53,12 @@ namespace ErrorCodes
 extern const int LOGICAL_ERROR;
 extern const int BAD_ARGUMENTS;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
+extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace Setting
 {
+extern const SettingsBool allow_experimental_aggregate_function_states_in_iceberg;
 extern const SettingsTimezone iceberg_timezone_for_timestamptz;
 }
 
@@ -325,9 +329,10 @@ void IcebergSchemaProcessor::addIcebergTableSchema(Poco::JSON::Object::Ptr schem
     std::lock_guard lock(mutex);
 
     Int32 schema_id = schema_ptr->getValue<Int32>(f_schema_id);
-    current_schema_id = schema_id;
     if (iceberg_table_schemas_by_ids.contains(schema_id))
     {
+        /// A schema-id is published below only once all of its fields have been parsed, and dropped
+        /// again if parsing throws, so a schema-id present here is never half-done.
         chassert(clickhouse_table_schemas_by_ids.contains(schema_id));
         std::unordered_map<String, String> type_mapping;
         if (allow_geo_parser)
@@ -341,27 +346,48 @@ void IcebergSchemaProcessor::addIcebergTableSchema(Poco::JSON::Object::Ptr schem
                 ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                 "Iceberg schema with schema-id {} is bound to two different schemas across metadata versions",
                 schema_id);
+        return;
     }
-    else
-    {
-        iceberg_table_schemas_by_ids[schema_id] = schema_ptr;
-        auto fields = schema_ptr->get(f_fields).extract<Poco::JSON::Array::Ptr>();
-        auto clickhouse_schema = std::make_shared<NamesAndTypesList>();
-        String current_full_name{};
-        for (size_t i = 0; i != fields->size(); ++i)
+
+    current_schema_id = schema_id;
+    /// Parsing a field throws on metadata this build cannot turn into a ClickHouse type: an unknown
+    /// Iceberg type, a contradictory `clickhouse.type` annotation, or a type gated behind a setting
+    /// the query did not enable. Everything written below is keyed by `schema_id`, so drop all of it
+    /// unless the whole schema parsed - otherwise the branch above would skip the retry.
+    bool parsed = false;
+    const auto rollback_unless_parsed = make_scope_guard(
+        [&]() TSA_NO_THREAD_SAFETY_ANALYSIS
         {
-            auto field = fields->getObject(static_cast<UInt32>(i));
-            auto name = field->getValue<String>(f_name);
-            bool required = field->getValue<bool>(f_required);
-            current_full_name = name;
-            auto type = getFieldType(field, f_type, context_, required, current_full_name, true);
-            clickhouse_schema->push_back(NameAndTypePair{name, type});
-            clickhouse_types_by_source_ids[{schema_id, field->getValue<Int32>(f_id)}] = NameAndTypePair{current_full_name, type};
-            clickhouse_ids_by_source_names[{schema_id, current_full_name}] = field->getValue<Int32>(f_id);
-        }
-        clickhouse_table_schemas_by_ids[schema_id] = clickhouse_schema;
+            /// NOTE: the exclusive lock taken above is still held here, but TSA cannot see that through a lambda.
+            current_schema_id = std::nullopt;
+            if (parsed)
+                return;
+            iceberg_table_schemas_by_ids.erase(schema_id);
+            clickhouse_table_schemas_by_ids.erase(schema_id);
+            std::erase_if(clickhouse_types_by_source_ids, [schema_id](const auto & entry) { return entry.first.first == schema_id; });
+            std::erase_if(clickhouse_ids_by_source_names, [schema_id](const auto & entry) { return entry.first.first == schema_id; });
+        });
+
+    auto fields = schema_ptr->get(f_fields).extract<Poco::JSON::Array::Ptr>();
+    auto clickhouse_schema = std::make_shared<NamesAndTypesList>();
+    String current_full_name{};
+    for (size_t i = 0; i != fields->size(); ++i)
+    {
+        auto field = fields->getObject(static_cast<UInt32>(i));
+        auto name = field->getValue<String>(f_name);
+        bool required = field->getValue<bool>(f_required);
+        current_full_name = name;
+        auto type = getFieldType(field, f_type, context_, required, current_full_name, true);
+        clickhouse_schema->push_back(NameAndTypePair{name, type});
+        clickhouse_types_by_source_ids[{schema_id, field->getValue<Int32>(f_id)}] = NameAndTypePair{current_full_name, type};
+        clickhouse_ids_by_source_names[{schema_id, current_full_name}] = field->getValue<Int32>(f_id);
     }
-    current_schema_id = std::nullopt;
+
+    /// Publish the two schema maps together, so a schema-id in one means the schema is fully parsed
+    /// and present in the other as well.
+    iceberg_table_schemas_by_ids[schema_id] = schema_ptr;
+    clickhouse_table_schemas_by_ids[schema_id] = clickhouse_schema;
+    parsed = true;
 }
 
 NameAndTypePair IcebergSchemaProcessor::getFieldCharacteristics(Int32 schema_version, Int32 source_id) const
@@ -538,6 +564,57 @@ IcebergSchemaProcessor::getComplexTypeFromObject(
 }
 
 DataTypePtr IcebergSchemaProcessor::getFieldType(
+    const Poco::JSON::Object::Ptr & field,
+    const String & type_key,
+    ContextPtr context_,
+    bool required,
+    String & current_full_name,
+    bool is_subfield_of_root)
+{
+    auto derived_type = getDerivedFieldType(field, type_key, context_, required, current_full_name, is_subfield_of_root);
+
+    /// A field may carry a `clickhouse.type` key recording a type the Iceberg field type alone cannot
+    /// express; it is written by createEmptyMetadataFile() and the ALTER paths in MetadataGenerator.
+    if (!field->has(f_clickhouse_type))
+        return derived_type;
+
+    const String annotated_name = field->getValue<String>(f_clickhouse_type);
+    auto annotated_type = DataTypeFactory::instance().get(annotated_name);
+
+    /// The table's metadata, not the query, names the aggregate function whose deserializer is handed
+    /// the state bytes, hence the opt-in. Reject rather than fall back to the derived type: reading
+    /// states as strings would be a wrong result, not an error. `SimpleAggregateFunction` needs no
+    /// opt-in, holding ordinary values with no state deserializer involved.
+    /// The setting is read from the context of the call, the way `getSimpleType` above reads
+    /// `iceberg_timezone_for_timestamptz`, so that the reading query can opt in at all: a table engine
+    /// constructs its schema processor at `ATTACH`.
+    if (hasAggregateFunctionType(annotated_type)
+        && !context_->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_iceberg])
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "Iceberg field '{}' records ClickHouse type {} in its `{}` key. Reading aggregate function "
+            "states from an Iceberg table is disabled: enable setting "
+            "allow_experimental_aggregate_function_states_in_iceberg to honour the recorded type",
+            field->has(f_name) ? field->getValue<String>(f_name) : type_key,
+            annotated_name,
+            f_clickhouse_type);
+
+    /// A stale or hand-edited annotation must not reinterpret the stored bytes as an unrelated type.
+    if (!annotatedTypeMatchesDerived(annotated_type, derived_type))
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Iceberg field '{}' records ClickHouse type {} in its `{}` key, but the field itself reads as {}",
+            field->has(f_name) ? field->getValue<String>(f_name) : type_key,
+            annotated_name,
+            f_clickhouse_type,
+            derived_type->getName());
+
+    /// The annotation spells out the full type, Nullable included, so it needs no makeNullable()
+    /// adjustment of the kind getDerivedFieldType() applies.
+    return annotated_type;
+}
+
+DataTypePtr IcebergSchemaProcessor::getDerivedFieldType(
     const Poco::JSON::Object::Ptr & field,
     const String & type_key,
     ContextPtr context_,

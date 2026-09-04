@@ -597,10 +597,16 @@ void registerParquetSchemaReader(FormatFactory & factory)
         "Parquet",
         [](const FormatSettings & settings)
         {
+            /// Both aggregate-state settings change the inferred schema, not just how the file is
+            /// read: whether a recorded `AggregateFunction` annotation is honoured, and whether a
+            /// refused column is dropped or makes inference throw.
             return fmt::format(
-                "schema_inference_make_columns_nullable={};enable_json_parsing={}",
+                "schema_inference_make_columns_nullable={};enable_json_parsing={};"
+                "allow_aggregate_function_states={};skip_columns_with_unsupported_types_in_schema_inference={}",
                 settings.schema_inference_make_columns_nullable,
-                settings.parquet.enable_json_parsing);
+                settings.parquet.enable_json_parsing,
+                settings.parquet.allow_aggregate_function_states,
+                settings.parquet.skip_columns_with_unsupported_types_in_schema_inference);
         });
 }
 

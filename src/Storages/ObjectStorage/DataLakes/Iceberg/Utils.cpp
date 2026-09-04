@@ -7,6 +7,7 @@
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeCustom.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -554,6 +555,10 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
         case TypeIndex::String:
             return {"string", true};
+        case TypeIndex::AggregateFunction:
+            /// Iceberg has no aggregate-state type, so the ClickHouse type name goes into the
+            /// field's `clickhouse.type` key.
+            return {Iceberg::f_binary, true};
         case TypeIndex::UUID:
             return {"uuid", true};
         case TypeIndex::Decimal32:
@@ -1039,6 +1044,8 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
         auto type = getIcebergType(column.type, iter);
         field->set(Iceberg::f_required, type.second);
         field->set(Iceberg::f_type, type.first);
+        if (needsClickHouseTypeAnnotation(column.type))
+            field->set(Iceberg::f_clickhouse_type, getClickHouseTypeAnnotationName(column.type));
         column_name_to_source_id[column.name] = iter_for_initial_columns;
         schema_fields->add(field);
     }

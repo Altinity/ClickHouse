@@ -137,12 +137,23 @@ std::optional<time_t> ExportPartitionTaskScheduler::run()
 
         const auto & manifest = entry.manifest;
         const auto key = entry.getCompositeKey();
-        const auto database = storage.getContext()->resolveDatabase(manifest.destination_database);
+
+        /// Resolving the destination is part of executing the task, so it runs under the task's
+        /// settings rather than this replica's own profile. It matters for a destination in a data
+        /// lake catalog database: `DatabaseDataLake::tryGetTable` rebuilds the table from the catalog
+        /// on every lookup and always asks for its schema, and `IcebergSchemaProcessor::getFieldType`
+        /// reads the aggregate-state gate from the context of that parse. With the raw server context
+        /// the parse throws `SUPPORT_IS_DISABLED`, the catalog turns that into "no such table", and
+        /// the task is skipped here regardless of how the scheduling `ALTER` was written. An ordinary
+        /// table engine is already attached, so either context resolves it the same way.
+        const auto destination_resolution_context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), manifest);
+
+        const auto database = destination_resolution_context->resolveDatabase(manifest.destination_database);
         const auto & table = manifest.destination_table;
 
         const auto destination_storage_id = StorageID(QualifiedTableName {database, table});
 
-        const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
+        const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, destination_resolution_context);
 
         if (!destination_storage)
         {

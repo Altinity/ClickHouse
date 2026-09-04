@@ -16,6 +16,7 @@ Coverage:
     test_export_part_multi_column_partition_key_success                     – composite (a, b, c) partition key round-trips
     test_export_part_partition_key_mismatch_variants_are_rejected (parametrized) – partition key column reordering,
         cardinality mismatches, and transform-expression reordering between src/dst are all rejected synchronously
+    test_export_part_aggregate_function_states       – AggregateFunction / SimpleAggregateFunction states survive the export
 """
 
 import logging
@@ -1402,6 +1403,86 @@ def test_export_part_tuple_subcolumn_partition_key_iceberg_rejected(cluster):
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert count == 0, f"Expected 0 rows in Iceberg table after rejected export, got {count}"
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_aggregate_function_states(cluster):
+    """
+    Export a part holding pre-aggregated states into an Iceberg table.
+
+    What this adds over test_storage_iceberg_with_spark/test_aggregate_function_states.py, which
+    reaches the same writer through a plain INSERT, is the export path's own pre-flight schema check:
+    verifyExportSchemaCastable() -> canBeSafelyCast() has to accept aggregate-state columns, or the
+    export is rejected synchronously and never scheduled.
+    """
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_agg_states_{sfx}"
+    iceberg = f"iceberg_agg_states_{sfx}"
+
+    # `k` is Int32 rather than UInt32 because Iceberg maps both to `int`, so a UInt32 source would
+    # additionally need export_merge_tree_part_allow_lossy_cast - a separate concern.
+    columns = (
+        "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64)"
+    )
+
+    make_mt(node, mt, columns, "k", order_by="k", engine="AggregatingMergeTree()")
+    # The Iceberg setting gates honouring the recorded `AggregateFunction` type as well as the DDL,
+    # and it is read from the query that parses the Iceberg schema. The CREATE below only needs it
+    # for the DDL; the export and the reads that follow pass it themselves.
+    make_iceberg_s3(
+        node,
+        iceberg,
+        columns,
+        "k",
+        extra_settings="allow_experimental_aggregate_function_states_in_iceberg = 1",
+    )
+
+    # A single INSERT leaves each partition with exactly one part, so no background merge can
+    # rewrite the states out from under the export. This one writes MergeTree, not Parquet, so it
+    # needs no Parquet setting.
+    node.query(
+        f"INSERT INTO {mt} "
+        f"SELECT toInt32(number % 2), uniqState(toUInt64(number % 23)), sumSimpleState(number) "
+        f"FROM numbers(200) GROUP BY number % 2"
+    )
+
+    for partition_id in ("0", "1"):
+        part = get_part(node, mt, partition_id)
+        # The exported data file is Parquet, written by a background task from the settings
+        # snapshotted off this ALTER query, so the Parquet gate has to be opened here. The export
+        # reads the destination's Iceberg schema, both in its pre-flight check and in that background
+        # task, so the Iceberg gate belongs here too.
+        export_part(
+            node,
+            mt,
+            part,
+            iceberg,
+            extra_settings=(
+                "allow_experimental_aggregate_function_states_in_parquet = 1, "
+                "allow_experimental_aggregate_function_states_in_iceberg = 1"
+            ),
+        )
+        wait_for_export_part(node, mt, part)
+        assert_part_log(node, mt, part)
+
+    exported = node.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {iceberg} GROUP BY k ORDER BY k "
+        f"SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1"
+    )
+    assert exported == node.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {mt} GROUP BY k ORDER BY k"
+    ), f"Exported states do not match the source table:\n{exported}"
+
+    total = node.query(
+        f"SELECT uniqMerge(u), sum(s) FROM {iceberg} "
+        f"SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1"
+    )
+    assert total == node.query(
+        "SELECT uniq(toUInt64(number % 23)), sum(number) FROM numbers(200)"
+    ), f"Merging every exported state does not match the original rows:\n{total}"
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
