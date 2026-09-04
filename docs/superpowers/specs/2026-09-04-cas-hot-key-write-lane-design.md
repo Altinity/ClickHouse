@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 30, 2026-09-04. Phase A. Brainstormed against the measurements in
+Revision 31, 2026-09-04. Phase A. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
 this document supersedes where they differ. Revisions 1 to 26 designed a larger change (combining
@@ -310,20 +310,36 @@ snapshot was taken, inside a catch-all in the `tryLogCurrentException` shape.
      submission decides again on `seen` when the cache holds it and on a read when the resolve
      read saw nothing; this is what today's `readModifyWrite` already demands of every `decide` in
      its precondition-moved arm.
-   - `Refused`: the store refused the bytes and nothing applied; the entry is dropped. If the
-     base was the cache, the refusal is of bytes decided on a hint and is not delivered: the key is
-     read through `observe` as in step 1 (a refused read is that `GaveUp`), `decide` runs on the
-     read, and the hold continues from step 3 with what that run yields, its verdict or its
-     candidate, whose `Refused`, if the store refuses again, is delivered. So from a cached start
-     only two results depend on the hint and reach the caller: `Committed`, which proves the hint
-     was the store's state, and `Conflict`, which proves it was not and sends the caller back with
-     `seen`; a `GaveUp` from a cached start depends on the fence, the lease, the deadline or the
-     transport, not on the hint's content, and is delivered as it is.
+   - `Refused`: the store refused the bytes and nothing applied; the entry is dropped.
    - `GaveUp` with `sent_any == false`: nothing was sent; the entry is unchanged.
    - `GaveUp` with `sent_any == true`: the write's fate is unknown, `FenceLost` after a landed
      `PUT` included; the entry is dropped.
    - An exception out of the engine's write: the entry is dropped and the exception propagates;
      the guard hands the key over.
+
+**What a hint can and cannot change.** The lane never delivers the `decide`'s verdict on a hint,
+and always delivers the store's answer to a write. The two are different in kind: a verdict is
+the caller's reasoning about bytes that may be stale, and can therefore be false; the store's
+answer is a fact about the store at that moment, whatever the caller thought, and is never false.
+`Committed` says the precondition held, so the hint was the store's state. `Conflict` says it did
+not, so the hint was stale, and sends the caller back with `seen`. `Refused` says the store
+refused that request. `GaveUp` says the fence, the lease, the deadline or the transport ended the
+call, with `sent_any` saying whether an attempt went out. A write decided on a stale hint is
+conditional on the stale etag and cannot land; what it costs is one 412 and one resolve read, and
+one more thing, which is the whole semantic difference from today's `readModifyWrite` and is
+accepted: a fresh read might have led the `decide` to render a marker and send nothing, and
+instead a write went out and the caller learns the store's answer to it first. So `beginRemoving`
+on a hint whose row an external writer has since changed sends a write, and if the fence trips
+between that refused write and its resolve read the caller is told `GaveUp{FenceLost, sent_any =
+true}`, `FencedOut`, where today's fresh read would have said `EntryChanged`; if the store refuses
+the request definitively (a credential denial, a size limit) the caller is told that `Refused`
+where a fresh read might have said `EntryChanged`. Both are true, both are classes today's engine
+produces for the same call, both land nothing, and both are followed by the caller's ordinary
+retry, whose fresh observation renders `EntryChanged` then. The alternatives were designed and
+rejected: re-deciding after a `Refused` and writing again inside the hold breaks "one `WriteState`
+per submission" (one credential refresh per submission) and puts a second write in a hold;
+revalidating after a `GaveUp` is impossible for the caller that cannot read. A `single_attempt`
+submission never starts from a hint, so `Retry::once` keeps its one attempt on fresh state.
 
 **Read your writes.** A `Committed` names the caller's own candidate under its own etag, and
 when `remember` admitted it (it fits the budget and the fill did not throw) the cache holds that
@@ -342,8 +358,10 @@ today.
 ### The cache {#the-cache}
 
 A `CacheBase` by key, constructed with the "LRU" policy name (its convenience constructor defaults
-to "SLRU") and the two metrics named in the sketch, weighted by object bytes, bounded by
-`cache_budget_bytes`, the new `PoolConfig` field `uint64_t hot_key_cache_bytes = 16ULL << 20`
+to "SLRU") and the two metrics named in the sketch, bounded by `cache_budget_bytes` through a weight that
+is never zero (`ObjectWeight`: the key's bytes, the etag's, the object's, and a fixed 64-byte
+allowance for the containers, so that keys holding empty objects are bounded by the budget too
+and the entry count needs no separate `max_count`), the new `PoolConfig` field `uint64_t hot_key_cache_bytes = 16ULL << 20`
 beside `manifest_decode_cache_bytes` (16 MiB: today's only hot object, the catalog, is under 1 MiB,
 and the field exists so a later `_ckpt` opt-in has a bound); 0 disables it, which is what a
 `CasRequests` without a pool gets.
@@ -444,12 +462,11 @@ submits to the lane.
   that does not use the lane (the GC erase) races the lane's writes as it races everything today.
 - INV-2. Holds on a key are entered in the order their submissions were queued; a submission
   resubmitted after a `Conflict` queues behind whoever arrived meanwhile.
-- INV-3. The cache never changes the semantics of a conditional write: a stale entry costs one
-  412 and one resolve read. Nothing that depends on the hint's content reaches the caller except
-  `Committed` (the hint was current) and `Conflict` (it was not): a verdict a `decide` renders on
-  a cached base, by exception or by returning nothing, and a store `Refused` of bytes decided on
-  one, are never delivered; they are re-rendered on a read, or replaced by that read's own
-  `GaveUp`. A `single_attempt` submission does not start from the cache.
+- INV-3. The cache never changes the semantics of a conditional write: a write decided on a stale
+  entry cannot land and costs one 412 and one resolve read. A verdict a `decide` renders on a
+  cached base, by exception or by returning nothing, is never delivered; it is re-rendered on a
+  read, or replaced by that read's own `GaveUp`. The store's answer to a write is always delivered,
+  because it is never false. A `single_attempt` submission does not start from the cache.
 - INV-4. `submit` returns for its caller a result the engine produced for that submission,
   through the paths `readModifyWrite` uses (`observe` and `gaveUpAfterFailedObservation` for the
   base, one `create` or `replace` for the write); the lane invents no result, reclassifies none,
@@ -699,11 +716,13 @@ tickets from `bytes` and appends its own, so order is visible in the object.
    returns `FencedOut`. The fence is tripped after the landed `PUT`: `GaveUp{FenceLost, sent_any =
    true}`, the object carries the ticket, the entry dropped. The engine call throws: the exception
    reaches the caller, the entry is dropped, and the next waiter holds (the guard handed over).
-   `Refused` after a cached start: the cache is stale, an external writer made the row differ, and
-   a hook makes the store refuse the first write definitively; the fresh run of the real
-   `beginRemoving`'s `decide` throws its marker, the caller receives `EntryChanged`, one lane read,
-   exactly one refused write and no second; a sibling where the fresh run produces bytes the store
-   refuses again receives that `Refused`, two refused writes, one read (INV-3).
+   The two accepted differences from a fresh read, at the catalog level: the cache is stale (an
+   external writer changed the row `beginRemoving` observed) and a hook makes the store refuse
+   the write definitively: the caller receives that `Refused` at once, one refused write, no read,
+   nothing landed, and its retry after a fresh observation returns `EntryChanged`; the same stale
+   cache and a hook that trips the fence between the refused write and its resolve read: the
+   caller receives `GaveUp{FenceLost, sent_any = true}`, `beginRemoving` returns `FencedOut`,
+   nothing landed, and after re-admission its retry returns `EntryChanged` (INV-3).
    Under `Retry::once`: a first `Conflict` ends the catalog caller with `throwCatalogWriteFailure`'s
    class and exactly one attempt sent, as today. Credential refresh: a hook fails the first
    submission's attempt with a refreshable credential error, lets the refreshed reissue lose a
@@ -761,7 +780,8 @@ tickets from `bytes` and appends its own, so order is visible in the object.
 7. Cache rules. A store `Refused`, an `Unresolved`, an exception out of the write, and a candidate
    above the budget each leave no entry: the next submission reads. A `GaveUp` that sent nothing
    leaves the entry as it was. Eviction: two keys whose objects exceed the budget together evict the
-   older; the next submission on it reads. A hook makes `CacheBase::set` throw after a landed
+   older; the next submission on it reads; N keys holding empty objects, N times the per-entry
+   weight above the budget, leave at most the budget's worth of entries. A hook makes `CacheBase::set` throw after a landed
    `PUT`, after a `Conflict` whose resolve read saw an `Object`, and after a fresh read the
    `decide` declined: the caller receives `Committed`, that `Conflict` and that `Declined`
    respectively, never the exception, and the next submission reads (INV-4).
@@ -911,3 +931,18 @@ not start from the cache, and a `Refused` after a cached start is re-decided on 
 the ticket is a 64-bit counter on the object, the mutex is `mutable` for the const test seams;
 the cache budget is `PoolConfig::hot_key_cache_bytes`, 16 MiB; test 11 mixes clean conflicts
 and a transport fault in one call to prove the reissue counter did not advance.
+
+Revision 31 folds in the fourth `codex` review of the phase A document: two criticals and one
+major. One critical was made by revision 30's own patch: re-deciding after a `Refused` and
+writing again inside the hold meant two `replace` calls and two `WriteState`s per submission,
+breaking the one-refresh rule the catalog section had just stated. The patch is withdrawn, and
+with it the round-three major it answered is accepted as a cost rather than patched, under one
+principle that also answers the other critical (a `GaveUp{FenceLost}` after a write a stale hint
+sent, where a fresh read would have rendered `EntryChanged`): the lane never delivers the
+`decide`'s verdict on a hint, which can be false, and always delivers the store's answer to a
+write, which cannot be. A write decided on a stale hint cannot land; what a hint can change is
+only which true fact the caller learns first, and its ordinary retry learns the other. Both
+scenarios are named in "What a hint can and cannot change" and pinned by test 2. The major: a
+byte-weighted cache holding empty objects grows without bound; the entry weight now includes the
+key, the etag and a fixed allowance, so the byte budget bounds the count. The `single_attempt`
+fresh-read rule from revision 30 stays.

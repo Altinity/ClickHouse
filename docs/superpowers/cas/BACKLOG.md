@@ -161,7 +161,7 @@ disk (S3 operations and CAS conflicts per dropped table) as the first measuremen
 + conditional PUTs); third = skip `StackTrace` capture for expected 412s.
 
 Design for the first target: `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
-(revision 30, phase A, 2026-09-04), which supersedes the fix sketch below where they differ; the
+(revision 31, phase A, 2026-09-04), which supersedes the fix sketch below where they differ; the
 deferred phase B is `{#hot-key-lane-phase-b}`.
 
 ### `[ref-catalog-cas-starvation-under-parallel-writers]` One process's CREATE/DROP writers starve each other on the ref-catalog compare-and-swap (2026-09-04) {#ref-catalog-cas-starvation}
@@ -214,7 +214,7 @@ Fix, two halves, in this order:
    winning (red today). Update the spec sentences at "Conflicts spend the same budget as errors".
 
 Superseded by the design `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
-(revision 30, phase A, 2026-09-04). Phase A is the fix sketch above minus nothing it needs: a per-pool
+(revision 31, phase A, 2026-09-04). Phase A is the fix sketch above minus nothing it needs: a per-pool
 FIFO lane above the request engine for any hot compare-and-swap object, the catalog first; one hold at a
 time per key from any of the pool's planes; an LRU of last known objects so the next write needs no read,
 under one absolute rule (a verdict a `decide` renders on a cached base is never delivered; every write is
