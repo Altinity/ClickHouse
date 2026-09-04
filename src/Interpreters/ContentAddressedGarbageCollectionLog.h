@@ -18,7 +18,9 @@ struct ContentAddressedGarbageCollectionLogElement
     /// `ABORTED`: the round threw an exception whose code names a transient condition (backend
     /// unavailability, a lost lease, a concurrent leader); the next scheduled round retries it.
     /// `STOPPED`: a transient failure observed after the disk's teardown began -- the round was cut
-    /// short by a shutdown, FORGET or the storage's destructor; `error` carries the engine's refusal.
+    /// short by a server shutdown or the storage's destructor, so neither had to wait for it;
+    /// `error` carries the engine's refusal. Decommission does not arm that flag and cannot produce
+    /// this outcome.
     /// `FAILED` is everything else -- fail-closed, an unclassified error reads as real.
     enum Outcome   : int8_t { UNKNOWN = 1, SUCCESS = 2, NOT_A_LEADER = 3, FAILED = 4, DEFERRED = 5, ABORTED = 6, STOPPED = 7 };
     enum Trigger   : int8_t { SCHEDULED = 1, MANUAL = 2 };

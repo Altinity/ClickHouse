@@ -1915,3 +1915,34 @@ TEST(CASRequests, StreamBodyHonoursTheCallersLiveness)
     char c;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { body->readStrict(&c, 1); });
 }
+
+/// The window the open already loaded is served WITHOUT a further admission: `Backend::stream` forces
+/// that first GET and accounts it to the open's own attempt, so re-checking it here would refuse
+/// bytes the caller has already paid for. The refusal belongs to the SECOND window, the first one the
+/// body actually asks the store for. Armed before the first read, so a wrapper that discarded the
+/// adopted window would refuse immediately instead of serving it.
+TEST(CASRequests, StreamBodyServesTheAdoptedWindowEvenWhenAdmissionIsAlreadyRefused)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    std::atomic<bool> torn_down{false};
+    Fence fence{[] { return uint64_t{0}; },
+                [&](uint64_t, uint64_t) { return torn_down.load() ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
+                [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto op = requests.admit();
+    orThrow(op.create("k", "0123456789", Retry::once()), "create");
+    backend->setStreamChunkForTest(4);
+
+    auto body = op.stream("k", Retry::once());
+    ASSERT_TRUE(body);
+    torn_down.store(true);   /// refused BEFORE the consumer touches the body
+
+    String first(4, '\0');
+    body->readStrict(first.data(), 4);
+    EXPECT_EQ(first, "0123") << "the window the open already paid for must be served, not re-admitted";
+    EXPECT_EQ(body->count(), 4u) << "the adopted window is counted once, by the wrapper";
+
+    char c;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { body->readStrict(&c, 1); });
+}

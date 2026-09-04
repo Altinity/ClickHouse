@@ -134,12 +134,17 @@ P2, operability only — nothing is corrupted or lost, and no data path is block
 `ContentAddressed/ContentAddressedMetadataStorage.cpp:432` is explicitly forbidden from waiting behind
 `gc_scheduler_mutex`). What is missing is cooperative cancellation:
 
-- A GC round has no stop hook. `CasGcScheduler::stop` (`Gc/CasGcScheduler.cpp:72-88`) sets `stopping`,
-  notifies `wake`, and then `join()`s — an in-flight round runs to completion, and the loop comment at
-  `:295-297` records the accepted extra round. `SYSTEM CAS GC STOP` (`:978`), `SYSTEM CAS FORGET`
-  (`:926`) and `shutdown` (`:887`) therefore all wait it out (the synchronous round through
-  `gc_scheduler_mutex`, held for the whole round at `:389`/`:619`/`:665`; the background one through
-  the join). The round's destructive/recovery work IS capped (`GcRoundWorkBudget`,
+- **Server shutdown and the storage destructor are DONE** (`{#cas-gc-teardown-stop-design}`): both arm
+  the pool's teardown flag before the lock or join they would otherwise wait behind, the open request
+  plane carries that flag as its fence, and a round in flight is refused at its next request. What
+  remains of this item is `SYSTEM CAS GC STOP` and `SYSTEM CAS FORGET`.
+- A GC round still has no stop hook for those two verbs. `CasGcScheduler::stop` sets `stopping`,
+  notifies `wake`, and then `join()`s — an in-flight round runs to completion. Neither verb may use
+  the pool-wide flag: `GC STOP` must not refuse an unrelated `system.content_addressed_mounts` query
+  or a running FSCK, and FORGET cannot arm at all, because an already-latched self-remount completes
+  one more step whose pool-identity probe is admitted on that same plane, and the reclaim FORGET's
+  second `tripMountLost` exists to override would then never happen. Both need the round-scoped
+  liveness below instead. The round's destructive/recovery work IS capped (`GcRoundWorkBudget`,
   `Gc/CasBlobInDegree.h:251`, filled from the non-zero defaults at `ContentAddressedSettings.cpp:76-83`),
   so the wait is finite — but there is no time budget at all in the settings, and against a slow bucket
   the wall-clock wait is whatever the bucket makes it.
@@ -159,9 +164,10 @@ tracked: `gc.md`{#fsck-scale-timeout} (fsck does not finish on a ~30 GiB pool) a
 SQL-vs-CLI parameter asymmetry.
 
 Corrected while triaging: `shutdown` does NOT serialize behind an in-flight FSCK — it takes
-`gc_scheduler_mutex` and `pointer_mutex` only (`:891`), never `lifecycle_mutex`, and the pool stays
-alive through the `shared_ptr` the scan holds. Its only wait is on a GC round, which is the documented
-priority choice at `:889-890` ("clean GC completion over fast shutdown").
+`gc_scheduler_mutex` and `pointer_mutex` only, never `lifecycle_mutex`, and the pool stays alive
+through the `shared_ptr` the scan holds. Its only wait was on a GC round; that wait is now bounded by
+one request, and the "clean GC completion over fast shutdown" priority it used to document is
+reversed.
 
 ## `DiskEncrypted` over a CA disk hides `isContentAddressed` from every CA-aware branch {#encrypted-wrapper-hides-content-addressed}
 

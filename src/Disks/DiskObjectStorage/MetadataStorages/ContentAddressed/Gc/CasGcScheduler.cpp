@@ -452,11 +452,16 @@ void CasGcScheduler::heartbeatLoop()
         }
         catch (...)
         {
-            /// A pulse refused by the open plane during teardown is the expected end of this loop,
-            /// not a failure to report; `stop` joins it moments later.
-            if (store->teardownBegun())
+            /// A pulse refused by the open plane during teardown is the expected end of this loop and
+            /// not a failure to report; `stop` joins it moments later. Only a TRANSIENT failure is
+            /// silent, for the same fail-closed reason the round classifier refuses to relabel a
+            /// non-transient one: a corrupt heartbeat that happens to coincide with a restart is an
+            /// incident, and swallowing it would be the one place this teardown path hides a defect.
+            const bool tearing_down = store->teardownBegun();
+            if (!tearing_down || !isTransientGcRoundError(getCurrentExceptionCode()))
+                tryLogCurrentException(log, "CA GC heartbeat pulse failed (advisory; will retry)");
+            if (tearing_down)
                 return;
-            tryLogCurrentException(log, "CA GC heartbeat pulse failed (advisory; will retry)");
         }
     }
 }

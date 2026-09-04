@@ -432,7 +432,10 @@ a failed build is the wrong binary.
   reclaim FORGET's second fence trip exists to override could never happen —
   `CASForget.ForgetReLatchesFenceAfterAReclaimReachesArmMountFence` proves it. No arm placement
   satisfies both, and silently dropping a decommission step is a protocol change this design forbids.
-  FORGET therefore keeps today's wait.
+  That rules out the pool-wide flag for FORGET; it does not rule out a bound. The round-scoped
+  liveness named above for `GC STOP` — one `CasOperation` threaded through the round's phases —
+  refuses only the round, leaving the self-remount's probe admitted, and would bound FORGET's join
+  too. FORGET therefore joins `GC STOP` as `CAS-049`'s remaining half rather than closing here.
 - **A single absolute teardown deadline** threaded through the drains and the farewell. The
   additive bound is accepted.
 - **A causal cancellation signal** from the engine to the scheduler. The honest `Stopped` is

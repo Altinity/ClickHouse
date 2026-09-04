@@ -4,19 +4,19 @@ A disk's teardown must not wait out a GC round. The paused-GC restart gives the 
 stop costs with no round in flight; every restart taken while GC runs must stay within one
 control-plane attempt of it, and across the attempts at least one round must be recorded as cut.
 
-What this scenario can and cannot prove. The timing bound and the final fsck are verdicts: a stop
-must stay within one attempt of the baseline, and whatever GC was doing when the server went down
-must leave a consistent pool behind. Whether a round was actually CUT is recorded, not asserted --
-only the lease holder runs rounds that do work, one lasts a fraction of a second, and the loop paces
-itself at `cas_gc_interval_sec`, so a restart meets one about a percent of the time. Driving rounds
-by hand does not help: a manual round may not steal the lease and returns `NotALeader` in
-milliseconds. The deterministic proof that a round IS cut, and cut at its next request, lives in the
-`CASGCTeardownStop` unit suite; what this scenario adds is that a real server restarted under a real
-GC leader stays fast and leaves the pool clean.
+What this scenario can and cannot prove. Only the mounter holding the GC lease runs rounds that do
+work, so every restart is aimed at whichever node currently leads -- restarting a follower proves
+nothing, its rounds are a lease read that returns in milliseconds. Even against the leader a round
+lasts a fraction of a second while the loop paces itself at `cas_gc_interval_sec`, so a restart meets
+one only some of the time; driving rounds by hand does not close that gap, because a manual round may
+not steal the lease. So the timing bound and the final fsck are the verdicts -- a stop stays within
+one attempt of the baseline, and whatever GC was doing when the server went down leaves a consistent
+pool -- while whether a round was actually CUT is recorded. If no restart was taken against a leader
+at all, the timing verdict proves nothing and says so rather than passing. The deterministic proof
+that a round IS cut, and cut at its next request, is the `CASGCTeardownStop` unit suite.
 """
 
 import subprocess
-import threading
 import time
 
 from ..framework import cluster_boot, observe, sql
@@ -31,10 +31,6 @@ _CONTAINERS = ("ca-soak-ch1-1", "ca-soak-ch2-1")
 _ATTEMPT_TIMEOUT_S = 5.0
 _STOP_SLACK_S = 10.0
 _TEARDOWN_STOP_LOG_LINE = "CA GC round stopped by the disk's teardown"
-# What the engine says when an admission is refused. A synchronous `SYSTEM CAS GC RUN` cut by the
-# teardown answers with it; the background loop logs `_TEARDOWN_STOP_LOG_LINE` instead. Either is a
-# round the teardown cut short.
-_REFUSAL_TEXT = "mount fence tripped"
 
 
 def _stop_seconds(container, log_fn):
@@ -137,58 +133,47 @@ class S46RestartUnderGc(Scenario):
             return
         result.observations["paused_stop_s"] = round(paused_stop_s, 1)
 
-        # (4) Keep a round in flight for the whole restart phase. GC paces itself at
-        #     `cas_gc_interval_sec` (10s here) and a round lasts a fraction of a second, so the
-        #     background loop alone is inside a round barely a percent of the time and a restart
-        #     meets one only by luck. Driving rounds back to back removes the luck; the round holds
-        #     the same lock and does the same work.
-        driving = threading.Event()
-        driving.set()
-        cut_synchronous = []
-
-        leader_node = next((n for n in cl.nodes() if n.container == leader), node)
-
-        def _drive_rounds():
-            while driving.is_set():
-                try:
-                    leader_node.command(f"SYSTEM CAS GC RUN {_DISK}", timeout=180)
-                except Exception as e:
-                    if _REFUSAL_TEXT in str(e):
-                        cut_synchronous.append(str(e)[:160])
-                    else:
-                        # The server is going down or coming back; that is the point.
-                        time.sleep(0.2)
-
-        driver = threading.Thread(target=_drive_rounds, daemon=True)
-        driver.start()
-
-        witnessed_before = _teardown_stops_logged(leader)
+        # (4) Restart repeatedly, aiming each one at whoever leads NOW: a stop hands the lease to the
+        #     peer, so the node that led the previous restart is a follower by the next one, and
+        #     restarting it again would measure nothing.
+        witnessed_before = {c: _teardown_stops_logged(c) for c in _CONTAINERS}
         stops = []
-        try:
-            for r in range(int(p["restarts"])):
-                time.sleep(1.0)
-                stops.append(_stop_seconds(leader, ctx.log))
-                _start(leader)
-                if not cluster_boot.wait_healthy(cl, timeout_s=240, log_fn=ctx.log):
-                    result.add(Verdict.check("cluster healthy after every restart", "healthy",
-                                             f"restart {r}: not healthy", False,
-                                             "a restarted node did not return"))
-                    return
-        finally:
-            driving.clear()
-            driver.join(timeout=300)
+        restarts_against_a_leader = 0
+        for r in range(int(p["restarts"])):
+            time.sleep(1.0)
+            current = _gc_leader(cl, since, ctx.log)
+            target = current or leader
+            if current is not None:
+                restarts_against_a_leader += 1
+            else:
+                result.note_anomaly(f"S46 restart {r}: no node had led recently; restarting {target} anyway")
+            stops.append(_stop_seconds(target, ctx.log))
+            _start(target)
+            if not cluster_boot.wait_healthy(cl, timeout_s=240, log_fn=ctx.log):
+                result.add(Verdict.check("cluster healthy after every restart", "healthy",
+                                         f"restart {r}: not healthy", False,
+                                         "a restarted node did not return"))
+                return
 
-        witnessed = (_teardown_stops_logged(leader) - witnessed_before) + len(cut_synchronous)
+        witnessed = sum(_teardown_stops_logged(c) - witnessed_before[c] for c in _CONTAINERS)
         result.observations["stop_seconds"] = [round(s, 1) for s in stops]
         result.observations["restarts_witnessed_cut"] = witnessed
-        result.observations["cut_synchronous_rounds"] = len(cut_synchronous)
+        result.observations["restarts_against_a_leader"] = restarts_against_a_leader
 
         bound = paused_stop_s + _ATTEMPT_TIMEOUT_S + _STOP_SLACK_S
         worst = max(stops) if stops else 0.0
-        result.add(Verdict.check(
-            "every stop within one attempt of the paused baseline",
-            f"<= {bound:.1f}s", f"max {worst:.1f}s", worst <= bound,
-            "GC's contribution to a teardown is one request, not one round"))
+        if restarts_against_a_leader == 0:
+            # Every stop hit a follower, whose rounds do nothing: the bound below would compare a stop
+            # with no round in flight against a baseline with no round in flight, which the unfixed
+            # code satisfies too.
+            result.add(Verdict.inconclusive(
+                "every stop within one attempt of the paused baseline", f"<= {bound:.1f}s",
+                "no restart was taken while the target held the GC lease"))
+        else:
+            result.add(Verdict.check(
+                "every stop within one attempt of the paused baseline",
+                f"<= {bound:.1f}s", f"max {worst:.1f}s", worst <= bound,
+                "GC's contribution to a teardown is one request, not one round"))
         result.add(Verdict.reported(
             "rounds cut by a teardown (info)", "recorded; a leading round is in flight ~1% of the time",
             str(witnessed),

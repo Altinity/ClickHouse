@@ -200,8 +200,12 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
     /// flight is then refused at its next request instead of running to completion under a disk that
     /// is being torn down. The ref ledger and the farewell live on the other two planes, so
-    /// teardown's own I/O never meets this fence. A committed write stays committed: `check_or_throw`
-    /// does not turn a landed `gc/state` into a failure, the next request refuses instead.
+    /// teardown's own I/O never meets this fence. A write already proven durable is admitted ONCE
+    /// MORE (`postCommit`), so an armed teardown can turn a landed `gc/state` into a give-up rather
+    /// than a commit. That is safe and not merely tolerable: the round is one-pass, so the next round
+    /// reads the state this one committed and re-derives the rest, exactly as after a crash at that
+    /// instant -- and every step of the tail the give-up skipped is admitted on THIS plane, so it
+    /// would have been refused anyway. What it costs is the round number on the round's own row.
     , gc_requests(pool_backend, Fence{
           [] { return uint64_t{0}; },
           [this](uint64_t, uint64_t) { return teardownBegun() ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
