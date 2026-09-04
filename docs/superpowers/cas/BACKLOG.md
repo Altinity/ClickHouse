@@ -261,6 +261,41 @@ combining, GCS spacing, a hold clamp and the GC erase inside the lane; that is p
 converge on its periphery (findings per round never below eight, the document tripled).
 
 
+
+### `[hot-key-lane-phase-a-followups]` Phase A of the hot-key lane landed on `cas-hot-key-lane`; what its reviews deferred (2026-09-04) {#hot-key-lane-phase-a-followups}
+
+Branch `cas-hot-key-lane` (12 commits over `e59fe7e8e4b`), `CAS*` gate 2406/2406, reviewed per task (opus/lite),
+whole-branch (opus: mergeable) and end to end (codex `gpt-5.6-sol` high: three majors, folded). Not yet merged.
+
+Before or right after merge:
+- The new death-test twin `CASRefCatalogDeathTest.AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoomAborts` has never
+  executed: `lane-g` has no debug or sanitizer build. Run `CASRefCatalog*:CASHotKeys.*` in an ASan build once.
+- The acceptance measurement of the design's Task 7 (ten minutes of the parallel stateless suite on the CA-s3 lane:
+  `DROP TABLE`/`CREATE TABLE` percentiles, `PreconditionFailed` on `ref_catalog`, the `CASHotKey*` and
+  `CASRequestConflictPause` deltas) is the gate for `{#hot-key-lane-phase-b}`.
+
+Deferred by the reviews (all triaged as not blocking the merge; the first is the one the measurement needs):
+- The catalog loop's own conflict pauses (`op.pause` in `casUpdateImpl`) have no `ProfileEvents` counter; the engine's
+  `CASRequestConflictPause` counts only `readModifyWrite`'s. Add one so the hottest key's pacing is visible.
+- Same-thread reentrant `submit` while holding self-waits until the deadline (the spec's callback rule is stated, not
+  enforced); a thread-local in-hold flag throwing `LOGICAL_ERROR` would make it immediate. Note: a `LOGICAL_ERROR`
+  aborts debug and sanitizer builds.
+- `CasRequests.h` pulls `Common/CacheBase.h` into every includer; a forward declaration of `CasHotKeys` plus an
+  out-of-line `CasRequests` destructor would confine it.
+- `CASRequestConflictPause`'s description says "no transport fault preceded it"; accurate: "in the same inner write".
+- `kWaitSlice` in `Backend/` vs the directory's `SCREAMING_SNAKE` constants.
+- The `Leave` guard's comment says "allocates nothing"; true only under the lock (the log line after it allocates).
+- Tests that discriminate weakly (each carries a deterministic sibling, so none is a false-pass risk today):
+  `CleanConflictsBeforeAFault...` (probabilistic; assert the ConflictPause/Reissue deltas),
+  `AConflictThatSettledAFault...` (sleep bound non-discriminating; the Reissue delta carries it),
+  `ABaseReadThatFails...` (pins only `sent_any` absolutely), `ACachedStartPastTheDeadlineSendsNothing`
+  (`decided == 1` is the discriminator, closed by the final review), the corruption test's "break again" arm,
+  `AFailedEnqueue...` (only the `inserted == true` arm), the GC-erase test ("exactly" in prose, "at most" in code),
+  the "nothing of ours landed" assertion (give the external a distinct `removal_started_round`).
+- Unused `ProfileEvents` externs in `gtest_cas_ref_catalog.cpp` and `gtest_cas_pool.cpp` (plan-mandated).
+- The two remaining items of `task-1-review.md` (the SDD workspace under `.superpowers/sdd/`, git-ignored; the
+  review files there are the only record of them if the workspace is deleted).
+
 ### `[hot-key-lane-phase-b]` Hot-key lane phase B: combining, GCS spacing, the hold clamp, the GC erase, `_ckpt` (2026-09-04) {#hot-key-lane-phase-b}
 
 Designed to revision 26 of the hot-key lane spec (commit `26bde9f9604`, 13.5k words) and deferred from
