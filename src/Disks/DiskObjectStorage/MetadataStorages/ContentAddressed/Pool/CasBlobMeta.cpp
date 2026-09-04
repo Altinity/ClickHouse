@@ -17,7 +17,7 @@ std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, con
     auto got = op.read(layout.blobMetaKey(ref), Retry::standard());
     if (!got)
         return std::nullopt;
-    return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .incarnation = std::move(got->incarnation)};
+    return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .etag = std::move(got->etag)};
 }
 
 WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const BlobRef & ref,
@@ -28,14 +28,14 @@ WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const Blob
 }
 
 WriteResult casMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,
-                    const Incarnation & expected, const BlobMeta & meta)
+                    const Etag & expected, const BlobMeta & meta)
 {
     ProfileEvents::increment(ProfileEvents::CASMetaCompareSwap);
     return op.replace(layout.blobMetaKey(ref), encodeBlobMeta(meta), expected, Retry::standard());
 }
 
 Removal deleteMetaExact(CasOperation & op, const Layout & layout, const BlobRef & ref,
-                        const Incarnation & expected)
+                        const Etag & expected)
 {
     ProfileEvents::increment(ProfileEvents::CASMetaDelete);
     return op.remove(layout.blobMetaKey(ref), expected, Retry::standard());

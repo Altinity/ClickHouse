@@ -13,23 +13,23 @@ GcMaintenanceReadResult readGcMaintenanceState(CasOperation & op, const Layout &
 {
     const auto got = op.read(layout.gcMaintenanceStateKey(), Retry::standard());
     if (!got)
-        return {.status = GcMaintenanceReadStatus::Absent, .state = std::nullopt, .incarnation = std::nullopt, .diagnostic = {}};
+        return {.status = GcMaintenanceReadStatus::Absent, .state = std::nullopt, .etag = std::nullopt, .diagnostic = {}};
     try
     {
         return {.status = GcMaintenanceReadStatus::Valid, .state = decodeGcMaintenanceState(got->bytes),
-            .incarnation = got->incarnation, .diagnostic = {}};
+            .etag = got->etag, .diagnostic = {}};
     }
     catch (const DB::Exception & e)
     {
         if (e.code() != ErrorCodes::CORRUPTED_DATA)
             throw;
         return {.status = GcMaintenanceReadStatus::Corrupt, .state = std::nullopt,
-            .incarnation = got->incarnation, .diagnostic = e.message()};
+            .etag = got->etag, .diagnostic = e.message()};
     }
 }
 
 WriteResult casGcMaintenanceState(
-    CasOperation & op, const Layout & layout, const std::optional<Incarnation> & expected,
+    CasOperation & op, const Layout & layout, const std::optional<Etag> & expected,
     const GcMaintenanceState & next, const Retry & policy)
 {
     const String key = layout.gcMaintenanceStateKey();

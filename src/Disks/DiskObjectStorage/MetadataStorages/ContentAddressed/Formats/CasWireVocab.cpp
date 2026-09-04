@@ -17,7 +17,7 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-static_assert(casEnumTableCoversEnum<kTokenTypeWords, TokenType>());
+static_assert(casEnumTableCoversEnum<kTokenTypeWords, Dialect>());
 static_assert(casEnumTableCoversEnum<kObjectKindWords, ObjectKind>());
 
 std::string_view dialectWordFromString(std::string_view w, std::string_view what)
@@ -56,7 +56,7 @@ ObjectKind objectKindFromWord(std::string_view w, std::string_view what)
     return kObjectKindWords.fromWord(w, what);
 }
 
-void writeTokenFields(CasJsonWriter & out, bool & first, const PersistedIncarnation & inc)
+void writeTokenFields(CasJsonWriter & out, bool & first, const PersistedEtag & inc)
 {
     writeStringField(out, SharedWire::token_type, dialectWordFromString(inc.dialect, "wire: dialect"), first);
     writeStringField(out, SharedWire::token, inc.value, first);
@@ -118,11 +118,11 @@ BlobRef BlobRefFields::build(std::string_view what) const
     return BlobRef{algo, codecFor(algo).fromHex(*digest_hex)};
 }
 
-PersistedIncarnation TokenFields::build(std::string_view what) const
+PersistedEtag TokenFields::build(std::string_view what) const
 {
     if (!type_word || !value)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: token missing token_type/token", what);
-    return PersistedIncarnation{String(dialectWordFromString(*type_word, what)), *value};
+    return PersistedEtag{String(dialectWordFromString(*type_word, what)), *value};
 }
 
 }

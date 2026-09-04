@@ -90,8 +90,8 @@ TEST(CASBlobInDegree, RunsAreByteDeterministic)
         {{bh(3), s(1), false}, {bh(1), s(1), false}, {bh(2), s(1), false}}, ra);
     foldDeltasIntoGeneration(*b2_req, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(3), s(1), false}}, rb);
-    const auto ga = a.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
-    const auto gb = b2.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
+    const auto ga = (*a_req).read(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0), Retry::standard());
+    const auto gb = (*b2_req).read(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0), Retry::standard());
     ASSERT_TRUE(ga.has_value());
     ASSERT_TRUE(gb.has_value());
     EXPECT_EQ(ga->bytes, gb->bytes);
@@ -143,7 +143,7 @@ TEST(CASBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
     DB::Cas::tests::OperationForTest backend_req(backend);
     Layout layout{"pool"};
     /// Pre-occupy the run key (attempt 7) with junk, then fold => divergent => CORRUPTED_DATA.
-    backend.putIfAbsent(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run");
+    (*backend_req).create(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run", Retry::once());
     std::vector<BlobDelta> deltas{{bh(1), s(1), false}};
     std::vector<RunRef> runs;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
@@ -184,7 +184,7 @@ TEST(CASBlobInDegree, DeterministicArtifactWhoseResolveReadObservedNothingIsNotC
 
     /// Occupy the key so the create's precondition is refused, THEN arm the refusal, so the failure
     /// falls on the resolve read rather than on the setup.
-    ASSERT_EQ(backend.putIfAbsent(key, "someone else's bytes").outcome, PutOutcome::Done);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*backend_req).create(key, "someone else's bytes", Retry::once())));
     backend.refuse_key = key;
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED,
@@ -235,7 +235,7 @@ CondemnedRow condemnedRowFor(uint64_t condemn_round, const String & tok = "t",
                              bool delete_pending = false, uint64_t size = 1)
 {
     return CondemnedRow{.delete_pending = delete_pending,
-                        .token = PersistedIncarnation{"emulated", tok},
+                        .token = PersistedEtag{"emulated", tok},
                         .size = size, .condemn_round = condemn_round};
 }
 
@@ -273,7 +273,8 @@ RunRef writeSourceEdgeRun(InMemoryBackend & backend, const Layout & layout,
 
     const String bytes = out.str();
     const String key = layout.blobTargetRunKey(gen, attempt, shard, 0);
-    backend.putIfAbsent(key, bytes);
+    DB::Cas::tests::OperationForTest op(backend);
+    (*op).create(key, bytes, Retry::once());
     return RunRef{.key = key, .checksum = sourceEdgeRunChecksum(bytes), .shard = shard, .key_generation = gen};
 }
 
@@ -467,7 +468,7 @@ TEST(CASThreeCursorMerge, NewCandidateCondemned)
     EXPECT_EQ(rmr.still_retired[0].ref, bh(3));
     const std::optional<Meta> present = (*backend_req).head(layout.blobKey(bh(3)), Retry::standard());
     ASSERT_TRUE(present.has_value());
-    EXPECT_TRUE(rmr.still_retired[0].token.matches(present->incarnation));
+    EXPECT_TRUE(rmr.still_retired[0].token.matches(present->etag));
     EXPECT_EQ(rmr.still_retired[0].size, 42u);
     EXPECT_EQ(rmr.still_retired[0].condemn_round, 7u);
     EXPECT_TRUE(rmr.graduated.empty());
@@ -477,7 +478,7 @@ TEST(CASThreeCursorMerge, NewCandidateCondemned)
     const DecodedRun out = decodeRun(*backend_req, runs2[0]);
     ASSERT_EQ(out.condemned.size(), 1u);
     EXPECT_EQ(out.condemned[0].first, b(3));
-    EXPECT_TRUE(out.condemned[0].second.token.matches(present->incarnation));
+    EXPECT_TRUE(out.condemned[0].second.token.matches(present->etag));
     EXPECT_TRUE(out.zero_markers.empty());
 }
 
@@ -586,7 +587,7 @@ TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
     EXPECT_EQ(g2.condemned[0].first, b(2));
     const std::optional<Meta> present = (*backend_req).head(layout.blobKey(bh(2)), Retry::standard());
     ASSERT_TRUE(present.has_value());
-    EXPECT_TRUE(g2.condemned[0].second.token.matches(present->incarnation));
+    EXPECT_TRUE(g2.condemned[0].second.token.matches(present->etag));
     EXPECT_EQ(g2.condemned[0].second.size, 7u);
     EXPECT_TRUE(g2.zero_markers.empty());
 }
@@ -607,7 +608,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
         const String bytes = out.str();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0),
                          .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .key_generation = 1};
-        backend.putIfAbsent(bad.key, bytes);
+        (*backend_req).create(bad.key, bytes, Retry::once());
 
         std::vector<RunRef> runs2;
         EXPECT_THROW(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
@@ -628,7 +629,7 @@ TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
         const String bytes = out.str();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0),
                          .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .key_generation = 1};
-        backend.putIfAbsent(bad.key, bytes);
+        (*backend_req).create(bad.key, bytes, Retry::once());
 
         std::vector<RunRef> runs2;
         EXPECT_THROW(foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
@@ -667,7 +668,7 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
     foldDeltasIntoGeneration(*oracle_req, layout, /*prior_runs*/{}, 1, 0, 0, gen1, runs1_o);
 
     const String gen1_run_key = layout.blobTargetRunKey(1, 0, 0, 0);
-    const auto gen1_run = backend.get(gen1_run_key);
+    const auto gen1_run = (*backend_req).read(gen1_run_key, Retry::standard());
     ASSERT_TRUE(gen1_run.has_value());
     const String gen1_run_bytes = gen1_run->bytes;
     /// Sanity: the prior run is far larger than one read buffer, so "it was never read whole" is a
@@ -688,8 +689,8 @@ TEST(CASBlobInDegree, FoldStreamsPriorRunWithoutReadingItWhole)
 
     /// Byte-reproducibility canary: streaming and materialized folds produce identical output bytes.
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
-    const auto gen2_c = backend.get(gen2_run_key);
-    const auto gen2_o = oracle.get(gen2_run_key);
+    const auto gen2_c = (*backend_req).read(gen2_run_key, Retry::standard());
+    const auto gen2_o = (*oracle_req).read(gen2_run_key, Retry::standard());
     ASSERT_TRUE(gen2_c.has_value());
     ASSERT_TRUE(gen2_o.has_value());
     EXPECT_EQ(gen2_c->bytes, gen2_o->bytes);
@@ -744,7 +745,7 @@ TEST(CASBlobInDegree, ZeroInDegreeStreamsRunWithoutReadingItWhole)
     foldDeltasIntoGeneration(*oracle_req, layout, /*prior_runs*/runs1_o, 2, 0, 0, gen2, runs2_o);
 
     const String gen2_run_key = layout.blobTargetRunKey(2, 0, 0, 0);
-    const auto gen2_run = backend.get(gen2_run_key);
+    const auto gen2_run = (*backend_req).read(gen2_run_key, Retry::standard());
     ASSERT_TRUE(gen2_run.has_value());
     /// Sanity: the run is far larger than one read buffer, for the same reason as above.
     ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
@@ -785,9 +786,9 @@ TEST(CASCondemnedRow, RoundTripAllTokenTypes)
     for (const auto & entry : DB::Cas::kTokenTypeWords.entries)
     {
         DB::Cas::CondemnedRow row;
-        row.delete_pending = (entry.value == DB::Cas::TokenType::Generation);
-        row.marker_confirmed = (entry.value == DB::Cas::TokenType::Emulated);
-        row.token = DB::Cas::PersistedIncarnation{String(entry.word), "etag-abc-123"};
+        row.delete_pending = (entry.value == DB::Cas::Dialect::Generation);
+        row.marker_confirmed = (entry.value == DB::Cas::Dialect::Emulated);
+        row.token = DB::Cas::PersistedEtag{String(entry.word), "etag-abc-123"};
         row.size = 4096;
         row.condemn_round = 7;
         const auto bytes = DB::Cas::encodeCondemnedRow(row);
@@ -800,7 +801,7 @@ TEST(CASCondemnedRow, UnknownMarkerByteFailsClosedWithCorruptedData)
 {
     /// This pins the condemned-row decoder's own marker validation.
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
+    row.token = DB::Cas::PersistedEtag{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[0] = 0x03;
 
@@ -835,7 +836,7 @@ TEST(CASRecordStream, RunMarkerByteContractFailsClosed)
 TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
+    row.token = DB::Cas::PersistedEtag{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[1] = 4;   // flags byte: only bits 0 (delete_pending) and 1 (marker_confirmed) are defined
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
@@ -844,7 +845,7 @@ TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
 TEST(CASCondemnedRow, UnknownTokenTypeFailsClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedIncarnation{"etag", "t"};
+    row.token = DB::Cas::PersistedEtag{"etag", "t"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes[2] = 99;   // token_type byte (offset: [0]=0x02 [1]=flags [2]=token_type)
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
@@ -853,7 +854,7 @@ TEST(CASCondemnedRow, UnknownTokenTypeFailsClosed)
 TEST(CASCondemnedRow, TruncatedPayloadFailsClosed)
 {
     DB::Cas::CondemnedRow row;
-    row.token = DB::Cas::PersistedIncarnation{"etag", "0123456789"};
+    row.token = DB::Cas::PersistedEtag{"etag", "0123456789"};
     auto bytes = DB::Cas::encodeCondemnedRow(row);
     bytes.resize(bytes.size() - 3);   // token bytes shorter than declared token_len
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);

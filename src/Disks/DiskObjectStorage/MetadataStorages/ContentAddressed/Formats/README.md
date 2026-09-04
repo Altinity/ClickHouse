@@ -61,9 +61,10 @@ algo-width hex (two chars per digest byte), with their algo name (`sha256:ab12â€
 hex would be ambiguous; unbounded u64 = decimal strings; bounded counts/lengths/ms-timestamps =
 numbers; units documented here per object as codecs land.
 
-`CasWireVocab.{h,cpp}` owns repeated value fields: `BlobRef` uses `algo`/`digest`, `Token` uses
-the jointly required `token_type`/`token`, `ManifestRef` uses `epoch`/`build`/`ord`, and owner-transition bindings use
-the corresponding `old_*` and `new_*` key bundles.
+`CasWireVocab.{h,cpp}` owns repeated value fields: `BlobRef` uses `algo`/`digest`, a persisted `Etag`
+uses the jointly required `token_type`/`token` (the wire key spellings predate, and are independent
+of, the C++ type's own name), `ManifestRef` uses `epoch`/`build`/`ord`, and owner-transition bindings
+use the corresponding `old_*` and `new_*` key bundles.
 
 ## Evolution rules (one screen)
 

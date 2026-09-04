@@ -635,7 +635,7 @@ std::vector<SourceEdgeRecord> makeSourceEdgeRecords(size_t n)
             rec.source_id = UInt128(0);
             rec.marker = RunMarker::Condemned;
             rec.delete_pending = (i % 200 == 0);
-            rec.token = PersistedIncarnation{"etag", "\"e1b2c3d4e5f6071829300a0b0c0d0e0f\""};
+            rec.token = PersistedEtag{"etag", "\"e1b2c3d4e5f6071829300a0b0c0d0e0f\""};
             rec.size = 64 * 1024;
             rec.condemn_round = 7;
         }

@@ -38,16 +38,16 @@ void expectThrowsCode(int expected_code, F && fn)
 }
 }
 
-static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kTokenTypeWords, DB::Cas::TokenType>());
+static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kTokenTypeWords, DB::Cas::Dialect>());
 static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kObjectKindWords, DB::Cas::ObjectKind>());
 static_assert(DB::Cas::casEnumTableCoversEnum<DB::Cas::kBlobHashAlgoWords, DB::Cas::BlobHashAlgo>());
 
 TEST(CASWireVocab, EnumTablesPinTheCurrentWords)
 {
     using namespace DB::Cas;
-    EXPECT_EQ(kTokenTypeWords.toWord(TokenType::ETag, "t"), "etag");
-    EXPECT_EQ(kTokenTypeWords.toWord(TokenType::Generation, "t"), "generation");
-    EXPECT_EQ(kTokenTypeWords.toWord(TokenType::Emulated, "t"), "emulated");
+    EXPECT_EQ(kTokenTypeWords.toWord(Dialect::ETag, "t"), "etag");
+    EXPECT_EQ(kTokenTypeWords.toWord(Dialect::Generation, "t"), "generation");
+    EXPECT_EQ(kTokenTypeWords.toWord(Dialect::Emulated, "t"), "emulated");
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::CityHash128, "t"), "ch128");
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::XXH3_128, "t"), "xxh3");
     EXPECT_EQ(kBlobHashAlgoWords.toWord(BlobHashAlgo::Sha256, "t"), "sha256");
@@ -61,7 +61,7 @@ TEST(CASWireVocab, EnumTablesPinTheCurrentWords)
 /// would otherwise round-trip silently through the untested value.
 TEST(CASWireVocab, ClosedSetsRoundTripEveryEnumeratorExhaustively)
 {
-    for (const auto t : magic_enum::enum_values<TokenType>())
+    for (const auto t : magic_enum::enum_values<Dialect>())
         EXPECT_EQ(kTokenTypeWords.fromWord(kTokenTypeWords.toWord(t, "t"), "t"), t);
     for (const auto k : magic_enum::enum_values<ObjectKind>())
         EXPECT_EQ(objectKindFromWord(objectKindToWord(k), "k"), k);
@@ -73,7 +73,7 @@ TEST(CASWireVocab, ClosedSetsRoundTripEveryEnumeratorExhaustively)
 
 TEST(CASWireVocab, EnumWordsRoundTrip)
 {
-    for (TokenType t : {TokenType::ETag, TokenType::Generation, TokenType::Emulated})
+    for (Dialect t : {Dialect::ETag, Dialect::Generation, Dialect::Emulated})
         EXPECT_EQ(kTokenTypeWords.fromWord(kTokenTypeWords.toWord(t, "t"), "t"), t);
     for (BlobHashAlgo a : {BlobHashAlgo::CityHash128, BlobHashAlgo::XXH3_128, BlobHashAlgo::Sha256})
         EXPECT_EQ(blobHashAlgoFromWord(blobHashAlgoName(a), "a"), a);
@@ -86,7 +86,7 @@ TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
 {
     CasJsonWriter out;
     bool first = true;
-    writeTokenFields(out, first, PersistedIncarnation{"etag", "etag-abc\"x"});
+    writeTokenFields(out, first, PersistedEtag{"etag", "etag-abc\"x"});
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("00112233445566778899aabbccddeeff"))};
     writeBlobRefFields(out, first, ref);
     closeObject(out, first);
@@ -229,7 +229,7 @@ TEST(CASWireVocab, TokenFieldsBuildsInAnyKeyOrderAndRequiresBothFields)
             continue;
         r.skipUnknown(key);
     }
-    const PersistedIncarnation built = fields.build("t");
+    const PersistedEtag built = fields.build("t");
     EXPECT_EQ(built.dialect, "etag");
     EXPECT_EQ(built.value, "abc");
 
@@ -264,14 +264,14 @@ TEST(CASWireVocab, OldManifestEpochKeyDoesNotAliasTheSemanticKey)
     }
 }
 
-/// A `PersistedIncarnation` survives every encoding a durable CAS record uses for one, and the type
+/// A `PersistedEtag` survives every encoding a durable CAS record uses for one, and the type
 /// system refuses the reverse direction: a persisted value must never be trusted to mint a live
-/// `Incarnation`, which only an admitted request may produce.
-static_assert(!std::is_constructible_v<DB::Cas::Incarnation, DB::Cas::PersistedIncarnation>);
+/// `Etag`, which only an admitted request may produce.
+static_assert(!std::is_constructible_v<DB::Cas::Etag, DB::Cas::PersistedEtag>);
 
-TEST(CASPersistedIncarnation, RoundTripsThroughEveryFormatAndNeverBecomesAnIncarnation)
+TEST(CASPersistedEtag, RoundTripsThroughEveryFormatAndNeverBecomesAnIncarnation)
 {
-    const PersistedIncarnation recorded{"generation", R"(17"3)"};   /// a quote the JSON encodings must escape
+    const PersistedEtag recorded{"generation", R"(17"3)"};   /// a quote the JSON encodings must escape
 
     /// 1. The shared `token_type`/`token` JSON pair.
     {
@@ -286,7 +286,7 @@ TEST(CASPersistedIncarnation, RoundTripsThroughEveryFormatAndNeverBecomesAnIncar
         String key;
         while (r.nextKey(key))
             ASSERT_TRUE(matchTokenFields(key, r, fields)) << "unexpected key " << key;
-        const PersistedIncarnation back = fields.build("t");
+        const PersistedEtag back = fields.build("t");
         EXPECT_EQ(back.dialect, recorded.dialect);
         EXPECT_EQ(back.value, recorded.value);
     }
@@ -332,7 +332,7 @@ TEST(CASPersistedIncarnation, RoundTripsThroughEveryFormatAndNeverBecomesAnIncar
 
 /// Both directions of the dialect vocabulary fail closed, so neither encoding can carry a value the
 /// other cannot name.
-TEST(CASPersistedIncarnation, UnknownDialectWordAndByteAreBothRefused)
+TEST(CASPersistedEtag, UnknownDialectWordAndByteAreBothRefused)
 {
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectWordFromString("etags", "t"); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { dialectByteFromWord("etags", "t"); });

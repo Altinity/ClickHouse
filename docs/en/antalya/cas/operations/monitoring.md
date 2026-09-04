@@ -82,9 +82,12 @@ SETTINGS system_events_show_zero_values = 1;
 ```
 
 `system.cas_log` records only nontrivial logical renewals. A `watermark_renew` row has outcome
-`retrying`, `recovered`, or `failed`, with detail keys `server_root_id`, `writer_epoch`, `seq`, a
-shortened `write_attempt_id`, `attempts_sent`, `elapsed_ms`, `remaining_confirmed_budget_ms`,
-`unresolved_reason`, `deadline_source`, `stop_cause`, and `classification`. Ordinary first-attempt
+`recovered` or `failed` — there is no per-attempt `retrying` row; the terminal event is the whole
+story — with detail keys `server_root_id`, `writer_epoch`, `seq`, a shortened `write_attempt_id`,
+`attempts_sent`, `elapsed_ms`, `remaining_confirmed_budget_ms`, and `classification`. The older
+`unresolved_reason`, `deadline_source`, and `stop_cause` keys no longer exist; `classification`
+carries what they used to say between them (see [debugging](/antalya/cas/operations/debugging#trace-renewal-remount)
+for the full value list). Ordinary first-attempt
 success produces no row. Every `mount_remount` attempt produces one final row with outcome `ok` or
 `failed` and details `attempt_no`, `step`, `server_root_id`, optional `writer_epoch`, and optional
 `error`.

@@ -60,6 +60,20 @@ public:
         return resolve_started;
     }
 
+    /// A plain read/replace through the primitive surface, for fixtures that need to observe or seed
+    /// state without going through the pool under test.
+    std::optional<DB::Cas::Object> readForTest(const String & key)
+    {
+        DB::Cas::tests::OperationForTest op(*this);
+        return (*op).read(key, Retry::standard());
+    }
+
+    bool replaceForTest(const String & key, const String & bytes, const Etag & expected)
+    {
+        DB::Cas::tests::OperationForTest op(*this);
+        return std::holds_alternative<Committed>((*op).replace(key, bytes, expected, Retry::standard()));
+    }
+
     /// The engine settles an ambiguous write by reading the key back, so the observation belongs on the
     /// READ PRIMITIVE -- the resolve read never reaches the legacy `get`.
     std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
@@ -111,11 +125,7 @@ CasRequestBudget renewalEventBudget()
 {
     return CasRequestBudget{
         .attempt_timeout_ms = 10,
-        .operation_deadline_ms = 500,
-        .max_attempts = 2,
         .lease_safety_margin_ms = 20,
-        .retry_initial_backoff_ms = 0,
-        .retry_max_backoff_ms = 0,
     };
 }
 
@@ -234,7 +244,7 @@ TEST(CASEvent, WatermarkRenewEventsAreBoundedAndComplete)
     EXPECT_LT(renewals[0].detail.at("write_attempt_id").size(), 32u);
     /// Both attempts sent the same body, so the event names the id the lease actually landed with --
     /// a reissue that minted a fresh id would leave the two disagreeing.
-    const MountLease landed = decodeMountLease(backend->get(store->layout().mountKey("test"))->bytes);
+    const MountLease landed = decodeMountLease(backend->readForTest(store->layout().mountKey("test"))->bytes);
     EXPECT_EQ(renewals[0].detail.at("write_attempt_id"), u128ToHex(landed.write_attempt_id).substr(0, 12));
 
     for (const String & key : {
@@ -288,7 +298,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
     std::array<std::shared_ptr<RenewalEventBackend>, depth> backends;
     std::array<std::unique_ptr<Layout>, depth> layouts;
     std::array<std::unique_ptr<CasRequests>, depth> planes;
-    std::array<std::unique_ptr<MountLeaseKeeper>, depth> keepers;
+    std::array<std::unique_ptr<MountLeaseRenewer>, depth> renewers;
     std::array<String, depth> server_root_ids;
     std::array<CasEventSink, depth> sinks;
     std::array<uint32_t, depth> renew_events{};
@@ -300,7 +310,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
     renew_at = [&](size_t index)
     {
         configureMountRenewObservability(&server_root_ids[index], &sinks[index], /*deferred=*/false);
-        MountRenewResult result = keepers[index]->renew(MountRenewOperationEnvironment{});
+        MountRenewResult result = renewers[index]->renew(MountRenewOperationEnvironment{});
         reportMountRenewCompletion(result);
         return result;
     };
@@ -321,12 +331,12 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
                     deepest_result = std::move(child_result);
             }
         };
-        /// One open-fence plane per keeper, on the same injected clock the keeper anchors its lease
+        /// One open-fence plane per renewer, on the same injected clock the renewer anchors its lease
         /// against, and with a sleep that advances it: the deepest renewal reissues, and no unit test
         /// may serve the engine's jittered backoff for real.
         planes[index] = std::make_unique<CasRequests>(
             backends[index], Fence::open(), [&] { return boot_ms; }, [&](uint64_t ms) { boot_ms += ms; });
-        keepers[index] = std::make_unique<MountLeaseKeeper>(
+        renewers[index] = std::make_unique<MountLeaseRenewer>(
             *planes[index],
             *planes[index],
             *layouts[index],
@@ -339,18 +349,16 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
             sinks[index],
             std::chrono::milliseconds(0),
             [&] { return boot_ms; });
-        keepers[index]->start();
+        renewers[index]->start();
 
         if (index + 1 < depth)
         {
             const String key = layouts[index]->mountKey(server_root_ids[index]);
-            auto observed = backends[index]->get(key);
+            auto observed = backends[index]->readForTest(key);
             ASSERT_TRUE(observed.has_value());
             MountLease foreign = decodeMountLease(observed->bytes);
             foreign.server_uuid = UInt128(100 + index);
-            ASSERT_EQ(
-                backends[index]->putOverwrite(key, encodeMountLease(foreign), observed->token).outcome,
-                PutOutcome::Done);
+            ASSERT_TRUE(backends[index]->replaceForTest(key, encodeMountLease(foreign), observed->etag));
         }
     }
     /// The deepest slot is the only one nobody took, so its renewal can recover: the attempt is lost
@@ -376,7 +384,7 @@ TEST(CASEvent, WatermarkRenewSinkFailureCannotChangeOutcome)
     uint64_t boot_ms = 100;
     auto store = openRenewalEventPool(backend, boot_ms);
     const String mount_key = store->layout().mountKey("test");
-    const uint64_t seq_before = decodeMountLease(backend->get(mount_key)->bytes).seq;
+    const uint64_t seq_before = decodeMountLease(backend->readForTest(mount_key)->bytes).seq;
     store->setEventSink([](const CasEvent & event)
     {
         if (event.type == CasEventType::WatermarkRenew)
@@ -385,7 +393,7 @@ TEST(CASEvent, WatermarkRenewSinkFailureCannotChangeOutcome)
 
     backend->throw_before_next_write = true;
     EXPECT_NO_THROW(store->renewWatermarkOnce());
-    EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).seq, seq_before + 1);
+    EXPECT_EQ(decodeMountLease(backend->readForTest(mount_key)->bytes).seq, seq_before + 1);
     EXPECT_TRUE(store->mayMutate());
 }
 
@@ -418,7 +426,7 @@ TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
         const std::optional<CasEvent> failed = one_failed_event(events);
         ASSERT_TRUE(failed.has_value()) << "the store's refusal must reach the event log";
-        /// A deterministic failure reaches the keeper as the exception the engine refuses to reissue,
+        /// A deterministic failure reaches the renewer as the exception the engine refuses to reissue,
         /// and an exception carries no attempt count -- so the classification is all this ending states.
         EXPECT_EQ(failed->detail.at("classification"), "deterministic_failure");
     }
@@ -468,7 +476,7 @@ TEST(CASEvent, ReentrantRenewalSinkPreservesOuterObservationIdentity)
     EXPECT_EQ(events[0].outcome, "recovered");
     EXPECT_EQ(events[0].detail.at("attempts_sent"), "2");
     EXPECT_EQ(events[0].detail.at("seq"), "2");
-    EXPECT_EQ(decodeMountLease(backend->get(store->layout().mountKey("test"))->bytes).seq, 3u)
+    EXPECT_EQ(decodeMountLease(backend->readForTest(store->layout().mountKey("test"))->bytes).seq, 3u)
         << "the nested first-attempt success must run without replacing the outer observation";
 }
 
@@ -566,7 +574,7 @@ bool anyRetiredPending(const PoolPtr & s)
 {
     /// Condemned state rides the adopted fold seal's RunMarker::Condemned rows, not a
     /// separate retired list — reconstruct the in-flight set from the seal.
-    return DB::Cas::tests::anyCondemnedInSeal(s->backend(), s->layout());
+    return DB::Cas::tests::anyCondemnedInSeal(*s->poolBackendPtr(), s->layout());
 }
 
 /// Drive regular GC to a fixpoint over the ACK-FLOOR round (renew the store's mount ack after each round;
@@ -632,8 +640,11 @@ TEST(CASEvent, LifecycleReconstructionFromRows)
     runGcToFixpoint(s, gc);
 
     /// The blob must actually be gone (the delete fired).
-    ASSERT_FALSE(b->head(s->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of(payload))})).exists)
-        << "GC must have deleted the now-unreferenced blob";
+    {
+        DB::Cas::tests::OperationForTest blob_op(b);
+        ASSERT_FALSE((*blob_op).head(s->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of(payload))}), Retry::standard()).has_value())
+            << "GC must have deleted the now-unreferenced blob";
+    }
 
     /// (a) the expected taxonomy was emitted across the lifecycle (manifest model: no standalone trees).
     EXPECT_TRUE(hasType(events, CasEventType::BlobPut));

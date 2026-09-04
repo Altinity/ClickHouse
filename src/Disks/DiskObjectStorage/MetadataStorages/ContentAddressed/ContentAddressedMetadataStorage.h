@@ -610,6 +610,13 @@ private:
     const uint64_t manifest_decode_cache_bytes;
     /// Bounded pool size for GC's per-hash freshness-metadata writes.
     const uint64_t gc_meta_pool_size;
+    /// The budget for one HTTP attempt of a writable Native mount's control-plane requests; feeds
+    /// `Cas::PoolConfig::cas_request_budget.attempt_timeout_ms` and the backend's own
+    /// `attemptTimeoutMs()`.
+    const uint64_t cas_attempt_timeout_ms;
+    /// Startup-only margin validated against the mount lease TTL; feeds
+    /// `Cas::PoolConfig::cas_request_budget.lease_safety_margin_ms`.
+    const uint64_t cas_lease_safety_margin_ms;
     /// Configured staging backend; `Local` preserves the existing write path.
     const Cas::StagingBackend staging_backend;
     /// Blob content-hash function passed to `Cas::PoolConfig`.
@@ -642,7 +649,7 @@ private:
     /// native_token_type`) -- immutable afterwards. `startup` also hands it to the object storage as a
     /// pin, which is what refuses a reload that would flip the dialect under this live pool; the check
     /// belongs there because only the object storage knows the effective `http_client`.
-    Cas::TokenType native_token_type = Cas::TokenType::ETag;
+    Cas::Dialect native_token_type = Cas::Dialect::ETag;
     /// shared_ptr so `runGarbageCollectionRoundNow`/`runOneGcRoundForTest` can take a snapshot under
     /// `pointer_mutex`, release it, and run the (long) round via the snapshot -- never holding
     /// `pointer_mutex` itself for the round's duration, so `gcHealth`/`store`/`partAccess` never
@@ -739,7 +746,7 @@ private:
         /// captured while the concrete backend is still in scope. Reading it back through `pool`
         /// would mean unwrapping the instrumentation decorator `Pool::open` adds, so it is returned
         /// here instead.
-        Cas::TokenType native_token_type = Cas::TokenType::ETag;
+        Cas::Dialect native_token_type = Cas::Dialect::ETag;
     };
 
     /// Builds the backend + `Cas::PoolConfig` and opens a pool exactly as `startup()` does. A read-only

@@ -7,23 +7,25 @@
 namespace DB::Cas
 {
 
-using Dialect = TokenType;
-
 /// The per-dialect grammar a response value must meet to be an incarnation. Generation: canonical
 /// positive decimal (no leading zero, not "0" -- zero is the dialect's absence sentinel). ETag:
 /// non-empty, not "*" after trimming whitespace, no comma (a list matches any member). Emulated:
 /// non-empty. `ObjectStorageBackend::isValidTokenValue` forwards here.
 bool isIncarnationValue(Dialect dialect, const String & value);
 
-/// One backend-observed incarnation of an object: the transport's own token value together with the
-/// backend and key it was observed against. Not default-constructible, not constructible from a bare
-/// `String`, and minted ONLY by `CasRequests` -- a caller can hold one only by way of an admitted
-/// read or write, so an `Incarnation` is always traceable to the request that produced it.
-class Incarnation
+/// One backend-observed incarnation of an object: the transport's own value naming that incarnation,
+/// together with the backend and key it was observed against. "Etag" names the ROLE this value plays
+/// -- whatever the backend hands back as the object's identity for a conditional write -- not the wire
+/// field: it is a literal ETag on S3-compatible stores, a generation number on GCS's JSON dialect, and
+/// a minted sequence value on the emulated/in-memory backends. Not default-constructible, not
+/// constructible from a bare `String`, and minted ONLY by `CasRequests` -- a caller can hold one only
+/// by way of an admitted read or write, so an `Etag` is always traceable to the request that produced
+/// it.
+class Etag
 {
 public:
-    Incarnation() = delete;
-    bool operator==(const Incarnation &) const = default;
+    Etag() = delete;
+    bool operator==(const Etag &) const = default;
 
     /// "etag:<value>" | "generation:<value>" | "emulated:<value>"
     String render() const;
@@ -34,7 +36,7 @@ public:
 private:
     friend class CasRequests;
 
-    Incarnation(uint64_t backend_id, String key, Dialect dialect, String value)
+    Etag(uint64_t backend_id, String key, Dialect dialect, String value)
         : backend_id_(backend_id), key_(std::move(key)), dialect_(dialect), value_(std::move(value))
     {
     }
@@ -48,7 +50,7 @@ private:
     String value_;
 };
 
-inline String Incarnation::render() const
+inline String Etag::render() const
 {
     switch (dialect_)
     {
@@ -60,27 +62,27 @@ inline String Incarnation::render() const
 }
 
 /// An incarnation as recorded in a persisted manifest/ref: the dialect word and value, without any
-/// live backend to check them against. Forward-only: a `PersistedIncarnation` is captured FROM a live
-/// `Incarnation`, never the reverse -- a persisted record must never be trusted to mint a live one.
+/// live backend to check them against. Forward-only: a `PersistedEtag` is captured FROM a live
+/// `Etag`, never the reverse -- a persisted record must never be trusted to mint a live one.
 /// `matches` re-derives the same rendering the live incarnation would produce and compares it
 /// textually, so the two representations can never drift apart.
-struct PersistedIncarnation
+struct PersistedEtag
 {
     String dialect;    /// "etag" | "generation" | "emulated"
     String value;
 
-    static PersistedIncarnation capture(const Incarnation & live);
-    bool matches(const Incarnation & live) const;
+    static PersistedEtag capture(const Etag & live);
+    bool matches(const Etag & live) const;
 };
 
-inline PersistedIncarnation PersistedIncarnation::capture(const Incarnation & live)
+inline PersistedEtag PersistedEtag::capture(const Etag & live)
 {
     const String rendered = live.render();
     const auto colon = rendered.find(':');
-    return PersistedIncarnation{rendered.substr(0, colon), rendered.substr(colon + 1)};
+    return PersistedEtag{rendered.substr(0, colon), rendered.substr(colon + 1)};
 }
 
-inline bool PersistedIncarnation::matches(const Incarnation & live) const
+inline bool PersistedEtag::matches(const Etag & live) const
 {
     return live.render() == dialect + ":" + value;
 }

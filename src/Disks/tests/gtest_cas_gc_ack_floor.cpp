@@ -31,9 +31,30 @@ ManifestRef ref(const String &, uint64_t seq, uint64_t inst)
 {
     return ManifestRef{.writer_epoch = 1, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
+/// A one-shot `create`, asserting it committed (mirrors the retired `backend.putIfAbsent(key, bytes)`).
+void createObj(Backend & backend, const String & key, const String & bytes)
+{
+    OperationForTest op(backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(key, bytes, Retry::once())));
+}
+
+/// An exact read (mirrors the retired `backend.get(key)`).
+std::optional<Object> readObj(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).read(key, Retry::standard());
+}
+
+/// A HEAD (mirrors the retired `backend.head(key)`).
+std::optional<Meta> headObj(Backend & backend, const String & key)
+{
+    OperationForTest op(backend);
+    return (*op).head(key, Retry::standard());
+}
+
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
 {
-    return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
+    return headObj(b, layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).has_value();
 }
 
 /// Publish one physical blob through the production durable-precommit ordering. The committed fixture
@@ -149,7 +170,7 @@ TEST(CASSemanticRefFixture, WrapperAdvancesCheckpointWithoutDiscardingSnapshot)
     RefCkpt with_snapshot = before_drop->ckpt;
     with_snapshot.checkpoint_snapshot_id = publish_id;
     ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(
-        store->layout().refCkptKey(life), encodeRefCkpt(with_snapshot), before_drop->incarnation,
+        store->layout().refCkptKey(life), encodeRefCkpt(with_snapshot), before_drop->etag,
         Retry::once())));
 
     const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", manifest);
@@ -179,9 +200,9 @@ TEST(CASSemanticRefFixture, CheckpointAdvanceRejectsNonMonotoneAndInvalidState)
     fixture::admitLive(*backend, store->layout(), invalid_ns);
     const NamespaceLifeId invalid_life = *CasRefCatalog::lifeIfCataloged(op, store->layout(), invalid_ns);
     const String invalid_key = store->layout().refCkptKey(invalid_life);
-    ASSERT_EQ(backend->putIfAbsent(invalid_key, "not a checkpoint").outcome, PutOutcome::Done);
+    createObj(*backend, invalid_key, "not a checkpoint");
     EXPECT_THROW(advanceRecoverableCkptForRawFixture(*backend, store->layout(), invalid_ns, id), DB::Exception);
-    EXPECT_EQ(backend->get(invalid_key)->bytes, "not a checkpoint");
+    EXPECT_EQ(readObj(*backend, invalid_key)->bytes, "not a checkpoint");
 }
 
 TEST(CASRawRefFixture, RawLogWriteDoesNotCreateCheckpoint)
@@ -275,11 +296,11 @@ TEST(CASGCRetire, ManifestBodyDeletedAfterDecrementsSealed)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     Gc gc(store, kGc);
     runRegularRoundReclaiming(gc);
-    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_TRUE(headObj(*backend, store->layout().manifestKey(ManifestId{ns, r})).has_value());
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     runRegularRoundReclaiming(gc);
-    EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_FALSE(headObj(*backend, store->layout().manifestKey(ManifestId{ns, r})).has_value());
 }
 
 /// A publish racing the pass (in-degree restored) is SPARED, not deleted (#14).
@@ -322,7 +343,7 @@ TEST(CASGCRecheck, UnreferencedBlobDeletedExactToken)
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     // The drop's -1 condemns blob 1; the retired-cursor pipeline (condemn -> graduate -> delete) reclaims it.
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(1)));
-    EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+    EXPECT_FALSE(headObj(*backend, store->layout().manifestKey(ManifestId{ns, r})).has_value());
 }
 
 /// Task 5 (spec 2026-07-09 §raw-body-refinement, v3): GC writes the writer's freshness meta ALONGSIDE
@@ -396,7 +417,7 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
     publishBlobWithDurablePrecommit(store, seed_ns, "seed", id, payload);
     store->dropRef(seed_ns, "seed");
     store->renewWatermarkOnce();
-    const Token t_seed = backend->head(store->layout().blobKey(id)).token;
+    const Etag t_seed = headObj(*backend, store->layout().blobKey(id))->etag;
 
     const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", hash)});
@@ -423,7 +444,7 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), hash).has_value())
         << "the spared entry drops from the retired set";
     EXPECT_TRUE(blobExists(*backend, store->layout(), hash));
-    EXPECT_EQ(backend->head(store->layout().blobKey(id)).token, t_seed)
+    EXPECT_EQ(headObj(*backend, store->layout().blobKey(id))->etag, t_seed)
         << "spare does not touch the body — the incarnation token is unchanged";
 
     /// ADD-ONLY: the spare must NOT clear the meta back to Clean (that is the deposed-leader hole).
@@ -440,7 +461,7 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
     const RootNamespace writer_ns{"00/spare-writer@cas@"};
     auto ref_w = publishBlobWithDurablePrecommit(store, writer_ns, "writer", id, payload);
     EXPECT_EQ(ref_w.ref, id);
-    const Token t_resurrect = backend->head(store->layout().blobKey(id)).token;
+    const Etag t_resurrect = headObj(*backend, store->layout().blobKey(id))->etag;
     EXPECT_NE(t_resurrect, t_seed) << "republication displaces the body with a fresh incarnation token";
     const auto lm_after = loadMetaForTest(*backend, store->layout(), hash);
     ASSERT_TRUE(lm_after.has_value());
@@ -492,10 +513,10 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     CasOperation op = requests.admit();
     const auto condemned_entry = currentEntryFor(*backend, store->layout(), hash);
     ASSERT_TRUE(condemned_entry.has_value());
-    const PersistedIncarnation t1 = condemned_entry->token;
+    const PersistedEtag t1 = condemned_entry->token;
     const std::optional<Meta> at_condemn = op.head(blob_key, Retry::once());
     ASSERT_TRUE(at_condemn);
-    ASSERT_TRUE(t1.matches(at_condemn->incarnation));
+    ASSERT_TRUE(t1.matches(at_condemn->etag));
 
     /// A NEW leader L2 folds a +1 that recovered h's in-degree and adopts a SPARE for h.
     const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
@@ -517,7 +538,7 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     publishBlobWithDurablePrecommit(store, writer_ns, "writer", id, payload);
     const std::optional<Meta> t2 = op.head(blob_key, Retry::once());
     ASSERT_TRUE(t2);
-    EXPECT_FALSE(t1.matches(t2->incarnation))
+    EXPECT_FALSE(t1.matches(t2->etag))
         << "the writer resurrected to a fresh incarnation, not a reuse of t1";
 
     /// L1 resumes and replays its stale pre-CAS redelete exactly as the round performs one: observe the
@@ -527,17 +548,17 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     const uint64_t removals_before = backend->deleteCount(blob_key);
     const std::optional<Meta> stale = op.head(blob_key, Retry::once());
     ASSERT_TRUE(stale);
-    EXPECT_FALSE(t1.matches(stale->incarnation))
+    EXPECT_FALSE(t1.matches(stale->etag))
         << "the stale redelete must miss the live reuse (add-only closes INV_NO_LOSS)";
-    if (t1.matches(stale->incarnation))
-        (void)op.remove(blob_key, stale->incarnation, Retry::once());
+    if (t1.matches(stale->etag))
+        (void)op.remove(blob_key, stale->etag, Retry::once());
     EXPECT_EQ(backend->deleteCount(blob_key), removals_before)
         << "the comparison failed, so the redelete sent no removal at all against the live body";
 
     /// The live body under t2 survives, stays reachable via the committed r2, and fsck sees no dangle.
     const std::optional<Meta> survivor = op.head(blob_key, Retry::once());
     ASSERT_TRUE(survivor);
-    EXPECT_EQ(survivor->incarnation, t2->incarnation);
+    EXPECT_EQ(survivor->etag, t2->etag);
     replaceRecoverableCkptForRawFixture(
         *backend, store->layout(), ns,
         RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 3},
@@ -569,9 +590,11 @@ TEST(CASGCRetire, CopyForwardedBlobSurvivesWhenRepublished)
     /// same verified bytes under a fresh token t1, then republish a part referencing the blob (the
     /// promoted dst ref of a republishRef move).
     const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
-    const Token t0 = backend->head(blob_key).token;
-    const auto res = backend->putOverwrite(blob_key, backend->get(blob_key)->bytes, t0);
-    ASSERT_EQ(res.outcome, PutOutcome::Done);
+    OperationForTest displace(*backend);
+    const Etag t0 = (*displace).head(blob_key, Retry::standard())->etag;
+    const WriteResult res = (*displace).replace(blob_key, readObj(*backend, blob_key)->bytes, t0, Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(res));
+    const Etag res_etag = std::get<Committed>(res).etag;
     const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl_detached", std::nullopt, r2);
@@ -580,9 +603,9 @@ TEST(CASGCRetire, CopyForwardedBlobSurvivesWhenRepublished)
     for (int i = 0; i < 4; ++i)
         gc.runRegularRound();
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
-    const HeadResult hr = backend->head(blob_key);
-    ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token, res.token);
+    const auto hr = (*displace).head(blob_key, Retry::standard());
+    ASSERT_TRUE(hr.has_value());
+    EXPECT_EQ(hr->etag, res_etag);
 }
 
 /// Copy-forward aftermath, stale-entry arm: a listed (hash, t0) entry whose incarnation was
@@ -609,9 +632,11 @@ TEST(CASGCRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
 
     const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
-    const Token t0 = backend->head(blob_key).token;
-    const auto res = backend->putOverwrite(blob_key, backend->get(blob_key)->bytes, t0);
-    ASSERT_EQ(res.outcome, PutOutcome::Done);
+    OperationForTest displace(*backend);
+    const Etag t0 = (*displace).head(blob_key, Retry::standard())->etag;
+    const WriteResult res = (*displace).replace(blob_key, readObj(*backend, blob_key)->bytes, t0, Retry::once());
+    ASSERT_TRUE(std::holds_alternative<Committed>(res));
+    const Etag res_etag = std::get<Committed>(res).etag;
 
     /// No events land at all (raw displacement). Drive rounds with the store's ack kept current so
     /// the (1, t0) entry graduates; its exact-token delete mismatches t1 and the entry drops.
@@ -622,9 +647,9 @@ TEST(CASGCRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
     }
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value())
         << "the stale (hash, t0) entry must settle (mismatch redelete drops it), not wedge the list";
-    const HeadResult hr = backend->head(blob_key);
-    ASSERT_TRUE(hr.exists) << "the fresh incarnation must never be deleted under the stale token";
-    EXPECT_EQ(hr.token, res.token);
+    const auto hr = (*displace).head(blob_key, Retry::standard());
+    ASSERT_TRUE(hr.has_value()) << "the fresh incarnation must never be deleted under the stale token";
+    EXPECT_EQ(hr->etag, res_etag);
 }
 
 /// A completed round adopts the SAME attempt its fold minted (the round's single gc/state CAS commits the
@@ -643,22 +668,22 @@ TEST(CASGCRecheck, CompletionInheritsFoldAttempt)
     Gc gc(store, kGc);
 
     gc.runRegularRound();          // round 1: one pass, single CAS commits (snap_generation, snap_attempt)
-    const auto after_round1 = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const auto after_round1 = decodeGcState(readObj(*backend, store->layout().gcStateKey())->bytes);
     // The round adopted the attempt of THIS round's fold: snap_attempt == the lease.seq that folded it.
     EXPECT_EQ(after_round1.snap_attempt, after_round1.lease.seq);
     EXPECT_GT(after_round1.snap_generation, 0u);
     // The fold seal is durable under the adopted (snap_generation, snap_attempt) pair (no completion seal).
-    EXPECT_TRUE(backend->head(store->layout()
-        .foldSealKey(after_round1.snap_generation, after_round1.snap_attempt)).exists);
+    EXPECT_TRUE(headObj(*backend, store->layout()
+        .foldSealKey(after_round1.snap_generation, after_round1.snap_attempt)).has_value());
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     gc.runRegularRound();          // round 2: re-acquire (bump lease.seq) -> fresh attempt at its fold
-    const auto after_round2 = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const auto after_round2 = decodeGcState(readObj(*backend, store->layout().gcStateKey())->bytes);
     EXPECT_EQ(after_round2.snap_attempt, after_round2.lease.seq);
     EXPECT_GT(after_round2.snap_attempt, after_round1.snap_attempt);   // per-round monotone attempt
     EXPECT_GT(after_round2.snap_generation, after_round1.snap_generation);
-    EXPECT_TRUE(backend->head(store->layout()
-        .foldSealKey(after_round2.snap_generation, after_round2.snap_attempt)).exists);
+    EXPECT_TRUE(headObj(*backend, store->layout()
+        .foldSealKey(after_round2.snap_generation, after_round2.snap_attempt)).has_value());
 }
 
 /// ---- round-paced graduation suite (spec 2026-07-02 + Task-9 amendment; re-keyed off acks in v3 Task 6) ----
@@ -680,9 +705,10 @@ TEST(CASGCAckFloor, NoOpRoundDoesNotMutateRefShards)
     {
         std::set<String> keys;
         String cursor;
+        OperationForTest op(*backend);
         for (;;)
         {
-            const ListPage page = backend->list(store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)), cursor, 1000);
+            const ListPage page = (*op).list(store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)), cursor, 1000, Retry::standard());
             for (const ListedKey & lk : page.keys)
                 keys.insert(lk.key);
             if (page.next_cursor.empty())
@@ -699,7 +725,7 @@ TEST(CASGCAckFloor, NoOpRoundDoesNotMutateRefShards)
     const std::set<String> after = listRefKeys();
     EXPECT_EQ(before, after) << "a no-op GC round must not mutate the table's ref objects";
     // The registry object is gone (Task 4); the fence never existed to write it.
-    EXPECT_FALSE(backend->get("p/gc/registry").has_value());
+    EXPECT_FALSE(readObj(*backend, "p/gc/registry").has_value());
 }
 
 /// The canonical pipeline: a blob condemned at round K stays present after the condemning round; the
@@ -878,18 +904,18 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
-    // srid2's keeper claims ONE lease via `start` and is never renewed again — tests never enable
+    // srid2's renewer claims ONE lease via `start` and is never renewed again — tests never enable
     // the runtime-owned renewal worker (`background_watermark` defaults to false), so this alone models a
     // crashed process: a body that is live-shaped (not terminated, not fenced) but whose write token
     // never changes again.
     const String srid2 = "stale-server";
-    CasRequests keeper_requests = openRequestsForTest(backend);
-    MountLeaseKeeper srid2_keeper(keeper_requests, keeper_requests, layout, srid2, DB::UInt128(0x2222),
+    CasRequests renewer_requests = openRequestsForTest(backend);
+    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
         /*writer_epoch=*/1,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
-    srid2_keeper.start();
-    ASSERT_FALSE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
+    srid2_renewer.start();
+    ASSERT_FALSE(decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes).gc_fenced);
 
     // The fence-out threshold on the GC leader's OWN monotonic clock — mirrors the production formula
     // in `Gc::runRegularRound` (ttl + 5% drift allowance + one round's worth of renewal slack).
@@ -924,7 +950,7 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     const RoundReport rep = gc.runRegularRound();
 
     EXPECT_EQ(rep.fence_outs, 1u);   // exactly one dead mount fenced-out this round
-    const MountLease fenced = decodeMountLease(backend->get(layout.mountKey(srid2))->bytes);
+    const MountLease fenced = decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes);
     EXPECT_TRUE(fenced.gc_fenced);
 
     // Exactly one GcFenceOut audit row was emitted, naming srid2 in its detail.
@@ -944,7 +970,7 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     // srid2's writer comes back and tries to renew: its held token was invalidated by the fence rewrite,
     // so synchronous renewal returns a terminal failure. (It renews on its own clock; liveness is irrelevant — the token guard
     // trips regardless.)
-    const MountRenewResult renewed = srid2_keeper.renew(MountRenewOperationEnvironment{});
+    const MountRenewResult renewed = srid2_renewer.renew(MountRenewOperationEnvironment{});
     ASSERT_EQ(renewed.outcome, MountRenewOutcome::Terminal);
     ASSERT_NE(renewed.failure, nullptr);
     EXPECT_THROW(std::rethrow_exception(renewed.failure), DB::Exception);
@@ -973,12 +999,12 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
 
     // A stale mount, exactly as `ExpiredMountFencedOutAndExcluded`: one claim, never renewed again.
     const String srid2 = "stale-server";
-    CasRequests keeper_requests = openRequestsForTest(backend);
-    MountLeaseKeeper srid2_keeper(keeper_requests, keeper_requests, layout, srid2, DB::UInt128(0x2222),
+    CasRequests renewer_requests = openRequestsForTest(backend);
+    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
         /*writer_epoch=*/1,
         std::chrono::milliseconds(100), [] { return 1000u; }, [&] { return fake_boot; });
-    srid2_keeper.start();
-    ASSERT_FALSE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
+    srid2_renewer.start();
+    ASSERT_FALSE(decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes).gc_fenced);
 
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
     const uint64_t threshold_ms = ttl_ms + ttl_ms / 20
@@ -996,7 +1022,7 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
     const RoundReport rep2 = gc.runRegularRound();
     EXPECT_EQ(rep2.fence_outs, 1u)
         << "Gc's default mono_ms_fn must track the Pool's injected boot clock, not the real wall clock";
-    EXPECT_TRUE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
+    EXPECT_TRUE(decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes).gc_fenced);
 }
 
 /// A redelete of a blob the writer RECREATED (fresh incarnation) between the pending publish and the
@@ -1095,15 +1121,15 @@ TEST(CASGCAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
     const String pending_key = store->layout().blobKey(blob_id);
     const std::optional<Meta> doomed = op.head(pending_key, Retry::once());
     ASSERT_TRUE(doomed);
-    ASSERT_TRUE(pending_entry.token.matches(doomed->incarnation));
-    ASSERT_EQ(op.remove(pending_key, doomed->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_TRUE(pending_entry.token.matches(doomed->etag));
+    ASSERT_EQ(op.remove(pending_key, doomed->etag, Retry::once()), Removal::Removed);
 
-    const uint64_t round_before = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
+    const uint64_t round_before = decodeGcState(readObj(*backend, store->layout().gcStateKey())->bytes).round;
     Gc gc2(store, kGc);
     const RoundReport rep = runRegularRoundReclaiming(gc2);
     store->renewWatermarkOnce();
     EXPECT_EQ(rep.absent, 1u);   // the replayed delete found the object already gone
-    const uint64_t round_after = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
+    const uint64_t round_after = decodeGcState(readObj(*backend, store->layout().gcStateKey())->bytes).round;
     EXPECT_GT(round_after, round_before);   // the round completed (no wedge)
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
 }
@@ -1160,8 +1186,8 @@ TEST(CASGCAckFloor, AbsentBlobSettlesAsAbsentWithoutASpeculativeConditionalRemov
     const String blob_key = store->layout().blobKey(blob_id);
     const std::optional<Meta> doomed = op.head(blob_key, Retry::once());
     ASSERT_TRUE(doomed);
-    ASSERT_TRUE(pending_entry.token.matches(doomed->incarnation));
-    ASSERT_EQ(op.remove(blob_key, doomed->incarnation, Retry::once()), Removal::Removed);
+    ASSERT_TRUE(pending_entry.token.matches(doomed->etag));
+    ASSERT_EQ(op.remove(blob_key, doomed->etag, Retry::once()), Removal::Removed);
     ASSERT_FALSE(op.head(blob_key, Retry::once()));
     backend->watch(blob_key);
 
@@ -1211,8 +1237,8 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
     /// plane's lease-bound policies keep their real clock.
     std::atomic<uint64_t> engine_now_ms{0};
     std::atomic<uint64_t> engine_sleeps{0};
-    store->gcRequests().setNowFnForTest([&] { return engine_now_ms.load(); });
-    store->gcRequests().setSleepFnForTest([&](uint64_t pause_ms)
+    store->openRequests().setNowFnForTest([&] { return engine_now_ms.load(); });
+    store->openRequests().setSleepFnForTest([&](uint64_t pause_ms)
     {
         engine_sleeps.fetch_add(1);
         engine_now_ms.fetch_add(pause_ms + 1);

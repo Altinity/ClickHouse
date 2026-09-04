@@ -100,6 +100,8 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_part_folder_cache_max_entry_bytes` | 16 MiB | Oversized part-folder views bypass retention above this size |
 | `cas_manifest_decode_cache_bytes` | 128 MiB | Manifest decode cache byte budget (`0` disables) |
 | `cas_gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
+| `cas_attempt_timeout_ms` | `5000` | Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove) |
+| `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: `cas_attempt_timeout_ms + cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, or the disk refuses to open writable |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
 
 ## Advanced GC pacing settings {#advanced-gc-pacing-settings}

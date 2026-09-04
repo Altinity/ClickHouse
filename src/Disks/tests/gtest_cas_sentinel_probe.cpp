@@ -58,10 +58,6 @@ CasRequests makeRequests(Backend & backend, DB::Cas::tests::FakeClock * clock = 
 class TransportFaultBackend final : public InMemoryBackend
 {
 public:
-    using Backend::getStream;
-    using Backend::head;
-    using Backend::list;
-
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (fail.load())
@@ -92,10 +88,10 @@ public:
 TEST(CASSentinelProbe, PresentKeyReturnsPresentWithBody)
 {
     InMemoryBackend backend;
-    ASSERT_EQ(backend.putIfAbsent("k", "hello").outcome, PutOutcome::Done);
-
     auto requests = makeRequests(backend);
     auto op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("k", "hello", Retry::once())));
+
     const auto result = probeSentinel(op, "k", Retry::standard());
     EXPECT_EQ(result.outcome, ProbeOutcome::Present);
     ASSERT_TRUE(result.body.has_value());
@@ -106,10 +102,10 @@ TEST(CASSentinelProbe, PresentKeyReturnsPresentWithBody)
 TEST(CASSentinelProbe, AbsentKeyWithContainerAliveReturnsKeyAbsent)
 {
     InMemoryBackend backend;
-    ASSERT_EQ(backend.putIfAbsent("other", "x").outcome, PutOutcome::Done);   // proves the backend is alive
-
     auto requests = makeRequests(backend);
     auto op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("other", "x", Retry::once())));   // proves the backend is alive
+
     const auto result = probeSentinel(op, "missing", Retry::standard());
     EXPECT_EQ(result.outcome, ProbeOutcome::KeyAbsent);
     EXPECT_FALSE(result.body.has_value());
@@ -126,10 +122,9 @@ TEST(CASSentinelProbe, ContainerDirectoryRemovedReturnsContainerAbsent)
     auto storage = tests::makeLocalObjectStorageForTest();
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
 
-    ASSERT_EQ(backend.putIfAbsent("k", "hello").outcome, PutOutcome::Done);
-
     auto requests = makeRequests(backend);
     auto op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("k", "hello", Retry::once())));
 
     /// Sanity, container alive: Present vs. KeyAbsent are genuinely distinct before we remove anything.
     EXPECT_EQ(probeSentinel(op, "k", Retry::standard()).outcome, ProbeOutcome::Present);

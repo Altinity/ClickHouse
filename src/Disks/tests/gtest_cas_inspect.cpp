@@ -147,13 +147,13 @@ TEST(CASInspect, RendersTokenTypeWireWordsEtagAndGeneration)
     etag_rec.ref = bh(1);
     etag_rec.source_id = UInt128{0};
     etag_rec.marker = RunMarker::Condemned;
-    etag_rec.token = PersistedIncarnation{"etag", "v-etag"};
+    etag_rec.token = PersistedEtag{"etag", "v-etag"};
 
     SourceEdgeRecord gen_rec;
     gen_rec.ref = bh(1);
     gen_rec.source_id = UInt128{1};
     gen_rec.marker = RunMarker::Condemned;
-    gen_rec.token = PersistedIncarnation{"generation", "v-gen"};
+    gen_rec.token = PersistedEtag{"generation", "v-gen"};
 
     DB::WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);
@@ -209,7 +209,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     condemned_rec.source_id = UInt128{0};
     condemned_rec.marker = RunMarker::Condemned;
     condemned_rec.delete_pending = true;
-    condemned_rec.token = PersistedIncarnation{"emulated", "etag-1"};
+    condemned_rec.token = PersistedEtag{"emulated", "etag-1"};
     condemned_rec.size = 123;
     condemned_rec.condemn_round = 7;
     condemned_rec.marker_confirmed = true;

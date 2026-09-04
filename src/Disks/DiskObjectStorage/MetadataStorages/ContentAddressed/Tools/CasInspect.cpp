@@ -288,7 +288,7 @@ String renderGcState(const GcState & s)
 /// A recorded incarnation's value is an opaque backend-native string (e.g. an S3 ETag) — NOT a
 /// 128-bit hash — so it renders verbatim (escaped), not hex-converted; `type` is the dialect word,
 /// naming which backend family minted it.
-String renderPersistedIncarnation(const PersistedIncarnation & inc)
+String renderPersistedEtag(const PersistedEtag & inc)
 {
     return JsonObj()
         .add("value", jsonEscape(inc.value))
@@ -401,7 +401,7 @@ String renderCondemnedRow(const CondemnedRow & r)
 {
     return JsonObj()
         .add("delete_pending", jsonBool(r.delete_pending))
-        .add("token", renderPersistedIncarnation(r.token))
+        .add("token", renderPersistedEtag(r.token))
         .add("size", jsonUInt(r.size))
         .add("condemn_round", jsonUInt(r.condemn_round))
         .add("marker_confirmed", jsonBool(r.marker_confirmed))

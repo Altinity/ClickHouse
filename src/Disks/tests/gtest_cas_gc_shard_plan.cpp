@@ -500,9 +500,9 @@ TEST(CASGCShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
 
     /// The blob-target runs for both shards are durably present (the reducer's write-once `putIfAbsent`),
     /// at disjoint object keys.
-    EXPECT_TRUE(backend->head(layout.blobTargetRunKey(kNewGen, kAttempt, /*shard=*/0, /*seq=*/0)).exists)
+    EXPECT_TRUE(op.head(layout.blobTargetRunKey(kNewGen, kAttempt, /*shard=*/0, /*seq=*/0), Retry::once()).has_value())
         << "shard-0 blob-target run must be durably written by r0.reduce";
-    EXPECT_TRUE(backend->head(layout.blobTargetRunKey(kNewGen, kAttempt, /*shard=*/1, /*seq=*/0)).exists)
+    EXPECT_TRUE(op.head(layout.blobTargetRunKey(kNewGen, kAttempt, /*shard=*/1, /*seq=*/0), Retry::once()).has_value())
         << "shard-1 blob-target run must be durably written by r1.reduce";
 
     /// (c) MERGED IN-DEGREE — the merged in-degrees across both shards equal the expected edge multiset.
@@ -559,14 +559,15 @@ TEST(CASGCShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     const ManifestId id0{ns, r0};
     const ManifestId id1{ns, r1};
 
+    OperationForTest verify_op(*backend);
     /// Local blobExists (the round-level helper is file-local to gtest_cas_gc_round.cpp).
     auto blobExists = [&](const UInt128 & hash)
     {
-        return backend->head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
+        return (*verify_op).head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)}), Retry::once()).has_value();
     };
     auto manifestExists = [&](const ManifestId & id)
     {
-        return backend->head(layout.manifestKey(id)).exists;
+        return (*verify_op).head(layout.manifestKey(id), Retry::once()).has_value();
     };
     /// Whether ANY gc-shard still holds an in-flight condemned entry (the ack-floor deletion pipeline is
     /// in flight while this is true). Condemned state is reconstructed from the adopted fold seal's
@@ -608,7 +609,7 @@ TEST(CASGCShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
 
     /// While both refs are live: each blob's in-degree is 1 in its OWNING shard's run, and nothing is
     /// collected (no-loss). Derive generation/attempt from gc/state — never hardcode.
-    const GcState live = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const GcState live = decodeGcState((*verify_op).read(layout.gcStateKey(), Retry::once())->bytes);
     ASSERT_GT(live.snap_generation, 0u);
     ASSERT_EQ(live.gc_shards, kGcShards) << "the pool must be running with gc_shards=2";
     EXPECT_EQ(inDegreeInRuns(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard0)}), 1)

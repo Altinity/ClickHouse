@@ -35,7 +35,7 @@ namespace DB
     M(CAS_ANOMALY_DIAG, "CasAnomalyDiag") \
     M(CAS_GC_HEARTBEAT, "CasGcHeartbeat") \
     M(CAS_GC_SCHEDULER, "CasGcSched") \
-    M(CAS_LEASE_KEEPER, "CasLeaseKeeper") \
+    M(CAS_LEASE_RENEWER, "CasLeaseRenewer") \
     M(CAS_REF_SNAPSHOT_PUBLISH, "CasRefSnapPub") \
     M(CAS_REMOUNT, "CasRemount") \
     M(CGROUP_MEMORY_OBSERVER, "CgrpMemUsgObsr") \

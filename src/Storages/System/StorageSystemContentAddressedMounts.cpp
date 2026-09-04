@@ -163,7 +163,7 @@ Pipe StorageSystemContentAddressedMounts::read(
                 /// Introspection reads on the open fence: a row describing this disk's mount slots must
                 /// still be produced when the local mount fence has already run down -- that is exactly
                 /// the state an operator opens this table to look at.
-                Cas::CasOperation op = store->gcRequests().admit();
+                Cas::CasOperation op = store->openRequests().admit();
                 mounts = Cas::listMounts(op, store->layout(), now_ms, skew_margin_ms);
             }
             catch (...)

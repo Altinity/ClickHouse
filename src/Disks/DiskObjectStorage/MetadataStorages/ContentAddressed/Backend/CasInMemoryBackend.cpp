@@ -22,18 +22,6 @@ namespace DB::Cas
 namespace
 {
 
-/// The windowed slice of `data` for `range`, with the clamping `getStream` documents: an offset at or
-/// past EOF yields an empty result; an open-ended length runs to EOF.
-String sliceWindow(const String & data, Range range)
-{
-    const size_t offset = static_cast<size_t>(range.offset);
-    if (offset >= data.size())
-        return {};
-    if (range.length.has_value())
-        return data.substr(offset, static_cast<size_t>(*range.length));
-    return data.substr(offset);
-}
-
 /// A CALLER bug, refused before it ever reaches the store: an empty, wildcard or list value would
 /// turn a conditional mutation into an unconditional one. Stricter than
 /// `isIncarnationValue(Dialect::Emulated, ...)` (non-empty only): this backend is a test double
@@ -60,12 +48,9 @@ void checkExpectedValue(const String & key, const String & value)
 
 }
 
-Token InMemoryBackend::mintToken()
+String InMemoryBackend::mintValue()
 {
-    Token t;
-    t.value = std::to_string(++token_seq_);
-    t.type = TokenType::Emulated;
-    return t;
+    return std::to_string(++token_seq_);
 }
 
 std::exception_ptr InMemoryBackend::takeArmedFailure(ArmedFailures & armed, const String & key)
@@ -96,30 +81,19 @@ std::optional<Backend::Raw> InMemoryBackend::read(const String & key, TransportA
     if (it == store_.end())
         return std::nullopt;
 
-    return Raw{it->second.bytes, it->second.token.value};
-}
-
-std::optional<GetStreamResult> InMemoryBackend::getStream(const String & key, Range range)
-{
-    std::lock_guard lock(mutex_);
-    auto it = store_.find(key);
-    if (it == store_.end())
-        return std::nullopt;
-
-    /// Copy the windowed bytes into an owning buffer — the in-memory backend has no separate storage
-    /// to stream from, so the "stream" reads from a private copy of exactly the requested window.
-    GetStreamResult sr;
-    sr.stream = std::make_unique<ReadBufferFromOwnString>(sliceWindow(it->second.bytes, range));
-    sr.token = it->second.token;
-    return sr;
+    return Raw{it->second.bytes, it->second.value};
 }
 
 std::unique_ptr<ReadBuffer> InMemoryBackend::stream(const String & key, TransportAccess &)
 {
-    auto sr = getStream(key, Range{});
-    if (!sr)
+    std::lock_guard lock(mutex_);
+    auto it = store_.find(key);
+    if (it == store_.end())
         return nullptr;
-    return std::move(sr->stream);
+
+    /// Copies the bytes into an owning buffer — the in-memory backend has no separate storage to
+    /// stream from, so the "stream" reads from a private copy taken while the lock is held.
+    return std::make_unique<ReadBufferFromOwnString>(it->second.bytes);
 }
 
 std::optional<Backend::RawMeta> InMemoryBackend::head(const String & key, TransportAccess &)
@@ -132,7 +106,7 @@ std::optional<Backend::RawMeta> InMemoryBackend::head(const String & key, Transp
     if (it == store_.end())
         return std::nullopt;
 
-    return RawMeta{static_cast<uint64_t>(it->second.bytes.size()), it->second.token.value};
+    return RawMeta{static_cast<uint64_t>(it->second.bytes.size()), it->second.value};
 }
 
 std::expected<String, Backend::RawConflict> InMemoryBackend::write(
@@ -197,24 +171,24 @@ std::expected<String, Backend::RawConflict> InMemoryBackend::writeUnderLock(
         if (store_.contains(key))
             return std::unexpected(RawConflict{});
 
-        Token t = mintToken();
+        String v = mintValue();
         Object obj;
         obj.bytes = bytes;
-        obj.token = t;
+        obj.value = v;
         store_[key] = std::move(obj);
-        return t.value;
+        return v;
     }
 
     auto it = store_.find(key);
     if (it == store_.end())
         return std::unexpected(RawConflict{});
-    if (enforce_tokens_ && it->second.token.value != *expected_value)
+    if (enforce_tokens_ && it->second.value != *expected_value)
         return std::unexpected(RawConflict{});
 
-    Token t = mintToken();
+    String v = mintValue();
     it->second.bytes = bytes;
-    it->second.token = t;
-    return t.value;
+    it->second.value = v;
+    return v;
 }
 
 void InMemoryBackend::publish(const BlobPublishRequest & request, TransportAccess &)
@@ -253,7 +227,7 @@ void InMemoryBackend::publish(const BlobPublishRequest & request, TransportAcces
         std::lock_guard lock(mutex_);
         Object object;
         object.bytes = std::move(body);
-        object.token = mintToken();
+        object.value = mintValue();
         store_[request.destination_key] = std::move(object);
         return;
     }
@@ -269,33 +243,22 @@ void InMemoryBackend::publish(const BlobPublishRequest & request, TransportAcces
 
     Object object;
     object.bytes = source->second.bytes;
-    object.token = mintToken();
+    object.value = mintValue();
     store_[request.destination_key] = std::move(object);
 }
 
-DeleteOutcome InMemoryBackend::applyDelete(const String & key, const Token & token)
+Backend::RawRemoval InMemoryBackend::applyDelete(const String & key, const String & expected_value)
 {
     // Caller holds the mutex.
     auto it = store_.find(key);
     if (it == store_.end())
-    {
-        DeleteOutcome d;
-        d.kind = DeleteOutcome::Kind::NotFound;
-        return d;
-    }
+        return RawRemoval::Gone;
 
-    if (enforce_tokens_ && it->second.token != token)
-    {
-        DeleteOutcome d;
-        d.kind = DeleteOutcome::Kind::TokenMismatch;
-        return d;
-    }
+    if (enforce_tokens_ && it->second.value != expected_value)
+        return RawRemoval::Mismatch;
 
     store_.erase(it);
-    DeleteOutcome d;
-    d.kind = DeleteOutcome::Kind::Deleted;
-    d.created_delete_marker = simulate_delete_markers_;
-    return d;
+    return simulate_delete_markers_ ? RawRemoval::DeleteMarker : RawRemoval::Removed;
 }
 
 Backend::RawRemoval InMemoryBackend::remove(const String & key, const String & expected_value, TransportAccess &)
@@ -304,8 +267,6 @@ Backend::RawRemoval InMemoryBackend::remove(const String & key, const String & e
     /// covering both the immediate delete below and the hold_deletes_ enqueue path, so a queued
     /// PendingDelete can never carry a malformed value either.
     checkExpectedValue(key, expected_value);
-
-    const Token expected{expected_value, TokenType::Emulated};
 
     std::lock_guard lock(mutex_);
 
@@ -316,26 +277,16 @@ Backend::RawRemoval InMemoryBackend::remove(const String & key, const String & e
         auto it = store_.find(key);
         if (it == store_.end())
             return RawRemoval::Gone;
-        if (enforce_tokens_ && it->second.token != expected)
+        if (enforce_tokens_ && it->second.value != expected_value)
             return RawRemoval::Mismatch;
         PendingDelete pd;
         pd.key = key;
-        pd.token = expected;
+        pd.value = expected_value;
         pending_deletes_.push_back(std::move(pd));
         return simulate_delete_markers_ ? RawRemoval::DeleteMarker : RawRemoval::Removed;
     }
 
-    const DeleteOutcome d = applyDelete(key, expected);
-    switch (d.kind)
-    {
-        case DeleteOutcome::Kind::Deleted:
-            return d.created_delete_marker ? RawRemoval::DeleteMarker : RawRemoval::Removed;
-        case DeleteOutcome::Kind::NotFound:
-            return RawRemoval::Gone;
-        case DeleteOutcome::Kind::TokenMismatch:
-            return RawRemoval::Mismatch;
-    }
-    UNREACHABLE();
+    return applyDelete(key, expected_value);
 }
 
 Backend::RawListPage InMemoryBackend::list(const String & prefix, const String & cursor, size_t limit, TransportAccess &)
@@ -358,7 +309,7 @@ Backend::RawListPage InMemoryBackend::list(const String & prefix, const String &
         RawListedKey lk;
         lk.key = it->first;
         lk.size = static_cast<uint64_t>(it->second.bytes.size());
-        lk.value = it->second.token.value;   /// in-memory backend always surfaces it (supportsListTokens == true)
+        lk.value = it->second.value;   /// in-memory backend always surfaces it (supportsListTokens == true)
         page.keys.push_back(std::move(lk));
         ++count;
         ++it;
@@ -426,21 +377,17 @@ size_t InMemoryBackend::pendingDeletes() const
     return pending_deletes_.size();
 }
 
-DeleteOutcome InMemoryBackend::landPendingDelete(size_t i)
+Backend::RawRemoval InMemoryBackend::landPendingDelete(size_t i)
 {
     std::lock_guard lock(mutex_);
     if (i >= pending_deletes_.size())
-    {
-        DeleteOutcome d;
-        d.kind = DeleteOutcome::Kind::NotFound;
-        return d;
-    }
+        return RawRemoval::Gone;
 
     PendingDelete pd = pending_deletes_[i];
     pending_deletes_.erase(pending_deletes_.begin() + static_cast<ptrdiff_t>(i));
 
-    // Apply the token check at LAND time — the object may have been modified since the delete was enqueued.
-    return applyDelete(pd.key, pd.token);
+    // Apply the value check at LAND time — the object may have been modified since the delete was enqueued.
+    return applyDelete(pd.key, pd.value);
 }
 
 void InMemoryBackend::refuseNextWrite(const String & key)

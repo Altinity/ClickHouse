@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -58,7 +58,7 @@ inline RunMarker runMarkerFromByte(char byte, std::string_view what)
 /// compression) + `Strict` (byte-deterministic for `putDeterministicArtifact` adoption).
 ///
 /// This file is backend-free: it accepts caller-owned `ReadBuffer`/`WriteBuffer` objects and reaches
-/// no backend or GC machinery -- `PersistedIncarnation` is a value type with no live backend behind
+/// no backend or GC machinery -- `PersistedEtag` is a value type with no live backend behind
 /// it, which is exactly why a persisted row may hold one. The GC layer owns the stream lifetime and the bridge to
 /// packed keys and condemned rows; this codec owns only the durable text representation and its
 /// identifier-layer types. Keeping that boundary physical prevents storage or GC dependencies from
@@ -87,7 +87,7 @@ struct SourceEdgeRecord
     UInt128 source_id{};
     RunMarker marker = RunMarker::Edge;
     bool delete_pending = false;
-    PersistedIncarnation token{};
+    PersistedEtag token{};
     uint64_t size = 0;
     uint64_t condemn_round = 0;
     bool marker_confirmed = false;   /// durable Condemned meta confirmed for this entry (graduation gate)

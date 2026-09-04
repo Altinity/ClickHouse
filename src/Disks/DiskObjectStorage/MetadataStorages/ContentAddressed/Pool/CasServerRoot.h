@@ -31,7 +31,7 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-enum class MountLeaseKeeperState : uint8_t
+enum class MountLeaseRenewerState : uint8_t
 {
     New,
     Active,
@@ -201,7 +201,7 @@ enum class MountPriorState
 /// slot. Decision over `get(mountKey)`:
 ///   - absent → write our body via `create` → `Claimed`;
 ///   - same `server_uuid` AND same `writer_epoch` as (our_uuid, our_epoch) → it is OUR OWN claim
-///     (a replay / the keeper adopting it):
+///     (a replay / the renewer adopting it):
 ///       - `gc_fenced` → terminal for THIS (uuid, epoch) — a fence costs an epoch, so refreshing it
 ///         in place would reactivate a fenced incarnation → `FencedSelf` (no write);
 ///       - otherwise → refresh (`replace` to bump seq + fresh `expires_at_ms`) → `Claimed`;
@@ -209,7 +209,7 @@ enum class MountPriorState
 ///     needs no fresh wall-clock trust (see
 ///     `claimMountAwaitingExpiry` below for how a plain "looks expired" reading is turned into one):
 ///       - `gc_fenced` (the GC leader already, itself, threshold-gated this incarnation dead; a fence
-///         costs an epoch, so its keeper can never renew again) → reclaim, `prior = Fenced`;
+///         costs an epoch, so its renewer can never renew again) → reclaim, `prior = Fenced`;
 ///       - the clean marker (`min_active_build_sequence == UINT64_MAX`, the predecessor's own graceful farewell) →
 ///         reclaim, `prior = Clean`;
 ///       - `proven_dead_incarnation` matches the CURRENTLY OBSERVED incarnation (the caller itself
@@ -244,7 +244,7 @@ struct MountClaimResult
     /// loop would otherwise re-read the mount key just to recover what `claimMount` had already read
     /// one line earlier and thrown away -- one wasted read per iteration. Empty for every other
     /// `Kind` (nothing to compare against).
-    std::optional<Incarnation> incarnation;
+    std::optional<Etag> etag;
 };
 
 /// Thrown when a mount operation observes that OUR OWN (uuid, epoch) slot was `gc_fenced` by the GC
@@ -267,7 +267,7 @@ public:
 /// attempt with no such proof.
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
-    uint64_t now_ms, uint64_t ttl_ms, const std::optional<Incarnation> & proven_dead_incarnation = {},
+    uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation = {},
     const CasEventSink & sink = {});
 
 /// Format the operator-actionable startup error shown when the mount lease is held by a genuinely
@@ -321,7 +321,7 @@ MountClaimResult claimMountAwaitingExpiry(
 /// tight poll loop.
 struct MountIncarnationObservation
 {
-    Incarnation incarnation;
+    Etag etag;
     uint64_t first_seen_mono_ms = 0;
 };
 
@@ -336,7 +336,7 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 /// Classification per body:
 ///   - `gc_fenced` already set → excluded (`already_fenced`); a fenced mount is terminal, no PUT;
 ///   - terminated (`min_active_build_sequence == UINT64_MAX`, the farewell sentinel stamped by
-///     `MountLeaseKeeper::terminate`) → excluded (`terminated`). `expires_at_ms` alone cannot
+///     `MountLeaseRenewer::terminate`) → excluded (`terminated`). `expires_at_ms` alone cannot
 ///     distinguish a graceful farewell from an unclean stop, so the sentinel — not the timestamps — is the
 ///     terminated marker;
 ///   - otherwise, observation-based liveness (the same
@@ -391,7 +391,7 @@ struct NonTerminalMountSlot
 /// Read-only scan of every mount slot under the pool prefix, answering ONE question: is some writer
 /// still entitled to this prefix? A slot counts as terminal on exactly the two clock-free certificates
 /// the mount protocol already recognises (`computeHeartbeatFloor`'s own classification): `gc_fenced`
-/// (the GC leader fenced that incarnation out, and a fence costs an epoch, so its keeper can never
+/// (the GC leader fenced that incarnation out, and a fence costs an epoch, so its renewer can never
 /// renew again) and `min_active_build_sequence == UINT64_MAX` (the holder's own graceful farewell). Everything else is
 /// reported, INCLUDING a body this build cannot decode -- an unreadable lease of some other format
 /// generation is precisely the case that must block, not the one to wave through.
@@ -445,7 +445,7 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 /// two clock-free certificates `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use for the
 /// identical question at pool-prefix and GC-heartbeat granularity —
 ///   - `gc_fenced` (the GC leader already fenced this incarnation; a fence costs an epoch, so its
-///     keeper can never renew again),
+///     renewer can never renew again),
 ///   - the clean-farewell sentinel `min_active_build_sequence == UINT64_MAX`,
 /// PLUS one more certificate available here that neither of those needs: a DIFFERENT `writer_epoch`
 /// currently live at that slot proves `writer_epoch`'s specific incarnation is superseded regardless of
@@ -483,7 +483,7 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 /// runtime, or performs a durable write from its destructor.
 ///
 /// ADOPT RULE (critical): the steady-state flow is `claimMount(...)` writes the live mount under
-/// (our_uuid, our_epoch), THEN `keeper.start()`. So `start`'s `claim` hook must ADOPT a live mount
+/// (our_uuid, our_epoch), THEN `renewer.start()`. So `start`'s `claim` hook must ADOPT a live mount
 /// that is ALREADY ours — same `server_uuid` AND same `writer_epoch` — instead of self-tripping the
 /// live-double-start guard. The discriminator is the (uuid, epoch) pair:
 ///   - same uuid + same epoch  → our own just-written claim (or a replay) → adopt: `replace`
@@ -498,10 +498,10 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 /// a farewell refused because the fence has run down would leave the slot looking live until GC
 /// fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a caller
 /// that has shutdown facts hands them over as a `Liveness`.
-class MountLeaseKeeper
+class MountLeaseRenewer
 {
 public:
-    MountLeaseKeeper(
+    MountLeaseRenewer(
         CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
         const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
@@ -509,7 +509,7 @@ public:
         CasEventSink event_sink_ = {},
         std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(2000),
         /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for
-        /// tests and wired by CasMountRuntime::installKeeper.
+        /// tests and wired by CasMountRuntime::installRenewer.
         std::function<uint64_t()> boot_ms_fn_ = {});
 
     /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
@@ -520,23 +520,23 @@ public:
     /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
     /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an
     /// operation admitted under it would be refused before its first attempt. It admits on this
-    /// keeper's own open plane, the one the claim and the farewell use, so there is no plane for a
+    /// renewer's own open plane, the one the claim and the farewell use, so there is no plane for a
     /// caller to get wrong. Same policy and same verdicts as `renew`.
     MountRenewResult renewForRemount(const MountRenewOperationEnvironment & environment = {});
     void release();
 
-    MountLeaseKeeperState state() const { return keeper_state; }
-    bool canRelease() const { return keeper_state == MountLeaseKeeperState::Active; }
+    MountLeaseRenewerState state() const { return renewer_state; }
+    bool canRelease() const { return renewer_state == MountLeaseRenewerState::Active; }
     uint64_t lastCommittedAttemptStartBootMs() const { return last_committed_attempt_start_boot_ms; }
 
 private:
     String encodeBody(uint64_t seq_, uint64_t wall_ms, uint64_t min_active_build_sequence, UInt128 write_attempt_id) const;
     /// The incarnation every guarded write of this slot names. Engaged for exactly the states that
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
-    const Incarnation & precondition() const;
+    const Etag & precondition() const;
     /// One renewal admitted on `plane`; `renew` and `renewForRemount` differ only in which they pass.
     MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment);
-    Incarnation claim(CasOperation & op, const String & body);
+    Etag claim(CasOperation & op, const String & body);
     [[noreturn]] void throwRenewConflict(const Observation & seen) const;
     MountRenewResult terminalResult(MountRenewResult result);
     void terminate(CasOperation & op);
@@ -554,13 +554,13 @@ private:
     CasEventSink event_sink;
     std::chrono::milliseconds lease_safety_margin;
     /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for
-    /// tests and wired by CasMountRuntime::installKeeper.
+    /// tests and wired by CasMountRuntime::installRenewer.
     std::function<uint64_t()> boot_ms_fn;
-    MountLeaseKeeperState keeper_state = MountLeaseKeeperState::New;
+    MountLeaseRenewerState renewer_state = MountLeaseRenewerState::New;
     uint64_t seq = 0;
     /// The incarnation our last landed write created; every renewal and the farewell name it as the
     /// precondition. Unset only before `start` has landed one.
-    std::optional<Incarnation> last_incarnation;
+    std::optional<Etag> last_etag;
     uint64_t confirmed_deadline_boot_ms = 0;
     uint64_t last_committed_attempt_start_boot_ms = 0;
 };

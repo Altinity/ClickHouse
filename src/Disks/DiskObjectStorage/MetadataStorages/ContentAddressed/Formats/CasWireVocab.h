@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasIncarnation.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
@@ -21,10 +21,10 @@ namespace DB::Cas
 /// The incarnation-dialect wire vocabulary; coverage is proven in `CasWireVocab.cpp`. It has two
 /// persisted encodings -- the word, used by every JSON codec here, and the one byte the condemned-row
 /// payload stores -- and both go through this one table so they can never name different sets.
-inline constexpr EnumWireTable<TokenType, 3> kTokenTypeWords{{{
-    {TokenType::ETag, "etag"},
-    {TokenType::Generation, "generation"},
-    {TokenType::Emulated, "emulated"},
+inline constexpr EnumWireTable<Dialect, 3> kTokenTypeWords{{{
+    {Dialect::ETag, "etag"},
+    {Dialect::Generation, "generation"},
+    {Dialect::Emulated, "emulated"},
 }}};
 
 /// The `ObjectKind` wire vocabulary; coverage is proven in `CasWireVocab.cpp`.
@@ -58,7 +58,7 @@ ObjectKind objectKindFromWord(std::string_view w, std::string_view what);
 /// Append the sibling fields `token_type` and `token` to an in-progress JSON object. The caller owns `first`,
 /// which must describe the fields already written to that object; the value is JSON-escaped. The
 /// dialect is validated on the way out, so a record can never persist a word its reader would reject.
-void writeTokenFields(CasJsonWriter & out, bool & first, const PersistedIncarnation & inc);
+void writeTokenFields(CasJsonWriter & out, bool & first, const PersistedEtag & inc);
 
 /// Append the sibling fields `algo` and `digest` to an in-progress JSON object. The algorithm word and
 /// lowercase digest are canonical, and the digest is rendered at the width required by `r.algo`.
@@ -160,7 +160,7 @@ struct TokenFields
 
     /// Requires both fields and validates the dialect word. `what` identifies the enclosing codec
     /// in `CORRUPTED_DATA` exceptions.
-    PersistedIncarnation build(std::string_view what) const;
+    PersistedEtag build(std::string_view what) const;
 };
 
 /// Each `match*Fields` helper tests `key` against the one or two field names it owns, consumes the

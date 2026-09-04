@@ -29,7 +29,7 @@ namespace DB::ContentAddressedSetting
 ///
 /// WHAT THIS FILE PINS: the last clause, per key. The counts below were READ OFF this tree before any
 /// key change and pasted as literals, which is the whole point of the file -- expectations re-derived
-/// after a change measure the change against itself. Incarnation qualification changes the KEY a
+/// after a change measure the change against itself. Etag qualification changes the KEY a
 /// namespace file is stored under, so the keys are derived from `Layout` rather than spelled out; what
 /// must not move is the count per key and the set of keys touched.
 ///
@@ -519,7 +519,8 @@ TEST(CASNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
 
     /// A valid pool already owns its explicit empty mandatory catalog. Nothing has opened this table:
     /// no namespace file written, no part published, and no ref operation has changed that object.
-    const auto catalog_before = storage->store()->backend().get(layout.refCatalogKey());
+    OperationForTest catalog_probe(storage->store()->poolBackendPtr());
+    const auto catalog_before = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_before);
     EXPECT_TRUE(decodeRefCatalog(catalog_before->bytes).entries.empty());
     object_storage->resetRecords();
@@ -538,10 +539,10 @@ TEST(CASNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
 
     EXPECT_EQ(object_storage->writtenContaining(layout.refCatalogKey()), std::vector<String>{})
         << "a removal must not write the catalog: it must not birth the namespace it is removing from";
-    const auto catalog_after_removal = storage->store()->backend().get(layout.refCatalogKey());
+    const auto catalog_after_removal = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_after_removal);
     EXPECT_EQ(catalog_after_removal->bytes, catalog_before->bytes);
-    EXPECT_EQ(catalog_after_removal->token, catalog_before->token)
+    EXPECT_EQ(catalog_after_removal->etag, catalog_before->etag)
         << "the mandatory catalog must remain byte-for-byte and token-for-token unchanged";
 
     /// Not vacuous: the SAME operations on the same table after a write do reach the file, so the zeros
@@ -553,8 +554,8 @@ TEST(CASNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUnto
     EXPECT_FALSE(storage->existsFile(kTablePath + "/format_version.txt"));
     /// Positive control: the write really did birth the namespace and mutate the same catalog object
     /// whose stability the removal assertions pin above.
-    const auto catalog_after_birth = storage->store()->backend().get(layout.refCatalogKey());
+    const auto catalog_after_birth = (*catalog_probe).read(layout.refCatalogKey(), Retry::standard());
     ASSERT_TRUE(catalog_after_birth);
     EXPECT_NE(catalog_after_birth->bytes, catalog_after_removal->bytes);
-    EXPECT_NE(catalog_after_birth->token, catalog_after_removal->token);
+    EXPECT_NE(catalog_after_birth->etag, catalog_after_removal->etag);
 }

@@ -441,7 +441,7 @@ public:
     /// or foreign observation; the gated mutate chokepoints then fail closed.
     void tripMountLost();
     /// Refresh the write-fence deadline (a CLOCK_BOOTTIME-milliseconds instant; release).
-    /// keeper renew calls this on success.
+    /// renewer renew calls this on success.
     void setMountDeadline(uint64_t deadline_boot_ms);
     /// Arm the fence at startup: set (uuid, epoch, deadline), clear `lost`.
     void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
@@ -508,7 +508,7 @@ public:
     /// next step boundary, bounding the joins below); (2) trip the local fence (the deliberate
     /// decommission act, allowed on a live disk); (3+4) stop the GC scheduler via `stop_and_join_gc` —
     /// injected because the scheduler is owned above the Pool, a no-op in contexts that run none — and stop
-    /// + join both persistent workers; (5) drain the ref lanes (bounded) and retire the keeper WITHOUT an
+    /// + join both persistent workers; (5) drain the ref lanes (bounded) and retire the renewer WITHOUT an
     /// unearned clean farewell (the lease expires by observation unless the lanes provably drained); then
     /// (6) publish `Vanished(forgotten)` carrying `reason` (the [D5] message with the operator's decommission
     /// timestamp). Idempotent: an already-`Vanished` pool returns immediately (first terminal transition
@@ -708,7 +708,6 @@ public:
     const PoolConfig & poolConfig() const { return config; }
     const PoolMeta & poolMeta() const { return meta; }
     const Layout & layout() const { return pool_layout; }
-    Backend & backend() { return *pool_backend; }
 
     /// ---- the three request planes ----
     /// The mount plane: the durable writes whose right to land IS this node's mount lease. An
@@ -723,22 +722,17 @@ public:
     /// claims. None of them hold a mount lease -- the claims are what ESTABLISHES one, so gating them
     /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
     /// reclaim.
-    CasRequests & gcRequests() { return gc_requests; }
+    CasRequests & openRequests() { return gc_requests; }
     /// The owning `BackendPtr` itself (not just a reference into it): the decommission slot-retirement
     /// decommission step (`CasDecommission.cpp`) must keep the backend alive across `admin.reset()` -- the graceful
     /// close that stamps the mount's farewell -- to physically delete the control objects afterward. A
     /// bare `Backend &` from `backend()` would dangle the instant the owning `Pool` is destroyed.
     BackendPtr poolBackendPtr() const { return pool_backend; }
 
-    /// Staging write surface for `PartWriteTxn`: thin delegates onto the ref ledger, so a staging write
+    /// Staging write surface for `PartWriteTxn`: thin delegate onto the ref ledger, so a staging write
     /// is admitted on the same plane and under the same policy as a ref-lane write and `PartWriteTxn`
-    /// reaches neither directly.
+    /// reaches it neither directly.
     WriteResult stagingPutIfAbsent(const String & key, const String & bytes);
-    /// Same retry/fence policy as `stagingPutIfAbsent`, for a mutable exact-incarnation overwrite.
-    WriteResult stagingConditionalOverwrite(const String & key, const String & bytes, const Incarnation & expected);
-    /// Same retry/fence policy as `stagingPutIfAbsent`, for a mutable marker where an existing
-    /// DIFFERENT value at the key is a normal `Conflict`, not corruption.
-    WriteResult stagingPutIfAbsentMutable(const String & key, const String & bytes);
 
     /// CAS mixed-algo pools:
     /// the NODE-LOCAL algo this Pool mints NEW content with (`PoolConfig::blob_hash_algo` -- never
@@ -773,10 +767,10 @@ public:
     void setLiveWriterEpochForTest(uint64_t writer_epoch) { mount_runtime.setLiveWriterEpoch(writer_epoch); }
 
     /// Self-remount after a GC fence-out (liveness counterpart of the fence-out safety rule): the
-    /// OLD incarnation may never write again (the keeper never re-mints), but a FRESH incarnation —
+    /// OLD incarnation may never write again (the renewer never re-mints), but a FRESH incarnation —
     /// durable writer_epoch bump + mount reclaim + re-armed write fence — is exactly what a server
     /// restart would create, so a live server may create it in place. Runs the same claim machinery as
-    /// `Pool::open`. Orchestration stays here; the owned mount primitives it drives (keeper swap,
+    /// `Pool::open`. Orchestration stays here; the owned mount primitives it drives (renewer swap,
     /// epoch bump, fence re-arm) live on `mount_runtime`. Returns false (and changes nothing durable
     /// beyond the epoch bump) when the
     /// mount cannot be claimed (foreign owner / a genuinely live twin) — the caller retries. Safe to
@@ -790,7 +784,7 @@ public:
     /// Test seam: how many times `scheduleRemount` has been ENTERED, counted
     /// unconditionally as its very first statement. This increments even under the default
     /// `background_watermark = false` (no worker exists; a
-    /// test never pays for a real self-remount attempt racing this Pool's own still-live keeper, which
+    /// test never pays for a real self-remount attempt racing this Pool's own still-live renewer, which
     /// -- confirmed while building this seam -- reliably takes 30+ seconds per call and is not something
     /// a fast unit test should be driving). Positively pins that a production call site (e.g.
     /// `reportImpossibleInterference`) actually invoked `scheduleRemount`, as opposed to merely observing
@@ -850,7 +844,7 @@ private:
     };
 
     /// The writable-mount startup tail shared by `open` and `openForDecommission`: owner claim →
-    /// writer_epoch → mount claim (+fence-recovery loop) → `MountLeaseKeeper` start → watermark
+    /// writer_epoch → mount claim (+fence-recovery loop) → `MountLeaseRenewer` start → watermark
     /// anchor. `our_uuid` is the identity to mount as -- `config.server_id` for a normal open, the
     /// victim's owner uuid for decommission (impersonation). `policy` changes only what happens when
     /// the mount claim does not resolve `Claimed`/`FencedSelf`: `WaitForExpiry` observes a stale-
@@ -1191,7 +1185,7 @@ private:
     /// `mount_runtime.finishTeardown` exactly as before.
     CasRefLedger ref_ledger;
     /// The mount / write-fence / build-watermark / self-remount runtime, extracted
-    /// from Pool. Owns the `MountLeaseKeeper`, the local `MountFence`, the per-server
+    /// from Pool. Owns the `MountLeaseRenewer`, the local `MountFence`, the per-server
     /// build watermark (`process_epoch` + the `builds_mutex`-guarded seq/registry) and its in-flight-build
     /// map, the live-incarnation `live_writer_epoch`, the unclean-epoch high-water-mark, and the
     /// persistent renewal and remount workers (with one driver mutex/condition pair). Injected with backend/layout

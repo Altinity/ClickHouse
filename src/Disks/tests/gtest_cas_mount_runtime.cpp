@@ -12,7 +12,7 @@ using namespace DB::Cas;
 namespace
 {
 
-/// A `CasMountRuntime` with nothing running on it: no keeper, no workers, an injected boot clock and a
+/// A `CasMountRuntime` with nothing running on it: no renewer, no workers, an injected boot clock and a
 /// fence the test arms by hand. Enough to exercise admission, which reads only the fence's own state.
 class RuntimeFixture
 {

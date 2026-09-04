@@ -294,13 +294,6 @@ public:
     /// corruption.
     WriteResult stagingPutIfAbsent(const String & key, const String & bytes);
 
-    /// The If-Match sibling of `stagingPutIfAbsent`, for a MUTABLE marker.
-    WriteResult stagingConditionalOverwrite(const String & key, const String & bytes, const Incarnation & expected);
-
-    /// Create-if-absent for a MUTABLE marker, where a DIFFERENT value already at the key is an
-    /// ordinary `Conflict` for the caller to act on rather than corruption.
-    WriteResult stagingPutIfAbsentMutable(const String & key, const String & bytes);
-
     /// Hooks required by `EventEmitter`: events are delivered to the injected sink when one is present.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink); }
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }

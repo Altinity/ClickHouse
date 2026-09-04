@@ -54,12 +54,13 @@ using CountingHintHoleBackend = DB::Cas::tests::HintHoleBackendOn<DB::Cas::tests
 /// than a fold seal).
 std::optional<RefCoverage> coverageOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
+    DB::Cas::tests::OperationForTest op(backend);
     const uint64_t gen = currentGenerationOf(backend, layout);
     const uint64_t attempt = currentAttemptOf(backend, layout);
     const UInt128 life_id = catalogLifeIdForTest(backend, layout, ns);
     for (uint64_t g = gen; ; --g)
     {
-        if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
+        if (const auto got = (*op).read(layout.foldSealKey(g, attempt), Retry::standard()))
         {
             const CasFoldSeal seal = decodeFoldSeal(got->bytes);
             const auto it = seal.ref_lives.find(life_id);
@@ -392,7 +393,10 @@ TEST(CASGCBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruc
     EXPECT_EQ(backend->deleteTotal(), 1u)
         << "the committed frontier permits the round's immediate manifest cleanup. Deleted:"
         << deletedKeysMessage(*backend);
-    EXPECT_TRUE(backend->head(layout.blobKey(legacyMetaTestRef(blob))).exists);
+    {
+        DB::Cas::tests::OperationForTest head_op(*backend);
+        EXPECT_TRUE((*head_op).head(layout.blobKey(legacyMetaTestRef(blob)), Retry::standard()).has_value());
+    }
 
     /// The raw F+1 record remains outside the CTE; it cannot defer the normal destructive pipeline.
     backend->disarm();

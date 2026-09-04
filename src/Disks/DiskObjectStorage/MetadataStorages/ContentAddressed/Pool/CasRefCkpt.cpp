@@ -1,5 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
 #include <algorithm>
@@ -189,7 +189,7 @@ std::optional<CkptSample> readCkpt(CasOperation & op, const Layout & layout, con
         return std::nullopt;
     /// Materialized read, then decode: the object is MUTABLE, so the body must be fixed before it is
     /// parsed, and the incarnation must be the one that labels exactly these bytes.
-    return CkptSample{decodeRefCkpt(got->bytes), got->incarnation};
+    return CkptSample{decodeRefCkpt(got->bytes), got->etag};
 }
 
 CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
@@ -285,7 +285,7 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
     UNREACHABLE();
 }
 
-MissingBaseVerdict classifyMissingSampledBase(const Incarnation & sampled, const std::optional<Incarnation> & current)
+MissingBaseVerdict classifyMissingSampledBase(const Etag & sampled, const std::optional<Etag> & current)
 {
     if (current && !(*current == sampled))
         return MissingBaseVerdict::RestartRecovery;

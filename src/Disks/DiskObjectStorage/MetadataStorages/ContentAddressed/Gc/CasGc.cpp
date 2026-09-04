@@ -88,7 +88,7 @@ uint64_t deletePrefixWholesale(CasOperation & op, const String & prefix, uint64_
 
 /// The text an incarnation carries into the event log. Persisted and live incarnations render the
 /// same way, so the column speaks one vocabulary whichever half of the pipeline wrote the row.
-String renderIncarnation(const PersistedIncarnation & token)
+String renderIncarnation(const PersistedEtag & token)
 {
     return token.dialect + ":" + token.value;
 }
@@ -342,7 +342,7 @@ void Gc::runNamespaceJanitorPage(
     NamespaceJanitorResult janitor_result;
     try
     {
-        CasRequests & requests = store->gcRequests();
+        CasRequests & requests = store->openRequests();
         const Layout & layout = store->layout();
         NamespaceJanitor janitor(requests, layout, 1000);
         /// ONE authority read per page, made here rather than from the predicate: the janitor's
@@ -371,7 +371,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     RoundReport & report = progress ? *progress : local_report;
     report = RoundReport{};
     GcState state;
-    std::optional<Incarnation> state_incarnation;
+    std::optional<Etag> state_etag;
 
     /// Every exit path waits for this round's meta jobs. The throwing `meta_pool_wait` phase below is
     /// a protocol barrier -- this round's condemns must be durable no later than the ledger they are
@@ -386,7 +386,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// are correlated by `round_id` and not by the round number a follower never learns.
     {
         GcPhaseTimer t(phase_sink, "lease");
-        report.acquired_lease = acquireOrRenewLease(state, state_incarnation, allow_steal);
+        report.acquired_lease = acquireOrRenewLease(state, state_etag, allow_steal);
         t.metric("acquired", report.acquired_lease ? 1 : 0);
         t.metric("steal_allowed", allow_steal ? 1 : 0);
     }
@@ -412,7 +412,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// attempt is idempotent.
 
     const Layout & layout = store->layout();
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const uint64_t new_round = state.round + 1;
 
     /// ONE budget instance for the WHOLE round, threaded into every destructive-or-observability-write
@@ -446,7 +446,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("deleted", drain_result.deleted);
     }
 
-    /// Incarnation-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
+    /// Etag-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
     /// rounds via `new_round`, not on heartbeat acks). Fencing no longer trusts a predecessor's stamped
     /// `expires_at_ms` against our wall clock — it
     /// fences ONLY once `mount_obs` has watched the mount's write-token hold unchanged for the full
@@ -626,7 +626,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_incarnation, report, new_round, *walk_plan, policy, round_work_budget);
+    FoldResult folded = fold(state, state_etag, report, new_round, *walk_plan, policy, round_work_budget);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -692,8 +692,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             const std::optional<Meta> observed = op.head(blob_key, Retry::standard());
             Removal del = Removal::Gone;
             if (observed)
-                del = entry.token.matches(observed->incarnation)
-                    ? op.remove(blob_key, observed->incarnation, Retry::standard())
+                del = entry.token.matches(observed->etag)
+                    ? op.remove(blob_key, observed->etag, Retry::standard())
                     : Removal::Mismatch;
 
             const OutcomeKind outcome_kind = del == Removal::Removed ? OutcomeKind::Deleted
@@ -946,12 +946,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
     round_commit_timer->metric("pruned_through", next.snap_pruned_through);
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
-    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_incarnation,
+    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());
     if (std::holds_alternative<Conflict>(commit))
         throw Exception(ErrorCodes::ABORTED,
             "CAS gc round: gc/state moved during the round (another leader advanced it); retry next round");
-    state_incarnation = orThrow(std::move(commit), "CAS gc round commit");
+    state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
     report.round = state.round;
     round_commit_timer->metric("round", report.round);
@@ -1057,8 +1057,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// sealed AND taken on a round that could prove its frontier -- an unprovable round's `-1` may
         /// itself be the observation that is missing an owner elsewhere, so deleting the body on it is
         /// exactly the irreversible step the gate exists to withhold.
-        static const std::map<ManifestId, Incarnation> kNoManifestCleanup;
-        const std::map<ManifestId, Incarnation> & mf_cleanup_now =
+        static const std::map<ManifestId, Etag> kNoManifestCleanup;
+        const std::map<ManifestId, Etag> & mf_cleanup_now =
             suppress_destructive ? kNoManifestCleanup : folded.mf_cleanup;
         uint64_t attempted = 0;
         for (const auto & [id, incarnation] : mf_cleanup_now)
@@ -1120,8 +1120,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             const std::optional<Meta> observed = op.head(nomination.key, Retry::standard());
             Removal outcome = Removal::Gone;
             if (observed)
-                outcome = nomination.token.matches(observed->incarnation)
-                    ? op.remove(nomination.key, observed->incarnation, Retry::standard())
+                outcome = nomination.token.matches(observed->etag)
+                    ? op.remove(nomination.key, observed->etag, Retry::standard())
                     : Removal::Mismatch;
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
@@ -1181,7 +1181,7 @@ void Gc::reportStuckRemovals(const RefPlan & plan, uint64_t current_round)
 }
 
 bool Gc::foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
-                           std::map<ManifestId, Incarnation> & mf_cleanup, uint32_t txn_ordinal)
+                           std::map<ManifestId, Etag> & mf_cleanup, uint32_t txn_ordinal)
 {
     const Layout & layout = store->layout();
 
@@ -1258,7 +1258,7 @@ bool Gc::foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, s
         }
 
     if (sign < 0)
-        mf_cleanup.emplace(id, got->incarnation);   /// owner removed: defer the exact body delete to recheck
+        mf_cleanup.emplace(id, got->etag);   /// owner removed: defer the exact body delete to recheck
     return true;
 }
 
@@ -1274,7 +1274,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     /// not show a `_ckpt` would make the second witness a function of the first, which is precisely the
     /// dependency it exists to break: the listing is a SNAPSHOT, and a `_ckpt` that became durable after
     /// the enumeration is exactly the one whose namespace has records the same enumeration also missed.
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
 
     std::set<String> witness_namespaces;
@@ -1344,7 +1344,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
 
 std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
     const String gen_prefix = layout.gcGenPrefix(0);
     const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
@@ -1356,7 +1356,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
     std::set<uint64_t> listed_generations;
     bool listed_anything = false;
     std::optional<std::pair<uint64_t, uint64_t>> newest;
-    op.forEachListedKey(top, [&](const KeyEntry & k)
+    op.forEachListedKey(top, [&](const ListedKey & k)
     {
         listed_anything = true;
         const size_t from = top.size();
@@ -1476,11 +1476,11 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
 
 Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
 
     GenerationSealProbe probe;
-    op.forEachListedKey(layout.gcGenPrefix(generation), [&](const KeyEntry & k)
+    op.forEachListedKey(layout.gcGenPrefix(generation), [&](const ListedKey & k)
     {
         probe.generation_exists = true;   /// ANY object proves this generation was minted
         /// Parse a candidate attempt out of the path and then PROVE it by rebuilding the key: only a
@@ -1553,12 +1553,12 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
     }
 }
 
-Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_incarnation*/,
+Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                         RoundReport & report,
                         uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy,
                         GcRoundWorkBudget & work_budget)
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
     FoldResult result;
 
@@ -1601,13 +1601,13 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_in
     /// `cleanupRefObjects` and terminal-evidence attribution -- retains both the chosen incarnation and
     /// the lifecycle/absence distinction instead of re-reading or reducing the catalog independently.
     result.catalog_cut = catalog_snapshot;
-    /// THE POSITIVE EMPTY-UNIVERSE PROOF (see the destructive gate below). `incarnation` is guaranteed by
+    /// THE POSITIVE EMPTY-UNIVERSE PROOF (see the destructive gate below). `etag` is guaranteed by
     /// `CasRefCatalog::read` on every operational path -- absence there is `CORRUPTED_DATA`, never an
     /// empty snapshot -- but the check stays here so this fails closed if a bootstrap/test snapshot
     /// ever reaches this line. `entries` (not `live_incarnation`, which drops `Creating`) is the right
     /// source: a catalog holding only `Creating` rows must NOT read as an empty universe, and `entries`
     /// is the one view that still carries those rows.
-    result.catalog_cut_proved_empty = catalog_snapshot.incarnation.has_value() && catalog_snapshot.catalog.entries.empty();
+    result.catalog_cut_proved_empty = catalog_snapshot.etag.has_value() && catalog_snapshot.catalog.entries.empty();
 
     /// A malformed ref-object key or namespace aborts ref folding for the whole round: the
     /// round produces no ref delta, advances no cursor, and authorizes no destructive work -- recorded as
@@ -1707,7 +1707,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_in
             e.type = CasEventType::GcRetireObserve;
             e.object_kind = CasEventObjectKind::Blob;
             e.object_hash = blobIdOf(ref);
-            e.token = observed ? observed->incarnation.render() : "";
+            e.token = observed ? observed->etag.render() : "";
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
             e.outcome = observed ? "present" : "absent";
@@ -1723,7 +1723,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_in
             e.type = CasEventType::BlobRetire;
             e.object_kind = CasEventObjectKind::Blob;
             e.object_hash = blobIdOf(ref);
-            e.token = observed->incarnation.render();
+            e.token = observed->etag.render();
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
             e.outcome = "retired";
@@ -1737,7 +1737,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_in
         /// sees it; a successful write records the in-process (hash, token) confirmation the graduation
         /// gate consumes (`scheduleCondemnMarkerWrite` captures everything BY VALUE — never by reference
         /// to `cur_blob`, which the fold's tight streaming loop mutates while the job is queued).
-        meta_writer->scheduleCondemnMarkerWrite(ref, PersistedIncarnation::capture(observed->incarnation),
+        meta_writer->scheduleCondemnMarkerWrite(ref, PersistedEtag::capture(observed->etag),
                                                 condemn_round, adjusted.size);
         return adjusted;
     };
@@ -2411,7 +2411,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Incarnation> & /*state_in
             /// CLAMP (barrier), never a round abort: keep the cursor below THIS log and re-read it next
             /// round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
             std::vector<BlobDelta> log_deltas;
-            std::map<ManifestId, Incarnation> log_mf_cleanup;
+            std::map<ManifestId, Etag> log_mf_cleanup;
             for (const RefManifestEdge & edge : edges)
             {
                 ProfileEvents::increment(ProfileEvents::CASRefEmittedEdges);   /// one manifest-edge event
@@ -3265,7 +3265,7 @@ void Gc::cleanupRefObjects(
     if (suppress_destructive)
         return;
 
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
     if (!folded.catalog_cut)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS GC ref cleanup: fold result carries no catalog cut");
@@ -3307,7 +3307,7 @@ void Gc::cleanupRefObjects(
                     [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
                 const std::optional<NamespaceLifeId> current_life
                     = current_catalog.life_index.resolve(life.incarnation);
-                if (current_catalog.incarnation != folded.catalog_cut->incarnation
+                if (current_catalog.etag != folded.catalog_cut->etag
                     || current_entry_it == current_catalog.catalog.entries.end()
                     || current_entry_it->ns != ns || *current_entry_it != observed_entry
                     || !current_life || *current_life != life)
@@ -3344,7 +3344,7 @@ void Gc::cleanupRefObjects(
                 return false;
             }
 
-            op.remove(key, h->incarnation, Retry::standard());
+            op.remove(key, h->etag, Retry::standard());
             ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted);   /// cleanup object deletion
             return true;
         };
@@ -3437,22 +3437,22 @@ uint64_t deletePrefixWholesale(CasOperation & op, const String & prefix, uint64_
     String cursor;
     while (deleted < bounded_remaining)
     {
-        KeyPage page = op.list(prefix, cursor, kListPageLimit, Retry::standard());
+        ListPage page = op.list(prefix, cursor, kListPageLimit, Retry::standard());
         /// One page fetched, not one increment per listed key below.
         ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
         for (const auto & listed : page.keys)
         {
             if (deleted >= bounded_remaining)
                 return deleted;
-            if (listed.incarnation.has_value())
+            if (listed.etag.has_value())
             {
                 /// `Gone` and `Mismatch` are both benign here (already gone / rewritten by a live
                 /// attempt); do not throw.
-                op.remove(listed.key, *listed.incarnation, Retry::standard());
+                op.remove(listed.key, *listed.etag, Retry::standard());
             }
             else if (const auto head = op.head(listed.key, Retry::standard()))
             {
-                op.remove(listed.key, head->incarnation, Retry::standard());
+                op.remove(listed.key, head->etag, Retry::standard());
             }
             ++deleted;
         }
@@ -3483,7 +3483,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
     if (keep == 0)
         return;   /// keep ALL (debug/forensics — replay GC's in-degree view as-of a past round)
 
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
 
     static constexpr uint64_t kMaxPrunePerRound = 64;   /// bound the per-round prune burst
@@ -3567,7 +3567,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
 
 std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attempt)
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     if (const auto got = op.read(store->layout().foldSealKey(generation, attempt), Retry::standard()))
         return decodeFoldSeal(
             got->bytes, store->layout(), store->poolConfig().gc_shards, generation);
@@ -3617,7 +3617,7 @@ std::vector<NamespaceLifeId> Gc::discoverUniverse()
     /// The filter itself lives in `CasRefCatalog::liveUniverse` (review Important C) -- fsck's own
     /// reachability walk needed the identical catalog-authoritative set and is not this class, so the
     /// filter moved to where both can share it rather than grow a second copy that could disagree.
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     return CasRefCatalog::liveUniverse(op, store->layout());
 }
 
@@ -3665,12 +3665,12 @@ RefScanSummary Gc::enumerateRefPrefix()
     /// name is absorbed per key by `parseRefObjectKeyForEnumeration`, which is what keeps this
     /// enumeration -- which runs before the fold, outside its catch -- unable to wedge the round.
     const Layout & layout = store->layout();
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
 
     RefScanSummary scan;
     static constexpr size_t kListPageLimit = 1000;
     size_t count_in_page = 0;
-    op.forEachListedKey(layout.casRefsPrefix(), [&](const KeyEntry & lk)
+    op.forEachListedKey(layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
         scan.keys.push_back(lk.key);
         const auto parsed = parseRefObjectKeyForEnumeration(layout, lk.key);
@@ -3706,7 +3706,7 @@ RoundInput Gc::listRefPrefix(const GcState & state)
     /// plan. A listed id absent from the later cut is dead, inert debris: it contributes no work and
     /// cannot force DEFER.
     RefScanSummary scan = enumerateRefPrefix();
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, store->layout());
     /// TEST SEAM: see `setPostHotScanCatalogReadHookForTest`. Moved into a local before invoking (the
     /// same reason `create_namespace_step1_pre_read_hook_for_test` is swapped rather than called
@@ -3745,7 +3745,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// Writes ONLY the GC plane; namespace streams/state, manifests, and blobs are read-only inputs;
     /// the rebuild never deletes them.
     RebuildReport rep;
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
 
     /// Read bookkeeping health before the lease (the lease acquire on an absent state CREATES a
@@ -3896,8 +3896,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// has_observation==false always takes the non-steal branch on its one and only call), pass it
     /// explicitly rather than rely on that invariant.
     GcState state;
-    std::optional<Incarnation> state_incarnation;
-    if (!acquireOrRenewLease(state, state_incarnation, /*allow_steal=*/false))
+    std::optional<Etag> state_etag;
+    if (!acquireOrRenewLease(state, state_etag, /*allow_steal=*/false))
     {
         rep.refusal = "another GC leader holds the lease";
         return rep;
@@ -3937,7 +3937,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         {
             std::vector<String> table_keys;
             op.forEachListedKey(layout.namespaceStreamPrefix(life),
-                [&](const KeyEntry & lk) { table_keys.push_back(lk.key); return true; },
+                [&](const ListedKey & lk) { table_keys.push_back(lk.key); return true; },
                 Retry::standard(), 1000, onGcEnumerationPage);
             std::map<NamespaceLifePhysicalId, RefTableListing> grouped;
             try
@@ -3974,7 +3974,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     {
         const String gen_prefix = layout.gcGenPrefix(0);
         const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
-        op.forEachListedKey(top, [&](const KeyEntry & k)
+        op.forEachListedKey(top, [&](const ListedKey & k)
         {
             const size_t from = top.size();
             const size_t slash = k.key.find('/', from);
@@ -4049,7 +4049,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// round once it is known, and nothing else is touched.
     std::set<UInt128> minted_hold_lives;
     uint64_t max_fence_round = 0;
-    std::map<ManifestId, Incarnation> mf_cleanup_unused;
+    std::map<ManifestId, Etag> mf_cleanup_unused;
 
     for (const NamespaceLifeId & life : rebuild_walk_universe)
     {
@@ -4171,7 +4171,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     {
         const RootNamespace ns{ns_str};
         std::vector<BlobDelta> deltas;
-        op.forEachListedKey(layout.manifestNamespacePrefix(ns), [&](const KeyEntry & k)
+        op.forEachListedKey(layout.manifestNamespacePrefix(ns), [&](const ListedKey & k)
         {
             if (owned_manifest_keys.contains(k.key))
                 return true;
@@ -4267,7 +4267,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// family independently of that, and the two reasons are stated apart on purpose — a future reader
     /// must not take this line as evidence that REBUILD still produces condemnations somewhere.
     next.manifest_sweep_cursor = "";
-    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_incarnation,
+    WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());
     if (std::holds_alternative<Conflict>(commit))
     {
@@ -4303,7 +4303,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
 {
     std::vector<PreviewEntry> out;
 
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const auto state_bytes = op.read(store->layout().gcStateKey(), Retry::standard());
     if (!state_bytes)
         return out;
@@ -4389,7 +4389,7 @@ void Gc::refreshAuthority(uint64_t admitted_generation)
     authority_held = false;
     try
     {
-        CasOperation op = store->gcRequests().admit();
+        CasOperation op = store->openRequests().admit();
         const auto got = op.read(store->layout().gcStateKey(), Retry::standard());
         if (!got)
             return;
@@ -4406,7 +4406,7 @@ void Gc::refreshAuthority(uint64_t admitted_generation)
 
 void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
 {
-    CasOperation op = store.gcRequests().admit();
+    CasOperation op = store.openRequests().admit();
     const String key = store.layout().gcHbKey();
     const auto got = op.read(key, Retry::standard());
     GcHeartbeat hb;
@@ -4418,21 +4418,21 @@ void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
     /// one on cadence, so a deposed leader must never spend a whole retry budget fighting for this key.
     const String body = encodeGcHeartbeat(hb);
     if (got)
-        op.replace(key, body, got->incarnation, Retry::once());
+        op.replace(key, body, got->etag, Retry::once());
     else
         op.create(key, body, Retry::once());
 }
 
-bool Gc::acquireOrRenewLease(GcState & state, std::optional<Incarnation> & state_incarnation, bool allow_steal)
+bool Gc::acquireOrRenewLease(GcState & state, std::optional<Etag> & state_etag, bool allow_steal)
 {
-    CasOperation op = store->gcRequests().admit();
+    CasOperation op = store->openRequests().admit();
     const String key = store->layout().gcStateKey();
 
     /// What the decision that actually landed wrote. `readModifyWrite` re-decides on every conflict
     /// against what the losing write's own resolve read observed, so the last decision is the committed
     /// one, and a competing leader's write makes the next decision see a moved lease tuple.
     GcState decided;
-    const std::optional<Incarnation> committed = orThrow(op.readModifyWrite(key,
+    const std::optional<Etag> committed = orThrow(op.readModifyWrite(key,
         [&](const std::optional<Object> & current_object) -> std::optional<String>
     {
         if (!current_object)
@@ -4518,7 +4518,7 @@ bool Gc::acquireOrRenewLease(GcState & state, std::optional<Incarnation> & state
 
     rememberObservation(decided.lease);
     state = std::move(decided);
-    state_incarnation = committed;
+    state_etag = committed;
     return true;
 }
 
@@ -4547,7 +4547,7 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     /// second -- the single reading taken here would otherwise authorise all of them.
     const uint64_t admitted_generation = leased_state.lease.seq;
     refreshAuthority(admitted_generation);
-    CasOperation op = store->gcRequests().admit([this] { return authority_held; });
+    CasOperation op = store->openRequests().admit([this] { return authority_held; });
     return CatalogLifecycleReconciler(op, store->layout(), *parent)
         .reconcile([this, admitted_generation] { refreshAuthority(admitted_generation); });
 }

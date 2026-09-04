@@ -21,7 +21,7 @@ namespace
 /// the probe has always thrown for it — everything else propagates unchanged. Every `remove` the battery
 /// issues against a live incarnation goes through this: a store that ignores the delete precondition AND
 /// mints delete markers must still be reported with this message, not the engine's terse one.
-Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const Incarnation & seen)
+Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const Etag & seen)
 {
     try
     {
@@ -54,14 +54,14 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
     auto cleanup = [&]() noexcept
     {
         // Skip the remove when HEAD says the key is already gone (the happy path: the battery's own
-        // delete already ran). `Incarnation` can only be minted from an actual HEAD/read observation, so
+        // delete already ran). `Etag` can only be minted from an actual HEAD/read observation, so
         // an unconditional "delete with whatever precondition" this backend never saw is not
         // constructible here — the gate below is the only way to reach `remove` at all.
         try
         {
             const auto h = op.head(key, Retry::standard());
             if (h)
-                op.remove(key, h->incarnation, Retry::standard());
+                op.remove(key, h->etag, Retry::standard());
         }
         catch (...) {} /// NOLINT(bugprone-empty-catch)
     };
@@ -69,13 +69,13 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
     try
     {
         // ---- Step 1: create fresh -> Committed; read-after-write returns the bytes. ----
-        Incarnation t1 = [&]
+        Etag t1 = [&]
         {
             WriteResult r = op.create(key, "probe-v1", Retry::standard());
             if (!std::holds_alternative<Committed>(r))
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: create on a fresh key did not commit — backend is unexpectedly occupied or broken");
-            return std::get<Committed>(r).incarnation;
+            return std::get<Committed>(r).etag;
         }();
         {
             const auto g = op.read(key, Retry::standard());
@@ -101,16 +101,16 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
 
         // ---- Step 3: replace against the CURRENT incarnation (t1) -> Committed; incarnation changed;
         //              bytes replaced. Every "wrong incarnation" step below reuses THIS key's own prior
-        //              incarnations (never a synthetic value) — an `Incarnation` is minted only from an
+        //              incarnations (never a synthetic value) — an `Etag` is minted only from an
         //              actual backend observation, so there is no other way to name one that is
         //              guaranteed wrong yet dialect-valid. ----
-        Incarnation t2 = [&]
+        Etag t2 = [&]
         {
             WriteResult r = op.replace(key, "probe-v2", t1, Retry::standard());
             if (!std::holds_alternative<Committed>(r))
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: replace with the correct incarnation was rejected — backend does not accept a valid overwrite");
-            Incarnation next = std::get<Committed>(r).incarnation;
+            Etag next = std::get<Committed>(r).etag;
             if (next == t1)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: replace succeeded but did not mint a new incarnation — an incarnation must "
@@ -158,7 +158,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
         // ---- Step 6: list(probe_prefix) contains the probe key (list-after-write). ----
         {
             bool found = false;
-            op.forEachListedKey(probe_prefix, [&](const KeyEntry & listed) -> bool
+            op.forEachListedKey(probe_prefix, [&](const ListedKey & listed) -> bool
             {
                 if (listed.key != key)
                     return true;
@@ -183,7 +183,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: remove succeeded (Removed) but the object is still readable — backend delete is not effective");
             bool still_listed = false;
-            op.forEachListedKey(probe_prefix, [&](const KeyEntry & listed) -> bool
+            op.forEachListedKey(probe_prefix, [&](const ListedKey & listed) -> bool
             {
                 if (listed.key != key)
                     return true;

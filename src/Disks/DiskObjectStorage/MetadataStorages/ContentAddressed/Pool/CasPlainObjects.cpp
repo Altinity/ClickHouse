@@ -56,7 +56,7 @@ std::vector<String> CasPlainObjects::listNamespaceFiles(const NamespaceLifeId & 
     const String prefix = layout.namespaceFilesPrefix(life);
     std::vector<String> names;
     CasOperation op = requests.admit();
-    op.forEachListedKey(prefix, [&](const KeyEntry & entry)
+    op.forEachListedKey(prefix, [&](const ListedKey & entry)
     {
         /// Strip the storage prefix so callers receive the bare flat file name.
         if (entry.key.starts_with(prefix))
