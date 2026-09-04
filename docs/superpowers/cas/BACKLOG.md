@@ -59,6 +59,23 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### `[stateless-lane-wall-time-is-drop-table]` Measured on the CA-s3 stateless lane (2026-09-04): DROP TABLE is the suite's largest wall-time sink; the server is not CPU-bound {#stateless-lane-wall-time-is-drop-table}
+
+`system.trace_log` over ten minutes of the parallel suite (~10 jobs): ~280 CPU samples against 630k
+Real samples — the server is waiting, not computing; 21% of the CPU samples are stack unwinding and
+symbolisation for exceptions (every expected 412/404/timeout builds a full `StackTrace`). Query threads'
+Real samples: 44% waiting in `InterpreterDropQuery::executeToTable` for the synchronous data drop, 25%
+in `TaskTracker::waitAll` under `fanOutBlobUploads`/`commit`/`moveDirectory` (the part-commit round
+trips), 14% in `finalizeConditionalWrite` (conditional PUT wait), 13% in `poll`. `system.query_log`,
+same window: DROP TABLE n=1436 p50 2.4 s p90 11.9 s max 34.7 s; CREATE TABLE p50 184 ms p90 391 ms;
+INSERT p50 253 ms p90 541 ms. S3 calls: GET 11 095, HEAD 2 966, PUT 1 597, LIST 206, DELETE 25.
+The background drop workers themselves sit in a futex inside `DatabaseCatalog::dropTableDataTask`, not
+in S3 — the drop chain is serialised somewhere (the namespace removal through the hot `ref_catalog`
+door with the conflict backoff up to 5 s fits the p90/max shape). Placement: profile one DROP on the CA
+disk (S3 operations and CAS conflicts per dropped table) as the first measurement of the
+`{#ref-catalog-cas-starvation}` follow-up; second target = the part-commit round trips (upload fan-out
++ conditional PUTs); third = skip `StackTrace` capture for expected 412s.
+
 ### `[ref-catalog-cas-starvation-under-parallel-writers]` One process's CREATE/DROP writers starve each other on the ref-catalog compare-and-swap (2026-09-04) {#ref-catalog-cas-starvation}
 
 Seen on the local CA-s3 stateless lane (run 2, ~10 parallel jobs): `01039_mergetree_exec_time`'s
