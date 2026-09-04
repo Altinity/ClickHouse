@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 27, 2026-09-04. Phase A. Brainstormed against the measurements in
+Revision 28, 2026-09-04. Phase A. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
 this document supersedes where they differ. Revisions 1 to 26 designed a larger change (combining
@@ -73,8 +73,9 @@ Goals:
   In the request engine, four changes: a pointer carried by `CasRequests` and exposed as
   `CasOperation::hotKeys()`; `friend class CasHotKeys` on `CasOperation`, for its private `gate`,
   `fits`, `reservedFor`, `observe` and `gaveUpAfterFailedObservation`; one field on `Conflict`,
-  `any_ambiguous`, set where `writeLoop` returns it from the `WriteState` it already keeps; and
-  Half 2's `conflictBackoff` and `pauseForConflict`. Two internal changes in `CasRefCatalog.cpp`,
+  `any_ambiguous`, set where `writeLoop` returns it from the `WriteState` it already keeps and
+  carried where `readModifyWriteOnPresence` rebuilds a bodyless `Conflict` under `single_attempt`
+  (`CasRequests.cpp:1034`); and Half 2's `conflictBackoff` and `pauseForConflict`. Two internal changes in `CasRefCatalog.cpp`,
   named below. Every existing catalog test stays green unchanged; the ones that count requests
   count writes, and a lone call's counts are today's.
 - Phase B adds combining, spacing and the clamp without changing `submit`'s signature, the
@@ -271,12 +272,14 @@ snapshot was taken, inside a catch-all in the `tryLogCurrentException` shape.
    it reissues ambiguous attempts, settles every refused precondition by a resolve read, and gates
    every attempt on the caller's fence, `Liveness` and budget as it does today. Its transport
    backoffs sleep inside the hold (a named tradeoff, below).
-4. **Settle.** The engine's result is returned unchanged; only the cache moves:
-   - `Committed`: the cache stores `Object{candidate, etag}`, inside a catch-all: `CacheBase::set`
-     allocates and may throw, and a failed hint fill after a proven `Committed` must not become
-     the result, so the failure is logged, the entry is dropped, and the result stands.
-   - `Conflict{seen, attempts_sent, any_ambiguous}`: the cache stores `seen` if it is an `Object`,
-     and is dropped otherwise. The class keeps the engine's two-sided meaning, a clean lost race
+4. **Settle.** The engine's result is returned unchanged; only the cache moves, and every fill
+   goes through one no-throw `remember` step: `CacheBase::set` allocates and may throw, and a
+   failed hint fill must never replace a result the engine already produced, so the failure is
+   logged, the entry is dropped, and the result stands. The same step fills the cache in step 2
+   for a read base the `decide` declined to write.
+   - `Committed`: `remember(Object{candidate, etag})`.
+   - `Conflict{seen, attempts_sent, any_ambiguous}`: `remember(seen)` if it is an `Object`; the
+     entry is dropped otherwise. The class keeps the engine's two-sided meaning, a clean lost race
      or an ambiguous attempt that may have landed and been superseded, and the caller's next
      submission decides again on `seen` when the cache holds it and on a read when the resolve
      read saw nothing; this is what today's `readModifyWrite` already demands of every `decide` in
@@ -310,7 +313,7 @@ nothing. It holds, per key, the last object this pool knows: the candidate a `Co
 the object a resolve read saw after a `Conflict`, or the base a hold read and then declined to
 write. It is dropped on `Refused`, on `GaveUp` after a send, on an exception out of the write and
 on a verdict rendered on it; it is unchanged by a `GaveUp` that sent nothing. A candidate above
-the budget is simply not stored. It is never a source of truth: every write against it is
+the budget is simply not stored, and a fill that throws is logged and dropped, never a result. It is never a source of truth: every write against it is
 conditional on its etag, and every verdict rendered on it is discarded and re-rendered on a read.
 Those two sentences are the whole safety argument, and they hold for any bytes, malformed ones
 included: a `decide` that cannot decode a cached object throws, the lane reads, and the read
@@ -405,10 +408,13 @@ submits to the lane.
   412 and one resolve read. A verdict a `decide` renders on a cached base, by exception or by
   returning nothing, is never delivered; it is re-rendered on a read, or replaced by that read's
   own `GaveUp`.
-- INV-4. `submit` returns for its caller the class and content `readModifyWrite` would return for
-  the same call, produced by the same engine paths (`observe` and `gaveUpAfterFailedObservation`
-  for the base, `create` and `replace` for the write); the lane invents no result. A `decide`'s
-  exception from a fresh read propagates unchanged.
+- INV-4. `submit` returns for its caller a result the engine produced for that submission,
+  through the paths `readModifyWrite` uses (`observe` and `gaveUpAfterFailedObservation` for the
+  base, one `create` or `replace` for the write); the lane invents no result, reclassifies none,
+  and lets no exception of its own replace one. A `decide`'s exception from a fresh read
+  propagates unchanged. What one submission is not is one `readModifyWrite` call: each
+  submission has its own `WriteState`, and the caller's loop, not the engine, decides whether a
+  `Conflict` is followed by another; the two consequences are named in [The catalog](#the-catalog).
 - INV-5. An item is removed only by its own guard; no item outlives its caller's stack; a lane is
   erased only while its queue is empty; `CasHotKeys::mutex` is held across no callback, no I/O
   and no `decide`; the guard neither allocates nor throws.
@@ -468,7 +474,7 @@ uint32_t faults = 0;
 for (;;)
 {
     WriteResult result = op.hotKeys().submit(key, op, frozen, decide);
-    if (const auto * conflict = std::get_if<Conflict>(&result))
+    if (const auto * conflict = std::get_if<Conflict>(&result); conflict && !frozen.single_attempt)
     {
         /// flat after a clean lost race; the growing schedule after a conflict that settled a fault
         op.pause(conflict->any_ambiguous ? Retry::backoff(++faults) : Retry::conflictBackoff());
@@ -482,13 +488,26 @@ for (;;)
 
 `policy` is `casUpdateImpl`'s existing parameter, `Retry::standard()` by default and the policy
 `resolveNamespaceLife` froze once and passes down, so a catalog mutation nested in a lifecycle step
-spends that step's window and never a fresh one. The loop ends at the frozen deadline with today's
-retry-later, through the same `GaveUp{Deadline}` `submit` returns when the wait or the write runs
-out of window, and has no attempt cap: today's `readModifyWrite` has none either, and a cap of
-`kMaxCatalogCasAttempts` (100) at a flat mean pause of 100 ms would end a writer after about ten
-seconds of cross-pool conflicts, well inside the window this change exists to make fair. The bare
-`op.pause` can overshoot the deadline by at most one pause, 200 ms, as the erase's loop already
-overshoots by one of its own; accepted. `casUpdate`, `casAdmitEntry` and the five lifecycle
+spends that step's window and never a fresh one. Under a `single_attempt` policy the first
+`Conflict` is the result, as `readModifyWrite` returns it today (`CasRequests.cpp:980`), and
+`throwCatalogWriteFailure` throws it as today; the loop never sends a second attempt under
+`Retry::once`, which permits one. No production catalog caller passes `once` today; the rule is
+the contract's. The loop ends at the frozen deadline with today's retry-later, through the same
+`GaveUp{Deadline}` `submit` returns when the wait or the write runs out of window, and has no
+attempt cap: today's `readModifyWrite` has none either, and a cap of `kMaxCatalogCasAttempts`
+(100) at a flat mean pause of 100 ms would end a writer after about ten seconds of cross-pool
+conflicts, well inside the window this change exists to make fair. The bare `op.pause` can
+overshoot the deadline by at most one pause: 200 ms after a clean conflict, and up to 5 s after a
+conflict that settled a transport fault, exactly what the erase's loop already accepts for its
+own growing pause (`CasRefCatalog.cpp:456`); a fence lost during the pause is caught by the next
+submission's first gate before anything is sent. Accepted, on a path that is already failing.
+
+Two things differ from one `readModifyWrite` call, both the semantics every hand-written loop of
+the contract already has: each submission is one engine call with its own `WriteState`, so a
+credential refresh may happen once per submission rather than once per catalog mutation (the GC
+erase's `replace` per attempt and the ref-log lane's `create`s are the precedent; a `Conflict`
+between two submissions means the store answered in between, so the credentials the last refresh
+installed worked); and `attempts_sent` in a result counts that submission's attempts. `casUpdate`, `casAdmitEntry` and the five lifecycle
 functions do not change: their `mutate`s, markers and outcomes are the same. `casAdmitEntry`'s
 duplicate-row `LOGICAL_ERROR`, thrown from the grammar check on a cached base, is re-rendered on a
 read like every other exception and is the same `LOGICAL_ERROR` on a read that shows the row;
@@ -533,8 +552,10 @@ it does not grow with the writer's loss count, and it knows no dialect.
   the loop, and `writeLoop` already carries the distinction.
 - The lane's callers pause between a `Conflict` from `submit` and their next submission by the
   same rule, and for that `Conflict` gains `bool any_ambiguous`, set where `writeLoop` returns it
-  from the `WriteState` it already keeps: `conflictBackoff()` when false, `Retry::backoff` on the
-  caller's own fault count when true, whether or not the resolve read saw a body. `attempts_sent`
+  from the `WriteState` it already keeps and carried where `readModifyWriteOnPresence` rebuilds a
+  bodyless `Conflict` under `single_attempt` (`CasRequests.cpp:1034`): `conflictBackoff()` when
+  false, `Retry::backoff` on the caller's own fault count when true, whether or not the resolve
+  read saw a body. `attempts_sent`
   cannot stand in for the flag: a throttled first attempt whose resolve read finds the key moved is
   `Conflict{attempts_sent = 1, any_ambiguous = true}`.
 
@@ -548,17 +569,18 @@ Half 2 is engine-wide and the lane covers the keys that write through it. The se
 `readModifyWrite` sites keep their in-process contention (`publishCkpt` on `_ckpt` above all), and
 on S3 their writers' retry pace goes from a schedule saturating at 5 s to a flat mean of 100 ms.
 This is the same fairness fix for the same starvation shape at smaller scale. Its cost, as one
-number: a writer whose round trip is negligible attempts up to about ten times a second, each
-attempt with its resolve `GET`, so a contended non-lane key sees at most about 20 M requests per
-second for M writers where today the growing schedule caps a writer near one attempt per 5 s. A
+number: a writer whose round trip is negligible attempts about ten times a second on average,
+each attempt with its resolve `GET`, so a contended non-lane key sees about 20 M requests per
+second for M writers in expectation (draws near 0 give back-to-back attempts, so a one-second
+window can exceed it) where today the growing schedule caps a writer near one attempt per 5 s. A
 refused precondition is a 412 with no body, S3 has no per-object write limit and its per-prefix
 request budget is thousands per second, and sustained pressure past it answers `SlowDown`, a
 transport fault that takes the growing schedule; GCS answers 429 the same way. Go/no-go for
 `_ckpt`, alongside the `ref_catalog` one: the predicted request rate on a contended `_ckpt` key is
-about 20 M per second for M writers (an expectation, not a bound: a draw of 0 gives back-to-back
-attempts), so the gate is twice that, 40 M per second per key for the M writers observed, and
-429/`SlowDown` counts on those keys must not exceed today's; if either fails, writing `_ckpt`
-through the lane is the answer, not a slower jitter.
+about 20 M per second for M writers in expectation, so the gate is on the measured peak, not the
+expectation: no one-second window on a contended key above 40 M requests for the M writers
+observed in it, and 429/`SlowDown` counts on those keys not above today's; if either fails,
+writing `_ckpt` through the lane is the answer, not a slower jitter.
 
 ### Edits to the backend request contract {#edits-to-the-backend-request-contract}
 
@@ -627,6 +649,12 @@ tickets from `bytes` and appends its own, so order is visible in the object.
    returns `FencedOut`. The fence is tripped after the landed `PUT`: `GaveUp{FenceLost, sent_any =
    true}`, the object carries the ticket, the entry dropped. The engine call throws: the exception
    reaches the caller, the entry is dropped, and the next waiter holds (the guard handed over).
+   Under `Retry::once`: a first `Conflict` ends the catalog caller with `throwCatalogWriteFailure`'s
+   class and exactly one attempt sent, as today. Credential refresh: a hook fails the first
+   submission's attempt with a refreshable credential error, lets the refreshed reissue lose a
+   race, and fails the second submission's attempt the same way; assert the second submission
+   refreshed once more (per-submission `WriteState`, the named difference from one
+   `readModifyWrite` call) and that the store's credential calls are exactly two.
 3. Verdicts on the cache (INV-3), at the catalog level in `gtest_cas_ref_catalog.cpp`. The pool
    lands once. An external `CasRequests` changes a row. A caller reads fresh outside the lane and
    runs the real `beginRemoving` through a `CasRequests` with a cache: `Transitioned`, not
@@ -670,7 +698,9 @@ tickets from `bytes` and appends its own, so order is visible in the object.
    above the budget each leave no entry: the next submission reads. A `GaveUp` that sent nothing
    leaves the entry as it was. Eviction: two keys whose objects exceed the budget together evict the
    older; the next submission on it reads. A hook makes `CacheBase::set` throw after a landed
-   `PUT`: the caller still receives `Committed` and the next submission reads.
+   `PUT`, after a `Conflict` whose resolve read saw an `Object`, and after a fresh read the
+   `decide` declined: the caller receives `Committed`, that `Conflict` and that `Declined`
+   respectively, never the exception, and the next submission reads (INV-4).
 8. Waiters leave on their own (INV-5). While the holder is parked inside its `decide`'s nested
    read: a waiter whose deadline passes leaves with `GaveUp{Deadline}` carrying its own source and
    the keyed log line naming the holder; a waiter whose fence is tripped or whose `Liveness` flips
@@ -696,9 +726,13 @@ tickets from `bytes` and appends its own, so order is visible in the object.
     `CASRequestReissue` 0, every sleep within [0, 200] ms. K races each preceded by a 429-class
     fault: `CASRequestReissue` K, `CASRequestConflictPause` 0, the growing schedule. Through
     `replace`: a throttled first attempt whose resolve read finds the key replaced returns
-    `Conflict{attempts_sent = 1, any_ambiguous = true}`, a clean 412 `any_ambiguous = false`; and
-    the catalog loop, fed K of the former, pauses on the growing schedule, and fed K of the latter
-    within [0, 200] ms each.
+    `Conflict{attempts_sent = 1, any_ambiguous = true}`, a clean 412 `any_ambiguous = false`;
+    through `readModifyWriteOnPresence` under `Retry::once`, the same ambiguous-then-moved case
+    returns `any_ambiguous = true` from the rebuilt bodyless `Conflict`; and the catalog loop, fed
+    K of the former, pauses on the growing schedule, and fed K of the latter within [0, 200] ms
+    each. The overshoot: a deadline that passes during the loop's pause is noticed at the next
+    submission's first gate, at most one `conflictBackoff` late after a clean conflict and at most
+    one `backoff(K)` late after K settled faults, with nothing sent.
 
 Pool level, through the ledger:
 
@@ -765,3 +799,15 @@ re-checks its own fence, `Liveness`, lease and deadline every slice, in that ord
 16); the lane is erased only when empty (9, 25); no attempt cap on the catalog loop (23); the
 200 ms pause overshoot accepted (24); eviction of a stalled holder rejected (11, 12); the
 `driver_mutex` audit (14); the step-1 marker catch (12).
+
+Revision 28 folds in the first `codex` review of the phase A document: five findings, against
+eighteen to twenty-two per round on the phase A plus B document, one of them a real critical and
+a one-line fix. The catalog loop honours `single_attempt`: a first `Conflict` under `Retry::once`
+is the result, as `readModifyWrite` returns it today, and never a second attempt. The two ways a
+submission differs from one `readModifyWrite` call, a per-submission `WriteState` (one credential
+refresh per submission) and per-submission `attempts_sent`, are named as the hand-written-loop
+semantics they are, with a test for the refresh. Minors: every cache fill goes through one
+no-throw `remember`, tested after `Committed`, `Conflict` and `Declined`; the pause overshoot is
+stated as up to 5 s after a settled fault, the erase loop's own; `any_ambiguous` is carried where
+`readModifyWriteOnPresence` rebuilds a bodyless `Conflict`; the Half 2 rate is an expectation and
+the `_ckpt` gate is on the measured one-second peak.
