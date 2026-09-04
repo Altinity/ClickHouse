@@ -1,5 +1,5 @@
 ---
-description: 'Design for serializing and combining one process''s conditional writes to a hot CAS control object (the ref catalog first) inside the request engine, remembering the last committed object so consecutive writes need no read, and pacing lost races between servers with a flat jitter instead of the transport-fault backoff. Motivated by measured CREATE/DROP starvation on the ref catalog.'
+description: 'Design for serializing one process''s conditional writes to a hot CAS control object (the ref catalog first) inside the request engine, remembering the last committed object so consecutive writes need no read, reporting a decide''s refusal only from a proven base, and pacing lost races between servers with a flat jitter instead of the transport-fault backoff. Motivated by measured CREATE/DROP starvation on the ref catalog.'
 sidebar_label: 'Hot-key write lane'
 sidebar_position: 45
 slug: /superpowers/specs/cas-hot-key-write-lane
@@ -9,21 +9,28 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 2. Brainstormed 2026-09-04 against the measurements in
+Revision 3. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
-supersedes the fix sketch in those items where they differ (the door lives in the engine, not in
-`CasRefCatalog`; writes are combined, not only serialized).
+supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
+`CasRefCatalog`.
 
-Revision 2 folds in the first review round. Revision 1 claimed that the remembered object is at
-least as fresh as anything a caller observed; it is not, because another server can write after this
-process's last commit, so a `decide` that refused on memory, or on a chained candidate that never
-became durable, could report a false verdict with no write to catch it. The fix is one rule: a
-verdict is reported only from a base that is proven, either an observation of this tenure or a
-committed batch. The same round removed the eager carve (a decide that reads could hold uncarved
-waiters past their deadlines), the copying of a leader's failure onto its members (they return to the
-queue instead), cross-plane batching, the LRU and its budget, and two wrong claims about the GC erase
-and the bootstrap create.
+Revision history, kept because each step removed something a review proved unsound:
+
+- Revision 1 combined the `decide`s queued behind a leader into one `PUT`, and claimed the
+  remembered object is at least as fresh as anything a caller observed. Neither held: another server
+  can write after this process's last commit, so a `decide` that refused on memory could report a
+  false verdict with no write to catch it.
+- Revision 2 kept combining and added the verdict rule below. The second review showed that
+  combining generic closures is unsound on its own: a later closure can change what an earlier
+  closure's contribution or refusal was about (a capacity refusal rendered on a prefix that the
+  final candidate would have admitted; a row a later closure rewrites), and the engine cannot know
+  which closures compose. Typed catalog deltas with provable composition would fix that, but they
+  belong in `CasRefCatalog`, where admission and row exactness are defined, and they are a larger
+  design.
+- Revision 3 drops combining. What remains is small: a per-key FIFO ticket with a deadline, one
+  remembered object, one rule for verdicts, and a flat conflict jitter. Combining is placed as a
+  follow-up with the constraints the reviews established.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -60,10 +67,10 @@ write; 21% of the CPU samples are stack capture for expected exceptions.
 
 Goals:
 
-- Inside one process, at most one conditional write in flight per hot key, in arrival order, and
-  no read by the lane between two consecutive commits of that process.
-- N concurrent catalog mutations of one process cost about one conditional `PUT`, not N, and never
-  a 412 against each other's in-flight write.
+- Inside one process, at most one conditional write in flight per hot key, in arrival order.
+- A `readModifyWrite` that follows a commit of this process starts from the committed object, not
+  from a `GET`. N concurrent catalog mutations of one process cost N sequential `PUT`s, at most one
+  `GET`, and no 412 against each other.
 - A lost race against another server is repaid after a flat jitter that does not grow with the
   writer's personal loss count. The growing backoff stays for transport faults.
 - No change to the catalog's API, to the semantics of any conditional write or of any verdict a
@@ -75,8 +82,12 @@ Non-goals:
 - Making the remembered object a source of truth. It is a hint: a stale hint costs one 412 and one
   resolve read on the write path, and one read on the verdict path, never correctness.
 - A general write cache for every key. Participation is opt-in, per key, by the owner.
-- Unifying this lane with the ref-log append lane (`CasRefLedger::appendRefOps`). The two share a
-  shape and a vocabulary; extracting a common component is a separate decision.
+- Combining several writers' mutations into one `PUT`. On S3 the lane's throughput is one `PUT`
+  latency per write, an order of magnitude above this lane's arrival rate. On a store that budgets
+  about one mutation per second per object (GCS), sustained arrivals above that budget queue up to
+  their deadlines; combining is the answer there and is placed as a follow-up in
+  [what this does not do](#placement-of-what-this-does-not-do).
+- Unifying this lane with the ref-log append lane (`CasRefLedger::appendRefOps`).
 - The other two `DROP TABLE` costs named in the BACKLOG item (part-commit round trips, `StackTrace`
   capture for expected 412s). They keep their placement there.
 
@@ -86,12 +97,11 @@ Two halves, in this order.
 
 **Half 1, the hot-key lane.** A per-pool component of the request engine, `CasHotKeys`, owned by
 `Pool` and shared by its three `CasRequests` planes. For a key the owner declares hot, every write
-verb queues in a FIFO lane for that key; the lane's leader performs its write; a `readModifyWrite`
-leader that contributed bytes also takes the compatible `readModifyWrite`s queued behind it, one at
-a time, applying their `decide`s to its candidate and landing them in the same conditional `PUT`.
-The lane remembers the last object this process committed, so a `readModifyWrite` can start from
-memory instead of a `GET`. A `decide`'s refusal is reported only from a proven base. `Pool`
-declares `refCatalogKey()` hot; nothing in `CasRefCatalog`, `CasRefLedger` or GC changes.
+verb takes a FIFO ticket for that key and runs only when its ticket is at the front; a waiter
+leaves on its own deadline or fence. The lane remembers the last object this process committed, so
+a `readModifyWrite` can start from it instead of a `GET`. A `decide`'s refusal is reported only
+from a proven base. `Pool` declares `refCatalogKey()` hot; nothing in `CasRefCatalog`,
+`CasRefLedger` or GC changes.
 
 **Half 2, conflict pacing.** In `readModifyWrite`, `readModifyWriteOnPresence` and the GC erase
 loop, a `Conflict` is repaid after `Retry::conflictBackoff()`, a flat uniform(0, 200 ms), and no
@@ -113,28 +123,29 @@ public:
     bool isHot(const String & key) const;
 private:
     friend class CasOperation;
-    struct Item;   /// one queued write, see below
     struct Lane    /// one hot key
     {
-        std::deque<std::shared_ptr<Item>> pending;   /// guarded by `mutex`
-        bool leader_active = false;                  /// guarded by `mutex`
+        std::deque<uint64_t> tickets;                /// guarded by `mutex`; front = the holder or the next holder
+        bool holder_active = false;                  /// guarded by `mutex`
         std::condition_variable cv;
         std::optional<Object> remembered;            /// guarded by `mutex`; the last object THIS process committed
+        uint64_t next_ticket = 0;                    /// guarded by `mutex`
     };
     std::mutex mutex;
     std::unordered_map<String, Lane> lanes;
 };
 ```
 
-A lane exists while it has a pending item, an active leader, or a memory, and is erased when the
-last of the three goes. There is no eviction and no byte budget: the owner's predicate names the
-hot keys, today exactly one per pool, and its object is under 1 MiB. A bound becomes necessary when
-a per-namespace key such as `_ckpt` is declared hot; that declaration brings it.
+A lane exists while it has a ticket, an active holder, or a memory, and is erased when the last of
+the three goes. There is no eviction and no byte budget: the owner's predicate names the hot keys,
+today exactly one per pool, and its object is under 1 MiB. A bound becomes necessary when a
+per-namespace key such as `_ckpt` is declared hot; that declaration brings it.
 
 `CasRequests` takes a `std::shared_ptr<CasHotKeys>` in its constructor. A `CasRequests` built
-without one (every existing test, the offline tools, the pool's local bootstrap `CasRequests`) owns
-a private instance whose predicate is "nothing is hot", so its behaviour is byte-for-byte today's.
-`CasRequests` remains a class that writes no member after construction: the lane has its own mutex.
+without one (every existing test, the offline tools, the pool factory's local bootstrap
+`CasRequests`) owns a private instance whose predicate is "nothing is hot", so its behaviour is
+byte-for-byte today's. `CasRequests` remains a class that writes no member after construction: the
+lane has its own mutex.
 
 `Pool` declares `std::shared_ptr<CasHotKeys> hot_keys` before `mount_requests`,
 `farewell_requests` and `gc_requests`, so it is constructed before them and destroyed after them,
@@ -147,144 +158,93 @@ Participation is by predicate, decided by the owner of the table, never by the c
 
 What memory is and is not. `remembered` is the last object this process committed, or the last
 object the engine's resolve read saw after a lost race. Either was the durable state at some
-moment. Neither is an observation of this tenure, and neither is guaranteed newer than an
+moment. Neither is an observation of this call, and neither is guaranteed newer than an
 observation a caller made outside the lane: `dropNamespaceImpl` reads the catalog fresh, sees a
 `Live` row another server created, and calls `beginRemoving` on it; the lane's memory may predate
 that row. A `decide` that refuses on such a base (the catalog's markers, or a `nullopt`) would be
 reporting a verdict about a state the store has left, and with no write sent nothing would catch
-it. The same holds for a verdict rendered on a chained candidate whose batch then fails to commit:
-the candidate never became durable, so a row the `decide` saw as changed may never have changed.
+it.
 
-The rule that closes both: **a verdict (a `decide` that returns `nullopt` or throws) is reported to
-its caller only from a proven base**, meaning either the base was an observation this tenure made
-(a `GET`, or the resolve read after a `Conflict`) and the verdict was rendered directly on it, or
-the batch the `decide` took part in committed, which proves the base was the durable state throughout
-and that the chained candidate became durable as written. A verdict on memory, or on a chained
-candidate whose batch did not commit, is not a result: the memory is cleared and the `decide` runs
-again on a fresh observation. A contribution (a `decide` that returns bytes) needs no such rule: the
-conditional `PUT` validates the base it was decided on, as today.
+The rule that closes it: **a verdict (a `decide` that returns `nullopt` or throws) is reported to
+its caller only when it was rendered on an observation of this call**, a `GET` or the resolve read
+after a `Conflict`. A verdict rendered on memory is not a result: the memory is cleared, the key is
+observed, and `decide` runs again on the observation; what it renders then is the result. A
+contribution (a `decide` that returns bytes) needs no such rule: the conditional `PUT` validates the
+base it was decided on, as today, and a refused precondition is settled by the resolve read, as
+today.
 
 With that rule the safety of the lane does not depend on what a `decide` does with `current`. The
 contract a participating site must meet is mechanical:
 
 1. `decide` tolerates being run again on a different `current`, which `readModifyWrite` already
-   requires of it (it re-decides on every `Conflict`).
-2. `decide` does not read `current->etag` as an identity of `current->bytes`. In a batch the
-   chained `current` carries the precondition of the pending write, not an incarnation of the chained
-   bytes. Every catalog `decide` decodes `bytes` only.
-3. `decide` issues no write on the same key. A write from inside the leader would wait for the
-   leader. Reads are fine, as today, and a `decide` that reads holds the chain for that read (see
+   requires of it (it re-decides on every `Conflict`), and tolerates a verdict it rendered on memory
+   being discarded and re-rendered.
+2. `decide` issues no write on the same key. A write from inside the holder would wait for the
+   holder. Reads are fine, as today, and a `decide` that reads holds the lane for that read (see
    [effects to name](#effects-to-name)).
-4. A `Liveness` closure carried by an operation whose `decide` may be run by another thread must be
-   safe to call from that thread. Today every writer on the catalog key that can be batched is a
-   mount-plane operation with no liveness closure.
 
-Today `refCatalogKey()` satisfies all four. The `_ckpt` keys are the next candidate and are not
+Today `refCatalogKey()` satisfies both. The `_ckpt` keys are the next candidate and are not
 declared by this design.
 
-### The queue and the leader {#the-queue-and-the-leader}
+### The ticket {#the-ticket}
 
-The lane mirrors `CasRefLedger::appendRefOps` on purpose, so a reader of one recognises the other.
+The lane is a FIFO ticket with a deadline. Every write verb on a hot key does the following around
+its existing body; nothing runs under `mutex` except the four steps marked.
 
-**Item.** One queued write, allocated by its caller and held by `shared_ptr` from the queue. A
-single-verb write (`create`, `replace`, `remove`, `readModifyWriteOnPresence`) queues a bare
-ticket: when it becomes leader it runs its own verb on its own thread and needs no result slot. A
-`readModifyWrite` item carries what a leader needs to run it:
+**Enter.** The caller binds its policy to an absolute deadline on the engine's clock
+(`policy.bind(now)`), as every verb does today at entry, so time spent waiting spends the caller's
+own window. Under `mutex`: take `next_ticket++`, push it at the back of `tickets` (the one
+allocation of the lane; a failure here leaves the lane untouched and propagates).
 
-```cpp
-struct Item
-{
-    CasRequests * plane;                     /// which `CasRequests` admitted it: a batch never crosses planes
-    CasOperation & op;                       /// the caller's own admission
-    Retry policy;                            /// as passed; `single_attempt` items are never carved
-    Retry::Bound bound;                      /// bound at entry: queue wait spends the caller's window
-    const DecideOnObject * decide = nullptr; /// null for a single-verb ticket
-    bool done = false;                       /// guarded by `mutex`
-    std::optional<WriteResult> result;       /// guarded by `mutex`; only a carved `readModifyWrite` is settled here
-    std::exception_ptr error;                /// guarded by `mutex`
-};
-```
+**Wait.** Loop:
 
-**Wait.** Under `mutex`: push the item, then loop. If `done`: leave with `result` or rethrow
-`error`. If the item is in `pending` (not carved) and its own `bound.deadline_ms` has passed on the
-engine's clock: erase it, leave with `GaveUp{Deadline}`. If in `pending` and its own gate is lost:
-erase, leave with `GaveUp{FenceLost}`. If it is the front of `pending` and no leader is active:
-become leader. Otherwise `cv.wait_for(lock, slice)` with a short slice (the pattern of
-`recovery_cv.wait_for(lock, 200ms)` in the ledger), so a waiter re-checks its own deadline against
-the engine's clock even when the leader is inside a long `decide`, and so an injected clock in a
-test moves it. Every handover also does `cv.notify_all()`.
+- Under `mutex`: if the ticket is at the front and `holder_active` is false, set
+  `holder_active = true` and leave the loop as the holder. Otherwise `cv.wait_for(lock, slice)`
+  with a short slice (the pattern of `recovery_cv.wait_for(lock, 200ms)` in the ledger), then
+  release the mutex.
+- Outside `mutex`: check the caller's own bound against the engine's clock, and `gate(0)` on the
+  caller's own operation. The gate is evaluated outside the lane mutex because it calls the
+  operation's `Liveness` closure, and the lane mutex must stay a leaf that calls nothing. If the
+  bound has passed: under `mutex`, erase the ticket (no allocation), then return
+  `GaveUp{Deadline}` with the bound's own source. If the gate is `FenceLost`: erase, return
+  `GaveUp{FenceLost}`; `NoBudget`: erase, return `GaveUp{Deadline, Lease}`, the engine's own
+  three-way mapping.
 
-**Leader.** Under `mutex`: install the exit guard, then `leader_active = true`, then release the
-mutex. Nothing between the two can throw. The leader's own item stays at the front of `pending`
-until the guard settles it. There is no eager carve.
+**Hold.** Run the verb's body on the caller's own thread, with the caller's own operation, policy,
+bound and result type, exactly as today, plus the memory step below. Every attempt still passes the
+operation's own gate and bound before it is sent, as today.
 
-**Carve, lazily.** Only after the leader's own `decide` has contributed bytes (below), and one item
-at a time: under `mutex`, look at the front of `pending` behind the leader; it is compatible when it
-is a `readModifyWrite` item on the same `plane` with `policy.single_attempt == false`. Push it onto
-the leader's owned list first (the only allocation), then pop it from `pending`; an allocation
-failure leaves the queue untouched and ends the carve. Release the mutex and run its `decide`. Stop
-carving at the first incompatible item or at an empty queue. An item still in `pending` is not owned
-by anyone but its caller and can leave on its own deadline.
+**Leave.** A guard on every exit, normal or exceptional, that under `mutex` pops the front ticket,
+sets `holder_active = false`, applies the memory rule, and does `cv.notify_all()`. Nothing in it
+allocates or throws.
 
-**Exit.** One guard on every exit, normal or exceptional, the shape of
-`completeOwnedItemsAndReleaseLeadership`: under `mutex`, every owned item not yet `done` is either
-settled or put back; `leader_active = false`; `cv.notify_all()`. Which items are settled and which
-are put back is decided by the batch's ending (below). An item is never left owned by no one after
-its caller's stack may be gone: the decide closure lives there.
+A holder never waits for another ticket and never runs anyone else's closure: a ticket is settled
+only by its own caller. No ticket outlives its caller's stack in the queue: the caller removes it on
+every exit path, and nothing else references it.
 
-**Fairness.** One batch per tenure. The leader hands over as soon as its batch is settled, even if
-the queue refilled meanwhile; the next front item leads the next batch.
+### The memory {#the-memory}
 
-### The batch {#the-batch}
+**Memory rule.** After any write verb on a hot key ends, in the leave guard: `Committed`
+remembers the bytes that verb wrote and the etag it got; a `Conflict` whose resolve read saw an
+`Object` remembers that object; `Removed`, `Gone`, `Mismatch`, `Refused`, `GaveUp`, `Declined` and
+every exception forget. Those are the only two sources; an ordinary `read` never reads or writes
+the memory, and absence is never remembered. A `GaveUp{FenceLost}` after a landed `PUT` also
+forgets: the memory is a hint, and forgetting is the fail-close direction.
 
-Every step runs on the leader's thread, on a ticket, never under `mutex` except where stated.
+**Where memory is used.** Only `readModifyWrite`. Its body gains one optional input, the
+remembered object, used in place of its initial observation:
 
-1. **Base.** `remembered`, if present; otherwise `observe` under the leader's policy and bound, as
-   `readModifyWrite` does today. A failed observation ends the tenure with the leader's own
-   `GaveUp` after failed observation; nothing was carved.
-2. **The leader's decide** on the base. Bytes: the leader is the first contributor and the
-   candidate is those bytes. A verdict on an observed base: final; the tenure ends and the leader
-   reports it; nothing was carved. A verdict on memory: not a result; clear the memory and return to
-   step 1, which now observes. This restart happens at most once per tenure.
-3. **Carve and chain.** For each item carved as above: `gate(0)` on its own operation; lost: settle
-   it now with `GaveUp{FenceLost}`, `sent_any = false`; its `decide` never runs. Otherwise
-   `decide(Object{bytes = candidate, etag = base etag})`. Bytes: the item is a contributor and the
-   candidate is those bytes. A verdict: held provisionally, the candidate unchanged, the chain
-   continues.
-4. **Write.** One `writeLoop` of the candidate against the base etag (a create when the base was
-   absence), under the leader's operation, policy and bound, with `ResolveWith::Body`: the inner
-   write of today's `readModifyWrite`.
-   - `Committed`: `remembered := (candidate, etag)`. For each contributor, `gate(0)` on its own
-     operation once more; lost: `GaveUp{FenceLost}` with `sent_any = true`, although the batch
-     landed, which is the engine's own rule for a single write whose fence was lost in flight;
-     otherwise `Committed{etag, attempts_sent, resolved_by_read}` with the batch's counts. Each
-     provisional verdict is now proven and is delivered: `Declined{seen = base}` or the rethrown
-     exception.
-   - `Conflict`: `remembered := seen` if the resolve read saw an `Object`, cleared otherwise;
-     pause `Retry::conflictBackoff()` under the leader's gate and bound (Half 2); base := seen, which
-     is an observation; re-run step 2 for the leader on it (a verdict there is final: the leader
-     reports it and the tenure ends with every owned item put back), then step 3 over every owned
-     item in order, contributors and provisional ones alike, each re-gated; then step 4 again.
-   - `Refused`, `GaveUp`, or an exception out of `writeLoop`: the leader alone receives it.
-     `remembered` is cleared. Every other owned item is put back at the front of `pending` in its
-     original order, not settled and not `done`; when it wakes it applies its own deadline and gate,
-     and the front one leads the next tenure, which observes because the memory is gone. A tenure's
-     failure is therefore never attributed to a member, and a member's provisional verdict is never
-     delivered from a base that did not commit.
+1. Base := `remembered` if present, else `observe` as today.
+2. `decide(base)`. Bytes: proceed to the inner write against the base's etag, as today. A verdict
+   on an observed base: return it, as today. A verdict on memory: clear the memory, `observe`,
+   `decide` again on the observation, and return what that renders. This restart happens at most
+   once per call, and the first verdict is discarded without being seen by anyone: it was rendered
+   on a hint.
+3. The inner write and the `Conflict` loop are today's, with the pause of Half 2. A `Conflict`'s
+   resolve read is an observation, so what `decide` renders on it is a result.
 
-**Memory rule, in one sentence.** After any write verb on a hot key, `Committed` remembers the
-bytes written and the etag returned, a `Conflict` whose resolve read saw an `Object` remembers that
-object, and every other ending and every exception forgets. Those are the only two sources; an
-ordinary `read` never reads or writes the memory, and absence is never remembered.
-
-### Single-verb writes on a hot key {#single-verb-writes-on-a-hot-key}
-
-`create`, `replace`, `remove` and `readModifyWriteOnPresence` on a hot key queue as bare tickets.
-Each runs when it becomes leader, on its caller's thread, with its own precondition, policy and
-result type, exactly as today; it is never carved into another leader's batch and never starts from
-memory. After it the memory rule applies unchanged: `Committed` remembers the bytes it wrote and the
-etag it got; a `Conflict` that saw an `Object` remembers it; `Removed`, `Gone`, `Mismatch` and every
-other ending forget.
+`create`, `replace`, `remove` and `readModifyWriteOnPresence` never start from memory. They take a
+ticket, run as today, and feed the memory rule.
 
 What this buys the GC erase, and what it does not. `deleteCompletedRemovingAtSnapshot` does a
 `replace` against the etag of the round's catalog cut, read by the reconciler earlier, and then its
@@ -295,7 +255,7 @@ feeds its next attempt exactly as today. The lane does not rewrite that loop and
 remove that 412.
 
 `initializeEmptyForNewPool` runs on the pool factory's local bootstrap `CasRequests`, before the
-`Pool` exists; it has no hot keys and seeds nothing. The first mount-plane write reads.
+`Pool` exists; it has no hot keys and seeds nothing. The first mount-plane `readModifyWrite` reads.
 
 ### Deadlines and fences {#deadlines-and-fences}
 
@@ -306,17 +266,16 @@ sleeps already spend.
 
 | who | bounded by | worst case |
 |---|---|---|
-| a waiter in `pending` | its own deadline and its own gate, re-checked every slice | its window plus one slice |
-| the leader | its own deadline; the engine starts no attempt that cannot finish inside it | its window, plus one attempt timeout, plus the windows of reads its own `decide` issues |
-| a carved item | the rest of the chain and the leader's write | the leader's worst case, less what already elapsed; after any non-commit it is back in `pending` under its own deadline |
+| a waiter | its own deadline and its own gate, re-checked every slice | its window plus one slice |
+| the holder | its own deadline; the engine starts no attempt that cannot finish inside it | its window, plus one attempt timeout, plus the windows of reads its own `decide` issues |
 
-Nothing copies a deadline verdict from one operation to another: `GaveUp::Source` is always the
-reporting operation's own bound. A carved item receives exactly one of: `Committed` from a committed
-batch, its own proven verdict, or its own gate's `FenceLost`; everything else returns it to the
-queue.
+Nothing copies a verdict from one operation to another: every `GaveUp` is the reporting operation's
+own, with its own `Source`. A frozen policy (`op.freeze`) and a lease-bound policy
+(`untilLeaseSafe`) behave as today: the bound the caller brought is the bound the wait and the
+write are checked against.
 
-A stopping plane or a lost fence reaches waiters through the same route as today: the leader's
-operation gives up at its gate, the tenure ends, every waiter wakes and applies its own gate.
+A stopping plane or a lost fence reaches waiters through their own gate, checked every slice, and
+reaches the holder through its own attempts' gates, as today.
 
 ### Lock order {#lock-order}
 
@@ -333,65 +292,51 @@ the in-memory backend holds its mutex only for the duration of one operation and
 without it; the mount plane's sleep is `CasMountRuntime::sleepInterruptibly`, a leaf; `decide`s
 call `op.admitted()` (atomics) and issue reads (backend leaf). No `decide` takes a ledger mutex.
 
-The order is therefore: caller (no locks) → `CasHotKeys::mutex` (a leaf: held for enqueue, one
-carve step, result delivery and memory updates; never across I/O, never across a `decide`) →
-backend mutex. The one rule this imposes on future callers, stated where the catalog API is
-documented: a catalog mutation is not entered while holding a ledger mutex. A `decide` that blocks
-on something a waiter holds is the only deadlock shape, and waiters hold nothing.
+`CasHotKeys::mutex` is a leaf that calls nothing: it is held only to push, inspect, pop or erase a
+ticket, to flip `holder_active`, and to read or write `remembered`. The gate, the `Liveness`
+closure, the verb's body and every `decide` run with it released. The order is therefore: caller
+(no locks) → `CasHotKeys::mutex` → nothing; and separately caller (no locks) → backend mutex. The
+one rule this imposes on future callers, stated where the catalog API is documented: a catalog
+mutation is not entered while holding a ledger mutex, because the holder's `decide` may take
+ledger-visible reads and a waiter must not hold what the holder needs. Today's callers hold nothing.
 
 ### Invariants {#invariants}
 
 - INV-HK1. Per process and hot key, at most one conditional write is in flight at any moment.
 - INV-HK2. Writes of one process to a hot key are applied in arrival order.
-- INV-HK3. Between two consecutive `Committed`s of one process on a hot key, the lane issues no
-  read of the key: the later write starts from memory. (Callers' own reads of the key, such as the
-  catalog's pre-check `read`, are outside the lane and unchanged.)
+- INV-HK3. A `readModifyWrite` that follows a `Committed` of this process on a hot key, with no
+  other ending in between, obtains its base from memory and issues no read for it. A lost race's
+  resolve read is not a base read and is unchanged.
 - INV-HK4. The memory of a hot key is either absent or a `(bytes, etag)` pair that was durable at
   some moment, taken from a `Committed` of this process or from the engine's resolve read. It never
   changes the semantics of a conditional write: a stale memory costs one 412 and one resolve read.
-- INV-HK5. A verdict (a `decide` returning `nullopt` or throwing) reaches its caller only from a
-  proven base: rendered directly on an observation of this tenure, or proven by the commit of the
-  batch it was rendered in.
-- INV-HK6. An item leaves the queue only by being settled or put back by a leader, or by removing
-  itself while it is in `pending`; no item is owned by no one while its caller may have unwound.
-- INV-HK7. A carved item's own fence is checked before its `decide` runs and again after the commit
-  it took part in; a lost fence before means its `decide` never ran, a lost fence after means
-  `GaveUp{FenceLost}` even though the batch landed.
-- INV-HK8. A batch never crosses `CasRequests` planes and never carries a `single_attempt` item.
+- INV-HK5. A verdict (a `decide` returning `nullopt` or throwing) reaches its caller only when it
+  was rendered on an observation of that call.
+- INV-HK6. A ticket is removed only by its own caller, on every exit path; no ticket references a
+  stack that may have unwound.
+- INV-HK7. `CasHotKeys::mutex` is held across no callback, no I/O and no `decide`.
 
 ### Effects to name {#effects-to-name}
 
-- A carved `decide` runs on the leader's thread while its caller is parked. The caller's
-  `CasOperation` is used by one thread at a time, which keeps its single-threaded contract, but
-  profile events and the stack of an exception thrown from that `decide` belong to the leader's
-  thread and query.
-- A `decide` that issues reads holds the chain for those reads. `reconcileStaleCreator` and
+- A `decide` that issues reads holds the lane for those reads. `reconcileStaleCreator` and
   `cancelStalledCreating` call `isCreatorFenceTerminal` inside `decide`, and that reads the mount
-  key under a fresh `Retry::standard()` on the member's operation. Today that window is the
-  caller's own; in a batch it is every later member's too. Uncarved waiters are unaffected (they hold
-  their own deadline); a carved member waits. Passing a frozen policy into `isCreatorFenceTerminal`
-  would bound it and is a follow-up outside this design.
-- `CasRefCatalog::casUpdate` and `casAdmitEntry` return the candidate this call's own `mutate`
-  produced, which is included in the committed object but is not the committed object when other
-  contributors followed in the batch. No production caller reads the return value; tests that assert
-  on it run without a hot predicate and see today's behaviour.
-- `Committed::attempts_sent` and `resolved_by_read` reported to a contributor are the batch's.
+  key under a fresh `Retry::standard()` on the caller's operation. Today that window is the
+  caller's own; in the lane it is also every waiter's, each of which still leaves on its own
+  deadline. Passing a frozen policy into `isCreatorFenceTerminal` would bound it and is a follow-up
+  outside this design.
+- A verdict rendered on memory costs one `GET` before the real verdict, which is what every
+  `readModifyWrite` costs today.
+- The `Committed` a caller receives is its own write's, with its own `attempts_sent`.
 
 ### Kinship with `appendRefOps` {#kinship-with-appendrefops}
 
-| | ref-log append lane | hot-key lane |
-|---|---|---|
-| item | `RefMutationItem` with `done`, `error`, `committed_id` under `ref_queue_mutex` | `Item` with `done`, `error`, `result` under `CasHotKeys::mutex`; a bare ticket for single verbs |
-| leader | first to find `leader_active` false; serves until its own item is done | first to find it false; one batch per tenure |
-| carve | compatible items into one ref-log transaction, at flush time | compatible items one at a time, as their `decide` is applied, into one conditional `PUT` |
-| exit | `completeOwnedItemsAndReleaseLeadership` | the same guard; settles on commit, puts back on anything else |
-| wait | `cv.wait`, woken at every handover | `cv.wait_for` in slices, woken at every handover, own deadline re-checked |
-| work per item | `build_ops` runs at most once; a rejection is final | `decide` re-runs on the fresh object after a conflict, as `readModifyWrite` already promises; a refusal is final only from a proven base |
-| key shape | write-once ref-log objects: a wedge and a `carved` mirror for confirms | replace-style control object: ambiguity is settled by the engine's resolve read |
-| home | inside `RefTableRuntime`, per namespace | inside the engine, per key |
-
-The shared shape is the point; the differences are why they are two components. Extracting a common
-flat-combining lane is possible and is not part of this design.
+The ref-log append lane is flat combining: items with `done`/`error`, a leader that carves
+compatible items into one transaction, an exit guard that completes owned items. The hot-key lane
+is deliberately less: a ticket lock with a deadline and one remembered object. It shares the mutex
+discipline (never held across the durable write) and the exit-guard discipline (every exit path
+releases), and nothing else. Combining is what the reviews showed cannot be done generically over
+closures; if it returns, it returns as typed catalog deltas and will resemble `appendRefOps` more
+closely.
 
 ## Half 2: conflict pacing {#half-2-conflict-pacing}
 
@@ -405,7 +350,6 @@ attempt 2 on), so the number has one home next to the schedule it departs from.
   meaning.
 - `CasRefCatalog::deleteCompletedRemovingAtSnapshot`: `op.pause(Retry::conflictBackoff())` instead
   of `op.pause(Retry::backoff(attempt + 1))`.
-- The hot-key batch loop uses the same pause on its `Conflict` path.
 - Transport faults and unresolved-but-repeatable attempts keep `pauseAndReissue` unchanged.
 
 Why flat is right and growing was wrong: a conflict is a lost race the resolve read has already
@@ -415,7 +359,7 @@ slowest and therefore the likeliest to lose again. The spec's motivation for pac
 of about one mutation per second per object, is served by the transport path: exceeding it answers
 429, which is a transport fault and takes the growing schedule. After Half 1, conflicts arise only
 between servers, and there a loss is dearer than before, because the losing server's whole lane
-waits behind its leader.
+waits behind its holder.
 
 ### Edits to the backend request contract {#edits-to-the-backend-request-contract}
 
@@ -431,17 +375,17 @@ In `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md`:
    process a hot key never conflicts with itself: see the hot-key write lane."
 2. In the hand-written loop rule, after "sleeps with the engine's jitter between iterations", add:
    "the flat `conflictBackoff` after a refused precondition, `backoff(attempt)` after a fault".
-3. A new short section pointing to this document for the lane's invariants and the participation
-   contract.
+3. In the `readModifyWrite` section, one paragraph: on a hot key the initial observation may be
+   the lane's remembered object, and a verdict rendered on it is re-rendered on an observation
+   before it is reported; pointer to this document.
 
 ## Observability {#observability}
 
 Three profile events, mirroring the ref-log lane's `CASRefQueueWaitMicroseconds`:
 
-- `CASHotKeyQueueWaitMicroseconds`: time from enqueue to completion, per item.
-- `CASHotKeyBatchMembers`: contributors per committed batch (sum; divide by
-  `CASHotKeyBatches` for the mean).
-- `CASHotKeyMemoryStarts` and `CASHotKeyReadStarts`: how a tenure obtained its base.
+- `CASHotKeyQueueWaitMicroseconds`: time from enter to hold, per ticket.
+- `CASHotKeyMemoryStarts` and `CASHotKeyReadStarts`: how a `readModifyWrite` obtained its base.
+- `CASHotKeyVerdictRestarts`: verdicts rendered on memory and re-rendered on an observation.
 
 The acceptance measurement is the existing one: ten minutes of the parallel stateless suite on the
 CA-s3 lane, `system.query_log` for `DROP TABLE` and `CREATE TABLE` percentiles, and the count of
@@ -451,54 +395,42 @@ CA-s3 lane, `system.query_log` for `DROP TABLE` and `CREATE TABLE` percentiles, 
 
 Engine level, in `gtest_cas_requests.cpp`'s harness: fake clock, counting backend, write hooks. A
 `CasHotKeys` with a predicate naming the test key is passed to the `CasRequests` under test. Each
-`decide` in these tests decodes a list of tickets from `bytes` and appends its own, so order and
-membership are visible in the object.
+`decide` in these tests decodes a list of tickets from `bytes` and appends its own, so order is
+visible in the object.
 
-1. Serialization and combining. N threads call `readModifyWrite` on the hot key; a write hook parks
-   the first leader until all N are queued. Assert: reads of the key 1, writes 2, the final object
-   lists the tickets in arrival order, no read between the two commits (INV-HK1, HK2, HK3).
-2. Fence before and after. A carved item whose operation was resumed under a stale generation
-   receives `GaveUp{FenceLost}` and its `decide` never ran (a counter); a carved item whose fence is
-   tripped by a hook between the `PUT` and the post-commit check receives `GaveUp{FenceLost}` with
-   `sent_any = true` while the object carries its ticket (INV-HK7).
-3. Verdict on stale memory. The process commits once (memory set). A second `CasRequests` over the
+1. Serialization and memory. N threads call `readModifyWrite` on the hot key; a write hook parks
+   the first holder until all N are waiting. Assert: reads of the key 1, writes N, no write
+   returned `Conflict`, the final object lists the tickets in arrival order (INV-HK1, HK2, HK3).
+2. Verdict on stale memory. The process commits once (memory set). A second `CasRequests` over the
    same backend writes a row. A caller reads the key fresh outside the lane and runs a
    `beginRemoving`-shaped `decide` (throw unless the row equals what it observed). Assert: no
-   exception, one read by the lane, `Committed`, the row transitioned (INV-HK5, the first half).
-4. Provisional verdict, failed batch. Leader's `decide` changes row R; a carved member's `decide`
-   throws because R no longer equals what it observed; a hook makes the batch `PUT` `Refused`.
-   Assert: the leader receives `Refused`, the member receives nothing yet, memory is cleared, the
-   member leads the next tenure from a fresh read, sees R unchanged, contributes, `Committed`
-   (INV-HK5, the second half; INV-HK6).
-5. Provisional verdict, committed batch. Same setup, the `PUT` commits. Assert: the member's
-   exception is delivered after the commit and the object carries the leader's change.
-6. Declined and thrown contributions. A carved `decide` returning `nullopt` receives `Declined`
-   after the commit, with no ticket in the object; a carved `decide` that throws receives its
-   exception after the commit.
-7. External writer on the write path. A second `CasRequests` writes between two writes of the
+   exception, exactly one read by the lane, `Committed`, the row transitioned, and the discarded
+   first verdict is visible only as `CASHotKeyVerdictRestarts` (INV-HK5).
+3. Verdict on an observation. Same shape, but the row really changed. Assert: the exception is
+   delivered, one read, no write.
+4. External writer on the write path. A second `CasRequests` writes between two writes of the
    first. Assert the first's next `readModifyWrite` does exactly one resolve read and one retry
    write and ends `Committed`, and the write after that starts from memory with zero reads.
-8. `Refused` and a thrown `writeLoop` clear the memory and put members back: the next tenure
-   reads, no item is left owned by no one, the next writer proceeds.
-9. Deadlines. A waiter in `pending` whose fake-clock deadline passes while the leader is parked
-   inside its `decide`'s nested read leaves with `GaveUp{Deadline}` and sends nothing; a carved item
-   whose own deadline passes receives the batch's `Committed`.
-10. Compatibility. A `Retry::once` item and an item from a second plane sharing the same
-    `CasHotKeys` are never carved: each runs as its own leader after the batch (INV-HK8). The
-    second-plane `replace` (the GC erase shape) lands and refreshes the memory.
-11. Half 2. One writer loses K races in a row (a hook mutates the key before every attempt).
-    Assert every recorded sleep is at most 200 ms and the sum at most K × 200 ms; a sibling test
-    injecting K transport faults sees the unchanged growing schedule.
+5. Forgetting. `Refused` from a hook, a thrown `writeLoop`, and a `GaveUp{FenceLost}` after a
+   landed `PUT` each clear the memory: the next write reads first.
+6. Deadlines and fences in the queue. A waiter whose fake-clock deadline passes while the holder
+   is parked inside its `decide`'s nested read leaves with `GaveUp{Deadline}` carrying its own
+   source and sends nothing; a waiter whose fence is tripped leaves with `GaveUp{FenceLost}`; a
+   waiter whose lease budget runs out leaves with `GaveUp{Deadline, Lease}`. The ticket is gone
+   from the lane in all three cases (INV-HK6).
+7. Cross-plane serialization. A `replace` from a second plane sharing the same `CasHotKeys` (the
+   GC erase shape) waits for a parked holder, lands, and refreshes the memory: the next
+   `readModifyWrite` starts with zero reads. A `remove` clears it.
+8. Half 2. One writer loses K races in a row (a hook mutates the key before every attempt).
+   Assert every recorded sleep is at most 200 ms and the sum at most K × 200 ms; a sibling test
+   injecting K transport faults sees the unchanged growing schedule.
 
 Pool level, through the ledger:
 
-12. N concurrent `createNamespace` calls on one `Pool`: catalog writes fewer than N, catalog reads
-    bounded by a constant independent of N.
-13. A second `Pool` over the same backend as the external writer: the first `Pool`'s next catalog
+9. N concurrent `createNamespace` calls on one `Pool`: catalog reads bounded by a constant
+   independent of N, and zero catalog writes returned `Conflict`.
+10. A second `Pool` over the same backend as the external writer: the first `Pool`'s next catalog
     mutation costs exactly one extra read and one retry write.
-
-Not tested: an allocation failure during the carve step (no injection point; the design's
-allocation-before-removal order is the argument).
 
 Regression: every existing test in `gtest_cas_ref_catalog.cpp` and its siblings runs unchanged,
 without a hot predicate, and must stay green. That is the check that the catalog API was not
@@ -506,8 +438,14 @@ touched.
 
 ## Placement of what this does not do {#placement-of-what-this-does-not-do}
 
+- Combining catalog mutations into one `PUT`: a BACKLOG item, with the constraints the reviews
+  established. It must be typed catalog deltas inside `CasRefCatalog`, not closures in the engine;
+  each delta conditioned on an exact row so that a later delta cannot silently rewrite an earlier
+  one's effect; admission evaluated on the final candidate, never on a prefix; a verdict delivered
+  only after the batch that rendered it committed, or re-rendered on an observation; every member
+  gated on its own fence before its delta is applied and after the commit; membership frozen before
+  the write. Motivation: a store that budgets one mutation per second per object.
 - Declaring the `_ckpt` keys hot, with the memory bound that many hot keys need: a BACKLOG item.
 - Bounding the reads a catalog `decide` issues (`isCreatorFenceTerminal` under a frozen policy): a
   BACKLOG item.
-- Unifying the two lanes: a BACKLOG note, not planned.
 - The two remaining `DROP TABLE` costs stay in `{#stateless-lane-wall-time-is-drop-table}`.
