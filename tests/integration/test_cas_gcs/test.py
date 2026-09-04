@@ -1302,6 +1302,60 @@ def test_a_reload_that_would_flip_the_token_dialect_is_refused():
         )
 
 
+@pytest.mark.parametrize("disk", sorted(CAS_DISKS))
+def test_first_per_key_throttling_is_transparently_absorbed(disk):
+    """Task 21's coverage gate, over the wire: `/_control/first_per_key_throttle` refuses the FIRST
+    request naming every key with `429 SlowDown`, modelling a real store's transient per-object
+    throttling. A CAS mount's own request engine must resolve every one of those refusals by
+    reissuing rather than surfacing them, so `CREATE TABLE` / `INSERT` / `SELECT` / `DROP TABLE`
+    against a CAS disk must all still succeed with the mode on.
+
+    Scoped to its own table and reset in `finally`: the throttle is a GLOBAL fake-service switch, and
+    leaving it on would refuse the first touch of every key every later test in this module makes.
+    """
+    node = cluster.instances["node"]
+    bucket = CAS_DISKS[disk]
+    table = "t_throttled_" + disk
+    try:
+        assert _control_post("/_control/first_per_key_throttle?enabled=1")["enabled"] is True
+        start_seq = _next_seq()
+
+        node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+        node.query(
+            """
+            CREATE TABLE {} (id Int64, data String)
+            ENGINE = MergeTree() ORDER BY id
+            SETTINGS storage_policy = '{}'
+            """.format(
+                table, disk
+            )
+        )
+        node.query(
+            "INSERT INTO {} SELECT number, toString(number) FROM numbers({})".format(
+                table, NUM_ROWS
+            )
+        )
+        assert int(node.query("SELECT count() FROM {}".format(table))) == NUM_ROWS
+        node.query("DROP TABLE {} SYNC".format(table))
+
+        records = _captured_since(start_seq, bucket)
+        throttled = [r for r in records if r["operation"] == "first_per_key_throttled"]
+        assert throttled, "the throttle control never fired -- this run exercises nothing"
+        assert all(r["status"] == 429 for r in throttled), throttled
+        # Every throttled key was reached again afterwards: `FirstPerKeyThrottled`'s own contract is
+        # refuse-once-then-pass, so a key throttled here but never seen again would mean the mount gave
+        # up on the refusal instead of absorbing it -- which the successful statements above already
+        # rule out, but this ties the failure (if any) to the exact key.
+        seen_again = {r["key"] for r in records if r["operation"] != "first_per_key_throttled"}
+        for record in throttled:
+            assert record["key"] in seen_again, "key '{}' was throttled once and never retried".format(
+                record["key"]
+            )
+    finally:
+        assert _control_post("/_control/first_per_key_throttle?enabled=0")["enabled"] is False
+        node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+
+
 # MUST STAY LAST IN THIS FILE. The fake's capture log is global and cumulative and nothing in this
 # module resets it, so this assertion covers exactly the traffic that precedes it.
 # Add new tests ABOVE this line.
