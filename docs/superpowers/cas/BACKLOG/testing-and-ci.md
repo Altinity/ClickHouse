@@ -114,3 +114,26 @@ covered" by the table-proxy unwrapping change — it no longer holds. `trySyncRe
 `StorageProxy::checkMutationIsPossible` forwarding reaches `StorageTableFunctionProxy` on the same
 principle. Non-CAS surface (it is the `lazy_load_tables` feature), so it belongs to the upstream
 carve-out rather than the CAS release. P3, but a silent no-op on a SYSTEM verb is worth a line.
+
+## Four narrow classification gaps left by the `gtest_cas_request_control.cpp` deletion {#request-control-classification-gaps}
+
+MINOR (TEST) — surfaced while building the per-property coverage map for the 53 tests deleted with
+`gtest_cas_request_control.cpp` (`docs/superpowers/cas/2026-09-04-request-control-deletion-coverage-map.md`).
+Each shares its code path with an already-tested sibling, so none is a live correctness risk, but none
+is separately pinned by name either:
+
+1. An `S3Exception` carrying `SlowDown`/`InternalFailure` (or any unmodeled/unnamed S3 error) on the
+   WRITE path is untested for falling through to ambiguity rather than `Refused` — the read-path
+   instance is `CASRequests.AnUnmodeledStoreErrorOnAReadIsReissuedNotSurfaced`, but `writeLoop`'s own
+   negative case (`!isDefinitelyRefusedWrite(e)`) has no write-path test naming the exception.
+2. `isEntityTooLargeError`'s specific S3 error name (`EntityTooLarge`) is untested — it shares
+   `isDefinitelyRefusedWrite`'s `||` chain with `MalformedXML`/`AccessDenied` (both of which ARE
+   tested by name), so the mechanism is proven but this specific name is not.
+3. `makeCasWriteRetryLaterExceptionPtr` (`CasRequests.h:73`) has no direct unit test verifying its
+   classification matches its direct-throw twin `throwCasWriteRetryLater`; production callers
+   (`CasRefLedger`'s queued-append completion paths) exercise it only indirectly.
+
+Fix: add one write-path test constructing an unnamed/`SlowDown` `S3Exception` and asserting it
+resolves via ambiguity rather than `Refused`; add an `EntityTooLarge`-named case alongside the existing
+`MalformedXML`/`AccessDenied` tests in `gtest_cas_requests.cpp`; add a direct
+`makeCasWriteRetryLaterExceptionPtr` classification test next to `CASWriteResult.OrThrowMapsEveryAlternative`.
