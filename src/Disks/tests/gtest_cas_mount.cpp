@@ -296,6 +296,14 @@ CasRequestBudget renewalLogBudget()
 
 }
 
+/// `CASMountAudit.PhysicalRetryCannotBeDelayedByDebugLogging` was retired when mount renewal moved onto
+/// `CasRequests`/`CasOperation` (the old hand-written renewal controller had a per-attempt progress
+/// callback the test used to interleave a blocking debug log with the retry loop's own pacing; nothing
+/// still exposes such a callback). Verified still true against the current engine, not just the
+/// migration's own commit message: `grep -n "LOG_\|getLogger" .../Backend/CasRequests.cpp` finds exactly
+/// one log call in the whole write-retry engine, `logCasWriteRetryLater`, reached only from the
+/// `[[noreturn]]` `throwCasWriteRetryLater` -- the terminal give-up, called once, never between
+/// attempts. No replacement test is needed: there is no per-attempt log call left to race.
 TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
 {
     const auto open_store = [](const std::shared_ptr<RenewalLogBackend> & backend, uint64_t & boot_ms, const String & prefix)
