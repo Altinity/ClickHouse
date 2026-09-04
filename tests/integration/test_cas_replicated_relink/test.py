@@ -1212,5 +1212,6 @@ def test_relink_wins_over_ttl_then_mover_converges():
             "SELECT count(), sum(v) FROM {}".format(table)
         )
     finally:
+        node2.query("SYSTEM START FETCHES {}".format(table))
         node2.query("SYSTEM START MOVES {}".format(table))
     drop_everywhere(table)

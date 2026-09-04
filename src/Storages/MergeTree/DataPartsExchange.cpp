@@ -252,7 +252,6 @@ CasConfirmAnswer Service::resolveContentAddressedConfirm(
     if (!routed)
         return CasConfirmAnswer::Unknown;
     const IContentAddressedExchange * matched = tryGetContentAddressedExchange(routing_disks[*routed]);
-    DiskPtr matched_disk = routing_disks[*routed];
 
     /// Gate 0 — the part-anchored fast filter. It is an AVAILABILITY filter and never a proof (spec
     /// §confirm-primitive, demoted in rev.5): `rollbackDeletingParts` puts a part back to `Outdated`
@@ -261,8 +260,8 @@ CasConfirmAnswer Service::resolveContentAddressedConfirm(
     /// a cheap `No` that costs no ledger work; every `Yes` is earned by gate 1 alone.
     ///
     /// `Deleting` is excluded by the state filter, an unknown name yields no part at all, and a part of
-    /// this name living on ANOTHER disk is rejected explicitly — `MOVE ... TO DISK` leaves a same-name
-    /// `Active` part behind on the destination disk, and only the instance the token routed to may be
+    /// this name living on ANOTHER mount is rejected explicitly — `MOVE ... TO DISK` leaves a same-name
+    /// `Active` part behind on the destination disk, and only the mount the token routed to may be
     /// the one the confirm is about. The parts set is read under its own lock, which
     /// `getPartIfExists` takes and releases, and the part reference is dropped before any ledger lock.
     {
@@ -271,7 +270,14 @@ CasConfirmAnswer Service::resolveContentAddressedConfirm(
             return CasConfirmAnswer::Unknown;
         const auto part = data.getPartIfExists(
             *part_info, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-        if (!part || part->getDataPartStorage().getDiskName() != matched_disk->getName())
+        if (!part)
+            return CasConfirmAnswer::No;
+        /// Compared by mount, not by disk name: a base disk and its cache wrapper are two names for one
+        /// exchange object, and a part living on either of them is a part of the mount the token routed
+        /// to. A different mount (a distinct exchange object) is the "another disk" this gate rejects.
+        const auto * part_exchange = tryGetContentAddressedExchange(
+            data.getStoragePolicy()->tryGetDiskByName(part->getDataPartStorage().getDiskName()));
+        if (part_exchange != matched)
             return CasConfirmAnswer::No;
     }
 
@@ -824,8 +830,8 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     int server_protocol_version = parse<int>(in->getResponseCookie("server_protocol_version", "0"));
     String remote_fs_metadata = parse<String>(in->getResponseCookie("remote_fs_metadata", ""));
 
-    /// The relink offer, if any, is already visible: response cookies arrive with the headers, before a
-    /// single body byte is read. Resolve the forced disk NOW, so the reservation below goes to it and the
+    /// The relink offer, if any, is already visible: response cookies arrive with the headers, before any
+    /// body field is consumed. Resolve the forced disk NOW, so the reservation below goes to it and the
     /// body reads keep their order. `offered_pool` is what the relink block later checks the chosen disk
     /// against; with a caller-supplied disk there is nothing to force and that check is all there is.
     const String ca_relink = parse<String>(in->getResponseCookie(CA_RELINK_COOKIE, ""));
@@ -847,7 +853,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
             {
                 forced_ca_disk = ca_candidate_disks[*chosen];
                 LOG_DEBUG(log, "Part {} is offered by relink for content-addressed pool {}; placing it on disk {} "
-                    "ahead of the storage policy's volume order and TTL rules", part_name, offered_pool, forced_ca_disk->getName());
+                    "ahead of the storage policy's volume order and TTL rules", part_name, offered_pool, ca_candidates[*chosen].disk_name);
                 /// From here on the target is decided: every `!disk` reservation branch below is skipped.
                 disk = forced_ca_disk;
             }
@@ -1004,9 +1010,14 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
         auto * chosen_ca = tryGetContentAddressedExchange(disk);
         if (!chosen_ca || offered_pool.empty() || chosen_ca->getPoolUUID() != offered_pool)
         {
-            LOG_INFO(log, "Part {} was offered by relink for content-addressed pool '{}', but no disk of this table's "
-                "storage policy takes it (chosen disk {}, pool '{}'); falling back to a byte fetch",
-                part_name, offered_pool, disk->getName(), chosen_ca ? chosen_ca->getPoolUUID() : "<none>");
+            if (offered_pool.empty())
+                LOG_INFO(log, "Part {} was offered by relink, but the offer does not name one of the {} advertised "
+                    "content-addressed pool(s) (cookie '{}'); falling back to a byte fetch onto disk {}",
+                    part_name, advertised_pools.size(), parse<String>(in->getResponseCookie(CA_POOL_UUID_PARAM, "")), disk->getName());
+            else
+                LOG_INFO(log, "Part {} was offered by relink for content-addressed pool '{}', but no disk of this table's "
+                    "storage policy takes it (chosen disk {}, pool '{}'); falling back to a byte fetch",
+                    part_name, offered_pool, disk->getName(), chosen_ca ? chosen_ca->getPoolUUID() : "<none>");
             return fall_back_to_byte_fetch();
         }
 

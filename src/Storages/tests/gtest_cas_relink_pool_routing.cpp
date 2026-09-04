@@ -40,10 +40,18 @@ TEST(CASRelinkPoolAdvertise, RoundTripsThreeIds)
 
 /// ---- which pool the offer is for ----
 
-TEST(CASRelinkPoolAdvertise, OfferedPoolIsTheCookieWhenPresent)
+TEST(CASRelinkPoolAdvertise, OfferedPoolIsTheCookieWhenItWasAdvertised)
 {
     EXPECT_EQ(resolveOfferedCasPool({"aa", "bb"}, "bb"), "bb");
-    EXPECT_EQ(resolveOfferedCasPool({"aa"}, "zz"), "zz");
+    EXPECT_EQ(resolveOfferedCasPool({"aa"}, "aa"), "aa");
+}
+
+TEST(CASRelinkPoolAdvertise, UnadvertisedCookieIsNoPool)
+{
+    /// The byte re-request after a failed relink advertises nothing; an offer that arrives anyway must
+    /// not re-enter the relink path through its cookie.
+    EXPECT_EQ(resolveOfferedCasPool({"aa"}, "zz"), "");
+    EXPECT_EQ(resolveOfferedCasPool({}, "aa"), "");
 }
 
 TEST(CASRelinkPoolAdvertise, AbsentCookieMeansTheSingleAdvertisedPool)

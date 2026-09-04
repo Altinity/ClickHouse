@@ -45,7 +45,14 @@ Strings decodeCasPoolAdvertise(const String & text)
 String resolveOfferedCasPool(const Strings & advertised_pools, const String & offered_pool_cookie)
 {
     if (!offered_pool_cookie.empty())
-        return offered_pool_cookie;
+    {
+        /// A cookie naming a pool this receiver did not advertise is not an answer to its question. In
+        /// particular the byte re-request after a failed relink advertises NOTHING, and a peer that
+        /// offers a relink anyway must not be able to re-enter the relink path through the cookie.
+        if (std::find(advertised_pools.begin(), advertised_pools.end(), offered_pool_cookie) != advertised_pools.end())
+            return offered_pool_cookie;
+        return {};
+    }
     if (advertised_pools.size() == 1)
         return advertised_pools.front();
     return {};

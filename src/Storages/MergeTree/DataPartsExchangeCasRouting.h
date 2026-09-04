@@ -10,18 +10,22 @@ namespace DB::DataPartsExchange
 
 /// The receiver's content-addressed pool advertise as it goes on the wire (the `cas_pool_uuid` request
 /// parameter): the pool ids of every disk of its storage policy that could take a relink — sorted,
-/// deduplicated, joined with ", ". The list form and the ", " splitter are the ones the zero-copy
-/// `remote_fs_metadata` capability list already uses, so the exchange keeps one list convention. A
-/// single id is written verbatim: a receiver with one pool puts on the wire exactly the string that a
-/// sender comparing the whole value with its own pool id matches. Empty ids are dropped (a storage that
-/// never started has no pool id and nothing to advertise).
+/// deduplicated, joined with ", ". The list form and the ", " delimiter are the ones the zero-copy
+/// `remote_fs_metadata` capability list already uses, so the exchange keeps one list convention (the
+/// decoder differs in one respect: an empty string is no pool at all, never one empty id). A single id
+/// is written verbatim: a receiver with one pool puts on the wire exactly the string that a sender
+/// comparing the whole value with its own pool id matches. Empty ids are dropped (a storage that never
+/// started has no pool id and nothing to advertise).
 String encodeCasPoolAdvertise(Strings pool_uuids);
 Strings decodeCasPoolAdvertise(const String & text);
 
-/// Which pool a relink offer is for. The sender names it in the `cas_pool_uuid` response cookie; a
-/// sender that predates the cookie can only have matched a one-element advertise, so an absent cookie
-/// means that single pool. Several advertised pools and no cookie is not a state an honest sender can
-/// produce, and the answer is "no pool" — the receiver never guesses.
+/// Which pool a relink offer is for. The sender names it in the `cas_pool_uuid` response cookie, and
+/// the answer is that cookie ONLY if it is one of the pools this receiver advertised — the advertise is
+/// the receiver's question, and a byte re-request after a failed relink advertises nothing, so a peer
+/// offering regardless can never select a disk. A sender that predates the cookie can only have matched
+/// a one-element advertise, so an absent cookie means that single pool. Several advertised pools and no
+/// cookie is not a state an honest sender can produce, and the answer is "no pool" — the receiver never
+/// guesses.
 String resolveOfferedCasPool(const Strings & advertised_pools, const String & offered_pool_cookie);
 
 /// One content-addressed disk of the RECEIVING table's storage policy, in policy order.
