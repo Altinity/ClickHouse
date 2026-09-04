@@ -863,10 +863,35 @@ def wait_for_new_export_transaction(node, mt_table, s3_table, previous_transacti
     )
 
 
+def create_split_export_tables(node, mt_table, s3_table, replica_name):
+    """Create a source table whose part splits into one destination file per row on export.
+
+    `export_merge_tree_part_max_rows_per_file` is evaluated once per chunk rather than per row
+    (see `MultiFileStorageObjectStorageSink::consume`), and `MergeTreeSequentialSource` emits one
+    chunk per index granule, so a part can only split at granule boundaries. With the default
+    granularity a small part is a single granule and never splits at all, hence
+    `index_granularity = 1`. `index_granularity_bytes = 0` disables adaptive granularity, which
+    would otherwise choose the granule size itself.
+    """
+    node.query(f"DROP TABLE IF EXISTS {mt_table} SYNC")
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16) "
+        f"ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') "
+        f"PARTITION BY year ORDER BY tuple() "
+        f"SETTINGS index_granularity = 1, index_granularity_bytes = 0"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
+
+    create_s3_table(node, s3_table)
+
+
 def export_partition_split_into_files(
     node, mt_table, s3_table, force=False, policy=None, previous_transaction_id=None
 ):
-    """Export partition 2020 with one row per destination file and wait for completion."""
+    """Export partition 2020 with one row per destination file and wait for completion.
+
+    Only splits per row for a table built by `create_split_export_tables`.
+    """
     settings = ["export_merge_tree_part_max_rows_per_file = 1"]
     if force:
         settings.append("export_merge_tree_partition_force_export = 1")
@@ -956,7 +981,7 @@ def test_export_partition_skip_policy_reports_every_split_file(cluster):
     mt_table = f"skip_reports_all_files_mt_table_{postfix}"
     s3_table = f"skip_reports_all_files_s3_table_{postfix}"
 
-    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+    create_split_export_tables(node, mt_table, s3_table, "replica1")
     # The destination file name is derived from the part name, so part names have to stay stable
     # across the two exports, otherwise the second one writes to fresh paths and skips nothing.
     node.query(f"SYSTEM STOP MERGES {mt_table}")
@@ -1001,7 +1026,7 @@ def test_export_partition_skip_policy_reexports_incomplete_part(cluster):
     mt_table = f"skip_reexports_partial_mt_table_{postfix}"
     s3_table = f"skip_reexports_partial_s3_table_{postfix}"
 
-    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+    create_split_export_tables(node, mt_table, s3_table, "replica1")
     node.query(f"SYSTEM STOP MERGES {mt_table}")
 
     export_partition_split_into_files(node, mt_table, s3_table)
