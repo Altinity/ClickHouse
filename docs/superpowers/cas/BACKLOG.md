@@ -120,18 +120,63 @@ here claiming the XML API lacks it was wrong). Retirements cannot be taken from 
 `sourceEdgeId` (`Gc/CasBlobInDegree.cpp:164`) is an irreversible hash, so a nominated orphan's body is
 still read, bounded by the candidate budget.
 
-Design, approved rev.3: `docs/superpowers/specs/2026-09-04-cas-gc-immutable-key-round-cost-design.md`
+Design, `IMPLEMENTED` (2026-09-04) on branch `cas-gc-write-once-keys`:
+`docs/superpowers/specs/2026-09-04-cas-gc-immutable-key-round-cost-design.md`
 (A: one floor per namespace per page; B: late manifest reads and read-ahead in the sweep; C:
 `removeManyWriteOnce` with `manifest_deletes` as consumer; D: ref-cleanup cohorts). Plan:
-`docs/superpowers/plans/2026-09-04-cas-gc-immutable-key-round-cost.md`. Measured rows replace the
-predictions here as each step lands.
+`docs/superpowers/plans/2026-09-04-cas-gc-immutable-key-round-cost.md`. Measured on two 2026-09-04
+GCS soaks of the implemented binary (`HEAD 0247064fa17`); full figures and the placement/re-scope
+notes are in the spec's `#implementation-record`:
 
-**Investigation item, not part of the design:** round 5's 5382 inline HEADs. `CASGCReadAheadWasted` is
-128 on the round's `Finish` row (two windows of 64 at concurrency 16), `epoch_crossings` is 2 on the
-intake row, round 6 without a crossing hinted 76 of 76. Hypothesis: the intake hints ref-log ids past an
-epoch seal, they are never taken, they stay in `pending`, and `topUpHeadHints` never finds room. Needs a
-local two-epoch cliff run to reproduce; the fix shape is the epoch-crossing discard rule the sweep's
-read-ahead gets in the design above, applied at `Gc/CasGc.cpp:2512`.
+| phase | before (morning, old binary) | after |
+|---|---|---|
+| `fold_reduce`, steady-state round | 300 to 380 s | 2.1 to 4.9 s |
+| `manifest_deletes`, round with 1506 keys | 617 s / 3250 keys | 2.0 s, 2 `CASBulkDeleteRequests` |
+| `ref_object_cleanup`, round with work | 200 s | 0.6 to 1.4 s |
+| `fold_reduce`, mass-removal round | 587 s | 123.4 s (item E: inline `HEAD`s, not this design's target) |
+
+**Investigation item, not part of the design (refined 2026-09-04 with run-2 evidence):** round 5's
+5382 inline HEADs was the first sighting. The no-chaos GCS soak reproduced the same pattern from
+ordinary workload backlog alone, without chaos and without a scripted cliff: rounds 23-25 show
+`CASGCReadAheadMiss` 2534 / 795 / 222 against inline `HEAD` counts 2530 / 793 / 219, and each round's
+`Finish` row shows `CASGCReadAheadWasted=64` — exactly one window pinned per round, independent of
+round size. Unlike the original sighting, `epoch_crossings=0` on the intake row for all three rounds,
+so the epoch-crossing hypothesis is not the only mechanism that pins the shared read-ahead window on
+a mass-removal round; something else pins it too. Needs a local reproduction that isolates the
+mechanism without a crossing; the fix shape, once found, is still an epoch-crossing-style discard
+rule applied at the fold's own hinting site, `Gc/CasGc.cpp:2512`.
+
+### `[soak-harness-needsrecovery-after-near-ttl-pause]` The soak harness treats a near-TTL chaos pause's designed fence-then-recover as a fatal violation (2026-09-04) {#soak-harness-needsrecovery-after-near-ttl-pause}
+
+GCS soak run 1 (`ca_live_20260904_r2`, phase 3, chaos): chaos fault #4 was `both pause` for 29 s
+against a 30 s mount-lease TTL. `ch2`'s renewer fenced (`external_lease_deadline`, 0 physical
+attempts), its ref append lane went `CASRefNeedsRecovery` at the committed-frontier publication
+fence, and the harness's recovery checkpoint treats any nonzero `CASRefNeedsRecovery` as a
+"LATE-PUT FENCING VIOLATION" and aborts the driver. The data model matched byte-for-byte on both
+nodes (count 62496, same `sum_fp`/`uniq_keys`/`sum_v`/`sum_version`) and fsck came back clean
+(`dangling=0 unreachable=0 stale_edge=0`); `system.cas_log` shows `ch2` recovered normally
+(`mount_remount ok`) once the pause ended. `CASRefNeedsRecovery` is a cumulative counter: one
+genuine, expected recovery event during a designed near-TTL pause keeps it nonzero in every later
+snapshot by construction, which is what "stays 1 across three ticks" actually means here, not a
+stuck lane. Ruled not attributable to the branch under measurement (`cas-gc-write-once-keys`): no
+file it touches sits on the mount renewer or the ref append lane. Fix options for the harness: (a)
+classify a chaos pause whose duration is within 1 s of the lease TTL as `freeze_long` rather than
+an ordinary pause, since a fence-then-recover is the designed outcome at that margin; or (b) drop
+`CASRefNeedsRecovery` from the must-stay-zero counter set at the recovery checkpoint specifically
+for the case where the lane has since remounted and the data model matches, since the counter
+cannot distinguish "recovered once, correctly" from "still stuck" without also reading the mount
+state.
+
+### `[gc-blob-pending-deletes-now-dominant]` With A-D landed, serial exact-token blob deletes are the largest remaining GC phase on a mass-removal round (2026-09-04) {#gc-blob-pending-deletes-now-dominant}
+
+GCS soak run 2 (`ca_live_20260904_r3`, phase 3, `--no-chaos`): round 25's `pending_deletes` phase
+alone took 551.5 s for 2731 blobs — one `HEAD` plus one conditional `DELETE` per blob, serial
+(about 100 ms each) — against `fold_reduce` 14.7 s, `manifest_deletes` 0.22 s and
+`ref_object_cleanup` 0.22 s in the same round. This is now the largest single-phase cost this
+design's rounds show, larger than any of the phases A-D target. Blobs stay exact-token by design
+(I5: a condemned blob key can be re-uploaded by a writer, so the exact-token delete is what keeps
+that resurrection safe; blobs are explicitly out of `removeManyWriteOnce`'s scope). The lever is
+already on this list: `[gc-delete-concurrency-serial]`.
 
 ### `[cas-transient-lease-fence-surfaces-to-clients]` A transient mount-lease fence surfaces to synchronous client calls as `NETWORK_ERROR` (2026-09-04) {#cas-transient-lease-fence-surfaces-to-clients}
 
