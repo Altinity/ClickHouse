@@ -59,6 +59,19 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### From the engine fix-round review (2026-09-04) {#engine-fix-round-review-2026-09-04}
+
+- **Spec drift.** `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md` (revision 13)
+  still prescribes `op.publish(…, Retry::once())` and "never the shared `standard`" for
+  `ensureBlobPresent`; since the loop-deadline fix the publish runs under the loop's frozen policy made
+  single-attempt (one physical attempt, bounded by the loop's one deadline). Reword the spec sentence.
+- **`CasRefLedger::resolveNamespaceLife` is a third hand-written loop of the forbidden shape:** 32
+  iterations, a fresh `Retry::standard()` window per verb, no pacing — the shape the spec's inventory
+  rule forbids ("a hand-written loop captures one `Retry` before it starts, shares it across every call
+  it makes"). Pre-existing, outside the fix round's brief. Placement: the same freeze-at-entry treatment
+  as `deleteCompletedRemovingAtSnapshot` / `ensureBlobPresent` (commit 1effe101617), with a red-first
+  test that a perpetual conflict ends within one window; owner = the next engine task on this branch.
+
 ### Spec drift: the ref-lane inventory row says `standard`, the coverage-gate paragraph and the code say `once` (2026-09-04) {#spec-drift-ref-lane-once}
 
 `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md` (revision 13) lists "the ref lane
