@@ -117,6 +117,7 @@ namespace Setting
     extern const SettingsUInt64 max_parser_depth;
     extern const SettingsUInt64 max_query_size;
     extern const SettingsNonZeroUInt64 max_parallel_replicas;
+    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
     extern const SettingsFloat max_streams_to_max_threads_ratio;
     extern const SettingsMaxThreads max_threads;
     extern const SettingsUInt64 max_threads_min_free_memory_per_thread;
@@ -2042,6 +2043,7 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
 
     size_t joins_count = 0;
     bool is_full_join = false;
+    bool is_right_join = false;
     bool is_global_join = false;
     bool is_right_join_with_remote_table = false;
     int first_join_pos = -1;
@@ -2070,6 +2072,8 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
 
             if (join_kind == JoinKind::Full)
                 is_full_join = true;
+            if (join_kind == JoinKind::Right)
+                is_right_join = true;
 
             if (join_node.getLocality() == JoinLocality::Global)
                 is_global_join = true;
@@ -2140,21 +2144,32 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
       */
     auto left_table_expression = table_expressions_stack.front();
 
-    /** If the leftmost table uses IStorageCluster (e.g., s3Cluster, hdfsCluster)
-      * and there are multiple tables (indicating a JOIN), we must wrap it in a subquery.
-      * This prevents IStorageCluster from receiving the full JOIN query, which it cannot handle.
+    /** If the leftmost table uses `IStorageCluster` (e.g., `s3Cluster`, `hdfsCluster`)
+      * and there are multiple tables (indicating a JOIN), we normally wrap it in a subquery.
+      * This prevents `IStorageCluster` from receiving the full JOIN query, which it cannot handle.
       *
-      * IStorageCluster is a simple storage that just forwards queries to remote nodes.
-      * Unlike StorageDistributed, it cannot decompose and handle JOINs across multiple tables,
+      * `IStorageCluster` is a simple storage that just forwards queries to remote nodes.
+      * Unlike `StorageDistributed`, it cannot decompose and handle JOINs across multiple tables,
       * because remote nodes don't have access to other tables in the JOIN.
       *
-      * StorageDistributed has sophisticated query planning logic to handle JOINs and should
+      * With `object_storage_cluster_join_mode = 'global'`, `IStorageCluster` must receive a
+      * supported full query so it can materialize the right side and send a `GLOBAL JOIN` to
+      * remote nodes. `RIGHT JOIN` and `FULL JOIN` stay on the initiator because broadcasting their
+      * preserved right side would make every shard emit the same unmatched rows.
+      *
+      * `StorageDistributed` has sophisticated query planning logic to handle JOINs and should
       * NOT be wrapped (wrapping breaks tests like 03577_server_constant_folding).
       */
     bool should_wrap_left_table = false;
-    bool has_multiple_tables = table_expressions_stack.size() > 1;
+    const bool has_multiple_tables = table_expressions_stack.size() > 1;
+    const bool use_global_join
+        = planner_context->getQueryContext()->getSettingsRef()[Setting::object_storage_cluster_join_mode]
+            == ObjectStorageClusterJoinMode::GLOBAL
+        && joins_count > 0
+        && !is_right_join
+        && !is_full_join;
 
-    if (has_multiple_tables)
+    if (has_multiple_tables && !use_global_join)
     {
         // Get the actual storage to check its type
         auto * table_node = left_table_expression->as<TableNode>();
