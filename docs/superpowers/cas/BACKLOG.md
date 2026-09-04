@@ -123,7 +123,8 @@ disk (S3 operations and CAS conflicts per dropped table) as the first measuremen
 + conditional PUTs); third = skip `StackTrace` capture for expected 412s.
 
 Design for the first target: `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
-(revision 26, 2026-09-04), which supersedes the fix sketch below where they differ.
+(revision 27, phase A, 2026-09-04), which supersedes the fix sketch below where they differ; the
+deferred phase B is `{#hot-key-lane-phase-b}`.
 
 ### `[ref-catalog-cas-starvation-under-parallel-writers]` One process's CREATE/DROP writers starve each other on the ref-catalog compare-and-swap (2026-09-04) {#ref-catalog-cas-starvation}
 
@@ -175,13 +176,115 @@ Fix, two halves, in this order:
    winning (red today). Update the spec sentences at "Conflicts spend the same budget as errors".
 
 Superseded by the design `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
-(revision 26, 2026-09-04, after sixteen codex and six opus review rounds; rev.25 took the owner's three decisions: `Generation` spacing inside the lane, the 200 ms conflict-pause overshoot accepted, idle lanes erased, and made the lane's `Decide` the engine's `DecideOnObject`, so `_ckpt` is a one-call change once its `decide` is audited; rev.26 folded the sixteenth codex round: no combining for operations with a `Liveness` closure, no cached verdict ever delivered, a decline cuts the batch, `Conflict::any_ambiguous`): a per-pool write lane
-above the request engine for any hot compare-and-swap object, the catalog first; one FIFO per key
-shared by the pool's planes, the queued mutations combined into one `PUT` with as-if-serial
-semantics, the engine's `WriteResult` returned unchanged (members told the leader's class, never a
-stronger one), an LRU of last known objects so the next write needs no read, a refusal reported only
-from a fresh read, and a flat conflict pause. The GC erase joins the lane in a follow-up with five
-named prerequisites; the stalled-holder case is recorded there as an accepted availability tradeoff.
+(revision 27, phase A, 2026-09-04). Phase A is the fix sketch above minus nothing it needs: a per-pool
+FIFO lane above the request engine for any hot compare-and-swap object, the catalog first; one hold at a
+time per key from any of the pool's planes; an LRU of last known objects so the next write needs no read,
+under one absolute rule (a verdict a `decide` renders on a cached base is never delivered; every write is
+conditional on the cached etag); the engine's `WriteResult` returned unchanged; the flat conflict pause,
+with the growing schedule kept for a conflict that settled a transport fault (`Conflict::any_ambiguous`);
+the step-1 fence marker caught. Revisions 1 to 26 (sixteen codex and six opus rounds) also designed
+combining, GCS spacing, a hold clamp and the GC erase inside the lane; that is phase B,
+`{#hot-key-lane-phase-b}`, deferred by owner decision on 2026-09-04 after the review loop failed to
+converge on its periphery (findings per round never below eight, the document tripled).
+
+
+### `[hot-key-lane-phase-b]` Hot-key lane phase B: combining, GCS spacing, the hold clamp, the GC erase, `_ckpt` (2026-09-04) {#hot-key-lane-phase-b}
+
+Designed to revision 26 of the hot-key lane spec (commit `26bde9f9604`, 13.5k words) and deferred from
+the phase A landing (revision 27) by owner decision on 2026-09-04. Not started. Phase A fixed the seams
+so that none of this reopens the callers: `submit`'s signature, `Decide = DecideOnObject`, the engine's
+`WriteResult` returned unchanged, the caller's `Conflict` loop and pause rule, the queue of `Item`s with
+the guard as the single remover, the hold as base, decide, write, settle. Each sub-item below has its
+own gate; none is started on the documentation's say-so.
+
+**0. Caller-side freeze in `dropNamespaceImpl` (do first, not phase B proper).** `cancelStalledCreating`'s
+creator-fence read (`isCreatorFenceTerminal(cancel_op, ...)`, `CasRefLedger.cpp:5121`) runs under a
+default `Retry::standard()` of its own while `resolveNamespaceLife` freezes once and passes its policy
+down (`:1384`). Inside a hold that read can keep the key for up to its own 90 s after its caller's
+window. Freeze once at `dropNamespaceImpl`'s entry and pass it to `cancelStalledCreating` and its read.
+One-line class; makes the clamp (item 3) unnecessary for phase A.
+
+**1. Combining.** Gate: the phase A acceptance run's `CASHotKeyQueueWaitMicroseconds` per submission
+and `PUT` rate on `ref_catalog`; combining pays when the queue wait, not the write, dominates a
+submission at p90. The design, with the rules twenty-two rounds established (each was lost once in a
+rewrite and found again as a critical, so they are listed): the holder takes the items queued behind it
+that were submitted on the same `CasRequests` (the leader's per-attempt fence gate then covers every
+member: same atomics, and a re-arm between two admissions is caught by whichever generation is older),
+are not under `single_attempt` (leader or member; `Retry::once` permits one attempt and a batch may
+reissue), carry no `Liveness` closure (the engine consults one before every physical attempt and the
+batch's write is gated on the leader alone; such an item holds alone), and whose bound deadline is not
+earlier than the leader's; allocation (`BatchOutcome`, the members vector) before taking, `taken` set in
+the same critical section, so a failed allocation takes nothing; "a leader takes this item" and "this
+item's caller leaves" decided under one mutex against `taken`, exclusive (the use-after-free the flag
+prevents was found by opus round 17). Chain: each member's `decide` on `Object{bytes = candidate, etag =
+base etag}` (the etag is a placeholder no `decide` may read as an identity of the bytes), after the
+member's own `gate(reservedFor(0, 2))` (`FenceLost`/`NoBudget` written as its `GaveUp` with `sent_any =
+false`, `decide` skipped); a member's exception is held; a decline stops the chain so the landed object is
+exactly its input; a taken item the chain did not reach is `Conflict{NotObserved}`. Settle: `Committed`
+gives each contributor a three-way `gate(0)` as `postCommit` does (`FenceLost` → `GaveUp{FenceLost,
+sent_any = true}`; `NoBudget` → `GaveUp{Deadline, Lease, sent_any = true}`; else `Committed{combined
+etag, attempts_sent = 0}`), delivers held exceptions, and gives the declined member
+`Declined{landed object}`; `Conflict` → every member `Conflict{seen, 0, any_ambiguous}`; `Refused` → the
+same `Refused` to every member; `GaveUp` with `sent_any = false` → members `Conflict{NotObserved}`;
+`GaveUp` with `sent_any = true` or an exception → members `GaveUp{Unresolved, sent_any = true}` with
+their own `Source`. Held verdicts are delivered only from a landed batch (as-if-serial: a batch that does
+not land is where serial execution would have landed a prefix). The leader's guard settles unsettled
+taken members the same way, settle and erase in one critical section. The as-if-serial argument covers
+the lane's key alone; a `decide`'s other reads must not observe a key a batch member may write. A
+member's `decide` runs on the leader's thread while its caller is parked (disjoint parts of the member's
+operation; the caller's step 1 touches `admitted_generation`, the fence and clock closures, the bound).
+`written` is a prefix state the store never held once later members followed (only test callers read
+it). Members carry `attempts_sent = 0`; the pool's attempt counters are the leader's. A member's reads
+inside the hold need the clamp (item 3). Invariants HK4, HK7, HK8 and tests 1 to 4, 12 and 16 of
+revision 26.
+
+**2. `Generation` spacing.** Gate: 429/`SlowDown` count on the catalog key over the parallel stateless
+suite on the `gcs` lane after phase A; the owner's position is "GCS will say if we are too fast". The
+design: `write_spacing_ms` as a constructor argument (`Pool` passes 1000 on the `Generation` dialect, 0
+elsewhere); `Lane::last_write_end_ms` optional, set by a no-throw guard around the engine's write on
+return and unwind (the lane exists then, the leader's item is in its queue, nothing allocates); before
+the write, `op.pause` the smaller of the remainder and the leader's remaining window, and let the verb's
+own entry gate decide (a pause that consumed the window ends `GaveUp{Deadline, sent_any = false}`);
+erasure becomes "erase a lane whose queue is empty and whose last write is older than the interval",
+swept at enter and leave, with the residue after the pool's last activity bounded by the write rate.
+INV-HK9 and tests 17, 18 of revision 26. Ten rounds of findings went into where this lives; above the
+engine it is one place, inside `readModifyWrite` it was three call sites and two result families.
+
+**3. The hold clamp.** One optional clamp deadline on `CasOperation`, honoured as a minimum at its
+twelve `policy.bind` sites, set by the lane for the hold and by a leader for a member's `decide`,
+cleared after; a read the clamp refuses gives up as at its own policy deadline, reported with
+`GaveUp::Source::Policy`. Required by combining (a member's nested read runs under the leader's hold);
+for phase A, item 0 is the caller-side answer.
+
+**4. The GC erase into the lane.** `deleteCompletedRemovingAtSnapshot`'s body from "refresh authority"
+through the `replace` becomes one `submit` whose `decide` refreshes authority, checks `op.admitted()`,
+`throwIfAmbiguous` and the exact row, and returns the erased candidate; the mandatory resolution read
+after `Committed` stays authoritative for the reconciler's next selection. Four prerequisites: the
+refresh reads `gc/state` through the erase's own operation, not a private one, so the clamp reaches it;
+the `decide` keeps `throwIfAmbiguous` and the absent-catalog refusal; `CompletedRemovingDeleteResult`
+needs the catalog cut the call ends on for `FencedOut` and `EntryChanged`, which a `decide` exception
+carries nowhere, so the erase captures the base it was shown or re-reads; the double refresh a
+cached-base re-run causes is one extra `gc/state` `GET` inside the hold. Its operation carries a
+`Liveness` closure (the cached `authority_held`), so it holds alone and never combines. The authority
+gap across the engine's internal reissue (a TTL on the GC lease) stays its own item. Until then the
+erase races the lane as it races everything today and costs the lane one stale cache entry per erase.
+
+**5. `_ckpt` and `gc/state` through the lane.** One-call change per site (`readModifyWrite` to `submit`
+in a `Conflict` loop with the pause rule). Gate: the audit of the `decide` contract's condition 1 for
+`publishCkptContribution`, whose `decide` counts its runs and records its decline's reason in captured
+locals that the caller's outcome reads, so a re-run on a fresh base doubles what it reports; move both
+out of the closure first. Operations that carry a `Liveness` closure will not combine (item 1) but do
+serialize and use the cache. Half 2's go/no-go for `_ckpt` left on `readModifyWrite`: 40·M requests per
+second per contended key for M writers, and 429/`SlowDown` not above today's.
+
+**How the design got here, for whoever picks this up.** Twenty-six revisions in one day; findings per
+review round never fell below eight; the document tripled while the core (FIFO ticket, `taken`
+handshake, cache as a hint the `PUT` validates, engine result unchanged) was judged sound from revision
+18 on. About 60% of the MAJOR+ findings after revision 21 were specific to combining, 20% to spacing and
+erasure. Rules for the next round of this work: a review revision only removes or tightens, never adds a
+feature; a new feature goes in its own revision and costs at least one round; a reviewer verifies
+against the checklist above and names the failing scenario; prose and pseudocode slips are MINOR; after
+three rounds the remaining questions are answered by code and tests, not by another revision.
 
 ### `[cas-s3-lane-put-timeout-logged-at-error]` A stalled single-attempt PUT is logged at Error and fails a stateless test whose write succeeded (2026-09-04) {#cas-s3-lane-put-timeout-logged-at-error}
 
