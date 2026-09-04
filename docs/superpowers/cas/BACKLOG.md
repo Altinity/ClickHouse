@@ -87,6 +87,12 @@ own post-failure fsck already showed `unreachable=0`: a timing miss, not non-con
   round 191. The fencing protocol did its job; the item is observability: the remount log should name
   the DNS failure class distinctly, and the host's Docker resolver flakiness is the suspect (unconfirmed
   against host DNS logs).
+  Not a storm: the remount attempts were 1.5, 2.5, 4.5, 8.5, 16.5 s apart, then 72 s (attempt 7 succeeded
+  once DNS returned) — `CasMountRuntime::remountLoop`'s deterministic doubling backoff 1 s → 30 s cap
+  (`backoff_ms = min(backoff_ms * 2, 30000)`), with NO jitter: both nodes lost the lease within 1.4 s of
+  each other and retried in lockstep (attempt k at the same second on ch1 and ch2). Harmless with two
+  nodes; with N nodes it is the thundering herd jitter exists to break. Small change: draw the remount
+  wait from the engine's full-jitter schedule (`Retry::backoff`) instead of the bare doubling.
 
 ### `[gc-manifests-are-immutable-so-reduce-and-deletes-can-be-cheap]` The orphan sweep re-reads every listed manifest and deletes manifests one conditional request at a time; manifest keys cannot be reborn, so neither is needed (2026-09-04, user) {#gc-manifests-immutable-cheap-reduce}
 
