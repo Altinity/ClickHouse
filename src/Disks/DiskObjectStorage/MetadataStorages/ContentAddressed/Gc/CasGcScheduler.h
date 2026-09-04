@@ -29,9 +29,13 @@ struct GcRoundLogRecord
     /// that genuinely folded and found nothing apart from one that never folded at all.
     /// `Aborted`: the round threw an exception whose code names a transient condition (backend
     /// unavailability, a lost lease, a concurrent leader) -- the next scheduled round retries it and
-    /// nothing durable is wrong. `Failed` is reserved for everything else (a logic error, corrupted
-    /// data, an unclassified code): fail-closed, an unrecognised failure reads as real.
-    enum class Outcome { Unknown, Success, NotALeader, Failed, Deferred, Aborted };
+    /// nothing durable is wrong. `Stopped`: the same transient class, observed after the pool's
+    /// teardown began -- a correlation, not a cause: the engine reports a refused teardown fence
+    /// exactly like a lost mount fence, so the flag is the only witness, and the row says so honestly
+    /// rather than reading a clean restart as a backend incident. `Failed` is reserved for everything
+    /// else (a logic error, corrupted data, an unclassified code): fail-closed, an unrecognised
+    /// failure reads as real -- during a teardown too.
+    enum class Outcome { Unknown, Success, NotALeader, Failed, Deferred, Aborted, Stopped };
     enum class Trigger { Scheduled, Manual };
 
     EventType event_type = EventType::Start;

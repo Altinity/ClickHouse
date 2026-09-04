@@ -1729,7 +1729,13 @@ public:
         const size_t chunk = stream_chunk.load();
         if (!opened || chunk == 0)
             return opened;
-        return std::make_unique<ChunkedStreamForTest>(std::move(opened), chunk, largestChunkSlot(key));
+        auto chunked = std::make_unique<ChunkedStreamForTest>(std::move(opened), chunk, largestChunkSlot(key));
+        /// Hand back a buffer whose FIRST window is already loaded, as a network-backed store does:
+        /// `ObjectStorageBackend::stream` forces that GET so the open's own attempt is what pays for
+        /// it. A fixture that returned an empty buffer would let a consumer which drops the preloaded
+        /// window -- and so silently loses the head of every streamed body -- pass its tests.
+        chunked->nextIfAtEnd();
+        return chunked;
     }
 
     /// Serve every stream opened from now on in windows of at most `bytes`, as a network-backed store
