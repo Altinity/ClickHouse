@@ -844,8 +844,14 @@ inline DB::Cas::Etag displaceBlobToken(
 /// what Phase-4 Lever A (spec 2026-07-06-cas-gc-round-skip-unchanged) is designed to skip -- passes 0
 /// here to force fold-every-round (shouldDeferRound's liveness bound: rounds_since_last_fold(0) >= 0
 /// is always true).
-inline DB::Cas::PoolPtr openPoolForTest(
-    std::shared_ptr<DB::Cas::InMemoryBackend> backend, uint64_t gc_fold_max_defer_rounds = 8)
+/// Templated on the backend's own pointer type (an `InMemoryBackend`, one of its many test subclasses,
+/// or a decorator that is not itself an `InMemoryBackend`, e.g. `ThrottlingBackend`) rather than fixed
+/// to `InMemoryBackend`/`BackendPtr`: a fixed pair of non-template overloads is genuinely AMBIGUOUS for
+/// a `shared_ptr<Derived>` argument, since "derived-to-`InMemoryBackend`" and "derived-to-`Backend`" are
+/// equally-ranked conversions with no tiebreaker; template argument deduction has none of that problem.
+template <typename BackendT>
+DB::Cas::PoolPtr openPoolForTest(
+    std::shared_ptr<BackendT> backend, uint64_t gc_fold_max_defer_rounds = 8)
 {
     return DB::Cas::Pool::open(std::move(backend),
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test",
@@ -1708,6 +1714,14 @@ public:
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
+    /// A blob publication reaches the store through `publish`, not `write` -- a "zero backend requests"
+    /// assertion built only from the primitives above would miss one landing.
+    void publish(const DB::Cas::BlobPublishRequest & request, DB::Cas::TransportAccess & access) override
+    {
+        tick(publish_counts, publish_total, request.destination_key);
+        InMemoryBackend::publish(request, access);
+    }
+
     std::unique_ptr<DB::ReadBuffer> stream(const String & key, DB::Cas::TransportAccess & access) override
     {
         tick(get_stream_counts, get_stream_total, key);
@@ -1741,6 +1755,7 @@ public:
     uint64_t putOverwriteCount(const String & key) const { return lookup(put_overwrite_counts, key); }
     uint64_t deleteCount(const String & key) const { return lookup(delete_counts, key); }
     uint64_t getStreamCount(const String & key) const { return lookup(get_stream_counts, key); }
+    uint64_t publishCount(const String & key) const { return lookup(publish_counts, key); }
 
     uint64_t getTotal() const { std::lock_guard lock(count_mutex); return get_total; }
     uint64_t headTotal() const { std::lock_guard lock(count_mutex); return head_total; }
@@ -1750,6 +1765,7 @@ public:
     uint64_t putOverwriteTotal() const { std::lock_guard lock(count_mutex); return put_overwrite_total; }
     uint64_t deleteTotal() const { std::lock_guard lock(count_mutex); return delete_total; }
     uint64_t getStreamTotal() const { std::lock_guard lock(count_mutex); return get_stream_total; }
+    uint64_t publishTotal() const { std::lock_guard lock(count_mutex); return publish_total; }
 
     /// Attempted deletes against any key whose path CONTAINS `substr` — the per-site assertion the
     /// destructive-gate tests make ("the generation prune deleted nothing", "the sweep deleted nothing").
@@ -1804,9 +1820,10 @@ public:
         put_overwrite_counts.clear();
         delete_counts.clear();
         get_stream_counts.clear();
+        publish_counts.clear();
         largest_stream_chunk.clear();
         get_total = head_total = list_total = write_total = put_total = put_overwrite_total
-            = delete_total = get_stream_total = 0;
+            = delete_total = get_stream_total = publish_total = 0;
     }
 
 private:
@@ -1857,6 +1874,7 @@ private:
     std::map<String, uint64_t> put_overwrite_counts;
     std::map<String, uint64_t> delete_counts;
     std::map<String, uint64_t> get_stream_counts;
+    std::map<String, uint64_t> publish_counts;
     uint64_t get_total = 0;
     uint64_t head_total = 0;
     uint64_t list_total = 0;
@@ -1865,6 +1883,7 @@ private:
     uint64_t put_overwrite_total = 0;
     uint64_t delete_total = 0;
     uint64_t get_stream_total = 0;
+    uint64_t publish_total = 0;
 };
 
 /// Records the ORDER of writes (so a test can compare indices) and lets a test refuse or fail chosen
@@ -2337,6 +2356,17 @@ public:
             && key.find(fault_substr) != String::npos)
             fault_count = 1;
         return ChunkFaultBackend::write(key, bytes, expected_value, access);
+    }
+
+    /// Disarms completely (not just unlatches): what a caller does right after driving a call to its
+    /// give-up is a further mutation that must reach the store normally.
+    void disarm()
+    {
+        latched = false;
+        mode = Mode::None;
+        fault_count = 0;
+        fault_skip = 0;
+        fail_read_once_key.clear();
     }
 };
 
