@@ -614,15 +614,12 @@ TEST(CASDetachedWork, FailedPublisherDispatchKeepsMutationAndClearsReservation)
 /// never a throw -- so only an exception from OUTSIDE that write (this hook stands in for one) ever
 /// reaches the handler.
 ///
-/// The hook fires (and throws) EXACTLY ONCE, then disarms itself before throwing. This exit -- an
-/// exception escaping before ANY of the write's own failure arms (each of which arms
-/// `advancePublishBackoff` before returning `false`) -- is the one path that never paces the redispatch
-/// `settleSnapshotPublish` re-admits: `admitSnapshotPublishUnderStateLock`'s only pacing gate is the
-/// backoff deadline, which nothing on this exit sets, so a fault that stayed armed here would make the
-/// ledger redispatch at full speed with no backoff -- measured at over a million redispatches in 30
-/// seconds pegging one core, stopped only by `tryRemountOnce`'s mount-lease check (real wall-clock, not
-/// the injectable boot clock) finally fencing the mount closed. Disarming after one throw keeps this
-/// test's own claim (settlement survives ONE throwing handler call) while never driving that busy loop.
+/// The hook fires (and throws) EXACTLY ONCE, then disarms itself before throwing. An exception escaping
+/// before any of the write's own failure arms now reaches the detached task's `catch (...)`, which arms
+/// `advancePublishBackoff` on that exit exactly as the ordinary failure arms do, so this throw paces the
+/// redispatch instead of driving it at full speed. Disarming after one throw lets the second dispatch
+/// take the healthy path and settle, keeping this test's claim narrow: settlement survives ONE throwing
+/// handler call.
 TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
 {
     auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
@@ -711,7 +708,18 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
                 << "the elapsed backoff never admitted the next publish attempt";
             std::this_thread::yield();
         }
-        store->waitForSnapshotPublishSettleForTest(ns);
+        /// Bounded poll rather than `waitForSnapshotPublishSettleForTest`: that call waits on a condvar
+        /// predicate with no deadline, and on an unpaced-redispatch regression the reservation count
+        /// never rests at zero long enough for the predicate to observe it, hanging the test instead of
+        /// failing it.
+        const auto settle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (store->pendingSnapshotPublishesForTest(ns) != 0)
+        {
+            ASSERT_LT(std::chrono::steady_clock::now(), settle_deadline)
+                << "the snapshot publish for '" << ns.string() << "' never settled: "
+                << "pending_snapshot_publishes stayed nonzero";
+            std::this_thread::yield();
+        }
         EXPECT_EQ(attempts.load(), 1 + step) << "more than one publish attempt ran within one backoff step";
     }
 
