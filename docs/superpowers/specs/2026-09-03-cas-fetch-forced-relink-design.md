@@ -199,7 +199,7 @@ cannot emit both (its relink branch returns at `:429`, before the zero-copy bran
   never mistaken for a fallback.
 - E3, the forced disk's pool is not `Live` when the relink is staged — the deliberate decision above,
   not a race. `prepareAdoptFromManifest` runs the write admission gate (`checkOpAdmitted`,
-  `ContentAddressedMetadataStorage.cpp:2290`) before it stages anything, and that gate throws for a pool
+  `ContentAddressedMetadataStorage.cpp:2310`) before it stages anything, and that gate throws for a pool
   that is not live (`throwCasTransientUnavailable`, or the terminal-lifecycle throw) — the exception
   propagates out of `relinkPartToDisk` and the fetch fails; the `MechanismFallbackAllowed` mapping and
   the byte re-request are never reached. A queue fetch is retried by the queue with its usual backoff;
