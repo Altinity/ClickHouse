@@ -2223,6 +2223,10 @@ public:
     /// One-shot: the next read of exactly this key throws, then it is cleared. Armed by
     /// `Mode::LandedThenLost` (see above); settable directly for a bare lost-read fault.
     String fail_read_once_key;
+    /// How many times a fault actually fired (a `--fault_count` write, not a skipped or non-matching
+    /// one), so a caller can prove the double was hit rather than infer it from an outcome that a
+    /// weaker policy could also produce.
+    int fault_hits = 0;
 
     std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
@@ -2247,6 +2251,7 @@ public:
             else if (fault_count > 0)
             {
                 --fault_count;
+                ++fault_hits;
                 switch (mode)
                 {
                     case Mode::Unresolved:
