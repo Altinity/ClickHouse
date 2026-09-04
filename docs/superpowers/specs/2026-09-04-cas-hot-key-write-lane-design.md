@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 9. Brainstormed 2026-09-04 against the measurements in
+Revision 10. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
 supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
@@ -72,6 +72,13 @@ Revision history, kept because each step removed something a review proved unsou
   existing authority gap, outside this design and a prerequisite for ever ticketing the open plane.
   The memory has a size cap, since the catalog's enforced cap is the 256 MiB object cap, and three
   test expectations were corrected.
+- Revision 10 makes the conflict pause dialect-aware: on `Generation` it is a flat one second plus
+  the jitter, for every key, so a non-hot writer (`_ckpt`, `gc/state`) retries a lost race no
+  faster than the store's documented rate without depending on 429s; on the other dialects it stays
+  uniform(0, 200 ms). A declared hot key's lane lives as long as its `CasRequests`, so the spacing
+  timestamp survives every forgetful ending, and `holder_active` is gone: the holder is the front
+  ticket. INV-HK3 is qualified by the memory cap, callbacks run during a ticket's tenure may not
+  write a hot key, and the two-plane jitter test asserts a range, not distinct instants.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -152,9 +159,10 @@ catalog's API, `CasRefLedger` and GC do not change, and `casUpdateImpl` changes 
 carries its own markers and which of its callers opt into memory.
 
 **Half 2, conflict pacing.** In `readModifyWrite` and `readModifyWriteOnPresence`, a clean
-refused precondition is repaid after `Retry::conflictBackoff()`, a flat uniform(0, 200 ms), and no
-longer advances the transport-fault counter. The GC erase loop keeps its pacing. Two sentences of
-the backend request contract change.
+refused precondition is repaid after `Retry::conflictBackoff(dialect)`, a flat pause that does not
+grow with the loss count (uniform(0, 200 ms); one second plus that on `Generation`), and no longer
+advances the transport-fault counter. The GC erase loop keeps its pacing. Two sentences of the
+backend request contract change.
 
 ## Half 1: the hot-key lane {#half-1-the-hot-key-lane}
 
@@ -171,13 +179,12 @@ public:
     bool isHot(const String & key) const;
 private:
     friend class CasOperation;
-    struct Lane    /// one hot key
+    struct Lane    /// one hot key; created on first use, lives as long as this object
     {
-        std::deque<uint64_t> tickets;                /// guarded by `mutex`; front = the holder or the next holder
-        bool holder_active = false;                  /// guarded by `mutex`
+        std::deque<uint64_t> tickets;                /// guarded by `mutex`; the front ticket is the holder
         uint64_t last_write_attempt_end_ms = 0;      /// guarded by `mutex`; for the Generation dialect's spacing
         std::condition_variable cv;
-        std::optional<Object> remembered;            /// guarded by `mutex`; the last object this plane committed
+        std::optional<Object> remembered;            /// guarded by `mutex`; the last candidate this plane committed
         uint64_t next_ticket = 0;                    /// guarded by `mutex`
     };
     std::mutex mutex;
@@ -185,19 +192,24 @@ private:
 };
 ```
 
+The front ticket is the holder; there is no separate holder flag. A ticket reaches the front only
+when every earlier ticket's guard has erased it, and a holder's own ticket stays at the front until
+its guard runs, so "my ticket is the front" is the whole exclusion.
+
 `CasRequests`'s constructor gains an optional `CasHotKeys::IsHot`. Every existing constructor call
 (every test, the offline tools, the pool factory's local bootstrap `CasRequests`) passes none and
 behaves byte-for-byte as today. `CasRequests` remains a class that writes no member after
 construction: the lane has its own mutex, and `CasOperation` reaches it through its owner.
 
-A lane exists while it has a ticket, an active holder, or a memory, and is erased when the last of
-the three goes. There is no eviction: the predicate names the hot keys, today exactly one. The
-memory has a size cap, an engine constant of 16 MiB (about a hundred thousand catalog rows at
-today's row size): a committed candidate above it is not remembered, and the next opted-in call
-reads, which is today's cost. The catalog's only enforced bound is the 256 MiB object cap, so
-without this cap one remembered catalog could be that large. A per-key budget across many hot
-keys becomes necessary when a per-namespace key such as `_ckpt` is declared hot; that
-declaration brings it.
+A lane is created the first time a write touches its key and lives as long as the `CasHotKeys`:
+the predicate names the hot keys, today exactly one, and the lane's spacing timestamp must
+survive endings that forget the memory. There is no eviction. The memory has a size cap, an
+engine constant of 16 MiB (about a hundred thousand catalog rows at today's row size): a
+committed candidate above it is not remembered, and the next opted-in call reads, which is
+today's cost. The catalog's only enforced bound is the 256 MiB object cap, so without this cap one
+remembered catalog could be that large. A per-key budget across many hot keys, and lane erasure,
+become necessary when a per-namespace key such as `_ckpt` is declared hot; that declaration
+brings them.
 
 `Pool` passes the predicate "`key == Layout(config.pool_prefix).refCatalogKey()`" to
 `mount_requests` and to no other plane.
@@ -298,9 +310,10 @@ contract a participating site must meet is mechanical:
    requires of it (it re-decides on every `Conflict`), and tolerates a `nullopt` it rendered on
    memory being discarded and re-rendered. A verdict it wants re-rendered on stale memory is a
    `nullopt`, never a throw; a site that cannot promise that for every throw does not opt in.
-2. `decide` issues no write on any hot key of the same plane. A write from inside the holder
-   would wait for the holder, and two holders entering each other's keys would wait forever. Reads
-   are fine, as today, and a `decide` that reads holds the lane for that read (see
+2. No callback that runs while a ticket is held, `decide`, the `Liveness` closure, a backend hook,
+   issues a write on any hot key of the same plane. A write from inside the holder would wait for
+   the holder, and two holders entering each other's keys would wait forever. Reads are fine, as
+   today, and a `decide` that reads holds the lane for that read (see
    [effects to name](#effects-to-name)).
 3. No operation that writes the hot key carries a `Liveness` closure whose truth a wait could
    stale. The catalog writers (`resolveNamespaceLife`'s and `dropNamespaceImpl`'s operations) carry
@@ -328,9 +341,8 @@ lane), then increment `next_ticket`. If the push throws, the number is not consu
 lookup created for this call is erased again, and the exception propagates. The moment the push
 succeeds, a ticket guard is installed: on every exit from here on, normal or by unwinding (the gate
 calls `std::function`s, `wait_for` may throw), it erases exactly this ticket from `tickets` (a
-`std::deque::erase` by value, no allocation), clears `holder_active` if this ticket was the holder,
-and does `cv.notify_all()`. It is `noexcept`. The leave step below is this guard running on the
-normal path.
+`std::deque::erase` by value, no allocation) and does `cv.notify_all()`. It is `noexcept`. The
+leave step below is this guard running on the normal path.
 
 **Wait.** Loop, in this order:
 
@@ -341,10 +353,10 @@ normal path.
    erase, return `GaveUp{Deadline}` with the bound's own source. The gate runs outside the lane
    mutex because it may call the operation's `Liveness` closure, and the lane mutex must stay a
    leaf that calls nothing.
-2. Under `mutex`: if the ticket is at the front and `holder_active` is false, set
-   `holder_active = true` and leave the loop as the holder. Otherwise `cv.wait_for(lock, slice)`
-   with a short slice (the pattern of `recovery_cv.wait_for(lock, 200ms)` in the ledger), release
-   the mutex, and go to step 1. The clock is read in step 1, never under the mutex.
+2. Under `mutex`: if the ticket is at the front, leave the loop as the holder. Otherwise
+   `cv.wait_for(lock, slice)` with a short slice (the pattern of
+   `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the mutex, and go to step 1. The
+   clock is read in step 1, never under the mutex.
 
 A ticket is promoted only after its checks passed in the same iteration. The engine's own
 per-attempt gate and `fits` still run before anything is sent, as today.
@@ -359,10 +371,9 @@ starts unless the sleep and the attempt after it fit the operation's bound; a re
 engine's usual `GaveUp`. After the attempt ends, successful or not, it records its end there.
 
 **Leave.** The ticket guard, on every exit: under `mutex`, move the prepared memory value into
-`remembered` or clear it (a holder that unwinds clears), erase this ticket, set
-`holder_active = false` if it was the holder, `cv.notify_all()`. It is `noexcept` and allocates
-nothing: the memory value is prepared before the guard runs (below), and erasing from a
-`std::deque` does not allocate.
+`remembered` or clear it (a holder that unwinds clears), erase this ticket, `cv.notify_all()`. It
+is `noexcept` and allocates nothing: the memory value is prepared before the guard runs (below),
+and erasing from a `std::deque` does not allocate.
 
 A holder never waits for another ticket and never runs anyone else's closure: a ticket is settled
 only by its own caller. No ticket outlives its caller's stack in the queue: the guard removes it on
@@ -468,9 +479,9 @@ the in-memory backend holds its mutex only for the duration of one operation and
 without it; the mount plane's sleep is `CasMountRuntime::sleepInterruptibly`, a leaf; `decide`s
 call `op.admitted()` (atomics) and issue reads (backend leaf). No `decide` takes a ledger mutex.
 
-`CasHotKeys::mutex` is a leaf that calls nothing: it is held only to push, inspect, pop or erase a
-ticket, to flip `holder_active`, and to move or clear `remembered`. The gate, the `Liveness`
-closure, the verb's body and every `decide` run with it released. The order is therefore: caller
+`CasHotKeys::mutex` is a leaf that calls nothing: it is held only to push, inspect or erase a
+ticket, to read or set the spacing timestamp, and to move or clear `remembered`. The gate, the
+`Liveness` closure, the clock, the verb's body and every `decide` run with it released. The order is therefore: caller
 (no locks) → `CasHotKeys::mutex` → nothing; and separately caller (no locks) → backend mutex. The
 one rule this imposes on future callers, stated where the catalog API is documented: a catalog
 mutation is not entered while holding a ledger mutex, because the holder's `decide` may take
@@ -484,9 +495,9 @@ ledger-visible reads and a waiter must not hold what the holder needs. Today's c
   the precondition orders those, as today.
 - INV-HK2. Writes of one plane to a hot key are applied in arrival order.
 - INV-HK3. An opted-in `readModifyWrite` that follows a `Committed` of an opted-in
-  `readModifyWrite` of this plane on a hot key, with no other ending in between, obtains its base
-  from memory and issues no read for it. A lost race's resolve read is not a base read and is
-  unchanged.
+  `readModifyWrite` of this plane on a hot key, with no other ending in between and a committed
+  candidate within the memory cap, obtains its base from memory and issues no read for it. A lost
+  race's resolve read is not a base read and is unchanged.
 - INV-HK4. The memory of a hot key is either absent or a `(bytes, etag)` pair this plane encoded
   and committed, durable at the moment of that commit. It never changes the semantics of a
   conditional write: a stale memory costs one 412 and one resolve read.
@@ -527,8 +538,14 @@ closely.
 
 ## Half 2: conflict pacing {#half-2-conflict-pacing}
 
-`Retry::conflictBackoff()` returns `backoff(1)`, uniform(0, 200 ms) (`backoff` doubles from
-attempt 2 on), so the number has one home next to the schedule it departs from.
+`Retry::conflictBackoff(Dialect)` returns, on the `ETag` and `Emulated` dialects, `backoff(1)`,
+uniform(0, 200 ms) (`backoff` doubles from attempt 2 on); on the `Generation` dialect,
+1000 ms plus `backoff(1)`. Both are flat: they do not grow with the writer's loss count. The
+`Generation` value is the store's documented rate for one writer, applied to every key the loop
+serves, hot or not: `_ckpt` and `gc/state` writers on GCS that lose a clean race retry no faster
+than once a second each, without relying on a 429 the store only might send. The number has one
+home next to the schedule it departs from, and the dialect comes from `Backend::dialect()`, which
+the engine already consults.
 
 - `CasOperation::readModifyWrite` and `readModifyWriteOnPresence`: on a `Conflict` whose inner
   write had no ambiguous attempt (a clean refused precondition, settled by the resolve read),
@@ -560,17 +577,16 @@ than before, because the losing plane's whole lane waits behind its holder.
 object name, says excess writes may be throttled, and asks applications not to exceed the rate. A
 429 is a transport fault and takes the growing schedule, but a lane that drains holders at `PUT`
 latency is not paced by 429s it does not receive, and today's code is not either. So on the
-`Generation` dialect the lane spaces write attempts itself: no conditional write attempt on a hot
-key starts sooner than one second after the previous write attempt on that key from this plane
-ended, successful or not. The wait is one sleep, not two: its length is the time to that
-one-second boundary plus, when the attempt follows a clean `Conflict`, the flat jitter of
-`conflictBackoff()`, so that two servers whose boundaries coincide do not retry at the same
-instant forever; the jitter is added to the boundary, never absorbed by it. The sleep goes
-through the plane's interruptible sleep after the engine's pre-sleep check and with the attempt's
-own gate and `fits` checked again after it. The dialect is `Backend::dialect()`, which the engine
-already consults; the S3 and emulated dialects get no spacing. This holds the documented budget by
-construction for one plane; two pools or two servers on one object still share it, as they do
-today. Go/no-go for the `gcs` lane: the count of 429s on `ref_catalog` in `system.text_log` over
+`Generation` dialect the lane spaces write attempts on a hot key itself, across different holders:
+no conditional write attempt on a hot key starts sooner than one second after the previous write
+attempt on that key from this plane ended, successful or not. The wait is one sleep, not two: its
+length is the larger of the time to that boundary and, when the attempt follows a clean
+`Conflict`, the dialect's conflict pause of one second plus jitter, so the jitter is never absorbed
+by the boundary and two servers whose boundaries coincide do not retry at the same instant
+forever. The sleep goes through the plane's interruptible sleep after the engine's pre-sleep check
+and with the attempt's own gate and `fits` checked again after it. The S3 and emulated dialects
+get no spacing. This holds the documented budget by construction for one plane; two pools or two
+servers on one object still share it, as they do today. Go/no-go for the `gcs` lane: the count of 429s on `ref_catalog` in `system.text_log` over
 the acceptance run must not exceed today's, and the count of 412s must fall; both recorded in
 `docs/superpowers/cas/BACKLOG/gcs.md`. Under sustained arrivals above one per second the queue
 grows to the deadline on that dialect, which is the store's limit and not the lane's; combining is
@@ -584,11 +600,11 @@ In `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md`:
    failure, and it must end — GCS bounds mutations of one object at about one per second, and today's
    `_ckpt` and catalog loops reissue without a sleep." with: "Conflicts spend the same deadline as
    errors but not the same pace: a clean lost race is settled by the resolve read and reissued after
-   `Retry::conflictBackoff()`, a flat uniform(0, 200 ms) that does not grow with the writer's loss
-   count. The growing schedule belongs to transport faults, and to a conflict that settled one; a
-   store's per-object rate limit (GCS, about one mutation per second, answered as 429 when it
-   throttles) reaches the loop that way, and is not otherwise held by this loop. Inside one plane a
-   hot key never conflicts with itself: see the hot-key write lane."
+   `Retry::conflictBackoff(dialect)`, flat: uniform(0, 200 ms) on the `ETag` and `Emulated`
+   dialects, one second plus that jitter on `Generation`, the store's documented rate for one
+   writer; neither grows with the writer's loss count. The growing schedule belongs to transport
+   faults, and to a conflict that settled one. Inside one plane a hot key never conflicts with
+   itself: see the hot-key write lane."
 2. In the hand-written loop rule, after "sleeps with the engine's jitter between iterations", add:
    "the flat `conflictBackoff` after a refused precondition when the loop can tell it from a
    settled fault, `backoff(attempt)` otherwise and after a fault; `deleteCompletedRemoving`'s
@@ -690,8 +706,14 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    sleep ends the holder with `GaveUp{FenceLost}` and no attempt, and that a holder whose bound
    cannot fit the sleep plus one attempt (plain, frozen and lease-bound policies) gives up before
    sleeping (INV-HK9). On the `ETag` dialect the same test records no spacing sleep. A two-plane
-   sibling on `Generation` has both planes lose a race at the same boundary and asserts their next
-   attempts are separated by a recorded jitter, not issued at the same instant.
+   sibling on `Generation` has both planes lose a race at the same boundary and asserts each
+   recorded sleep is one second plus a jitter within [0, 200 ms], drawn independently per plane (a
+   range, since two draws may legitimately coincide). Siblings for the lane's lifetime: after a
+   committed `replace`, a `Refused`, a `Declined` and an oversized commit, an immediately following
+   write on the same key still waits to the one-second boundary. A non-hot key on `Generation`
+   that loses K clean races records K sleeps of one second plus jitter each.
+7e. Memory cap. A committed candidate of exactly the cap is remembered; one byte above is not,
+   and the next opted-in call reads.
 8. Open plane overlaps. A second `CasRequests` with no predicate (the open-plane shape) does a
    `replace` while the hot plane's holder is parked; it does not wait; whichever write is refused is
    settled by its resolve read; after an open-plane win the hot plane's next opted-in
@@ -699,7 +721,8 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    that starts from memory, because the committed retry candidate is this plane's own.
 9. Half 2, clean conflict. One writer loses K clean races in a row (a hook mutates the key before
    every attempt). Assert `CASRequestConflictPause` advanced K times, `CASRequestReissue` not at
-   all, and every recorded sleep is at most 200 ms.
+   all, and every recorded sleep is at most 200 ms on the `Emulated` dialect and within
+   [1000, 1200] ms on a backend reporting `Generation`.
 10. Half 2, conflict after a fault. A hook makes the attempt fail with a 429-class transport error
     and then moves the key before the resolve read, K times. Assert `CASRequestReissue` advanced
     K times and `CASRequestConflictPause` not at all. A sibling with K plain transport faults and
