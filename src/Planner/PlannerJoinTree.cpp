@@ -104,6 +104,7 @@ namespace Setting
     extern const SettingsMap additional_table_filters;
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
     extern const SettingsBool async_socket_for_remote;
+    extern const SettingsDistributedProductMode distributed_product_mode;
     extern const SettingsBool empty_result_for_aggregation_by_empty_set;
     extern const SettingsBool enable_unaligned_array_join;
     extern const SettingsBool join_use_nulls;
@@ -129,6 +130,7 @@ namespace Setting
     extern const SettingsBool parallel_replicas_for_non_replicated_merge_tree;
     extern const SettingsUInt64 parallel_replicas_min_number_of_rows_per_replica;
     extern const SettingsUInt64 parallel_replica_offset;
+    extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool optimize_move_to_prewhere;
     extern const SettingsBool optimize_move_to_prewhere_if_final;
     extern const SettingsBool use_concurrency_control;
@@ -154,6 +156,47 @@ namespace ErrorCodes
 
 namespace
 {
+
+const StorageDistributed * getDistributedStorageFromTableExpression(const QueryTreeNodePtr & table_expression)
+{
+    const auto * table_node = table_expression->as<TableNode>();
+    if (!table_node)
+        return nullptr;
+
+    return typeid_cast<const StorageDistributed *>(table_node->getStorage().get());
+}
+
+void tryRewriteGlobalRightJoinAsLeftJoin(QueryNode & query_node, const ContextPtr & context)
+{
+    auto * join_node = query_node.getJoinTree()->as<JoinNode>();
+    if (!join_node
+        || join_node->getKind() != JoinKind::Right
+        || join_node->getStrictness() != JoinStrictness::All
+        || !join_node->isOnJoinExpression())
+        return;
+
+    const auto & settings = context->getSettingsRef();
+    const auto distributed_product_mode = settings[Setting::distributed_product_mode];
+    const bool is_global = join_node->getLocality() == JoinLocality::Global
+        || distributed_product_mode == DistributedProductMode::GLOBAL
+        || (distributed_product_mode != DistributedProductMode::LOCAL && settings[Setting::prefer_global_in_and_join]);
+    if (!is_global)
+        return;
+
+    const auto * left_storage = getDistributedStorageFromTableExpression(join_node->getLeftTableExpression());
+    const auto * right_storage = getDistributedStorageFromTableExpression(join_node->getRightTableExpression());
+    if (!left_storage || !right_storage || left_storage->getShardCount() < 2 || right_storage->getShardCount() < 2)
+        return;
+
+    /** A `GLOBAL RIGHT JOIN` cannot run with the left table sharded and the right table broadcast.
+      * Every shard would independently emit unmatched rows from the complete right table.
+      * Swap the inputs before choosing the `Distributed` table that will execute the query, so the
+      * preserved side stays sharded and the original left table is broadcast instead.
+      * Projection nodes are already resolved and keep the user-visible column order unchanged.
+      */
+    std::swap(join_node->getLeftTableExpression(), join_node->getRightTableExpression());
+    join_node->setKind(JoinKind::Left);
+}
 
 /// Check if current user has privileges to SELECT columns from table
 /// Throws an exception if access to any column from `column_names` is not granted
@@ -1976,7 +2019,10 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     const ColumnIdentifierSet & outer_scope_columns,
     PlannerContextPtr & planner_context)
 {
-    const QueryTreeNodePtr & join_tree_node = query_node->as<QueryNode &>().getJoinTree();
+    auto & query_node_typed = query_node->as<QueryNode &>();
+    tryRewriteGlobalRightJoinAsLeftJoin(query_node_typed, planner_context->getQueryContext());
+
+    const QueryTreeNodePtr & join_tree_node = query_node_typed.getJoinTree();
     auto table_expressions_stack = buildTableExpressionsStack(join_tree_node);
     size_t table_expressions_stack_size = table_expressions_stack.size();
     bool is_single_table_expression = table_expressions_stack_size == 1;
