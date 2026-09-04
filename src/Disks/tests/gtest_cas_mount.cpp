@@ -1259,10 +1259,29 @@ TEST(CASMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
 }
 
-/// Pool::open must call validateCasRequestBudget itself (not just the free function in isolation —
-/// see gtest_cas_request_control.cpp for that): an inconsistent cas_request_budget must refuse a
-/// writable mount end-to-end (RFC cas-s3-timeout-retry-control §required-timeout-model), never mount
-/// silently with a budget that could let a controlled attempt outlive the lease it is fenced under.
+/// `validateCasRequestBudget` itself, isolated from `Pool::open`: a consistent default budget is
+/// accepted silently, and the overflow-safe comparison (subtraction against the TTL rather than
+/// computing `attempt_timeout_ms + lease_safety_margin_ms` directly) really does reject an absurd
+/// near-`UINT64_MAX` config rather than letting the sum wrap to a spuriously small value that would
+/// pass the inequality when it should fail closed.
+TEST(CASRequestBudget, ValidateAcceptsDefaultsAndRejectsAnOverflowingSumWithoutWrapping)
+{
+    EXPECT_NO_THROW(validateCasRequestBudget(
+        CasRequestBudget{}, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000));
+
+    const CasRequestBudget overflowing{
+        .attempt_timeout_ms = std::numeric_limits<uint64_t>::max() - 100,
+        .lease_safety_margin_ms = std::numeric_limits<uint64_t>::max() - 100};
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        validateCasRequestBudget(overflowing, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);
+    });
+}
+
+/// Pool::open must call validateCasRequestBudget itself (not just the free function in isolation,
+/// pinned directly above): an inconsistent cas_request_budget must refuse a writable mount end-to-end
+/// (RFC cas-s3-timeout-retry-control §required-timeout-model), never mount silently with a budget that
+/// could let a controlled attempt outlive the lease it is fenced under.
 TEST(CASMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
 {
     auto b = std::make_shared<InMemoryBackend>();

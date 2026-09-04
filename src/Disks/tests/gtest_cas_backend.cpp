@@ -1105,6 +1105,26 @@ TEST(CASObjectStorageBackend, PublishBlobRefusesVerbatimCopyWithoutNativeTranspo
     EXPECT_FALSE(storage->exists(DB::StoredObject(destination)));
 }
 
+/// Every Native conditional write selects the SingleAttempt object-storage retry profile (RFC
+/// cas-s3-timeout-retry-control §disable-transparent-conditional-write-retries): the CAS request
+/// engine, not the object-storage client, owns retry/backoff for a conditional PUT, so a client-level
+/// retry loop reissuing the identical request underneath it would double the reissue and could land a
+/// write the engine itself had already given up on. Two seams prove the property without a live/fake
+/// S3 endpoint: `IObjectStorage::supportsRetryProfile` is the fail-closed capability check
+/// `checkConditionalWriteSingleAttemptSupport` relies on at mount time, and
+/// `s3_max_unexpected_write_error_retries_override` is the SECOND retry-affecting layer above the S3
+/// client -- `WriteBufferFromS3`'s own makeSinglepartUpload/completeMultipartUpload loop, bounded
+/// independently of the client-level override.
+TEST(CASObjectStorageBackend, ConditionalWriteSelectsSingleAttemptAndLocalStorageDoesNotSupportIt)
+{
+    auto backend = std::make_shared<ObjectStorageBackend>(
+        tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    const auto ws = backend->conditionalWriteSettingsForTest();
+    EXPECT_EQ(ws.object_storage_retry_profile, DB::ObjectStorageRetryProfile::SingleAttempt);
+    EXPECT_EQ(ws.s3_max_unexpected_write_error_retries_override, 1u);
+    EXPECT_FALSE(tests::makeLocalObjectStorageForTest()->supportsRetryProfile(DB::ObjectStorageRetryProfile::SingleAttempt));
+}
+
 /// The Native conditional-PUT path discriminates a lost precondition by the canonical S3 error code
 /// string ("PreconditionFailed", "NoSuchKey", ...) that `S3Exception` carries from the response XML
 /// `<Code>` — a 412 is UNMODELED for the AWS SDK (the enum value is UNKNOWN), so the name is the only
