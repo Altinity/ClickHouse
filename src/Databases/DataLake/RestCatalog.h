@@ -255,7 +255,8 @@ protected:
         const String & method = {},
         const Poco::URI & url = {},
         const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {}) const;
+        const String & body = {},
+        bool * used_cached_oauth_token = nullptr) const;
 
     void validateAuthHeaders(const DB::HTTPHeaderEntry & header) const;
 
@@ -322,7 +323,8 @@ public:
         const String & method = {},
         const Poco::URI & url = {},
         const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {}) const override;
+        const String & body = {},
+        bool * used_cached_oauth_token = nullptr) const override;
 
     /// `bearer_mode` means the catalog authenticates with `onelake_bearer_token`,
     /// otherwise with the `onelake_client_id` + `onelake_client_secret` pair.
@@ -365,7 +367,8 @@ public:
         const String & method = {},
         const Poco::URI & url = {},
         const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {}) const override;
+        const String & body = {},
+        bool * used_cached_oauth_token = nullptr) const override;
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }

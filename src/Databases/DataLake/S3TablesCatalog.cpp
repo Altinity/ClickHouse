@@ -246,7 +246,8 @@ DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(
     const String & method,
     const Poco::URI & url,
     const DB::HTTPHeaderEntries & extra_headers,
-    const String & body) const
+    const String & body,
+    bool * /*used_cached_oauth_token*/) const
 {
     DB::HTTPHeaderEntries all_signed;
     signRequestWithAWSV4(method, url, extra_headers, body, *signer, region, "s3tables", all_signed);

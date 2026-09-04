@@ -221,6 +221,18 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"variant_throw_on_type_mismatch", true, true, "New setting to control type mismatch behavior in default Variant implementation"},
             {"dynamic_throw_on_type_mismatch", true, true, "New setting to control type mismatch behavior in default Dynamic implementation"},
         });
+        addSettingsChanges(settings_changes_history, "26.3.1.20001.altinityantalya",
+        {
+            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+            {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
+            {"export_merge_tree_part_allow_lossy_cast", false, false, "New setting to gate lossy casts in EXPORT PART/PARTITION behind explicit acknowledgment"},
+            {"export_merge_tree_part_schema_match_mode", "POSITION", "POSITION", "New setting to control how EXPORT PART/EXPORT PARTITION matches source columns to destination columns"},
+            {"export_merge_tree_part_ignore_extra_source_columns", false, false, "New setting to allow EXPORT PART/EXPORT PARTITION when the source table has columns absent from the destination"},
+            {"export_merge_tree_partition_retry_initial_backoff_seconds", 5, 5, "New setting for exponential back-off between failed part export retries in an export partition task"},
+            {"export_merge_tree_partition_retry_max_backoff_seconds", 300, 300, "New setting capping the exponential back-off between failed part export retries in an export partition task"},
+            {"export_merge_tree_partition_max_retries", 3, 3, "Obsolete and ignored: export partition tasks now retry retryable failures until the task timeout and fail immediately on non-retryable errors, instead of using a fixed retry budget"},
+            {"allow_experimental_database_s3_tables", false, false, "New setting to enable experimental database S3 tables (AWS Iceberg REST catalog)."},
+        });
         addSettingsChanges(settings_changes_history, "26.3",
         {
             {"defer_partition_pruning_after_final", false, true, "Gates the FINAL planner's unconditional skipping of partition pruning when the partition-key column is not in the sorting key. The behavior change itself shipped silently in 26.3 via https://github.com/ClickHouse/ClickHouse/pull/98242; this entry retroactively documents it so `compatibility = '26.2'` restores the pre-regression behavior (0 = prune before FINAL, fast; 1 = defer pruning, correctness-safe)."},
