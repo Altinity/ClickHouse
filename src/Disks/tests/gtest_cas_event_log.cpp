@@ -136,6 +136,9 @@ PoolPtr openRenewalEventPool(
     String prefix = "renewal-events",
     String server_root_id = "test")
 {
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the renewal-boundary math these tests drive matches what admits.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     return Pool::open(backend, PoolConfig{
         .pool_prefix = std::move(prefix),
         .server_root_id = std::move(server_root_id),

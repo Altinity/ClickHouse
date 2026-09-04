@@ -59,6 +59,139 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### `[stateless-lane-wall-time-is-drop-table]` Measured on the CA-s3 stateless lane (2026-09-04): DROP TABLE is the suite's largest wall-time sink; the server is not CPU-bound {#stateless-lane-wall-time-is-drop-table}
+
+`system.trace_log` over ten minutes of the parallel suite (~10 jobs): ~280 CPU samples against 630k
+Real samples — the server is waiting, not computing; 21% of the CPU samples are stack unwinding and
+symbolisation for exceptions (every expected 412/404/timeout builds a full `StackTrace`). Query threads'
+Real samples: 44% waiting in `InterpreterDropQuery::executeToTable` for the synchronous data drop, 25%
+in `TaskTracker::waitAll` under `fanOutBlobUploads`/`commit`/`moveDirectory` (the part-commit round
+trips), 14% in `finalizeConditionalWrite` (conditional PUT wait), 13% in `poll`. `system.query_log`,
+same window: DROP TABLE n=1436 p50 2.4 s p90 11.9 s max 34.7 s; CREATE TABLE p50 184 ms p90 391 ms;
+INSERT p50 253 ms p90 541 ms. S3 calls: GET 11 095, HEAD 2 966, PUT 1 597, LIST 206, DELETE 25.
+The background drop workers themselves sit in a futex inside `DatabaseCatalog::dropTableDataTask`, not
+in S3 — the drop chain is serialised somewhere (the namespace removal through the hot `ref_catalog`
+door with the conflict backoff up to 5 s fits the p90/max shape). Placement: profile one DROP on the CA
+disk (S3 operations and CAS conflicts per dropped table) as the first measurement of the
+`{#ref-catalog-cas-starvation}` follow-up; second target = the part-commit round trips (upload fan-out
++ conditional PUTs); third = skip `StackTrace` capture for expected 412s.
+
+### `[ref-catalog-cas-starvation-under-parallel-writers]` One process's CREATE/DROP writers starve each other on the ref-catalog compare-and-swap (2026-09-04) {#ref-catalog-cas-starvation}
+
+Seen on the local CA-s3 stateless lane (run 2, ~10 parallel jobs): `01039_mergetree_exec_time`'s
+`CREATE TABLE` failed after 78.9 s with "CAS ref catalog update: gave up at the policy deadline". RCA in
+`docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md`: 113 `PreconditionFailed` (412) on
+`cas_s3/cas/ref_catalog` in 80 s from 53 threads; the losing writer made 35 attempts spaced by the
+engine's full-jitter backoff (up to the 5 s cap) while fresh writers, starting at attempt 1, kept
+winning about once a second; successful `CREATE TABLE` in the window: p50 203 ms, p90 457 ms, max 10.4 s.
+`readModifyWrite` routes a `Conflict` into the same `pauseAndReissue`/`Retry::backoff` schedule and the
+same `reissues` counter as a transport fault; the spec prescribes exactly that ("conflicts spend the same
+budget as errors", motivated by GCS's ~1 write/s per-object budget) but never analyses fairness among
+many independent writers on one hot key. Pre-migration, the catalog loop retried a conflict at once,
+capped at 100 attempts. Verdict: spec-conformant, unfair by construction under sustained arrivals.
+
+DROP TABLE is the same starvation, measured on one 33.6 s drop (table `6f6ae69d…`, two parts): the
+query waited 18 s in the drop queue behind other drops, `dropAllData` then spent 1.0 s on two
+`delete_tmp` ref repoints (~0.5 s per part) and **15.4 s in "removing table directory recursive"**,
+which is ONE namespace-removal conditional write on `ref_catalog` that lost eight races in a row
+(`WriteBufferFromS3 was canceled` at +0.03, +0.21, +0.37, +0.71, +1.8, +4.5, +8.1, +12.3 s — the
+growing conflict backoff) before landing; the worker thread then immediately took the next table.
+Sixteen drop workers were active, all bottlenecked on that one key: drops complete in bursts of ~10 per
+5 s with gaps. The query thread itself issues zero S3/CAS calls (all per-query counters are 0); it only
+waits. So a DROP is, as designed, one catalog write plus one ref write per part — and the catalog
+write is what costs seconds.
+
+Fix, two halves, in this order:
+
+1. **Serialize within a process and remember the last committed state (user's proposal, primary).**
+   Compare-and-swap is needed only against other servers. Inside one server every catalog mutation
+   takes one FIFO door per pool in `CasRefCatalog`: one write at a time, no combining. The door keeps
+   the last COMMITTED snapshot and its etag from the previous successful write, applies the next change
+   to that snapshot and issues the conditional PUT against the remembered etag — no read before the
+   write. Only a lost race (another server's write, a 412 that the engine settles by its resolve read)
+   refreshes the remembered state from `Conflict::seen` and retries; any outcome that does not prove
+   what is durable (`GaveUp`, `Conflict{NotObserved}`, a fence loss or remount) invalidates the memory,
+   so the next writer reads first — fail-close. GC, the reconciler and decommission take the same door,
+   otherwise their writes stale the memory and cost one extra round trip each. Effect on this lane: N
+   concurrent `CREATE`s become N sequential PUTs with no reads and no intra-process 412s. Tests: N
+   threads on the in-memory backend under an injected clock — at most one CAS in flight, FIFO order,
+   zero reads between consecutive committed writes, bounded maximum wait; and a second `Pool` on the
+   same backend as the external writer whose win forces exactly one re-read and one retry.
+2. **Decouple conflict pacing from transport-fault backoff (secondary, spec change).** A `Conflict`
+   already carries the fresh object; pace its reissue with a flat small jitter (the RCA suggests
+   uniform(0, 250 ms)) instead of the growing `reissues`-driven schedule, keeping the capped exponential
+   backoff for real transport faults. Size the flat ceiling against the GCS object budget the spec cites;
+   with half 1 in place, conflicts come only from other servers and are rare. Pin with an N-writer fake-clock
+   test asserting the earliest writer's consecutive-loss streak stays bounded while new arrivals keep
+   winning (red today). Update the spec sentences at "Conflicts spend the same budget as errors".
+
+### `[cas-s3-lane-put-timeout-logged-at-error]` A stalled single-attempt PUT is logged at Error and fails a stateless test whose write succeeded (2026-09-04) {#cas-s3-lane-put-timeout-logged-at-error}
+
+Seen on the local CA-s3 stateless lane (run 2 after the 404-scope fix): `<Error> WriteBufferFromS3:
+S3Exception … Timeout … key cas_s3/cas/ref_catalog` reaches the client's stderr and fails the test
+although stdout is right. Root cause (`docs/superpowers/cas/2026-09-04-put-timeout-error-log-rca.md`):
+the request engine issues writes through the single-attempt client with `attempt_timeout_ms` = 5000
+(`CasRequestBudget` default) and `WriteBufferFromS3` bounded to one attempt, so a stall past 5 s throws
+once and `WriteBufferFromS3.cpp` logs it at Error once; the engine then classifies the timeout as
+ambiguous, resolves by a read and reissues to the deadline — the write lands, the log line stays. This
+predates the request-contract migration (same client, timeout and log site before it); it surfaces
+locally under the full parallel suite hammering one S3 endpoint.
+
+Recommended fix (not applied — it touches the upstream slice `src/IO/WriteBufferFromS3.cpp`, consult
+first): a thread-local log-severity scope modelled on `Expect404ResponseScope`, opened by the request
+engine's write loop around its single-attempt writes, that downgrades only the timeout/network-stall
+class at that one `LOG_ERROR` site to Info while still counting `WriteBufferFromS3RequestsErrors`; an
+ordinary non-CAS timeout keeps logging at Error. The engine's ambiguity handling is untouched by design.
+Until then the class is attributable on the lane by its exact line and key.
+
+### From the engine fix-round review (2026-09-04) {#engine-fix-round-review-2026-09-04}
+
+- **Spec drift.** `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md` (revision 13)
+  still prescribes `op.publish(…, Retry::once())` and "never the shared `standard`" for
+  `ensureBlobPresent`; since the loop-deadline fix the publish runs under the loop's frozen policy made
+  single-attempt (one physical attempt, bounded by the loop's one deadline). Reword the spec sentence.
+- **`CasRefLedger::resolveNamespaceLife` is a third hand-written loop of the forbidden shape:** 32
+  iterations, a fresh `Retry::standard()` window per verb, no pacing — the shape the spec's inventory
+  rule forbids ("a hand-written loop captures one `Retry` before it starts, shares it across every call
+  it makes"). Pre-existing, outside the fix round's brief. Placement: the same freeze-at-entry treatment
+  as `deleteCompletedRemovingAtSnapshot` / `ensureBlobPresent` (commit 1effe101617), with a red-first
+  test that a perpetual conflict ends within one window; owner = the next engine task on this branch.
+
+### Spec drift: the ref-lane inventory row says `standard`, the coverage-gate paragraph and the code say `once` (2026-09-04) {#spec-drift-ref-lane-once}
+
+`docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md` (revision 13) lists "the ref lane
+(`commitRefChunk`, the recovery walk, `resolveWedgeOnce`) — `create` under `standard`" in the inventory
+table, while its coverage-gate paragraph states that "the `once` writes of the pulse and the wedge retry
+are never a key's first request" and that the recovery walk's epoch seal at `T+1` is a `once` write.
+The implementation follows the paragraph (`resolveWedgeOnce` and the recovery seal `create` under
+`Retry::once`; the lane's own next flush is the retry), as chosen in the migration's ref-ledger unit and
+approved by its review. Fix: reword the inventory row to say `commitRefChunk` under `standard`, the wedge
+retry and the epoch seal under `once` with the reason. Found by the external test review (tests-02 #7/#8).
+
+### Soak 2026-09-04 (phase 3, 30 min, seed 20260904, binary 6ddaefbcc9e) — return items {#soak-2026-09-04-return-items}
+
+Verdict PASS (`SOAK_EXIT=0`, both checkpoints `dangling=0 stale_edge=0 dryrun_count=0`, `GaveUp` = 0 on both
+nodes; ch1 self-fenced and remounted cleanly under the one `freeze_long` fault). Three items survive the
+analysis (full evidence in the plan workspace's soak report at the time; the run row is appended to
+`utils/ca-soak/scenarios/RUN_HISTORY.md`):
+
+- **GC round cost at ~825k objects.** The `gc_checkpoint` stage's GC on ch1 cost 1934.9 s cumulative over
+  50 rounds, single rounds up to 179.8 s in `manifest_deletes`; the driver's pool-drain wait blocked on it,
+  so the "30-minute" run took 2590 s wall-clock (+44%). Profile `CasPool`'s `manifest_deletes` and
+  `fold_ref_intake` phases at that object count before trusting any duration-budgeted phase-3 gate.
+- **`B152/B185` warning text is wrong for this occurrence.** `wait_for_pool_consistent` in
+  `utils/ca-soak/soak/run.py` reports "did not HOLD dangling==0 … after a fault window", but the flap
+  happened in the routine `gc_checkpoint` stage before any chaos fault. Broaden or correct the message so
+  a real future finding is not dismissed as the known post-restart flap.
+- **Pool drain probe `None` under load.** One `pool_bytes=None` sample at 23:26:26Z inside the GC-drain
+  window; plausibly a `docker exec`/`du` subprocess timeout under host I/O contention, unprovable from
+  RustFS logs (known observability gap). `soak/pool.py` `pool_size` should log subprocess-timeout and
+  empty-stdout as distinct causes.
+
+Also noted, no item: `_ckpt checkpoint could not be advanced … persistent CAS contention` errors in the
+steady/mutations stages traced to RustFS `PUT` timeouts on the same objects moments earlier, all
+self-healed; the dominant `AWSClient 404` error-log volume is the expected `HEAD`-miss dedup probing.
+
 ### Codex production review (2026-09-03, adjudicated) — residue {#codex-prod-review-2026-09-03-residue}
 
 Adjudication of the external reviewer's 10 findings against spec revision 13: 3 confirmed defects (fixed in
@@ -139,7 +272,7 @@ code before being touched; comments now state the reason and drop plan/review pr
 - `task-7-report.md` (workspace only): "no caller reaches them yet" — legacy write verbs reach `write`/`remove` through the forwarders; the accurate claim is that no assertion needs a per-key write counter.
 - U10 review prose batch (units/U10-review.md P7): the `PLANES` doc in `Pool/CasServerRoot.h` promising a `Liveness` no production caller passes — `CasMountRuntime::installRenewer` (renamed from `installKeeper`) supplies none either. `CasServerRoot.h` is a forbidden file for the source-comment pass; left for the engine-defect pass.
 - U9 prose (units/U9-rereview.md NEW-3): `Pool/CasPartWriteTxn.cpp`'s `reconcileMetaClean` create-first gate comment over-states what an absent observation implies (an absent body does not imply an absent marker). Forbidden file for the source-comment pass; left for the engine-defect pass.
-- LOCK TASK item: delete the callerless `stagingPutIfAbsentMutable` and `stagingConditionalOverwrite` on `Pool` and `CasRefLedger` (the mount-plane doors the U9 fix closed). Not a comment or a requested rename, and `Pool` is defined in the forbidden `Pool/CasPool.cpp`; left for a task authorized to touch it.
+- RESOLVED: the callerless `stagingPutIfAbsentMutable`/`stagingConditionalOverwrite` LOCK TASK item above is stale — `grep -rn` over `src/` and `programs/` finds no such symbol anywhere in the tree; the deletion already happened.
 - U6 re-review prose (units/U6-rereview.md F4, `Pool/CasRefCatalog.cpp`): its two internal-document-reference sites (the header and test-file sweep did not reach `.cpp`, a forbidden file for the source-comment pass); left for the engine-defect pass.
 - Engine test seam (if the checkpoint shows jitter-dependent reds): `Retry::backoff` draws full jitter with no test seam, so a test driving an ambiguity under `untilLeaseSafe` with a short remaining lease is a coin flip; a `setBackoffFnForTest` on `CasRequests` (used by `pauseAndReissue`) would make it deterministic. `MountLeaseRenewer::renewOn`'s (renamed from `MountLeaseKeeper`) `catch (...)` arm reports `attempts_sent = 0` — an exception that escaped the engine carries no count; document at the field. `Pool/CasServerRoot.h` is a forbidden file for the source-comment pass; left for the engine-defect pass.
 - Product question from the lock (2026-09-03): `CAS_WRITE_UNATTRIBUTED` is unreachable on the Native/S3 write path now — its only throw site was the deleted legacy minter, and the request engine settles a 2xx whose value fits no grammar by a resolve read (`GaveUp{Unresolved}` at the deadline). Decide whether a distinct unattributed-write signal is wanted (an event/counter) or the error code is retired; the three tests that pinned the throw now pin the give-up. (Spec revision 13 records this as an open product question rather than deciding it — see [the rulings doc](2026-09-03-request-contract-rulings.md).)

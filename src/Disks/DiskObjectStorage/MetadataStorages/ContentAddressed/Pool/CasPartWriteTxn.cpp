@@ -273,10 +273,12 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     /// a dependency under an incarnation the precommit never saw. The build's own facts -- cancellation
     /// and a superseded writer epoch -- stay in `requireAlive`, where each states which one refused.
     CasOperation op = store->mountRequests().resume(txn_generation);
-    /// ONE bound for the whole publication loop, frozen before it starts: every HEAD, marker write and
-    /// paced retry below shares this deadline, so a body whose publication keeps coming back ambiguous
-    /// is refused as retry-later inside one standard window instead of spending a fresh window per
-    /// verb across eight iterations. The attempt cap below is the secondary bound.
+    /// ONE bound for the whole publication loop, frozen before it starts: every HEAD and marker write
+    /// below shares this deadline, so a body whose publication keeps coming back ambiguous is refused
+    /// as retry-later inside one standard window instead of spending a fresh window per verb across
+    /// eight iterations. The paced retry is a bare sleep that does not consult the deadline, so the
+    /// loop can sleep one backoff (at most 5 s) past it before the next verb refuses to start. The
+    /// attempt cap below is the secondary bound.
     const Retry policy = op.freeze(Retry::standard());
     /// The unrepeatable publication, under the SAME bound: the engine may never reissue an envelope
     /// (see the publication call below), but the loop's deadline still governs whether one may start.
@@ -475,13 +477,12 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
 
         try
         {
-            /// A single physical publication, deliberately not under the shared policy: the engine
-            /// would reissue this exact envelope, and a re-sent envelope re-publishes the same
-            /// `incarnation_tag`, so on a content-derived-ETag dialect the republished body carries the
-            /// incarnation GC condemned and the exact-incarnation delete would remove a live body.
-            /// Every physical publication therefore mints its own envelope -- each iteration of this
-            /// loop builds one -- and the engine may never reissue one. The verbatim staged copy is
-            /// additionally a once-only privilege `beginPublication` spends.
+            /// A single physical publication, which the engine may never reissue: a re-sent envelope
+            /// re-publishes the same `incarnation_tag`, so on a content-derived-ETag dialect the
+            /// republished body carries the incarnation GC condemned and the exact-incarnation delete
+            /// would remove a live body. Every physical publication therefore mints its own envelope --
+            /// each iteration of this loop builds one. The verbatim staged copy is additionally a
+            /// once-only privilege `beginPublication` spends.
             op.publish(BlobPublishRequest{key, std::move(publication)}, publication_policy);
         }
         catch (const std::exception & error)

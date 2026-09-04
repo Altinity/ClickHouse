@@ -236,10 +236,11 @@ struct MountClaimResult
     Kind kind = ForeignOwner;
     /// The lease this result is ABOUT. For `Claimed` it is the body this server installed; for
     /// `ForeignOwner`, `FencedSelf` and `LiveDoubleStart` it is the body that was observed at the key,
-    /// which is what `mountDoubleStartMessage` renders as the existing mount. The one exception is a
-    /// raced write whose conflict settled to no observation at all: nothing was seen to report, so
-    /// this carries the lease this server proposed and `etag` is empty.
-    MountLease body;
+    /// which is what `mountDoubleStartMessage` renders as the existing mount. EMPTY exactly when a
+    /// raced write's conflict settled to no observation at all -- nobody was seen, so no operator
+    /// message may name a holder, and the lease this server merely PROPOSED is not one. An optional
+    /// rather than the proposal, because a caller cannot check a convention it cannot see.
+    std::optional<MountLease> body;
     /// Which certificate of death justified a same-uuid, different-epoch `Claimed` reclaim (`None` for
     /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).
     MountPriorState prior = MountPriorState::None;
@@ -279,7 +280,10 @@ MountClaimResult claimMount(
 /// live second server (the same `server_root_id` is mounted twice). Produced only AFTER this server
 /// has already waited for the lease to lapse (see `claimMountAwaitingExpiry`) and it did not — so the
 /// remediation is about a live twin, not about waiting.
-String mountDoubleStartMessage(const String & srid, const MountLease & existing);
+/// `existing` empty renders the identity block as "could not be observed": a raced write whose
+/// conflict saw nothing has no holder to name, and naming the proposer would point an operator at this
+/// very process.
+String mountDoubleStartMessage(const String & srid, const std::optional<MountLease> & existing);
 
 /// Observation-based mount claim for restart recovery.
 /// Wraps `claimMount` in a loop:

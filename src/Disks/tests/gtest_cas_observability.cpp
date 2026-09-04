@@ -148,6 +148,7 @@ TEST(CASObservability, RenewalCountersHaveExactPhysicalAndLogicalDeltas)
     const auto run = [](RenewalCounterBackend::Fault fault, uint64_t attempts, uint64_t retries, uint64_t resolved, uint64_t recovered)
     {
         auto backend = std::make_shared<RenewalCounterBackend>();
+        backend->setAttemptTimeoutMs(renewalCounterBudget().attempt_timeout_ms);
         uint64_t boot_ms = 100;
         auto store = Pool::open(backend, PoolConfig{
             .pool_prefix = "renewal-counter-" + std::to_string(attempts) + "-" + std::to_string(resolved),
@@ -171,6 +172,7 @@ TEST(CASObservability, RenewalCountersHaveExactPhysicalAndLogicalDeltas)
 TEST(CASObservability, ExternalLeaseDeadlineCountsOnceWithoutReconstructingAttempts)
 {
     auto backend = std::make_shared<RenewalCounterBackend>();
+    backend->setAttemptTimeoutMs(renewalCounterBudget().attempt_timeout_ms);
     uint64_t boot_ms = 100;
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "renewal-deadline-counter",
@@ -181,9 +183,9 @@ TEST(CASObservability, ExternalLeaseDeadlineCountsOnceWithoutReconstructingAttem
     });
 
     /// The fence deadline is 1100 and the safety margin 20, so admission refuses once fewer than
-    /// twenty milliseconds of lease remain. At 1090 nothing can be started and the logical renewal ends
-    /// without reconstructing a sent attempt. (Not 1071: the engine reserves the backend's own attempt
-    /// timeout, which is zero for an in-memory backend, so 29 ms of remaining lease is still room.)
+    /// twenty milliseconds of lease remain. At 1090 only ten milliseconds remain, short of the margin
+    /// however much a single attempt reserves, so nothing can be started and the logical renewal ends
+    /// without reconstructing a sent attempt.
     boot_ms = 1090;
     const RenewalCounterSnapshot before = renewalCounters();
     EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);

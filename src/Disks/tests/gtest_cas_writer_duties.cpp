@@ -36,18 +36,24 @@ PoolConfig singleAttemptConfig()
     return config;
 }
 
-PoolPtr openSingleAttemptPool(const BackendPtr & backend)
+template <typename BackendT>
+PoolPtr openSingleAttemptPool(const std::shared_ptr<BackendT> & backend)
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the fence math these single-attempt fixtures drive matches what admits.
+    backend->setAttemptTimeoutMs(singleAttemptConfig().cas_request_budget.attempt_timeout_ms);
     return Pool::open(backend, singleAttemptConfig());
 }
 
-PoolPtr openFrozenSingleAttemptPool(const BackendPtr & backend)
+template <typename BackendT>
+PoolPtr openFrozenSingleAttemptPool(const std::shared_ptr<BackendT> & backend)
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     PoolConfig config = singleAttemptConfig();
     config.boot_ms_fn = [] { return uint64_t{0}; };
     config.mount_renew_period = std::chrono::hours{1};
+    backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);
     return Pool::open(backend, config);
 }
 
@@ -88,44 +94,7 @@ uint64_t leaveRejectedCleanupDuty(const PoolPtr & store, const RootNamespace & n
     return rejected_seq;
 }
 
-/// `ChunkFaultBackend` counts its faults, and a count can no longer wedge one logical write: the write
-/// engine settles every ambiguity by an exact read and reissues, so a bounded fault is outlived and the
-/// call commits on a later attempt instead of exhausting its own retry window. Latching keeps the fault
-/// (and, for `LandedThenLost`, the paired lost resolve-read) armed on every reissue, so the duty tests
-/// below can drive a call all the way to a genuine give-up.
-class LatchedChunkFaultBackend : public DB::Cas::tests::ChunkFaultBackend
-{
-public:
-    bool latched = false;
-
-    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        if (latched && !fail_read_once_key.empty() && key == fail_read_once_key)
-            throw Poco::TimeoutException("LatchedChunkFaultBackend: the lost read stays lost");
-        return ChunkFaultBackend::read(key, access);
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             DB::Cas::TransportAccess & access) override
-    {
-        if (latched && mode != Mode::None && fault_skip == 0 && !expected_value && !fault_substr.empty()
-            && key.find(fault_substr) != String::npos)
-            fault_count = 1;
-        return ChunkFaultBackend::write(key, bytes, expected_value, access);
-    }
-
-    /// Disarms completely (not just unlatches): what a caller does right after driving a call to its
-    /// give-up is a further mutation that must reach the store normally.
-    void disarm()
-    {
-        latched = false;
-        mode = Mode::None;
-        fault_count = 0;
-        fault_skip = 0;
-        fail_read_once_key.clear();
-    }
-};
+using DB::Cas::tests::LatchedChunkFaultBackend;
 
 /// Latches `backend` and drives `f` to a NETWORK_ERROR give-up, then disarms the fault completely so a
 /// caller's next mutation reaches the store normally. The caller must have installed a
@@ -200,6 +169,9 @@ TEST(CASWriterDuties, ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation)
     PoolConfig config = singleAttemptConfig();
     config.boot_ms_fn = [] { return uint64_t{0}; };
     config.mount_renew_period = std::chrono::hours{1};
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the fence math this single-attempt fixture drives matches what admits.
+    backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);
     auto store = Pool::open(backend, config);
     const RootNamespace ns{"srv1/writer_duty_reject"};
 
@@ -377,6 +349,9 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
         .attempt_timeout_ms = 50,
         .lease_safety_margin_ms = 50,
     };
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     const RootNamespace ns{"srv1/writer_duty_crash"};
 
     auto predecessor = Pool::open(backend, PoolConfig{
@@ -452,6 +427,9 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
         .attempt_timeout_ms = 50,
         .lease_safety_margin_ms = 50,
     };
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     /// Rooted under the POOL's OWN `server_root_id` ("test", unlike this file's other fixtures, which
     /// stay under "srv1" precisely because they never drive the orphan sweep): `prefixEligible`'s
     /// watermark floor is looked up by walking the NAMESPACE's own prefix segments for a live mount

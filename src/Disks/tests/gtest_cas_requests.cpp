@@ -1067,12 +1067,16 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
     /// A competitor takes the key while our own create is in flight, and that create's own fate is
     /// lost. The ambiguity is armed from inside the hook so the competitor's write cannot consume it.
     bool staged = false;
+    std::optional<Etag> rival_etag;
     backend->onBeforeWrite("k", [&]
     {
         if (staged)
             return;
         staged = true;
-        (void)rival.create("k", "theirs", Retry::once());
+        const WriteResult rival_result = rival.create("k", "theirs", Retry::once());
+        const auto * rival_committed = std::get_if<Committed>(&rival_result);
+        ASSERT_NE(rival_committed, nullptr);
+        rival_etag = rival_committed->etag;
         backend->injectAmbiguousWrite("k");
     });
 
@@ -1083,9 +1087,15 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
     const auto * conflict = std::get_if<Conflict>(&result);
     ASSERT_NE(conflict, nullptr);
     /// The ambiguity forced a body read, and the body stops at this boundary: a caller of the
-    /// presence loop can never come to depend on bytes the loop does not promise.
-    EXPECT_TRUE(std::holds_alternative<Meta>(conflict->seen));
-    EXPECT_FALSE(std::holds_alternative<Object>(conflict->seen));
+    /// presence loop can never come to depend on bytes the loop does not promise. `get_if<Meta>` plus
+    /// its field checks, not a bare `holds_alternative`: a variant that already proved it holds `Meta`
+    /// cannot also hold `Object`, so the field checks are what a regression could actually fail --
+    /// proving the observed Meta is the RIVAL's own committed incarnation, not some other object.
+    ASSERT_TRUE(rival_etag.has_value());
+    const auto * meta_seen = std::get_if<Meta>(&conflict->seen);
+    ASSERT_NE(meta_seen, nullptr);
+    EXPECT_EQ(meta_seen->etag, *rival_etag);
+    EXPECT_EQ(meta_seen->size, String("theirs").size());
     EXPECT_EQ(backend->getTotal(), 1u);
 }
 

@@ -160,24 +160,32 @@ private:
     std::vector<CasEvent> events;
 };
 
-PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
+template <typename BackendT>
+PoolPtr openPool(const std::shared_ptr<BackendT> & backend, CasRequestBudget budget = {})
 {
     /// Recovery tests seed ref-log/snapshot residue before opening; a pool with such residue always has a
     /// `_pool_meta` in production, so establish it first (Task 7's zero-write bootstrap check refuses to
     /// mint a fresh identity over residual data — see `seedPoolMetaForRestart`). Idempotent, and a no-op
     /// for the fresh-open tests that seed nothing (the subsequent open validates the just-created meta).
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 
 /// Task 11: like `openPool`, but the caller supplies (and owns) the rest of the config -- snapshot
 /// thresholds, grace age, a fake `boot_ms_fn`, etc. `pool_prefix`/`server_root_id` are pinned so every
 /// test in this file addresses the same pool shape.
-PoolPtr openPoolWithConfig(const BackendPtr & backend, PoolConfig config)
+template <typename BackendT>
+PoolPtr openPoolWithConfig(const std::shared_ptr<BackendT> & backend, PoolConfig config)
 {
     config.pool_prefix = "p";
     config.server_root_id = "test";
     DB::Cas::tests::seedPoolMetaForRestart(*backend);   /// see `openPool` above
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);
     return Pool::open(backend, std::move(config));
 }
 
