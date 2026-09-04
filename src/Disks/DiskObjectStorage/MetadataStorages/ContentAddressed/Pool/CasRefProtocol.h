@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasKeyReader.h>
 #include <base/types.h>
 #include <algorithm>
 #include <cstdint>
@@ -795,8 +796,11 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
 /// under this immutable authority. In particular, this read-only API never probes or adopts `F+1`. There
 /// is deliberately no self-resolving compatibility overload: every consumer must pass the row from its
 /// frozen catalog cut explicitly.
+///
+/// `reader`, when set, fetches the logs; it may prefetch ids of the current epoch and drops them at a
+/// seal. Every decision and every error path is the same with and without it.
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt);
+    const std::optional<RefCkpt> & ckpt, KeyReader * reader = nullptr);
 
 }

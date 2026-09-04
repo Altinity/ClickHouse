@@ -621,6 +621,8 @@ private:
     const uint64_t gc_meta_pool_size;
     /// Bounded pool size for the GC fold's read-ahead; 1 disables it.
     const uint64_t gc_read_concurrency;
+    /// Keys per batch delete request for the write-once families.
+    const uint64_t gc_bulk_delete_chunk_keys;
     /// The budget for one HTTP attempt of a writable Native mount's control-plane requests; feeds
     /// `Cas::PoolConfig::cas_request_budget.attempt_timeout_ms` and the backend's own
     /// `attemptTimeoutMs()`.

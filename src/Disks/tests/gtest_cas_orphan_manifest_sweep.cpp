@@ -389,9 +389,11 @@ TEST(CASOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamesp
     EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
-/// The candidate body and token must be frozen before the later catalog cut. A concurrent same-key
-/// replacement after that observation is a new physical incarnation and must lose the old-token delete.
-TEST(CASOrphanManifestSweep, CursorPageCannotDeleteManifestReplacedAfterObservation)
+/// Manifest keys are write-once, so a same-key rewrite after the observation below never happens in
+/// production; this backend forces one anyway to prove the page does not need the old freeze-before-cut
+/// discipline to stay correct. The body is read only after the catalog cut, so it sees whatever
+/// incarnation is actually there at that point and deletes it under its own current token.
+TEST(CASOrphanManifestSweep, CursorPageDeletesTheIncarnationSeenAfterTheCatalogCut)
 {
     auto backend = std::make_shared<ReplacingManifestAfterObservationBackend>();
     auto store = openPoolForTest(backend);
@@ -408,8 +410,8 @@ TEST(CASOrphanManifestSweep, CursorPageCannotDeleteManifestReplacedAfterObservat
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_TRUE(backend->didReplace());
-    EXPECT_EQ(result.deleted, 0u);
-    EXPECT_TRUE(headExists(*backend, key));
+    EXPECT_EQ(result.deleted, 1u);
+    EXPECT_FALSE(headExists(*backend, key));
 }
 
 /// Any duplicate current life id makes the catalog-to-physical join ambiguous. The cursor page is

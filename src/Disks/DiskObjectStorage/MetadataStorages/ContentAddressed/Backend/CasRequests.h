@@ -196,6 +196,9 @@ private:
     uint64_t attempt_reservation_ms;
 };
 
+/// The cap on one `removeManyWriteOnce` chunk -- also the ceiling a batch-delete request can carry.
+inline constexpr size_t kBulkDeleteMaxKeys = 1000;
+
 /// One admitted operation: the unit a policy, a fence generation and a liveness predicate apply to.
 /// Move-only, and every request it makes re-checks its admission -- before each attempt, before each
 /// sleep, and once more after a proven commit, so a write whose fence was lost while it was in flight
@@ -241,6 +244,12 @@ public:
     /// absent; never returns `Mismatch` -- under `once`, where there is no reissue to resolve one, a
     /// `Mismatch` is the retry-later throw the read verbs use when their policy is exhausted.
     Removal removeCurrent(const String & key, const Retry & policy);
+    /// Deletes ONE chunk of up to `kBulkDeleteMaxKeys` write-once keys as one request under the
+    /// policy: admission, fence, budget, deadline, backoff and reissue exactly as `remove`. A reissue
+    /// resends the whole chunk; a key the failed attempt already deleted is absent, and absence is
+    /// success. Throws when the policy is exhausted. More keys than the cap is a caller bug: the
+    /// consumer chunks, so that every chunk that succeeded is recorded before a later one can fail.
+    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, const Retry & policy);
     /// The one primitive that reports failure as a value, so the policy reissues on the OUTCOME:
     /// `Indeterminate` is retried, the four authoritative outcomes return at once, and an
     /// `Indeterminate` that outlives the bound is returned rather than thrown. Admission refused before

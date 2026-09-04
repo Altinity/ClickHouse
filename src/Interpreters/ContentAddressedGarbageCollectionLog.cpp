@@ -45,7 +45,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"objects_absent", std::make_shared<DataTypeUInt64>(), "Retire candidates found already absent."},
         {"objects_replaced", std::make_shared<DataTypeUInt64>(), "412-saves (a resurrection won the race)."},
         {"objects_spared", std::make_shared<DataTypeUInt64>(), "Candidates spared (in-degree > 0 at recheck)."},
-        {"manifests_deleted", std::make_shared<DataTypeUInt64>(), "Owner-removed manifest bodies physically deleted this round (counted separately from blob deletes, B11)."},
+        {"manifests_deleted", std::make_shared<DataTypeUInt64>(), "Owner-removed manifest bodies deleted or found already absent this round (a batch delete of write-once keys cannot tell the two apart), counted separately from blob deletes."},
         {"entries_condemned", std::make_shared<DataTypeUInt64>(), "Retired entries newly condemned this round (retired-cursor pipeline stage 1)."},
         {"entries_graduated", std::make_shared<DataTypeUInt64>(), "Retired entries newly floor-passed and republished delete_pending this round (stage 2; deleted the NEXT round)."},
         {"entries_redeleted", std::make_shared<DataTypeUInt64>(), "Pending exact-token blob deletes executed this round (stage 3)."},

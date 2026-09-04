@@ -979,6 +979,12 @@ Backend::RawRemoval ObjectStorageBackend::removeUnder(
         return RawRemoval::Mismatch;
 
     object_storage->removeObjectIfExists(StoredObject(emuPath(key)));
+    emuForgetDeletedToken(key);
+    return RawRemoval::Removed;
+}
+
+void ObjectStorageBackend::emuForgetDeletedToken(const String & key)
+{
     /// Keep the deleted incarnation's last-minted etag around ONLY while a same-mtime-quantum
     /// collision with an immediate recreate is still possible (emuMintToken) — once it is
     /// comfortably old, erase it so `emu_token_state` does not grow for the lifetime of the backend
@@ -991,7 +997,31 @@ Backend::RawRemoval ObjectStorageBackend::removeUnder(
         else
             emu_token_expiry.push_back(EmuTokenExpiry{now_ns, key, it->second});
     }
-    return RawRemoval::Removed;
+}
+
+void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &)
+{
+    if (keys.empty())
+        return;
+    if (mode == Mode::Native)
+    {
+        StoredObjects objects;
+        objects.reserve(keys.size());
+        for (const WriteOnceKey & key : keys)
+            objects.emplace_back(key.str());
+        /// `NOT_IMPLEMENTED` from a storage without a batch delete propagates -- fail-closed by construction.
+        object_storage->removeObjectsIfExistUnderProfile(objects, controlPlaneProfile(), attempt_timeout_ms);
+        return;
+    }
+
+    std::lock_guard lock(emu_mutex);
+    for (const WriteOnceKey & key : keys)
+    {
+        if (!emuExists(key.str()))
+            continue;
+        object_storage->removeObjectIfExists(StoredObject(emuPath(key.str())));
+        emuForgetDeletedToken(key.str());
+    }
 }
 
 Backend::RawListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit, TransportAccess &)

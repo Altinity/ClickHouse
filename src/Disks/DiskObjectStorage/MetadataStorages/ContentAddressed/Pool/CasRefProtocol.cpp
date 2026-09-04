@@ -1041,7 +1041,7 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
 
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt)
+    const std::optional<RefCkpt> & ckpt, KeyReader * reader)
 {
     /// The frozen catalog row and `_ckpt` supplied by the caller determine every recovery boundary;
     /// this function must not re-read either mutable object, or enumerate the stream, because that
@@ -1070,7 +1070,11 @@ RecoveredRefTable recoverRefTableDetailedFromAuthority(
         RefTxnId id = *grounding.walk_from;
         while (id <= *grounding.committed_through)
         {
-            const auto got = op.read(layout.refLogKey(life, id), Retry::standard());
+            const String key = layout.refLogKey(life, id);
+            if (reader && id.ref_sequence < std::numeric_limits<uint64_t>::max())
+                hintRefLogsWithinEpoch(*reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1},
+                                       *grounding.committed_through);
+            const auto got = reader ? reader->take(key) : op.read(key, Retry::standard());
             if (!got)
             {
                 /// `NamespaceLifeId` is opaque and unique to one logical life. A later birth has a
@@ -1092,7 +1096,12 @@ RecoveredRefTable recoverRefTableDetailedFromAuthority(
 
             if (const std::optional<RefTxnId> next = nextRefLogIdWithinCommittedFrontier(
                     id, is_seal, *grounding.committed_through))
+            {
+                if (is_seal && reader && id.ref_sequence < std::numeric_limits<uint64_t>::max())
+                    discardRefLogHintsOfEpoch(*reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1},
+                                              *grounding.committed_through);
                 id = *next;
+            }
             else
                 break;
         }

@@ -11,6 +11,7 @@
 
 #include <Common/ProfileEvents.h>
 
+#include <mutex>
 #include <set>
 
 /// Task 12 required GC tests over the snapshot+log ref model (spec 2026-07-11-cas-ref-table-snapshot-log-design).
@@ -124,49 +125,139 @@ public:
     {
         Catalog,
         GcFence,
+        CatalogRebirth,
     };
 
     enum class Timing : uint8_t
     {
-        BeforeFirstDelete,
         AfterFirstDelete,
+        DuringChunk,
     };
 
     void arm(
         Authority authority_, Timing timing_, const Layout & layout,
         const String & first_cleanup_key_)
     {
+        arm(authority_, timing_, layout, first_cleanup_key_, std::nullopt);
+    }
+
+    void arm(
+        Authority authority_, Timing timing_, const Layout & layout,
+        const String & first_cleanup_key_, const RootNamespace & reborn_ns_)
+    {
+        arm(authority_, timing_, layout, first_cleanup_key_, std::optional<RootNamespace>{reborn_ns_});
+    }
+
+    /// "Before the first chunk" has no backend-request seam of its own to hang off: `cleanupRefObjects`
+    /// issues no `HEAD`, and the chunk's own catalog/`gc/state` reads only happen ONCE, back to back,
+    /// immediately before the delete they license -- by the time either is observable from a backend
+    /// override, the chunk's catalog snapshot is already cached in `authorityHolds`'s local, and moving
+    /// the authority no longer changes what THIS chunk decides. The window that must be hit instead is
+    /// the round's own hot-scan catalog cut: `Gc::setPostHotScanCatalogReadHookForTest` (`CasGc.h`)
+    /// fires the instant that cut is taken, before the round -- and later `authorityHolds` -- does
+    /// anything else with it, so a move landed there is exactly "before the first chunk starts" and the
+    /// chunk's later fresh reads observe it.
+    ///
+    /// `Authority::Catalog` moves the catalog's token directly, right there in the hook: the round's
+    /// own `round_commit` CAS (phase 13) never touches the catalog, so nothing downstream collides.
+    /// `Authority::GcFence` cannot do the same for `gc/state`: bumping its lease THERE lands strictly
+    /// BEFORE `round_commit`'s own `gc/state` replace (which still holds the etag from lease adoption,
+    /// phase 1), so that replace loses its own CAS and the round throws before `cleanupRefObjects`
+    /// (phase 17) ever runs -- the "nothing deleted" assertions would pass vacuously, not because
+    /// cleanup refused. Instead, the hook only ARMS `armGcFenceMoveOnAuthorityHoldsRevalidationForTest`: the
+    /// actual lease bump is deferred to a LATER read of `gc/state`. Not the next one -- namespace
+    /// janitor / orphan-sweep bookkeeping between `round_commit` and `cleanupRefObjects` also touches
+    /// the catalog and `gc/state`, just never the two BACK TO BACK the way `authorityHolds` does
+    /// (catalog, then `gc/state`, nothing in between): that adjacency is the one place in a round only
+    /// `authorityHolds`'s own revalidation produces, so gating on it -- rather than on the catalog key
+    /// alone -- is what actually lands the move inside that SAME call, well after `round_commit`.
+    static void moveRefCleanupAuthorityBeforeFirstChunk(Authority authority_, CasOperation & op, const Layout & layout)
+    {
+        if (authority_ == Authority::GcFence)
+            throw std::logic_error(
+                "moveRefCleanupAuthorityBeforeFirstChunk is for Authority::Catalog/CatalogRebirth only -- "
+                "use armGcFenceMoveOnAuthorityHoldsRevalidationForTest for Authority::GcFence");
+        /// Same-content rewrite: only the catalog's TOKEN moves (mints a fresh etag), never its
+        /// parsed content -- the pure "someone else touched this row" race `Authority::Catalog`
+        /// models, as opposed to `Authority::CatalogRebirth`'s actual incarnation bump.
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
+        op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), *snap.etag, Retry::standard());
+    }
+
+    /// Arms the seam `read` below fires on: see the doc comment above. Called from the test body
+    /// before the round (and so before any read-ahead worker exists), but still under the mutex, so
+    /// this method and `read`'s critical sections never race even under future reordering.
+    void armGcFenceMoveOnAuthorityHoldsRevalidationForTest(const Layout & layout)
+    {
+        catalog_key = layout.refCatalogKey();
+        gc_state_key = layout.gcStateKey();
+        std::lock_guard lock(seam_mutex);
+        catalog_seam_armed = true;
+    }
+
+    /// `read` also runs on the GC read-ahead pool's threads (`CasGcReadAhead.cpp` schedules
+    /// `CasOperation::read` there; `gc_read_concurrency` defaults to 16), concurrently with the round
+    /// thread's own reads -- `catalog_seam_armed` and `last_control_key_read` below are shared mutable
+    /// state a pool thread's read can land between `authorityHolds`'s two reads, so both are read AND
+    /// written only under `seam_mutex`. `last_control_key_read` tracks only the catalog and `gc/state`
+    /// keys, never any other key a read-ahead worker fetches: those workers never touch either control
+    /// key (they fetch ref-log/manifest bodies), so an unrelated concurrent read can never perturb the
+    /// adjacency signal even though it runs lock-free between this method's two critical sections.
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        bool fires_here = false;
+        {
+            std::lock_guard lock(seam_mutex);
+            fires_here = catalog_seam_armed && key == gc_state_key && last_control_key_read == catalog_key;
+            if (fires_here)
+                catalog_seam_armed = false;
+            if (key == catalog_key || key == gc_state_key)
+                last_control_key_read = key;
+        }
+        if (fires_here)
+        {
+            const auto current = CountingBackend::read(key, access);
+            if (!current)
+                throw std::runtime_error("test-injected cleanup authority object is absent");
+            GcState moved = decodeGcState(current->bytes);
+            ++moved.lease.seq;
+            if (!write(key, encodeGcState(moved), current->value, access).has_value())
+                throw std::runtime_error("test-injected cleanup authority move lost its CAS");
+            return CountingBackend::read(key, access);   /// the FRESH, post-move bytes, for THIS read
+        }
+        return CountingBackend::read(key, access);
+    }
+
+    /// The `AfterFirstDelete` seam moves the authority once the first chunk's batch delete has
+    /// landed (so that chunk keeps whatever it already observed and only the NEXT chunk's
+    /// revalidation refuses); `DuringChunk` moves it after the chunk's revalidation but before its
+    /// batch delete lands, so the chunk in flight still completes under the authority it observed.
+    void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, DB::Cas::TransportAccess & access) override
+    {
+        const bool names_first = std::any_of(keys.begin(), keys.end(),
+            [&](const DB::Cas::WriteOnceKey & key) { return key.str() == first_cleanup_key; });
+        if (armed && timing == Timing::DuringChunk && names_first)
+            moveAuthority(access);   /// after the revalidation, before the deletes land
+        CountingBackend::removeManyWriteOnce(keys, access);
+        if (armed && timing == Timing::AfterFirstDelete && names_first)
+            moveAuthority(access);
+    }
+
+private:
+    void arm(
+        Authority authority_, Timing timing_, const Layout & layout,
+        const String & first_cleanup_key_, std::optional<RootNamespace> reborn_ns_)
+    {
         authority = authority_;
         timing = timing_;
         catalog_key = layout.refCatalogKey();
         gc_state_key = layout.gcStateKey();
         first_cleanup_key = first_cleanup_key_;
+        reborn_ns = std::move(reborn_ns_);
+        layout_for_rebirth_seed = &layout;
         armed = true;
     }
 
-    /// The primitive `head` override below hides every base overload of that name.
-    using CountingBackend::head;
-
-    /// Both seams hang off the transport primitives, so they fire whichever surface the cleanup pass
-    /// reaches the store through.
-    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        auto result = CountingBackend::head(key, access);
-        if (armed && timing == Timing::BeforeFirstDelete && key == first_cleanup_key)
-            moveAuthority(access);
-        return result;
-    }
-
-    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
-                                        DB::Cas::TransportAccess & access) override
-    {
-        auto result = CountingBackend::remove(key, expected_value, access);
-        if (armed && timing == Timing::AfterFirstDelete && key == first_cleanup_key)
-            moveAuthority(access);
-        return result;
-    }
-
-private:
     /// `access` is the token the caller's own primitive override already holds for its in-flight
     /// request; reused here for this method's extra read+write rather than minting a new CasRequests,
     /// exactly as `Backend::probeSentinelRaw`'s default implementation reuses one `access` across its
@@ -174,7 +265,7 @@ private:
     void moveAuthority(TransportAccess & access)
     {
         armed = false;
-        const String & key = authority == Authority::Catalog ? catalog_key : gc_state_key;
+        const String & key = authority == Authority::GcFence ? gc_state_key : catalog_key;
         const auto got = read(key, access);
         if (!got)
             throw std::runtime_error("test-injected cleanup authority object is absent");
@@ -186,16 +277,73 @@ private:
             ++moved.lease.seq;
             bytes = encodeGcState(moved);
         }
+        UInt128 reborn_incarnation = 0;
+        if (authority == Authority::CatalogRebirth)
+        {
+            RefCatalog catalog = decodeRefCatalog(bytes);
+            for (CatalogEntry & entry : catalog.entries)
+                if (reborn_ns && entry.ns == *reborn_ns)
+                {
+                    entry.incarnation = entry.incarnation + 1;
+                    reborn_incarnation = entry.incarnation;
+                }
+            bytes = encodeRefCatalog(catalog);
+        }
         if (!write(key, bytes, got->value, access).has_value())
             throw std::runtime_error("test-injected cleanup authority move lost its CAS");
+
+        /// Give the reborn life SOMETHING of its own, landed right after its catalog row exists (any
+        /// earlier and an "unknown incarnation" sweep elsewhere in the SAME round can claim it, since
+        /// no catalog entry yet names that incarnation) -- so the "reborn life untouched" assertions
+        /// below test something real instead of an empty listing.
+        if (authority == Authority::CatalogRebirth && reborn_ns && reborn_incarnation != 0 && layout_for_rebirth_seed)
+        {
+            const Layout & layout = *layout_for_rebirth_seed;
+            const NamespaceLifeId reborn_life = NamespaceLifeId::fromCatalogEntry(*reborn_ns, reborn_incarnation);
+            const RefTxnId reborn_log_id{1, 1};
+            const RefLogTxn reborn_birth{
+                .ns = reborn_ns->string(), .txn_id = reborn_log_id, .ops = {namespaceBirthOp()},
+                .prev_epoch_seal = std::nullopt};
+            if (!write(layout.refLogKey(reborn_life, reborn_log_id),
+                    sealObject(FormatId::RefLog, encodeRefLogTxn(reborn_birth)), std::nullopt, access).has_value())
+                throw std::runtime_error("test-injected reborn-life log seed lost its CAS");
+            const RefTableSnapshot reborn_snap = minimalLiveSnapshot(reborn_ns->string(), reborn_log_id);
+            if (!write(layout.refSnapshotKey(reborn_life, reborn_log_id),
+                    sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(reborn_snap)), std::nullopt, access).has_value())
+                throw std::runtime_error("test-injected reborn-life snapshot seed lost its CAS");
+            /// A checkpoint too, naming the seeded log/snapshot: without one, the NEXT round's recovery
+            /// grounding for this namespace finds "no usable checkpoint", which SUPPRESSES that round's
+            /// destructive work ENTIRELY (every namespace, not just this one) -- a test relying on the
+            /// old cohort surviving round 2 would then be observing a no-op round, not the plan moving
+            /// to the reborn life. `writeRecoverableCkptForRawFixture` resolves its own fresh catalog
+            /// read, which already sees the incarnation bump the write just above landed.
+            writeRecoverableCkptForRawFixture(*this, layout, *reborn_ns, RefCkpt{
+                .life_epoch = 1,
+                .committed_through = reborn_log_id,
+                .checkpoint_snapshot_id = reborn_log_id,
+                .last_epoch_seal = std::nullopt,
+            });
+        }
     }
 
     Authority authority = Authority::Catalog;
-    Timing timing = Timing::BeforeFirstDelete;
+    Timing timing = Timing::AfterFirstDelete;
     String catalog_key;
     String gc_state_key;
     String first_cleanup_key;
+    std::optional<RootNamespace> reborn_ns;
+    const Layout * layout_for_rebirth_seed = nullptr;
     bool armed = false;
+    /// Guards both members below: `read` runs concurrently on the GC read-ahead pool's threads, see
+    /// the doc comment on `read` itself.
+    std::mutex seam_mutex;
+    /// Independent of `armed`/`timing`/`authority` above: `armGcFenceMoveOnAuthorityHoldsRevalidationForTest`
+    /// arms this, and the `read` override consumes it once.
+    bool catalog_seam_armed = false;
+    /// The most recent CONTROL key (catalog or `gc/state`) read -- every other key a read-ahead
+    /// worker reads is ignored, so `read` can recognize the catalog-then-`gc/state` ADJACENCY
+    /// `authorityHolds` alone produces -- see the doc comment above `moveRefCleanupAuthorityBeforeFirstChunk`.
+    String last_control_key_read;
 };
 
 struct RefCleanupFixture
@@ -580,30 +728,40 @@ TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
     EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(op, layout, *entry, checkpoint->ckpt));
 }
 
-TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
+TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstChunkRefusesEveryRefObjectDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
-    backend->arm(
-        RefCleanupAuthorityRaceBackend::Authority::Catalog,
-        RefCleanupAuthorityRaceBackend::Timing::BeforeFirstDelete, layout, keys.first_log_key);
 
     Gc gc(store, kGc);
+    /// Lands the move in the exact window between the round's own hot-scan catalog cut (what
+    /// `authorityHolds` later compares `folded.catalog_cut` against) and everything after it -- "the
+    /// catalog moved before the first chunk starts", the case spec §D's test (1) names.
+    OperationForTest race_op(*backend);
+    bool hook_fired = false;
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        hook_fired = true;
+        RefCleanupAuthorityRaceBackend::moveRefCleanupAuthorityBeforeFirstChunk(
+            RefCleanupAuthorityRaceBackend::Authority::Catalog, *race_op, layout);
+    });
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(hook_fired) << "the race hook never fired -- this test proves nothing about the race";
 
-    OperationForTest raw_op(*backend);
-    EXPECT_TRUE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
-    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
+    OperationForTest head_op(*backend);
+    EXPECT_TRUE((*head_op).head(keys.first_log_key, Retry::once()).has_value());
+    EXPECT_TRUE((*head_op).head(keys.second_log_key, Retry::once()).has_value());
     EXPECT_EQ(backend->deleteCount(keys.first_log_key), 0u);
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
 
-TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenKeysAllowsFirstAndRefusesSecondDelete)
+TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenChunksAllowsFirstAndRefusesSecondDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .gc_bulk_delete_chunk_keys = 1, .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
     backend->arm(
@@ -620,18 +778,29 @@ TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenKeysAllowsFirstAndRefusesS
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
 
-TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
+TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstChunkRefusesEveryRefObjectDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
-    backend->arm(
-        RefCleanupAuthorityRaceBackend::Authority::GcFence,
-        RefCleanupAuthorityRaceBackend::Timing::BeforeFirstDelete, layout, keys.first_log_key);
 
     Gc gc(store, kGc);
+    /// Bumping `gc/state`'s lease directly from the hot-scan hook (as `Authority::Catalog` bumps the
+    /// catalog above) would land BEFORE the round's own `round_commit` CAS (phase 13), which still
+    /// holds the etag from lease adoption (phase 1) -- that CAS would then lose and the round would
+    /// throw before `cleanupRefObjects` (phase 17) ever runs, so "nothing deleted" would hold
+    /// vacuously. Instead, only ARM the seam here: the actual bump happens on `authorityHolds`'s own
+    /// `gc/state` read (phase 17, long after `round_commit` landed) -- see the class doc comment above
+    /// `moveRefCleanupAuthorityBeforeFirstChunk`.
+    bool hook_fired = false;
+    gc.setPostHotScanCatalogReadHookForTest([&]
+    {
+        hook_fired = true;
+        backend->armGcFenceMoveOnAuthorityHoldsRevalidationForTest(layout);
+    });
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(hook_fired) << "the race hook never fired -- this test proves nothing about the race";
 
     OperationForTest raw_op(*backend);
     EXPECT_TRUE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
@@ -640,10 +809,11 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObject
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
 
-TEST(CASRefGcCleanupAuthority, GcFenceMoveBetweenKeysAllowsFirstAndRefusesSecondDelete)
+TEST(CASRefGcCleanupAuthority, GcFenceMoveBetweenChunksAllowsFirstAndRefusesSecondDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .gc_bulk_delete_chunk_keys = 1, .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
     backend->arm(
@@ -658,6 +828,176 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveBetweenKeysAllowsFirstAndRefusesSecond
     EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
     EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
+}
+
+TEST(CASRefGcCleanupAuthority, LeaseMoveDuringAChunkLetsTheChunkCompleteAndNothingElse)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .gc_bulk_delete_chunk_keys = 1, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
+    backend->arm(RefCleanupAuthorityRaceBackend::Authority::GcFence,
+                 RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, keys.first_log_key);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head(keys.first_log_key, Retry::once()).has_value()) << "the chunk in flight completes";
+    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value()) << "the next chunk's revalidation refuses";
+    EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
+    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
+}
+
+TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .gc_bulk_delete_chunk_keys = 1, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, ns);
+    backend->arm(RefCleanupAuthorityRaceBackend::Authority::CatalogRebirth,
+                 RefCleanupAuthorityRaceBackend::Timing::DuringChunk, layout, keys.first_log_key, ns);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
+    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
+    /// Whatever the reborn life owns is untouched: its keys carry a different life id and were never
+    /// in the cohort. Every key under the new life's stream prefix is still present -- `moveAuthority`'s
+    /// `CatalogRebirth` branch seeds the reborn life's own `_log` and `_snap` right after the catalog
+    /// rewrite lands (see its doc comment: any earlier and an "unknown incarnation" sweep elsewhere in
+    /// the SAME round could claim them, since no catalog entry names that incarnation yet).
+    const CasRefCatalog::Snapshot cut = CasRefCatalog::read(*raw_op, layout);
+    const auto entry = std::find_if(cut.catalog.entries.begin(), cut.catalog.entries.end(),
+                                    [&](const CatalogEntry & e) { return e.ns == ns; });
+    ASSERT_NE(entry, cut.catalog.entries.end());
+    const NamespaceLifeId reborn = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
+    ListPage page = (*raw_op).list(layout.namespaceStreamPrefix(reborn), "", 1000, Retry::once());
+    ASSERT_FALSE(page.keys.empty()) << "the seeded new-life objects must be listed, or this test proves nothing";
+    for (const ListedKey & listed : page.keys)
+    {
+        EXPECT_EQ(backend->deleteCount(listed.key), 0u) << listed.key;
+        EXPECT_TRUE((*raw_op).head(listed.key, Retry::once()).has_value()) << listed.key;
+    }
+
+    /// The next round revalidates against the NEW catalog row: the old (dead) life is no longer named
+    /// by any entry `cleanupRefObjects` walks, so its plan/cohort revalidation -- built fresh from the
+    /// catalog entry each round -- has nothing of the old life's to touch. What actually happens to the old cohort's
+    /// second key, once the round runs unsuppressed, is that the NAMESPACE JANITOR
+    /// (`CasNamespaceJanitor.cpp:131`, `catalog_cut.life_index.resolve(*life_id)` failing for a
+    /// physical life the catalog no longer names) reclaims it as leaked dead-life debris -- exactly
+    /// spec §D's own words: "a moved catalog row means either a dropped life, whose keys the
+    /// namespace janitor deletes anyway, or a reborn one". So the key does NOT survive; it survives
+    /// past `cleanupRefObjects` specifically, then is reclaimed by a wholly separate, pre-existing
+    /// mechanism this task never touches. Attribute the delete precisely rather than asserting
+    /// "survives" and being right for an unrelated reason: capture the `ref_object_cleanup` phase's
+    /// `suppressed` metric (to confirm the round actually ran, not merely suppressed everything, which
+    /// an unusable checkpoint ANYWHERE would do -- see the checkpoint seeded above) and the
+    /// `namespace_cleanup` phase's `janitor_deleted` metric, and independently confirm `cleanupRefObjects`
+    /// itself deleted nothing this round via the GLOBAL `CASRefCleanupObjectsDeleted` counter (the
+    /// `GcPhaseRecord::profile_events` delta is unavailable here: it needs a `CurrentThread` with an
+    /// attached `ThreadStatus`, which a bare gtest thread does not have).
+    std::optional<uint64_t> ref_cleanup_suppressed;
+    std::optional<uint64_t> janitor_deleted;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "ref_object_cleanup")
+            if (const auto it = rec.metrics.find("suppressed"); it != rec.metrics.end())
+                ref_cleanup_suppressed = it->second;
+        if (rec.phase == "namespace_cleanup")
+            if (const auto it = rec.metrics.find("janitor_deleted"); it != rec.metrics.end())
+                janitor_deleted = it->second;
+    });
+    using ProfileEvents::global_counters;
+    const auto ref_cleanup_deleted_before = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(ref_cleanup_suppressed.has_value()) << "the ref_object_cleanup phase row never fired";
+    EXPECT_EQ(*ref_cleanup_suppressed, 0u)
+        << "round two must actually run destructive work, not merely leave everything alone because it was suppressed";
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load(), ref_cleanup_deleted_before)
+        << "cleanupRefObjects' own plan/cohort must delete NOTHING this round: the old life is not in it "
+           "(no catalog entry names it) and the reborn life's own checkpoint-named log is not yet deletable";
+    ASSERT_TRUE(janitor_deleted.has_value()) << "the namespace_cleanup phase row never fired";
+    EXPECT_GE(*janitor_deleted, 1u)
+        << "the old cohort's second key is expected to be reclaimed by the namespace janitor, not to survive";
+    EXPECT_FALSE((*raw_op).head(keys.second_log_key, Retry::once()).has_value())
+        << "the old cohort's second key is dead-life debris once its life no longer resolves in the "
+           "catalog -- the namespace janitor reclaims it, exactly as spec §D says it would";
+    /// The reborn life's own objects are untouched: round two's plan, cleanup and cohort are about the
+    /// reborn life now, and none of what it seeded for itself is in that plan. The namespace janitor
+    /// leaves them alone too, since they resolve fine against the CURRENT catalog entry.
+    for (const ListedKey & listed : page.keys)
+        EXPECT_TRUE((*raw_op).head(listed.key, Retry::once()).has_value()) << listed.key;
+}
+
+TEST(CASRefGc, RefObjectCleanupDeletesExactlyThePlannedSet)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+
+    /// Two committed publishes -> logs {1,1} and {1,2}.
+    const ManifestRef r1 = mref(1);
+    const ManifestRef r2 = mref(2);
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    const uint64_t v1 = publishCommittedTransition(*backend, layout, ns, "t1", std::nullopt, r1);
+    const uint64_t v2 = publishCommittedTransition(*backend, layout, ns, "t2", std::nullopt, r2);
+
+    /// Two observed snapshots: an OLD one covering only v1, and the NEWEST covering v2. Both are real
+    /// wire-format snapshot objects (the recovery codec reads them).
+    RefTableSnapshot old_snap = minimalLiveSnapshot(ns.string(), RefTxnId{1, v1},
+        {committedRow("t1", r1)});
+    RefTableSnapshot new_snap = minimalLiveSnapshot(ns.string(), RefTxnId{1, v2},
+        {committedRow("t1", r1), committedRow("t2", r2)});
+    writeRefSnapshotRaw(*backend, layout, old_snap);
+    writeRefSnapshotRaw(*backend, layout, new_snap);
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, v2},
+        .checkpoint_snapshot_id = RefTxnId{1, v2},
+        .last_epoch_seal = std::nullopt,
+    });
+
+    /// The plan the pass computes: `listing` names every log and snapshot this round's scan would
+    /// observe, `durable_cursor` is the fold cursor after folding both logs, `checkpoint_snapshot_id`
+    /// is the checkpoint-named recovery snapshot, and this fixture never crosses an epoch, so there
+    /// is no retained-seal proof.
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    const RefTableListing listing{
+        .logs = {RefTxnId{1, v1}, RefTxnId{1, v2}},
+        .snapshots = {RefTxnId{1, v1}, RefTxnId{1, v2}}};
+    const RefTxnId durable_cursor{1, v2};
+    const RefTxnId checkpoint_snapshot_id{1, v2};
+    const std::optional<RefTxnId> retained_log_proof = std::nullopt;
+
+    OperationForTest op(*backend);
+    const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint_snapshot_id, retained_log_proof);
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    for (const RefTxnId & id : plan.deletable_logs)
+        EXPECT_FALSE((*op).head(layout.refLogKey(life, id), Retry::once()).has_value());
+    for (const RefTxnId & id : plan.deletable_snapshots)
+        EXPECT_FALSE((*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value());
+    /// and every listed key NOT in the plan is present -- the chunked implementation deletes exactly
+    /// the set the per-key implementation would have deleted, nothing more.
+    const std::set<RefTxnId> deleted_logs(plan.deletable_logs.begin(), plan.deletable_logs.end());
+    const std::set<RefTxnId> deleted_snapshots(plan.deletable_snapshots.begin(), plan.deletable_snapshots.end());
+    for (const RefTxnId & id : listing.logs)
+        if (!deleted_logs.contains(id))
+            EXPECT_TRUE((*op).head(layout.refLogKey(life, id), Retry::once()).has_value())
+                << "log " << renderRefTxnId(id) << " not in the plan must survive";
+    for (const RefTxnId & id : listing.snapshots)
+        if (!deleted_snapshots.contains(id))
+            EXPECT_TRUE((*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value())
+                << "snapshot " << renderRefTxnId(id) << " not in the plan must survive";
 }
 
 /// Task 13 (spec §implementation-impact / §GC Budget): one fold+clean round increments every ref-intake

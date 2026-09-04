@@ -61,7 +61,7 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_snapshot_generations_to_keep, 3, "GC snapshot generations retained", 0) \
     DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
     DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \
-    DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep DELETE budget per round", 0) \
+    DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep candidate budget per round: keys that pass every retain check, whose bodies are read and decided", 0) \
     DECLARE(UInt64, gc_round_graduation_budget, 5000, "Blob graduation (condemned -> delete_pending) cohort cap per round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_redelete_budget, 5000, "Blob redelete (exact-token delete of a prior delete_pending row) cohort cap per round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_sweep_namespace_budget, 20, "Orphan-manifest sweep: distinct namespaces per page whose protection view may be built (0 = unbounded)", 0) \
@@ -77,6 +77,7 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, manifest_decode_cache_bytes, 128ULL << 20, "Manifest DECODE cache byte budget (0 disables)", 0) \
     DECLARE(UInt64, gc_meta_pool_size, 16, "Bounded pool size for GC per-hash freshness-meta writes", 0) \
     DECLARE(UInt64, gc_read_concurrency, 16, "Bounded pool size for the GC fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate HEADs; 1 disables read-ahead", 0) \
+    DECLARE(UInt64, gc_bulk_delete_chunk_keys, 1000, "Keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots); 1 to 1000", 0) \
     DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a writable Native mount's control-plane requests", 0) \
     DECLARE(UInt64, lease_safety_margin_ms, 2000, "Startup-only margin validated against the mount lease TTL (attempt_timeout_ms + this must be strictly less than the lease TTL)", 0) \
     DECLARE(String, staging_backend, "local", "Blob staging backend (local | s3); s3 is opt-in", 0) \
@@ -231,6 +232,12 @@ void ContentAddressedSettings::validate()
             "(got {}, {}, {})",
             settings[ContentAddressedSetting::gc_interval_sec].value, settings[ContentAddressedSetting::gc_shards].value,
             settings[ContentAddressedSetting::gc_read_concurrency].value);
+
+    if (settings[ContentAddressedSetting::gc_bulk_delete_chunk_keys] == 0
+        || settings[ContentAddressedSetting::gc_bulk_delete_chunk_keys] > 1000)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: gc_bulk_delete_chunk_keys must be between 1 and 1000 (got {})",
+            settings[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value);
 
     /// The layout subtree identity is explicit and REQUIRED — no default, so an ABSENT key throws a
     /// typed `NO_ELEMENTS_IN_CONFIG` (mirroring the `metadata_type` check in `MetadataStorageFactory`),

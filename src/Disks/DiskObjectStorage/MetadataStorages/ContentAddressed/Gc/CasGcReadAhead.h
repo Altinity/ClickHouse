@@ -26,12 +26,16 @@ namespace DB::Cas
 /// durable before the round began (it is a gap whenever it is read), and a manifest body still being
 /// uploaded when the early read lands yields the same hold a slightly earlier sequential read yields
 /// today. Nothing is hinted above `committed_through`, so no request is issued that the sequential
-/// walk would not issue.
+/// walk would not issue -- with one bounded exception: a ref-log hinting site does not yet know where
+/// an epoch's closing seal is (it learns that only by decoding the log at that position), so it may
+/// hint ids past the seal, inside the SAME epoch, that turn out not to exist. Those are discarded
+/// rather than taken, overshooting by at most one window per epoch crossing, and counted wasted.
 ///
 /// Memory is the CALLER's to bound: `pending` counts hinted-but-untaken slots and `window` is how
 /// many a hinting site keeps in flight. A key hinted twice is one request. Results never taken are
-/// awaited by the destructor and counted as wasted. Only the owning thread touches the maps; a
-/// worker touches only its own slot.
+/// awaited by the destructor and counted as wasted, or discarded explicitly by `discardRead`/
+/// `discardHead`, which counts them at once. Only the owning thread touches the maps; a worker
+/// touches only its own slot.
 class GcReadAhead
 {
 public:
@@ -46,6 +50,14 @@ public:
 
     std::optional<Object> takeRead(const String & key);
     std::optional<Meta> takeHead(const String & key);
+
+    /// Drops a hinted key the caller will never take. The request is already in flight or done; the
+    /// wait is bounded by that one request, its result and its exception are dropped, and the slot is
+    /// counted as wasted now rather than in the destructor. The exception is dropped because no
+    /// sequential walk would have issued this request, so none could have failed on it; the fence and
+    /// the budget are re-observed by the very next request anyway. A key nobody hinted is a no-op.
+    void discardRead(const String & key);
+    void discardHead(const String & key);
 
     /// Hinted but not yet taken, both verbs together: what a hinting site throttles itself against.
     size_t pending() const { return reads.size() + heads.size(); }
@@ -71,6 +83,9 @@ private:
 
     template <typename T, typename Inline>
     std::optional<T> take(Slots<T> & slots, const String & key, Inline inline_request);
+
+    template <typename T>
+    void discard(Slots<T> & slots, const String & key);
 
     CasOperation & op;
     CasRequests & requests;

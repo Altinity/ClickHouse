@@ -12,8 +12,8 @@
 
 ## Global Constraints
 
-- **Worktree and branch.** All work happens in `/home/mfilimonov/workspace/ClickHouse/lane-g` on branch `cas-gc-write-once-keys`, created from `cas-gc-rebuild` in Task 0. Never commit on `cas-gc-rebuild` or `master`. Never push.
-- **Build.** `cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_<task>.log 2>&1; echo NINJA_EXIT=$?`. No `-j`, no `nproc`. Dispatch a subagent to read the log and return a concise summary; never paste the log. A new test file is picked up by the `CONFIGURE_DEPENDS` glob; if `ninja` does not compile it, run `cmake .` in the build dir once.
+- **Worktree and branch.** All work happens in the worktree `/home/mfilimonov/workspace/ClickHouse/master` on branch `cas-gc-write-once-keys` (created from `cas-gc-rebuild` at `b7f2b3f38b4`; the `lane-g` worktree is taken by another implementer). The build dir is `/home/mfilimonov/workspace/ClickHouse/master/build` (release, no sanitizer; `unit_tests_dbms` present). Never commit on `cas-gc-rebuild` or `master`. Never push. At the end the branch merges into `cas-gc-rebuild`.
+- **Build.** `cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_<task>.log 2>&1; echo NINJA_EXIT=$?`. No `-j`, no `nproc`. Dispatch a subagent to read the log and return a concise summary; never paste the log. A new test file is picked up by the `CONFIGURE_DEPENDS` glob; if `ninja` does not compile it, run `cmake .` in the build dir once.
 - **Gate.** `./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_<task>_gate.log 2>&1; echo GTEST_EXIT=$?` from the build dir, plus the task's own suite filter. Suite names MUST start with `CAS`; never widen the filter.
 - **`LOGICAL_ERROR` sites.** Never `EXPECT_THROW` them. A test of one goes in a `CAS...DeathTest` suite under `#if defined(DEBUG_OR_SANITIZER_BUILD)` with `EXPECT_DEATH`, the pattern in `src/Disks/tests/gtest_cas_blob_upload_pool.cpp:62-68`.
 - **Git.** Stage and commit by explicit path only: `git add -- <paths>` then `git commit -- <paths>`; never `git add -A`; check `git diff --cached --stat` shows only your files; check `git branch --show-current` prints `cas-gc-write-once-keys` after every commit. Commit messages end with:
@@ -36,19 +36,15 @@
 
 **Interfaces:** none.
 
-- [ ] **Step 1: Park lane-g's uncommitted soak notes and branch off `cas-gc-rebuild`**
+- [ ] **Step 1: Verify the branch**
 
-lane-g is on `cas-gc-teardown-stop`, which is fully merged into `cas-gc-rebuild`, with two modified tracked files that are soak notes. Park them, do not discard them:
+The `lane-g` worktree is occupied by another implementer, so this plan runs in the `master` worktree (a checkout of the shared repo, NOT the `master` branch). The branch `cas-gc-write-once-keys` was created there from `cas-gc-rebuild` at `b7f2b3f38b4`. The tree carries pre-existing modified files (`utils/ca-soak/...`, `docs/superpowers/cas/BACKLOG/gcs.md`, contrib submodule pointers) that belong to other work: never stage them; every commit names its paths.
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
-git status --short | grep -v '^??'
-git stash push -m "lane-g soak notes parked before cas-gc-write-once-keys" -- utils/ca-soak/scenarios/BACKLOG.md utils/ca-soak/scenarios/RUN_HISTORY.md
-git checkout -b cas-gc-write-once-keys cas-gc-rebuild
-git branch --show-current
+cd /home/mfilimonov/workspace/ClickHouse/master
+git branch --show-current     # cas-gc-write-once-keys
 git log --oneline -1
 ```
-Expected: branch `cas-gc-write-once-keys`, HEAD `e59fe7e8e4b` or later. Tell the user the stash exists.
 
 - [ ] **Step 2: Rewrite the BACKLOG entry**
 
@@ -104,7 +100,7 @@ gap remains exactly as stated for blobs.
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- docs/superpowers/cas/BACKLOG.md
 git diff --cached --stat
 git commit -m "ca-docs: BACKLOG — GC round cost entry corrected (floor probes, round attribution, GCS batch delete, no reverse edge index) and the round-5 head read-ahead investigation item
@@ -315,7 +311,7 @@ TEST(CASOrphanSweepRequests, MountVanishingMidPageKeepsTheDecisionsOfTheFloorAsR
 - [ ] **Step 2: Build and run to verify they fail**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t1a.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t1a.log 2>&1; echo NINJA_EXIT=$?
 ```
 Expected: compile error, `prefixEligibleUnder` and `floor_lookups` undeclared.
 
@@ -438,7 +434,7 @@ In `CA/Gc/CasGc.cpp` after `t.metric("listed", sweep.listed);` (`:1181`):
 - [ ] **Step 4: Build, run the new suite, run the gate**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t1b.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t1b.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASOrphanSweepRequests.*' > test_wok_t1_suite.log 2>&1; echo GTEST_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t1_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
@@ -447,7 +443,7 @@ Expected: both exit 0. If `FloorIsReadOncePerNamespacePerPage` reports `retained
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp src/Disks/tests/gtest_cas_orphan_sweep_requests.cpp
 git diff --cached --stat
 git commit -m "ca-gc: orphan sweep reads a namespace's mount floor once per page
@@ -527,7 +523,7 @@ TEST(CASOrphanSweepRequests, RetainedKeysCostNoBodyRead)
 - [ ] **Step 2: Build and run to verify they fail**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t2a.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t2a.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASOrphanNomination.OnlyCandidatesCostABodyRead:CASOrphanSweepRequests.RetainedKeysCostNoBodyRead' > test_wok_t2_fail.log 2>&1; echo GTEST_EXIT=$?
 ```
 Expected: both FAIL on the body-read counts (today the freeze loop reads the first 100 well-formed keys).
@@ -611,7 +607,7 @@ In `planManifestCursorPage`:
 - [ ] **Step 4: Build, run the two suites and the gate**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t2b.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t2b.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASOrphanNomination.*:CASOrphanSweepRequests.*' > test_wok_t2_suite.log 2>&1; echo GTEST_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t2_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
@@ -620,7 +616,7 @@ Expected: 0, 0. `CorruptManifestIsRetainedAndSurfaced` and `TokenAbaIsRetainedAn
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp src/Disks/tests/gtest_cas_orphan_nomination.cpp src/Disks/tests/gtest_cas_orphan_sweep_requests.cpp
 git diff --cached --stat
 git commit -m "ca-gc: orphan sweep reads a manifest body only for a candidate, after the catalog cut
@@ -809,7 +805,7 @@ If `failNextReadWith` is the arming the read-ahead worker's `read` consumes (it 
 - [ ] **Step 2: Build to verify the failure**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t3a.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t3a.log 2>&1; echo NINJA_EXIT=$?
 ```
 Expected: compile error, the headers do not exist.
 
@@ -940,7 +936,7 @@ Update the class comment in the header ("Results never taken are awaited by the 
 - [ ] **Step 4: Build, run the suites, run the gate**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t3b.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t3b.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASGCKeyReader.*:CASGCReadAhead.*' > test_wok_t3_suite.log 2>&1; echo GTEST_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t3_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
@@ -948,7 +944,7 @@ cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms >
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcReadAhead.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcReadAhead.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasKeyReader.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcKeyReader.h src/Disks/tests/gtest_cas_gc_key_reader.cpp
 git diff --cached --stat
 git commit -m "ca-gc: key reader with hint, take and discard; GcReadAhead::discardRead counts a dropped hint as wasted at once
@@ -1090,7 +1086,7 @@ TEST(CASOrphanSweepRequests, EpochCrossingDiscardsAtMostOneWindowAndTheNewEpochI
 - [ ] **Step 2: Build to verify the failure**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t4a.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t4a.log 2>&1; echo NINJA_EXIT=$?
 ```
 Expected: compile error on the new `planManifestCursorPage` parameters.
 
@@ -1263,7 +1259,7 @@ The cursor read at `:252` and the `cross_from_missing_cursor` path stay inline o
 - [ ] **Step 6: Build, run the suites, run the gate**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t4b.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t4b.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASOrphanSweepRequests.*:CASOrphanNomination.*:CASRefRecoveryCasWalk.*:CASGCReadAhead.*' > test_wok_t4_suite.log 2>&1; echo GTEST_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t4_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
@@ -1272,7 +1268,7 @@ cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms >
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasKeyReader.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasKeyReader.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp src/Disks/tests/gtest_cas_orphan_sweep_requests.cpp
 git diff --cached --stat
 git commit -m "ca-gc: orphan sweep reads candidate bodies and both ref-stream walks through the read-ahead; hints stop at the epoch and are discarded at a seal
@@ -1346,7 +1342,7 @@ TEST(CASWriteOnceKey, FactoriesMintTheSameStringsAsThePlainKeyFunctions)
 - [ ] **Step 2: Build to verify the failure**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t5a.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t5a.log 2>&1; echo NINJA_EXIT=$?
 ```
 
 - [ ] **Step 3: Implement**
@@ -1410,7 +1406,7 @@ after `manifestKey` (`:274`):
 - [ ] **Step 4: Build, run, gate**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t5b.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t5b.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASWriteOnceKey.*:CASLayout*' > test_wok_t5_suite.log 2>&1; echo GTEST_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t5_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
@@ -1418,7 +1414,7 @@ cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms >
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasWriteOnceKey.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h src/Disks/tests/gtest_cas_write_once_key.cpp
 git diff --cached --stat
 git commit -m "ca-layout: WriteOnceKey, mintable only by Layout for manifests, ref logs and ref snapshots
@@ -1557,7 +1553,7 @@ Includes: the same the batch helper uses (`src/IO/S3/deleteFileFromS3.cpp:1-8`: 
 - [ ] **Step 3: Build the server target that includes S3 (the unit-test binary links it too)**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t6.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t6.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t6_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
 Expected: builds; the gate is unchanged (nothing calls the overload yet).
@@ -1565,7 +1561,7 @@ Expected: builds; the gate is unchanged (nothing calls the overload yet).
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h src/Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.cpp src/Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h src/Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.cpp
 git diff --cached --stat
 git commit -m "object storage: removeObjectsIfExistUnderProfile, one DeleteObjects under a chosen retry profile with absence as success
@@ -1954,7 +1950,7 @@ If `mutex_` is not `mutable`, make `bulkRemoveCalls` take it the way the other c
 - [ ] **Step 6: Build; the gate is run after Task 8**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t7.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t7.log 2>&1; echo NINJA_EXIT=$?
 ```
 Expected: the tree compiles except `gtest_cas_bulk_delete_backend.cpp`, which needs `CasOperation::removeManyWriteOnce` from Task 8. If the executor wants a green build here, temporarily exclude nothing: go straight to Task 8.
 
@@ -2125,7 +2121,7 @@ In the validation block (`:227-233`), add a second check:
 - [ ] **Step 4: Build, run the three bulk-delete suites, run the gate**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t8.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t8.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASBulkDelete*:CASWriteOnceKey.*:CASSettings*' > test_wok_t8_suite.log 2>&1; echo GTEST_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t8_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
@@ -2133,7 +2129,7 @@ cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms >
 - [ ] **Step 5: Commit Tasks 7 and 8 together**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Common/ProfileEvents.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h src/Disks/tests/cas_test_helpers.h src/Disks/tests/gtest_cas_part_write.cpp src/Disks/tests/gtest_cas_decommission.cpp src/Disks/tests/gtest_cas_bulk_delete_backend.cpp src/Disks/tests/gtest_cas_bulk_delete_engine.cpp src/Disks/tests/gtest_cas_settings.cpp
 git diff --cached --stat
 git commit -m "ca-backend: removeManyWriteOnce — one batch delete of up to 1000 write-once keys through every backend and the engine
@@ -2343,7 +2339,7 @@ In the second test keep only ONE `onBeforeBulkRemove` registration (the `>= 2` o
 - [ ] **Step 2: Build and run to verify they fail**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t9a.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t9a.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASGCManifestBulkDelete.*' > test_wok_t9_fail.log 2>&1; echo GTEST_EXIT=$?
 ```
 Expected: the first test fails on `bulkRemoveCalls() == 0` (the phase still uses `op.remove` per key).
@@ -2421,7 +2417,7 @@ Add `#include <algorithm>` if `std::clamp` is not visible. The phase comment abo
 - [ ] **Step 5: Build, run, gate**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t9b.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t9b.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASGCManifestBulkDelete.*:CASGCRound.*:CASGCLog*' > test_wok_t9_suite.log 2>&1; echo GTEST_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t9_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
@@ -2430,7 +2426,7 @@ cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms >
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp src/Interpreters/ContentAddressedGarbageCollectionLog.cpp docs/en/operations/system-tables/cas_gc_log.md src/Disks/tests/gtest_cas_gc_manifest_bulk_delete.cpp
 git diff --cached --stat
 git commit -m "ca-gc: manifest_deletes sends owner-removed bodies in batch requests of write-once keys
@@ -2551,7 +2547,7 @@ Read `tests/integration/test_cas_gc_s3/test.py` for the exact way it waits on ro
 - [ ] **Step 2: Run it**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 python3 -m ci.praktika run "integration" --test test_cas_gc_bulk_delete > build/test_wok_t10_integration.log 2>&1; echo PRAKTIKA_EXIT=$?
 ```
 The binary praktika runs is `ci/tmp/clickhouse`; build `clickhouse` in `build/` first and symlink it there as the CAS praktika recipe says (`docs/superpowers/cas/AGENTS.md` §3). Never run this while a ca-soak is live on the host. Have a subagent read the log and report pass or the failing assertion.
@@ -2559,7 +2555,7 @@ The binary praktika runs is `ci/tmp/clickhouse`; build `clickhouse` in `build/` 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- tests/integration/test_cas_gc_bulk_delete/__init__.py tests/integration/test_cas_gc_bulk_delete/configs/storage_conf.xml tests/integration/test_cas_gc_bulk_delete/test.py
 git diff --cached --stat
 git commit -m "ca-tests: integration test — manifest_deletes is one DeleteObjects per chunk on RustFS and an absent key is accepted
@@ -2697,7 +2693,7 @@ Fill the oracle test's seeding and the "not in the plan" loop from the fixture a
 - [ ] **Step 2: Build and run to verify the new tests fail**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t11a.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t11a.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASRefGcCleanupAuthority.*:CASRefGc.RefObjectCleanup*' > test_wok_t11_fail.log 2>&1; echo GTEST_EXIT=$?
 ```
 Expected: the `DuringChunk` tests fail (no bulk call happens yet), the `BetweenChunks` ones still pass on the per-key path.
@@ -2803,7 +2799,7 @@ Replace the `deleteRefObject` lambda and the two delete loops (`CA/Gc/CasGc.cpp`
 - [ ] **Step 4: Build, run, gate**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms > build_wok_t11b.log 2>&1; echo NINJA_EXIT=$?
+cd /home/mfilimonov/workspace/ClickHouse/master/build && ninja unit_tests_dbms > build_wok_t11b.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CASRefGc*' > test_wok_t11_suite.log 2>&1; echo GTEST_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t11_gate.log 2>&1; echo GTEST_EXIT=$?
 ```
@@ -2812,7 +2808,7 @@ cd /home/mfilimonov/workspace/ClickHouse/lane-g/build && ninja unit_tests_dbms >
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g
+cd /home/mfilimonov/workspace/ClickHouse/master
 git add -- src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp src/Disks/tests/gtest_cas_ref_gc.cpp
 git diff --cached --stat
 git commit -m "ca-gc: ref-object cleanup deletes covered logs and snapshots in revalidated cohorts
@@ -2840,7 +2836,7 @@ Dispatch a `ca-review` agent (opus, high) with: the spec's §D and §Invariants,
 - [ ] **Step 1: The whole gate on the committed HEAD**
 
 ```bash
-cd /home/mfilimonov/workspace/ClickHouse/lane-g && git status --short | grep -v '^??'
+cd /home/mfilimonov/workspace/ClickHouse/master && git status --short | grep -v '^??'
 cd build && ninja > build_wok_t12_full.log 2>&1; echo NINJA_EXIT=$?
 ./src/unit_tests_dbms --gtest_filter='CAS*' > test_wok_t12_gate.log 2>&1; echo GTEST_EXIT=$?
 ```

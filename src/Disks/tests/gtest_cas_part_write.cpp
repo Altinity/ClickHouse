@@ -203,6 +203,7 @@ public:
     }
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {
@@ -247,6 +248,7 @@ public:
     }
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {
@@ -976,6 +978,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
         RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
         RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+        void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
         std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                                  const std::optional<String> & expected_value, TransportAccess & access) override
         {
@@ -1068,6 +1071,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
         std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
         RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
         RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+        void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
         std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                                  const std::optional<String> & expected_value, TransportAccess & access) override
         {
@@ -1665,6 +1669,7 @@ TEST(CASPartWriteTxn, AdoptEvidenceRecordsTrustedManifestDependencyProofWithoutI
         }
         RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
         RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+        void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
         std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                                  const std::optional<String> & expected_value, TransportAccess & access) override
         {

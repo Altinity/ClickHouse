@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Common/ThreadPool.h>
 #include <base/types.h>
 #include <optional>
 #include <set>
@@ -131,6 +132,13 @@ struct ManifestSweepResult
     uint64_t retained_tail_removal = 0;
     uint64_t retained_work_budget = 0;
 
+    /// The floor a namespace's builds are judged against is one mount body per server root. A page
+    /// resolves it once per namespace (`floor_lookups`); each lookup reads the mount key of every
+    /// `/`-prefix of the namespace until one answers (`floor_reads`), so an absent mount costs the
+    /// whole chain once.
+    uint64_t floor_lookups = 0;
+    uint64_t floor_reads = 0;
+
     /// Exact-GET/decode candidates. The reducer must adopt every `source_retirements` entry before the
     /// caller may delete `key`, and only after re-observing `token` at it: a key whose incarnation
     /// moved on belongs to a fresh owner and must be left alone.
@@ -187,24 +195,41 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
 /// judged-dead heuristic. A missing lease provides no deletion authority, so the prefix is not eligible.
 bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
 
-/// Plan one cursor page without deleting. Every candidate is exact-GET, decoded and identity-validated;
-/// its exact manifest-source edges are returned for accounting-neutral retirement in the next fold.
+/// The pure half of `prefixEligible`: whether `prefix` is retired under one observation of the mount
+/// floor. `nullopt` (no mount body under any prefix of the namespace) admits nothing. Retirement is
+/// permanent -- the epoch and the acknowledgement floor only grow and the farewell is terminal -- so
+/// an admission derived from any observation stays true afterwards, which is what lets a page judge
+/// every build of a namespace against one read.
+bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix);
+
+/// Plan one cursor page without deleting. A key is decided from key-derived facts first; only a
+/// candidate's body is read, after the catalog cut, then decoded and identity-validated; its exact
+/// manifest-source edges are returned for accounting-neutral retirement in the next fold.
 /// Catalog-named namespaces are retain-only unless the caller explicitly authorizes recovery from its
 /// frozen catalog cut and the exact `_ckpt` frontier of the life named there.
 ///
-/// `work_budget`, when set, bounds the body-GET/retention fan-out to `nomination_budget` well-formed
-/// candidates (never the whole `list_budget`-sized page), caps how many DISTINCT namespaces this page
-/// may build a fresh protection view for, and caps the committed-tail recovery walk's ref-log GET
+/// `nomination_budget` is a candidate budget: the page stops deciding once it has that many
+/// candidates, and reads exactly that many bodies at most. `work_budget`, when set, additionally
+/// caps how many DISTINCT namespaces this page may build a fresh protection view for, and caps the
+/// committed-tail recovery walk's ref-log GET
 /// count cumulatively across the round (shared with every other destructive-work family via the same
 /// `GcRoundWorkBudget` instance). Exhausting either cap retains every remaining candidate belonging to
 /// the affected namespace on THIS page rather than deciding it without a complete protection view;
 /// `nullptr` (the default) reproduces the pre-budget unbounded behavior.
+///
+/// `read_pool` and `read_concurrency` (default `nullptr`/1, i.e. every read inline on the caller's
+/// operation) drive the page's read-ahead: with a pool and a concurrency above one, the candidates'
+/// bodies and the catalog-recovery/committed-tail ref-log walks overlap their round trips on `read_pool`
+/// instead of serializing request by request. Every decision this function makes is unchanged by that
+/// choice; see `GcReadAhead` for what may be fetched early and why.
 ManifestSweepResult planManifestCursorPage(
     Pool & store,
     const String & cursor,
     uint64_t list_budget,
     uint64_t nomination_budget,
     bool catalog_recovery_authoritative,
-    GcRoundWorkBudget * work_budget = nullptr);
+    GcRoundWorkBudget * work_budget = nullptr,
+    ThreadPool * read_pool = nullptr,
+    size_t read_concurrency = 1);
 
 }

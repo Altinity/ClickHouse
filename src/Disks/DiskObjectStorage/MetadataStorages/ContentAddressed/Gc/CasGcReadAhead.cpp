@@ -101,6 +101,29 @@ void GcReadAhead::hintHead(const String & key)
         [](CasOperation & worker, const String & k) { return worker.head(k, Retry::standard()); });
 }
 
+template <typename T>
+void GcReadAhead::discard(Slots<T> & slots, const String & key)
+{
+    const auto it = slots.find(key);
+    if (it == slots.end())
+        return;
+    std::shared_ptr<Slot<T>> slot = std::move(it->second);
+    slots.erase(it);
+    /// `wait`, not `get`: the result and any exception belong to a request nobody wanted.
+    slot->future.wait();
+    ProfileEvents::increment(ProfileEvents::CASGCReadAheadWasted);
+}
+
+void GcReadAhead::discardRead(const String & key)
+{
+    discard<Object>(reads, key);
+}
+
+void GcReadAhead::discardHead(const String & key)
+{
+    discard<Meta>(heads, key);
+}
+
 std::optional<Object> GcReadAhead::takeRead(const String & key)
 {
     return take<Object>(reads, key,

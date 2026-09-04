@@ -126,6 +126,10 @@ public:
     ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) override;
 
+    /// One `DeleteObjects` for the given objects (the caller chunks to at most 1000); absence is success.
+    void removeObjectsIfExistUnderProfile(
+        const StoredObjects & objects, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) override;
+
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
@@ -212,6 +216,8 @@ private:
 
     ConditionalRemoveResult removeObjectIfTokenMatchesImpl(
         const StoredObject & object, const std::string & etag, const std::shared_ptr<const S3::Client> & used_client);
+
+    void removeObjectsIfExistImpl(const StoredObjects & objects, const std::shared_ptr<const S3::Client> & used_client);
 
     std::shared_ptr<const S3::Client> clientForRetryProfile(ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) const;
 

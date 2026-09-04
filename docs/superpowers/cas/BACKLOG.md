@@ -96,41 +96,87 @@ own post-failure fsck already showed `unreachable=0`: a timing miss, not non-con
 
 ### `[gc-manifests-are-immutable-so-reduce-and-deletes-can-be-cheap]` The orphan sweep re-reads every listed manifest and deletes manifests one conditional request at a time; manifest keys cannot be reborn, so neither is needed (2026-09-04, user) {#gc-manifests-immutable-cheap-reduce}
 
-Measured on the 15-minute real-GCS soak (leader ch1, `system.cas_gc_log`): rounds 1.2 s → 18.8 s → 128 s →
-466 s → 584 s (round 4: `fold_reduce` 587 s, 204 manifests deleted; round 5 still running when the
-15-minute driver reached its drain wait); round 3 = `fold_reduce` 380 s (3840 sequential GETs, 294 s of S3 latency at ~76 ms each; 1966 of
-them absent-key misses), `fold_ref_intake` 46 s (read-ahead engaged: 1159 hits), `manifest_deletes` 37 s
-(188 conditional deletes at ~196 ms, sequential). The reduce's GETs are the orphan manifest sweep
-(`CasOrphanManifestSweep.cpp` `planManifestCursorPage`, one `read` per listed key) plus the ref-log
-chain probes of `activeManifestKeys`.
+Measured on the 15-minute real-GCS soak (leader `ca-live-gcs-ch1-1`, `system.cas_gc_log`, phase rows
+joined to `Finish` rows through `round_id`): rounds 1.2 s → 18.8 s → 128 s → 584 s → longer. Round 3 =
+`fold_reduce` 380 s (3840 GETs: 2870 `CASGCGet`, 814 `CASRootGet`, 100 `CASManifestGet`; 1966 read
+errors), `fold_ref_intake` 46 s, `manifest_deletes` 37 s (188 conditional deletes). Round 4 =
+`fold_reduce` 300 s (3002 `CASGCGet`, 2006 errors), `ref_object_cleanup` 204 s (512 keys × HEAD + catalog
+GET + gc/state GET + conditional DELETE). Round 5 = `fold_reduce` 587 s (3400 GET + 5383 HEAD, all HEADs
+inline: `CASGCReadAheadMiss` 5382, hits 0), `manifest_deletes` 617 s (3250 conditional deletes at ~190 ms).
+`orphan_sweep` nominated nothing in any round.
 
-Why the reads and the per-key conditional deletes are not needed (user, 2026-09-04): a manifest key is
-`<prefix>/cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` with `writer_epoch` durable-monotone
-per server root, `build_sequence` monotone per epoch, the ordinal per build; a reborn namespace continues
-the epoch counter and a recreated server root is refused as a foreign owner. So the same manifest key is
-never written twice with different bytes — manifests are unique and immutable by construction. The
-sweep's "freeze the exact incarnation before the catalog cut" (`:631`) guards a rebirth that cannot
-happen, and the exact-etag delete of a manifest guards the same non-event. (Blobs are different: a
-content-addressed blob key CAN be re-uploaded, so blob deletes keep the exact-incarnation condition.)
+The reduce's `CASGCGet` volume is NOT manifest bodies (those are capped at 100 by
+`manifest_sweep_delete_budget_keys`): it is `floorForNamespace` in `prefixEligibleOn`
+(`Gc/CasOrphanManifestSweep.cpp:481`), called once per listed manifest because the eligibility memo is
+keyed by build prefix and every `INSERT` is its own build; each call reads the mount key of every
+`/`-prefix of the namespace (`…/store/465` 404, `…/store` 404, `<root>` hit). 956 × 3 = 2868 ≈ 2870
+reads; 956 × 2 + 54 reissues = 1966 errors. Rounds 4 and 5: 1000 × 3 + 2 = 3002, 1000 × 2 + 6 = 2006.
 
-Three changes, cheapest first:
-1. **Read-ahead the sweep page** — reuse `GcReadAhead` (`hintRead`/`takeRead`, window `4 × concurrency`)
-   over the LIST page in `planManifestCursorPage`, and the next-N ids in `activeManifestKeys`. Pure
-   reads, no semantic change; ~10× on GCS.
-2. **Take `source_retirements` from the in-degree source-edge runs instead of the manifest body.** The
-   body is read (`:921`) only to compute the blob in-degree decrements of a nominated orphan; those edges
-   are exactly what the fold's `SourceEdgeRun`s recorded when the manifest was folded, and an orphan that
-   never reached precommit has no edges to retire. Then the sweep needs only the LIST (existence), no
-   GET per key — removes the reduce's read volume entirely except honest tail probes. Requires confirming
-   that precommit is the only way an orphan acquires `+1` edges.
-3. **Bulk-delete manifests** — with immutable keys `manifest_deletes` can use S3 `DeleteObjects` (up to
-   1000 keys per request) instead of one `remove(key, etag)` per manifest: 188 requests → 1. Needs a
-   `removeMany(keys)` verb in the backend contract (the engine treats a batch as one request with
-   per-key outcomes; a timeout after a partial delete is benign because deletes are idempotent). Dialect
-   caveat: the GCS XML API has no multi-object delete (batch exists only in the JSON API), so on GCS the
-   gain is parallelism, not batching.
-Placement: after the request-contract plan; items 1 and 3 are contract-visible (a new verb), item 2 is
-GC-internal.
+Why the per-key conditional deletes are not needed (user, 2026-09-04): manifest keys, ref `_log` and
+`_snap` keys are write-once by construction (`op.create`, epoch/sequence/ordinal monotone, life-qualified;
+global manifest-key uniqueness rests on decommission being irreversible). Blobs are NOT write-once and
+keep the exact-token delete. GCS accepts batch `DeleteObjects` (the live gate proves it; an earlier note
+here claiming the XML API lacks it was wrong). Retirements cannot be taken from the source-edge runs:
+`sourceEdgeId` (`Gc/CasBlobInDegree.cpp:164`) is an irreversible hash, so a nominated orphan's body is
+still read, bounded by the candidate budget.
+
+Design, `IMPLEMENTED` (2026-09-04) on branch `cas-gc-write-once-keys`:
+`docs/superpowers/specs/2026-09-04-cas-gc-immutable-key-round-cost-design.md`
+(A: one floor per namespace per page; B: late manifest reads and read-ahead in the sweep; C:
+`removeManyWriteOnce` with `manifest_deletes` as consumer; D: ref-cleanup cohorts). Plan:
+`docs/superpowers/plans/2026-09-04-cas-gc-immutable-key-round-cost.md`. Measured on two 2026-09-04
+GCS soaks of the implemented binary (`HEAD 0247064fa17`); full figures and the placement/re-scope
+notes are in the spec's `#implementation-record`:
+
+| phase | before (morning, old binary) | after |
+|---|---|---|
+| `fold_reduce`, steady-state round | 300 to 380 s | 2.1 to 4.9 s |
+| `manifest_deletes`, round with 1506 keys | 617 s / 3250 keys | 2.0 s, 2 `CASBulkDeleteRequests` |
+| `ref_object_cleanup`, round with work | 200 s | 0.6 to 1.4 s |
+| `fold_reduce`, mass-removal round | 587 s | 123.4 s (item E: inline `HEAD`s, not this design's target) |
+
+**Investigation item, not part of the design (refined 2026-09-04 with run-2 evidence):** round 5's
+5382 inline HEADs was the first sighting. The no-chaos GCS soak reproduced the same pattern from
+ordinary workload backlog alone, without chaos and without a scripted cliff: rounds 23-25 show
+`CASGCReadAheadMiss` 2534 / 795 / 222 against inline `HEAD` counts 2530 / 793 / 219, and each round's
+`Finish` row shows `CASGCReadAheadWasted=64` — exactly one window pinned per round, independent of
+round size. Unlike the original sighting, `epoch_crossings=0` on the intake row for all three rounds,
+so the epoch-crossing hypothesis is not the only mechanism that pins the shared read-ahead window on
+a mass-removal round; something else pins it too. Needs a local reproduction that isolates the
+mechanism without a crossing; the fix shape, once found, is still an epoch-crossing-style discard
+rule applied at the fold's own hinting site, `Gc/CasGc.cpp:2512`.
+
+### `[soak-harness-needsrecovery-after-near-ttl-pause]` The soak harness treats a near-TTL chaos pause's designed fence-then-recover as a fatal violation (2026-09-04) {#soak-harness-needsrecovery-after-near-ttl-pause}
+
+GCS soak run 1 (`ca_live_20260904_r2`, phase 3, chaos): chaos fault #4 was `both pause` for 29 s
+against a 30 s mount-lease TTL. `ch2`'s renewer fenced (`external_lease_deadline`, 0 physical
+attempts), its ref append lane went `CASRefNeedsRecovery` at the committed-frontier publication
+fence, and the harness's recovery checkpoint treats any nonzero `CASRefNeedsRecovery` as a
+"LATE-PUT FENCING VIOLATION" and aborts the driver. The data model matched byte-for-byte on both
+nodes (count 62496, same `sum_fp`/`uniq_keys`/`sum_v`/`sum_version`) and fsck came back clean
+(`dangling=0 unreachable=0 stale_edge=0`); `system.cas_log` shows `ch2` recovered normally
+(`mount_remount ok`) once the pause ended. `CASRefNeedsRecovery` is a cumulative counter: one
+genuine, expected recovery event during a designed near-TTL pause keeps it nonzero in every later
+snapshot by construction, which is what "stays 1 across three ticks" actually means here, not a
+stuck lane. Ruled not attributable to the branch under measurement (`cas-gc-write-once-keys`): no
+file it touches sits on the mount renewer or the ref append lane. Fix options for the harness: (a)
+classify a chaos pause whose duration is within 1 s of the lease TTL as `freeze_long` rather than
+an ordinary pause, since a fence-then-recover is the designed outcome at that margin; or (b) drop
+`CASRefNeedsRecovery` from the must-stay-zero counter set at the recovery checkpoint specifically
+for the case where the lane has since remounted and the data model matches, since the counter
+cannot distinguish "recovered once, correctly" from "still stuck" without also reading the mount
+state.
+
+### `[gc-blob-pending-deletes-now-dominant]` With A-D landed, serial exact-token blob deletes are the largest remaining GC phase on a mass-removal round (2026-09-04) {#gc-blob-pending-deletes-now-dominant}
+
+GCS soak run 2 (`ca_live_20260904_r3`, phase 3, `--no-chaos`): round 25's `pending_deletes` phase
+alone took 551.5 s for 2731 blobs — one `HEAD` plus one conditional `DELETE` per blob, serial
+(about 100 ms each) — against `fold_reduce` 14.7 s, `manifest_deletes` 0.22 s and
+`ref_object_cleanup` 0.22 s in the same round. This is now the largest single-phase cost this
+design's rounds show, larger than any of the phases A-D target. Blobs stay exact-token by design
+(I5: a condemned blob key can be re-uploaded by a writer, so the exact-token delete is what keeps
+that resurrection safe; blobs are explicitly out of `removeManyWriteOnce`'s scope). The lever is
+already on this list: `[gc-delete-concurrency-serial]`.
 
 ### `[cas-transient-lease-fence-surfaces-to-clients]` A transient mount-lease fence surfaces to synchronous client calls as `NETWORK_ERROR` (2026-09-04) {#cas-transient-lease-fence-surfaces-to-clients}
 
@@ -1041,6 +1087,10 @@ per-key conditional (i.e. the safety property is fundamentally incompatible with
 API), this item stays permanently blocked and the correct scope is delete-side concurrency
 (`[gc-delete-concurrency-serial]`) instead. Full measurement:
 `docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md#opp-multidelete`.
+
+**Closed by construction for the three write-once families** (manifest bodies, ref `_log`, ref `_snap`):
+see `[gc-manifests-are-immutable-so-reduce-and-deletes-can-be-cheap]` and the design it points to. The
+gap remains exactly as stated for blobs.
 
 ## `[gc-delete-concurrency-serial]` GC's destructive deletes run with almost no overlap {#gc-delete-concurrency-serial}
 

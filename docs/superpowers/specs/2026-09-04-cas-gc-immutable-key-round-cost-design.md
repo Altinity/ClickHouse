@@ -9,7 +9,8 @@ doc_type: 'design'
 
 # CAS GC round cost on write-once keys {#cas-gc-immutable-key-round-cost-design}
 
-**Status:** rev.3 (2026-09-04), APPROVED for planning. Nothing here is implemented. rev.1 and
+**Status:** IMPLEMENTED (2026-09-04) on branch `cas-gc-write-once-keys` (17 commits from
+`b7f2b3f38b4`; merge target `cas-gc-rebuild`). rev.3 was the approved draft. rev.1 and
 rev.2 were reviewed against the code; every finding is folded in and listed in the review record
 at the end. Implementation happens on a new branch off `cas-gc-rebuild` in the `lane-g` worktree. The
 measurements are from the 15-minute real-GCS soak of 2026-09-04 (leader `ca-live-gcs-ch1-1`,
@@ -441,14 +442,19 @@ counters; it is not part of this design because its fix touches the fold, and th
 Each step passes the `CAS*` gtest gate, then a 15-minute GCS soak whose phase table is re-read the
 way this document's was, and the measured row replaces the prediction in the BACKLOG entry.
 
-## Expected effect, predictions {#expected}
+## Expected effect, measured {#expected}
 
-| phase | measured | after A | after A and B | after C | after D |
-|---|---|---|---|---|---|
-| `fold_reduce`, rounds 3 and 4 | 300 to 380 s | 60 to 100 s | 20 to 40 s | same | same |
-| `manifest_deletes`, round 5 | 617 s | same | same | under 2 s | same |
-| `ref_object_cleanup`, rounds 4 and 6 | 200 s | same | same | same | about 1 s |
-| `fold_reduce`, round 5 | 587 s | about 300 s | about 300 s | same | same, E remains |
+Before/after from the 2026-09-04 GCS soaks: the "before" column is the morning run this design's
+measurements are drawn from (old binary); "after" is the two 2026-09-04 afternoon soaks
+(`ca_live_20260904_r2`/`r3`) of `HEAD 0247064fa17` (production code identical to the soak binary
+`fe0b909f011`). Full figures in `#implementation-record` below.
+
+| phase | before (morning, old binary) | after |
+|---|---|---|
+| `fold_reduce`, steady-state round | 300 to 380 s | 2.1 to 4.9 s |
+| `manifest_deletes`, round with 1506 keys | 617 s / 3250 keys | 2.0 s, 2 `CASBulkDeleteRequests` |
+| `ref_object_cleanup`, round with work | 200 s | 0.6 to 1.4 s |
+| `fold_reduce`, mass-removal round (run 2 round 23) | 587 s | 123.4 s — dominated by 2530 inline `HEAD`s, item E; not this design's target |
 
 ## Documentation changes {#docs}
 
@@ -498,6 +504,101 @@ way this document's was, and the measured row replaces the prediction in the BAC
   or if any key outside the three families reaches a backend.
 - D is wrong if the oracle test finds a key deleted by D that the per-key implementation retains,
   or if test (4) finds a new-life key gone.
+
+**Held on the 2026-09-04 GCS soaks** (both runs; figures in `#implementation-record`):
+- A held: reduce-row `CASGCGet` dropped to 5-8 per round (was near 3x `listed`), `floor_lookups`
+  equalled the namespace count (2) on every round including the 1506-1789-key mass-removal rounds.
+- B1 held: `CASManifestGet` stayed at 0-2 per reduce row, bodies read only for nominated candidates.
+- B2 held: read-ahead hits ran 100-530 per reduce row, `CASGCReadAheadWasted` was 0 on every round of
+  run 2 (no crossings observed) and bounded to one window (64) on run 1's two crossing rounds.
+- C held: `manifest_deletes` requests equalled `ceil(attempted/1000)` in every round, including the
+  first rounds to cross a 1000-key boundary (1506 keys -> 2 requests, 1789 keys -> 2 requests);
+  `DiskS3DeleteObjects` equalled `CASBulkDeleteRequests` throughout.
+- D held: `ref_object_cleanup` stayed at 0.2 to 1.4 s per round with work, 4-6 `GET`s per round
+  (catalog plus `gc/state` per chunk), `DiskS3DeleteObjects` equalled the chunk count; the dedicated
+  oracle and interposition gtests (Task 11) passed under the `CAS*` gate.
+
+## Implementation record {#implementation-record}
+
+**Placement adjustments made during implementation** (three, all noted in the plan's Global
+Constraints so they are not deviations, only recorded here for where to find the code):
+- `WriteOnceKey` lives in `Primitives/CasWriteOnceKey.h`, not under `Formats/CasLayout.h` as the
+  decision section sketches, so `Backend` does not have to include the layout header to see the
+  type.
+- The `GcKeyReader`-shaped interface lives in `Pool/CasKeyReader.h` because the recovery walk
+  (`recoverRefTableDetailedFromAuthority`) is itself in `Pool/`; only the read-ahead-backed
+  implementation, `ReadAheadKeyReader`, lives in `Gc/`. The inline implementation needed by
+  `Pool/` callers with no read-ahead lives alongside the interface.
+- A new pool setting, `gc_bulk_delete_chunk_keys` (range 1 to 1000, default 1000), sizes the chunks
+  both `manifest_deletes` and `ref_object_cleanup` cut the write-once verb into, so gtests can
+  exercise a chunk boundary (`ceil(N/chunk)` > 1) with a small cohort instead of needing 1001+ keys
+  in a fixture.
+
+**Task 10 re-scope.** The plan's brief for the wire integration test called for asserting that an
+externally deleted, still-listed manifest is treated as absent-and-successful inside a batch. That
+scenario instead triggers a permanent fold hold in the current engine (the missing key blocks the
+whole fold rather than reaching the batch-delete path), so the scenario cannot exercise the
+batch's absence branch on the wire. The integration test was re-scoped to prove per-round chunking
+on RustFS instead: `gc_bulk_delete_chunk_keys` is set low in the test's `storage_conf` so
+`requests == ceil(attempted / gc_bulk_delete_chunk_keys) == CASBulkDeleteRequests ==
+S3DeleteObjects`. Absence-as-success itself is still covered, at the layer where it is reachable:
+the S3 `NoSuchKey`-as-success branch (backend gtest) and the engine-level gtest that reissues a
+chunk after an injected throw and finds the already-deleted keys succeed as absent.
+
+**Two GCS soaks, 2026-09-04, both `SOAK_EXIT=1`, neither for a reason attributable to this
+design:**
+- **Run 1** (`ca_live_20260904_r2`, phase 3, 15 minutes with chaos): stopped at the recovery
+  checkpoint after chaos fault #4 (`both pause` 29 s against a 30 s lease TTL) on
+  `CASRefNeedsRecovery=1` (`ch2`). Data model matched byte-for-byte on both nodes (count 62496,
+  same `sum_fp`/`uniq_keys`/`sum_v`/`sum_version`), fsck `dangling=0 unreachable=0 stale_edge=0`.
+  **Ruling:** not attributable to this branch — no file this branch touches sits on the mount
+  renewer or the ref append lane, every measured GC row matches this section's falsification
+  checks, `system.cas_log` shows the ref lane recovered normally (`mount_remount ok` on `ch2`),
+  and the counter that tripped the checkpoint (`CASRefNeedsRecovery`) is cumulative, so one
+  genuine recovery event keeps it nonzero in every later snapshot by construction. Filed as
+  `[soak-harness-needsrecovery-after-near-ttl-pause]` in the BACKLOG.
+- **Run 2** (`ca_live_20260904_r3`, phase 3, 15 minutes, `--no-chaos`): stopped at the
+  `gc_checkpoint` stage's own bound — "GC unreachable count never stabilized within 420 s
+  (backlog-scaled bound)" — a harness-bound timeout, the same class the morning reference run hit,
+  now caused by round 25 alone taking 570 s. **Ruling:** the 420 s bound does not scale to a round
+  this expensive; the round's own cost is real GC work (see below), not a defect in this design.
+  Filed as `[gc-blob-pending-deletes-now-dominant]` in the BACKLOG.
+
+**What remains outside this design and now dominates**, per the falsified rows above:
+- **Blob `pending_deletes`, exact-token, serial.** Run 2 round 25: 551.5 s for 2731 blobs, one
+  `HEAD` plus one conditional `DELETE` per blob, serial (about 100 ms each). Blobs are not
+  write-once (I5) and keep the exact-token delete by design; the lever is
+  `[gc-delete-concurrency-serial]`, already on the BACKLOG and explicitly out of this design's
+  scope.
+- **The reduce's inline `HEAD`s on a mass-removal round (item E).** Run 2 rounds 23-25 reproduce it
+  from ordinary workload backlog alone, without chaos and without a scripted cliff: round 23 shows
+  123.4 s of `fold_reduce`, of which 2530 are inline `HEAD`s (`CASGCReadAheadMiss` 2534,
+  `CASGCReadAheadHit` 420); round 24, 793 inline `HEAD`s (`miss` 795). Unlike this design's own
+  read-ahead sites, `epoch_crossings=0` on the intake row for all three rounds, so the epoch
+  crossing this design's B2 rule discards hints for is not the only mechanism that pins the fold's
+  shared read-ahead window on a mass-removal round; each round's `Finish` row shows
+  `CASGCReadAheadWasted=64`, i.e. exactly one window pinned per round regardless of round size.
+  This refines, but does not close, item E; still out of this design's scope because its fix
+  touches the fold.
+
+**Deferred minors accepted at the final review**, kept rather than fixed in this branch:
+`recoverRefTableDetailedFromAuthority`'s recovery-walk read-ahead hints stay pinned to one window
+on a throw path until item E's fix lands, since the fold's own hinting site has the same
+open question this branch does not touch; `GcReadAhead::discardHead` has no caller yet in this
+branch's own code paths and is kept for item E's eventual fix, which is expected to call it.
+
+**Counter semantics note.** `CASRefCleanupObjectsDeleted` now counts a key found already absent
+(and therefore not physically deleted) the same as one this round's chunk deleted, matching the
+`manifests_deleted` semantic change C already makes intentional and documents in
+`cas_gc_log.md`.
+
+**For `utils/ca-soak/scenarios/RUN_HISTORY.md`** (not edited here — that file carries unrelated
+uncommitted edits in this worktree; the user pastes these two rows):
+
+| timestamp | scenario | seed | duration | exit | binary | log | verdict |
+|---|---|---|---|---|---|---|---|
+| 2026-09-04 (run 1, prefix `ca_live_20260904_r2`) | phase3-gcs, with chaos | 20260904 | 15m (stopped ~9.7 min in) | `SOAK_EXIT=1` | `fe0b909f011` (`cas-gc-write-once-keys`) | `build/soak_wok_gcs15.log` | `CASRefNeedsRecovery` checkpoint trip after a near-TTL chaos pause; data model and fsck clean; ruled not attributable, see `[soak-harness-needsrecovery-after-near-ttl-pause]` |
+| 2026-09-04 (run 2, prefix `ca_live_20260904_r3`) | phase3-gcs, `--no-chaos` | 20260904 | 15m (stopped ~22 min in) | `SOAK_EXIT=1` | `fe0b909f011` (`cas-gc-write-once-keys`) | `build/soak_wok_gcs15_nochaos.log` | `gc_checkpoint` 420 s harness bound exceeded by a 570 s round dominated by serial blob `pending_deletes`; A/B/C/D all held through the mass-removal rounds, see `[gc-blob-pending-deletes-now-dominant]` |
 
 ## Review record {#review-record}
 
