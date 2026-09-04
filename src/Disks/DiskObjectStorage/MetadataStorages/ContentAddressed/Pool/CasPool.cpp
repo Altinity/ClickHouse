@@ -726,14 +726,22 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         if (claim.kind != MountClaimResult::Claimed)
         {
             if (policy == MountClaimPolicy::NoWait)
+            {
                 /// No FORCE variant, no wait-and-observe: the decommission gate treats any live-looking
-                /// or foreign-owner lease as an immediate refusal.
+                /// or foreign-owner lease as an immediate refusal. A raced write that observed nobody
+                /// has no holder to describe, and the lease this server merely proposed is not one --
+                /// naming it would send an operator after this very process.
+                const String holder = claim.body
+                    ? fmt::format("mount lease held by uuid={} epoch={} pid={} hostname={} (expires_at_ms={})",
+                                  u128ToHex(claim.body->server_uuid), claim.body->writer_epoch,
+                                  claim.body->pid, claim.body->hostname, claim.body->expires_at_ms)
+                    : String("the conditional write that lost the mount slot observed nothing at the key, "
+                             "so the holder is unknown to this server");
                 throw Exception(ErrorCodes::ABORTED,
-                    "CAS decommission '{}': pool member is alive or contended — mount lease held by "
-                    "uuid={} epoch={} pid={} hostname={} (expires_at_ms={}). Refusing (no FORCE variant "
-                    "exists; stop the server or wait for its lease to lapse).",
-                    srid, u128ToHex(claim.body.server_uuid), claim.body.writer_epoch, claim.body.pid,
-                    claim.body.hostname, claim.body.expires_at_ms);
+                    "CAS decommission '{}': pool member is alive or contended — {}. Refusing (no FORCE "
+                    "variant exists; stop the server or wait for its lease to lapse).",
+                    srid, holder);
+            }
             /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed
             /// with the actionable, multi-line startup error.
             throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));

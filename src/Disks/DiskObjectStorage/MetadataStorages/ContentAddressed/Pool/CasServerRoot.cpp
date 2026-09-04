@@ -78,15 +78,15 @@ std::optional<Observation> conflictOrThrow(WriteResult && result, const String &
 /// lease this server proposed and failed to install -- that body is what the caller renders into the
 /// fail-closed operator message, and naming ourselves there points an operator at the wrong process.
 /// The observed incarnation names the body returned beside it, so the caller's observation loop
-/// compares like with like. A conflict the resolve read could not settle to a body observed nothing to
-/// name, and leaves the caller's own re-read to identify the holder.
-MountClaimResult racedDoubleStart(const Observation & seen, const MountLease & proposed)
+/// compares like with like. A conflict the resolve read could not settle to a body saw NOBODY, and
+/// reports nobody: the caller's own re-read is what identifies the holder there.
+MountClaimResult racedDoubleStart(const Observation & seen)
 {
     if (const Object * occupant = std::get_if<Object>(&seen))
         return {.kind = MountClaimResult::LiveDoubleStart,
                 .body = decodeMountLease(occupant->bytes),
                 .etag = occupant->etag};
-    return {.kind = MountClaimResult::LiveDoubleStart, .body = proposed, .etag = std::nullopt};
+    return {.kind = MountClaimResult::LiveDoubleStart, .body = std::nullopt, .etag = std::nullopt};
 }
 
 uint64_t defaultBootMs()
@@ -801,7 +801,7 @@ MountClaimResult claimMount(
                                   fmt::format("CAS mount slot claim of '{}'", key)))
             /// Raced with a concurrent writer between the read and the create. Treat as a live double
             /// start — fail closed; never overwrite a slot that appeared under us.
-            return racedDoubleStart(*raced, body);
+            return racedDoubleStart(*raced);
         emitMountEvent(sink, CasEventType::MountClaim, srid, "mint", nullptr, "fresh mount slot minted");
         return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
     }
@@ -837,7 +837,7 @@ MountClaimResult claimMount(
             /// The mount changed under us between the read and the write, so `got->etag` is KNOWN
             /// STALE -- that mismatch is exactly why the write was refused. What the write's resolve
             /// read observed is current, and it is that pair that is reported.
-            return racedDoubleStart(*raced, body);
+            return racedDoubleStart(*raced);
         emitMountEvent(sink, CasEventType::MountClaim, srid, "refresh", &existing,
             "own claim replayed — refreshed seq + expiry");
         return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
@@ -870,7 +870,7 @@ MountClaimResult claimMount(
             /// The mount changed under us between the read and the write — someone else is racing the
             /// reclaim. Fail closed, and report what the write's resolve read observed rather than
             /// `got->etag`, which that mismatch just proved stale.
-            return racedDoubleStart(*raced, body);
+            return racedDoubleStart(*raced);
         const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
                                      : clean_marker       ? MountPriorState::Clean
                                                            : MountPriorState::UncleanObserved;
@@ -891,11 +891,17 @@ MountClaimResult claimMount(
     return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .etag = got->etag};
 }
 
-String mountDoubleStartMessage(const String & srid, const MountLease & existing)
+String mountDoubleStartMessage(const String & srid, const std::optional<MountLease> & existing)
 {
+    const String identity = existing
+        ? fmt::format("server_uuid={} hostname={} pid={} last_seq={} expires_at_ms={}",
+                      u128ToHex(existing->server_uuid), existing->hostname, existing->pid,
+                      existing->seq, existing->expires_at_ms)
+        : String("could not be observed -- the conditional write that lost this slot saw nothing at "
+                 "the key, so the holder's identity is unknown to this server");
     return fmt::format(
         "Content-addressed disk cannot start: server_root_id '{}' is actively mounted by another LIVE server.\n"
-        "  Existing mount: server_uuid={} hostname={} pid={} last_seq={} expires_at_ms={}\n"
+        "  Existing mount: {}\n"
         "This server already waited for the mount lease to lapse, but it kept being renewed — a second\n"
         "server is holding the same CAS namespace. This prevents two ClickHouse servers from writing it.\n"
         " - If the other server is running intentionally, configure a unique <cas_server_root_id> for this disk.\n"
@@ -907,8 +913,7 @@ String mountDoubleStartMessage(const String & srid, const MountLease & existing)
         "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.\n"
         " - As a LAST RESORT, after verifying that NO server is writing this root, manually delete the mount\n"
         "   object gc/server-roots/{}/mount and restart; this server will then re-claim it.",
-        srid, u128ToHex(existing.server_uuid), existing.hostname, existing.pid,
-        existing.seq, existing.expires_at_ms, srid, srid);
+        srid, identity, srid, srid);
 }
 
 namespace
@@ -959,10 +964,11 @@ MountClaimResult claimMountAwaitingExpiry(
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
 
-        /// `claimMount` already read the current body. Reuse `r.etag` whenever `claimMount`
-        /// set it (the common case: no write was attempted, so what it read is still current) instead of
-        /// re-reading the SAME key here. The rare stale-race branches deliberately leave `.etag`
-        /// unset (see their own comments), so this still falls back to a fresh read exactly there.
+        /// `claimMount` already read the current body, and a raced write reports whatever its own
+        /// resolve read observed. Reuse `r.etag` whenever it is set instead of re-reading the SAME key
+        /// here; only a raced write whose conflict observed nothing at all leaves it unset, and that is
+        /// exactly where this reads -- for the body as well as the incarnation, since a result with no
+        /// observation has no holder to report either.
         std::optional<Etag> current_etag = r.etag;
         if (!current_etag)
         {
@@ -983,6 +989,7 @@ MountClaimResult claimMountAwaitingExpiry(
                 continue;
             }
             current_etag = got->etag;
+            r.body = decodeMountLease(got->bytes);
         }
 
         if (!observed || *observed != *current_etag)
@@ -993,8 +1000,8 @@ MountClaimResult claimMountAwaitingExpiry(
                 return r;
             observed = *current_etag;
             observed_since = mono_ms_fn();
-            if (on_wait_start)
-                on_wait_start(r.body, threshold_ms);
+            if (on_wait_start && r.body)
+                on_wait_start(*r.body, threshold_ms);
             LOG_INFO(getLogger("CasMountLease"),
                 "Attempting to mount content-addressed server root {} after node change or hard "
                 "restart; waiting ~{} ms (incarnation-stability observation) to confirm the previous "

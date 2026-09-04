@@ -2772,6 +2772,9 @@ TEST(CASPartWrite, EveryPhysicalPublicationMintsAFreshIncarnationTag)
 /// window it captured and the next iteration's HEAD refuses to start. The insert is refused as
 /// retry-later, which is what a caller can act on; the alternative is a single blob upload sitting on
 /// the request for twenty-five minutes. The eight-attempt cap stays as the secondary bound.
+///
+/// The throw and the publication count are what fail if the shared bound regresses: without it this
+/// same fixture publishes a fourth time and the call SUCCEEDS.
 TEST(CASPartWrite, EnsureBlobPresentIsBoundedByTheOneWindowItCaptured)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
@@ -2795,7 +2798,9 @@ TEST(CASPartWrite, EnsureBlobPresentIsBoundedByTheOneWindowItCaptured)
     });
 
     EXPECT_EQ(b->publish_stream_attempts, 3) << "the fourth iteration must not start a publication";
-    EXPECT_LT(now->load(), 2 * 90'000u) << "the loop outlived the window it captured";
+    /// The clock is past the captured deadline when the loop stops, which is what stopped it -- the
+    /// third publication ends at 120 s of a window that closed at 90 s.
+    EXPECT_GT(now->load(), 90'000u);
 }
 
 namespace

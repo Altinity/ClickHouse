@@ -446,10 +446,12 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             .catalog_snapshot = std::move(catalog_snapshot)};
     };
 
-    /// ONE bound for the whole loop, frozen before the first iteration: every erase, every resolution
-    /// read and every paced retry below shares this deadline, so a permanently contended catalog gives
-    /// up retry-later within one standard window rather than spending a fresh window per verb per
-    /// iteration.
+    /// ONE bound for the whole loop, frozen before the first iteration: every erase and every
+    /// resolution read below shares this deadline, so a permanently contended catalog gives up
+    /// retry-later within one standard window rather than spending a fresh window per verb per
+    /// iteration. The paced retry at the end of the loop is a bare sleep that does not consult the
+    /// deadline, so the loop can sleep one backoff (at most 5 s) past it before the next erase refuses
+    /// to start.
     const Retry policy = op.freeze(Retry::standard());
 
     for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)

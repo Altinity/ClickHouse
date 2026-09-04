@@ -208,8 +208,9 @@ TEST(CASMountClaimConflicts, ALostCreateReportsTheOccupantNotTheProposer)
     const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100);
 
     EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
-    EXPECT_EQ(claim.body.server_uuid, DB::UInt128(2)) << "the result named this server's own proposal";
-    EXPECT_EQ(claim.body.writer_epoch, 1u);
+    ASSERT_TRUE(claim.body.has_value());
+    EXPECT_EQ(claim.body->server_uuid, DB::UInt128(2)) << "the result named this server's own proposal";
+    EXPECT_EQ(claim.body->writer_epoch, 1u);
     ASSERT_TRUE(claim.etag.has_value()) << "the observed occupant's incarnation is what was read";
     EXPECT_NE(mountDoubleStartMessage("r", claim.body).find(u128ToHex(DB::UInt128(2))), String::npos)
         << "the operator message must name the foreign holder";
@@ -244,7 +245,43 @@ TEST(CASMountClaimConflicts, ALostRefreshReportsTheObservedBodyNotTheProposer)
     const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100);
 
     EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
-    EXPECT_EQ(claim.body.pid, 4242);
-    EXPECT_EQ(claim.body.seq, 99u);
+    ASSERT_TRUE(claim.body.has_value());
+    EXPECT_EQ(claim.body->pid, 4242);
+    EXPECT_EQ(claim.body->seq, 99u);
     ASSERT_TRUE(claim.etag.has_value());
+}
+
+/// The residue of the same rule: a raced write whose conflict settles to no observation saw nobody, so
+/// there is no holder to name. Reporting the lease this server merely PROPOSED would put this very
+/// process in the "Existing mount" line of an operator message -- the same defect as naming it after a
+/// conflict that did observe someone. `ProvenAbsent` is the reachable half; `NotObserved` (the resolve
+/// read itself failed) leaves through the same branch.
+TEST(CASMountClaimConflicts, ARacedRefreshThatObservedNothingNamesNoHolder)
+{
+    auto backend = std::make_shared<MountSlotRaceBackend>();
+    Layout layout("p");
+    uint64_t now = 1000;
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation seed = requests.admit();
+    ASSERT_EQ(claimMount(seed, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100).kind,
+              MountClaimResult::Claimed);
+    /// The slot is removed under our own refresh, so the refused precondition resolves to a proven
+    /// absence rather than to an occupant.
+    backend->before_put_overwrite = [&]
+    {
+        OperationForTest racer(*backend);
+        const String key = layout.mountKey("r");
+        const auto got = (*racer).read(key, Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        ASSERT_EQ((*racer).remove(key, got->etag, Retry::standard()), Removal::Removed);
+    };
+    CasOperation op = requests.admit();
+    const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100);
+
+    EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
+    EXPECT_FALSE(claim.etag.has_value());
+    EXPECT_FALSE(claim.body.has_value()) << "a result that observed nobody reported a lease anyway";
+    const String message = mountDoubleStartMessage("r", claim.body);
+    EXPECT_NE(message.find("could not be observed"), String::npos)
+        << "the message named a holder nobody saw: " << message;
 }
