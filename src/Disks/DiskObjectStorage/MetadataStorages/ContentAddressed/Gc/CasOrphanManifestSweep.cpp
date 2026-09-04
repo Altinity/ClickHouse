@@ -10,11 +10,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcKeyReader.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <set>
 #include <limits>
 
@@ -183,8 +186,8 @@ struct NamespaceProtection
 /// Reaching the budget before even calling `recoverRefTableDetailedFromAuthority` (already spent by an
 /// earlier namespace) skips that call entirely and reports incomplete immediately.
 NamespaceProtection activeManifestKeys(
-    CasOperation & op, const Layout & layout, const CatalogEntry & catalog_entry, const RefCkpt & ckpt,
-    const std::optional<RefCoverage> & coverage, GcRoundWorkBudget * work_budget = nullptr)
+    CasOperation & op, KeyReader & reader, const Layout & layout, const CatalogEntry & catalog_entry,
+    const RefCkpt & ckpt, const std::optional<RefCoverage> & coverage, GcRoundWorkBudget * work_budget = nullptr)
 {
     NamespaceProtection protection;
     if (work_budget && !work_budget->sweepRecoveryOpAvailable())
@@ -200,7 +203,7 @@ NamespaceProtection activeManifestKeys(
     /// The exact row and `_ckpt` come from the caller's frozen catalog cut. Do not resolve `ns` here:
     /// a later catalog cut can name a reborn life and turn this old life into an apparent orphan.
     const RecoveredRefTable recovered = recoverRefTableDetailedFromAuthority(
-        op, layout, catalog_entry, ckpt);
+        op, layout, catalog_entry, ckpt, &reader);
     if (work_budget)
         ++work_budget->sweep_recovery_ops_used;   /// one coarse unit for the snapshot+tail recovery itself
     const RefTableState & state = recovered.state;
@@ -301,7 +304,9 @@ NamespaceProtection activeManifestKeys(
             protection.recovery_incomplete = true;
             break;
         }
-        const auto got = op.read(layout.refLogKey(life, id), Retry::standard());
+        if (id.ref_sequence < std::numeric_limits<uint64_t>::max())
+            hintRefLogsWithinEpoch(reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1}, *ckpt.committed_through);
+        const auto got = reader.take(layout.refLogKey(life, id));
         if (work_budget)
             ++work_budget->sweep_recovery_ops_used;
         if (!got)
@@ -333,6 +338,8 @@ NamespaceProtection activeManifestKeys(
         {
             if (is_seal)
             {
+                if (id.ref_sequence < std::numeric_limits<uint64_t>::max())
+                    discardRefLogHintsOfEpoch(reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1}, *ckpt.committed_through);
                 prior.reset();
                 prior_is_seal.reset();
             }
@@ -548,7 +555,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
                 warnings->push_back(warning);
             return 0;
         }
-        protection = activeManifestKeys(op, layout, *catalog_entry, ckpt->ckpt, view.coverage);
+        InlineKeyReader reader(op);
+        protection = activeManifestKeys(op, reader, layout, *catalog_entry, ckpt->ckpt, view.coverage);
         view.tail_removal_targets = protection.tail_removal_targets;
 
     }
@@ -621,7 +629,9 @@ ManifestSweepResult planManifestCursorPage(
     uint64_t list_budget,
     uint64_t nomination_budget,
     bool catalog_recovery_authoritative,
-    GcRoundWorkBudget * work_budget)
+    GcRoundWorkBudget * work_budget,
+    ThreadPool * read_pool,
+    size_t read_concurrency)
 {
     ManifestSweepResult result;
     result.next_cursor = cursor;
@@ -630,6 +640,18 @@ ManifestSweepResult planManifestCursorPage(
 
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
+    /// The page's reader. With a pool and concurrency above one the candidates' bodies and the two
+    /// ref-stream walks overlap their round trips; otherwise every read is inline and the page is the
+    /// sequential one, request for request.
+    std::optional<GcReadAhead> read_ahead;
+    std::unique_ptr<KeyReader> reader;
+    if (read_pool && read_concurrency > 1)
+    {
+        read_ahead.emplace(op, store.openRequests(), *read_pool, read_concurrency);
+        reader = std::make_unique<ReadAheadKeyReader>(*read_ahead);
+    }
+    else
+        reader = std::make_unique<InlineKeyReader>(op);
     const ListPage page = op.list(layout.casManifestsPrefix(), cursor, list_budget, Retry::standard());
     /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
     /// call), so the metric increments once per call, not once per listed key.
@@ -776,7 +798,7 @@ ManifestSweepResult planManifestCursorPage(
                     else
                     {
                         NamespaceProtection protection = activeManifestKeys(
-                            op, layout, *catalog_entry, ckpt->ckpt, view_it->second.coverage, work_budget);
+                            op, *reader, layout, *catalog_entry, ckpt->ckpt, view_it->second.coverage, work_budget);
                         if (protection.recovery_incomplete)
                         {
                             /// The committed-tail walk stopped early: `active`/`tail_removal_targets`
@@ -856,9 +878,12 @@ ManifestSweepResult planManifestCursorPage(
         decided_through = listed.key;
     }
 
+    size_t next_body_hint = 0;
     for (const ListedManifestObject & candidate : candidates)
     {
-        const std::optional<Object> got = op.read(candidate.key, Retry::standard());
+        while (next_body_hint < candidates.size() && reader->pending() < reader->window())
+            reader->hint(candidates[next_body_hint++].key);
+        const std::optional<Object> got = reader->take(candidate.key);
         if (!got)
         {
             /// Gone since the LIST: a fresh writer never reuses the key, so there is nothing to

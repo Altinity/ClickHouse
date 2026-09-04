@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Common/ThreadPool.h>
 #include <base/types.h>
 #include <optional>
 #include <set>
@@ -221,6 +222,8 @@ ManifestSweepResult planManifestCursorPage(
     uint64_t list_budget,
     uint64_t nomination_budget,
     bool catalog_recovery_authoritative,
-    GcRoundWorkBudget * work_budget = nullptr);
+    GcRoundWorkBudget * work_budget = nullptr,
+    ThreadPool * read_pool = nullptr,
+    size_t read_concurrency = 1);
 
 }
