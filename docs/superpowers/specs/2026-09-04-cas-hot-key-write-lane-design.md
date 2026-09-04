@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 33, 2026-09-04. Phase A. Brainstormed against the measurements in
+Revision 34, 2026-09-04. Phase A. Accepted: the `codex` review of revision 33 found no critical and no major. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
 this document supersedes where they differ. Revisions 1 to 26 designed a larger change (combining
@@ -60,8 +60,10 @@ Goals:
 - Per pool and key written through the lane, at most one conditional write in flight, in arrival
   order, from any of the pool's planes.
 - No two writers of one pool ever race each other on such a key: N concurrent mutations cost N
-  conditional `PUT`s and at most one `GET`, never a 412 against each other, and a lone mutation
-  costs one `PUT` and no `GET` when the pool wrote the object last.
+  conditional `PUT`s and, when the cache admits the object (it fits the budget and the fill did
+  not throw), at most one `GET`, never a 412 against each other; a lone mutation costs one `PUT`
+  and no `GET` when the pool wrote the object last and the cache admitted it. An object above the
+  budget costs a `GET` per mutation, as today.
 - A lost race against another server is repaid after a flat jitter that does not grow with the
   writer's personal loss count. The growing backoff stays for transport faults, including a
   conflict that settled one.
@@ -76,7 +78,7 @@ Goals:
   verdict without writing; each is an answer every caller handles today, and none is false. In
   the request engine, four changes: a pointer carried by `CasRequests` and exposed as
   `CasOperation::hotKeys()`; `friend class CasHotKeys` on `CasOperation`, for its private `gate`,
-  `fits`, `reservedFor`, `observe` and `gaveUpAfterFailedObservation`; one field on `Conflict`,
+  `fits`, `reservedFor`, `observe`, `gaveUpAfterFailedObservation` and `gaveUp`; one field on `Conflict`,
   `any_ambiguous`, set where `writeLoop` returns it from the `WriteState` it already keeps and
   carried where `readModifyWriteOnPresence` rebuilds a bodyless `Conflict` under `single_attempt`
   (`CasRequests.cpp:1034`); and Half 2's `conflictBackoff` and `pauseForConflict`. Two internal changes in `CasRefCatalog.cpp`,
@@ -209,6 +211,12 @@ key.
 3. It issues no write through the lane to any key (a write from inside a hold would wait for the
    hold), and its reads go through the operation it was given, under a policy its caller chose
    knowing they run inside the hold.
+4. It reads `base->bytes` and never `base->etag`, neither as an identity of those bytes nor as an
+   input to its decision. Phase A does not need this condition; phase B does, and states it now
+   so that no caller admitted under phase A is re-audited for it: combining hands a member a
+   chained `Object` whose etag is the base's, a placeholder for bytes the store never held under
+   it, and a `decide` that branched on the etag would decide differently from serial execution.
+   The catalog's `decide`s decode `current->bytes` only.
 
 For `_ckpt`, `gc/state` or any other key, condition 1 is the one to audit before its first
 `submit`: `publishCkptContribution`'s `decide` counts its runs and records its decline's reason in
@@ -241,7 +249,9 @@ thing that removes an item from the queue.
    caller leaves.
 2. Under `mutex`: if step 1 decided to leave, leave with the `GaveUp` the engine would have
    returned for the same condition (`FenceLost`; `Deadline` with `Source::Lease`; `Deadline` with
-   the bound's own source), which the caller handles as it handles the engine's; a waiter that has
+   the bound's own source), built by the engine's own `gaveUp(why, source, state)` on a fresh
+   `WriteState`, so that it carries `sent_any = false`, `attempts_sent = 0` and `last_seen =
+   NotObserved`, which the caller handles as it handles the engine's; a waiter that has
    reached the front leaves the same way, since the write it would issue would be refused at the
    same gate. Otherwise, if the item is the front of the queue: set `holder_since_ms`, leave the
    loop as the holder. Otherwise `cv.wait_for(lock, 200ms)` (the ledger's
@@ -716,8 +726,8 @@ tickets from `bytes` and appends its own, so order is visible in the object.
 
 1. Serialization, order, cache (INV-1, INV-2, INV-3). N threads submit; a write hook parks the
    first holder, and each further thread is released only after the test observes its item queued
-   (`queueDepthForTest`), so arrival order is the release order. Assert: reads 1, writes N, no
-   `Conflict`, the final object lists all tickets in arrival order, every caller received
+   (`queueDepthForTest`), so arrival order is the release order; the objects fit the cache budget.
+   Assert: reads 1, writes N, no `Conflict`, the final object lists all tickets in arrival order, every caller received
    `Committed` with its own candidate's etag, and a following submission starts from the cache
    with zero reads. A sibling installs a hook asserting `CasHotKeys::mutex` is not held whenever
    `decide`, a `Liveness` closure or a backend hook runs (INV-5). Another fails each of Enter's two
@@ -817,8 +827,9 @@ tickets from `bytes` and appends its own, so order is visible in the object.
    the keyed log line naming the holder; a waiter whose fence is tripped or whose `Liveness` flips
    leaves with `GaveUp{FenceLost}`; a waiter whose lease budget runs out leaves with
    `GaveUp{Deadline, Lease}`; a waiter whose `Liveness` is false and whose lease budget is exhausted
-   at the same slice leaves with `GaveUp{Deadline, Lease}`, the engine's order. The item is gone in
-   every case. A waiter at the front whose deadline
+   at the same slice leaves with `GaveUp{Deadline, Lease}`, the engine's order. Every such `GaveUp`
+   carries `sent_any = false`, `attempts_sent = 0` and `last_seen = NotObserved`. The item is gone
+   in every case. A waiter at the front whose deadline
    passed in the same slice the holder left never holds, never runs `decide`, reads nothing. After
    the last item of a key leaves, `laneCountForTest` is 0 and `queueDepthForTest` of the key is 0;
    a hook parks a waiter between its wait slices while the holder leaves, and the waiter's next
@@ -998,3 +1009,12 @@ the rule is a change to the backend contract, not to this design. Minors: a reso
 by a bound is `GaveUp{Deadline}` or `GaveUp{FenceLost}` through `gaveUpForReadStop`, not
 `Unresolved`, and test 2 says which; the three test-only hooks under `driver_mutex` are
 `MountConfig`'s, not `PoolConfig`'s.
+
+Revision 34 records the sixth `codex` review of the phase A document, of revision 33: no
+critical, no major, and the verdict that the design is sound enough to write an implementation
+plan from. Its three minors are folded: condition 4 of the `decide` contract forbids reading
+`base->etag`, needed by phase B's chained placeholder and stated now so no phase A caller is
+re-audited; the one-`GET` goal and test 1 are qualified by the cache admitting the object; a
+waiter's give-up is built by the engine's `gaveUp` on a fresh `WriteState` and test 8 asserts
+`sent_any`, `attempts_sent` and `last_seen`. This revision has not been reviewed; it differs from
+revision 33 by those three additions only.
