@@ -1719,18 +1719,10 @@ public:
     /// so `deleteCount(key)` reads the same whichever verb deleted it.
     void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, DB::Cas::TransportAccess & access) override
     {
-        {
-            std::lock_guard lock(count_mutex);
-            ++bulk_remove_total;
-        }
         for (const DB::Cas::WriteOnceKey & key : keys)
             tick(delete_counts, delete_total, key.str());
         InMemoryBackend::removeManyWriteOnce(keys, access);
     }
-
-    /// How many `removeManyWriteOnce` requests this backend counted (armed failures included, like
-    /// `bulkRemoveCalls`, but counted at this decorator rather than the base).
-    uint64_t bulkRemoveTotal() const { std::lock_guard lock(count_mutex); return bulk_remove_total; }
 
     /// A blob publication reaches the store through `publish`, not `write` -- a "zero backend requests"
     /// assertion built only from the primitives above would miss one landing.
@@ -1848,7 +1840,6 @@ public:
         largest_stream_chunk.clear();
         get_total = head_total = list_total = write_total = put_total = put_overwrite_total
             = delete_total = get_stream_total = publish_total = 0;
-        bulk_remove_total = 0;
     }
 
 private:
@@ -1900,7 +1891,6 @@ private:
     std::map<String, uint64_t> delete_counts;
     std::map<String, uint64_t> get_stream_counts;
     std::map<String, uint64_t> publish_counts;
-    uint64_t bulk_remove_total = 0;
     uint64_t get_total = 0;
     uint64_t head_total = 0;
     uint64_t list_total = 0;

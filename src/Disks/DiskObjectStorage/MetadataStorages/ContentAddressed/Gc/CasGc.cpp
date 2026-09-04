@@ -3652,7 +3652,7 @@ void Gc::cleanupRefObjects(
         }
 
         const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
-        for (size_t begin = 0; begin < cohort.size(); begin += chunk_keys)
+        for (size_t begin = 0; begin < cohort.size(); )
         {
             /// Cumulative per-round cap in KEYS, exactly as before; a chunk is cut to what remains. The
             /// plan recomputes the same remaining candidates from durable state next round, so nothing
@@ -3668,6 +3668,10 @@ void Gc::cleanupRefObjects(
             op.removeManyWriteOnce(chunk, Retry::standard());
             work_budget.ref_cleanup_objects_used += chunk.size();
             ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted, chunk.size());   /// cleanup object deletion
+            /// Advance by what was actually sent, not the nominal chunk size: the budget cap above can
+            /// truncate a chunk short of `chunk_keys`, and advancing by the full stride would skip the
+            /// untried remainder instead of retrying it next iteration.
+            begin = end;
         }
     }
 }

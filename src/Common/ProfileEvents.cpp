@@ -823,7 +823,7 @@ The server successfully detected this situation and will download merged part fr
     M(CASRefLogBodyGets, "Number of CAS ref-log bodies read and decoded during GC. Growth indicates more reference history to process.", ValueType::Number) \
     M(CASRefManifestBodyFoldGets, "Number of manifest bodies read while GC follows reference edges. High values indicate cache misses or many referenced manifests.", ValueType::Number) \
     M(CASRefEmittedEdges, "Number of reachability edges emitted while GC folds CAS reference history. Growth indicates more reference relationships to process.", ValueType::Number) \
-    M(CASRefCleanupObjectsDeleted, "Number of old CAS ref logs and snapshots deleted after safe coverage was confirmed. Growth indicates cleanup progress.", ValueType::Number) \
+    M(CASRefCleanupObjectsDeleted, "Number of old CAS ref logs and snapshots deleted after safe coverage was confirmed. Includes keys that were already absent, since a batch delete of write-once keys cannot tell the two apart. Growth indicates cleanup progress.", ValueType::Number) \
     M(CASRefSnapshotPutBytes, "Total bytes written to CAS ref-table snapshots. A high value indicates frequent or large snapshot publication.", ValueType::Bytes) \
     M(CASRefSnapshotTailLogs, "Number of CAS ref-log entries compacted into published snapshots. Growth indicates snapshot maintenance work.", ValueType::Number) \
     M(CASRefSnapshotPublishDispatched, "Number of background CAS ref-table snapshot publications started. High values indicate frequent threshold or read-triggered publishing.", ValueType::Number) \

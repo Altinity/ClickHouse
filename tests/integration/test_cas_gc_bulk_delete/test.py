@@ -48,6 +48,9 @@ def gc_manifest_delete_totals(node):
     Sum every `manifest_deletes` phase row with work across however many rounds it took: the
     owner-removed manifests from one DROP TABLE are not guaranteed to fold in a single round, so
     reading only the first row would silently under-count on a slow run.
+
+    Chunking happens per round, not over the grand total, so the expected request count is the
+    sum over rows of `ceil(row_attempted / CHUNK_KEYS)`, not `ceil(total_attempted / CHUNK_KEYS)`.
     """
     node.query("SYSTEM FLUSH LOGS")
     rows = (
@@ -61,10 +64,14 @@ def gc_manifest_delete_totals(node):
         .splitlines()
     )
     totals = [0, 0, 0, 0, 0]
+    expected_requests = 0
     for row in rows:
-        for i, value in enumerate(int(x) for x in row.split("\t")):
+        values = [int(x) for x in row.split("\t")]
+        for i, value in enumerate(values):
             totals[i] += value
-    return tuple(totals)  # attempted, accepted, requests, bulk_requests, s3_deletes
+        expected_requests += math.ceil(values[0] / CHUNK_KEYS)
+    # attempted, accepted, requests, bulk_requests, s3_deletes, expected_requests
+    return tuple(totals) + (expected_requests,)
 
 
 def test_manifest_deletes_go_in_one_request_per_chunk():
@@ -91,19 +98,26 @@ def test_manifest_deletes_go_in_one_request_per_chunk():
 
     node.query("DROP TABLE t SYNC")
 
-    attempted = accepted = requests = bulk_requests = s3_deletes = 0
+    attempted = accepted = requests = bulk_requests = s3_deletes = expected_requests = 0
     for _ in range(RECLAIM_RETRIES):
         node.query("SYSTEM CAS GC RUN")
-        attempted, accepted, requests, bulk_requests, s3_deletes = gc_manifest_delete_totals(node)
+        (
+            attempted,
+            accepted,
+            requests,
+            bulk_requests,
+            s3_deletes,
+            expected_requests,
+        ) = gc_manifest_delete_totals(node)
         if attempted >= NUM_INSERTS:
             break
         time.sleep(RECLAIM_SLEEP)
     assert attempted >= NUM_INSERTS, "manifest_deletes never reported the dropped table's manifests"
 
     assert accepted == attempted, "every owner-removed manifest body is deleted or already absent"
-    assert requests == math.ceil(attempted / CHUNK_KEYS), (
-        f"{attempted} keys at {CHUNK_KEYS} per chunk should take "
-        f"{math.ceil(attempted / CHUNK_KEYS)} requests, got {requests}"
+    assert requests == expected_requests, (
+        f"chunking is per round, so {attempted} keys at {CHUNK_KEYS} per chunk across however "
+        f"many rounds it took should sum to {expected_requests} requests, got {requests}"
     )
     assert bulk_requests == requests
     assert s3_deletes == requests, "one DeleteObjects per chunk, no singular fallback"

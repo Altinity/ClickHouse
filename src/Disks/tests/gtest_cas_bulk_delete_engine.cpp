@@ -85,7 +85,7 @@ TEST(CASBulkDeleteEngineDeathTest, MoreThanOneThousandKeysIsACallerBug)
     auto backend = std::make_shared<CountingBackend>();
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
-    EXPECT_DEATH({ op.removeManyWriteOnce(manifestKeys(1001), Retry::once()); }, "");
+    EXPECT_DEATH({ op.removeManyWriteOnce(manifestKeys(1001), Retry::once()); }, "removeManyWriteOnce");
     EXPECT_EQ(backend->bulkRemoveCalls(), 0u);
 }
 #endif

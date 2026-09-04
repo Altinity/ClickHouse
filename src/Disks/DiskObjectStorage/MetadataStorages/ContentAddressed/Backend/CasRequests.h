@@ -196,6 +196,9 @@ private:
     uint64_t attempt_reservation_ms;
 };
 
+/// The cap on one `removeManyWriteOnce` chunk -- also the ceiling a batch-delete request can carry.
+inline constexpr size_t kBulkDeleteMaxKeys = 1000;
+
 /// One admitted operation: the unit a policy, a fence generation and a liveness predicate apply to.
 /// Move-only, and every request it makes re-checks its admission -- before each attempt, before each
 /// sleep, and once more after a proven commit, so a write whose fence was lost while it was in flight
@@ -203,9 +206,6 @@ private:
 ///
 /// SINGLE-THREADED: it carries mutable per-call state, so one operation belongs to one task. A caller
 /// that fans work out gives each task its own, built from `generation()` through `CasRequests::resume`.
-/// The cap on one `removeManyWriteOnce` chunk -- also the ceiling a batch-delete request can carry.
-inline constexpr size_t kBulkDeleteMaxKeys = 1000;
-
 class CasOperation
 {
 public:

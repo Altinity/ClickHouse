@@ -11,6 +11,7 @@
 
 #include <Common/ProfileEvents.h>
 
+#include <mutex>
 #include <set>
 
 /// Task 12 required GC tests over the snapshot+log ref model (spec 2026-07-11-cas-ref-table-snapshot-log-design).
@@ -885,8 +886,8 @@ TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
     }
 
     /// The next round revalidates against the NEW catalog row: the old (dead) life is no longer named
-    /// by any entry `cleanupRefObjects` walks, so its plan/cohort mechanism -- the thing THIS task
-    /// changes -- has nothing of the old life's to touch. What actually happens to the old cohort's
+    /// by any entry `cleanupRefObjects` walks, so its plan/cohort revalidation -- built fresh from the
+    /// catalog entry each round -- has nothing of the old life's to touch. What actually happens to the old cohort's
     /// second key, once the round runs unsuppressed, is that the NAMESPACE JANITOR
     /// (`CasNamespaceJanitor.cpp:131`, `catalog_cut.life_index.resolve(*life_id)` failing for a
     /// physical life the catalog no longer names) reclaims it as leaked dead-life debris -- exactly
