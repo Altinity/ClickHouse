@@ -59,6 +59,38 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### `[ref-catalog-cas-starvation-under-parallel-writers]` One process's CREATE/DROP writers starve each other on the ref-catalog compare-and-swap (2026-09-04) {#ref-catalog-cas-starvation}
+
+Seen on the local CA-s3 stateless lane (run 2, ~10 parallel jobs): `01039_mergetree_exec_time`'s
+`CREATE TABLE` failed after 78.9 s with "CAS ref catalog update: gave up at the policy deadline". RCA in
+`docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md`: 113 `PreconditionFailed` (412) on
+`cas_s3/cas/ref_catalog` in 80 s from 53 threads; the losing writer made 35 attempts spaced by the
+engine's full-jitter backoff (up to the 5 s cap) while fresh writers, starting at attempt 1, kept
+winning about once a second; successful `CREATE TABLE` in the window: p50 203 ms, p90 457 ms, max 10.4 s.
+`readModifyWrite` routes a `Conflict` into the same `pauseAndReissue`/`Retry::backoff` schedule and the
+same `reissues` counter as a transport fault; the spec prescribes exactly that ("conflicts spend the same
+budget as errors", motivated by GCS's ~1 write/s per-object budget) but never analyses fairness among
+many independent writers on one hot key. Pre-migration, the catalog loop retried a conflict at once,
+capped at 100 attempts. Verdict: spec-conformant, unfair by construction under sustained arrivals.
+
+Fix, two halves, in this order:
+
+1. **Serialize and combine within a process (user's proposal, primary).** Compare-and-swap is needed
+   only against other servers; inside one server every catalog mutation goes through one FIFO writer per
+   pool in `CasRefCatalog` that drains the queue, applies every pending change to a fresh snapshot and
+   issues ONE conditional PUT — write-combining, so N concurrent `CREATE`s cost one round trip, and the
+   GCS per-object budget is served better, not worse. A lost race (another server) re-reads and replays
+   the whole queue. GC/reconciler catalog updates take the same door. Tests: N threads on the in-memory
+   backend under an injected clock — at most one CAS in flight, bounded maximum wait, FIFO order; and a
+   second `Pool` on the same backend as the external writer whose win forces one replay.
+2. **Decouple conflict pacing from transport-fault backoff (secondary, spec change).** A `Conflict`
+   already carries the fresh object; pace its reissue with a flat small jitter (the RCA suggests
+   uniform(0, 250 ms)) instead of the growing `reissues`-driven schedule, keeping the capped exponential
+   backoff for real transport faults. Size the flat ceiling against the GCS object budget the spec cites;
+   with half 1 in place, conflicts come only from other servers and are rare. Pin with an N-writer fake-clock
+   test asserting the earliest writer's consecutive-loss streak stays bounded while new arrivals keep
+   winning (red today). Update the spec sentences at "Conflicts spend the same budget as errors".
+
 ### `[cas-s3-lane-put-timeout-logged-at-error]` A stalled single-attempt PUT is logged at Error and fails a stateless test whose write succeeded (2026-09-04) {#cas-s3-lane-put-timeout-logged-at-error}
 
 Seen on the local CA-s3 stateless lane (run 2 after the 404-scope fix): `<Error> WriteBufferFromS3:
