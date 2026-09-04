@@ -9,9 +9,10 @@ doc_type: 'design'
 
 # CAS GC does not hold up teardown {#cas-gc-teardown-stop-design}
 
-**Status:** DRAFT for review, rev.3 (2026-09-04). rev.1 and rev.2 were reviewed by `codex`
+**Status:** DRAFT for review, rev.4 (2026-09-04). rev.1–rev.3 were reviewed by `codex`
 (`gpt-5.6-sol`, high, one resumed session) with Occam's razor as the first question; every accepted
-finding is folded in below and the record is at the end. Line references are against `86b60a23de4` on `cas-gc-rebuild` and will drift; the symbol
+finding is folded in below and the record is at the end. rev.3's verdict: direction sound, joins and
+lifetimes preserved, first failing-first test named (T3). Line references are against `86b60a23de4` on `cas-gc-rebuild` and will drift; the symbol
 names will not.
 
 ## Decision {#decision}
@@ -27,22 +28,31 @@ A round cut this way is recorded with a new outcome, `Stopped`, distinct from `A
 honestly: a transient failure observed after teardown began.
 
 What this bounds: the **additional** wait that GC adds to a teardown — today unbounded, afterwards at
-most one **unit**, where a unit is one of:
+most **the remainder of one interval between two admission observations** on the open plane.
+Admission is observed before each request attempt, before each retry sleep, and before each refill
+of a streamed body; it is not observed after a request returns. One interval can therefore contain,
+in sequence:
 
-- one in-flight control-plane attempt (`attempt_timeout_ms`, 5 s at the default,
-  `ContentAddressedSettings.cpp:80`);
-- one SDK refill of a streamed run body, **including the SDK's own retries inside that refill** —
-  `ReadBufferFromS3::nextImpl` reissues up to `max_single_read_retries` times with a doubling
-  backoff from 100 ms (`src/IO/ReadBufferFromS3.cpp:184-227`), under the storage's ordinary read
-  settings, and this design does not reach inside it;
-- one retry sleep, woken at once;
-- one in-memory reduce — the fold's CPU-only sort and merge over the deltas of one generation
-  (`Gc/CasBlobInDegree.cpp:376-394`, `:606-684`), which makes no request and is not gated.
+1. the I/O already in flight when the arm lands — one control-plane attempt (`attempt_timeout_ms`,
+   5 s at the default, `ContentAddressedSettings.cpp:80`), or one SDK refill of a streamed body
+   **including the SDK's own retries inside that refill** (`ReadBufferFromS3::nextImpl` reissues up to
+   `max_single_read_retries` times with a doubling backoff from 100 ms,
+   `src/IO/ReadBufferFromS3.cpp:184-227`, under the storage's ordinary read settings — this design
+   does not reach inside it); a retry sleep already entered is woken at once instead;
+2. then the synchronous CPU work between that I/O and the next gate: decoding and walking the
+   object it returned (a manifest or a fold seal is capped at 256 MiB, `Formats/CasFormat.cpp:127`,
+   `:129`), encoding the next artifact, finishing one bounded advisory page (the namespace janitor's
+   1000-key page, `Gc/CasGc.cpp:360-366`), or — the longest known — the fold's in-memory sort and
+   merge over one generation's deltas (`Gc/CasBlobInDegree.cpp:376-394`, `:606-684`, with the
+   delta-wide preparation at `Gc/CasGc.cpp:3228-3242`).
 
-The first three are pool-size independent; the reduce grows with the delta count and is bounded by
-measurement, not by a gate. The total teardown remains additive over its other, already-bounded
-phases (the detached-work drain, the ref-lane drain, the farewell's own retry budget); a single
-global teardown deadline is out of scope.
+The I/O part is pool-size independent. The CPU part is bounded by the object caps and, for the
+reduce, by measurement rather than by a gate; the review's census found no other wait under `Gc/` —
+no direct backend call, no thread-pool or future wait that is not subordinate to an admitted request
+(`GcReadAhead`'s futures, the meta-writer's queue and drain, the heartbeat's condition variable, the
+scheduler joins). The total teardown remains additive over its other, already-bounded phases (the
+detached-work drain, the ref-lane drain, the farewell's own retry budget); a single global teardown
+deadline is out of scope.
 Sub-second teardown, which would need the join removed and the round's objects to outlive the
 storage, is explicitly not the goal.
 
@@ -173,16 +183,29 @@ Three details are load-bearing:
    therefore first fires when the consumer advances past the first window.
 2. **`nextImpl`:** `in->position() = position()` (account the bytes the consumer took), the admission
    check, then `if (!in->next()) { BufferBase::set(in->position(), 0, 0); return false; }` and
-   otherwise `BufferBase::set(in->position(), in->available(), 0)`. No byte is copied. An exception
-   from the check or from `in->next()` leaves both buffers cancelled, as `ReadBuffer::next` already
-   arranges.
-3. **The refusal keeps the request gate's mapping.** The wrapper does not build its own exception: it
-   captures an admission callback that `CasOperation` constructs from its own `gate` — the one that
-   already maps `Fence::Admit::LostOrRearmed` to `throwCasTransientUnavailable` and `NoBudget` to
-   `throwCasWriteRetryLater` (`CasRequests.cpp:354-364`). On the open plane only the first ever
-   fires; on the mount plane, where S3 staging streams under a fence that can answer `NoBudget`
-   (`Pool/CasMountRuntime.cpp:138-151`), the body refusal reads exactly like a refused open. One
-   implementation for request and body.
+   otherwise `BufferBase::set(in->position(), in->available(), 0)`. No byte is copied. A refusal from
+   the check cancels the wrapper (`ReadBuffer::next` cancels the buffer whose `nextImpl` threw,
+   `src/IO/ReadBuffer.cpp:103-119`); an exception from `in->next()` cancels both layers. Either way the
+   buffer the consumer holds is unusable and unwinds with ownership intact.
+3. **The refusal keeps the request gate's mapping, and the wrapper holds no reference to the
+   operation.** `CasOperation::gate` reads `owner` (a `CasRequests &`) and the operation's own
+   members (`CasRequests.cpp:285-297`, `CasRequests.h:267-274`); a callback such as
+   `[this] { gate(0); }` would dangle on the staging path. The mapping is factored into a free
+   helper — `admitOrThrow(const Fence::Admit, const Liveness &, verb, subject)` — used by the request
+   gate and by the wrapper alike, and the wrapper captures **by value** exactly:
+
+   ```cpp
+   std::function<Fence::Admit(uint64_t, uint64_t)> admit = owner.fence.admit;   /// a copy of the closure
+   const uint64_t admitted_generation;
+   const Liveness liveness;                                                     /// a copy, never a move
+   const String key;                                                            /// for the exception text
+   ```
+
+   and evaluates fence first, caller liveness second — the gate's order. `LostOrRearmed` maps to
+   `throwCasTransientUnavailable`, `NoBudget` to `throwCasWriteRetryLater` (`CasRequests.cpp:354-364`).
+   On the open plane only the first ever fires; on the mount plane, where S3 staging streams under a
+   fence that can answer `NoBudget` (`Pool/CasMountRuntime.cpp:138-151`), the body refusal reads
+   exactly like a refused open.
 
 Granularity: one SDK refill, about a megabyte, including that refill's own SDK retries (see the unit
 definition in [Decision](#decision)).
@@ -312,17 +335,22 @@ the minimal behaviour, kept as is.
    comments for `outcome`, `error` and `error_code` (`.cpp:41`, `:54-55`) gain the definition above,
    verbatim. The system-log schema changes; there is no persisted data to migrate, and `SystemLog`
    renames a table whose schema differs at startup as it always does.
-2. **The scheduler loop.** Immediately after it takes `gc_round_mutex` (`CasGcScheduler.cpp:335`)
-   and before it emits a Start row, the loop checks `store->teardownBegun()` and returns. This one
-   check closes both **teardown** windows: the "accepted extra round" queued behind a manual round
+2. **The scheduler loop — observability hygiene, not part of the bound.** Without it, a round that
+   starts after the arm emits a Start row, is refused at its first lease request
+   (`Gc/CasGc.cpp:4659-4668`, before anything reaches the backend) and adds a `Stopped` row that says
+   nothing; the latency bound holds either way. The secondary requirement "no new scheduled Start
+   after teardown begins" is worth two lines: immediately after the loop takes `gc_round_mutex`
+   (`CasGcScheduler.cpp:335`) and before it emits a Start row, it checks `store->teardownBegun()` and
+   returns. This one check closes both **teardown** windows: the "accepted extra round" queued behind a manual round
    (`:331-334`), and the loop's own next tick between `beginTeardown` and `stop`. The same extra
    round on a plain `SYSTEM CAS GC STOP` — a race with the scheduler's own `stopping`, not with
    teardown — stays as the loop comment describes it; that verb is out of scope. Leaving the loop on a terminal
    condition is the pattern already at `:311-323`; `stop` then joins a finished thread and clears
    `i_am_leader` after the join, as today. The `catch` (`:373-391`) logs at INFO instead of through
    `tryLogCurrentException` when the outcome was `Stopped`.
-3. **The heartbeat thread.** `pulseHeartbeat` runs on the open plane and is refused during the
-   teardown window; its `catch` logs at ERROR. It gains `if (store->teardownBegun()) break;`.
+3. **The heartbeat thread — the same hygiene.** `stop` already wakes and joins it; the one line
+   `if (store->teardownBegun()) break;` in its `catch` only spares the ERROR line a refused pulse
+   would log in the window.
 
 Other catches that will log a refusal during the window, listed and **not** suppressed — a bounded
 burst at WARNING/ERROR within a few seconds of a shutdown, none feeding a counter any test or
@@ -349,14 +377,14 @@ parked thread.
 |---|---|---|---|
 | T1 | the open plane's fence refuses after the arm, and a caller's `Liveness` is still honoured | `gtest_cas_requests.cpp`, `CASRequests` | a `CasRequests` built with the teardown fence over an atomic; after the flip the next `read` is refused **before** it is sent — `OrderedFaultBackend` sees no request. Caller liveness false with the fence open is refused too. |
 | T2 | a round in flight unwinds at its next unit, not at a phase boundary — for the gated units | new `gtest_cas_gc_teardown_stop.cpp`, `CASGCTeardownStop` | a real `Pool` with the background scheduler. Three cases, one gate each: (a) between two requests (`BetweenRecoveryGetsBackend` shape, `gtest_cas_detached_work.cpp:67`); (b) **inside the body**: a backend whose `stream` returns a buffer that parks in `nextImpl` after the open returned; (c) a read-ahead worker's `resume`d `read`, with the fold **consuming** that future — an unconsumed one has its exception dropped by `~GcReadAhead` (`Gc/CasGcReadAhead.cpp:21-38`) and proves nothing. The test waits for "entered", calls `beginTeardown`, opens the gate. Asserts: no new request reached the backend after the gate opened; exactly one Finish row, `Stopped`; `stop` returned; `isQuiescent`. Heartbeat: the scheduler is configured so no pulse is in flight when the count starts — one already admitted before the arm is permitted by the design. |
-| T3 | `shutdown` returns while a synchronous round holds `gc_scheduler_mutex` | same file | two gates. The round parks at request k; `shutdown` runs in `std::async`; the test arms by releasing k. Today's code proceeds to request k+1 and parks there — `shutdown`'s future stays `timeout`; the fixed code never issues k+1 and the future is `ready`. That is the red-then-green shape; a single gate is not, because today's round simply completes once released. |
-| T4 | the open plane's sleep is the interruptible one, and stays so after the test seam is cleared | new file, `CASGCTeardownStop` | a wiring test, not a race: arm teardown **first**, then call the plane's `pause(60000)` from a `std::async` and assert `ready` at once — a predicate `wait_for` whose predicate already holds returns without waiting, so there is no timing and no seam. Repeat after `setCasRetrySleepForTest({})`. The engine's gate-then-sleep order makes both interleavings correct, so "woken mid-sleep" needs no separate proof. |
+| T3 | `shutdown` returns while a synchronous round holds `gc_scheduler_mutex` — **the plan's first failing-first test** | same file | two gates. The round parks at request k; `shutdown` runs in `std::async`; the test **waits until `pool->teardownBegun()` is true** (a state handshake — releasing k at once would race the shutdown thread's arm), then releases k. Today's code proceeds to request k+1 and parks there — `shutdown`'s future stays `timeout`; the fixed code never issues k+1 and the future is `ready`. Gate k+1 is released by RAII after the assertion so a failed run cannot hang teardown. That is the red-then-green shape; a single gate is not, because today's round simply completes once released. |
+| T4 | the open plane's sleep is the interruptible one, and stays so after the test seam is cleared | new file, `CASGCTeardownStop` | a wiring test, not a race: arm teardown **first**, then call the plane's `pause(60000)` from a `std::async` and assert the future is `ready` within a short deadline — a predicate `wait_for` whose predicate already holds returns without waiting, so a plane still wired to the plain sleep cannot pass. No sleep orders any thread; the deadline is the assertion. First half with no seam installed; second half after `setCasRetrySleepForTest({})` cleared a previously installed one. "Woken mid-sleep" needs no separate proof: the engine samples the gate and then sleeps, and a predicate `wait_for` is correct in both interleavings. |
 | T5 | the fail-closed classification rule | `gtest_cas_gc_log.cpp`, `CASGCLog` | twins of `TransientThrowIsClassifiedAborted` (`:331`): `NETWORK_ERROR` with teardown begun → `Stopped`; `BAD_ARGUMENTS` with teardown begun → **stays `Failed`**. The second matters more than the first. |
-| T6 | the extra-round window is closed | same file as T2 | a manual round holds `gc_round_mutex` behind a gate while the scheduled loop is queued on it; arm; release. Assert the loop emitted no Start row of its own. |
+| T6 | the hygiene invariant: no scheduled Start after teardown begins | same file as T2 | a manual round holds `gc_round_mutex` behind a gate while the scheduled loop is queued on it; arm; release. Assert the loop emitted no Start row of its own. Secondary; drops with the post-lock check if that is ever removed. |
 | T7 | a stop inside the janitor is swallowed as designed | same file as T2 | a deferred round with the stop parked inside the janitor page; assert the Finish row is `Deferred`, not `Stopped`, and no exception escaped — pinning the definition, so a later reader who "fixes" it does so on purpose. |
-| T8 | black box, live server: restart under an observed in-flight round | `tests/integration/test_cas_gc_s3`, a new case | in order: (1) `SYSTEM CAS GC STOP` while the pool is still small, so the stop itself is short; (2) populate a pool large enough that a round takes many seconds, with GC paused; (3) restart and measure the **stop phase** — the paused baseline; (4) after restart GC starts by itself: wait for a `Start` row with no `Finish` — the proof a round is in flight — then restart and measure the stop phase again. Assert `under_gc_stop <= paused_stop + one unit + slack`: independence from round length, not an absolute. Afterwards `system.cas_gc_log` for this disk and window has `Aborted = Error = 0`; `Stopped` is reported, not asserted. |
-| T9 | the premise itself — the protocol survives death at any instant | `utils/ca-soak/scenarios/cards/s46_restart_under_gc.py` | phase 3 `--duration`, a large pool, N restarts of `ch1` under GC, each taken only after a `Start` row without its `Finish` is observed. Asserts: each stop time is within one unit plus slack of the same paused baseline; `Aborted = Error = 0`; **fsck clean at the end** — every interrupted round left consistent state. The only test that checks the premise rather than the mechanism. |
-| T10 | the wrapper's window handling | `gtest_cas_requests.cpp` | a backend whose `stream` returns a buffer with a preloaded first window and a distinct second: assert the exact byte sequence, EOF, that the admission check first fires on advancing past the first window, and that a refusal leaves the buffer cancelled. |
+| T8 | black box, live server: a restart that **provably** cut a long round short | `tests/integration/test_cas_gc_s3`, a new case | in order: (1) `SYSTEM CAS GC STOP` while the pool is still small, so the stop itself is short; (2) populate, with GC paused, a pool large enough that one round takes tens of seconds; (3) restart and measure the **stop phase** — the paused baseline; (4) after restart GC starts by itself: let one full round finish and read its `duration_ms` — the calibration; (5) wait for the next `Start` row, record its `round_id`, and restart **within the first half of the calibrated duration**, measuring the stop phase. Assert `under_gc_stop <= paused_stop + one interval + slack`, **and** that the recorded `round_id`'s Finish row is `Stopped` — the witness that a round was actually cut. A `Success`/`Deferred` there fails the test as "no interruption witnessed" rather than passing it: the inequality alone is an upper bound a restart between rounds satisfies trivially. `system.cas_gc_log` for this disk and window has `Aborted = Error = 0`. The integration S3 mock (`helpers/s3_mocks/broken_s3.py`) can slow PUTs only, and no CAS test uses it; a GET-side hold would be a change to a shared non-CAS helper and is not taken — the calibrated window plus the witness is the CAS-local form. |
+| T9 | the premise itself — the protocol survives death at any instant | `utils/ca-soak/scenarios/cards/s46_restart_under_gc.py` | probabilistic by design: phase 3 `--duration`, a large pool, N restarts of `ch1`, each taken after a `Start` row without its `Finish` and within the first half of the last calibrated round duration. Reports how many of the N were witnessed as `Stopped`; asserts every stop time within one interval plus slack of the same paused baseline, `Aborted = Error = 0`, and **fsck clean at the end** — every interrupted round left consistent state. The only test that checks the premise rather than the mechanism. |
+| T10 | the wrapper's window handling | `gtest_cas_requests.cpp` | a backend whose `stream` returns a buffer with a preloaded first window and a distinct second: assert the exact byte sequence, EOF, that the admission check first fires on advancing past the first window, and that a refusal leaves the wrapper the consumer holds cancelled. |
 | T11 | the mount-plane consumer keeps its mapping | `gtest_cas_requests.cpp` | a stream on a fence that answers `NoBudget` mid-body: the refusal is `throwCasWriteRetryLater`, as for a refused open. |
 
 Not tested, by decision: the SDK's retries inside one refill and the CPU-only reduce — the two
@@ -409,6 +437,17 @@ a failed build is the wrong binary.
   the storage; rejected as re-opening the use-after-free class the current teardown closes.
 
 ## Review record {#review-record}
+
+rev.3 → rev.4, from the resumed `codex` review (verdict: direction sound, first failing-first test
+is T3). Accepted and folded in: the bound is restated as the remainder of one admission interval,
+which can hold an in-flight I/O and the CPU work up to the next gate, with the capped-object decode
+and the advisory page named; the census "no other wait under `Gc/`" is recorded; the wrapper's
+captures are spelled out and the mapping moves to a free helper; the cancellation prose is exact;
+the post-lock check, T6 and the heartbeat line are relabelled observability hygiene; T3 gains the
+`teardownBegun` handshake; T4's deadline is named as the assertion; T8 requires the cut round's
+`Stopped` row as a witness within a calibrated window, and T9 is declared probabilistic. Declined:
+gating inside one SDK refill, chunking the sort, a sleep-entry seam (all accepted by the reviewer);
+a GET-side hold in the shared S3 mock.
 
 rev.2 → rev.3, from the resumed `codex` review. Accepted and folded in: the unit definition now
 names the SDK's in-refill retries and the CPU-only reduce as ungated units and T8/T9 assert against
