@@ -59,6 +59,29 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### `[snapshot-publish-error-hook-busy-loop]` An exception before any write-failure arm in the background snapshot publisher redispatches with no backoff (2026-09-04) {#snapshot-publish-error-hook-busy-loop}
+
+`CasRefLedger::dispatchSnapshotPublisher`'s detached task's outer `catch (...)` (`CasRefLedger.cpp`,
+around the `dispatch_detached` call) never arms `advancePublishBackoff` — every OTHER exit from
+`tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl` (a non-`Committed` write, an encode
+failure, a checkpoint that fails to advance) does, before returning `false`. `settleSnapshotPublish`
+re-evaluates `admitSnapshotPublishUnderStateLock` on every settlement, and its only pacing gate is
+the backoff deadline (`now >= rt.publish_backoff_until_ms`) — so an exception reaching the outer
+`catch` without one of those ordinary arms having run first (any exception thrown before the
+write attempt itself — an encode setup bug, an assertion, anything unanticipated) causes the ledger
+to redispatch at full speed, forever, since the tail count that made it over-threshold is never
+cleared either. Measured directly: `1,263,317` redispatches in 30 real seconds, one core pegged. It
+stops only because `Pool::tryRemountOnce`'s mount-lease check uses real `std::chrono::system_clock`
+(not the injectable boot clock the rest of the engine reads), so the real default 30000ms
+`mount_lease_ttl_ms` eventually elapses and fences the mount closed. A test that reproduces this
+exact path deterministically, without a real 30s spin, is `CASDetachedWork
+.SettlementSurvivesAThrowingErrorHandler` (`src/Disks/tests/gtest_cas_detached_work.cpp`) with its
+`snapshot_after_capture_hook_for_test` re-armed persistently instead of self-disarming after one
+throw. Fix shape: arm `advancePublishBackoff` in `dispatchSnapshotPublisher`'s outer `catch (...)`
+(or in `settleSnapshotPublish` before a redispatch) so ANY exception paces the same as an ordinary
+write failure. This is a lease/ledger production-path change and needs review before it is made, not
+something to fix opportunistically alongside an unrelated task.
+
 ### `[stateless-lane-wall-time-is-drop-table]` Measured on the CA-s3 stateless lane (2026-09-04): DROP TABLE is the suite's largest wall-time sink; the server is not CPU-bound {#stateless-lane-wall-time-is-drop-table}
 
 `system.trace_log` over ten minutes of the parallel suite (~10 jobs): ~280 CPU samples against 630k
