@@ -2147,34 +2147,9 @@ TEST(CASRefRecoveryCasWalk, RecoveryStartsAtRecreatedLifeGenesisAndLeavesPredece
     EXPECT_EQ(seal2->prev_epoch_seal, std::nullopt) << "sequence 2 carries no chain link";
 }
 
-/// `PutHookBackend::casPut` must route through its immediate parent `HidingListBackend::casPut`, not
-/// past it to `CountingBackend`, so that a test arming BOTH layers on one `PutHookBackend` instance
-/// gets both behaviors composed rather than one silently disabled by the other.
-TEST(CASRefRecoveryCasWalk, PutHookBackendComposesHidingListBackendCasPutFaultInjection)
-{
-    auto backend = std::make_shared<PutHookBackend>();
-
-    /// `HidingListBackend::write` only runs `before_cas_put` on the CONDITIONAL branch (an `expected`
-    /// token present) -- a bare create-shaped `casPut(..., std::nullopt)` takes the other branch and
-    /// can never reach it. Seed the key first so the probed call below is a genuine replace.
-    OperationForTest op(*backend);
-    const WriteResult seeded = (*op).create("p/probe", "seed", Retry::once());
-    ASSERT_TRUE(std::holds_alternative<Committed>(seeded));
-
-    bool before_cas_put_fired = false;
-    backend->before_cas_put = [&](const String &, const String &, const std::optional<String> &)
-    {
-        before_cas_put_fired = true;
-    };
-
-    backend->watched_substr = "probe";
-    bool on_key_fired = false;
-    backend->on_key = [&] { on_key_fired = true; };
-
-    ASSERT_TRUE(std::holds_alternative<Committed>(
-        (*op).replace("p/probe", "x", std::get<Committed>(seeded).etag, Retry::once())));
-
-    EXPECT_TRUE(before_cas_put_fired)
-        << "HidingListBackend's before_cas_put hook must still fire for a PutHookBackend instance";
-    EXPECT_TRUE(on_key_fired) << "PutHookBackend's own on_key hook must still fire on top of it";
-}
+/// `PutHookBackendComposesHidingListBackendCasPutFaultInjection` was retired: it pinned that
+/// `PutHookBackend::casPut` reaches its immediate parent `HidingListBackend::casPut` rather than
+/// bypassing it to `CountingBackend` -- a fact about this file's own fixture class hierarchy (ordinary
+/// C++ virtual dispatch), not a claim any production change could falsify. `PutHookBackend` and
+/// `HidingListBackend` are still exercised together, on real recovery-walk scenarios, elsewhere in this
+/// file (search for `PutHookBackend>`).
