@@ -37,11 +37,14 @@ enum class ResolveAudit : uint8_t { Emit, Deferred };
 /// there is no independent apply marker or durable-id floor whose combinations form a second,
 /// implicit state machine.
 ///
-/// `Ready` is the only state that admits a new append or certifies a cached row. `Writing` owns the
+/// `Ready` is the state that admits a new append. A cached row is certified (`confirmExactRef`) in
+/// `Ready` and in `Writing` alike, and in both only while no queued or carved mutation names that row's
+/// ref -- a `Ready` lane with such a mutation queued refuses too. `Writing` owns the
 /// exact attempt before its first possible send. `Wedged` owns that same attempt after an ambiguous
-/// result. `NeedsRecovery` means a transaction is known durable but cannot be installed in this cache;
-/// it is a hard write and certification fence until replay completes. `Closed` records a successor's
-/// epoch seal, and `Faulted` records foreign or internally inconsistent durable state.
+/// result and certifies nothing. `NeedsRecovery` means a transaction is known durable but cannot be
+/// installed in this cache; it is a hard write and certification fence until replay completes. `Closed`
+/// records a successor's epoch seal, and `Faulted` records foreign or internally inconsistent durable
+/// state.
 enum class RefLaneState : uint8_t
 {
     Ready,
@@ -57,7 +60,9 @@ enum class RefLaneState : uint8_t
 /// `Yes` is the only answer that AUTHORIZES anything, so it is the only one that must be earned: it is
 /// returned exclusively when every rule of the lane snapshot holds. `Unknown` is the catch-all for
 /// every ambiguity, and it is the answer this primitive is biased towards: a cold, evicted, recovering,
-/// busy or non-`Ready` table answers `Unknown` rather than doing any work to find out.
+/// busy, fenced-out, wedged or otherwise broken table answers `Unknown` rather than doing any work to
+/// find out, and so does a table with a queued or in-flight mutation of the asked-about ref (or of the
+/// whole namespace); a mutation of another ref does not refuse.
 ///
 /// `No` means "this runtime's committed row for that ref is not the manifest you asked about" -- and
 /// nothing more. It is NOT a proof of the negative about the durable table, because the mount fence is
@@ -154,7 +159,8 @@ public:
     /// receiver drives, so it must never be able to make this writer do work.
     ///
     /// The rules are evaluated as one snapshot spanning both lane mutexes, in this order: table warm
-    /// and resident; lane state `Ready`; exact committed-row equality; mount fence live last. Every
+    /// and resident; lane state `Ready` or `Writing`, with no queued or carved mutation whose
+    /// `MutationScope` covers the ref; exact committed-row equality; mount fence live last. Every
     /// ambiguity answers `Unknown` -- see `ConfirmAnswer`, and the .cpp for why the order and the
     /// two-mutex hold are what make a `Yes` a linearization point rather than a guess.
     ConfirmAnswer confirmExactRef(const RootNamespace & ns, const String & ref_name,
@@ -481,6 +487,30 @@ public:
         return it != ref_name_slots.end() && it->second.current->leader_active;
     }
 
+    /// Returns the number of items carved by the current tenure and not yet released by its exit guard.
+    /// Under the queue mutex, like `refQueuePendingForTest`.
+    size_t refCarvedForTest(const RootNamespace & ns)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_name_slots.find(ns.string());
+        return it == ref_name_slots.end() ? 0 : it->second.current->carved.size();
+    }
+
+    /// Returns whether the `carved` entry for `ref_name` (if any) is already completed. Lets a test
+    /// PROVE an earlier chunk's item is done rather than infer it from carve-hook ordering. Under the
+    /// queue mutex, like `refCarvedForTest`; `done` itself is guarded by the same mutex.
+    bool refCarvedItemDoneForTest(const RootNamespace & ns, const String & ref_name)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_name_slots.find(ns.string());
+        if (it == ref_name_slots.end())
+            return false;
+        for (const auto & item : it->second.current->carved)
+            if (item->scope.kind == MutationScope::Kind::Ref && item->scope.ref_name == ref_name)
+                return item->done;
+        return false;
+    }
+
     /// Returns the number of callers currently waiting for `ns` recovery under its state mutex.
     uint64_t refRecoveryWaitersForTest(const RootNamespace & ns)
     {
@@ -712,7 +742,7 @@ private:
 
     /// One coherent decoded `RefTableState` and append runtime for a namespace. It is recovered lazily
     /// and evicted only as a whole. `state_mutex` is separate from
-    /// `ref_queue_mutex` (which only ever guards `pending`/`leader_active`) so a reader (resolveRef/
+    /// `ref_queue_mutex` (which only ever guards `pending`/`carved`/`leader_active`) so a reader (resolveRef/
     /// listRefs) can observe `state` without contending with the flush leader's network round trip --
     /// the leader only holds `state_mutex` for the brief copy-out-before-validate and the
     /// apply-after-commit steps, never for the `putIfAbsentControlled` call itself.
@@ -844,6 +874,18 @@ private:
         uint64_t publish_backoff_ms = 0;
 
         std::deque<std::shared_ptr<RefMutationItem>> pending;    /// guarded by ref_queue_mutex
+        /// The current tenure's carved items, from the carve (`flushRefBatch`'s PUBLISH phase) to the
+        /// tenure's exit guard (`completeOwnedItemsAndReleaseLeadership`), both under `ref_queue_mutex`.
+        /// The carve pops an item out of `pending`, so `pending` alone cannot show a mutation between
+        /// carve and install -- the window in which its transaction may be durable while the committed
+        /// row still lags it. The mirror makes that item visible, under the same mutex, to a reader
+        /// (such as `confirmExactRef`) that holds only the runtime. An item is completed by its chunk's
+        /// install or earlier by an error, often long before the exit guard; the mirror keeps it
+        /// regardless.
+        /// Over-inclusive on purpose: an installed item and an item that failed validation before any
+        /// send both stay here until the exit guard; that is one tenure of over-refusal for their refs,
+        /// never an under-refusal.
+        std::vector<std::shared_ptr<RefMutationItem>> carved;     /// guarded by ref_queue_mutex
         bool leader_active = false;                               /// guarded by ref_queue_mutex
         /// Set before the exact `Live -> Removing` catalog CAS and retained until that life is deleted.
         /// New positive mutations check it in the same queue critical section as admission; the one
@@ -1108,9 +1150,10 @@ private:
     /// and apply-after-commit ordering -- the LIVE state is still only ever advanced once the object is
     /// durable; `commitRefChunk`'s pre-`PUT` apply targets a private candidate that nothing else can
     /// observe. Every item it carves out of `pending` is appended to
-    /// `owned_items` (the leader's responsibility set) at the moment it is carved. When a batch's total
-    /// op count exceeds `ref_txn_max_ops`, the validation loop emits SEVERAL ref-log transactions in one
-    /// tenure via `commitRefChunk` -- each a complete commit boundary.
+    /// `owned_items` (the leader's responsibility set) and to `rt->carved` (the confirm-visible mirror,
+    /// see `RefTableRuntime::carved`) at the moment it is carved. When a batch's total op count exceeds
+    /// `ref_txn_max_ops`, the validation loop emits SEVERAL ref-log transactions in one tenure via
+    /// `commitRefChunk` -- each a complete commit boundary.
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                        std::vector<std::shared_ptr<RefMutationItem>> & owned_items);
 
@@ -1179,10 +1222,12 @@ private:
 
     /// Leadership-exit guard for `appendRefOps`: under `ref_queue_mutex`, completes every still-unfinished
     /// item this leader owned (with `flush_exception` when unwinding, or a fail-closed `LOGICAL_ERROR`
-    /// otherwise), removes each owned item from `pending` so no future leader can carve it, and releases
-    /// leadership (`leader_active = false` + `cv.notify_all`). On the normal path every owned item is
-    /// already `done`, so only the leadership release has effect. This is the single authority that
-    /// resets `leader_active` on any exit from the leader loop.
+    /// otherwise), removes each owned item from `pending` so no future leader can carve it, clears
+    /// `rt->carved` (the confirm-visible mirror, now that every carved item's fate -- installed or a
+    /// recorded lane failure -- no longer needs to be seen), and releases leadership
+    /// (`leader_active = false` + `cv.notify_all`). On the normal path every owned item is already
+    /// `done`, so only the leadership release and the mirror clear have effect. This is the single
+    /// authority that resets `leader_active` on any exit from the leader loop.
     void completeOwnedItemsAndReleaseLeadership(
         const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
         const std::vector<std::shared_ptr<RefMutationItem>> & owned_items,

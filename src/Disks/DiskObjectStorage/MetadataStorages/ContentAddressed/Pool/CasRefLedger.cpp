@@ -57,6 +57,11 @@ namespace ProfileEvents
     extern const Event CASRefAppendDefiniteFailure;
     extern const Event CASRefAppendSealRejected;
     extern const Event CASRefAppendOccupantUnreadable;
+    extern const Event CASRelinkConfirmRefusedRefMutationInFlight;
+    extern const Event CASRelinkConfirmRefusedLaneWedged;
+    extern const Event CASRelinkConfirmRefusedLaneBroken;
+    extern const Event CASRelinkConfirmRefusedStateLockBusy;
+    extern const Event CASRelinkConfirmRefusedMountCannotSpeak;
     extern const Event CASRefNeedsRecovery;
     extern const Event CASRefSweepDeferred;
     extern const Event CASRefSweepRearmed;
@@ -81,6 +86,16 @@ namespace DB::Cas
 
 namespace
 {
+/// The relink confirm's logger, resolved once. `LOG_IMPL` evaluates its logger argument BEFORE testing
+/// the level, so `getLogger` at the call site would take the global logger-registry lock on every
+/// refusal even with tracing off -- and `confirmExactRef` refuses while holding pool-wide append
+/// admission, on a path a remote peer drives.
+const LoggerPtr & confirmLogger()
+{
+    static const LoggerPtr logger = getLogger("CasRefLedger");
+    return logger;
+}
+
 /// Classifies whether an exception thrown out of a ref-table recovery attempt (checkpoint/snapshot/log
 /// GETs, or the seal PUT) is a TRANSIENT object-store transport failure worth retrying,
 /// vs. a terminal condition (corruption, decode failure, logic error, resource limit) that must fail
@@ -423,15 +438,17 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     ///   `sweepStalePrecommitsForRead` and `maybeScheduleSnapshotPublish`, the three maintenance calls
     ///   `resolveRef` performs and all three of which can do I/O.
     ///
-    ///   ONE snapshot across BOTH lane mutexes. `pending`/`leader_active` live under
+    ///   ONE snapshot across BOTH lane mutexes. `pending`/`carved` live under
     ///   `ref_queue_mutex`, the rows and the wedge under `state_mutex`, and the whole point of the
     ///   rules is their CONJUNCTION -- read at different instants they would prove nothing. The lock
     ///   ORDER is the one the rest of this file already establishes (`enforceRefTableCacheBudget`
     ///   nests `state_mutex` under `ref_queue_mutex`, and nothing anywhere takes them the other way
     ///   round). Because admission (`appendRefOps`' `pending.push_back`) happens under
-    ///   `ref_queue_mutex`, an append is either entirely before this snapshot -- and then visible as a
-    ///   pending item -- or entirely after it. There is no interleaving in which a removal is admitted
-    ///   and this function still answers `Yes`.
+    ///   `ref_queue_mutex`, an append is either entirely before this snapshot -- and then visible in
+    ///   `pending` or, once carved, in `carved` -- or entirely after it. There is no interleaving in
+    ///   which a mutation of the asked-about ref is admitted and this function still answers `Yes`; a
+    ///   mutation of another ref may be admitted, and the answer is still right, because it cannot move
+    ///   this ref's row.
     ///
     /// What a `Yes` does NOT prove, stated so nobody has to rediscover it: that this runtime's
     /// recovered view is a COMPLETE replay of the durable log. Completeness is recovery's contract, not
@@ -443,6 +460,12 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// Rule 2 (residency). Direct slot lookup, never a catalog observation or exact-runtime acquisition:
     /// a read-only query must not let a peer grow this writer's cache or make the next reader pay for a
     /// recovery it invented. A cold or evicted table is simply unknown here.
+    ///
+    /// These two arms are the ONLY refusals in this function that are deliberately not counted: a table
+    /// this mount has never touched, or has dropped under cache-budget pressure, is ordinary cache
+    /// behaviour rather than the lane, mount or load condition each counter below separates. Counting
+    /// it would put a number that moves with cache size next to numbers that describe this writer's
+    /// health. There is also no runtime here to attribute the refusal to.
     const auto it = ref_name_slots.find(ns.string());
     if (it == ref_name_slots.end())
         return ConfirmAnswer::Unknown;
@@ -450,16 +473,31 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
         return ConfirmAnswer::Unknown;
     RefTableRuntime & rt = *it->second.current;
 
-    /// `try_to_lock`, not a blocking acquire: `ensureRefTableRecovered` holds `state_mutex` across its
-    /// whole exact replay, so blocking here would make a confirm WAIT on someone else's recovery --
-    /// up to the full retry envelope -- while holding `ref_queue_mutex`, which is pool-wide append
-    /// admission. That is the zero-I/O contract broken by proxy: the query would not issue a request,
-    /// it would merely be paid for by one, and it would stall every table's lane meanwhile. Failing to
-    /// take the lock is just one more ambiguity, so it answers like every other one. (Same technique,
-    /// and same non-blocking rationale, as `enforceRefTableCacheBudget`'s candidate loop.)
+    /// Every refusal below is attributed here, on the node that computed it: `ConfirmAnswer` crosses
+    /// two interfaces as a three-value enum and stays that way, so the counters and this trace line are
+    /// the only way a live gate can tell load (`RefMutationInFlight`) from a fault (`LaneWedged`,
+    /// `LaneBroken`), from contention (`StateLockBusy`), or from this mount losing its claim to the
+    /// namespace (`MountCannotSpeak`). The invariant to keep when editing below: every
+    /// `return ConfirmAnswer::Unknown` past this point goes through `refuse`, and the only uncounted
+    /// refusals in this function are the two residency arms above, which say why.
+    const auto refuse = [&](ProfileEvents::Event reason, std::string_view why)
+    {
+        ProfileEvents::increment(reason);
+        LOG_TRACE(confirmLogger(), "Relink confirm for ref '{}' in namespace '{}' is unknown: {}",
+                  ref_name, ns.string(), why);
+        return ConfirmAnswer::Unknown;
+    };
+
+    /// `try_to_lock`, not a blocking acquire: this function already holds `ref_queue_mutex`, which is
+    /// pool-wide append admission, so blocking here would stall EVERY table's lane for as long as
+    /// whoever holds `state_mutex` keeps it. That is the zero-I/O contract broken by proxy: the query
+    /// would not issue a request, it would merely wait on one, and it would hold up admission
+    /// meanwhile. Failing to take the lock is just one more ambiguity, so it answers like every other
+    /// one. (Same technique, and same non-blocking rationale, as `enforceRefTableCacheBudget`'s
+    /// candidate loop.)
     std::unique_lock<std::mutex> slock(rt.state_mutex, std::try_to_lock);
     if (!slock.owns_lock())
-        return ConfirmAnswer::Unknown;
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedStateLockBusy, "the table's state lock is held");
 
     /// Rule 2 (warm). An unrecovered or mid-recovery runtime has an EMPTY `state`, which would read as
     /// "the ref does not exist" -- knowledge it does not have. `superseded_by_remount` is the same
@@ -469,16 +507,40 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     if (!rt.recovered || rt.recovery_in_progress
         || rt.catalog_life_invalidated.load(std::memory_order_acquire)
         || rt.superseded_by_remount.load(std::memory_order_acquire))
-        return ConfirmAnswer::Unknown;
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak,
+                      "the table is unrecovered, recovering, retired or superseded by a remount");
 
-    /// Rule 3 (lane quiescent). A wedge is "an object that may be durable and is not applied" -- it may
-    /// BE the removal being asked about. A pending item or an active leader tenure is a mutation this
-    /// table has already admitted; mid-tenure, a chunked flush has committed some of its transactions
-    /// and not others, and `leader_active` spans the whole tenure, so that partially-durable window is
-    /// covered too. None of the three says anything about WHICH ref is affected, so all three are
-    /// table-scoped refusals.
-    if (rt.lane_state != RefLaneState::Ready || !rt.pending.empty() || rt.leader_active)
-        return ConfirmAnswer::Unknown;
+    /// Rule 3 (no admitted mutation of THIS ref). The hazard is a committed row that lags a transaction
+    /// of the asked-about ref: the leader does not hold `state_mutex` across the `PUT`, so between
+    /// "durable" and "installed" that ref's row is stale, and a `Yes` read off it would authorize a
+    /// receiver to promote over a blob the transaction may already have retired. A mutation of ANOTHER
+    /// ref cannot change this ref's binding or the blobs its manifest protects, so its row is exactly as
+    /// authoritative as on an idle lane; refusing for it is what starved two replicas of each other on a
+    /// slow control plane. Every admitted mutation names its scope (`MutationScope`, recorded at
+    /// admission under `ref_queue_mutex` and validated against its ops at flush), and it is visible in
+    /// `pending` from admission to carve and in `carved` from carve to the tenure's exit guard, so "a
+    /// change of this ref is queued or in flight" is read from those two. The lane states other than
+    /// `Ready`/`Writing` refuse table-wide: `Wedged` holds a transaction that may be durable, and once
+    /// its tenure exits nothing but the attempt and the lane state records WHICH ref it touched -- the
+    /// exit guard clears the carved mirror, and the chunk's items were completed with an error before
+    /// that -- and `NeedsRecovery`, `Closed`, `Faulted` are fences on the whole view.
+    /// `Writing` with nothing carved cannot happen; it fails closed.
+    if (rt.lane_state == RefLaneState::Wedged)
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneWedged, "the lane holds an unresolved append");
+    if (rt.lane_state != RefLaneState::Ready && rt.lane_state != RefLaneState::Writing)
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is neither Ready nor Writing");
+    if (rt.lane_state == RefLaneState::Writing && rt.carved.empty())
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is Writing with nothing carved");
+    const auto covers = [&](const MutationScope & scope)
+    {
+        return scope.kind == MutationScope::Kind::WholeShard || scope.ref_name == ref_name;
+    };
+    for (const auto & item : rt.pending)
+        if (covers(item->scope))
+            return refuse(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight, "a queued mutation names this ref");
+    for (const auto & item : rt.carved)
+        if (covers(item->scope))
+            return refuse(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight, "a carved mutation names this ref");
 
     /// Rule 5 (exact row equality) -- the only rule that can answer `No` at all. On a table that passed
     /// rules 2-4 the committed map is this writer's view, so a missing row or a different `ManifestRef`
@@ -503,7 +565,8 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     if (!fence_ok_fn()
         || rt.catalog_life_invalidated.load(std::memory_order_acquire)
         || rt.superseded_by_remount.load(std::memory_order_acquire))
-        return ConfirmAnswer::Unknown;
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak,
+                      "this mount no longer holds the namespace's write fence");
 
     return ConfirmAnswer::Yes;
 }
@@ -2162,6 +2225,11 @@ void CasRefLedger::completeOwnedItemsAndReleaseLeadership(
         /// no-op for them; it only matters for an item the leader owned but never got to carve.
         std::erase(rt->pending, owned);
     }
+    /// The tenure is over: every carved item is completed (above, or by its chunk's commit) and its
+    /// effect is either installed, or its failure is recorded by the lane state (`Wedged` for an
+    /// ambiguous `PUT`, `NeedsRecovery` for a durable-but-not-installed chunk), so the confirm no
+    /// longer needs to see it.
+    rt->carved.clear();
     rt->leader_active = false;
     rt->cv.notify_all();
 }
@@ -2678,6 +2746,31 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     return result;
 }
 
+namespace
+{
+/// The first ref name `op` mutates that differs from `scope_ref`, or nullptr when every name it
+/// carries is `scope_ref` or it carries none (`NamespaceBirth`, `RemoveNamespace` and `EpochSeal` are
+/// namespace-level and name no ref). Naming no ref is not the same as moving no ref: a
+/// `RemoveNamespace` moves every row of the namespace, so its caller rejects it under a `Ref` scope
+/// on its own rather than reading an answer out of this function. Both bindings of an
+/// `OwnerTransition` count -- a promotion names the ref twice -- because this check runs before the
+/// transition's shape is validated, so either binding may still carry any name at this point.
+const String * refNamedOutsideScope(const RefOp & op, const String & scope_ref)
+{
+    if (op.kind == RefOpKind::OwnerTransition)
+    {
+        if (op.old_binding && op.old_binding->ref_name != scope_ref)
+            return &op.old_binding->ref_name;
+        if (op.new_binding && op.new_binding->ref_name != scope_ref)
+            return &op.new_binding->ref_name;
+        return nullptr;
+    }
+    if (op.kind == RefOpKind::SetPublishedAt && op.ref_name != scope_ref)
+        return &op.ref_name;
+    return nullptr;
+}
+}
+
 void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                                  std::vector<std::shared_ptr<RefMutationItem>> & owned_items)
 {
@@ -2863,16 +2956,18 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// `seen_refs`/`batch` growth and only recorded the batch into `owned_items` afterwards, so any throw
     /// after the first pop stranded already-popped items -- neither in `pending` nor in `owned_items` --
     /// and their waiters hung forever. Instead:
-    ///   PLAN (may throw, mutates NOTHING): under `ref_queue_mutex`, scan `pending` WITHOUT popping and
-    ///   build the selection count, reserving every container (`batch`, `owned_items`) that the publish
-    ///   below grows. A throw here leaves `pending`/`owned_items` byte-for-byte unchanged, so the
-    ///   leadership-exit guard completes only the leader's own item and the untouched followers stay
-    ///   queued for a later leader.
+    ///   PLAN (may throw, mutates no CONTENT): under `ref_queue_mutex`, scan `pending` WITHOUT popping
+    ///   and build the selection count, reserving CAPACITY in every container (`batch`, `owned_items`,
+    ///   `rt->carved`) that the publish below grows -- a capacity change, never a size or content
+    ///   change. A throw here leaves `pending`/`owned_items`/`carved` byte-for-byte unchanged in
+    ///   content, so the leadership-exit guard completes only the leader's own item and the untouched
+    ///   followers stay queued for a later leader.
     ///   PUBLISH (no-throw): still under the SAME continuous `ref_queue_mutex` hold (no TOCTOU by
     ///   construction), pop the selected front items and append them to `batch` and `owned_items` using
     ///   only non-throwing operations (capacity pre-reserved; `shared_ptr` copies and `deque::pop_front`
-    ///   never throw). ProfileEvents increments are deferred past the plan so the plan is literally
-    ///   non-mutating.
+    ///   never throw). ProfileEvents increments are deferred past the plan so the plan performs no
+    ///   observable mutation beyond the reserved capacity above. The same items are appended to
+    ///   `rt->carved`, the confirm-visible mirror the exit guard clears.
     std::vector<std::shared_ptr<RefMutationItem>> batch;
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -2916,6 +3011,9 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         if (carve_hook_for_test)
             carve_hook_for_test(CarvePhaseForTest::PlanReserveOwned);
         owned_items.reserve(owned_items.size() + selected);
+        /// Reserve the confirm-visible mirror too, for the same reason: the publish appends into it and
+        /// must not throw.
+        rt->carved.reserve(rt->carved.size() + selected);
 
         /// --- PUBLISH (no-throw) ---
         if (carve_hook_for_test)
@@ -2924,6 +3022,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         {
             batch.push_back(rt->pending.front());        /// shared_ptr copy, capacity reserved
             owned_items.push_back(rt->pending.front());  /// same item into the responsibility set
+            rt->carved.push_back(rt->pending.front());   /// and into the confirm-visible mirror
             rt->pending.pop_front();
         }
 
@@ -3047,10 +3146,34 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         /// this item. `item_ops` was built in step 1 against the pre-boundary state; the carve
         /// deduplicates ref names within a batch, so the overflowing item operates on a ref distinct
         /// from the just-committed chunk's and re-validating it against the reseeded `working` is
-        /// consistent.
+        /// consistent. The scope is validated here as well, because the confirm relies on it (see
+        /// `confirmExactRef`, rule 3).
         RefTableState item_scratch = working;
         try
         {
+            /// Scope validation. `MutationScope` is what `confirmExactRef` reads to decide whether a
+            /// queued or in-flight mutation may change the ref it is asked about, so a `Ref{name}` item
+            /// whose ops mutate ANOTHER ref would let the confirm answer `Yes` off a row this very item is
+            /// about to change. Checked before anything durable and failing only this item: every
+            /// production caller names the exact ref its ops mutate, so a mismatch is a programming error.
+            if (it->scope.kind == MutationScope::Kind::Ref)
+            {
+                for (const RefOp & op : item_ops)
+                {
+                    /// A namespace removal names no ref and moves every row, so it is outside every
+                    /// `Ref` scope. The confirm's answer about every OTHER ref rests on this scope
+                    /// check alone, so it is rejected here rather than left to any later one.
+                    if (op.kind == RefOpKind::RemoveNamespace)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "ref mutation on namespace '{}' is scoped to ref '{}' but its {} op moves every ref",
+                            ns.string(), it->scope.ref_name, refOpKindToWireWord(op.kind));
+                    if (const String * other = refNamedOutsideScope(op, it->scope.ref_name))
+                        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "ref mutation on namespace '{}' is scoped to ref '{}' but its {} op names ref '{}'",
+                            ns.string(), it->scope.ref_name, refOpKindToWireWord(op.kind), *other);
+                }
+            }
+
             /// Whole-item shape validation (prerequisite to `dropNamespace`): the
             /// per-op loop below previews each op as its OWN single-op trial transaction, so a
             /// whole-transaction-shape rule like "remove_namespace must be the FINAL op" trivially
