@@ -742,7 +742,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             ++report.redeleted;
             ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
             /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
-            /// writer already resurrected a fresh incarnation at this hash (INV-1), and that writer's
+            /// writer already resurrected a fresh incarnation at this hash, and that writer's
             /// own republication path already flipped the meta back to Clean; blindly deleting here
             /// would race that legitimate Clean write for no reason (the meta is advisory, but there is
             /// no reason to touch it on that path at all).

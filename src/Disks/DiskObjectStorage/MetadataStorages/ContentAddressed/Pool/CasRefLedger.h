@@ -114,8 +114,8 @@ public:
         /// wedge captures the generation at admission and presents it back -- through `mount_requests`,
         /// by resuming an operation under it -- on every later retry and before every install, so a
         /// result that returns after a fence loss or a re-arm is inert for the superseded runtime instead
-        /// of installing a stale view (spec §3, "the mount-fence generation is captured at admission and
-        /// required on every slot-occupy and install").
+        /// of installing a stale view: the generation is captured at admission and required on every
+        /// slot-occupy and install.
         std::function<uint64_t()> fence_generation_fn_,
         std::function<uint64_t()> boot_ms_now_fn_,
         std::function<bool()> may_mutate_,

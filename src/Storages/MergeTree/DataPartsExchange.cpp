@@ -957,8 +957,8 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     /// chose to relink: it sent only the part's encoded PartManifest body, no file bytes, and the
     /// reservation above already went to the offered pool's disk. Build the part by staging this
     /// server's OWN local manifest over the blobs already in the shared pool (adopt-by-hash -> revalidate
-    /// -> promote inside adoptPartFromManifest) — self-contained since task 6 routed
-    /// uuid.txt/metadata_version.txt through the content path, so there is no separate mutable header to
+    /// -> promote inside adoptPartFromManifest) — self-contained because uuid.txt and
+    /// metadata_version.txt travel through the content path, so there is no separate mutable header to
     /// reconstruct. If the relink is not possible (blob missing/condemned — a transient or a
     /// genuinely-different pool the cheap pre-filter let through, or a mixed-build pair offering an
     /// unrecognized cookie value), fall back to a normal byte fetch by re-requesting WITHOUT relink.

@@ -1191,9 +1191,9 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                 {
                     /// A STRAGGLER: an ordinary transaction of the dead epoch landed at `T+1` between
                     /// our read and our create. Adopt it, advance `T` by exactly ONE, and try the seal
-                    /// again at the NEW `T+1`. Never mint `T+2` around it: ids are state-derived
-                    /// (INV-1/INV-2), and writing past an occupied slot puts a hole in the durable
-                    /// stream that no later reader can distinguish from a lost object.
+                    /// again at the NEW `T+1`. Never mint `T+2` around it: ids are state-derived, and
+                    /// writing past an occupied slot puts a hole in the durable stream that no later
+                    /// reader can distinguish from a lost object.
                     ProfileEvents::increment(ProfileEvents::CASRefRecoveryStragglerAdopted);
                     ++sequence;
                 }
@@ -3834,7 +3834,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// derives the SAME id and hits the SAME conflict, loudly, until a remount-level recovery (a
             /// fresh writer epoch is a fresh key namespace) clears it. Advancing past the occupant, which is
             /// what the pool-wide allocator did, would have written this table's stream around a foreign
-            /// object and hidden the violation -- and produced the hole INV-1 exists to forbid.
+            /// object and hidden the violation -- and produced a hole in a stream that must stay dense.
             ///
             /// Route it through the anomaly policy, exactly as the wedge-resolution site does for the
             /// identical observation. Failing closed is right, but failing closed FOREVER is
@@ -3923,7 +3923,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// happened". A separate event keeps both readings available: the wedge counter now means
             /// only genuinely ambiguous appends, and this one means availability preserved.
             ProfileEvents::increment(ProfileEvents::CASRefAppendPreAttemptRefused);
-            /// The id is not consumed (INV-1): it was derived from `greatest_applied`, which this
+            /// The id is not consumed: it was derived from `greatest_applied`, which this
             /// refusal leaves exactly as it was, so the next caller on this table derives the SAME id
             /// and the durable stream keeps no trace of the refusal. That is the free half of the
             /// every-attempt rule -- an attempt that provably sent nothing owes nothing.

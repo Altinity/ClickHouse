@@ -186,7 +186,7 @@ public:
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
         const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
 
-    /// === The §3 creation lifecycle, built on the two primitives above ===
+    /// === The creation lifecycle, built on the two primitives above ===
 
     /// Outcome of the two-step tail every creation attempt ends in (`_ckpt` publish + `Creating ->
     /// Live` CAS) -- shared by a fresh `createNamespace` and a reconciler that just adopted a stalled

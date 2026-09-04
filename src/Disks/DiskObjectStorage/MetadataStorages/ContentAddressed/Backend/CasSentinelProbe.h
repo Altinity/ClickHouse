@@ -9,7 +9,7 @@ namespace DB::Cas
 /// timeouts / 5xx / connection errors => Indeterminate; permission errors => AccessDenied;
 /// missing container/bucket/prefix-parent => ContainerAbsent; a clean authoritative miss => KeyAbsent.
 ///
-/// Free-function entry point (spec §2) — a thin dispatch to `op`'s own typed-evidence classification
+/// Free-function entry point — a thin dispatch to `op`'s own typed-evidence classification
 /// (`CasOperation::probeSentinel`, which in turn reaches `Backend::probeSentinelRaw`; see there for the
 /// per-backend semantics: the S3-native raw HEAD error, the Local container-directory stat, or the
 /// generic head/get-based default for a backend without sharper evidence).

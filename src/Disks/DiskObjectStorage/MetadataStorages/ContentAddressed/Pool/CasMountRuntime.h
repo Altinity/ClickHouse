@@ -304,10 +304,10 @@ public:
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
     /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
-    /// it is published before the state store) OR `IdentityLost` (rev.8: a fail-loud TERMINAL state — no
+    /// it is published before the state store) OR `IdentityLost` (a fail-loud TERMINAL state — no
     /// demoted observer; recovery is restart or FORGET). Consulted by `scheduleRemount` before arming and by
     /// the remount loop at every step boundary. (The GC scheduler applies the same three-way test through
-    /// `Pool`, spec §9 rev.8 item 8.)
+    /// `Pool`.)
     bool remountTerminal() const
     {
         return vanished_intent.load(std::memory_order_acquire)
