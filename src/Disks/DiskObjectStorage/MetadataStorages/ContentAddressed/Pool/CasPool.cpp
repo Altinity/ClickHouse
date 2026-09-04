@@ -196,7 +196,18 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           config.boot_ms_fn,
           mountPlaneSleepFn())
     , farewell_requests(pool_backend, Fence::open(), config.boot_ms_fn)
-    , gc_requests(pool_backend, Fence::open(), config.boot_ms_fn)
+    /// The open plane's fence is the pool's teardown flag: generation 0 forever, exactly like
+    /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
+    /// flight is then refused at its next request instead of running to completion under a disk that
+    /// is being torn down. The ref ledger and the farewell live on the other two planes, so
+    /// teardown's own I/O never meets this fence. A committed write stays committed: `check_or_throw`
+    /// does not turn a landed `gc/state` into a failure, the next request refuses instead.
+    , gc_requests(pool_backend, Fence{
+          [] { return uint64_t{0}; },
+          [this](uint64_t, uint64_t) { return teardownBegun() ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
+          [](uint64_t) {}},
+          config.boot_ms_fn,
+          openPlaneSleepFn())
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
     /// established (fresh create, steady-state member, or a just-completed admission union) --
     /// register-before-first-write means this Pool's own `writeAlgo()` is ALWAYS a
@@ -1893,11 +1904,11 @@ void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
     /// All three planes, not just the ledger's: a test that replaces the retry sleep must not be left
     /// with a real one on the plane the site under test happens to use.
     farewell_requests.setSleepFnForTest(sleep_fn);
-    gc_requests.setSleepFnForTest(sleep_fn);
     ref_ledger.setCasRetrySleepForTest(sleep_fn);
-    /// The ledger reaches the mount plane too, and `CasRequests` falls back to the engine's plain
-    /// sleep for an empty argument -- which is not this plane's default. Re-install ours last, so
-    /// clearing the seam cannot leave a parked or stopping renewal held for a whole capped backoff.
+    /// `CasRequests` falls back to the engine's plain sleep for an empty argument -- which is neither
+    /// the mount plane's nor the open plane's default. Re-install both, so clearing the seam cannot
+    /// leave a parked renewal held for a whole capped backoff, or the open plane deaf to a teardown.
+    gc_requests.setSleepFnForTest(sleep_fn ? sleep_fn : openPlaneSleepFn());
     mount_requests.setSleepFnForTest(sleep_fn ? std::move(sleep_fn) : mountPlaneSleepFn());
 }
 

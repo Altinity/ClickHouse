@@ -1146,6 +1146,20 @@ private:
         return [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); };
     }
 
+    /// The open plane's inter-attempt sleep: woken by `beginTeardown`, so a retry backing off on the
+    /// GC plane cannot hold a teardown for a whole capped backoff. A predicate wait, so the detached
+    /// tasks' own completions -- which notify the same variable -- do not cut a sleep short. Named
+    /// for the same reason as `mountPlaneSleepFn`: the test seam has to be able to put it back.
+    std::function<void(uint64_t)> openPlaneSleepFn()
+    {
+        return [this](uint64_t ms)
+        {
+            std::unique_lock lock(detached_work->mutex);
+            detached_work->cv.wait_for(lock, std::chrono::milliseconds(ms),
+                                       [this] { return detached_work->stopping.load(std::memory_order_acquire); });
+        };
+    }
+
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
