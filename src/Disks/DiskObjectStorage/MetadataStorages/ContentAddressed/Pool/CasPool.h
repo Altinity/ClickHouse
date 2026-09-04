@@ -410,6 +410,12 @@ public:
     ~Pool();
 
     bool tryDispatchDetached(std::function<void(DetachedStopToken)> task);
+    /// Marks this pool as being torn down. The open request plane refuses every further admission and
+    /// wakes a retry sleep on it, and no new detached task is accepted. Idempotent, and it frees,
+    /// nulls and swaps nothing: it can be called before any lock a teardown takes, so a GC round
+    /// holding such a lock is refused at its next request instead of being waited out.
+    void beginTeardown() noexcept;
+    bool teardownBegun() const noexcept;
     bool stopAndDrainDetachedWork(uint64_t deadline_ms);
     uint64_t detachedWorkInFlight() const;
     uint64_t detachedWorkInFlightForTest() const { return detachedWorkInFlight(); }

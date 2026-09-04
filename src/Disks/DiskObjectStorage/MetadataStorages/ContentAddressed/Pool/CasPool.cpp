@@ -1043,14 +1043,23 @@ bool Pool::tryDispatchDetached(std::function<void(DetachedStopToken)> task)
     return true;
 }
 
-bool Pool::stopAndDrainDetachedWork(uint64_t deadline_ms)
+void Pool::beginTeardown() noexcept
 {
     {
         std::lock_guard lock(detached_work->mutex);
-        detached_work->stopping = true;
+        detached_work->stopping.store(true, std::memory_order_release);
     }
     detached_work->cv.notify_all();
+}
 
+bool Pool::teardownBegun() const noexcept
+{
+    return detached_work->stopping.load(std::memory_order_acquire);
+}
+
+bool Pool::stopAndDrainDetachedWork(uint64_t deadline_ms)
+{
+    beginTeardown();
     std::unique_lock lock(detached_work->mutex);
     return detached_work->cv.wait_for(lock, std::chrono::milliseconds(deadline_ms),
                                       [this] { return detached_work->in_flight == 0; });
@@ -1064,8 +1073,7 @@ uint64_t Pool::detachedWorkInFlight() const
 
 bool Pool::detachedWorkStoppingForTest() const
 {
-    std::lock_guard lock(detached_work->mutex);
-    return detached_work->stopping;
+    return teardownBegun();
 }
 
 void Pool::setDetachedDrainDeadlineBudgetForTest(uint64_t attempt_timeout_ms, uint64_t lease_safety_margin_ms)
