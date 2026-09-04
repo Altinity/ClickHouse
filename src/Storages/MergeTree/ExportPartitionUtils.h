@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <vector>
 #include <string>
 #include <Core/Field.h>
@@ -28,9 +29,53 @@ namespace ExportPartitionUtils
 {
     bool isNonRetryableExportError(int code);
 
+    /// Capped exponential back-off, matching the standard ClickHouse convention
+    /// (see ZooKeeperRetriesControl): delay = min(initial << (retry_count - 1), max).
+    /// `retry_count` is the number of failures so far (>= 1 when a retry is pending).
+    size_t computeRetryBackoffSeconds(size_t retry_count, size_t initial_backoff_seconds, size_t max_backoff_seconds);
+
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
-    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest);
+    /// Build a query context carrying the export task's persisted settings. Templated on the
+    /// descriptor type so it serves both the replicated manifest (backed by ZooKeeper) and the
+    /// plain `MergeTreePartitionExportTask` (backed by disk); both expose the same setting fields.
+    template <typename ManifestT>
+    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ManifestT & manifest);
+
+    /// Validates that `dest_storage` is a legal export target for the specific partition being
+    /// exported and, for Iceberg destinations, returns the serialized destination `metadata.json`
+    /// to persist in the task descriptor; returns an empty string for non-data-lake destinations.
+    ///
+    /// For data lakes this resolves the destination `IcebergMetadata`, gates on
+    /// `allow_insert_into_iceberg` and runs `verifyIcebergPartitionCompatibility`. For every other
+    /// destination it runs `verifyPlainPartitionCompatibility`. Because both checks fold the
+    /// exported parts' min/max index, this must be called after the part list is collected; the
+    /// destination checks that do not depend on the partition (self-export, `supportsImport`,
+    /// `verifyExportSchemaCastable`) are done by the caller up-front. Throws on any incompatibility.
+    std::string extractDestinationIcebergMetadataJson(
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const StoragePtr & dest_storage,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context);
+
+    /// ZooKeeper-free commit core shared by the replicated and plain partition-export paths:
+    /// assembles the Iceberg commit arguments (deriving the partition source block from the
+    /// exported parts when the destination is a data lake with a partition key) and invokes
+    /// `commitExportPartitionTransaction` on the destination storage, returning its commit info so
+    /// the caller can persist it.
+    IStorage::ExportPartitionCommitInfo commitExportedPaths(
+        const String & transaction_id,
+        const String & partition_id,
+        const String & iceberg_metadata_json,
+        bool write_full_path_in_iceberg_metadata,
+        const std::optional<String> & iceberg_partition_timezone,
+        const std::vector<std::string> & exported_paths,
+        const std::vector<String> & exported_part_names,
+        const StoragePtr & destination_storage,
+        MergeTreeData & source_storage,
+        const ContextPtr & context);
 
     /// Get the min/max values from the partition expression columns
     Block getPartitionSourceBlockForIcebergCommit(
