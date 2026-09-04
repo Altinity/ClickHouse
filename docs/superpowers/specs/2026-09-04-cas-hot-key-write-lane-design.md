@@ -9,10 +9,10 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 24, 2026-09-04. Brainstormed against the measurements in
+Revision 25, 2026-09-04. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
-this document supersedes where they differ. The revision history at the end records twenty-one
+this document supersedes where they differ. The revision history at the end records twenty-four
 earlier revisions and the two structural decisions that shaped this one: the lane sits above the
 request engine and returns the engine's own result unchanged; and the GC erase, which the design
 means to bring into the lane, is a follow-up with named prerequisites rather than a caller of this
@@ -61,9 +61,15 @@ Goals:
 - A lost race against another server is repaid after a flat jitter that does not grow with the
   writer's personal loss count. The growing backoff stays for transport faults, including a
   conflict that settled one, and for a store that answers 429.
-- The lane serves any hot compare-and-swap object, not the catalog only: its `decide` sees bytes,
-  it returns the engine's own `WriteResult`, and a caller chooses to write through it. The catalog
-  is the first caller.
+- The lane serves any hot compare-and-swap object, not the catalog only: its `decide` is the
+  engine's own `DecideOnObject` (bytes to write, or nothing, or a refusal by exception), it returns
+  the engine's own `WriteResult`, and a caller chooses to write through it, one call-site change per
+  site. The catalog is the first caller.
+- On a store whose conditional writes are generation-numbered (the `Generation` dialect, GCS), two
+  writes through the lane on one key start at least one second apart, the rate GCS documents per
+  object, so a burst of one pool's mutations never asks GCS to throttle it. The store's own
+  throttling, 429, stays a transport fault on the growing schedule.
+- Lanes are erased when idle, so a key written once costs nothing after its last writer left.
 - No change to the catalog's API, to the semantics of any conditional write or of any result or
   verdict a caller sees, to the 90 s windows, to what any read returns, or to a single line of GC.
   A read issued inside a hold gives up earlier than today when the hold's window is shorter than
@@ -80,13 +86,9 @@ Non-goals:
 
 - Making the remembered object a source of truth. It is a hint: a stale hint costs one 412 and one
   resolve read on the write path, and one read on the verdict path, never correctness.
-- Pacing the lane to a store's documented per-object write rate. This is the owner's decision,
-  recorded here after two reviews argued the other way: GCS documents about one mutation per
-  second per object and says excess writes may be throttled; a store that finds the pool too fast
-  answers 429, which is a transport fault and takes the growing schedule, and combining already
-  makes one `PUT` carry every mutation that arrived meanwhile. The `gcs` lane's acceptance run
-  measures 429s on the catalog; if they rise, spacing is a BACKLOG item there, designed against the
-  measurement rather than the documentation.
+- Pacing anything but the lane's own writes. The engine's reissues inside one verb, its resolve
+  reads, the sites that keep `readModifyWrite`, and other pools are unpaced, as today; the spacing
+  above is the documented rate kept where keeping it costs ten lines, not a proof against 429.
 - Bringing the GC erase into the lane in this change. It writes the same key today by racing the
   mount plane and keeps doing so; what it costs the lane and what bringing it in requires are in
   [the GC erase](#the-gc-erase).
@@ -108,8 +110,9 @@ the engine, with the semantics "as if each had committed alone, in that order". 
 exactly as it handles today's, plus one rule, resubmit on `Conflict`. Every member is told, in the
 same five alternatives, a class it is safe to act on: the leader's own when the batch's fate is the
 member's fate, and `Conflict{NotObserved}`, "nothing applied, submit again", when the leader sent
-nothing. A refusal a `decide` renders on a cached base is never reported; the lane reads and
-decides again. `CasRefCatalog` writes through the lane.
+nothing. A `decide` that returns nothing is `Declined`, as in the engine. A refusal or a decline a
+`decide` renders on a cached base is never reported; the lane reads and decides again.
+`CasRefCatalog` writes through the lane.
 
 **Half 2, conflict pacing.** In `CasOperation::readModifyWrite` and `readModifyWriteOnPresence`,
 for the sites that keep using them, a clean refused precondition is repaid after
@@ -136,25 +139,29 @@ class CasHotKeys
 public:
     explicit CasHotKeys(uint64_t cache_budget_bytes);   /// 0: no cache
 
-    /// The caller's mutation of `key`: the candidate bytes to write over `base`, or a refusal by
-    /// exception. `base` is absent when the key does not exist; a caller that refuses to
-    /// bootstrap throws there. See "The contract of a decide".
-    using Decide = std::function<String(const std::optional<Object> & base)>;
+    /// The caller's mutation of `key`, the engine's own decide type: the candidate bytes to write
+    /// over `base`, nothing (`Declined`), or a refusal by exception. `base` is absent when the key
+    /// does not exist; a caller that refuses to bootstrap throws there. See "The contract of a
+    /// decide".
+    using Decide = DecideOnObject;
 
     /// One hold: base, decide, combine, one engine write, settle. Returns the engine's own result
     /// for that write, unchanged in class and content, and reports a `decide`'s refusal by
     /// propagating its exception, never from a cached or unlanded base.
     WriteResult submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide);
 
-    /// Test seam: items in the key's queue, holder and settled members included.
+    /// Test seams: items in the key's queue, holder and settled members included (0 for a key with
+    /// no lane); lanes in existence.
     size_t queueDepthForTest(const String & key) const;
+    size_t laneCountForTest() const;
 
 private:
     struct Item;   /// one queued submission, see "The ticket"
-    struct Lane    /// one key; created on first use, lives as long as this object (one key today; erasure is a prerequisite for per-namespace keys)
+    struct Lane    /// one key; created on first use, erased when idle (see "Leave")
     {
         std::deque<std::shared_ptr<Item>> queue;     /// guarded by `mutex`; the first item not `done` is the holder-to-be
         std::optional<uint64_t> holder_since_ms;     /// guarded by `mutex`; for the log line
+        uint64_t last_write_end_ms = 0;              /// guarded by `mutex`; when the last write through the lane returned, for the spacing
         std::condition_variable cv;
     };
     std::mutex mutex;
@@ -186,11 +193,12 @@ entry condition for any other key.
    than once (on a cached base and then a fresh one; in a batch that did not land and then again),
    and the `decide` neither observes nor cares which run is reported. The catalog's `decide`s are
    pure functions of `base` plus idempotent reads.
-2. It refuses by throwing, and its exception is the verdict serial execution would render on the
-   same base. The lane reports a refusal only when it was rendered on a fresh read or in a batch that
-   landed; a refusal rendered on a cached base is discarded and the `decide` runs again on a fresh
-   read, and a refusal rendered in a batch that did not land is discarded and the caller submits
-   again (below).
+2. It refuses by throwing and declines by returning nothing, and either is the verdict serial
+   execution would render on the same base. The lane reports a refusal or a decline only when it
+   was rendered on a fresh read or in a batch that landed; one rendered on a cached base is
+   discarded and the `decide` runs again on a fresh read, and one rendered in a batch that did not
+   land is discarded and the caller submits again (below). A decline is a verdict like a refusal
+   because a stale hint can say "nothing to write" about an object the store no longer holds.
 3. It tolerates being run against a state its own mutation is already in, and resolves that
    without a wrong verdict: a `Conflict{seen}` after an ambiguous attempt means the write may have
    landed and been superseded, and the caller re-decides on `seen`. The catalog's `beginRemoving`
@@ -219,9 +227,11 @@ entry condition for any other key.
    leader's gate covers; a caller whose `Liveness` must be consulted before every attempt of its
    own write does not write through the lane.
 
-For `_ckpt`, `gc/state` or any other key, conditions 3, 5 and 6 are the ones to audit before its
-first `submit`; `publishCkpt`'s declines, `Gc::refreshAuthority`'s private operation and
-`Gc::authority_held`'s plain `bool` are the known cases.
+For `_ckpt`, `gc/state` or any other key, conditions 1, 3, 5 and 6 are the ones to audit before
+its first `submit`; the known cases are `publishCkptContribution`'s `decide`, which counts its runs
+and records its decline's reason in captured locals that the caller's outcome then reads, so a
+re-run on a fresh base doubles what it reports (condition 1); `Gc::refreshAuthority`'s private
+operation; and `Gc::authority_held`'s plain `bool`.
 
 ### The ticket {#the-ticket}
 
@@ -239,6 +249,7 @@ struct Item
     std::optional<WriteResult> result;       /// guarded by `mutex`; this member's own settlement, written by the leader before `done`
     std::shared_ptr<const BatchOutcome> shared;    /// guarded by `mutex`; what the batch's members share
     std::exception_ptr held;                 /// the member's own `decide` exception, delivered by its owner only if the batch landed
+    bool declined = false;                   /// the member's `decide` returned nothing; `Declined` only if the batch landed
 };
 
 /// One per batch, allocated by the leader before its write, shared by every member it settles:
@@ -308,10 +319,15 @@ attempt for any reason but a transport that does not answer.
 unsettled (the leader unwound), settle every taken member from the `BatchOutcome` allocated before
 the write, as `GaveUp{Unresolved, sent_any = true}` (below) and reset `holder_since_ms`; erase this
 item; if the caller left on its deadline behind a held item, snapshot that item and
-`holder_since_ms`; `cv.notify_all()`. After releasing the mutex: record the queue time and emit the
-log line if a snapshot was taken, inside a catch-all in the `tryLogCurrentException` shape. The
-settlement and the erase are one critical section, so a taken and unsettled member is never the
-first item not `done`.
+`holder_since_ms`; `cv.notify_all()`; then erase every lane whose queue is empty and whose
+`last_write_end_ms` is at least the dialect's spacing interval ago (below; the interval is 0 on the
+`ETag` and `Emulated` dialects, so an emptied lane goes at once, and on `Generation` it stays up to
+a second so the spacing survives a gap). A `Lane` is referenced only by threads whose item is in its
+queue, so an empty lane has no referent, and the map holds at most the busy keys plus those written
+within the last interval. After releasing the mutex: record the queue time and emit the log line if
+a snapshot was taken, inside a catch-all in the `tryLogCurrentException` shape. The settlement and
+the erase are one critical section, so a taken and unsettled member is never the first item not
+`done`.
 
 ### The batch {#the-batch}
 
@@ -319,10 +335,12 @@ first item not `done`.
    today's initial observation, and which may find the key absent. A cached start is gated as a
    read would be, `gate(reservedFor(0, 1))` and `fits`, so a caller past its deadline, lease or
    fence never runs `decide` on the cache.
-2. **The leader's decide** on the base. Bytes: the candidate. An exception: if the base was a fresh
-   read, it propagates to the caller as today; if the base was the cache, the cache entry is
-   dropped, the key is read, and `decide` runs once more on the read; what that run does is the
-   result. Any exception, not a chosen class: a refusal, a decode failure on bytes another writer
+2. **The leader's decide** on the base. Bytes: the candidate. Nothing: `Declined{seen}` with the
+   base as the engine's observation (the `Object`, or `ProvenAbsent`), no write and no batch; the
+   guard hands the key over, and a read base is stored in the cache. An exception: if the base was
+   a fresh read, it propagates to the caller as today. Either verdict on a cached base: the cache
+   entry is dropped, the key is read, and `decide` runs once more on the read; what that run does
+   is the result. Any exception, not a chosen class: a refusal, a decode failure on bytes another writer
    stored, an allocation failure inside the decode, all get the same one re-run on a fresh read,
    because a `decide` is re-runnable by contract, and the only thing a refusal on a hint proves is
    that a hint is not a proof. One exception to the re-run: if the validating read cannot be made
@@ -358,28 +376,36 @@ first item not `done`.
    write the `GaveUp` the engine would have returned, `sent_any = false`, into that item's own
    `result` now, and skip its `decide`. Otherwise `decide(Object{bytes = candidate, etag = base
    etag})`, with the member's operation clamped to the leader's bound. Bytes: the item contributes
-   and the candidate is those bytes. An exception: held in the item, the candidate unchanged, the
-   chain continues.
-4. **Write.** One engine call: `op.replace(key, candidate, base.etag, policy)`, or
-   `op.create(key, candidate, policy)` when the base was absence and the `decide` returned bytes
-   for it, under the leader's operation and frozen policy. The engine's verb is one logical write:
+   and the candidate is those bytes. Nothing: `declined` is set, the candidate unchanged. An
+   exception: held in the item, the candidate unchanged. The chain continues in both cases.
+4. **Write.** First the spacing: on the `Generation` dialect (the leader's
+   `backendForCapabilityPredicates().dialect()`), if the lane's `last_write_end_ms` is less than
+   `kGenerationWriteSpacingMs` (1000) ago on the engine's clock, `op.pause` the smaller of the
+   remainder and the leader's remaining window; the verb's own entry gate then decides, so a pause
+   that consumed the window ends as `GaveUp{Deadline, sent_any = false}` and the members are told
+   `Conflict{NotObserved}` as for any leader that sent nothing. Then one engine call:
+   `op.replace(key, candidate, base.etag, policy)`, or `op.create(key, candidate, policy)` when the
+   base was absence and the `decide` returned bytes for it, under the leader's operation and frozen
+   policy. When it returns, however it returns, `last_write_end_ms` is set under `mutex`. The engine's verb is one logical write:
    it reissues ambiguous attempts, settles every refused precondition by a resolve read, and gates
    every attempt on the leader's fence. Its transport backoffs sleep inside the hold (a named
    tradeoff, below).
 5. **Settle.** The engine's result is the leader's, unchanged. `create` and `replace` return four
-   of `WriteResult`'s five alternatives: `Declined` is produced only by the two read-modify-write
-   verbs (their `return Declined{...}` sites are the only ones in `CasRequests.cpp`), so the lane
-   never sees it and the enumeration below is complete. Every taken member is told, in its own
-   `result`, a class it is safe to act on, never a stronger one than the leader's; a held exception
-   is delivered only when the batch landed, because it was rendered on the chained candidate, a
-   state that exists only if the batch lands, and in every other case the member is settled like a
-   contributor and decides again on a real base:
+   of `WriteResult`'s five alternatives, never `Declined` (its two `return Declined{...}` sites in
+   `CasRequests.cpp` are the read-modify-write verbs'); the lane produces `Declined` itself, in
+   step 2 for a leader and here for a member, so the enumeration below is complete. Every taken
+   member is told, in its own `result`, a class it is safe to act on, never a stronger one than the
+   leader's; a held exception or a decline is delivered only when the batch landed, because it was
+   rendered on the chained candidate, a state that exists only if the batch lands, and in every
+   other case the member is settled like a contributor and decides again on a real base:
    - `Committed`: the cache stores the candidate. Each contributor is gated once more on its own
      operation, `gate(0)`, three ways as `postCommit` does: `FenceLost` → `GaveUp{FenceLost,
      sent_any = true}`; `NoBudget` → `GaveUp{Deadline, Source::Lease, sent_any = true}`; otherwise
      `Committed{etag, attempts_sent = 0, resolved_by_read}` with the combined object's etag and the
      batch's `resolved_by_read`. Each held exception is delivered to its owner: the serial verdict,
-     now that the base and the prefix are durable.
+     now that the base and the prefix are durable. Each `declined` member receives `Declined{seen}`
+     with the landed object (the candidate under the combined etag), the object its `Committed`
+     would have named; no caller reads a `Declined`'s `seen` beyond its class today.
    - `Conflict{seen, attempts_sent}`: the cache stores `seen` if it is an `Object`, and is dropped
      otherwise. Every taken member receives `Conflict{seen, attempts_sent = 0}`. The class has the
      engine's two-sided meaning, a clean lost race or an ambiguous attempt that may have landed and
@@ -457,7 +483,8 @@ to "SLRU") and the two metrics named in the sketch, weighted by object bytes, bo
 `manifest_decode_cache_bytes`; 0 disables it, which is what a `CasRequests` without a pool gets.
 It is read and written outside the lane's mutex; its synchronization is its own and it calls
 nothing. It holds, per key, the last object this pool knows: the
-candidate a `Committed` wrote, or the object a resolve read saw after a `Conflict`. It is dropped
+candidate a `Committed` wrote, the object a resolve read saw after a `Conflict`, or the base a
+hold read and then declined to write. It is dropped
 on `Refused`, on `GaveUp` after a send, and on an exception out of the write; it is unchanged by a
 `GaveUp` that sent nothing. A candidate above the budget is simply not stored. It is never a source
 of truth: every write against it is conditional on its etag, and every refusal rendered on it is
@@ -557,7 +584,7 @@ that runs while a ticket is held (`decide`, `Liveness`, a backend hook) submits 
 - INV-HK5. An item is removed only by its own guard; no item references a stack that may have
   unwound; "a leader takes this item" and "this item's caller leaves" are decided under one mutex
   against one flag and are exclusive; what a parked caller touches of its own operation is
-  disjoint from what the leader touches.
+  disjoint from what the leader touches; a lane is erased only while no item is in its queue.
 - INV-HK6. `CasHotKeys::mutex` is held across no callback, no I/O and no `decide`; the guard
   neither allocates nor throws.
 - INV-HK7. A member's own fence, `Liveness` and lease budget for one write are checked before its
@@ -568,12 +595,14 @@ that runs while a ticket is held (`decide`, `Liveness`, a backend hook) submits 
   engine's own alternatives, a class it is safe to act on and never a stronger one than the
   leader's: the leader's class when the batch's fate is the member's, and `Conflict{NotObserved}`,
   "nothing applied, submit again", when the leader sent nothing.
+- INV-HK9. On the `Generation` dialect, two writes through the lane on one key of one pool start at
+  least `kGenerationWriteSpacingMs` apart on the engine's clock, whatever the first returned.
 
 ### Kinship with `appendRefOps` {#kinship-with-appendrefops}
 
 | | ref-log append lane | hot-key lane |
 |---|---|---|
-| item | `RefMutationItem` with `done`, `error`, `committed_id` under `ref_queue_mutex` | `Item` with `done`, `held`, `outcome` under `CasHotKeys::mutex` |
+| item | `RefMutationItem` with `done`, `error`, `committed_id` under `ref_queue_mutex` | `Item` with `done`, `result`, a held verdict (`held`, `declined`) under `CasHotKeys::mutex` |
 | leader | first to find `leader_active` false; serves until its own item is done | the first item not `done`; one batch per hold |
 | combine | compatible items into one ref-log transaction, `build_ops` run by the leader | queued submissions into one conditional `PUT`, `decide` run by the leader on the chained candidate |
 | failure | a rejection is final per item | every member is told the leader's class and decides again in its own loop |
@@ -616,7 +645,9 @@ The loop ends at the frozen deadline with today's retry-later, through the same 
 `readModifyWrite` has none either, and a cap of `kMaxCatalogCasAttempts` (100) at a flat mean pause
 of 100 ms would end a writer after about ten seconds of cross-pool conflicts, well inside the
 window this change exists to make fair. The bare `op.pause` can overshoot the deadline by at most
-one pause, 200 ms, as the erase's loop already overshoots by one of its own; accepted. `casUpdate`,
+one pause, 200 ms, as the erase's loop already overshoots by one of its own; decided and accepted,
+against a `fits`-checked pause that would need a third `friend` or a new engine verb to save 200 ms
+on a call that is already failing at its 90 s deadline. `casUpdate`,
 `casAdmitEntry` and the five lifecycle functions do not change: their `mutate`s, markers and
 outcomes are the same.
 `casAdmitEntry`'s duplicate-row `LOGICAL_ERROR`, thrown from the grammar check on a cached base, is
@@ -733,6 +764,7 @@ Profile events, mirroring the ref-log lane's `CASRefQueueWaitMicroseconds`:
 - `CASHotKeyCacheStarts` and `CASHotKeyReadStarts`: how a hold obtained its base.
 - `CASHotKeyCacheRefusalsReread`: refusals rendered on the cache and re-rendered on a read.
 - `CASHotKeyBatchNotLanded`: members told a non-`Committed` class by a batch that did not land.
+- `CASHotKeySpacingMilliseconds`: time slept before a write to keep the `Generation` spacing.
 
 One log line, naming the key: a waiter that left on its deadline while a held item was at the
 front, with that item's ticket and how long it has held. It is what makes a stuck holder visible
@@ -865,6 +897,31 @@ Pool level, through the ledger:
 15. A second `Pool` over the same backend as the external writer: the first `Pool`'s next catalog
     mutation costs exactly one extra read and one retry write.
 
+Lane level again, for what this revision added:
+
+16. Declines. A leader's `decide` returns nothing on a fresh read: `Declined{Object}` with that
+    read, no write, the next submission starts from the cache with that object; on an absent key,
+    `Declined{ProvenAbsent}`. On a cached base that an external writer has since replaced: the
+    cache entry is dropped, one read, the `decide` runs again and this time writes; `Committed`,
+    the decline never reported, `CASHotKeyCacheRefusalsReread` 1 (INV-HK3). A member's `decide`
+    returns nothing in a batch that lands: `Declined{seen}` with the landed object, its ticket
+    absent from it, delivered after the commit; in a batch that does not land: `Conflict{seen}`, it
+    re-decides in its next hold, ran exactly twice (INV-HK4). A leader that declines with items
+    queued behind it: no batch, the next item holds and lands.
+17. Spacing (INV-HK9). On a backend reporting the `Generation` dialect, two holds back to back on
+    one key: the second's write starts no earlier than 1000 ms after the first's returned on the
+    synchronized clock, `CASHotKeySpacingMilliseconds` records the sleep, and it holds when the
+    first write returned `Conflict`, `Refused` or threw. On the `ETag` dialect the same two holds
+    sleep nothing. A leader whose remaining window is shorter than the spacing left sleeps only the
+    window and receives `GaveUp{Deadline, sent_any = false}`; its members `Conflict{NotObserved}`.
+    Two keys are not spaced against each other.
+18. Erasure (INV-HK5). `ETag` dialect: after the last item of a key leaves, `laneCountForTest` is
+    0 and `queueDepthForTest` of the key is 0; a hook parks a waiter between its wait slices while
+    the holder leaves, and the waiter's next slice finds its item where it was. `Generation`
+    dialect: the lane outlives its last item until the interval passes, and the next leave on any
+    key erases it; a hold entered within the interval on the erased-then-recreated key is still
+    spaced, because the lane was not erased before the interval passed.
+
 Regression: every existing test in `gtest_cas_ref_catalog.cpp` and its siblings runs unchanged,
 on a `CasRequests` without a pool and therefore without a cache, and must stay green. What they
 count: writes, through `WriteCountingBackend`; none of them counts reads of the catalog key. A lone
@@ -881,10 +938,11 @@ that the catalog API and its write shape were not touched.
 
 - Bringing the GC erase into the lane, with the five prerequisites in [the GC erase](#the-gc-erase):
   a BACKLOG item, the first follow-up.
-- Writing `_ckpt` and `gc/state` through the lane: a BACKLOG item, gated on conditions 3 and 5 of
-  the `decide` contract being checked for `publishCkpt`'s declines and the lease machine.
-- Spacing the lane to a store's documented per-object rate: a BACKLOG item in the `gcs` lane,
-  gated on its acceptance run showing 429s on `ref_catalog`.
+- Writing `_ckpt` and `gc/state` through the lane: a BACKLOG item. With `Decide` the engine's
+  `DecideOnObject`, the change per site is the call, `readModifyWrite` to `submit` in a `Conflict`
+  loop; what gates it is the audit of conditions 1, 3, 5 and 6 named in the contract, and for
+  `publishCkptContribution` that means moving its run counter and decline reason out of captured
+  locals, since the lane runs a `decide` more than once.
 - The GC erase's authority gap across the engine's internal reissue, and its principled closure, a
   TTL on the GC lease: a BACKLOG item, existing today.
 - A whole-request deadline in the S3 transport, which makes a non-answering attempt end on its own
@@ -964,3 +1022,19 @@ read the caller's own gate refuses is delivered as rendered, so `FencedOut` stay
 as decisions rather than fixes: no pacing to GCS's documented rate (the owner's), and the bare
 conflict pause's overshoot of at most 200 ms. Lanes live as long as the object; erasure is a
 prerequisite for per-namespace keys.
+
+Revision 25 settles what revision 24 had recorded as open decisions, with the owner, and answers
+the owner's question why the catalog and `_ckpt` refuse differently. They refuse differently
+because they mean different things: a catalog marker is a verdict with a reason its caller
+branches on, and `publishCkpt`'s nothing-to-write is an idempotent success; both are already
+expressible in the engine's `DecideOnObject`, so the lane's `Decide` is now that type and not a
+narrower one, `Declined` is produced by the lane under the same cached-base and landed-batch rules
+as a refusal, and any `readModifyWrite` site becomes a lane site by changing its call. The three
+decisions, each taken with its cost stated: the `Generation` spacing goes into the lane, ten lines
+before the batch's write, because above the engine it is one place and not the three call sites
+and two result families that made it 150 lines and two review holes inside `readModifyWrite`, and
+because without it one burst on GCS parks the whole queue behind a 5 s transport backoff; the
+200 ms overshoot of the catalog's conflict pause is accepted, as the erase's 5 s already is; idle
+lanes are erased, with the spacing interval as the one thing that keeps an emptied lane alive, so
+per-namespace keys have no prerequisite left in the lane. New: `laneCountForTest`, INV-HK9,
+tests 16 to 18, and the `_ckpt` follow-up names the captured-local counter its `decide` must lose.
