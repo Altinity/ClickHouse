@@ -232,7 +232,7 @@ Create `src/Storages/MergeTree/DataPartsExchangeCasRouting.h`:
 ```cpp
 #pragma once
 
-#include <base/types.h>
+#include <Core/Types_fwd.h>
 
 #include <optional>
 #include <vector>
