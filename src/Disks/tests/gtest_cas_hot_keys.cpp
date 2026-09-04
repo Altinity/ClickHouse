@@ -10,6 +10,9 @@
 
 #include <Common/ProfileEvents.h>
 #include <IO/S3/Client.h>
+
+#include "config.h"
+
 #include <Poco/Exception.h>
 
 #include <atomic>
@@ -625,6 +628,14 @@ TEST(CASHotKeys, TheCacheForgetsWhatItCannotVouchFor)
     EXPECT_EQ(reads(), before + 1);
 #endif
 
+    /// Ticket 2 only lands when the S3-only Refused sub-case above runs it; the terminal bytes below
+    /// follow the same guard.
+#if USE_AWS_S3
+    constexpr auto kFinalBytes = "1,2,3,4,5,6,7";
+#else
+    constexpr auto kFinalBytes = "1,3,4,5,6,7";
+#endif
+
     /// Unresolved after a send: dropped. A single-attempt submission never starts from the cache, so
     /// arming the ambiguity and the resolve-read failure up front would let the hold's own base read
     /// consume them; a one-shot write hook lands both on the write's own resolve read instead.
@@ -669,7 +680,7 @@ TEST(CASHotKeys, TheCacheForgetsWhatItCannotVouchFor)
     hot_keys.cache_fill_hook_for_test = {};
     ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(7))));
     EXPECT_EQ(reads(), before + 1);
-    DB::Cas::tests::expectBytes(*backend, "k", "1,2,3,4,5,6,7");
+    DB::Cas::tests::expectBytes(*backend, "k", kFinalBytes);
 }
 
 TEST(CASHotKeys, TheBudgetBoundsBytesAndEntries)

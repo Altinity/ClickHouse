@@ -152,7 +152,9 @@ void CasHotKeys::leave(const String & key, Item & item, bool entered_hold, uint6
         auto it = lanes.find(key);
         chassert(it != lanes.end());
         Lane & lane = it->second;
-        lane.queue.erase(std::find(lane.queue.begin(), lane.queue.end(), &item));
+        auto found = std::find(lane.queue.begin(), lane.queue.end(), &item);
+        chassert(found != lane.queue.end());
+        lane.queue.erase(found);
         if (entered_hold)
             lane.holder_since_ms.reset();
         else if (!lane.queue.empty() && lane.holder_since_ms)
