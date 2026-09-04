@@ -4190,6 +4190,15 @@ void CasRefLedger::dispatchSnapshotPublisher(const RootNamespace & ns, const std
             }
             catch (...)
             {
+                {
+                    /// Pace the exception exactly like an ordinary non-Committed publish. Every ordinary
+                    /// failure arm inside the attempt arms this backoff before returning; an exception
+                    /// thrown before any of them reaches here with the deadline unarmed, and settlement's
+                    /// ONLY pacing gate is that deadline -- so without this the publisher redispatches at
+                    /// full speed for as long as the fault persists.
+                    std::lock_guard lock(rt->state_mutex);
+                    advancePublishBackoff(*rt);
+                }
                 if (publish_error_hook)
                     publish_error_hook();
                 try

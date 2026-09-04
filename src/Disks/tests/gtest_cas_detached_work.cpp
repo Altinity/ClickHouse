@@ -659,6 +659,66 @@ TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
     store->setSnapshotAfterCaptureHookForTest(nullptr);
 }
 
+/// A publish attempt that throws BEFORE any of the ordinary write-failure arms must pace exactly like
+/// an ordinary failure: settlement's only pacing gate is the publish backoff deadline, so an exception
+/// that leaves it unarmed redispatches the publisher at full speed for as long as the fault persists.
+/// The clock is the injected boot clock, so the schedule is virtual and the test spends no wall time
+/// waiting one out; the one real-time wait is the bounded observation window, because an unpaced
+/// redispatch runs on a background thread and has to be caught in the act rather than waited out.
+TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
+{
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
+    constexpr uint64_t step_ms = 100;
+    std::atomic<uint64_t> fake_boot{1000};
+    std::atomic<uint64_t> error_hook_calls{0};
+    PoolConfig config;
+    config.boot_ms_fn = [&fake_boot] { return fake_boot.load(); };
+    /// Initial == max, so every step of the schedule is the same virtual `step_ms` and the test can
+    /// advance the clock by a constant.
+    config.snapshot_publish_backoff_initial_ms = step_ms;
+    config.snapshot_publish_backoff_max_ms = step_ms;
+    config.publish_error_hook_for_test = [&error_hook_calls] { error_hook_calls.fetch_add(1); };
+    auto store = openPublishingPool(backend, config);
+    const RootNamespace ns{"srv1/throwing_publisher_pacing"};
+
+    std::atomic<uint64_t> attempts{0};
+    store->setSnapshotAfterCaptureHookForTest([&attempts]
+    {
+        attempts.fetch_add(1);
+        throw std::runtime_error("injected: every publish attempt throws before its write");
+    });
+
+    ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
+
+    /// The virtual clock does not move here, so the armed deadline is still in the future for the whole
+    /// window and exactly ONE attempt may have run.
+    const auto observe_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < observe_until && attempts.load() <= 1)
+        std::this_thread::yield();
+    EXPECT_EQ(attempts.load(), 1u) << "the throwing attempt redispatched without arming the publish backoff";
+    EXPECT_GE(error_hook_calls.load(), 1u) << "the injected throw never reached the error handler";
+
+    /// One step of the schedule per iteration: the tail is still over threshold, so each mutation
+    /// re-evaluates admission, and exactly one attempt may pass per elapsed backoff interval.
+    for (uint64_t step = 1; step <= 3; ++step)
+    {
+        fake_boot.fetch_add(step_ms);
+        ASSERT_NO_THROW(publishRef(store, ns, "ref_" + std::to_string(step + 1), step + 1));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (attempts.load() < 1 + step)
+        {
+            ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+                << "the elapsed backoff never admitted the next publish attempt";
+            std::this_thread::yield();
+        }
+        store->waitForSnapshotPublishSettleForTest(ns);
+        EXPECT_EQ(attempts.load(), 1 + step) << "more than one publish attempt ran within one backoff step";
+    }
+
+    EXPECT_EQ(error_hook_calls.load(), attempts.load());
+    store->setSnapshotAfterCaptureHookForTest(nullptr);
+}
+
 /// A publisher asleep in recovery backoff must be woken by the stop, not waited out. The injected
 /// sleep stands in for a long backoff without spending wall-clock time.
 TEST(CASDetachedWork, StopWakesRecoveryBackoffSleep)
