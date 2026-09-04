@@ -46,8 +46,12 @@ struct Declined  { Observation seen; };
 /// A competing write won: the key's current state does not match what this call expected.
 /// `attempts_sent` counts the HTTP attempts this call made, the same count `Committed` and `GaveUp`
 /// carry: an operator's attempt counters sum over ALL the endings of a write, and losing the key is
-/// one an operator wants counted rather than dropped.
-struct Conflict  { Observation seen; uint32_t attempts_sent = 0; };
+/// one an operator wants counted rather than dropped. `any_ambiguous` is true when an attempt of the
+/// inner write ended without proof of whether it applied before the resolve read settled the race: a
+/// caller outside the engine paces such a conflict on the growing schedule, as the engine's own
+/// loops do, and a clean lost race on the flat one. `attempts_sent` cannot stand in for it: a
+/// throttled first attempt whose resolve read finds the key moved is one attempt, ambiguous.
+struct Conflict  { Observation seen; uint32_t attempts_sent = 0; bool any_ambiguous = false; };
 /// The store itself refused the request (not a lost precondition) -- `store_error` is a ClickHouse
 /// error code and `message` explains it. `attempts_sent` is the same count `Conflict` carries, for
 /// the same reason.

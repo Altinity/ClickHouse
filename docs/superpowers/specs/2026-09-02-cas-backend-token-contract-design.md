@@ -361,7 +361,7 @@ using Observation = std::variant<NotObserved, ProvenAbsent, Meta, Object>;   // 
 
 struct Committed { Etag etag; uint32_t attempts_sent; bool resolved_by_read; };
 struct Declined  { Observation seen; };                      // readModifyWrite only: decide returned nullopt; no attempts_sent — a decline is the resolve read's answer, not an attempt's
-struct Conflict  { Observation seen; uint32_t attempts_sent; };
+struct Conflict  { Observation seen; uint32_t attempts_sent; bool any_ambiguous; };   // a competing write won; `any_ambiguous`: an attempt of the inner write was ambiguous before the resolve read settled it
 struct Refused   { int store_error; String message; uint32_t attempts_sent; };      // the store proved this write never applied (the definite-failure whitelist)
 struct GaveUp
 {
@@ -627,9 +627,12 @@ ambiguous inner write is resolved by that same read, scoped to the inner write i
 land as `Committed`; the precondition unchanged is unresolved-but-repeatable and reissues (or, under
 `once`, ends in `GaveUp{Unresolved}`); anything else is a `Conflict` and the next iteration re-decides
 on it. A 404 on the `replace` is a vanish: re-read, and `decide` sees absence;
-deadline or admission are `GaveUp` with `sent_any` and the last observation. Conflicts spend
-the same budget as errors: a hot key is also a failure, and it must end — GCS bounds mutations of one
-object at about one per second, and today's `_ckpt` and catalog loops reissue without a sleep.
+deadline or admission are `GaveUp` with `sent_any` and the last observation. Conflicts spend the
+same deadline as errors but not the same pace: a clean lost race is settled by the resolve read and
+reissued after `Retry::conflictBackoff()`, a flat uniform over [0, 200] ms that does not grow with the
+writer's loss count. The growing schedule belongs to transport faults, and to a conflict that settled
+one. A key several writers of one pool share is written through the hot-key lane, above this engine,
+and never conflicts with itself: see the hot-key write lane.
 
 **The decision encodes the site's terminal conditions.** `readModifyWrite` is not "retry until
 landed"; it is "re-decide until the decision is `nullopt` or lands". A site whose conflict is
@@ -681,14 +684,16 @@ from the code, and the plan's checklist carries it. Rules first, then the sites.
 - A data-plane publish is not a conditional write and cannot be inside a `readModifyWrite`; the loop
   around it stays, its requests named.
 - **A hand-written loop captures one `Retry` before it starts, shares it across every call it makes,
-  and sleeps with the engine's jitter between iterations** (`Retry::backoff(attempt)` is the engine's
-  own helper, exposed for exactly these two sites). The loop ends when that deadline does — never a
+  and sleeps with the engine's jitter between iterations** — the flat `conflictBackoff` after a refused
+  precondition when the loop can tell it from a settled fault, `backoff(attempt)` otherwise and after a
+  fault (`Retry::backoff(attempt)` is the engine's own helper, exposed for exactly these two sites). The
+  loop ends when that deadline does — never a
   hundred unslept iterations against the hot catalog key, and never a hundred ninety-second budgets.
   This makes "conflicts spend the same budget as errors" true everywhere it is stated.
 
 | site | after |
 |---|---|
-| `CasRefCatalog::casUpdateImpl` | `readModifyWrite`, `standard` |
+| `CasRefCatalog::casUpdateImpl` | the hot-key lane's `submit`, under the caller's policy frozen once, `conflictBackoff` between submissions and `backoff` after a conflict that settled a fault; every other result handled as today |
 | `CasRefCatalog::deleteCompletedRemoving` | hand-written over `read` + `replace` + post-write `read` under one shared `standard`, jittered sleep between iterations; outcomes `Deleted` / `ProofRefused` / `EntryChanged` / `FencedOut` (via `op.admitted()`) and the retry-later throw stay. The drain's `Liveness` is not a per-decision read: it is the GC leader's own cached authority flag, refreshed by one `gc/state` read before every erase attempt and again before the drain-complete verdict is reported — a stale cache would let a deposed leader erase a row, or report completion on an authority it lost since its last erase, so both refreshes are fail-closed |
 | `PoolMeta::admitOrValidate` | `readModifyWrite`, `standard` — bounded for free (the livelock closes) |
 | `PoolMeta::createOrValidate` | `read`, `standard`; on absence `create`; on conflict the row above — the steady-state open stays one `GET` |

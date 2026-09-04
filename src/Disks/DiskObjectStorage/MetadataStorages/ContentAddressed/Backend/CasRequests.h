@@ -122,6 +122,7 @@ namespace detail
 /// The engine's per-attempt counters, behind functions so the header need not declare the events.
 void recordAttempt();
 void recordReissue();
+void recordConflictPause();
 }
 
 class CasOperation;
@@ -348,6 +349,10 @@ private:
     /// Admission, then the jittered sleep. A value means the call ended during it; nullopt means the
     /// caller may send another attempt.
     std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry::Bound & bound);
+    /// The sibling for a clean lost race: the same admission and the same reservation, a flat
+    /// `Retry::conflictBackoff` sleep, and `state.reissues` untouched, so a transport fault that follows
+    /// starts its own schedule at the beginning.
+    std::optional<WriteResult> pauseForConflict(WriteState & state, const Retry::Bound & bound);
 
     /// `sleep_ms` plus `envelopes` attempt reservations, saturating.
     uint64_t reservedFor(uint64_t sleep_ms, uint32_t envelopes) const;
