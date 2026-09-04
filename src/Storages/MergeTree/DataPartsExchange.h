@@ -113,6 +113,10 @@ public:
         const String & tmp_prefix_ = "",
         std::optional<CurrentlySubmergingEmergingTagger> * tagger_ptr = nullptr,
         bool try_zero_copy = true,
+        /// The target disk when the CALLER has already decided it (zero-copy `MOVE` re-fetching a shared
+        /// part onto the move's destination); never overridden. When absent, a content-addressed relink
+        /// offer decides the disk — the policy disk on the sender's pool — ahead of the storage policy's
+        /// own placement; otherwise the ordinary reservation does.
         DiskPtr dest_disk = nullptr,
         /// CAS fetch-by-relink (spec §B66b): may this request advertise its content-addressed pool
         /// identity, i.e. may the sender answer with a relink offer instead of the part's bytes?

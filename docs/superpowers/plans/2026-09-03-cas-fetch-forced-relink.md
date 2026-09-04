@@ -22,7 +22,7 @@
 - Comments and docs: functions written as `f`, not `f()`, when naming the function itself; literal names in backticks; comments keep the REASON and carry no plan/backlog/spec provenance ("Task 3", "rev.2", "CAS-134" do not belong in code comments).
 - gtest suites for content-addressed code MUST be named `CAS…` — the gate filter is exactly `--gtest_filter='CAS*'`; never widen it.
 - Build: `cd build && ninja clickhouse unit_tests_dbms > ninja_<task>.log 2>&1` — no `-j`, no `nproc`; output always redirected into the build dir; have a subagent (cheap model, medium effort) read the log and return only the summary. Confirm the binary is the one you built before trusting a green test (`ls -la --time-style=full-iso build/programs/clickhouse`).
-- Tests: every run redirected to `build/test_<name>.log`; a subagent summarizes. Integration: `python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test test_cas_replicated_relink > build/test_integration_<task>.log 2>&1` from the repo root (`ci/tmp/clickhouse` → `build/programs/clickhouse`, already symlinked; `--test` takes ONE space-separated list). Unit: `build/src/unit_tests_dbms --gtest_filter='CASRelink*' > build/test_gtest_<task>.log 2>&1`.
+- Tests: every run redirected to `build/test_<name>.log`; a subagent summarizes. Integration: `python3 -m ci.praktika run "integration" --test test_cas_replicated_relink > build/test_integration_<task>.log 2>&1` from the repo root (`ci/tmp/clickhouse` → `build/programs/clickhouse`, already symlinked; `--test` takes ONE space-separated list). Unit: `build/src/unit_tests_dbms --gtest_filter='CASRelink*' > build/test_gtest_<task>.log 2>&1`.
 - Docs under `docs/`: every header carries an explicit `{#kebab-anchor}`; new files need the frontmatter block.
 - No new MergeTree/server setting. No change to `IContentAddressedExchange`. No liveness predicate (spec §decisions, last two rows).
 - Log lines that existing tests grep for MUST keep their text: `Sending part {} by relink`, `Relink of part {} onto disk {} finished (no bytes transferred).`, `Download of part {} onto disk {} finished.`, `Failpoint cas_relink_receiver_force_mechanism_failure: abandoning the relink of part {}`.
@@ -232,7 +232,7 @@ Create `src/Storages/MergeTree/DataPartsExchangeCasRouting.h`:
 ```cpp
 #pragma once
 
-#include <base/types.h>
+#include <Core/Types_fwd.h>
 
 #include <optional>
 #include <vector>
@@ -617,7 +617,7 @@ Run: `cd build && ninja clickhouse unit_tests_dbms > ninja_task2.log 2>&1; echo 
 
 - [ ] **Step 6: Run the existing relink suite — behaviour must be unchanged**
 
-Run: `python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test test_cas_replicated_relink > build/test_integration_task2.log 2>&1; echo EXIT=$? >> build/test_integration_task2.log`
+Run: `python3 -m ci.praktika run "integration" --test test_cas_replicated_relink > build/test_integration_task2.log 2>&1; echo EXIT=$? >> build/test_integration_task2.log`
 Expected (subagent reads the log): all 11 existing tests `PASSED`, `EXIT=0`. In particular `test_replicated_fetch_by_relink` and `test_confirm_refuses_when_source_dropped_in_window` (the confirm routing path) are green.
 
 - [ ] **Step 7: Commit**
@@ -645,7 +645,7 @@ git branch --show-current && git log -1 --stat
 
 **Files:**
 - Create: `tests/integration/test_cas_replicated_relink/configs/storage_conf_tiered.xml`
-- Modify: `tests/integration/test_cas_replicated_relink/test.py` (fixture `main_configs` for node2 at lines 67-76; one helper after `active_part_names`; six new tests appended after `test_stalled_publish_protects_source_blobs_and_commits_nothing`)
+- Modify: `tests/integration/test_cas_replicated_relink/test.py` (fixture `main_configs` for node2 at lines 67-76; one helper after `active_part_names`; seven new tests appended after `test_stalled_publish_protects_source_blobs_and_commits_nothing`)
 - Modify: `src/Storages/MergeTree/DataPartsExchange.cpp:693-725` (advertise), `:786-790` (after the cookie reads), `:803-808` (reservation), `:881-933` (relink block head and post-check)
 - Modify: `src/Storages/MergeTree/DataPartsExchange.h:120-131` (the `dest_disk`/`allow_ca_relink` comment)
 
@@ -740,7 +740,7 @@ def detached_part_disk(node, table, part):
     ).strip()
 ```
 
-- [ ] **Step 2: Write the six failing integration tests**
+- [ ] **Step 2: Write the seven failing integration tests**
 
 Append to `test.py`:
 
@@ -756,7 +756,10 @@ Append to `test.py`:
 def _fetch_via_queue(node1, node2, table, node2_policy, create_sql=None):
     """INSERT on node1 while node2's fetches are stopped, then let node2 fetch exactly that one part.
 
-    Returns the part name. `create_sql` overrides the table DDL (it must contain `{policy}` and `{zk}`).
+    Returns `(part, blobs_before)`: the part name and the pool's blob keys as they were AFTER the
+    insert on node1 and BEFORE node2 fetched — the only snapshot `assert_no_new_blobs` can be measured
+    against, since the insert itself writes the part's blobs. `create_sql` overrides the table DDL (it
+    must contain `{policy}` and `{zk}`).
     """
     drop_everywhere(table)
     if create_sql is None:
@@ -768,9 +771,10 @@ def _fetch_via_queue(node1, node2, table, node2_policy, create_sql=None):
     node2.query("SYSTEM STOP FETCHES {}".format(table))
     insert_rows(node1, table, 0)
     part = active_part_names(node1, table)[0]
+    blobs_before = blob_keys()
     node2.query("SYSTEM START FETCHES {}".format(table))
     node2.query("SYSTEM SYNC REPLICA {}".format(table), timeout=90)
-    return part
+    return part, blobs_before
 
 
 def test_tiered_policy_relinks_onto_cas_over_volume_order():
@@ -780,9 +784,8 @@ def test_tiered_policy_relinks_onto_cas_over_volume_order():
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
     table = "tiered_order"
-    blobs_before = blob_keys()
 
-    part = _fetch_via_queue(node1, node2, table, TIERED_STORAGE_POLICY)
+    part, blobs_before = _fetch_via_queue(node1, node2, table, TIERED_STORAGE_POLICY)
 
     assert_relinked(node2, table, part)
     assert part_disk(node2, table, part) == CA_DISK
@@ -804,7 +807,7 @@ def test_relink_carries_projection_under_tiered_policy():
         "SETTINGS storage_policy = '{policy}'"
     )
 
-    part = _fetch_via_queue(node1, node2, table, TIERED_STORAGE_POLICY, create_sql=create_sql)
+    part, _ = _fetch_via_queue(node1, node2, table, TIERED_STORAGE_POLICY, create_sql=create_sql)
 
     assert_relinked(node2, table, part)
     assert part_disk(node2, table, part) == CA_DISK
@@ -823,9 +826,8 @@ def test_two_pool_policy_relinks_into_second_pool():
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
     table = "two_pools"
-    blobs_before = blob_keys()
 
-    part = _fetch_via_queue(node1, node2, table, TWO_POOLS_STORAGE_POLICY)
+    part, blobs_before = _fetch_via_queue(node1, node2, table, TWO_POOLS_STORAGE_POLICY)
 
     assert_relinked(node2, table, part)
     assert part_disk(node2, table, part) == CA_DISK
@@ -930,13 +932,13 @@ def test_offer_without_pool_cookie_resolves_to_single_advertised_pool():
     node1.query("SYSTEM ENABLE FAILPOINT cas_relink_sender_omit_pool_cookie")
     try:
         one_pool = "omit_cookie_one"
-        part = _fetch_via_queue(node1, node2, one_pool, TIERED_STORAGE_POLICY)
+        part, _ = _fetch_via_queue(node1, node2, one_pool, TIERED_STORAGE_POLICY)
         assert_relinked(node2, one_pool, part)
         assert part_disk(node2, one_pool, part) == CA_DISK
         drop_everywhere(one_pool)
 
         two_pools = "omit_cookie_two"
-        part = _fetch_via_queue(node1, node2, two_pools, TWO_POOLS_STORAGE_POLICY)
+        part, _ = _fetch_via_queue(node1, node2, two_pools, TWO_POOLS_STORAGE_POLICY)
         assert_byte_downloaded(node2, two_pools, part, disk=OTHER_CA_DISK)
         assert part_disk(node2, two_pools, part) == OTHER_CA_DISK
         assert len(log_lines(node1, relink_offer_pattern(two_pools, part))) == 1
@@ -947,7 +949,7 @@ def test_offer_without_pool_cookie_resolves_to_single_advertised_pool():
 
 - [ ] **Step 3: Run the new tests to verify they fail against the Task 2 binary**
 
-Run: `python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test "test_cas_replicated_relink/test.py::test_tiered_policy_relinks_onto_cas_over_volume_order test_cas_replicated_relink/test.py::test_two_pool_policy_relinks_into_second_pool" > build/test_integration_task3_red.log 2>&1; echo EXIT=$? >> build/test_integration_task3_red.log`
+Run: `python3 -m ci.praktika run "integration" --test "test_cas_replicated_relink/test.py::test_tiered_policy_relinks_onto_cas_over_volume_order test_cas_replicated_relink/test.py::test_two_pool_policy_relinks_into_second_pool" > build/test_integration_task3_red.log 2>&1; echo EXIT=$? >> build/test_integration_task3_red.log`
 Expected: both FAIL — the tiered one on `assert_relinked` (the log shows `Download of part ... onto disk default finished`), the two-pool one likewise with `disk_cas_other`. If praktika's `--test` does not accept `::` selectors, run the whole directory and read the two names in the summary.
 
 - [ ] **Step 4: Replace the receiver's advertise block**
@@ -1161,10 +1163,10 @@ In `src/Storages/MergeTree/DataPartsExchange.h`, the parameter `DiskPtr dest_dis
 
 Run: `cd build && ninja clickhouse > ninja_task3.log 2>&1; echo NINJA_EXIT=$? >> ninja_task3.log` — subagent summary; expected `NINJA_EXIT=0`, no new warnings (an unused-variable warning for `remote_fs_metadata` or `advertised_pool_uuid` means a leftover from Step 4/7).
 
-- [ ] **Step 10: Run the whole relink suite — the six new tests and the eleven old ones**
+- [ ] **Step 10: Run the whole relink suite — the seven new tests and the eleven old ones**
 
-Run: `python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test test_cas_replicated_relink > build/test_integration_task3.log 2>&1; echo EXIT=$? >> build/test_integration_task3.log`
-Expected (subagent): 17 `PASSED`, `EXIT=0`. If `test_relink_carries_projection_under_tiered_policy` alone fails, that is a pre-existing projection-relink defect, not this task's — report it, do not paper over it, and continue with the other sixteen green.
+Run: `python3 -m ci.praktika run "integration" --test test_cas_replicated_relink > build/test_integration_task3.log 2>&1; echo EXIT=$? >> build/test_integration_task3.log`
+Expected (subagent): 18 `PASSED`, `EXIT=0`. If `test_relink_carries_projection_under_tiered_policy` alone fails, that is a pre-existing projection-relink defect, not this task's — report it, do not paper over it, and continue with the other sixteen green.
 
 - [ ] **Step 11: Commit**
 
@@ -1178,7 +1180,7 @@ disk independently; the offer survived only when the two coincided. Now the
 sender's cas_pool_uuid cookie names the pool, the forced disk is resolved
 from the response headers before the reservation, and the reservation goes
 to it — ahead of volume order, JBOD balancing and TTL move rules. A pool
-disk that is not live is still the target and fails closed. Six integration
+disk that is not live is still the target and fails closed. Seven integration
 tests: tiered policy, projection, two pools (closes CAS-134), mechanism
 fallback on the forced disk, detached fetch, and the E1/absent-cookie arms.
 
@@ -1210,7 +1212,7 @@ def test_relink_wins_over_ttl_then_mover_converges():
     node2 around the fetch so the intermediate placement is observable, exactly as `test_ttl_move` does.
 
     `IF EXISTS` precedes the disk name in the grammar. It is there for node1, whose policy has no
-    `default` disk: without it every reservation on node1 would log a warning about the missing disk.
+    `default` disk: without it `CREATE TABLE` on node1 fails with `BAD_TTL_EXPRESSION`.
     """
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -1260,8 +1262,8 @@ def test_relink_wins_over_ttl_then_mover_converges():
 
 - [ ] **Step 2: Run it**
 
-Run: `python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test test_cas_replicated_relink > build/test_integration_task4.log 2>&1; echo EXIT=$? >> build/test_integration_task4.log`
-Expected (subagent): 18 `PASSED`, `EXIT=0`. If the move never happens within 120 s, read node2's log for `Would like to reserve space on disk 'default'` (a reservation problem on the local disk) or `moving` errors before touching the timeout.
+Run: `python3 -m ci.praktika run "integration" --test test_cas_replicated_relink > build/test_integration_task4.log 2>&1; echo EXIT=$? >> build/test_integration_task4.log`
+Expected (subagent): 19 `PASSED`, `EXIT=0`. If the move never happens within 120 s, read node2's log for `Would like to reserve space on disk 'default'` (a reservation problem on the local disk) or `moving` errors before touching the timeout.
 
 - [ ] **Step 3: Commit**
 
@@ -1399,11 +1401,11 @@ Run: `build/src/unit_tests_dbms --gtest_filter='CAS*' > build/test_gtest_task6.l
 
 - [ ] **Step 2: The relink integration suite, whole**
 
-Run: `python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test test_cas_replicated_relink > build/test_integration_task6.log 2>&1; echo EXIT=$? >> build/test_integration_task6.log` — expected 18 `PASSED`.
+Run: `python3 -m ci.praktika run "integration" --test test_cas_replicated_relink > build/test_integration_task6.log 2>&1; echo EXIT=$? >> build/test_integration_task6.log` — expected 19 `PASSED`.
 
 - [ ] **Step 3: Neighbouring relink consumers**
 
-Run: `python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test "test_cas_gcs_relink_liveness test_cas_drop_pool_member" > build/test_integration_task6_neighbours.log 2>&1; echo EXIT=$? >> build/test_integration_task6_neighbours.log` — both suites relink over a single-disk policy; the one-element advertise is byte-for-byte the old one, so both must stay green. (`test_cas_gcs_relink_liveness` runs against the fake GCS server bundled with the test; if the harness cannot start it locally, say so in the report rather than skipping silently.)
+Run: `python3 -m ci.praktika run "integration" --test "test_cas_gcs_relink_liveness test_cas_drop_pool_member" > build/test_integration_task6_neighbours.log 2>&1; echo EXIT=$? >> build/test_integration_task6_neighbours.log` — both suites relink over a single-disk policy; the one-element advertise is byte-for-byte the old one, so both must stay green. (`test_cas_gcs_relink_liveness` runs against the fake GCS server bundled with the test; if the harness cannot start it locally, say so in the report rather than skipping silently.)
 
 - [ ] **Step 4: Report**
 
