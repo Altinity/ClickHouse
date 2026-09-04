@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 7. Brainstormed 2026-09-04 against the measurements in
+Revision 8. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
 supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
@@ -56,6 +56,14 @@ Revision history, kept because each step removed something a review proved unsou
   nested reads legitimately run for their own windows; it never fires without an active holder.
   The `Generation` dialect gets per-key spacing of write attempts to the store's documented one
   mutation per second. Guarantees are stated per plane, and the tests cover the marker matrix.
+- Revision 8 removes the wedge escape: its lifetime and spacing semantics kept growing, and the
+  honest statement of the stalled-holder case (fail-stop, recovered by the attempt's own end)
+  costs nothing. The memory has one source, an opted-in call's own committed candidate; a resolve
+  read's bytes are never remembered, so stale memory can never carry another writer's malformed
+  object into a corruption verdict. `reconcileStaleCreator` and `cancelStalledCreating`, which read
+  inside `decide` after matching the row, do not opt in; the three hot decisions do. The
+  `Generation` spacing sleep is budgeted like every engine sleep, removal verbs keep their
+  exception-based refusals, and the GC authority window is described as it is.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -159,7 +167,6 @@ private:
     {
         std::deque<uint64_t> tickets;                /// guarded by `mutex`; front = the holder or the next holder
         bool holder_active = false;                  /// guarded by `mutex`
-        uint64_t attempt_started_ms = 0;             /// guarded by `mutex`; the holder's transport attempt in flight, 0 if none
         uint64_t last_write_attempt_end_ms = 0;      /// guarded by `mutex`; for the Generation dialect's spacing
         std::condition_variable cv;
         std::optional<Object> remembered;            /// guarded by `mutex`; the last object this plane committed
@@ -186,12 +193,13 @@ as `_ckpt` is declared hot; that declaration brings it.
 ### The open plane stays out {#the-open-plane-stays-out}
 
 The GC erase runs on `openRequests()` under a `Liveness` closure that returns a cached flag, and
-the reconciler refreshes that flag by one `gc/state` read at the top of every erase attempt,
-immediately before the `replace`. That refresh is the authority argument of the GC drain: the gap
-between it and the `PUT` is a few instructions. A ticket would put a wait in that gap, and a leader
-deposed during the wait would still erase when its turn came, because the engine's gate consults
-the cached flag, not the store. Mount-plane writers have no such gap: their fence is three atomics
-the engine re-reads before every attempt, so a wait cannot stale it.
+the reconciler refreshes that flag by one `gc/state` read at the top of every erase attempt. That
+refresh is the authority argument of the GC drain. Between it and the `replace` today there is
+only local work, the exactness check, the copy, the erase and the encode of the catalog, and no
+I/O and no wait; the engine's gate before the `PUT` consults the cached flag, not the store. A
+ticket would put an unbounded wait in that gap, and a leader deposed during the wait would still
+erase when its turn came. Mount-plane writers have no such flag: their fence is three atomics the
+engine re-reads before every attempt, so a wait cannot stale it.
 
 So the open plane has no lane. Consequences, all of them today's behaviour:
 
@@ -209,14 +217,14 @@ So the open plane has no lane. Consequences, all of them today's behaviour:
 
 Participation is by predicate, decided by the owner of the `CasRequests`, never by the call site.
 
-What memory is and is not. `remembered` is the last object this plane committed, or the last
-object the engine's resolve read saw after a lost race. Either was the durable state at some
-moment. Neither is an observation of this call, and neither is guaranteed newer than an
-observation a caller made outside the lane: `dropNamespaceImpl` reads the catalog fresh, sees a
-`Live` row another server created, and calls `beginRemoving` on it; the lane's memory may predate
-that row. A `decide` that refuses on such a base (the catalog's markers, or a `nullopt`) would be
-reporting a verdict about a state the store has left, and with no write sent nothing would catch
-it.
+What memory is and is not. `remembered` is the candidate an opted-in `readModifyWrite` of this
+plane last committed: bytes this plane encoded, and the etag the store returned for them. It was
+the durable state at the moment of that commit. It is not an observation of this call, and it is
+not guaranteed newer than an observation a caller made outside the lane: `dropNamespaceImpl` reads
+the catalog fresh, sees a `Live` row another server created, and calls `beginRemoving` on it; the
+lane's memory may predate that row. A `decide` that refuses on such a base (the catalog's markers,
+or a `nullopt`) would be reporting a verdict about a state the store has left, and with no write
+sent nothing would catch it.
 
 The rule that closes it: **a `nullopt` from `decide` is reported as `Declined` only when it was
 rendered on an observation of this call**, a `GET` or the resolve read after a `Conflict`. A
@@ -243,15 +251,24 @@ it is thrown. This is the one change inside `CasRefCatalog.cpp`, and no signatur
 **Memory is opt-in per call site, not per key.** The ticket applies to every write on a hot key;
 the memory start applies only where the caller asks for it, `readModifyWrite(key, decide, policy,
 MemoryStart::Allowed)`, with `Never` the default. A site may opt in only after an audit shows that
-every exception its `decide` can throw is either independent of `current` or carried as `nullopt`.
-The audit for the catalog: the five lifecycle decisions, `createNamespaceStep1`,
-`completeCreation`, `reconcileStaleCreator`, `beginRemoving` and `cancelStalledCreating`, refuse
-only through the four markers and the admission refusal, all captured; `casUpdate` and
-`casAdmitEntry` do not opt in, because `casAdmitEntry` reports a duplicate row as the
-`LOGICAL_ERROR` of `encodeRefCatalog`'s grammar check, by design, and a row that GC has since
-erased would raise it falsely from memory where today's `GET` sees absence and admits. Those two
-have no production caller and stay read-first; they still take a ticket. `casUpdateImpl` carries
-the choice as an internal parameter its public callers set.
+every exception its `decide` can throw is either independent of `current` or carried as `nullopt`,
+and that `decide` does no I/O after consulting `current`. The audit for the catalog:
+
+- `createNamespaceStep1`, `completeCreation` and `beginRemoving` opt in. Each refuses only through
+  a marker or the admission refusal, all captured, and does no I/O inside `decide` beyond
+  `op.admitted()`, which reads atomics. These are the writes behind `CREATE TABLE` (steps 1 and 3)
+  and `DROP TABLE`.
+- `reconcileStaleCreator` and `cancelStalledCreating` do not opt in. After matching the row they
+  call `isCreatorFenceTerminal`, a backend read, inside `decide`; on stale memory that read would
+  run where today's fresh observation returns `EntryChanged` without it, and its transport failure
+  would become the caller's result. They are rare (a stalled creation) and stay read-first.
+- `casUpdate` and `casAdmitEntry` do not opt in. `casAdmitEntry` reports a duplicate row as the
+  `LOGICAL_ERROR` of `encodeRefCatalog`'s grammar check, by design, and a row that GC has since
+  erased would raise it falsely from memory where today's `GET` sees absence and admits. Both have
+  no production caller.
+
+Every one of them still takes a ticket. `casUpdateImpl` carries the choice as an internal
+parameter its public callers set.
 
 With that rule the safety of the lane does not depend on what a `decide` does with `current`. The
 contract a participating site must meet is mechanical:
@@ -278,7 +295,10 @@ candidate, are written by operations that do carry closures, and are not declare
 
 The lane is a FIFO ticket with a deadline. Every write verb on a hot key, `create`, `replace`,
 `remove`, `removeCurrent`, `readModifyWrite` and `readModifyWriteOnPresence`, does the following
-around its existing body. Nothing runs under `mutex` except the steps marked.
+around its existing body. Nothing runs under `mutex` except the steps marked. A refusal while
+waiting is reported in the verb's own result family: the `WriteResult` verbs return the `GaveUp`
+named below; `remove` and `removeCurrent`, which return `Removal`, throw the same fence or
+deadline exception their read-class loops throw today for the same condition.
 
 **Enter.** The caller binds its policy to an absolute deadline on the engine's clock
 (`policy.bind(now)`), as every verb does today at entry, so time spent waiting spends the caller's
@@ -301,25 +321,21 @@ normal path.
    mutex because it may call the operation's `Liveness` closure, and the lane mutex must stay a
    leaf that calls nothing.
 2. Under `mutex`: if the ticket is at the front and `holder_active` is false, set
-   `holder_active = true` and leave the loop as the holder. Otherwise, if `holder_active` is true
-   and the holder's transport attempt is stuck (`attempt_started_ms != 0` and the engine's clock is
-   past it by more than twice the backend's attempt timeout, on a backend that has one), the lane
-   is wedged (below): erase this ticket, clear the memory, and leave the loop un-ticketed.
-   Otherwise `cv.wait_for(lock, slice)` with a short slice (the pattern of
-   `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the mutex, and go to step 1.
+   `holder_active = true` and leave the loop as the holder. Otherwise `cv.wait_for(lock, slice)`
+   with a short slice (the pattern of `recovery_cv.wait_for(lock, 200ms)` in the ledger), release
+   the mutex, and go to step 1. The clock is read in step 1, never under the mutex.
 
 A ticket is promoted only after its checks passed in the same iteration. The engine's own
 per-attempt gate and `fits` still run before anything is sent, as today.
 
 **Hold.** Run the verb's body on the caller's own thread, with the caller's own operation, policy,
-bound and result type, exactly as today, plus the memory step below. While the ticket is held, the
-operation carries a pointer to the lane, and every transport attempt it makes, on any key (its own
-write, its resolve reads, the reads a `decide` issues), records `attempt_started_ms` before the
-call and clears it after, under `mutex`, through a scope guard so an attempt that throws clears it
-too; the ticket guard clears it as well. That is the only signal the wedge escape reads. On the
-`Generation` dialect, a write attempt on the hot key additionally waits, through the plane's
-interruptible sleep, until one second after `last_write_attempt_end_ms`, and records its own end
-there (see [Half 2](#half-2-conflict-pacing)).
+bound and result type, exactly as today, plus the memory step below. On the `Generation` dialect,
+each write attempt on the hot key is preceded by the spacing wait of
+[Half 2](#half-2-conflict-pacing): the holder snapshots `last_write_attempt_end_ms` under
+`mutex`, computes the delay outside it, and before sleeping runs the engine's own pre-sleep check,
+`gate(reservedFor(delay, 2))` and `fits`, exactly as `pauseAndReissue` does, so the sleep never
+starts unless the sleep and the attempt after it fit the operation's bound; a refusal there is the
+engine's usual `GaveUp`. After the attempt ends, successful or not, it records its end there.
 
 **Leave.** The ticket guard, on every exit: under `mutex`, move the prepared memory value into
 `remembered` or clear it (a holder that unwinds clears), erase this ticket, set
@@ -333,21 +349,21 @@ every exit path, and nothing else references it.
 
 ### The memory {#the-memory}
 
-**Memory rule.** After any write verb on a hot key ends: `Committed` remembers the bytes that verb
-wrote and the etag it got; a `Conflict` whose resolve read saw an `Object` remembers that object;
-`Removed`, `Gone`, `Mismatch`, `Refused`, `GaveUp`, `Declined` and every exception forget. Those are
-the only two sources; an ordinary `read` never reads or writes the memory, and absence is never
-remembered. A `GaveUp{FenceLost}` after a landed `PUT` also forgets: the memory is a hint, and
-forgetting is the fail-close direction.
+**Memory rule.** After any write verb on a hot key ends: a `Committed` of an opted-in
+`readModifyWrite` remembers the candidate that call encoded and the etag the store returned for
+it; every other ending of every verb forgets. That is the only source. Bytes that came from the
+store, a resolve read's `Conflict::seen` among them, are never remembered: another writer's
+malformed object, remembered and then repaired in the store, would otherwise reach an opted-in
+`decide` as a stale base and become a corruption verdict where today's observation sees the
+repair. A `create` or `replace` that commits forgets too: its bytes are the caller's, not a
+candidate this loop encoded, and the next opted-in call pays one read for it. An ordinary `read`
+never reads or writes the memory, and absence is never remembered. A `GaveUp{FenceLost}` after a
+landed `PUT` forgets: the memory is a hint, and forgetting is the fail-close direction.
 
 **Preparing the value.** The `(bytes, etag)` pair is assembled outside the mutex, before the leave
-guard, and never by moving from the `WriteResult` the caller receives: a `Committed`'s etag is
-copied, a `Conflict`'s memory is copied from the engine's own `WriteState::last_seen` and the
-returned `Conflict::seen` stays intact, `GaveUp::last_seen` is never sourced from memory. The bytes
-are the engine's own candidate string for `readModifyWrite` (moved, since the engine owns it) and a
-copy of the caller's bytes for `create` and `replace`, taken before the attempt is sent (a copy that
-fails is a plain exception before any attempt, as an allocation in the verb's body is today). If the
-value cannot be assembled, the guard forgets. The guard only moves.
+guard: the bytes by moving the engine's own candidate string, which the engine owns once `decide`
+returned it, and the etag by copying from the `Committed` the caller will receive, which stays
+intact. If the copy fails, the guard forgets. The guard only moves.
 
 **Where memory is used.** Only `readModifyWrite`, and only for a call that passed
 `MemoryStart::Allowed`. Its body gains one optional input, the remembered object, used in place of
@@ -364,7 +380,8 @@ its initial observation:
    at most once per call, and the first `nullopt` is discarded without being seen by anyone: it was
    rendered on a hint. An exception from `decide` propagates, whatever the base.
 3. The inner write and the `Conflict` loop are today's, with the pause of Half 2. A `Conflict`'s
-   resolve read is an observation, so what `decide` renders on it is a result.
+   resolve read is an observation, so what `decide` renders on it is a result; the object it saw
+   drives the re-decide, as today, and is not remembered.
 
 `create`, `replace`, `remove`, `removeCurrent`, `readModifyWriteOnPresence` and a
 `readModifyWrite` that did not opt in never start from memory. They take a ticket, run as today,
@@ -390,24 +407,22 @@ write are checked against.
 A stopping plane or a lost fence reaches waiters through their own gate, checked every slice, and
 reaches the holder through its own attempts' gates, as today.
 
-**A stalled holder, and the wedge escape.** The engine calls the transport synchronously and
-cannot cancel it. A stalled attempt ends at the backend's attempt timeout, which the engine reserves
-per attempt; an attempt that trickles rather than stalls has no bound, today or after the backend
-request contract, and today it traps only its own caller. In the lane it would trap the key. So the
-lane gives exclusivity up before it gives liveness up, and it does so on the one signal that
-distinguishes a trickle from legitimate work: a single transport attempt that has run longer than
-the backend's attempt timeout. A holder's `decide` may issue reads whose windows are its own
-(`isCreatorFenceTerminal` reads under a fresh `Retry::standard()`), so the hold's total length is
-not a wedge signal; the length of one attempt is, because no healthy attempt outlives its timeout.
-A waiter that finds the holder's current attempt older than twice that timeout treats the lane as
-wedged: it erases its ticket, clears the memory, and runs its verb un-ticketed, exactly as on a
-cold key, with a fresh observation and its own conditional `PUT`. This is safe because exclusivity
-was never the safety argument; the precondition is. The stuck write may still land later, or first,
-and whichever of the two loses its precondition is settled by its resolve read, as any two servers'
-writes are. When the stuck holder finally returns, its guard erases its ticket and clears
-`holder_active`, and the lane is a lane again. The escape never fires without an active holder, and
-never on a backend without an attempt timeout (the in-memory backend reports none). Nothing is
-forced and nothing is cancelled; the degraded mode is today's behaviour.
+**A stalled holder.** The engine calls the transport synchronously and cannot cancel it. A
+stalled attempt ends at the backend's attempt timeout, which the engine reserves per attempt. An
+attempt that trickles rather than stalls, delivering bytes slowly enough that no socket timeout
+fires, has no bound in the engine, today or after the backend request contract, and the S3
+transport's request timeouts are per socket operation, not per request. Today such an attempt
+traps only its own caller and its query. In the lane it traps the hot key on this plane: every
+later catalog writer waits to its own deadline and reports the same typed retry-later the trapped
+writer would, and `CREATE`/`DROP` on this pool fail with that error until the attempt ends. The
+attempt ends when the transport returns, when the connection is closed by either side, or when
+the process restarts; nothing in the lane ends it, because nothing in the engine can. This is
+accepted as fail-stop: nothing lands that should not, no second write is started under a running
+first one, and the failure mode is observable (`CASHotKeyQueueWaitMicroseconds` climbs while
+`CASRequestAttempt` on the key does not). A holder lease that hands exclusivity to a waiter while
+the first write is still running was designed and rejected: it is safe under the precondition,
+but its lifetime and spacing rules cost more than the trickle case is worth, and a trickle that
+defeats every socket timeout is a transport fault to fix in the transport.
 
 ### Lock order {#lock-order}
 
@@ -434,16 +449,17 @@ ledger-visible reads and a waiter must not hold what the holder needs. Today's c
 ### Invariants {#invariants}
 
 - INV-HK1. Per `CasRequests` and hot key, at most one conditional write is in flight at any
-  moment, outside the wedge escape. The mount plane is the only plane with hot keys, so per pool
-  at most one mount-plane write is in flight per hot key; an open-plane write, another pool's
-  write, or an escaped write may overlap it, and the precondition orders those, as today.
+  moment. The mount plane is the only plane with hot keys, so per pool at most one mount-plane
+  write is in flight per hot key; an open-plane write or another pool's write may overlap it, and
+  the precondition orders those, as today.
 - INV-HK2. Writes of one plane to a hot key are applied in arrival order.
-- INV-HK3. A `readModifyWrite` that follows a `Committed` of this plane on a hot key, with no
-  other ending in between, obtains its base from memory and issues no read for it. A lost race's
-  resolve read is not a base read and is unchanged.
-- INV-HK4. The memory of a hot key is either absent or a `(bytes, etag)` pair that was durable at
-  some moment, taken from a `Committed` of this plane or from the engine's resolve read. It never
-  changes the semantics of a conditional write: a stale memory costs one 412 and one resolve read.
+- INV-HK3. An opted-in `readModifyWrite` that follows a `Committed` of an opted-in
+  `readModifyWrite` of this plane on a hot key, with no other ending in between, obtains its base
+  from memory and issues no read for it. A lost race's resolve read is not a base read and is
+  unchanged.
+- INV-HK4. The memory of a hot key is either absent or a `(bytes, etag)` pair this plane encoded
+  and committed, durable at the moment of that commit. It never changes the semantics of a
+  conditional write: a stale memory costs one 412 and one resolve read.
 - INV-HK5. A `nullopt` from `decide` reaches its caller as `Declined` only when it was rendered on
   an observation of that call; an exception from `decide` reaches its caller unchanged, whatever
   the base, and no write is sent after it.
@@ -453,12 +469,9 @@ ledger-visible reads and a waiter must not hold what the holder needs. Today's c
   guard neither allocates nor throws.
 - INV-HK8. A waiter is promoted to holder only in an iteration whose gate and bound checks passed,
   and a memory start passes the same one-attempt gate and `fits` an observation would.
-- INV-HK9. A holder whose single transport attempt has outlived twice the backend's attempt
-  timeout loses exclusivity: waiters write un-ticketed and the precondition alone orders the
-  writes. The escape never fires without an active holder or on a backend without an attempt
-  timeout.
-- INV-HK10. On the `Generation` dialect, write attempts on a hot key from one plane are at least
-  one second apart.
+- INV-HK9. On the `Generation` dialect, write attempts on a hot key from one plane are at least
+  one second apart, and the spacing sleep starts only when it and the attempt after it fit the
+  operation's bound.
 
 ### Effects to name {#effects-to-name}
 
@@ -593,20 +606,25 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    call's ticket (the fresh bytes and their etag stayed paired through the re-decide), and that
    the write after that starts from memory with zero reads. A sibling makes the resolve read the
    call's last act (a `once` policy): the returned `Conflict::seen` carries the object, and the next
-   `readModifyWrite` starts from memory with zero reads (INV-HK4, the conflict source, with the
-   caller's observation intact).
+   `readModifyWrite` reads, because a resolve read's bytes are never remembered (INV-HK4). A
+   second sibling has the external writer store malformed bytes, then repair them, between two
+   opted-in calls of the first plane: the second call reads and commits, and no corruption verdict
+   is raised.
 4a. The marker matrix, in `gtest_cas_ref_catalog.cpp` through a hot `CasRequests`. For each of
-   `createNamespaceStep1` (already present), `completeCreation`, `reconcileStaleCreator`,
-   `beginRemoving`, `cancelStalledCreating` (entry mismatch, fence moved, creator still live) and
-   the admission refusal: one case where memory is stale and the refusal would be false (an
-   external `CasRequests` changed the row, or GC-shaped erase freed capacity) asserting the same
-   positive outcome a cold key gives, and one case where the refusal is true on the observation
-   asserting the same outcome and error class a cold key gives, with one read and no write. Plus:
-   `casAdmitEntry` of a namespace whose remembered row an external erase removed admits it (it is
-   read-first), and a `decide` that throws decode corruption on memory propagates that exception
-   with no second read and no write (INV-HK5).
-5. Forgetting. `Refused` from a hook, a thrown `writeLoop`, a `remove`, and a `GaveUp{FenceLost}`
-   after a landed `PUT` each clear the memory: the next write reads first.
+   the opted-in decisions, `createNamespaceStep1` (already present), `completeCreation` (entry
+   mismatch, fence moved) and `beginRemoving` (entry mismatch, fence moved), and the admission
+   refusal: one case where memory is stale and the refusal would be false (an external
+   `CasRequests` changed the row, or an open-plane erase freed capacity) asserting the same positive
+   outcome a cold key gives, and one case where the refusal is true on the observation asserting
+   the same outcome and error class a cold key gives, with one read and no write. Plus:
+   `reconcileStaleCreator`, `cancelStalledCreating` and `casAdmitEntry` each read first on a hot
+   key with memory present (one read, `CASHotKeyMemoryStarts` unchanged), and a `decide` that
+   throws decode corruption on memory propagates that exception with no second read and no write
+   (INV-HK5).
+5. Forgetting. `Refused` from a hook, a thrown `writeLoop`, a `remove`, a committed `replace`,
+   and a `GaveUp{FenceLost}` after a landed `PUT` each clear the memory: the next opted-in write
+   reads first. A `remove` and a `removeCurrent` refused while waiting throw the same exception
+   class their loops throw today for a lost fence or a passed deadline.
 6. Waiters leave on their own. While the holder is parked inside its `decide`'s nested read: a
    waiter whose fake-clock deadline passes leaves with `GaveUp{Deadline}` carrying its own source
    and sends nothing; a waiter whose fence is tripped leaves with `GaveUp{FenceLost}`; a waiter
@@ -622,23 +640,21 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
 7a. Exceptional exits. A `Liveness` closure that throws from the gate, and a `decide` that throws a
    non-verdict exception on memory. Assert: the exception reaches the caller unchanged, no write was
    sent for the second, the ticket is gone, and the next waiter is promoted (INV-HK6).
-7b. Wedge escape. On a backend reporting an attempt timeout, the holder is parked inside a `PUT`
-   that never returns; the clock is advanced past twice the timeout. Assert: the next waiter
-   proceeds un-ticketed with a fresh read and lands; when the parked `PUT` is released it is refused
-   and settled by its resolve read; the lane is exclusive again afterwards (a third writer waits
-   for a fourth). Siblings: the first ticket is parked between enqueue and promotion (no holder
-   yet) and the second ticket waits rather than escaping; the holder is parked inside a `decide`
-   (no attempt in flight) past any length and the waiter does not escape; the backend reports no
-   attempt timeout and the waiter does not escape (INV-HK9).
+7b. Stalled holder. The holder is parked inside a `PUT` that does not return; the clock is
+   advanced past every waiter's deadline. Assert: each waiter leaves with its own `GaveUp`, no
+   second write was started, the queue is empty, and when the `PUT` is finally released the holder
+   commits and the next writer proceeds normally (fail-stop, then recovery).
 7c. Generation spacing. On a backend whose dialect is `Generation`, N writes through the lane:
    assert consecutive write attempts on the key are at least one second apart on the clock, that
-   the sleeps went through the plane's sleep function, and that a fence tripped during the spacing
-   sleep ends the waiter with `GaveUp{FenceLost}` and no attempt (INV-HK10). On the `ETag` dialect
-   the same test records no spacing sleep.
+   the sleeps went through the plane's sleep function, that a fence tripped during the spacing
+   sleep ends the holder with `GaveUp{FenceLost}` and no attempt, and that a holder whose bound
+   cannot fit the sleep plus one attempt (plain, frozen and lease-bound policies) gives up before
+   sleeping (INV-HK9). On the `ETag` dialect the same test records no spacing sleep.
 8. Open plane overlaps. A second `CasRequests` with no predicate (the open-plane shape) does a
    `replace` while the hot plane's holder is parked; it does not wait; whichever write is refused is
-   settled by its resolve read; after an open-plane win the hot plane's next `readModifyWrite` pays
-   exactly one resolve read and one retry write.
+   settled by its resolve read; after an open-plane win the hot plane's next opted-in
+   `readModifyWrite` pays exactly one resolve read and one retry write, and the one after that
+   reads again, because a resolve read is never remembered.
 9. Half 2, clean conflict. One writer loses K clean races in a row (a hook mutates the key before
    every attempt). Assert `CASRequestConflictPause` advanced K times, `CASRequestReissue` not at
    all, and every recorded sleep is at most 200 ms.
@@ -677,6 +693,10 @@ tests already cover each marker and the admission refusal against a cold key.
 - Ticketing the GC erase: a BACKLOG note. It needs the reconciler's authority refresh to run after
   the ticket is held and before the `PUT`, which is a hook the engine does not offer; the benefit
   is one avoided 412 per GC erase.
+- Remembering a resolve read's object, so that one external conflict costs one read rather than
+  two: a BACKLOG note, gated on validating the bytes (a decode) before remembering them.
+- A holder lease that hands exclusivity on after a stuck attempt: rejected, see
+  [a stalled holder](#deadlines-and-fences); revisit only with evidence of a trickling transport.
 - Declaring the `_ckpt` keys hot, with the memory bound that many hot keys need: a BACKLOG item.
 - Bounding the reads a catalog `decide` issues (`isCreatorFenceTerminal` under a frozen policy): a
   BACKLOG item.
