@@ -2293,20 +2293,42 @@ TEST(CASRefCatalog, ATrueRefusalCreateNamespaceStep1SeesASuperseder)
                                 .incarnation = observed.incarnation, .removal_started_round = 9};
     ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
               CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
-    /// Admitted directly, rather than through a full `createNamespace` (which would also run
-    /// `completeCreation` and land "a" Live): the store must hold a plain Creating row under
-    /// `other_creator`, the shape this matrix row names.
+    /// The store now carries no row for "a"; the pool's cache still holds its own stale "a" Live from
+    /// the first `createNamespace` above. `createNamespace`'s own pre-check read is unconditional and
+    /// always fresh, so if the rival lands its row BEFORE this call, the pre-check alone would already
+    /// return `Superseded` and step 1 -- the lane -- would never run. The rival instead lands INSIDE
+    /// the window `setCreateNamespaceStep1PreReadHookForTest` names: after the pre-check already saw
+    /// nothing, but before step 1's own (lane) read. `createNamespaceStep1`'s decide then runs first
+    /// against the CACHED hint (still "a" Live) -- which already has a row for "a", so it throws
+    /// immediately without ever reaching the store -- and that verdict-on-a-hint is dropped: the lane
+    /// re-reads for real and decides again, this time seeing the rival's fresh row, and throws again.
+    /// That second throw is the one that reaches `createNamespace`.
     const CreatorFence other_creator{.server_root_id = "other", .writer_epoch = 1, .fence_generation = 1};
     CatalogEntry other_creating = entryInState("a", NsState::Creating, 5);
     other_creating.creator = other_creator;
-    CasRefCatalog::casAdmitEntry(other, layout, 1, other_creating);
+    CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest([&]
+    {
+        CasRefCatalog::casAdmitEntry(other, layout, 1, other_creating);
+    });
 
-    /// The pool's cache still holds its own stale "a" (deleted above); this second create races the
-    /// namespace against a fresh Creating row from a different creator, which the pre-check read in
-    /// `createNamespace` always sees fresh -- the case this row of the matrix documents does not need
-    /// the lane's own cache to differ from the store to prove.
+    /// The hook's own admission is a real write on the SAME shared backend the pool uses, so a raw
+    /// backend read/write count taken across this call would count the rival's own IO alongside the
+    /// lane's -- `CASHotKeyCacheVerdictsReread` does not: it increments only when a CACHED hint's
+    /// verdict is dropped and re-decided, which the rival's cache-less admission (its own private,
+    /// budget-0 `CasHotKeys`) never does, so it isolates the lane's own contribution cleanly.
+    const uint64_t rereads_before = eventCount(ProfileEvents::CASHotKeyCacheVerdictsReread);
     EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
               CasRefCatalog::NamespaceCreationOutcome::Superseded);
+    EXPECT_EQ(eventCount(ProfileEvents::CASHotKeyCacheVerdictsReread) - rereads_before, 1u)
+        << "one lane read: the cached hint's verdict was dropped and redecided on a fresh read";
+
+    /// No write of ours landed: the row for "a" is exactly what the rival left it as.
+    const CasRefCatalog::Snapshot snap_after = CasRefCatalog::read(other, layout);
+    const CatalogEntry * after = &snap_after.catalog.entries.at(0);
+    EXPECT_EQ(after->state, NsState::Creating);
+    ASSERT_TRUE(after->creator.has_value());
+    EXPECT_EQ(*after->creator, other_creator);
+    EXPECT_EQ(after->incarnation, other_creating.incarnation);
 }
 
 /// completeCreation: the cache holds "a" Creating (incarnation 1) matching the store's row for "a",
@@ -2617,14 +2639,22 @@ TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
     /// are still on the catalog when the second starts, and re-admitting the same namespace would
     /// duplicate it rather than race it.
     constexpr int K = 3;
+    /// The settled-fault scenario draws 8, not 3: an upper-bound-only check on `backoff`'s draws
+    /// cannot tell the growing schedule from the flat one (both stay under 200 ms plenty often at
+    /// small K), so that scenario also needs a floor. With `backoff(attempt) = uniform(0, min(5000,
+    /// 200 << (attempt-1)))`, the flat schedule can NEVER draw over 200 ms, so a single draw over
+    /// 200 ms is proof by itself that the schedule grew; drawing 8 times keeps the growing schedule's
+    /// own chance of missing that floor purely by bad luck around 2^-28.
+    constexpr int K2 = 8;
     int moved = 0;
+    int limit = K;
     bool inside = false;
     bool ambiguous = false;
     String prefix = "x";
     uint64_t incarnation_base = 10;
     f.backend->onBeforeWrite(key, [&]
     {
-        if (inside || moved >= K)
+        if (inside || moved >= limit)
             return;
         inside = true;
         CasRefCatalog::casAdmitEntry(other, layout, 1, liveEntry(prefix + std::to_string(moved), incarnation_base + moved));
@@ -2646,16 +2676,23 @@ TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
         EXPECT_LE(s, 200u);
     EXPECT_EQ(eventCount(ProfileEvents::CASRequestConflictPause) - pauses_before, 0u) << "the lane's caller pauses itself; the engine's counter is for its own loops";
 
-    /// K conflicts that each settled a fault: the growing schedule, on the loop's own count.
+    /// K2 conflicts that each settled a fault: the growing schedule, on the loop's own count. An
+    /// upper-bound check alone is satisfied by the flat schedule too (its draws are a subset of the
+    /// growing schedule's early-attempt range), so this also asserts a floor: at least one draw over
+    /// 200 ms, which the flat schedule can never produce.
     f.clock.sleeps.clear();
     moved = 0;
+    limit = K2;
     ambiguous = true;
     prefix = "y";
     incarnation_base = 20;
     CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });
-    ASSERT_EQ(f.clock.sleeps.size(), static_cast<size_t>(K));
+    ASSERT_EQ(f.clock.sleeps.size(), static_cast<size_t>(K2));
     for (size_t i = 0; i < f.clock.sleeps.size(); ++i)
         EXPECT_LE(f.clock.sleeps[i], std::min<uint64_t>(5000, 200ull << i));
+    EXPECT_TRUE(std::any_of(f.clock.sleeps.begin(), f.clock.sleeps.end(), [](uint64_t s) { return s > 200u; }))
+        << "the flat schedule can never draw over 200 ms; a growing schedule almost certainly does "
+           "somewhere in 8 draws, so this is what tells the two schedules apart";
 }
 
 TEST(CASRefCatalog, TheGCEraseRacesTheLaneAsItRacesEverything)
