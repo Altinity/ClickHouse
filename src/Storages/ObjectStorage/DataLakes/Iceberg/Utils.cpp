@@ -9,6 +9,7 @@
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeCustom.h>
+#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -517,7 +518,7 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
 }
 
 /// Returns type and required
-std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter)
+std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version)
 {
     switch (type->getTypeId())
     {
@@ -544,8 +545,30 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         case TypeIndex::Date32:
             return {"date", true};
         case TypeIndex::DateTime:
-        case TypeIndex::DateTime64:
             return {"timestamp", true};
+        case TypeIndex::DateTime64:
+        {
+            /// Iceberg `timestamp` is microseconds; `timestamp_ns` is nanoseconds and is
+            /// allowed only in format version 3. Writing it into v1/v2 metadata is invalid.
+            const auto scale = getDecimalScale(*type);
+            if (scale == 9)
+            {
+                if (format_version < 3)
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Iceberg type {} requires format version 3 or higher, got version {}",
+                        type->getName(),
+                        format_version);
+
+                auto date_time64 = std::static_pointer_cast<const DataTypeDateTime64>(type);
+                if (date_time64->hasExplicitTimeZone())
+                    return {Iceberg::f_timestamptz_ns, true};
+                return {Iceberg::f_timestamp_ns, true};
+            }
+            if (scale <= 6)
+                return {Iceberg::f_timestamp, true};
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+        }
         case TypeIndex::Time:
             return {"time", true};
         case TypeIndex::Time64:
@@ -581,7 +604,7 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
                 Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
                 field->set(Iceberg::f_id, ++iter_fields);
                 field->set(Iceberg::f_name, type_tuple->getNameByPosition(iter_names));
-                auto child_type = getIcebergType(element->getNormalizedType(), iter);
+                auto child_type = getIcebergType(element->getNormalizedType(), iter, format_version);
                 field->set(Iceberg::f_required, child_type.second);
                 field->set(Iceberg::f_type, child_type.first);
                 fields->add(field);
@@ -597,7 +620,7 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
 
             field->set(Iceberg::f_type, "list");
             field->set(Iceberg::f_element_id, ++iter);
-            auto child_type = getIcebergType(type_array->getNestedType(), iter);
+            auto child_type = getIcebergType(type_array->getNestedType(), iter, format_version);
             field->set(Iceberg::f_required, false);
             field->set(Iceberg::f_element, child_type.first);
             field->set(Iceberg::f_element_required, child_type.second);
@@ -612,8 +635,8 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
             field->set(Iceberg::f_key_id, ++iter);
             field->set(Iceberg::f_value_id, ++iter);
 
-            field->set(Iceberg::f_key, getIcebergType(type_map->getKeyType(), iter).first);
-            auto value_type = getIcebergType(type_map->getValueType(), iter);
+            field->set(Iceberg::f_key, getIcebergType(type_map->getKeyType(), iter, format_version).first);
+            auto value_type = getIcebergType(type_map->getValueType(), iter, format_version);
             field->set(Iceberg::f_value, value_type.first);
             field->set(Iceberg::f_value_required, value_type.second);
             return {field, true};
@@ -621,7 +644,7 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         case TypeIndex::Nullable:
         {
             auto type_nullable = std::static_pointer_cast<const DataTypeNullable>(type);
-            return {getIcebergType(type_nullable->getNestedType(), iter).first, false};
+            return {getIcebergType(type_nullable->getNestedType(), iter, format_version).first, false};
         }
         case TypeIndex::Variant:
         {
@@ -1036,7 +1059,7 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
         Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
         field->set(Iceberg::f_id, ++iter_for_initial_columns);
         field->set(Iceberg::f_name, column.name);
-        auto type = getIcebergType(column.type, iter);
+        auto type = getIcebergType(column.type, iter, format_version);
         field->set(Iceberg::f_required, type.second);
         field->set(Iceberg::f_type, type.first);
         column_name_to_source_id[column.name] = iter_for_initial_columns;
