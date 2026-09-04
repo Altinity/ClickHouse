@@ -62,6 +62,9 @@ struct StreamLocalLimits;
 class EnabledQuota;
 struct SelectQueryInfo;
 
+/// Declared opaquely (definition in Core/SettingsEnums.h) to keep this widely included header light.
+enum class MergeTreePartExportFileAlreadyExistsPolicy : uint8_t;
+
 using NameDependencies = std::unordered_map<String, std::vector<String>>;
 using DatabaseAndTableName = std::pair<String, String>;
 
@@ -459,7 +462,7 @@ It is currently only implemented in StorageObjectStorage.
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
         const std::function<void(const std::string &)> & /* new_file_path_callback */,
-        bool /* overwrite_if_exists */,
+        MergeTreePartExportFileAlreadyExistsPolicy /* file_already_exists_policy */,
         std::size_t /* max_bytes_per_file */,
         std::size_t /* max_rows_per_file */,
         const std::optional<std::string> & /* iceberg_metadata_json_string */,
