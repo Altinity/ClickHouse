@@ -298,6 +298,7 @@ std::optional<UInt64> StorageObjectStorageCluster::totalBytes(ContextPtr query_c
     return configuration->totalBytes(query_context);
 }
 
+
 bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function)
 {
     // Change table engine on table function for distributed request
@@ -545,6 +546,57 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     }
     if (object_storage_type_arg)
         args.insert(args.end(), object_storage_type_arg);
+}
+
+ASTPtr StorageObjectStorageCluster::buildClusterTableFunctionAST(
+    const String & cluster_name, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context)
+{
+    if (cluster_name.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "buildClusterTableFunctionAST requires a non-empty cluster name for {}", getStorageID().getNameForLogs());
+
+    /// A throwaway single-table "SELECT ... FROM <this storage>" query, run through the same
+    /// updateQueryToSendIfNeeded()/updateQueryForDistributedEngineIfNeeded() rewrite already proven correct for
+    /// the leftmost-table (q17) dispatch, instead of duplicating their argument-construction logic (access
+    /// data, structure/format, dynamic storage type, *Cluster name mapping) here. The synthetic query's only
+    /// table expression is unambiguously this storage, so position-0 lookup inside updateQueryForDistributedEngineIfNeeded
+    /// is exact -- no name/StorageID search needed.
+    ASTPtr database_and_table_name = make_intrusive<ASTTableIdentifier>(getStorageID());
+
+    auto table_expression = make_intrusive<ASTTableExpression>();
+    table_expression->database_and_table_name = database_and_table_name;
+    table_expression->children.push_back(database_and_table_name);
+    ASTPtr table_expression_ast = table_expression;
+
+    auto tables_element = make_intrusive<ASTTablesInSelectQueryElement>();
+    tables_element->table_expression = table_expression_ast;
+    tables_element->children.push_back(table_expression_ast);
+    ASTPtr tables_element_ast = tables_element;
+
+    auto tables = make_intrusive<ASTTablesInSelectQuery>();
+    tables->children.push_back(tables_element_ast);
+    ASTPtr tables_ast = tables;
+
+    auto synthetic_query = make_intrusive<ASTSelectQuery>();
+    synthetic_query->setExpression(ASTSelectQuery::Expression::TABLES, ASTPtr(tables_ast));
+    ASTPtr synthetic_query_ast = synthetic_query;
+
+    /// getClusterName()/getOriginalClusterName() may well be empty here (e.g. for a driver nested below a CTE,
+    /// whose own resolution scope never got parallel_replicas_for_cluster_engines -- see
+    /// findObjectStorageClusterWholeQueryDriver in findParallelReplicasQuery.cpp). Pin it to the explicit
+    /// cluster_name via a context copy scoped to just this call, so updateQueryToSendIfNeeded()'s internal
+    /// getClusterName(context) calls resolve to what the caller actually asked for.
+    auto scoped_context = Context::createCopy(context);
+    scoped_context->setSetting("object_storage_cluster", cluster_name);
+
+    updateQueryToSendIfNeeded(synthetic_query_ast, storage_snapshot, scoped_context, /*make_cluster_function*/ true);
+
+    auto * rewritten_table_expression = tables->children[0]->as<ASTTablesInSelectQueryElement>()->table_expression->as<ASTTableExpression>();
+    if (!rewritten_table_expression || !rewritten_table_expression->table_function)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "buildClusterTableFunctionAST failed to produce a table function for {}", getStorageID().getNameForLogs());
+
+    return rewritten_table_expression->table_function;
 }
 
 void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextPtr query_context)

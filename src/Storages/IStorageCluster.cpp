@@ -468,6 +468,7 @@ void IStorageCluster::read(
     data.remote_table.database = context->getCurrentDatabase();
     data.remote_table.table = getName();
     RestoreQualifiedNamesVisitor(data).visit(query_to_send);
+
     AddDefaultDatabaseVisitor visitor(context, context->getCurrentDatabase(),
                                       /* only_replace_current_database_function_= */false,
                                       /* only_replace_in_join_= */true);
@@ -487,6 +488,91 @@ void IStorageCluster::read(
         sample_block,
         std::move(this_ptr),
         std::move(query_to_send),
+        processed_stage,
+        cluster,
+        log,
+        external_tables);
+
+    query_plan.addStep(std::move(reading));
+}
+
+/// EXPERIMENTAL PROTOTYPE (see object_storage_cluster_bypass_join_wrap in PlannerJoinTree.cpp / §3.4-3.6 in
+/// ICEBERG_JOIN_EXPERIMENT.md): entry point for the whole-query object-storage-cluster dispatch
+/// (buildQueryPlanForObjectStorageCluster in findParallelReplicasQuery.cpp), where the caller has already done
+/// everything read() normally does before constructing ReadFromCluster:
+///   - the driver TableNode has already been replaced, at the QueryTree level via cloneAndReplace(), with a
+///     TableFunctionNode for this storage's own *Cluster table-function form (built by
+///     StorageObjectStorageCluster::buildClusterTableFunctionAST()), so prepared_query_to_send already has the
+///     cluster function sitting at its correct (possibly deeply-nested-under-CTEs) position;
+///   - because that replacement rebinds every ColumnNode's column_source pointer structurally (see
+///     IQueryTreeNode::cloneAndReplace()), every identifier in prepared_query_to_send is already correctly
+///     qualified -- RestoreQualifiedNamesVisitor's string-based alias-to-remote-name rewrite is unnecessary
+///     (and would be wrong here, since this storage is no longer the query's own first table expression);
+///   - sample_block is the header of the *whole* prepared query (computed by the caller via
+///     InterpreterSelectQueryAnalyzer::getSampleBlock on the replaced query tree), not this storage's own
+///     physical columns.
+/// This storage (the original txnlog-equivalent StorageObjectStorageCluster) is still what ReadFromCluster
+/// holds and calls getTaskIteratorExtension() on -- it alone owns the file listing / task-iterator logic that
+/// partitions work across workers; the JOIN/GROUP BY the workers see comes entirely from prepared_query_to_send.
+void IStorageCluster::readPreparedClusterQuery(
+    QueryPlan & query_plan,
+    const Names & column_names,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info,
+    ContextPtr context,
+    SharedHeader sample_block,
+    ASTPtr prepared_query_to_send,
+    QueryProcessingStage::Enum processed_stage,
+    const String & dispatch_cluster_name)
+{
+    if (dispatch_cluster_name.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "readPreparedClusterQuery requires a non-empty cluster name for {}", getStorageID().getNameForLogs());
+
+    updateConfigurationIfNeeded(context);
+    storage_snapshot->check(column_names);
+
+    const auto & settings = context->getSettingsRef();
+    auto cluster = getClusterImpl(context, dispatch_cluster_name, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
+
+    AddDefaultDatabaseVisitor visitor(context, context->getCurrentDatabase(),
+                                      /* only_replace_current_database_function_= */false,
+                                      /* only_replace_in_join_= */true);
+    visitor.visit(prepared_query_to_send);
+
+    auto this_ptr = std::static_pointer_cast<IStorageCluster>(shared_from_this());
+
+    std::optional<Tables> external_tables = std::nullopt;
+    if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
+        external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
+
+    /// This ReadFromCluster represents dispatch of the *entire* prepared remote query (built by
+    /// buildQueryPlanForObjectStorageCluster()), not a normal single-table read -- there is no per-table
+    /// Planner/PlannerContext for prepared_query_to_send's replaced table-function node (it was only
+    /// header-analyzed via getSampleBlockAndPlannerContext(), never actually planned as its own table
+    /// expression -- that only happens on the remote worker). query_info.planner_context, as passed in, is
+    /// scoped to the *outer* query tree, not to the replaced node, so
+    /// SelectQueryInfo::buildNodeNameToInputNodeColumn() -- called from SourceStepWithFilter::applyFilters()
+    /// during query plan optimization -- would look up query_info.table_expression in a planner context that
+    /// never registered it, throwing LOGICAL_ERROR "... is not registered in planner context". Clear both
+    /// (external_tables is already captured above, from the same planner_context, and passed to
+    /// ReadFromCluster separately) so buildNodeNameToInputNodeColumn() takes its guarded `if (planner_context)`
+    /// early-out and returns an empty map instead -- the same degraded-but-safe path
+    /// SourceStepWithFilterBase::applyFilters() always uses for storages with no QueryTree/planner context at
+    /// all. This only affects how the locally-built filter_actions_dag names its input columns; it does not
+    /// affect getTaskIteratorExtension() (uses driver_storage/storage_snapshot passed directly to read()) or
+    /// correctness of the query workers execute (that comes entirely from prepared_query_to_send).
+    query_info.table_expression.reset();
+    query_info.planner_context.reset();
+
+    auto reading = std::make_unique<ReadFromCluster>(
+        column_names,
+        query_info,
+        storage_snapshot,
+        context,
+        std::move(sample_block),
+        std::move(this_ptr),
+        std::move(prepared_query_to_send),
         processed_stage,
         cluster,
         log,

@@ -1971,6 +1971,39 @@ JoinTreeQueryPlan buildQueryPlanForArrayJoinNode(const QueryTreeNodePtr & array_
 
 }
 
+namespace
+{
+
+/// EXPERIMENTAL (see object_storage_cluster_bypass_join_wrap): capability check for the IStorageCluster
+/// leftmost-table wrap bypass below. The bypass hands the whole JOIN query to the leftmost IStorageCluster's
+/// own read() (see IStorageCluster.cpp), which forwards it to remote nodes using AST-level rewriting/qualified-
+/// name restoration. That machinery only works when every *other* table expression in the same flattened join
+/// scope needs no further recursive planning of its own -- i.e. rejects a QUERY/UNION node (a CTE or subquery,
+/// e.g. IcebergBench q2/q4/q13/q16's `appinfo_d`) wherever it appears in the scope, since that's a query
+/// boundary read()'s AST rewriting cannot safely serialize. Structural JOIN/CROSS_JOIN/ARRAY_JOIN nodes that
+/// buildTableExpressionsStack() also leaves in the flattened stack are allowed through (they're not table
+/// expressions, and getNodeType() already distinguishes them from QUERY/UNION, so no special-casing is needed
+/// for them here). Confirmed live: bypassing unconditionally for the QueryNode-RHS shape produces
+/// "Not found column __tableN.appinfo_app in block" instead of a clean error. Keyed purely on QueryTreeNodeType,
+/// not on query/table/CTE names, so it generalizes to any query with this shape.
+bool canBypassClusterJoinWrapForTableExpressions(const QueryTreeNodes & table_expressions_stack)
+{
+    /// table_expressions_stack[0] is always the leftmost table expression itself (buildTableExpressionsStack()
+    /// walks left-to-right, depth-first); every other entry is either another table expression in the same
+    /// scope or a structural JOIN/CROSS_JOIN/ARRAY_JOIN node (which getNodeType() distinguishes from QUERY/UNION
+    /// automatically, so no special-casing is needed here).
+    for (size_t i = 1; i < table_expressions_stack.size(); ++i)
+    {
+        auto node_type = table_expressions_stack[i]->getNodeType();
+        if (node_type == QueryTreeNodeType::QUERY || node_type == QueryTreeNodeType::UNION)
+            return false;
+    }
+
+    return true;
+}
+
+}
+
 JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     const SelectQueryInfo & select_query_info,
     SelectQueryOptions & select_query_options,
@@ -2109,27 +2142,38 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     bool should_wrap_left_table = false;
     bool has_multiple_tables = table_expressions_stack.size() > 1;
 
-    /// EXPERIMENTAL A/B SETTING (not for production): bypasses the IStorageCluster wrapping guard
-    /// so object-storage-cluster sources (e.g. StorageObjectStorageCluster / Iceberg) can receive
-    /// the full JOIN query and execute JOIN + partial aggregation on the workers instead of the
-    /// initiator. See object_storage_cluster_join_mode in IStorageCluster.cpp for the remote-side
-    /// handling. Off by default; enable per-query with SETTINGS object_storage_cluster_bypass_join_wrap=1.
-    bool experimental_bypass_cluster_join_wrap =
-        planner_context->getQueryContext()->getSettingsRef()[Setting::object_storage_cluster_bypass_join_wrap];
-
-    if (has_multiple_tables && !experimental_bypass_cluster_join_wrap)
+    // Get the actual storage to check its type
+    const IStorageCluster * left_storage_cluster = nullptr;
+    if (has_multiple_tables)
     {
-        // Get the actual storage to check its type
         auto * table_node = left_table_expression->as<TableNode>();
         auto * table_function_node = left_table_expression->as<TableFunctionNode>();
 
         if (table_node || table_function_node)
         {
             const auto & storage = table_node ? table_node->getStorage() : table_function_node->getStorage();
-            // Only wrap if it's specifically IStorageCluster, not StorageDistributed or other remote storages
-            should_wrap_left_table = (dynamic_cast<const IStorageCluster *>(storage.get()) != nullptr);
+            // Only relevant if it's specifically IStorageCluster, not StorageDistributed or other remote storages
+            left_storage_cluster = dynamic_cast<const IStorageCluster *>(storage.get());
         }
     }
+
+    /// EXPERIMENTAL A/B SETTING (not for production): bypasses the IStorageCluster wrapping guard
+    /// so object-storage-cluster sources (e.g. StorageObjectStorageCluster / Iceberg) can receive
+    /// the full JOIN query and execute JOIN + partial aggregation on the workers instead of the
+    /// initiator. See object_storage_cluster_join_mode in IStorageCluster.cpp for the remote-side
+    /// handling. Off by default; enable per-query with SETTINGS object_storage_cluster_bypass_join_wrap=1.
+    ///
+    /// Capability-gated (see canBypassClusterJoinWrapForTableExpressions() above): only bypasses when the
+    /// driver is directly an IStorageCluster AND every other table expression in this JOIN scope is a plain
+    /// TableNode/TableFunctionNode. A QueryNode/UnionNode RHS (a CTE/subquery) keeps the original wrapping
+    /// behavior instead of being (incorrectly) forwarded whole to IStorageCluster::read().
+    bool experimental_bypass_cluster_join_wrap =
+        left_storage_cluster != nullptr
+        && planner_context->getQueryContext()->getSettingsRef()[Setting::object_storage_cluster_bypass_join_wrap]
+        && canBypassClusterJoinWrapForTableExpressions(table_expressions_stack);
+
+    if (has_multiple_tables && !experimental_bypass_cluster_join_wrap)
+        should_wrap_left_table = (left_storage_cluster != nullptr);
 
     auto left_table_expression_query_plan = buildQueryPlanForTableExpression(
         left_table_expression,

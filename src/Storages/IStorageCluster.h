@@ -42,6 +42,24 @@ public:
 
     ClusterPtr getCluster(ContextPtr context) const { return getClusterImpl(context, cluster_name); }
 
+    /// EXPERIMENTAL PROTOTYPE (see object_storage_cluster_bypass_join_wrap): entry point for a caller that has
+    /// already built the complete query to dispatch -- including replacing this storage's own driver TableNode
+    /// with its *Cluster table-function form at the QueryTree level (see
+    /// StorageObjectStorageCluster::buildClusterTableFunctionAST(), findParallelReplicasQuery.cpp's
+    /// buildQueryPlanForObjectStorageCluster()) -- so none of read()'s own query-rewriting
+    /// (updateQueryToSendIfNeeded(), RestoreQualifiedNamesVisitor) is needed or correct to repeat. This storage
+    /// is still what owns the task-iterator/file-listing logic ReadFromCluster calls into.
+    void readPreparedClusterQuery(
+        QueryPlan & query_plan,
+        const Names & column_names,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        SharedHeader sample_block,
+        ASTPtr prepared_query_to_send,
+        QueryProcessingStage::Enum processed_stage,
+        const String & dispatch_cluster_name);
+
     /// Query is needed for pruning by virtual columns (_file, _path)
     virtual RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node * predicate,

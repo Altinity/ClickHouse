@@ -1919,6 +1919,14 @@ Planner::Planner(const QueryTreeNodePtr & query_tree_,
             findTableUnionForParallelReplicas(query_tree, select_query_options),
             collectFiltersForAnalysis(query_tree, select_query_options, post_filter_))))
 {
+    /// EXPERIMENTAL, DIAGNOSTIC ONLY (see object_storage_cluster_bypass_join_wrap): no-op unless that setting
+    /// is enabled; purely observes (via LOG_WARNING) whether the parallel-replicas candidate traversal above
+    /// -- run again here with eligibility relaxed to IStorageCluster -- would have found a distributable
+    /// whole-query candidate and driver table the same way it does for MergeTree. Does not affect
+    /// planner_context or query execution. Restricted to the outermost (non-subquery) Planner invocation
+    /// inside the function itself, since this constructor also runs for each recursively-planned subquery.
+    if (!select_query_options.only_analyze)
+        logObjectStorageClusterParallelReplicasCandidate(query_tree, planner_context->getQueryContext(), select_query_options);
 }
 
 Planner::Planner(const QueryTreeNodePtr & query_tree_,
@@ -2296,6 +2304,18 @@ void Planner::buildPlanForQueryNode()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node)
     {
         join_tree_query_plan = buildQueryPlanForParallelReplicas(query_node, planner_context, select_query_info.storage_limits);
+    }
+    else if (QueryTreeNodePtr object_storage_cluster_driver = select_query_options.only_analyze
+                 ? nullptr
+                 : findObjectStorageClusterWholeQueryDriver(query_tree, query_context))
+    {
+        /// EXPERIMENTAL PROTOTYPE (see object_storage_cluster_bypass_join_wrap, §3.4 in
+        /// ICEBERG_JOIN_EXPERIMENT.md): whole-query dispatch for an IStorageCluster driver nested below a
+        /// CTE/subquery (e.g. IcebergBench q21) that PlannerJoinTree.cpp's existing leftmost-table bypass
+        /// (§3.1) can't reach -- analogous to the MergeTree branch above, but routed through the driver's own
+        /// IStorageCluster::readPreparedClusterQuery()/ReadFromCluster path rather than
+        /// ClusterProxy::executeQueryWithParallelReplicas.
+        join_tree_query_plan = buildQueryPlanForObjectStorageCluster(query_tree, object_storage_cluster_driver, select_query_info, planner_context);
     }
     else
     {
