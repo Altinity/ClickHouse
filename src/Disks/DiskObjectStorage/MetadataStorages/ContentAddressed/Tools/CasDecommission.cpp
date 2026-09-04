@@ -119,7 +119,9 @@ bool deleteSlotObject(CasOperation & op, const String & key, const Etag & etag, 
 
 DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                                           const String & victim_srid, const CasEventSink & sink,
-                                          const std::function<void()> & request_gc_round)
+                                          const std::function<void()> & request_gc_round,
+                                          const std::function<uint64_t()> & drain_now_fn,
+                                          const std::function<void(uint64_t)> & drain_sleep_fn)
 {
     DecommissionReport report;
     report.srid = victim_srid;
@@ -149,10 +151,21 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
     config.event_sink = sink;
     PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
+    if (drain_now_fn && drain_sleep_fn)
+    {
+        /// `sweepNamespace` below issues its deletes on `admin`'s own GC plane.
+        admin->setCasRequestNowFnForTest(drain_now_fn);
+        admin->setCasRetrySleepForTest(drain_sleep_fn);
+    }
 
     /// A second engine over the pool's own (now instrumented) backend: `CasRequests` keeps its own
     /// shared_ptr to it, so `op` stays usable after `admin.reset()` retires the `Pool` below.
     CasRequests requests(admin->poolBackendPtr(), Fence::open());
+    if (drain_now_fn && drain_sleep_fn)
+    {
+        requests.setNowFnForTest(drain_now_fn);
+        requests.setSleepFnForTest(drain_sleep_fn);
+    }
     CasOperation op = requests.admit();
 
     EventEmitter{*admin}.emit([&](CasEvent & e)
