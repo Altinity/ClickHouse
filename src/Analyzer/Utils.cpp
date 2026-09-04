@@ -41,6 +41,7 @@
 #include <Storages/IStorage.h>
 
 #include <Interpreters/Context.h>
+#include <Interpreters/misc.h>
 
 #include <Analyzer/ArrayJoinNode.h>
 #include <Analyzer/ColumnNode.h>
@@ -57,6 +58,12 @@
 
 #include <Analyzer/Resolve/IdentifierResolveScope.h>
 
+<<<<<<< HEAD
+=======
+#include <Core/Streaming/CursorTree_fwd.h>
+
+#include <functional>
+>>>>>>> 5b547003b27 (Merge pull request #2249 from Altinity/fix/join-filter-pushdown-through-rename)
 #include <ranges>
 
 namespace DB
@@ -1291,24 +1298,84 @@ bool hasUnknownColumn(const QueryTreeNodePtr & node, QueryTreeNodePtr table_expr
     return false;
 }
 
-void removeExpressionsThatDoNotDependOnTableIdentifiers(
+namespace
+{
+
+template <typename KeepFunction>
+bool walkOrdinaryFunctions(const QueryTreeNodePtr & node, KeepFunction && keep_function)
+{
+    QueryTreeNodes stack = {node};
+    while (!stack.empty())
+    {
+        auto current = std::move(stack.back());
+        stack.pop_back();
+        if (!current)
+            continue;
+
+        const auto type = current->getNodeType();
+        if (type == QueryTreeNodeType::QUERY || type == QueryTreeNodeType::UNION)
+            return false;
+
+        if (const auto * function = current->as<FunctionNode>())
+        {
+            if (!function->isOrdinaryFunction())
+                return false;
+            auto function_base = function->getFunction();
+            if (!function_base || !keep_function(function_base))
+                return false;
+        }
+
+        for (const auto & child : current->getChildren())
+        {
+            if (child)
+                stack.push_back(child);
+        }
+    }
+    return true;
+}
+
+bool isSafeToDuplicateInQueryTree(const QueryTreeNodePtr & node)
+{
+    return walkOrdinaryFunctions(
+        node,
+        [](const FunctionBasePtr & function_base)
+        {
+            return function_base->isDeterministic()
+                && function_base->isDeterministicInScopeOfQuery()
+                && !function_base->isStateful()
+                && !function_base->isServerConstant()
+                && !functionIsDictGet(function_base->getName())
+                && !functionIsJoinGet(function_base->getName());
+        });
+}
+
+void filterConjunctions(
     QueryTreeNodePtr & expression,
-    const QueryTreeNodePtr & table_expression,
+    const std::function<bool(const QueryTreeNodePtr &)> & keep,
     const ContextPtr & context)
 {
     auto * function = expression->as<FunctionNode>();
     if (!function)
-        return;
-
-    if (function->getFunctionName() != "and")
     {
-        if (hasUnknownColumn(expression, table_expression))
-            expression = nullptr;
+        if (!keep(expression))
+            expression = {};
         return;
     }
 
+    if (function->getFunctionName() != "and")
+    {
+        if (!keep(expression))
+            expression = {};
+        return;
+    }
+
+<<<<<<< HEAD
     std::deque<QueryTreeNodePtr> conjunctions;
     std::deque<QueryTreeNodePtr> processing{ expression };
+=======
+    QueryTreeNodesDeque conjunctions;
+    QueryTreeNodesDeque processing{expression};
+>>>>>>> 5b547003b27 (Merge pull request #2249 from Altinity/fix/join-filter-pushdown-through-rename)
 
     while (!processing.empty())
     {
@@ -1318,10 +1385,7 @@ void removeExpressionsThatDoNotDependOnTableIdentifiers(
         if (auto * function_node = node->as<FunctionNode>())
         {
             if (function_node->getFunctionName() == "and")
-                std::ranges::copy(
-                    function_node->getArguments(),
-                    std::back_inserter(processing)
-                );
+                std::ranges::copy(function_node->getArguments(), std::back_inserter(processing));
             else
                 conjunctions.push_back(node);
         }
@@ -1335,7 +1399,7 @@ void removeExpressionsThatDoNotDependOnTableIdentifiers(
 
     for (const auto & node : processing)
     {
-        if (!hasUnknownColumn(node, table_expression))
+        if (keep(node))
             conjunctions.push_back(node);
     }
 
@@ -1355,6 +1419,29 @@ void removeExpressionsThatDoNotDependOnTableIdentifiers(
 
     const auto function_impl = FunctionFactory::instance().get("and", context);
     function->resolveAsFunction(function_impl->build(function->getArgumentColumns()));
+}
+
+}
+
+void removeExpressionsThatDoNotDependOnTableIdentifiers(
+    QueryTreeNodePtr & expression,
+    const QueryTreeNodePtr & table_expression,
+    const ContextPtr & context)
+{
+    filterConjunctions(
+        expression,
+        [&](const QueryTreeNodePtr & node) { return !hasUnknownColumn(node, table_expression); },
+        context);
+}
+
+void removeExpressionsThatAreUnsafeToDuplicate(
+    QueryTreeNodePtr & expression,
+    const ContextPtr & context)
+{
+    if (!expression)
+        return;
+
+    filterConjunctions(expression, isSafeToDuplicateInQueryTree, context);
 }
 
 namespace
