@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 13. Brainstormed 2026-09-04 against the measurements in
+Revision 14. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
 supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
@@ -100,6 +100,11 @@ Revision history, kept because each step removed something a review proved unsou
   `FencedOut`; the same translation `casUpdate` already performs is applied there and in
   `casAdmitEntry`. The ticket guard is the sole remover of a ticket, and the spacing timestamp
   is an `optional`.
+- Revision 14: a single-attempt policy never starts from memory (it cannot re-decide after the
+  conflict a stale base would cause, so it observes as today); the pre-attempt sleep reserves
+  the verb's own envelope count, not always two; the moment a ticket enters its hold is a local
+  fact that decides whether its ending touches the memory; and the deadline and conflict tests
+  are stated so they can run.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -216,10 +221,13 @@ private:
 };
 ```
 
-The front ticket is the holder; there is no separate holder flag. A ticket reaches the front only
-when every earlier ticket's own guard has erased it, and a holder's own ticket stays at the front
-until its guard runs, so "my ticket is the front" is the whole exclusion, and nothing but a
-ticket's own caller ever removes it.
+The front ticket is the holder-to-be; there is no separate holder flag. A ticket reaches the
+front only when every earlier ticket's own guard has erased it, and a ticket stays at the front
+until its own guard runs, so "my ticket is the front" is the whole exclusion, and nothing but a
+ticket's own caller ever removes it. Whether the front ticket has actually entered its hold (run
+its checks and started the verb's body) is a fact its caller keeps in a local, `entered_hold`,
+and reports to its guard; between the previous guard's erase and that moment the front ticket
+holds nothing, and `holder_since_ms` is 0.
 
 `CasRequests`'s constructor gains an optional `CasHotKeys::IsHot`. Every existing constructor call
 (every test, the offline tools, the pool factory's local bootstrap `CasRequests`) passes none and
@@ -391,38 +399,45 @@ leave step below is this guard running on the normal path.
    The gate runs outside the lane mutex because it may call the operation's `Liveness` closure,
    and the lane mutex must stay a leaf that calls nothing.
 2. Under `mutex`: if the ticket is at the front, set `holder_since_ms` to the clock value read in
-   step 1 and leave the loop as the holder. Otherwise `cv.wait_for(lock, slice)` with a short
-   slice (the pattern of `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the mutex,
-   and go to step 1. The clock is read in step 1, never under the mutex. A waiter that leaves on
-   its deadline in step 1 records that fact for its guard, which snapshots the front ticket and
-   `holder_since_ms` under the mutex and logs them after releasing it.
+   step 1, set the local `entered_hold`, and leave the loop as the holder. Otherwise
+   `cv.wait_for(lock, slice)` with a short slice (the pattern of
+   `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the mutex, and go to step 1. The
+   clock is read in step 1, never under the mutex. A waiter that leaves on its deadline in step 1
+   records that fact for its guard, which snapshots the front ticket and `holder_since_ms` under
+   the mutex and logs them after releasing it (a `holder_since_ms` of 0 means the front has not
+   entered its hold yet).
 
 A ticket is promoted only after its checks passed in the same iteration. The engine's own
 per-attempt gate and `fits` still run before anything is sent, as today.
 
 **Hold.** Run the verb's body on the caller's own thread, with the caller's own operation, policy,
 bound and result type, exactly as today, plus the memory step below. Every sleep the body takes
-before a write attempt goes through one helper, `pauseBeforeAttempt`: it takes the larger of the
-pause the loop owes (the growing transport backoff after a fault or an ambiguous attempt, the
-flat conflict pause after a clean lost race, or nothing before a first attempt) and, on the
-`Generation` dialect and a hot key, the time to the one-second boundary after
-`last_write_attempt_end_ms` (snapshotted under `mutex`, computed outside it); runs the engine's
-pre-sleep check, `gate(reservedFor(delay, 2))` and `fits`, exactly as `pauseAndReissue` does, so
-the sleep never starts unless the sleep and the attempt after it fit the operation's bound; sleeps
-once through the plane's interruptible sleep; and re-checks the gate after. A refusal there is the
-engine's usual `GaveUp`. After every write attempt on a hot key ends, successful or not, its end is
-recorded in `last_write_attempt_end_ms`. Credential-refresh reissues and ambiguous-attempt
-reissues take the same helper, so a hot `Generation` key never sleeps twice before one attempt and
-never issues one inside the boundary.
+before a write attempt goes through one helper, `pauseBeforeAttempt(delay_owed, envelopes)`: it
+takes the larger of the pause the loop owes (the growing transport backoff after a fault or an
+ambiguous attempt, the flat conflict pause after a clean lost race, or nothing before a first
+attempt) and, on the `Generation` dialect and a hot key, the time to the one-second boundary
+after `last_write_attempt_end_ms` (snapshotted under `mutex`, computed outside it); runs the
+engine's pre-sleep check, `gate(reservedFor(delay, envelopes))` and `fits`, with the envelope
+count the verb reserves today, two for `writeLoop` (the attempt and its resolve read), one for
+`remove`'s single request, and what `removeCurrent`'s own iteration reserves for its head plus
+remove, so the sleep never starts unless the sleep and what follows it fit the operation's bound
+and a verb that fits today still fits; sleeps once through the plane's interruptible sleep; and
+re-checks the gate after. A refusal there is the engine's usual `GaveUp`. After every write
+attempt on a hot key ends, successful or not, its end is recorded in
+`last_write_attempt_end_ms`. Credential-refresh reissues and ambiguous-attempt reissues take the
+same helper, so a hot `Generation` key never sleeps twice before one attempt and never issues one
+inside the boundary.
 
 **Leave.** The ticket guard, on every exit, holder or waiter, normal or unwinding, in this
-order: under `mutex`, if this ticket was the holder, move the prepared memory value into
-`remembered` or clear it (a holder that unwinds clears); erase this ticket; if the caller left on
-its deadline behind a holder, snapshot the front ticket and `holder_since_ms`;
-`cv.notify_all()`; after releasing the mutex, record the queue time to the profile event and
-emit the log line if a snapshot was taken. It is the sole remover of a ticket and the sole
-notifier. It is `noexcept` and allocates nothing: the memory value is prepared before the guard
-runs (below), and erasing from a `std::deque` does not allocate.
+order: under `mutex`, if `entered_hold` is set, move the prepared memory value into
+`remembered` or clear it (a holder that unwinds clears) and set `holder_since_ms = 0`; if it is
+not set, the memory is untouched, because a ticket that never held wrote nothing and learned
+nothing; erase this ticket; if the caller left on its deadline behind a front ticket, snapshot
+that ticket and `holder_since_ms`; `cv.notify_all()`; after releasing the mutex, record the
+queue time to the profile event and emit the log line if a snapshot was taken. It is the sole
+remover of a ticket and the sole notifier. It is `noexcept` and allocates nothing: the memory
+value is prepared before the guard runs (below), and erasing from a `std::deque` does not
+allocate.
 
 A holder never waits for another ticket and never runs anyone else's closure: a ticket is settled
 only by its own caller. No ticket outlives its caller's stack in the queue: the guard removes it
@@ -430,9 +445,10 @@ on every exit path, and nothing else references it.
 
 ### The memory {#the-memory}
 
-**Memory rule.** After any write verb on a hot key ends: a `Committed` of an opted-in
+**Memory rule.** After any write verb on a hot key ends its hold: a `Committed` of an opted-in
 `readModifyWrite` remembers the candidate that call encoded and the etag the store returned for
-it; every other ending of every verb forgets. That is the only source. Bytes that came from the
+it; every other ending of every verb that held forgets; a ticket that never entered its hold
+leaves the memory as it found it. That is the only source. Bytes that came from the
 store, a resolve read's `Conflict::seen` among them, are never remembered: another writer's
 malformed object, remembered and then repaired in the store, would otherwise reach an opted-in
 `decide` as a stale base and become a corruption verdict where today's observation sees the
@@ -455,9 +471,11 @@ resolve read of a `Conflict`), so a `GaveUp` produced before any read, at the ga
 inner write or at its `fits`, reports `NotObserved` and never the remembered bytes as something
 this call saw.
 
-**Where memory is used.** Only `readModifyWrite`, and only for a call that passed
-`MemoryStart::Allowed`. Its body gains one optional input, the remembered object, used in place of
-its initial observation:
+**Where memory is used.** Only `readModifyWrite`, only for a call that passed
+`MemoryStart::Allowed`, and only under a policy that may reissue: a `single_attempt` policy
+(`Retry::once`) observes as today, because after the conflict a stale base would cause it may
+not re-decide, and its one attempt must be decided on the current object. Its body gains one
+optional input, the remembered object, used in place of its initial observation:
 
 1. Base := `remembered` if present, else `observe` as today. A memory start is gated exactly like
    the observation it replaces: `gate(reservedFor(0, 1))`, one attempt envelope, and
@@ -734,12 +752,13 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    first. Assert the first's next `readModifyWrite` does exactly one resolve read and one retry
    write and ends `Committed`, that the committed body is the external writer's bytes plus this
    call's ticket (the fresh bytes and their etag stayed paired through the re-decide), and that
-   the write after that starts from memory with zero reads. A sibling makes the resolve read the
-   call's last act (a `once` policy): the returned `Conflict::seen` carries the object, and the next
-   `readModifyWrite` reads, because a resolve read's bytes are never remembered (INV-HK4). A
-   second sibling has the external writer store malformed bytes, then repair them, between two
-   opted-in calls of the first plane: the second call reads and commits, and no corruption verdict
-   is raised.
+   the write after that starts from memory with zero reads. A sibling runs an opted-in call under
+   `Retry::once` with memory present: it observes first (`CASHotKeyReadStarts` advances), its one
+   attempt is decided on the observation, and a conflict forced after that observation returns
+   `Conflict` with `seen` intact, after which the next call reads, because a resolve read's bytes
+   are never remembered (INV-HK4). A second sibling has the external writer store malformed
+   bytes, then repair them, between two opted-in calls of the first plane: the second call reads
+   and commits, and no corruption verdict is raised.
 4a. The marker matrix, in `gtest_cas_ref_catalog.cpp` through a hot `CasRequests`. For each of
    the opted-in decisions, `createNamespaceStep1` (already present), `completeCreation` (entry
    mismatch, fence moved) and `beginRemoving` (entry mismatch, fence moved), and the admission
@@ -776,7 +795,9 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    the holder's ticket remains in the lane, and when the `PUT` is finally released the holder
    commits and the next writer proceeds normally. Sibling: `cancelStalledCreating` through
    `dropNamespaceImpl` issues its terminality read under the frozen policy (its deadline is not
-   later than the outer one), so a holder parked in that read gives up by the outer deadline.
+   later than the outer one); with that read answering retryable transport failures and the clock
+   advanced, the holder gives up at the outer deadline rather than a fresh 90 s later. A read that
+   never returns is the accepted stalled-holder case, not this test.
 7g. Fence during step 1. A creator queued behind a parked holder has its fence tripped before its
    turn: `createNamespace` returns `FencedOut`, nothing was written, and `resolveNamespaceLife`
    reports retry-later. Its fence tripped between its landed step-1 `PUT` and the post-commit
@@ -804,20 +825,23 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
 7f. One sleep per attempt on a hot `Generation` key. A credential-refresh reissue and an
    ambiguous-attempt reissue each record exactly one sleep before the next attempt, of length
    `max(transport backoff, boundary)`, attributed to the operation's own bound; a clean conflict
-   records one sleep of `max(conflict pause, boundary)`.
+   records one sleep of `max(conflict pause, boundary)`. A `remove` whose bound fits the spacing
+   delay plus one attempt but not two is admitted, as today; a `readModifyWrite` in the same
+   position is refused, as today.
 8. Open plane overlaps. A second `CasRequests` with no predicate (the open-plane shape) does a
    `replace` while the hot plane's holder is parked; it does not wait; whichever write is refused is
    settled by its resolve read; after an open-plane win the hot plane's next opted-in
    `readModifyWrite` pays exactly one resolve read and one retry write, commits, and the one after
    that starts from memory, because the committed retry candidate is this plane's own.
-9. Half 2, clean conflict. One writer loses K clean races in a row (a hook mutates the key before
-   every attempt). Assert `CASRequestConflictPause` advanced K times, `CASRequestReissue` not at
-   all, and every recorded sleep is at most 200 ms on the `Emulated` dialect and within
+9. Half 2, clean conflict, parameterized over `readModifyWrite` and
+   `readModifyWriteOnPresence`. One writer loses K clean races in a row (a hook mutates the key
+   before every attempt). Assert `CASRequestConflictPause` advanced K times, `CASRequestReissue`
+   not at all, and every recorded sleep is at most 200 ms on the `Emulated` dialect and within
    [1000, 1200] ms on a backend reporting `Generation`.
-10. Half 2, conflict after a fault. A hook makes the attempt fail with a 429-class transport error
-    and then moves the key before the resolve read, K times. Assert `CASRequestReissue` advanced
-    K times and `CASRequestConflictPause` not at all. A sibling with K plain transport faults and
-    no external write sees the same counters.
+10. Half 2, conflict after a fault, parameterized over both verbs. A hook makes the attempt fail
+    with a 429-class transport error and then moves the key before the resolve read, K times.
+    Assert `CASRequestReissue` advanced K times and `CASRequestConflictPause` not at all. A
+    sibling with K plain transport faults and no external write sees the same counters.
 
 Pool level, through the ledger:
 
