@@ -38,6 +38,11 @@ const String kFile = "format_version.txt";
 const String kFilePath = kTablePath + "/" + kFile;
 const UInt128 kLife2Id = hexToU128("22222222222222222222222222222222");
 
+/// The erase entry point requires a liveness refresh because a real drain's liveness is a cached flag
+/// its owner re-reads from the store. This fixture's operation carries no liveness at all, so there is
+/// nothing cached for a refresh to update.
+void noAuthorityRefresh() {}
+
 struct DiskFixture
 {
     DB::ObjectStoragePtr object_storage;
@@ -78,7 +83,9 @@ void deleteCatalogLife(
 {
     Backend & backend = storage.store()->backend();
     const Layout & layout = storage.store()->layout();
-    CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & current)
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    CasRefCatalog::casUpdate(op, layout, [&](const RefCatalog & current)
     {
         RefCatalog next = current;
         const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
@@ -93,7 +100,7 @@ void deleteCatalogLife(
         return next;
     });
 
-    const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(backend, layout);
+    const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(op, layout);
     const auto it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(), [&](const CatalogEntry & entry)
     {
         return entry.ns == life1.ns && entry.incarnation == life1.incarnation;
@@ -106,9 +113,7 @@ void deleteCatalogLife(
     parent.ref_lives.emplace(life1.incarnation, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 1}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
-    if (CasRefCatalog::deleteCompletedRemoving(
-            backend, layout, *it, parent, 1,
-            [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Held; })
+    if (CasRefCatalog::deleteCompletedRemoving(op, layout, *it, parent, noAuthorityRefresh)
         != CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted)
         throw DB::Exception(
             DB::ErrorCodes::LOGICAL_ERROR, "Failed to delete fixture catalog life '{}'", life1.ns.string());
@@ -121,8 +126,10 @@ NamespaceLifeId admitReplacementLife(
     if (life1.incarnation == kLife2Id)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Fixture life ids unexpectedly collide");
     const NamespaceLifeId life2 = NamespaceLifeId::fromCatalogEntry(life1.ns, kLife2Id);
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(storage.store()->backend());
+    CasOperation op = requests.admit();
     CasRefCatalog::casAdmitEntry(
-        storage.store()->backend(), storage.store()->layout(), storage.store()->poolConfig().gc_shards, CatalogEntry{
+        op, storage.store()->layout(), storage.store()->poolConfig().gc_shards, CatalogEntry{
         .ns = life2.ns, .state = NsState::Live, .incarnation = life2.incarnation});
     return life2;
 }

@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
@@ -436,7 +436,7 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
 /// Everything a successful recovery of one ref table seeds. Produced by streaming replay
 /// (`RefReplayBuilder::finish`) rather than assigned field-by-field into the runtime, so the whole
 /// publication is one value installed atomically -- a prose field list would drift, but a struct that
-/// the install copies wholesale cannot silently lose a field (Codex review round 4, spec §5).
+/// the install copies wholesale cannot silently lose a field.
 ///
 /// `finish` populates the fields that are a pure function of `(base snapshot, replayed tail)`: `state`,
 /// `newest_snapshot_id`, `tail_count`, `tail_bytes`, and `base_snapshot_bytes`. The
@@ -470,7 +470,7 @@ struct RecoveryResult
     std::optional<RefTxnId> last_epoch_seal;
 };
 
-/// The streaming generalisation of `replay` (spec §5): owns a PRIVATE candidate `RefTableState` and
+/// The streaming generalisation of `replay`: owns a PRIVATE candidate `RefTableState` and
 /// applies decoded transactions into it ONE AT A TIME, in place, discarding the candidate on any throw.
 /// It is the memory fix for a long post-snapshot tail: `replay` takes the whole `tail` materialised in a
 /// vector (every decoded transaction resident at once, each up to the 20 MiB normal-class cap), whereas
@@ -528,7 +528,7 @@ uint64_t decodedRefLogTxnFootprint(const RefLogTxn & txn);
 /// identical seam.
 void reportReplayMemoryDelta(int64_t delta_footprint_bytes);
 
-/// Test-only observability for the streaming-recovery memory invariant (spec §5): while a probe is
+/// Test-only observability for the streaming-recovery memory invariant: while a probe is
 /// installed, each recovery loop reports the resident footprint of every decoded transaction it holds,
 /// for exactly the span it holds it (`reportReplayMemoryDelta` + `decodedRefLogTxnFootprint`). A
 /// memory-bound test tracks the peak of the summed reported footprint and asserts it stays within a
@@ -730,13 +730,13 @@ struct EpochCrossResult
 /// disagree about when an epoch boundary has been proved -- a rule that says which records a cut
 /// contains cannot have two implementations.
 ///
-/// `life`: the namespace's life, REQUIRED (review NEW-3 -- a `nullopt`-resolves-internally default was
-/// tried once and reintroduced the exact divergence review C3 removed from `Gc::fold`, just relocated
-/// into `CasFsck.cpp`'s independent walk, which had its OWN already-resolved `life` in scope one call
-/// site above and simply did not pass it). Every caller must resolve `life` itself, ONCE, and pass the
-/// SAME value here that it uses for every other read in its own walk -- this function no longer
-/// resolves anything on its own, so there is no second resolution left to disagree with the first.
-EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, const RootNamespace & ns,
+/// `life`: the namespace's life, REQUIRED -- a `nullopt`-resolves-internally default was tried once
+/// and let two callers resolve `life` independently and disagree, even though one of them
+/// (`CasFsck.cpp`'s walk) already had its OWN resolved `life` in scope one call site above and simply
+/// did not pass it in. Every caller must resolve `life` itself, ONCE, and pass the SAME value here
+/// that it uses for every other read in its own walk -- this function no longer resolves anything on
+/// its own, so there is no second resolution left to disagree with the first.
+EpochCrossResult crossEpochFromSeal(CasOperation & op, const Layout & layout, const RootNamespace & ns,
                                     const RefTxnId & from_seal, std::optional<bool> seal_proven,
                                     const RefTxnId & witness, const NamespaceLifeId & life);
 
@@ -767,8 +767,10 @@ struct RecoveredRefTable
 /// the named predecessor to be an `EpochSeal`, then read the snapshot. This order prevents a forged
 /// snapshot at any historical seal or contextually invalid epoch start from becoming state. Cleanup
 /// retains both the matching log and returned predecessor proof while the checkpoint names this base.
-/// When supplied, `admit_request` runs immediately before each raw backend request so a caller may
-/// refuse later requests without changing their durable order. Its default preserves read-only callers.
+/// Every read below is one of `op`'s own requests, so a caller that needs to refuse a later request
+/// mid-walk (a recovery attempt superseded while it runs) folds that fact into `op`'s `Liveness`
+/// predicate at admission rather than passing a callback here -- the operation already re-checks it
+/// before each request.
 struct CheckpointSnapshotBase
 {
     RefTableSnapshot snapshot;
@@ -779,8 +781,7 @@ struct CheckpointSnapshotBase
 };
 
 CheckpointSnapshotBase readCheckpointSnapshotBase(
-    Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefCkpt & checkpoint,
-    const std::function<void()> & admit_request = {});
+    CasOperation & op, const Layout & layout, const NamespaceLifeId & life, const RefCkpt & checkpoint);
 
 /// Recover a ref table from ONE immutable lifecycle authority cut supplied by the caller. `catalog_entry`
 /// is either the exact row from that caller's frozen catalog cut or absence from that same cut; `ckpt` is
@@ -795,7 +796,7 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
 /// is deliberately no self-resolving compatibility overload: every consumer must pass the row from its
 /// frozen catalog cut explicitly.
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
-    Backend & backend, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
+    CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
     const std::optional<RefCkpt> & ckpt);
 
 }

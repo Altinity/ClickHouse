@@ -156,13 +156,13 @@ public:
 
     std::vector<CopyCall> copy_calls;
 
-    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
+    void publish(const DB::Cas::BlobPublishRequest & request, DB::Cas::TransportAccess & access) override
     {
         if (const auto * copy = std::get_if<DB::Cas::VerbatimStagedBlobPublication>(&request.publication))
             copy_calls.push_back({copy->object_key, request.destination_key, true});
         else
             copy_calls.push_back({String{}, request.destination_key, false});
-        DB::Cas::InMemoryBackend::publishBlob(request);
+        DB::Cas::InMemoryBackend::publish(request, access);
     }
 
     /// Every key read as a stream, with a count. Republishing opens its source with `getStream`, so
@@ -202,36 +202,40 @@ public:
 
     explicit EtagFaithfulPublicationBackend(FaultScript script_) : script(script_) {}
 
-    /// Unhide the transport primitive that shares this name; the legacy override below is what the
-    /// production sites this double instruments still call.
+    /// Unhide the legacy convenience overloads that the primitive overrides below would otherwise
+    /// hide: `head(key)` and `deleteExact(key, token)` are inherited UNCHANGED (Backend's own default
+    /// implementations), so a caller through either legacy name still reaches the ETag-faithful
+    /// primitives below by virtual dispatch -- which is what the production sites this double
+    /// instruments actually call now.
     using DB::Cas::Backend::head;
 
-    DB::Cas::HeadResult head(const String & key) override
+    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
     {
-        DB::Cas::HeadResult result = DB::Cas::InMemoryBackend::head(key);
-        if (result.exists && isBlobBodyKey(key))
+        std::optional<DB::Cas::Backend::RawMeta> result = DB::Cas::InMemoryBackend::head(key, access);
+        if (result && isBlobBodyKey(key))
         {
-            const auto body = DB::Cas::InMemoryBackend::get(key);
+            const auto body = DB::Cas::InMemoryBackend::read(key, access);
             chassert(body.has_value());
-            result.token = DB::Cas::Token{sipHash128String(body->bytes), DB::Cas::TokenType::ETag};
+            result->value = sipHash128String(body->bytes);
         }
         return result;
     }
 
-    DB::Cas::DeleteOutcome deleteExact(const String & key, const DB::Cas::Token & token) override
+    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
+                                        DB::Cas::TransportAccess & access) override
     {
         if (!isBlobBodyKey(key))
-            return DB::Cas::InMemoryBackend::deleteExact(key, token);
+            return DB::Cas::InMemoryBackend::remove(key, expected_value, access);
 
-        const DB::Cas::HeadResult current = head(key);
-        if (!current.exists)
-            return DB::Cas::DeleteOutcome{.kind = DB::Cas::DeleteOutcome::Kind::NotFound};
-        if (current.token != token)
-            return DB::Cas::DeleteOutcome{.kind = DB::Cas::DeleteOutcome::Kind::TokenMismatch};
-        return DB::Cas::InMemoryBackend::deleteExact(key, DB::Cas::InMemoryBackend::head(key).token);
+        const auto current = head(key, access);
+        if (!current)
+            return DB::Cas::Backend::RawRemoval::Gone;
+        if (current->value != expected_value)
+            return DB::Cas::Backend::RawRemoval::Mismatch;
+        return DB::Cas::InMemoryBackend::remove(key, DB::Cas::InMemoryBackend::head(key, access)->value, access);
     }
 
-    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
+    void publish(const DB::Cas::BlobPublishRequest & request, DB::Cas::TransportAccess & access) override
     {
         const bool is_copy = std::holds_alternative<DB::Cas::VerbatimStagedBlobPublication>(request.publication);
         if (is_copy)
@@ -245,7 +249,7 @@ public:
                 || (script == FaultScript::FirstCondemnedStreamLandsThenDeleted && !is_copy)))
         {
             fault_fired = true;
-            DB::Cas::InMemoryBackend::publishBlob(request);
+            DB::Cas::InMemoryBackend::publish(request, access);
             queued_delete_token = head(request.destination_key).token;
 
             if (script != FaultScript::CopyLandsThenCondemned)
@@ -254,7 +258,7 @@ public:
             throw Poco::TimeoutException("ETag-faithful staged publication response lost");
         }
 
-        DB::Cas::InMemoryBackend::publishBlob(request);
+        DB::Cas::InMemoryBackend::publish(request, access);
     }
 
     FaultScript script;

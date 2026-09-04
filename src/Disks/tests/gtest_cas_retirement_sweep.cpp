@@ -82,14 +82,14 @@ public:
         return served;
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
-        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
         std::lock_guard lock(m);
         if (omitted.empty())
             return page;
         auto it = std::find_if(page.keys.begin(), page.keys.end(),
-                               [&](const ListedKey & k) { return k.key == omitted; });
+                               [&](const RawListedKey & k) { return k.key == omitted; });
         if (it == page.keys.end())
             return page;              /// not a qualifying call -- do not count it
         if (seen_calls++ != target_call)
@@ -123,38 +123,32 @@ public:
     std::atomic<size_t> ref_prefix_lists{0};
     std::atomic<size_t> janitor_prefix_lists{0};
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (!refs_prefix.empty() && prefix == refs_prefix)
             ++ref_prefix_lists;
         if (!janitor_prefix.empty() && prefix == janitor_prefix)
             ++janitor_prefix_lists;
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 };
 
-/// Forces the FIRST `putIfAbsent` whose key contains `fault_key_substr` to throw an ambiguous
-/// (Unresolved-classified) exception, `fault_count` times -- the minimal fault injection needed to drive
-/// a ref-log append into the `Unresolved`/wedge outcome, with `max_attempts = 1` in the budget so the
-/// single failed attempt exhausts the retry budget immediately. (Same shape as `gtest_cas_pool.cpp`'s
-/// file-local backend of the same name; both are three lines of `throw` over `InMemoryBackend`, and
-/// hoisting a shared one would couple two suites' fault models for no gain.)
+/// Every write of a matching key is a lost response, for as long as `fault_key_substr` names one. It
+/// has to be every one: the request engine settles an ambiguity by an exact read and then reissues, so
+/// a counted fault is outlived by the reissues and the write commits -- the difference between the
+/// wedge this fixture needs and a clean commit. Clearing `fault_key_substr` disarms it.
 class UnresolvedPutBackend final : public InMemoryBackend
 {
 public:
-    using Backend::putIfAbsent;
-
     String fault_key_substr;
-    int fault_count = 0;
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
     {
-        if (fault_count > 0 && !fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
-        {
-            --fault_count;
+        if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
             throw Poco::TimeoutException("UnresolvedPutBackend: simulated ambiguous result (response lost)");
-        }
-        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 };
 
@@ -337,7 +331,6 @@ TEST(CASRetirementSweep, TheRoundEnumeratesTheRefPrefixExactlyOnce)
 TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoverySeal)
 {
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
     budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 100;
@@ -368,11 +361,14 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     publishOneBlobPart(store, ns, "x", "straggler-payload");
     ASSERT_EQ(store->liveWriterEpoch(), 1u);
 
-    /// Drive the next ref-log append into the Unresolved/wedge outcome: the single attempt the budget
-    /// allows fails ambiguously, so this process can never learn whether its conditional PUT landed.
-    /// That undecidability is the whole reason the resolution is a conditional CREATE and not a GET.
+    /// Drive the next ref-log append into the Unresolved/wedge outcome: every attempt it makes fails
+    /// ambiguously, so this process can never learn whether its conditional PUT landed. That
+    /// undecidability is the whole reason the resolution is a conditional CREATE and not a GET. The
+    /// give-up is the append's own retry window, and the engine's inter-attempt sleeps pay it on the
+    /// same injected boot clock the fence and the deadline are measured against, so it costs no real
+    /// time and no lease.
+    store->setCasRetrySleepForTest([&fake_boot](uint64_t ms) { fake_boot += ms + 1; });
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 

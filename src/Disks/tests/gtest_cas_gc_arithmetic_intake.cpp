@@ -415,15 +415,14 @@ TEST(CASGCArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadO
     class AlternatingGetBackend : public InMemoryBackend
     {
     public:
-        using DB::Cas::Backend::get;
         String flaky;
         size_t reads = 0;
 
-        std::optional<GetResult> get(const String & key, Range range) override
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
         {
             if (key == flaky && ++reads % 2 == 0)
                 return std::nullopt;
-            return InMemoryBackend::get(key, range);
+            return InMemoryBackend::read(key, access);
         }
     };
 

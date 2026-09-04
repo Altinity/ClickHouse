@@ -30,9 +30,9 @@ namespace DB::Cas
 {
 
 CasManifestReader::CasManifestReader(
-    Backend & backend_, const Layout & layout_, const PoolMeta & meta_,
+    CasRequests & requests_, const Layout & layout_, const PoolMeta & meta_,
     const CasEventSink & event_sink_, size_t manifest_decode_cache_bytes)
-    : backend(backend_), layout(layout_), meta(meta_), event_sink(event_sink_)
+    : requests(requests_), layout(layout_), meta(meta_), event_sink(event_sink_)
 {
     if (manifest_decode_cache_bytes > 0)
         manifest_cache = std::make_unique<ManifestDecodeCache>(
@@ -52,7 +52,8 @@ std::shared_ptr<const PartManifest> CasManifestReader::readManifestShared(const 
     /// (`INV-NO-DANGLE`). Never substitute an empty manifest: callers must observe the missing object
     /// as an exception. The `GET` alone carries the absence signal, so no `HEAD` precedes it.
     const String key = layout.manifestKey(id);
-    std::optional<GetResult> object = backend.get(key);
+    CasOperation op = requests.admit();
+    std::optional<Object> object = op.read(key, Retry::standard());
     if (!object)
     {
         if (event_sink)

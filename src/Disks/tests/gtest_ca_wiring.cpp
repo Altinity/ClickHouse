@@ -4,6 +4,24 @@
 #include <Disks/DiskLocal.h>
 #include <Common/ErrorCodes.h>
 #include <filesystem>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/Plain/MetadataStorageFromPlainObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
+#include <Disks/tests/cas_test_helpers.h>
+#include <IO/ReadHelpers.h>
+#include <IO/ReadPipeline.h>
+#include <Poco/AutoPtr.h>
+#include <Poco/Util/MapConfiguration.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Common/Exception.h>
+#include <algorithm>
+#include <set>
 
 namespace DB::ErrorCodes
 {
@@ -316,20 +334,6 @@ TEST(CASPartPathParser, SplitCacheEvictionStaysCorrect)
 /// the rewritten ContentAddressedMetadataStorage (real ctor over a Local object storage; the
 /// backend self-selects EmulatedSingleProcess token semantics).
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/Plain/MetadataStorageFromPlainObjectStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
-#include <Disks/tests/cas_test_helpers.h>
-#include <IO/ReadHelpers.h>
-#include <IO/ReadPipeline.h>
-#include <Poco/AutoPtr.h>
-#include <Poco/Util/MapConfiguration.h>
 
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
@@ -2035,10 +2039,6 @@ TEST(CASWiringExchangeDeathTest, PrepareAdoptRefusesATargetThatIsNotAPartDirecto
 
 /// ==== Commit atomicity (B122): a publish failing mid-loop must not leave a PARTIAL commit ====
 
-#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
-#include <Common/Exception.h>
-#include <algorithm>
-#include <set>
 
 namespace DB::ErrorCodes
 {

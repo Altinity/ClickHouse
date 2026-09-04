@@ -69,27 +69,38 @@ PoolPtr openPool(const BackendPtr & backend)
 }
 
 /// The fence-controlled pool of `gtest_cas_ref_install_safety.cpp`, for the pre-attempt refusal: the
-/// boot clock is frozen so `setMountDeadline` alone decides both fence predicates, renewal is parked an
-/// hour out so nothing re-arms the deadline underneath the test, and the single-attempt budget makes
-/// `attempt_timeout_ms + lease_safety_margin_ms` (200 ms) the window between "the flush is admitted"
-/// and "an attempt may start".
-PoolPtr openPoolFenceControlled(const BackendPtr & backend)
+/// boot clock is frozen so `setMountDeadline` alone decides every fence predicate, renewal is parked an
+/// hour out so nothing re-arms the deadline underneath the test, and the backend reports the budget's
+/// own `attempt_timeout_ms` because that -- not the budget field -- is what the request engine reserves
+/// per attempt, exactly as `ContentAddressedMetadataStorage` pairs the two in production. No fault is
+/// injected here at all -- the refusal comes from the lease having no room to start a write -- so
+/// nothing in this fixture depends on an attempt count.
+PoolPtr openPoolFenceControlled(const std::shared_ptr<InMemoryBackend> & backend)
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
     cfg.boot_ms_fn = [] { return uint64_t{0}; };
     cfg.mount_renew_period = std::chrono::milliseconds{3600000};
     CasRequestBudget budget;
-    budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
+    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is refused by validateCasRequestBudget
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     return Pool::open(backend, cfg);
 }
 
 constexpr uint64_t FENCE_DEADLINE_HEALTHY_MS = 30000;
-constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 100;
+/// Between "the flush is admitted" and "an attempt may start" sit three gates with different
+/// appetites, all measured against the lease's remaining time (the frozen clock at 0 makes the
+/// deadline BE the remaining time), and each refuses until its own reservation plus
+/// `lease_safety_margin_ms` (100) is STRICTLY cleared:
+///   a `CasOperation::admitted` guard reserves nothing            -- clears above 100;
+///   a read reserves one attempt envelope                         -- clears above 200;
+///   a write reserves TWO, the attempt and the read that settles it -- clears above 300.
+/// This test wants the guards and the reads on the way in to pass while the append's own first
+/// request is refused, so it sits strictly between the second and the third.
+constexpr uint64_t FENCE_DEADLINE_REFUSES_ATTEMPT_MS = 250;
 
 /// A bare `Pool::open` with no `_pool_meta` seeded: the path an operator's pool RECREATION takes, and
 /// the only one that runs the bootstrap residual + quiesce gates (`seedPoolMetaForRestart` mints the
@@ -290,18 +301,20 @@ TEST(CASRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
 
 TEST(CASPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
 {
-    InMemoryBackend backend;
+    auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
     const PoolMeta created = PoolMeta::createOrValidate(
-        backend, layout, /*blob_header_len=*/256, /*gc_shards=*/4,
+        op, layout, /*blob_header_len=*/256, /*gc_shards=*/4,
         BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
     EXPECT_EQ(created.gc_shards, 4u);
 
     const PoolMeta reopened = PoolMeta::createOrValidate(
-        backend, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
+        op, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
         BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/false);
     EXPECT_EQ(reopened.gc_shards, 4u);
-    EXPECT_EQ(decodePoolMeta(backend.get(layout.poolMetaKey())->bytes).gc_shards, 4u);
+    EXPECT_EQ(decodePoolMeta(op.read(layout.poolMetaKey(), Retry::standard())->bytes).gc_shards, 4u);
 }
 
 /// The one path where "an attempt that provably sent nothing consumes nothing" does not hold, and the
@@ -347,7 +360,9 @@ TEST(CASRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
     /// The durable stream itself is dense: `1`, `2`, `3` all exist as objects. `ns` was born through
     /// the REAL append lane (Stage B Task 4-C), so its objects sit at a real catalog-minted incarnation,
     /// not the Stage-A sentinel -- resolve it the same way production discovery does.
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
+    CasRequests catalog_requests(backend, Fence::open());
+    CasOperation catalog_op = catalog_requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns).value();
     for (uint64_t seq = 1; seq <= 3; ++seq)
         EXPECT_TRUE(backend->head(store->layout().refLogKey(life, RefTxnId{epoch, seq})).exists)
             << "log object " << epoch << "-" << seq << " must exist: the durable stream has no hole";

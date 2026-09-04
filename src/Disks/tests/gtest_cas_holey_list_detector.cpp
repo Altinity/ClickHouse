@@ -56,8 +56,8 @@ namespace
 class HoleyListBackend : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::list;
+    /// Unhide the legacy `list` overloads the primitive override below would otherwise hide.
+    using Backend::list;
     /// Omit `key` from the `nth` (0-based) subsequent qualifying `list` call. Resets the counter.
     void omitFromNthListCall(const String & key, size_t nth)
     {
@@ -76,14 +76,16 @@ public:
         return served;
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    /// Sabotages the PRIMITIVE, which every legacy forwarder reaches too, so the hole is served
+    /// whichever surface issued the enumeration.
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
-        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        RawListPage page = InMemoryBackend::list(prefix, cursor, limit, access);
         std::lock_guard lock(m);
         if (omitted.empty())
             return page;
         auto it = std::find_if(page.keys.begin(), page.keys.end(),
-                               [&](const ListedKey & k) { return k.key == omitted; });
+                               [&](const RawListedKey & k) { return k.key == omitted; });
         if (it == page.keys.end())
             return page;              /// not a qualifying call — do not count it
         if (seen_calls++ != target_call)
@@ -143,9 +145,13 @@ bool blobPresent(const std::shared_ptr<HoleyListBackend> & b, const Layout & lay
 /// than guessing a sequence number.
 std::set<String> listRefKeys(Backend & b, const Layout & layout, const RootNamespace & ns)
 {
-    /// Stage B (Task 4-C): `ns` is born through the REAL append lane here, so its objects sit at a
-    /// real catalog-minted incarnation, not the Stage-A sentinel.
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(b, layout, ns).value();
+    /// `ns` is born through the REAL append lane here, so its objects sit at a real catalog-minted
+    /// incarnation rather than a fixture-chosen one. The catalog read is made on an open-fence
+    /// operation of its own: this helper only observes, and shares no admission with the code
+    /// under test.
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(b);
+    CasOperation op = requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(op, layout, ns).value();
     std::set<String> keys;
     forEachListedKey(b, layout.namespaceStreamPrefix(life), [&](const ListedKey & k) { keys.insert(k.key); });
     return keys;

@@ -72,12 +72,17 @@ uint64_t saturatingAdd(uint64_t lhs, uint64_t rhs)
     return lhs > std::numeric_limits<uint64_t>::max() - rhs ? std::numeric_limits<uint64_t>::max() : lhs + rhs;
 }
 
+}
+
 /// The failure class a fresh credential could fix, named here rather than taken from
 /// `S3Exception::isAccessTokenExpiredError`, which also fires on `S3Errors::UNKNOWN` -- the SDK's code
 /// for EVERY error it does not model. Borrowing it would put throttling codes an S3-compatible store
 /// reports under a non-AWS name into the credential class, and would carve a real access denial out of
 /// `isDefinitelyRefusedWrite` so the write wedges its caller instead of being refused. `UNKNOWN` is
 /// therefore never matched by code alone; a store that spells the error out by name still matches.
+///
+/// Declared in the header: a caller whose OWN loop makes the next physical attempt has to tell this
+/// class apart from the rest of `isDefinitelyRefusedWrite`.
 bool isRefreshableCredentialError([[maybe_unused]] const std::exception & e)
 {
 #if USE_AWS_S3
@@ -96,6 +101,9 @@ bool isRefreshableCredentialError([[maybe_unused]] const std::exception & e)
 #endif
 }
 
+namespace
+{
+
 /// An answer from the store rather than a fault in reaching it: reissuing replays it unchanged.
 bool isDefiniteStoreRefusal([[maybe_unused]] const std::exception & e)
 {
@@ -109,6 +117,20 @@ bool isDefiniteStoreRefusal([[maybe_unused]] const std::exception & e)
 GaveUp::Source sourceFor(const Retry::Bound & bound)
 {
     return bound.lease_bound ? GaveUp::Source::Lease : GaveUp::Source::Policy;
+}
+
+/// Could the precondition this write was built with still be met by what the resolve read saw? A
+/// create needs the key absent; a replace needs the incarnation it named to still be current.
+bool preconditionStillSatisfiable(const Observation & seen, const std::optional<Incarnation> & expected)
+{
+    return std::visit(detail::Overload{
+        /// The read itself failed, so it proved nothing either way and an ambiguous attempt may still
+        /// be alive. Reporting a conflict on it would name an occupant nobody observed.
+        [](const NotObserved &) { return true; },
+        [&](const ProvenAbsent &) { return !expected.has_value(); },
+        [&](const Meta & m) { return expected.has_value() && m.incarnation == *expected; },
+        [&](const Object & o) { return expected.has_value() && o.incarnation == *expected; }},
+        seen);
 }
 
 /// Drop the body from an observation the write engine had to fetch to prove whose bytes were at the
@@ -560,7 +582,7 @@ CasOperation::Resolved CasOperation::observePresence(const String & key, const R
 WriteResult CasOperation::gaveUp(GaveUp::Why why, GaveUp::Source source, WriteState & state) const
 {
     ProfileEvents::increment(ProfileEvents::CASRequestGaveUp);
-    return GaveUp{why, source, state.sent_any, state.last_seen};
+    return GaveUp{why, source, state.sent_any, state.last_seen, state.attempts_sent};
 }
 
 WriteResult CasOperation::gaveUpForReadStop(ReadStop stop, WriteState & state, const Retry::Bound & bound) const
@@ -631,6 +653,11 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
     if (expected)
         expected_value = owner.valueFor(key, *expected);
 
+    /// This inner write's own bytes are what an ambiguity of it could have landed. A previous inner
+    /// write of the same call sent DIFFERENT bytes and ended in a conflict, which proved its attempts
+    /// dead -- carrying its ambiguity forward is how a competitor's identical object gets claimed.
+    state.any_ambiguous = false;
+
     for (;;)
     {
         /// A write reserves TWO envelopes: the attempt, and the exact read that settles it. That is
@@ -653,7 +680,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         std::optional<std::expected<String, Backend::RawConflict>> outcome;
         /// A credential answer is given BEFORE the store applies anything, so the attempt provably did
         /// not land. It is the one failure that is neither a commit nor an ambiguity, and keeping it out
-        /// of `any_ambiguous` is what lets a second credential failure of the same call be refused
+        /// of `any_ambiguous` is what lets a second credential failure of this inner write be refused
         /// instead of resolved by a read and reissued to the deadline.
         bool credential_answer = false;
         bool refreshed = false;
@@ -668,30 +695,35 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         {
             if (isDeterministicLocalFailure(e.code()))
                 throw;
-            /// ONE refresh per call, and only for the class a credential could explain -- so an
-            /// oversized entity or a malformed request never triggers a re-acquisition, and a denial
-            /// that fresh credentials do not fix is refused on the second look rather than reissued to
-            /// the deadline (the storage hands back a new client every time it is asked).
+            /// ONE refresh per call, only for the class a credential could explain, and only when a
+            /// reissue could sign with what it installs. So an oversized entity never triggers a
+            /// re-acquisition, a denial fresh credentials do not fix is refused on the second look
+            /// rather than reissued to the deadline (the storage hands back a new client every time it
+            /// is asked), and under a single-attempt policy the refusal below is literally "no refresh
+            /// installed credentials and no earlier ambiguity".
             credential_answer = isRefreshableCredentialError(e);
-            if (credential_answer && !state.refresh_attempted)
+            if (credential_answer && !state.refresh_attempted && !policy.single_attempt)
             {
                 state.refresh_attempted = true;
                 refreshed = owner.backend->refreshCredentials();
             }
-            /// Fresh credentials only help if there is a reissue to sign with them, so under `once` the
-            /// store's answer stands even when a refresh succeeded. A refusal that FOLLOWS an ambiguous
-            /// attempt of this call proves nothing about that attempt, so it is settled by the read
-            /// below instead of ending the call here.
-            if ((!refreshed || policy.single_attempt) && isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
+            /// A refusal that FOLLOWS an ambiguous attempt of this inner write proves nothing about that
+            /// attempt, so it is settled by the read below instead of ending the call here.
+            if (!refreshed && isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
             {
                 ProfileEvents::increment(ProfileEvents::CASRequestRefused);
-                return Refused{e.code(), e.message()};
+                return Refused{e.code(), e.message(), state.attempts_sent};
             }
         }
-        catch (const std::exception &)
+        catch (const std::exception & e)
         {
-            /// An unmodeled failure may still have landed: leave `outcome` disengaged and settle it by
-            /// reading, never by reporting a refusal the store never gave.
+            /// Only the transport can have landed anything, and every exception it raises is a
+            /// `Poco::Exception`. A local fault -- a bad allocation, a logic error raised inside the
+            /// attempt -- is not a store answer, and settling it by a read would bury the bug behind an
+            /// outcome the store never gave. What is left is an unmodeled transport failure that may
+            /// still have landed, so `outcome` stays disengaged and the read below settles it.
+            if (!dynamic_cast<const Poco::Exception *>(&e))
+                throw;
         }
 
         if (outcome && outcome->has_value())
@@ -705,10 +737,8 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         if (!outcome && !credential_answer)
             state.any_ambiguous = true;
 
-        /// Nothing for a read to settle: this attempt did not apply, and no EARLIER attempt of the call
-        /// is unresolved either. Re-send it under the credentials the refresh installed. The policy is
-        /// named here rather than inherited from the refusal above, so a gap in what counts as a
-        /// definite refusal can never turn `once` into a sleeping loop.
+        /// Nothing for a read to settle: this attempt did not apply, and no EARLIER attempt of this
+        /// inner write is unresolved either. Re-send it under the credentials the refresh installed.
         if (refreshed && !policy.single_attempt && !state.any_ambiguous)
         {
             if (auto given_up = pauseAndReissue(state, bound))
@@ -730,17 +760,29 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// reported as an ordinary conflict and a lease refusal as a policy deadline.
         if (resolved.stop)
             return gaveUpForReadStop(*resolved.stop, state, bound);
-        if (const auto * obj = std::get_if<Object>(&state.last_seen))
-        {
-            /// Our own bytes prove an earlier ambiguous attempt landed. Without an ambiguity there was
-            /// nothing of ours to land, so identical bytes are somebody else's object and the caller
-            /// that owns the key's meaning decides what that means.
-            if (state.any_ambiguous && obj->bytes == bytes)
-                return postCommit(obj->incarnation, /*resolved_by_read=*/true, state, bound);
-            return Conflict{state.last_seen};
-        }
+
+        /// No attempt of this inner write is unresolved, so the refused precondition IS the answer.
+        /// Identical bytes here are somebody else's object, and the caller that owns the key's meaning
+        /// decides what that means.
         if (!state.any_ambiguous)
-            return Conflict{state.last_seen};
+            return Conflict{state.last_seen, state.attempts_sent};
+
+        if (!preconditionStillSatisfiable(state.last_seen, expected))
+        {
+            /// The precondition has MOVED, and THAT is what makes byte equality a proof: an attempt
+            /// that never applied leaves the key exactly as it found it, so under an incarnation that
+            /// did not move our own bytes cannot be told from the bytes already there. A create reaches
+            /// here for every object it sees -- an occupied key never satisfies its precondition.
+            if (const auto * obj = std::get_if<Object>(&state.last_seen); obj && obj->bytes == bytes)
+                return postCommit(obj->incarnation, /*resolved_by_read=*/true, state, bound);
+            /// Nothing of this inner write's is at the key, and a reissue would be refused too.
+            return Conflict{state.last_seen, state.attempts_sent};
+        }
+
+        /// Unresolved but repeatable: the precondition would still be met -- or nothing was observed at
+        /// all, which proves neither way and leaves this write's ambiguity alive. A reissue is what
+        /// settles it, and re-sending the same bytes under the same precondition is safe: it ends at
+        /// the store's own answer. A policy with no reissue has to say it settled nothing.
         if (policy.single_attempt)
             return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
         if (auto given_up = pauseAndReissue(state, bound))
@@ -849,7 +891,7 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
             current.reset();
 
         if (policy.single_attempt)
-            return Conflict{state.last_seen};
+            return Conflict{state.last_seen, state.attempts_sent};
         if (auto given_up = pauseAndReissue(state, bound))
             return *given_up;
 

@@ -285,13 +285,14 @@ String renderGcState(const GcState & s)
         .str();
 }
 
-/// `Token::value` is an opaque backend-native string (e.g. an S3 ETag) — NOT a 128-bit hash — so it
-/// renders verbatim (escaped), not hex-converted; `type` names which backend family minted it.
-String renderToken(const Token & t)
+/// A recorded incarnation's value is an opaque backend-native string (e.g. an S3 ETag) — NOT a
+/// 128-bit hash — so it renders verbatim (escaped), not hex-converted; `type` is the dialect word,
+/// naming which backend family minted it.
+String renderPersistedIncarnation(const PersistedIncarnation & inc)
 {
     return JsonObj()
-        .add("value", jsonEscape(t.value))
-        .add("type", jsonEscape(tokenTypeToWord(t.type)))
+        .add("value", jsonEscape(inc.value))
+        .add("type", jsonEscape(inc.dialect))
         .str();
 }
 
@@ -400,7 +401,7 @@ String renderCondemnedRow(const CondemnedRow & r)
 {
     return JsonObj()
         .add("delete_pending", jsonBool(r.delete_pending))
-        .add("token", renderToken(r.token))
+        .add("token", renderPersistedIncarnation(r.token))
         .add("size", jsonUInt(r.size))
         .add("condemn_round", jsonUInt(r.condemn_round))
         .add("marker_confirmed", jsonBool(r.marker_confirmed))

@@ -5,15 +5,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
+#include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
+#include <IO/ReadSettings.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
 #include <base/defines.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
-#include <Disks/tests/cas_test_helpers.h>
-#include <IO/ReadSettings.h>
 
 #include <chrono>
 #include <atomic>
@@ -34,6 +34,8 @@
 #endif
 
 using namespace DB::Cas;
+
+using DB::Cas::tests::expectBytes;
 
 namespace DB::ErrorCodes
 {
@@ -261,11 +263,11 @@ TEST(CASInMemory, OverwriteIsTokenExactAndMintsFreshToken)
     InMemoryBackend b;
     const Token t1 = b.putIfAbsent("k", "v1").token;
     EXPECT_EQ(b.putOverwrite("k", "v2", Token{"wrong", TokenType::Emulated}).outcome, PutOutcome::PreconditionFailed);
-    EXPECT_EQ(b.get("k")->bytes, "v1");                       // untouched on mismatch
+    expectBytes(b, "k", "v1");                                // untouched on mismatch
     const auto overwrite = b.putOverwrite("k", "v2", t1);
     EXPECT_EQ(overwrite.outcome, PutOutcome::Done);
     EXPECT_NE(overwrite.token, t1);                           // tokens never repeat
-    EXPECT_EQ(b.get("k")->bytes, "v2");
+    expectBytes(b, "k", "v2");
 }
 
 TEST(CASInMemory, CasPutCreateAndSwap)
@@ -453,14 +455,14 @@ TEST(CASInMemoryFaults, HeldDeleteLandsLater)
     b.putOverwrite("k", "v1'", t1);
     auto landed = b.landPendingDelete(0);             // the zombie lands NOW
     EXPECT_EQ(landed.kind, DeleteOutcome::Kind::TokenMismatch);   // 412 — INV-NO-RETURN in miniature
-    EXPECT_EQ(b.get("k")->bytes, "v1'");
+    expectBytes(b, "k", "v1'");
 }
 
 TEST(CASInMemoryFaults, InjectedCasConflictFiresOnce)
 {
     InMemoryBackend b;
     const Token t1 = b.casPut("m", "s1", std::nullopt).token;
-    b.failNextCasPut("m");
+    b.refuseNextWrite("m");
     EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Conflict);     // injected
     EXPECT_EQ(b.get("m")->bytes, "s1");
     EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Committed);    // next attempt is real
@@ -636,19 +638,14 @@ TEST(CASSizedReadSettings, CapsToKnownSizePlusSlackButNeverAboveBase)
     EXPECT_EQ(unknown.remote_fs_settings.buffer_size, 1ULL << 20);
 }
 
-/// The CountingBackend request-shape recorders that the streaming-memory gates consume: per-key and
-/// total getStream counts, and the whole-object get flag that marks a resident-memory violation for a
-/// run object. The ranged-window recorder is no longer exercised here: a materialized read is always
-/// whole now, so only `getStream` still carries a window.
-TEST(CASCountingBackendShape, RecordsGetStreamAndWholeGetShape)
+/// The CountingBackend recorders the streaming-memory gates consume: per-key and total stream counts.
+/// A window is no longer part of the shape -- a materialized read is always whole, so only `getStream`
+/// still carries one, and it is not what the gates measure.
+TEST(CASCountingBackendShape, RecordsStreamOpensPerKeyAndInTotal)
 {
     DB::Cas::tests::CountingBackend backend;
     backend.putIfAbsent("k", String(1000, 'x'));
 
-    backend.get("k");
-    EXPECT_EQ(backend.wholeGetCount("k"), 1u);
-
-    /// getStream counters (per-key and total).
     backend.getStream("k", DB::Cas::Range{.offset = 2, .length = 5});
     backend.getStream("k");
     backend.getStream("absent");
@@ -656,8 +653,90 @@ TEST(CASCountingBackendShape, RecordsGetStreamAndWholeGetShape)
     EXPECT_EQ(backend.getStreamTotal(), 3u);
 
     backend.resetCounts();
-    EXPECT_EQ(backend.wholeGetCount("k"), 0u);
+    EXPECT_EQ(backend.getStreamCount("k"), 0u);
     EXPECT_EQ(backend.getStreamTotal(), 0u);
+}
+
+/// Armed chunking makes this backend serve a stream the way a network-backed store does, in bounded
+/// windows, instead of handing over the materialized object in one piece. The bytes a consumer reads
+/// are the same either way; what changes is that a consumer which assumed one contiguous window can no
+/// longer get one.
+TEST(CASCountingBackendShape, AnArmedChunkBoundsTheWindowAStreamHandsOut)
+{
+    const String body(10'000, 'x');
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    ASSERT_EQ(backend->putIfAbsent("run", body).outcome, PutOutcome::Done);
+
+    /// Unarmed: the whole object arrives as one window, which is what this backend's materialization
+    /// makes of any stream and exactly what the bound exists to remove.
+    {
+        auto opened = backend->getStream("run");
+        ASSERT_TRUE(opened);
+        String drained;
+        readStringUntilEOF(drained, *opened->stream);
+        EXPECT_EQ(drained, body);
+        EXPECT_EQ(backend->largestStreamChunk("run"), 0u) << "nothing records a window while chunking is off";
+    }
+
+    backend->setStreamChunkForTest(4096);
+    {
+        auto opened = backend->getStream("run");
+        ASSERT_TRUE(opened);
+        String drained;
+        readStringUntilEOF(drained, *opened->stream);
+        EXPECT_EQ(drained, body) << "chunking changes the window, never the bytes";
+        EXPECT_EQ(backend->largestStreamChunk("run"), 4096u);
+        EXPECT_LT(backend->largestStreamChunk("run"), body.size())
+            << "the consumer never held the object entire";
+    }
+
+    /// The mode outlives a counter reset, and the recorded window does not.
+    backend->resetCounts();
+    EXPECT_EQ(backend->largestStreamChunk("run"), 0u);
+    auto reopened = backend->getStream("run");
+    ASSERT_TRUE(reopened);
+    String again;
+    readStringUntilEOF(again, *reopened->stream);
+    EXPECT_EQ(backend->largestStreamChunk("run"), 4096u);
+}
+
+/// What makes every request-profile gate in this tree trustworthy: a counter names a PHYSICAL request,
+/// so the same request counts once whichever surface issued it. Before the counters moved onto the
+/// transport primitives a legacy call and a `CasOperation` call landed on different counters, and a
+/// gate written against one was blind to the other.
+TEST(CASCountingBackendShape, OneRequestIsCountedOnceWhicheverSurfaceIssuedIt)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    DB::Cas::CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    DB::Cas::CasOperation op = requests.admit();
+
+    EXPECT_EQ(backend->putIfAbsent("k", "v").outcome, PutOutcome::Done);   /// legacy create
+    EXPECT_TRUE(std::holds_alternative<Committed>(
+        op.create("k2", "v", Retry::standard())));                        /// the same request, admitted
+    EXPECT_EQ(backend->putCount("k"), 1u);
+    EXPECT_EQ(backend->putCount("k2"), 1u);
+    EXPECT_EQ(backend->writeTotal(), 2u);
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u) << "neither write carried a precondition";
+
+    const Token seen = backend->head("k").token;                          /// legacy head
+    EXPECT_TRUE(op.head("k", Retry::standard()));                         /// admitted head
+    EXPECT_EQ(backend->headCount("k"), 2u);
+
+    expectBytes(*backend, "k", "v");                                      /// legacy read
+    EXPECT_TRUE(op.read("k", Retry::standard()));                         /// admitted read
+    EXPECT_EQ(backend->getCount("k"), 2u);
+
+    EXPECT_EQ(backend->putOverwrite("k", "w", seen).outcome, PutOutcome::Done);
+    EXPECT_EQ(backend->putOverwriteCount("k"), 1u) << "a write with a precondition is the replace shape";
+    EXPECT_EQ(backend->writeCount("k"), 2u);
+
+    const std::optional<Meta> k2_meta = op.head("k2", Retry::standard());
+    ASSERT_TRUE(k2_meta);
+    EXPECT_EQ(op.remove("k2", k2_meta->incarnation, Retry::standard()), Removal::Removed);
+    EXPECT_EQ(backend->deleteExact("k", backend->head("k").token).kind, DeleteOutcome::Kind::Deleted);
+    EXPECT_EQ(backend->deleteCount("k"), 1u);
+    EXPECT_EQ(backend->deleteCount("k2"), 1u);
+    EXPECT_EQ(backend->deleteTotal(), 2u);
 }
 
 #if USE_AWS_S3

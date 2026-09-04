@@ -55,8 +55,6 @@ const RootNamespace kNsB{"00/zz@cas@"};
 class CatalogChangesOnSecondReadBackend : public CountingBackend
 {
 public:
-    using Backend::get;
-
     void armCatalogMutation(const String & key)
     {
         catalog_key = key;
@@ -66,9 +64,9 @@ public:
 
     size_t catalogReads() const { return catalog_reads; }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        auto got = CountingBackend::get(key, range);
+        auto got = CountingBackend::read(key, access);
         if (!armed || key != catalog_key)
             return got;
 
@@ -78,11 +76,9 @@ public:
         if (!got)
             throw std::runtime_error("catalog mutation fixture: second catalog read found absence");
 
-        const PutResult put = CountingBackend::putOverwrite(
-            key, encodeRefCatalog(RefCatalog{}), got->token, {});
-        if (put.outcome != PutOutcome::Done)
+        if (!CountingBackend::write(key, encodeRefCatalog(RefCatalog{}), got->value, access))
             throw std::runtime_error("catalog mutation fixture: catalog rewrite conflicted");
-        return CountingBackend::get(key, range);
+        return CountingBackend::read(key, access);
     }
 
 private:
@@ -111,9 +107,10 @@ bool condemnedInSealedRuns(Backend & backend, const Layout & layout, const DB::U
     if (!sealed)
         return false;
     const CasFoldSeal seal = decodeFoldSeal(sealed->bytes);
+    DB::Cas::tests::OperationForTest operation(backend);
     for (const RunRef & r : seal.blob_target_runs)
     {
-        auto reader = openSourceEdgeRun(backend, r.key);
+        auto reader = openSourceEdgeRun(*operation, r.key);
         String k;
         String p;
         while (reader.next(k, p))

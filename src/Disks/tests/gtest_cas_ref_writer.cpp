@@ -53,7 +53,7 @@ extern const Event CASRefSnapshotPutBytes;
 extern const Event CASRefSnapshotTailLogs;
 extern const Event CASRefSnapshotPublishDispatched;
 extern const Event CASRefSnapshotPublishBackoff;
-extern const Event CASConditionalWriteFenceLostPostWrite;
+extern const Event CASRequestFenceLostPostWrite;
 extern const Event CASRefRecoveryEpochSealed;
 extern const Event CASRefRecoveryRetries;
 }
@@ -72,30 +72,74 @@ using DB::Cas::tests::writeSealAt;
 namespace
 {
 
-/// The operation deadline every SINGLE-ATTEMPT fixture in this file uses, and the reason it is
-/// deliberately NOT `attempt_timeout_ms`.
-///
-/// Those fixtures exist to make one injected ambiguous response conclusive, and `max_attempts = 1`
-/// alone achieves that: with retries allowed the controller would resolve-before-reissue and report a
-/// definite outcome instead. The deadline contributes nothing to that -- but setting it EQUAL to the
-/// attempt timeout collapses the controller's pre-send gate into a race. The deadline is captured as
-/// `now + operation_deadline_ms` and the gate asks `now + attempt_timeout_ms > deadline`
-/// (`CasRequestControl.cpp`), so equal values reduce it to `now_2 > now_1`: ONE elapsed millisecond
-/// between the two clock reads refuses the operation with NOTHING SENT, the injected fault is never
-/// reached, and the product correctly does not wedge -- flipping every wedge expectation downstream.
-///
-/// That is not hypothetical. It took down
-/// `CASRefWriterStalePrecommitSweep.BoundedBatchesAndInterruptionResumeAcrossMounts` on 5 of 6 sanitizer
-/// CI runs (fixed in `8f9e63c7a19`), `CASRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`
-/// under parallel-build load, and `CASRefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`
-/// in a full-binary ASan run -- the last one with the mechanism named verbatim in the thrown message
-/// ("refused BEFORE any request was sent ... the operation deadline rejected before the first request").
-///
-/// A wide deadline keeps the request always actually sent, so what the test observes is the fault it
-/// injected rather than the machine it ran on. A fixture that genuinely wants the pre-send REFUSAL
-/// must drive it deterministically with a frozen clock (see `gtest_cas_ref_install_safety.cpp`'s
-/// `openPoolFenceControlled`), never by racing the wall clock.
+/// The operation deadline every wedge fixture in this file uses, distinct from `attempt_timeout_ms`
+/// because `validateCasRequestBudget` requires the two to differ strictly: `Pool::open` refuses a
+/// budget where `attempt_timeout_ms >= operation_deadline_ms` with `BAD_ARGUMENTS`, so an equal or
+/// smaller value would refuse to open the pool at all rather than exercise any fixture below.
 constexpr uint64_t kSingleAttemptDeadlineMs = 5000;
+
+/// The budget every wedge fixture here uses. It bounds the mount lease's own admission arithmetic and
+/// nothing else: a write's ATTEMPT COUNT is the `Retry` policy's, and the ref lane's is `standard`, so
+/// no budget field can make an injected fault conclusive. What does is `driveToTheWedge` below --
+/// the fault stays armed for the whole call while the injected clock carries it to its own deadline.
+CasRequestBudget wedgeTestBudget()
+{
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
+    budget.lease_safety_margin_ms = 100;
+    return budget;
+}
+
+/// The engine reissues an unresolved write until its OWN retry window closes, and that window is
+/// measured on a clock the engine reads. Both seams here share one counter -- the sleep the engine
+/// performs is what advances the clock -- so a fault that stays armed ends the call at its deadline
+/// with no real time passing. Installed on the whole pool, because the ref-lane write, its settling
+/// read and the recovery retry loop all pace through the same seam. The pool owns the closures and the
+/// closures own the clock, so it outlives everything that can still read it.
+class VirtualRetryClock
+{
+public:
+    static std::shared_ptr<VirtualRetryClock> installOn(const PoolPtr & store)
+    {
+        auto clock = std::make_shared<VirtualRetryClock>();
+        store->setCasRequestNowFnForTest([clock] { return clock->nowMs(); });
+        store->setCasRetrySleepForTest([clock](uint64_t ms) { clock->advance(ms); });
+        return clock;
+    }
+
+    uint64_t nowMs() const
+    {
+        std::lock_guard lock(mutex);
+        return now_ms;
+    }
+    size_t pauseCount() const
+    {
+        std::lock_guard lock(mutex);
+        return pauses;
+    }
+    uint64_t longestPause() const
+    {
+        std::lock_guard lock(mutex);
+        return longest_pause;
+    }
+
+    void advance(uint64_t ms)
+    {
+        std::lock_guard lock(mutex);
+        /// Plus one millisecond, because full jitter can draw a ZERO pause: a clock that does not move
+        /// would leave the loop reissuing for ever against a fault that never clears.
+        now_ms += ms + 1;
+        ++pauses;
+        longest_pause = std::max(longest_pause, ms);
+    }
+
+private:
+    mutable std::mutex mutex;
+    uint64_t now_ms = 0;
+    size_t pauses = 0;
+    uint64_t longest_pause = 0;
+};
 
 /// A `CasEvent` sink safe to hand to `Pool::setEventSink`: the emit runs on whatever thread the pool's
 /// background syncer happens to be on, and the test reads the accumulated events afterward from the
@@ -181,9 +225,68 @@ void publishWithProductionBirth(const PoolPtr & store, const RootNamespace & ns,
     build->promote(ns, ref, build->buildId(), id);
 }
 
-CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const RootNamespace & ns)
+/// Fixture observations of durable state run on an OPEN fence: they are not writes a mount admitted,
+/// and each owns the `CasRequests` its operation borrows, so none of these hands one back.
+std::optional<CkptSample> readCkptForTest(const BackendPtr & backend, const Layout & layout,
+                                          const NamespaceLifeId & life)
 {
-    const RefCatalog catalog = CasRefCatalog::read(backend, layout).catalog;
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    return readCkpt(op, layout, life);
+}
+
+CasRefCatalog::Snapshot readCatalogForTest(const BackendPtr & backend, const Layout & layout)
+{
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    return CasRefCatalog::read(op, layout);
+}
+
+/// A fixture's own conditional replace, for the races these tests stage by hand.
+bool replaceForTest(const BackendPtr & backend, const String & key, const String & bytes,
+                    const Incarnation & expected)
+{
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    return std::holds_alternative<Committed>(op.replace(key, bytes, expected, Retry::standard()));
+}
+
+void casAdmitEntryForTest(const BackendPtr & backend, const Layout & layout, uint64_t gc_shards,
+                          const CatalogEntry & entry)
+{
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    CasRefCatalog::casAdmitEntry(op, layout, gc_shards, entry);
+}
+
+std::optional<NamespaceLifeId> lifeIfCatalogedForTest(const BackendPtr & backend, const Layout & layout,
+                                                      const RootNamespace & ns)
+{
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    return CasRefCatalog::lifeIfCataloged(op, layout, ns);
+}
+
+uint64_t allocateWriterEpochForTest(const BackendPtr & backend, const Layout & layout, const String & server_root_id)
+{
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    return allocateWriterEpoch(op, layout, server_root_id, EpochMintPolicy::NormalMount, 0,
+                               [] { return RefCatalog{}; });
+}
+
+/// A fixture enumeration on an open fence: the primitive `list` override in this file's test backend
+/// hides the legacy name, and a test walking a prefix should ride the same engine production does.
+KeyPage listForTest(const BackendPtr & backend, const String & prefix, const String & cursor, size_t limit)
+{
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    return op.list(prefix, cursor, limit, Retry::standard());
+}
+
+CatalogEntry catalogEntryOrThrow(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
+{
+    const RefCatalog catalog = readCatalogForTest(backend, layout).catalog;
     const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
     {
         return entry.ns == ns;
@@ -194,16 +297,18 @@ CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const
 }
 
 CatalogEntry replaceCatalogLifeForRuntimeRace(
-    Backend & backend, const Layout & layout, const CatalogEntry & predecessor, UInt128 successor_incarnation)
+    const BackendPtr & backend, const Layout & layout, const CatalogEntry & predecessor,
+    UInt128 successor_incarnation)
 {
-    const CasRefCatalog::Snapshot before_delete = CasRefCatalog::read(backend, layout);
+    const CasRefCatalog::Snapshot before_delete = readCatalogForTest(backend, layout);
     RefCatalog without_predecessor = before_delete.catalog;
     std::erase_if(without_predecessor.entries, [&](const CatalogEntry & entry)
     {
         return entry.ns == predecessor.ns && entry.incarnation == predecessor.incarnation;
     });
-    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(without_predecessor), before_delete.token).outcome
-        != CasOutcome::Committed)
+    if (!before_delete.incarnation
+        || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(without_predecessor),
+                           *before_delete.incarnation))
         throw std::runtime_error("test failed to retire exact predecessor catalog life");
 
     CatalogEntry successor{
@@ -211,11 +316,11 @@ CatalogEntry replaceCatalogLifeForRuntimeRace(
         .state = NsState::Live,
         .incarnation = successor_incarnation,
         .creator = std::nullopt};
-    const CasRefCatalog::Snapshot after_delete = CasRefCatalog::read(backend, layout);
+    const CasRefCatalog::Snapshot after_delete = readCatalogForTest(backend, layout);
     RefCatalog reborn = after_delete.catalog;
     reborn.entries.push_back(successor);
-    if (backend.casPut(layout.refCatalogKey(), encodeRefCatalog(reborn), after_delete.token).outcome
-        != CasOutcome::Committed)
+    if (!after_delete.incarnation
+        || !replaceForTest(backend, layout.refCatalogKey(), encodeRefCatalog(reborn), *after_delete.incarnation))
         throw std::runtime_error("test failed to publish successor catalog life");
     return successor;
 }
@@ -252,7 +357,7 @@ struct CompletedRemovingFixture
 };
 
 CompletedRemovingFixture prepareResidentRemovalForDrain(
-    const PoolPtr & store, Backend & backend, const RootNamespace & ns, Gc & gc)
+    const PoolPtr & store, const BackendPtr & backend, const RootNamespace & ns, Gc & gc)
 {
     publishWithProductionBirth(store, ns, "predecessor");
     const CatalogEntry predecessor = catalogEntryOrThrow(backend, store->layout(), ns);
@@ -268,9 +373,9 @@ CompletedRemovingFixture prepareResidentRemovalForDrain(
     if (runRegularRoundReclaiming(gc).deferred)
         throw std::runtime_error("fixture terminal fold unexpectedly deferred");
 
-    const GcState state = decodeGcState(backend.get(store->layout().gcStateKey())->bytes);
+    const GcState state = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
     const CasFoldSeal seal = decodeFoldSeal(
-        backend.get(store->layout().foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
+        backend->get(store->layout().foldSealKey(state.snap_generation, state.snap_attempt))->bytes);
     const auto row = seal.ref_lives.find(predecessor.incarnation);
     if (row == seal.ref_lives.end() || !row->second.cleanup_evidence)
         throw std::runtime_error("fixture terminal fold produced no cleanup evidence");
@@ -355,11 +460,7 @@ public:
         DB::Cas::tests::seedPoolMetaForRestart(*this);
     }
 
-    using CountingBackend::get;
     using CountingBackend::getStream;
-    using CountingBackend::putIfAbsent;
-    using CountingBackend::putOverwrite;
-    using CountingBackend::casPut;
 
     void clearRequestJournal()
     {
@@ -400,6 +501,13 @@ public:
 
     String fault_key_substr;
     int fault_count = 0;
+    /// LATCHED: a COUNT can no longer make an injected fault conclusive, because the write engine
+    /// settles each ambiguity by an exact read and then REISSUES -- a fault that runs out mid-call is
+    /// answered by the next attempt instead of by the call's own deadline, which is the difference
+    /// between a wedge and a commit. While this is set the count is topped up before every matching
+    /// create, so the fault outlasts the whole call.
+    bool fault_latched = false;
+    bool ckpt_conflict_latched = false;
     /// Let the first `fault_skip` matching PUTs through untouched before `fault_count` starts faulting.
     /// Needed now that recovery's in-band epoch seal (INV-2) shares the `_log/` prefix with every other
     /// write under a namespace: a test that wants to fault something LATER in the same prefix (e.g. the
@@ -428,17 +536,18 @@ public:
     /// times. Recovery must not consume this injection; callers that intentionally enumerate still do.
     int list_fault_count = 0;
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    DB::Cas::Backend::RawListPage list(const String & prefix, const String & cursor, size_t limit,
+                                       DB::Cas::TransportAccess & access) override
     {
         if (list_fault_count > 0)
         {
             --list_fault_count;
             throw DB::Exception(DB::ErrorCodes::S3_ERROR, "RefWriterTestBackend: simulated transient LIST failure");
         }
-        return CountingBackend::list(prefix, cursor, limit);
+        return CountingBackend::list(prefix, cursor, limit, access);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         recordRequestJournalEvent("GET " + key);
         if (key == ckpt_get_hook_key && ckpt_get_hook)
@@ -472,18 +581,52 @@ public:
             }
             return std::nullopt;
         }
-        return CountingBackend::get(key, range);
+        return CountingBackend::read(key, access);
     }
 
-    CasResult casPut(
-        const String & key, const String & bytes, const std::optional<Token> & expected,
-        const ObjectMeta & meta) override
+    /// Every write fault hangs off the ONE keyed primitive. Which of them applies is decided by whether
+    /// the write carries a precondition, which is exactly what used to separate a conditional replace
+    /// from a create.
+    std::expected<String, DB::Cas::Backend::RawConflict> write(
+        const String & key, const String & bytes, const std::optional<String> & expected_value,
+        DB::Cas::TransportAccess & access) override
+    {
+        topUpLatchedFaults(key, expected_value);
+        if (expected_value)
+            return conditionalReplaceForTest(key, bytes, *expected_value, access);
+        return createForTest(key, bytes, access);
+    }
+
+    /// Both latches are re-armed HERE rather than inside each seam, so a latched fault reads exactly
+    /// like the counted one it replaces.
+    void topUpLatchedFaults(const String & key, const std::optional<String> & expected_value)
+    {
+        if (ckpt_conflict_latched && key == ckpt_conflict_key)
+            ckpt_conflict_count = 1;
+        if (fault_latched && !expected_value && fault_skip == 0 && !fault_key_substr.empty()
+            && key.find(fault_key_substr) != String::npos)
+            fault_count = 1;
+    }
+
+    void disarmFaults()
+    {
+        fault_latched = false;
+        ckpt_conflict_latched = false;
+        fault_count = 0;
+        fault_skip = 0;
+        ckpt_conflict_count = 0;
+        corrupt_count = 0;
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> conditionalReplaceForTest(
+        const String & key, const String & bytes, const String & expected_value,
+        DB::Cas::TransportAccess & access)
     {
         recordRequestJournalEvent("CAS " + key);
         if (key == ckpt_conflict_key && ckpt_conflict_count > 0)
         {
             --ckpt_conflict_count;
-            return {CasOutcome::Conflict, {}};
+            return std::unexpected(DB::Cas::Backend::RawConflict{});
         }
         if (key == catalog_fault_key && catalog_cas_fault != CatalogCasFault::None)
         {
@@ -491,31 +634,32 @@ public:
             catalog_cas_fault_fired = true;
             if (fault == CatalogCasFault::CommitThenThrow)
             {
-                const CasResult result = CountingBackend::casPut(key, bytes, expected, meta);
-                if (result.outcome != CasOutcome::Committed)
+                auto result = CountingBackend::write(key, bytes, expected_value, access);
+                if (!result.has_value())
                     return result;
                 throw Poco::TimeoutException(
                     "RefWriterTestBackend: catalog CAS committed but its response was lost");
             }
 
-            CasResult replacement = CountingBackend::casPut(
-                key, catalog_replacement_bytes, expected, meta);
-            if (replacement.outcome != CasOutcome::Committed)
+            auto replacement = CountingBackend::write(key, catalog_replacement_bytes, expected_value, access);
+            if (!replacement.has_value())
                 return replacement;
-            return {CasOutcome::Conflict, {}};
+            return std::unexpected(DB::Cas::Backend::RawConflict{});
         }
-        return CountingBackend::casPut(key, bytes, expected, meta);
+        return CountingBackend::write(key, bytes, expected_value, access);
     }
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    std::expected<String, DB::Cas::Backend::RawConflict> createForTest(
+        const String & key, const String & bytes, DB::Cas::TransportAccess & access)
     {
         recordRequestJournalEvent("PUT " + key);
         if (corrupt_count > 0 && !corrupt_key_substr.empty() && key.find(corrupt_key_substr) != String::npos)
         {
             --corrupt_count;
             /// A foreign writer lands a DIFFERENT object at this exact key; then our own response is lost.
-            CountingBackend::putIfAbsent(
-                key, corrupt_foreign_bytes.empty() ? bytes + String("\x01_FOREIGN_DIFFERENT") : corrupt_foreign_bytes);
+            (void)CountingBackend::write(
+                key, corrupt_foreign_bytes.empty() ? bytes + String("\x01_FOREIGN_DIFFERENT") : corrupt_foreign_bytes,
+                std::nullopt, access);
             throw Poco::TimeoutException("RefWriterTestBackend: a foreign different object landed; response lost");
         }
         if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
@@ -561,16 +705,16 @@ public:
                 block_entered = true;
                 block_cv.notify_all();
                 block_cv.wait(lk, [&] { return !block_armed; });
-                /// fix-round F3-1a (CRITICAL, unlock-throw race harness): on release, behave like
-                /// `corrupt_key_substr` above instead of proceeding normally -- a foreign writer landed
-                /// DIFFERENT bytes at this exact key while we were parked, so our own attempt is a
-                /// PROVEN conflict once `putIfAbsentControlled`'s resolve-before-reissue GETs it. Lets a
-                /// test make the recovery seal's PUT throw CORRUPTED_DATA from INSIDE the unlocked
-                /// window, deterministically, instead of merely returning a non-Committed outcome.
+                /// On release, behave like `corrupt_key_substr` above instead of proceeding normally --
+                /// a foreign writer landed DIFFERENT bytes at this exact key while we were parked, so
+                /// our own attempt is a PROVEN conflict once the write engine's own settling read
+                /// observes it. Lets a test make the recovery seal's write throw CORRUPTED_DATA from
+                /// INSIDE the unlocked window, deterministically, instead of merely returning a
+                /// non-Committed outcome.
                 if (block_throw_corrupted_on_release)
                 {
                     lk.unlock();
-                    CountingBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"));
+                    (void)CountingBackend::write(key, bytes + String("\x01_FOREIGN_DIFFERENT"), std::nullopt, access);
                     {
                         std::lock_guard g(block_mutex);
                         block_call_completed = true;
@@ -581,7 +725,7 @@ public:
                 }
             }
         }
-        const PutResult r = CountingBackend::putIfAbsent(key, bytes, meta);
+        auto r = CountingBackend::write(key, bytes, std::nullopt, access);
         {
             std::lock_guard g(block_mutex);
             block_call_completed = true;
@@ -599,7 +743,7 @@ public:
     {
         if (pending_delayed_write)
         {
-            CountingBackend::putIfAbsent(pending_delayed_write->first, pending_delayed_write->second);
+            (void)putIfAbsent(pending_delayed_write->first, pending_delayed_write->second);
             pending_delayed_write.reset();
         }
     }
@@ -708,6 +852,31 @@ private:
     std::set<String> independent_released_keys;
 };
 
+/// Wedge the lane the way the engine reaches that state: EVERY attempt of the ref-log create is
+/// unresolved, the settling read proves the key still absent, and the call gives up at its own retry
+/// window having sent something -- which is the `sent_any` half of the wedge rule. A one-shot fault
+/// cannot produce it: the reissue would settle the key and commit. So the fault is held armed for the
+/// whole call and fully disarmed afterwards, because what every caller does next is a flush that must
+/// reach the store normally.
+///
+/// The pacing assertions are what make a fixture whose sleep seam is not wired FAIL rather than sleep
+/// the whole window out for real.
+void driveToTheWedge(VirtualRetryClock & clock, RefWriterTestBackend & backend,
+                     const std::function<void()> & drive)
+{
+    const size_t pauses_before = clock.pauseCount();
+    const uint64_t clock_before = clock.nowMs();
+    backend.fault_latched = true;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, drive);
+    backend.disarmFaults();
+    EXPECT_GT(clock.pauseCount(), pauses_before + 1)
+        << "the reissues must pace through the injected sleep, never a real one";
+    EXPECT_LE(clock.longestPause(), 5000u) << "each pause is the engine's own capped full jitter";
+    EXPECT_GE(clock.nowMs() - clock_before, 60000u)
+        << "the give-up must be the call's own retry window, not a pre-attempt refusal";
+}
+
+
 }
 
 /// ===================================================================================
@@ -739,7 +908,7 @@ TEST(CASRefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
 
     EXPECT_EQ(backend->putCount(layout.refCatalogKey()), 0u);
     EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0u);
-    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->writeCount(layout.refCatalogKey()), 0u);
     EXPECT_EQ(backend->deleteCount(layout.refCatalogKey()), 0u);
     const auto catalog_after = backend->get(layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
@@ -754,7 +923,7 @@ TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocal
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/cold-read-catalog-aba"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
-    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, layout, ns);
     ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
     std::mutex mutex;
@@ -787,7 +956,7 @@ TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocal
     }
 
     const CatalogEntry successor
-        = replaceCatalogLifeForRuntimeRace(*backend, layout, predecessor, UInt128{0xabc002});
+        = replaceCatalogLifeForRuntimeRace(backend, layout, predecessor, UInt128{0xabc002});
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
@@ -818,14 +987,14 @@ TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsReplacementByExternalPoolActor)
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/external-catalog-runtime-publication"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
-    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, layout, ns);
     ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
     CatalogEntry successor;
     store->setReadableCatalogAfterObservationHookForTest([&]
     {
         successor = replaceCatalogLifeForRuntimeRace(
-            external_store->backend(), external_store->layout(), predecessor, UInt128{0xabc003});
+            external_store->poolBackendPtr(), external_store->layout(), predecessor, UInt128{0xabc003});
         const NamespaceLifeId successor_life
             = NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation);
         if (external_store->backend().putIfAbsent(
@@ -885,7 +1054,7 @@ TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsAliasingIncarnationAdmittedBetw
     const RootNamespace ns{"srv1/aliasing-incarnation-target"};
     const RootNamespace alias{"srv1/aliasing-incarnation-thief"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
-    const CatalogEntry target_row = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry target_row = catalogEntryOrThrow(backend, layout, ns);
     ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
     store->setReadableCatalogAfterObservationHookForTest([&]
@@ -896,7 +1065,7 @@ TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsAliasingIncarnationAdmittedBetw
         thief.incarnation = target_row.incarnation;
         thief.creator = CreatorFence{
             .server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
-        CasRefCatalog::casAdmitEntry(*backend, layout, 1, thief);
+        casAdmitEntryForTest(backend, layout, 1, thief);
     });
 
     EXPECT_THROW((void)store->listRefs(ns), DB::Exception);
@@ -937,7 +1106,7 @@ TEST(CASRefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)
 
     EXPECT_EQ(backend->putCount(layout.refCatalogKey()), 0u);
     EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0u);
-    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->writeCount(layout.refCatalogKey()), 0u);
     EXPECT_EQ(backend->deleteCount(layout.refCatalogKey()), 0u);
     const auto catalog_after = backend->get(layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
@@ -959,7 +1128,7 @@ TEST(CASRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
 
     EXPECT_EQ(backend->putCount(layout.refCatalogKey()), 0u);
     EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), 0u);
-    EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), 0u);
+    EXPECT_EQ(backend->writeCount(layout.refCatalogKey()), 0u);
     EXPECT_EQ(backend->deleteCount(layout.refCatalogKey()), 0u);
     const auto catalog_after = backend->get(layout.refCatalogKey());
     ASSERT_TRUE(catalog_after);
@@ -976,7 +1145,7 @@ TEST(CASRefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
     const RootNamespace ns{"srv1/birth_only"};
 
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
@@ -1000,7 +1169,7 @@ TEST(CASRefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
         {namespaceBirthOp(), publishCommittedOps("part_1", m1)[0]}, std::nullopt});
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 2},
         {publishCommittedOps("part_1", m1)[1]}, std::nullopt});
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
@@ -1039,7 +1208,7 @@ TEST(CASRefWriterRecovery, TerminalGapBelowCheckpointFrontierIsCorruptionNotSame
         .last_epoch_seal = RefTxnId{1, 2},
     });
 
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
     const String next_log_key = layout.refLogKey(life, RefTxnId{2, 2});
     auto store = openPool(backend);
     const uint64_t installs_before = store->recoveryInstallCountForTest();
@@ -1082,7 +1251,7 @@ TEST(CASRefWriterRecovery, SnapshotPlusTailRecovery)
     tail_ops.push_back(publishCommittedOps("b", mb)[0]);
     tail_ops.push_back(publishCommittedOps("b", mb)[1]);
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 6}, tail_ops, std::nullopt});
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 6},
@@ -1118,7 +1287,7 @@ TEST(CASRefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
     /// UNADMITTED namespace mints a fresh RANDOM incarnation rather than adopting the sentinel the raw
     /// fixture writes at.
     DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
     const RefTxnId snap_x{1, 10};
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
@@ -1181,7 +1350,7 @@ TEST(CASRefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestar
     /// further down is a real production read that would otherwise mint a fresh RANDOM incarnation
     /// for this unadmitted namespace instead of adopting the sentinel the raw fixture writes at.
     DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
-    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, layout, ns);
     const RootNamespace other_ns{"srv1/other"};
     DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
@@ -1224,10 +1393,10 @@ TEST(CASRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     ASSERT_TRUE(store->resolveRef(ns, "part_1").has_value());
     ASSERT_TRUE(store->resolveRef(ns, "part_2").has_value());
 
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
     const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
     const String ckpt_key = store->layout().refCkptKey(life);
-    const auto ckpt_before = readCkpt(*backend, store->layout(), life);
+    const auto ckpt_before = readCkptForTest(backend, store->layout(), life);
     ASSERT_TRUE(ckpt_before);
     ASSERT_TRUE(ckpt_before->ckpt.committed_through);
     const RefTxnId expected_frontier{
@@ -1237,7 +1406,7 @@ TEST(CASRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     const uint64_t list_before = backend->listTotal();
     const uint64_t put_before = backend->putTotal();
     const uint64_t ckpt_get_before = backend->getCount(ckpt_key);
-    const uint64_t ckpt_cas_before = backend->casPutCount(ckpt_key);
+    const uint64_t ckpt_cas_before = backend->writeCount(ckpt_key);
 
     std::mutex mutex;
     std::condition_variable cv;
@@ -1346,7 +1515,7 @@ TEST(CASRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     EXPECT_EQ(backend->putTotal(), put_before + 1) << "exactly one body PUT with create-if-absent";
     EXPECT_EQ(backend->getCount(ckpt_key), ckpt_get_before + 1)
         << "one committed chunk pays exactly one checkpoint GET";
-    EXPECT_EQ(backend->casPutCount(ckpt_key), ckpt_cas_before + 1)
+    EXPECT_EQ(backend->writeCount(ckpt_key), ckpt_cas_before + 1)
         << "one committed chunk pays exactly one checkpoint CAS";
 
     const std::vector<String> journal = backend->requestJournal();
@@ -1357,7 +1526,7 @@ TEST(CASRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     EXPECT_EQ(journal[3], "INSTALL");
     EXPECT_EQ(journal[4], "FOLLOWER ACK");
 
-    const auto durable_ckpt = readCkpt(*backend, store->layout(), life);
+    const auto durable_ckpt = readCkptForTest(backend, store->layout(), life);
     ASSERT_TRUE(durable_ckpt);
     EXPECT_EQ(durable_ckpt->ckpt.committed_through, expected_frontier);
 }
@@ -1368,23 +1537,29 @@ TEST(CASRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWit
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/frontier-conflict"};
     publishEmptyPart(store, ns, "x");
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
     const String ckpt_key = store->layout().refCkptKey(life);
-    const auto before = readCkpt(*backend, store->layout(), life);
+    const auto before = readCkptForTest(backend, store->layout(), life);
     ASSERT_TRUE(before);
     ASSERT_TRUE(before->ckpt.committed_through);
     const RefTxnId candidate{before->ckpt.committed_through->writer_epoch,
                              before->ckpt.committed_through->ref_sequence + 1};
     const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
 
+    /// Latched, not counted: the frontier publication re-reads and reissues on every refusal until ITS
+    /// window closes, so a bounded refusal would be outlived and the checkpoint would advance.
+    auto clock = VirtualRetryClock::installOn(store);
     backend->ckpt_conflict_key = ckpt_key;
-    backend->ckpt_conflict_count = 100;
+    backend->ckpt_conflict_latched = true;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    backend->disarmFaults();
 
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the publication's reissues must pace through the injected sleep, never a real one";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
         << "the durable log was not installed or acknowledged";
-    const auto after = readCkpt(*backend, store->layout(), life);
+    const auto after = readCkptForTest(backend, store->layout(), life);
     ASSERT_TRUE(after);
     EXPECT_EQ(after->ckpt.committed_through, before->ckpt.committed_through);
     EXPECT_TRUE(backend->get(store->layout().refLogKey(life, candidate)))
@@ -1400,9 +1575,9 @@ TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecover
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/frontier-fenced"};
     publishEmptyPart(store, ns, "x");
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
+    const NamespaceLifeId life = lifeIfCatalogedForTest(backend, store->layout(), ns).value();
     const String ckpt_key = store->layout().refCkptKey(life);
-    const auto before = readCkpt(*backend, store->layout(), life);
+    const auto before = readCkptForTest(backend, store->layout(), life);
     ASSERT_TRUE(before);
     ASSERT_TRUE(before->ckpt.committed_through);
     const RefTxnId candidate{before->ckpt.committed_through->writer_epoch,
@@ -1416,7 +1591,7 @@ TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecover
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
         << "the fenced frontier attempt must not install or acknowledge the durable log";
-    const auto after = readCkpt(*backend, store->layout(), life);
+    const auto after = readCkptForTest(backend, store->layout(), life);
     ASSERT_TRUE(after);
     EXPECT_EQ(after->ckpt.committed_through, before->ckpt.committed_through);
     EXPECT_TRUE(backend->get(store->layout().refLogKey(life, candidate)));
@@ -1539,14 +1714,11 @@ TEST(CASRefWriterAppendLane, InvalidBatchEntryGetsOwnExceptionBatchSurvives)
 
 TEST(CASRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"srv1/wedge_a"};
     const RootNamespace ns_b{"srv1/wedge_b"};
@@ -1555,9 +1727,7 @@ TEST(CASRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     publishEmptyPart(store, ns_b, "y");
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_a)) + "_log/";
-    backend->fault_count = 1;
-
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns_a, "x"); });
     EXPECT_TRUE(store->refLaneWedgedForTest(ns_a));
 
     /// A different table proceeds normally while ns_a stays wedged.
@@ -1577,23 +1747,18 @@ TEST(CASRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
 
 TEST(CASRefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_unwedge"};
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->resolveRef(ns, "x").has_value()) << "not yet applied while wedged";
 
@@ -1617,14 +1782,11 @@ TEST(CASRefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
 /// tail counter is a stable running count.
 TEST(CASRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_tail"};
     publishEmptyPart(store, ns, "x");
@@ -1632,10 +1794,10 @@ TEST(CASRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 
     const size_t tail_after_setup = store->tailSinceSnapshotCountForTest(ns);
 
-    /// Wedge the lane: the single-attempt budget turns the ambiguous log PUT into an Unresolved outcome.
+    /// Wedge the lane: every attempt of the log create is unresolved, so the call gives up at its own
+    /// retry window having sent something.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->resolveRef(ns, "x").has_value()) << "not applied while merely wedged";
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_after_setup)
@@ -1661,14 +1823,11 @@ TEST(CASRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 /// it, and it must track the wedge's full lifecycle (0 -> 1 -> 0), not just a one-shot snapshot.
 TEST(CASRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughItsLifecycle)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"srv1/wedge_count_a"};
     const RootNamespace ns_b{"srv1/wedge_count_b"};
@@ -1678,9 +1837,7 @@ TEST(CASRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroug
     ASSERT_EQ(store->wedgedRefLaneCount(), 0u) << "both tables cached and healthy before the fault";
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_a)) + "_log/";
-    backend->fault_count = 1;
-
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns_a, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_a));
     EXPECT_EQ(store->wedgedRefLaneCount(), 1u);
 
@@ -1708,7 +1865,7 @@ TEST(CASRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroug
 /// bookkeeping is restored, proven by a bounded wait on both a same-table and an independent-table
 /// append.
 ///
-/// The reaction is now the mount's, not the table's [review I5]: a foreign object at a key that
+/// The reaction is now the mount's, not the table's: a foreign object at a key that
 /// mount-lease exclusivity says is exclusively ours contradicts the exclusivity itself, so the append
 /// site routes through `reportImpossibleInterference` exactly as the wedge-resolve site does -- fence
 /// closed, remount scheduled. The fence is released only after remount, so there are two separate scopes to keep straight, and this test
@@ -1783,23 +1940,19 @@ TEST(CASRefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemou
 /// occupant for what it is -- corruption -- and one test covers every build.
 TEST(CASRefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/i1_wedge"};
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    /// Wedge the lane with an ambiguous PUT that never landed.
+    /// Wedge the lane: every attempt of the log create is unresolved and nothing lands.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     /// A foreign writer lands a DIFFERENT object at the exact wedged key; the next append's wedge resolve
@@ -1849,15 +2002,12 @@ TEST(CASRefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
 /// used to stand in for debug/sanitizer builds went with it.
 TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/anomaly_wedge"};
     publishEmptyPart(store, ns, "x");
@@ -1865,10 +2015,9 @@ TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 
     store->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
-    /// Wedge the lane with an ambiguous PUT that never landed.
+    /// Wedge the lane: every attempt of the log create is unresolved and nothing lands.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->mayMutate()) << "the fence must not be tripped yet -- only an ordinary Unresolved wedge so far";
     ASSERT_EQ(store->scheduleRemountCallCountForTest(), 0u) << "no remount must have been scheduled yet by the ordinary wedge alone";
@@ -1929,8 +2078,8 @@ TEST(CASAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
-            for (const ListedKey & lk : page.keys)
+            const KeyPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
+            for (const KeyEntry & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
                 if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log)
@@ -1990,48 +2139,58 @@ TEST(CASAnomalyPolicy, DiagnosticDispatchLoggingCannotReplaceFailClosedException
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
 }
 
-/// I3: a conditional write whose attempt classified Committed but whose FINAL post-write fence check
-/// failed (the mount fence was lost after the write may have landed) is counted separately, not folded
-/// into the generic Unresolved classifier (spec §Late Predecessor PUT best-effort diagnostic).
-TEST(CASRequestControllerFenceLoss, I3PostWriteFenceLossIsCounted)
+/// A write whose attempt landed but whose post-commit admission check failed is counted separately,
+/// not folded into the generic unresolved give-up: the object may exist, and only the caller's own
+/// resolution of the key may say so.
+TEST(CASRefWriteContract, PostWriteFenceLossIsCounted)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<CountingBackend>();
-    CasRequestBudget budget;
-    budget.max_attempts = 3;
-    CasRequestController ctrl(backend, budget, [] { return static_cast<uint64_t>(0); });   // fixed clock
+    bool live = true;
+    backend->onWriteCommitted("k", [&live] { live = false; });
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit([&live] { return live; });
 
-    /// `fence_ok` holds for the pre-attempt check, then is lost by the post-write check.
-    int calls = 0;
-    auto fence_ok = [&calls] { return ++calls <= 1; };
-
-    const auto before = global_counters[ProfileEvents::CASConditionalWriteFenceLostPostWrite].load();
-    const CasWriteOutcome outcome = ctrl.putIfAbsentControlled("k", "v", fence_ok);
-    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved) << "a post-write fence loss must never be reported as Committed";
-    EXPECT_EQ(global_counters[ProfileEvents::CASConditionalWriteFenceLostPostWrite].load(), before + 1);
+    const auto before = global_counters[ProfileEvents::CASRequestFenceLostPostWrite].load();
+    const WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_TRUE(gave_up != nullptr) << "a post-write fence loss must never be reported as committed";
+    EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRequestFenceLostPostWrite].load(), before + 1);
 }
 
-/// Task B (stageManifest rides the controller): a Committed return surfaces the committed
-/// incarnation's token — from the attempt's own PutResult, and equally from a resolve that proves an
-/// earlier ambiguous attempt landed — so audit emitters (`PartWriteTxn::stageManifest`'s `ManifestPut`
-/// event) keep their token without a follow-up HEAD.
-TEST(CASRequestController, CommittedSurfacesTokenFromPutAndFromResolve)
+/// A commit surfaces the incarnation it created -- from the attempt's own response, and equally from a
+/// settling read that proves an earlier ambiguous attempt of the SAME call landed -- so an audit
+/// emitter keeps the incarnation without a follow-up head.
+TEST(CASRefWriteContract, CommittedSurfacesTheIncarnationFromTheWriteAndFromTheSettlingRead)
 {
     auto backend = std::make_shared<CountingBackend>();
-    CasRequestController ctrl(backend, CasRequestBudget{}, [] { return static_cast<uint64_t>(0); });
-    const auto fence_ok = [] { return true; };
+    CasRequests requests(backend, Fence::open());
 
-    Token direct_token;
-    ASSERT_EQ(ctrl.putIfAbsentControlled("k1", "v1", fence_ok, &direct_token), CasWriteOutcome::Committed);
-    EXPECT_EQ(direct_token, backend->head("k1").token) << "the direct-commit token is the PutResult's";
+    CasOperation direct = requests.admit();
+    const WriteResult first = direct.create("k1", "v1", Retry::standard());
+    const auto * direct_committed = std::get_if<Committed>(&first);
+    ASSERT_TRUE(direct_committed != nullptr);
+    EXPECT_FALSE(direct_committed->resolved_by_read);
+    CasOperation reader = requests.admit();
+    const auto observed = reader.head("k1", Retry::standard());
+    ASSERT_TRUE(observed.has_value());
+    EXPECT_EQ(direct_committed->incarnation, observed->incarnation)
+        << "the direct-commit incarnation is the write's own response";
 
-    /// k2 already holds the IDENTICAL bytes (an earlier ambiguous attempt that landed): the attempt's
-    /// PreconditionFailed collapses to Unresolved and the resolve GET proves Committed — the token must
-    /// be the observed incarnation's, and no second incarnation is ever created.
-    const Token pre_existing = backend->putIfAbsent("k2", "v2").token;
-    Token resolved_token;
-    ASSERT_EQ(ctrl.putIfAbsentControlled("k2", "v2", fence_ok, &resolved_token), CasWriteOutcome::Committed);
-    EXPECT_EQ(resolved_token, pre_existing) << "the resolve-commit token is the observed incarnation's";
+    /// The write of `k2` lands and its response is lost: the settling read proves the commit, and the
+    /// incarnation reported is the one that is actually there.
+    backend->injectAmbiguousLandedWrite("k2");
+    CasOperation resolving = requests.admit();
+    const WriteResult second = resolving.create("k2", "v2", Retry::standard());
+    const auto * resolved_committed = std::get_if<Committed>(&second);
+    ASSERT_TRUE(resolved_committed != nullptr);
+    EXPECT_TRUE(resolved_committed->resolved_by_read);
+    CasOperation second_reader = requests.admit();
+    const auto second_observed = second_reader.head("k2", Retry::standard());
+    ASSERT_TRUE(second_observed.has_value());
+    EXPECT_EQ(resolved_committed->incarnation, second_observed->incarnation)
+        << "the resolve-commit incarnation is the observed one";
 }
 
 /// ===================================================================================
@@ -2086,24 +2245,21 @@ TEST(CASRefTableCacheEviction, ZeroBudgetDisablesEviction)
 /// re-recovery must not be allowed to drop and re-materialize it (which could re-allocate an id).
 TEST(CASRefTableCacheEviction, WedgedTableIsNeverEvicted)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPoolWithConfig(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .cas_request_budget = budget, .ref_table_cache_bytes = 1});
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns_w{"srv1/wedged"};
     publishEmptyPart(store, ns_w, "x");
 
-    /// Wedge ns_w's append lane with one ambiguous (Unresolved) PUT that exhausts the single-attempt budget.
+    /// Wedge ns_w's append lane: every attempt of its log create is unresolved, so the call gives up at
+    /// its own retry window having sent something.
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_w)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_w, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns_w, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_w));
 
     /// Pressure the cache with other tables. ns_w is idle and over the 1-byte budget, but its wedged lane
@@ -2169,7 +2325,7 @@ TEST(CASRefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameR
     const RootNamespace ns{"srv1/publisher-predecessor-rebirth"};
 
     publishWithProductionBirth(store, ns, "predecessor");
-    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, layout, ns);
     const NamespaceLifeId predecessor_life
         = NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation);
     const auto predecessor_snapshot
@@ -2210,13 +2366,13 @@ TEST(CASRefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameR
     EXPECT_NO_THROW(store->dropNamespace(ns));
     EXPECT_FALSE(runRegularRoundReclaiming(gc).deferred);
     EXPECT_TRUE(runRegularRoundReclaiming(gc).deferred);
-    const RefCatalog after_removal = CasRefCatalog::read(*backend, layout).catalog;
+    const RefCatalog after_removal = readCatalogForTest(backend, layout).catalog;
     EXPECT_TRUE(std::none_of(after_removal.entries.begin(), after_removal.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; }));
 
     publishWithProductionBirth(store, ns, "successor");
     const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
-    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry successor = catalogEntryOrThrow(backend, layout, ns);
     EXPECT_NE(successor.incarnation, predecessor.incarnation);
     const auto predecessor_ckpt_before_resume = backend->get(layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_before_resume)
@@ -2259,7 +2415,7 @@ TEST(CASRefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapsh
     const RootNamespace ns{"srv1/publisher-predecessor-ckpt-race"};
 
     publishWithProductionBirth(store, ns, "predecessor");
-    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, layout, ns);
     const NamespaceLifeId predecessor_life
         = NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation);
     const auto candidate_id = listGreatestLogIdForLifeForTest(*backend, layout, predecessor_life);
@@ -2301,13 +2457,13 @@ TEST(CASRefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapsh
     EXPECT_NO_THROW(store->dropNamespace(ns));
     EXPECT_FALSE(runRegularRoundReclaiming(gc).deferred);
     EXPECT_TRUE(runRegularRoundReclaiming(gc).deferred);
-    const RefCatalog after_removal = CasRefCatalog::read(*backend, layout).catalog;
+    const RefCatalog after_removal = readCatalogForTest(backend, layout).catalog;
     EXPECT_TRUE(std::none_of(after_removal.entries.begin(), after_removal.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; }));
 
     publishWithProductionBirth(store, ns, "successor");
     const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
-    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry successor = catalogEntryOrThrow(backend, layout, ns);
     EXPECT_NE(successor.incarnation, predecessor.incarnation);
     const auto predecessor_ckpt_before_resume = backend->get(layout.refCkptKey(predecessor_life));
     ASSERT_TRUE(predecessor_ckpt_before_resume);
@@ -2346,7 +2502,7 @@ TEST(CASRefWriterRuntimeIdentity, CapturedReaderCannotRetargetSameNameSuccessor)
 
     publishWithProductionBirth(store, ns, "shared");
     ASSERT_TRUE(store->resolveRef(ns, "shared"));
-    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, layout, ns);
     Gc gc(store, UInt128{107});
     ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
 
@@ -2383,7 +2539,7 @@ TEST(CASRefWriterRuntimeIdentity, CapturedReaderCannotRetargetSameNameSuccessor)
     EXPECT_FALSE(runRegularRoundReclaiming(gc).deferred);
     EXPECT_TRUE(runRegularRoundReclaiming(gc).deferred);
     publishWithProductionBirth(store, ns, "shared");
-    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry successor = catalogEntryOrThrow(backend, layout, ns);
     EXPECT_NE(successor.incarnation, predecessor.incarnation);
     const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
     const auto successor_ref = store->resolveRef(ns, "shared");
@@ -2420,7 +2576,7 @@ TEST(CASRefWriterRuntimeIdentity, CapturedAppendCannotEnqueueIntoSameNameSuccess
     const RootNamespace ns{"srv1/captured-append-rebirth"};
 
     publishWithProductionBirth(store, ns, "shared");
-    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, layout, ns);
     Gc gc(store, UInt128{108});
     ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
 
@@ -2457,7 +2613,7 @@ TEST(CASRefWriterRuntimeIdentity, CapturedAppendCannotEnqueueIntoSameNameSuccess
     EXPECT_FALSE(runRegularRoundReclaiming(gc).deferred);
     EXPECT_TRUE(runRegularRoundReclaiming(gc).deferred);
     publishWithProductionBirth(store, ns, "shared");
-    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry successor = catalogEntryOrThrow(backend, layout, ns);
     EXPECT_NE(successor.incarnation, predecessor.incarnation);
     const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
     const auto successor_ref = store->resolveRef(ns, "shared");
@@ -2491,7 +2647,7 @@ TEST(CASRefWriterRuntimeIdentity, LatePredecessorInvalidationLeavesSuccessorAtta
     const RootNamespace ns{"srv1/late-predecessor-invalidation"};
 
     publishWithProductionBirth(store, ns, "predecessor");
-    const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry predecessor = catalogEntryOrThrow(backend, layout, ns);
     const NamespaceLifeId predecessor_life
         = NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation);
     Gc gc(store, UInt128{109});
@@ -2501,7 +2657,7 @@ TEST(CASRefWriterRuntimeIdentity, LatePredecessorInvalidationLeavesSuccessorAtta
     ASSERT_TRUE(runRegularRoundReclaiming(gc).deferred);
 
     publishWithProductionBirth(store, ns, "successor");
-    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry successor = catalogEntryOrThrow(backend, layout, ns);
     ASSERT_NE(successor.incarnation, predecessor.incarnation);
     const NamespaceLifeId successor_life
         = NamespaceLifeId::fromCatalogEntry(ns, successor.incarnation);
@@ -2903,11 +3059,7 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/c4_latch"};
 
-    CasRequestBudget budget;   /// one attempt per publish so a failure is a single PUT
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     uint64_t fake_now = 1'000'000;
     PoolConfig config;
@@ -2918,10 +3070,15 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.cas_request_budget = budget;
     auto store = openPoolWithConfig(backend, config);
+    /// The boot clock above is frozen (it is what keeps the publish backoff armed), so the REQUEST
+    /// engine needs its own advancing clock or a saturated publish never reaches its retry window and
+    /// reissues for ever.
+    VirtualRetryClock::installOn(store);
 
-    /// Every `_snap` PUT throws Unresolved (backend saturated), from the very first publish attempt.
+    /// Every `_snap` create is unresolved (backend saturated) and stays that way for the whole call, so
+    /// the publish gives up at its own window -- which is one dispatch, which is what this test counts.
     backend->fault_key_substr = "_snap/";
-    backend->fault_count = 100000;
+    backend->fault_latched = true;
 
     publishEmptyPart(store, ns, "a");   /// crosses the threshold -> one dispatch -> fails -> backoff armed
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -2952,7 +3109,7 @@ TEST(CASRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUn
         predecessor_config.snapshot_log_bytes_threshold = 1ULL << 40;
         auto predecessor = openPoolWithConfig(backend, predecessor_config);
         DB::Cas::tests::fixture::admitLive(*backend, predecessor->layout(), ns);
-        const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, predecessor->layout(), ns);
+        const NamespaceLifeId life = *lifeIfCatalogedForTest(backend, predecessor->layout(), ns);
         ASSERT_EQ(backend->putIfAbsent(predecessor->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
             .life_epoch = predecessor->liveWriterEpoch(),
             .committed_through = std::nullopt,
@@ -3035,11 +3192,7 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     const Layout layout("p");
     const RootNamespace ns{"srv1/c4_backoff"};
 
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     uint64_t fake_now = 1'000'000;
     PoolConfig config;
@@ -3050,10 +3203,13 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.cas_request_budget = budget;
     auto store = openPoolWithConfig(backend, config);
+    /// As above: the frozen boot clock drives the backoff decisions, so the request engine gets its own.
+    VirtualRetryClock::installOn(store);
 
-    /// Fail ONLY the first `_snap` PUT (arms the backoff); later PUTs succeed.
+    /// Fail the FIRST dispatch's `_snap` create for the whole call, so it gives up at its own retry
+    /// window and arms the backoff; the fault is cleared before the retry below.
     backend->fault_key_substr = "_snap/";
-    backend->fault_count = 1;
+    backend->fault_latched = true;
 
     publishEmptyPart(store, ns, "a");   /// dispatch -> publish fails -> backoff armed
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -3067,7 +3223,8 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
         << "a read within the backoff window must not re-dispatch";
     EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
 
-    /// Advance past the backoff: exactly one retry is dispatched and it publishes.
+    /// Advance past the backoff, with the fault cleared: exactly one retry is dispatched and it publishes.
+    backend->disarmFaults();
     fake_now += 2000;
     store->resolveRef(ns, "a");
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -3222,32 +3379,29 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
         .last_epoch_seal = std::nullopt,
     });
 
-    /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
-    /// transparently retries away. `8f9e63c7a19` widened `kSingleAttemptDeadlineMs` off a zero-width
-    /// race (equal attempt/operation deadlines), but it still measures the capture-to-gate window --
-    /// encoding the removal chunk (up to `ref_txn_max_ops` ops) -- against the REAL wall clock, so it
-    /// recurred (3 of 3 sanitizer lanes) once that encode step got slow enough on its own, independent
-    /// of scheduler contention: msan in particular. `ref_request_controller` reads its clock through
-    /// the same injectable seam as the mount fence (`CasRefLedger`'s `controller_boot_ms_fn` is the
-    /// pool's `boot_ms_fn`), so freeze it here instead of racing it -- the fault-injecting PUT below
-    /// still reaches the backend synchronously; only the deadline arithmetic stops moving.
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    /// The successor: `fault_latched` below makes ONE simulated ambiguous response wedge the lane
+    /// rather than being resolved by the engine's own reissue. `boot_ms_fn` seeds every plane's own
+    /// clock at construction and drives the mount lease's deadline math, so freezing it here keeps the
+    /// fence alive across the whole retry window; the request engine gets its own separately advancing
+    /// clock below, so its reissues still pace forward.
+    const CasRequestBudget budget = wedgeTestBudget();
     PoolConfig config;
     config.cas_request_budget = budget;
     config.boot_ms_fn = [] { return uint64_t{0}; };
     auto successor = openPoolWithConfig(backend, config);
+    /// The boot clock above is frozen, so the request engine needs its own advancing one: an armed
+    /// fault otherwise reissues for ever instead of ending the call at its retry window.
+    auto clock = VirtualRetryClock::installOn(successor);
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the dead predecessor
     /// epoch `e1` (its durable ids are `{e1,1}` and `{e1,2}`, so the seal lands at `{e1,3}`) -- that PUT
     /// shares this same `_log/` prefix, so it would eat the fault before the sweep ever gets a chance.
-    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended.
+    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended. Latched past
+    /// the skip, because the write engine reissues within a call: a single-shot fault would be answered
+    /// by the next attempt and the chunk would commit.
     backend->fault_skip = 1;
-    backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
+    backend->fault_latched = true;
 
     /// The sweep is piggybacked on this mount's very first touch; its (uncertain) failure is INSULATED
     /// from the read (resolveRef/listRefs call `sweepStalePrecommitsForRead`, not
@@ -3258,6 +3412,9 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
     EXPECT_EQ(deferred_after, deferred_before + 1)
         << "the read-only caller must observe (and count) the deferred sweep failure, not throw";
     EXPECT_TRUE(successor->refLaneWedgedForTest(ns));
+    backend->disarmFaults();
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the reissues must pace through the injected sleep, never a real one";
 
     /// The first chunk's request actually landed server-side; the caller just never saw the ack.
     backend->materializePendingDelayedWrite();
@@ -3293,8 +3450,8 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
-            for (const ListedKey & lk : page.keys)
+            const KeyPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
+            for (const KeyEntry & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
                 if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation
@@ -3348,11 +3505,7 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
     /// transparently retries away (mirrors the wedge-semantics tests in this file exactly).
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
     PoolConfig config;
     config.cas_request_budget = budget;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
@@ -3368,14 +3521,18 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
         << "the unclean predecessor must exercise the injected mount-observation wait";
 
     successor->setEventSink([&](const CasEvent & e) { seen.add(e); });
+    /// The boot clock this test drives the sweep backoff on is its own; the request engine gets a
+    /// separate advancing clock, or an armed fault reissues for ever instead of ending its call.
+    auto clock = VirtualRetryClock::installOn(successor);
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the predecessor's now-dead
     /// epoch (its three precommits are its only durable ids, so the seal takes the very next slot) --
     /// that PUT shares this same `_log/` prefix, so it would eat the fault before the sweep gets a turn.
-    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended.
+    /// Skip it and land the fault on the sweep's FIRST removal chunk's PUT, as intended. Latched past
+    /// the skip, because the write engine reissues within a call.
     backend->fault_skip = 1;
-    backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
+    backend->fault_latched = true;
 
     /// FIRST trigger (read path): the sweep's removal PUT is uncertain -> the lane wedges; the read
     /// itself still succeeds and counts the deferral (existing contract) -- but the shot must NOT be
@@ -3389,6 +3546,9 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     EXPECT_TRUE(successor->needsStalePrecommitSweepForTest(ns))
         << "a failed sweep must re-arm needs_stale_precommit_sweep, not consume the once-per-mount shot";
     EXPECT_EQ(global_counters[ProfileEvents::CASRefSweepRearmed].load(), rearmed_before + 1);
+    backend->disarmFaults();
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the reissues must pace through the injected sleep, never a real one";
 
     /// Within the backoff window (the injected clock has not advanced) a read must NOT re-attempt --
     /// the bounded-backoff storm latch: no new deferral, flag still armed.
@@ -3507,25 +3667,26 @@ std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout
 /// exactly what recovery must refuse. The link names the id the recovering pool's own CAS-walk will mint
 /// for the dead epoch: one past that epoch's greatest durable id, which is what `seal_of_previous_epoch`
 /// derives by listing rather than hard-coding, so the fixture cannot drift from the walk's arithmetic.
-uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamespace & ns,
+uint64_t seedTwinDrop(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns,
                       const String & ref_name, const ManifestRef & old_ref)
 {
     uint64_t greatest_in_previous_epoch = 0;
     uint64_t previous_epoch = 0;
-    forEachListedKey(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), [&](const ListedKey & lk)
+    for (const KeyEntry & lk : listForTest(
+             backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), "", 1000).keys)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
         if (!parsed || parsed->kind != RefObjectKind::Log)
-            return;
+            continue;
         if (parsed->txn_id.writer_epoch > previous_epoch
             || (parsed->txn_id.writer_epoch == previous_epoch && parsed->txn_id.ref_sequence > greatest_in_previous_epoch))
         {
             previous_epoch = parsed->txn_id.writer_epoch;
             greatest_in_previous_epoch = parsed->txn_id.ref_sequence;
         }
-    }, 1000);
+    }
 
-    const uint64_t twin_epoch = allocateWriterEpoch(backend, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });
+    const uint64_t twin_epoch = allocateWriterEpochForTest(backend, layout, "test");
     RefLogTxn twin;
     twin.ns = ns.string();
     twin.txn_id = RefTxnId{twin_epoch, 1};
@@ -3534,7 +3695,7 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
     drop.kind = RefOpKind::OwnerTransition;
     drop.old_binding = RefOwnerBinding{RefOwnerKind::Committed, ref_name, old_ref};
     twin.ops = {drop};
-    DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, twin);
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, twin);
     return twin_epoch;
 }
 
@@ -3604,7 +3765,7 @@ TEST(CASRefWriterRemount, ReRecoversStaleCacheToTwinDrop)
 
     /// A same-uuid twin bumped the durable epoch and durably dropped "a"; this Pool's warm cache never
     /// observed it.
-    const uint64_t twin_epoch = seedTwinDrop(*backend, layout, ns, "a", a_id.ref);
+    const uint64_t twin_epoch = seedTwinDrop(backend, layout, ns, "a", a_id.ref);
     ASSERT_GT(twin_epoch, e1);
     ASSERT_TRUE(store->resolveRef(ns, "a").has_value()) << "precondition: the warm cache is stale";
 
@@ -3635,7 +3796,7 @@ TEST(CASRefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
 
     const ManifestId a_id = publishEmptyPart(store, ns, "a");
     const uint64_t e1 = store->liveWriterEpoch();
-    const uint64_t twin_epoch = seedTwinDrop(*backend, layout, ns, "a", a_id.ref);
+    const uint64_t twin_epoch = seedTwinDrop(backend, layout, ns, "a", a_id.ref);
     ASSERT_GT(twin_epoch, e1);
 
     fenceOutRefMount(*backend, layout.mountKey("test"));
@@ -3659,11 +3820,7 @@ TEST(CASRefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
 /// its slot -- see `quiesceRefTablesForRemount`'s doc comment (`CasPool.h`).
 TEST(CASRefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     /// The self-remount below blocks on nothing (see
@@ -3680,10 +3837,10 @@ TEST(CASRefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    /// Wedge the lane with an ambiguous PUT that never landed server-side.
+    /// Wedge the lane: every attempt of the log create is unresolved and nothing lands server-side.
+    auto clock = VirtualRetryClock::installOn(store);
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     fenceOutRefMount(*backend, layout.mountKey("test"));
@@ -3786,7 +3943,7 @@ TEST(CASRefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemoving
     const RootNamespace ns{"srv1/removing_blocks_cached_writer"};
     publishEmptyPart(store, ns, "existing");
 
-    const CasRefCatalog::Snapshot before = CasRefCatalog::read(*backend, layout);
+    const CasRefCatalog::Snapshot before = readCatalogForTest(backend, layout);
     const auto observed = std::find_if(before.catalog.entries.begin(), before.catalog.entries.end(),
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     ASSERT_NE(observed, before.catalog.entries.end());
@@ -3830,7 +3987,9 @@ TEST(CASRefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemoving
     }
     if (writer_parked)
     {
-        CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
+        CasRequests catalog_requests(backend, Fence::open());
+        CasOperation catalog_op = catalog_requests.admit();
+        CasRefCatalog::casUpdate(catalog_op, layout, [&](const RefCatalog & current)
         {
             RefCatalog next = current;
             const auto it = std::find(next.entries.begin(), next.entries.end(), exact_live);
@@ -3881,8 +4040,8 @@ TEST(CASRefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
-            for (const ListedKey & lk : page.keys)
+            const KeyPage page = listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
+            for (const KeyEntry & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
                 if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log
@@ -3932,7 +4091,7 @@ TEST(CASRefWriterNamespaceRemoval, RemovalPublishesTerminalLogWithoutTerminalSna
         << "the terminal transaction remains ordinary immutable stream work until GC folds it";
 
     size_t terminal_logs = 0;
-    for (const ListedKey & listed : backend->list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), "", 1000).keys)
+    for (const KeyEntry & listed : listForTest(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), "", 1000).keys)
     {
         const auto parsed = layout.parseRefObjectKey(listed.key);
         if (!parsed || parsed->kind != RefObjectKind::Log)
@@ -3994,7 +4153,7 @@ TEST(CASRefWriterNamespaceRemoval, GenericAppendCannotWriteTerminalWhileCatalogI
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/unauthorized_terminal"};
     publishEmptyPart(store, ns, "owned");
-    const CatalogEntry live = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry live = catalogEntryOrThrow(backend, layout, ns);
     ASSERT_EQ(live.state, NsState::Live);
     const auto greatest_before = listGreatestLogIdForLifeForTest(
         *backend, layout, NamespaceLifeId::fromCatalogEntry(ns, live.incarnation));
@@ -4023,7 +4182,7 @@ TEST(CASRefWriterNamespaceRemoval, GenericAppendCannotWriteTerminalWhileCatalogI
             /*skip_stale_precommit_sweep=*/true);
     });
 
-    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns), live);
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns), live);
     EXPECT_EQ(listGreatestLogIdForLifeForTest(
         *backend, layout, NamespaceLifeId::fromCatalogEntry(ns, live.incarnation)), greatest_before)
         << "an unauthorized terminal must allocate no id and create no ref-log object";
@@ -4038,7 +4197,7 @@ TEST(CASRefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurabl
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/absent_unauthorized_terminal"};
-    const CasRefCatalog::Snapshot catalog_before = CasRefCatalog::read(*backend, store->layout());
+    const CasRefCatalog::Snapshot catalog_before = readCatalogForTest(backend, store->layout());
 
     backend->resetCounts();
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
@@ -4056,10 +4215,10 @@ TEST(CASRefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurabl
 
     EXPECT_EQ(backend->putTotal(), 0u);
     EXPECT_EQ(backend->putOverwriteTotal(), 0u);
-    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
-    const CasRefCatalog::Snapshot catalog_after = CasRefCatalog::read(*backend, store->layout());
-    EXPECT_EQ(catalog_after.token, catalog_before.token);
+    const CasRefCatalog::Snapshot catalog_after = readCatalogForTest(backend, store->layout());
+    EXPECT_EQ(catalog_after.incarnation, catalog_before.incarnation);
     EXPECT_EQ(catalog_after.catalog, catalog_before.catalog);
     EXPECT_FALSE(store->refTableLifeForTest(ns));
 }
@@ -4077,13 +4236,13 @@ TEST(CASRefWriterNamespaceRemoval, CatalogedNamespaceFilesOnlyLifeCompletesRemov
     const RootNamespace ns{"srv1/files_only"};
     const NamespaceLifeId life = store->namespaceLife(ns);
     store->putNamespaceFile(life, "format_version.txt", "1\n");
-    ASSERT_TRUE(backend->list(layout.namespaceStreamPrefix(life), "", 100).keys.empty());
-    ASSERT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Live);
+    ASSERT_TRUE(listForTest(backend, layout.namespaceStreamPrefix(life), "", 100).keys.empty());
+    ASSERT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
 
     EXPECT_NO_THROW(store->dropNamespace(ns));
-    ASSERT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Removing);
+    ASSERT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
 
-    const ListPage terminal_page = backend->list(layout.namespaceStreamPrefix(life), "", 100);
+    const KeyPage terminal_page = listForTest(backend, layout.namespaceStreamPrefix(life), "", 100);
     ASSERT_EQ(terminal_page.keys.size(), 1u);
     const auto parsed = layout.parseRefObjectKey(terminal_page.keys.front().key);
     ASSERT_TRUE(parsed);
@@ -4098,7 +4257,7 @@ TEST(CASRefWriterNamespaceRemoval, CatalogedNamespaceFilesOnlyLifeCompletesRemov
     Gc gc(store, UInt128{181});
     ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
     (void)runRegularRoundReclaiming(gc);
-    const RefCatalog after = CasRefCatalog::read(*backend, layout).catalog;
+    const RefCatalog after = readCatalogForTest(backend, layout).catalog;
     EXPECT_TRUE(std::none_of(after.entries.begin(), after.entries.end(), [&](const CatalogEntry & entry)
     {
         return entry.ns == ns;
@@ -4114,19 +4273,19 @@ TEST(CASRefWriterNamespaceRemoval, PredurableCatalogReadFailureReopensExactLiveL
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/predurable_read_failure"};
     publishEmptyPart(store, ns, "owned");
-    const CatalogEntry live = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry live = catalogEntryOrThrow(backend, layout, ns);
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_gets_before_fault = 1;   /// initial discovery succeeds; post-close observation fails
     backend->catalog_get_fault_count = 1;
     EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
-    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns), live);
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns), live);
 
     EXPECT_NO_THROW(store->updateRefPublishedAt(ns, "owned", [](RefPublishedAtUpdate & update)
     {
         update.published_at_ms = 17;
     })) << "a fresh exact Live observation must reopen the lane after a pre-durable failure";
-    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Live);
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Live);
 }
 
 /// spec §Namespace Removal (writer, line 666): "After the transaction is durable, it applies the same
@@ -4167,14 +4326,11 @@ TEST(CASRefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThr
 /// remains `Removing`, positive ownership is refused, and a retry of the same removal resolves the wedge.
 TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCompletes)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remove_fault_keeps_build"};
 
@@ -4185,11 +4341,9 @@ TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCom
     build->precommitAdd(ns, "inflight", id);
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
+    driveToTheWedge(*clock, *backend, [&] { store->dropNamespace(ns); });
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
-
-    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Removing);
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
     EXPECT_FALSE(store->resolveRef(ns, "committed"))
         << "a fresh name lookup must not expose a catalog-Removing life";
     /// The build was NOT cancelled: a non-append operation (`stageManifest` -- it never touches the now
@@ -4210,14 +4364,11 @@ TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCom
 /// `RemovalAppendFailureLeavesRemovingAndRetryCompletes`.
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeStaysTrueThroughRemovingUntilTerminalRetrySucceeds)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/presence_removing_no_terminal"};
 
@@ -4225,10 +4376,9 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeStaysTrueThroughRemovingUntilTer
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropNamespace(ns); });
 
-    ASSERT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Removing);
+    ASSERT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Removing);
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns))
         << "the catalog transitioned but the terminal append never landed -- cleanup is unproven";
 
@@ -4252,7 +4402,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeCreatingIsPresentAndRemovalWaits
     entry.state = NsState::Creating;
     entry.incarnation = UInt128(99);
     entry.creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
-    CasRefCatalog::casAdmitEntry(*backend, layout, 1, entry);
+    casAdmitEntryForTest(backend, layout, 1, entry);
 
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
 
@@ -4260,7 +4410,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeCreatingIsPresentAndRemovalWaits
     /// dead (absence proves nothing), so removal fails closed rather than cancelling a `Creating` row a
     /// live writer might still publish into.
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
-    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Creating);
+    EXPECT_EQ(catalogEntryOrThrow(backend, layout, ns).state, NsState::Creating);
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
 
     /// Publish a GC-fenced lease for the SAME server root -- one of `isCreatorFenceTerminal`'s accepted
@@ -4324,7 +4474,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeNoRowObservationRevalidatesRathe
     born.state = NsState::Creating;
     born.incarnation = UInt128(1234);
     born.creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
-    CasRefCatalog::casAdmitEntry(*backend, layout, 1, born);
+    casAdmitEntryForTest(backend, layout, 1, born);
 
     {
         std::lock_guard lock(mutex);
@@ -4389,7 +4539,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeIgnoresUnrelatedCatalogChurnBetw
     born.state = NsState::Creating;
     born.incarnation = UInt128(5678);
     born.creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
-    CasRefCatalog::casAdmitEntry(*backend, layout, 1, born);
+    casAdmitEntryForTest(backend, layout, 1, born);
 
     {
         std::lock_guard lock(mutex);
@@ -4444,14 +4594,11 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeFenceLossPropagatesRatherThanAns
 /// (absent, immediately, no GC).
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeFacadeConsistencyAcrossRemovalLifecycle)
 {
-    CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
-    budget.lease_safety_margin_ms = 100;
+    const CasRequestBudget budget = wedgeTestBudget();
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
+    auto clock = VirtualRetryClock::installOn(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/presence_facade_consistency"};
 
@@ -4460,8 +4607,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeFacadeConsistencyAcrossRemovalLi
     EXPECT_FALSE(store->listRefs(ns).empty());
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
-    backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    driveToTheWedge(*clock, *backend, [&] { store->dropNamespace(ns); });
 
     EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns))
         << "present for cleanup, even though content below is about to prove unreadable";
@@ -4495,7 +4641,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeRevalidatesAfterTerminalProvenRa
 
     const auto catalog_entry = [&]() -> std::optional<CatalogEntry>
     {
-        const RefCatalog catalog = CasRefCatalog::read(*backend, layout).catalog;
+        const RefCatalog catalog = readCatalogForTest(backend, layout).catalog;
         const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
         {
             return entry.ns == ns;
@@ -4678,7 +4824,7 @@ TEST(CASRefWriterNamespaceRemoval, CreateAgainstRemovingRetriesWithoutMutation)
         expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceLife(ns); });
         EXPECT_EQ(backend->putTotal(), 0u);
         EXPECT_EQ(backend->putOverwriteTotal(), 0u);
-        EXPECT_EQ(backend->casPutTotal(), 0u);
+        EXPECT_EQ(backend->writeTotal(), 0u);
     }
 
     auto fresh_store = openPool(backend);
@@ -4686,7 +4832,7 @@ TEST(CASRefWriterNamespaceRemoval, CreateAgainstRemovingRetriesWithoutMutation)
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)fresh_store->namespaceLife(ns); });
     EXPECT_EQ(backend->putTotal(), 0u);
     EXPECT_EQ(backend->putOverwriteTotal(), 0u);
-    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 0u);
 }
 
 /// Same-name rebirth must not inherit the predecessor's physical life or folded cursor even when the
@@ -4715,7 +4861,7 @@ TEST(CASRefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResi
     };
     const auto catalog_entry = [&]() -> std::optional<CatalogEntry>
     {
-        const RefCatalog catalog = CasRefCatalog::read(*backend, layout).catalog;
+        const RefCatalog catalog = readCatalogForTest(backend, layout).catalog;
         const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
         {
             return entry.ns == ns;
@@ -4743,7 +4889,7 @@ TEST(CASRefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResi
     ASSERT_GT(backend->putTotal(), puts_before_drop)
         << "control: the real removal call returned after durably writing its terminal artifacts";
     std::optional<RefTxnId> terminal_id;
-    for (const ListedKey & listed : backend->list(
+    for (const KeyEntry & listed : listForTest(backend,
         layout.namespaceStreamPrefix(NamespaceLifeId::fromCatalogEntry(ns, predecessor.incarnation)),
         "", 1000).keys)
     {
@@ -4790,7 +4936,7 @@ TEST(CASRefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResi
     ASSERT_EQ(store->refTableLifeForTest(ns)->incarnation, successor.incarnation);
 
     const NamespaceLifeId successor_life = NamespaceLifeId::fromCatalogEntry(ns, successor.incarnation);
-    const ListPage successor_stream = backend->list(layout.namespaceStreamPrefix(successor_life), "", 1000);
+    const KeyPage successor_stream = listForTest(backend, layout.namespaceStreamPrefix(successor_life), "", 1000);
     ASSERT_FALSE(successor_stream.keys.empty()) << "the real successor writer produced foldable stream work";
     std::vector<GcPhaseRecord> successor_phases;
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { successor_phases.push_back(phase); });
@@ -4829,13 +4975,13 @@ TEST(CASRefWriterNamespaceRemoval, CommitThenThrowEraseResolvesAndRebindsResiden
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/removal-erase-lost-response"};
     Gc gc(store, UInt128{101});
-    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, backend, ns, gc);
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;
     EXPECT_NO_THROW((void)runRegularRoundReclaiming(gc));
 
-    const RefCatalog after_erase = CasRefCatalog::read(*backend, layout).catalog;
+    const RefCatalog after_erase = readCatalogForTest(backend, layout).catalog;
     EXPECT_TRUE(std::none_of(after_erase.entries.begin(), after_erase.entries.end(), [&](const CatalogEntry & entry)
     {
         return entry.ns == ns && entry.incarnation == ready.predecessor.incarnation;
@@ -4843,7 +4989,7 @@ TEST(CASRefWriterNamespaceRemoval, CommitThenThrowEraseResolvesAndRebindsResiden
     EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
     EXPECT_NO_THROW(publishWithProductionBirth(store, ns, "successor"));
-    const CatalogEntry successor = catalogEntryOrThrow(*backend, layout, ns);
+    const CatalogEntry successor = catalogEntryOrThrow(backend, layout, ns);
     EXPECT_NE(successor.incarnation, ready.predecessor.incarnation);
     EXPECT_EQ(store->liveWriterEpoch(), ready.writer_epoch);
     EXPECT_NE(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
@@ -4870,7 +5016,7 @@ TEST(CASRefWriterNamespaceRemoval, OtherWinnerReplacementInvalidatesExactPredece
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/removal-other-winner-replacement"};
     Gc gc(store, UInt128{102});
-    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, backend, ns, gc);
 
     const CatalogEntry replacement{
         .ns = ns,
@@ -4904,13 +5050,13 @@ TEST(CASRefWriterNamespaceRemoval, LaterNameLookupReconcilesAfterEraseResolution
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/removal-resolution-read-failure-lookup"};
     Gc gc(store, UInt128{103});
-    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, backend, ns, gc);
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;
     backend->catalog_resolution_get_fault_count = 1;
     EXPECT_THROW((void)runRegularRoundReclaiming(gc), std::runtime_error);
-    EXPECT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
+    EXPECT_TRUE(readCatalogForTest(backend, layout).catalog.entries.empty());
 
     std::optional<NamespaceLifeId> successor;
     EXPECT_NO_THROW(successor = store->namespaceLife(ns));
@@ -4931,17 +5077,17 @@ TEST(CASRefWriterNamespaceRemoval, PostListCatalogCutReconcilesMissedEraseInvali
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/removal-resolution-read-failure-post-list"};
     Gc gc(store, UInt128{104});
-    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, backend, ns, gc);
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;
     backend->catalog_resolution_get_fault_count = 1;
     EXPECT_THROW((void)runRegularRoundReclaiming(gc), std::runtime_error);
-    EXPECT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
+    EXPECT_TRUE(readCatalogForTest(backend, layout).catalog.entries.empty());
 
     EXPECT_NO_THROW((void)runRegularRoundReclaiming(gc));
     EXPECT_NO_THROW(publishWithProductionBirth(store, ns, "successor"));
-    EXPECT_NE(catalogEntryOrThrow(*backend, layout, ns).incarnation, ready.predecessor.incarnation);
+    EXPECT_NE(catalogEntryOrThrow(backend, layout, ns).incarnation, ready.predecessor.incarnation);
     EXPECT_NE(store->refTableRuntimeIdentityForTest(ns), ready.runtime_identity);
 }
 
@@ -4956,7 +5102,7 @@ TEST(CASRefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutat
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/existing-live-assignment"};
-    CasRefCatalog::casAdmitEntry(*backend, store->layout(), 1, CatalogEntry{
+    casAdmitEntryForTest(backend, store->layout(), 1, CatalogEntry{
         .ns = ns, .state = NsState::Live, .incarnation = UInt128{41}});
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, store->layout(), ns, RefCkpt{
         .life_epoch = store->liveWriterEpoch(),
@@ -4972,7 +5118,7 @@ TEST(CASRefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutat
     EXPECT_EQ(store->refTableLifeForTest(ns)->incarnation, UInt128{41});
     EXPECT_EQ(backend->putTotal(), 0u);
     EXPECT_EQ(backend->putOverwriteTotal(), 0u);
-    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->writeTotal(), 0u);
 }
 
 /// A read of a never-born name may observe the catalog, but it must not allocate the local name slot
@@ -5065,17 +5211,17 @@ namespace
 /// under `ns` -- epoch 1 births ref "a", epoch 2 adds ref "b" -- with no snapshot, and burns the
 /// durable epoch counter to exactly 2 so a subsequent `Pool::open` allocates epoch 3 (both dead
 /// epochs land strictly below the fresh writer's own, as `dead_region_nonempty` requires).
-void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const RootNamespace & ns)
+void seedSealFixtureDeadEpochs(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)
 {
-    allocateWriterEpoch(backend, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });   /// burns epoch 1
-    allocateWriterEpoch(backend, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });   /// burns epoch 2
+    allocateWriterEpochForTest(backend, layout, "test");   /// burns epoch 1
+    allocateWriterEpochForTest(backend, layout, "test");   /// burns epoch 2
 
     RefLogTxn birth;
     birth.ns = ns.string();
     birth.txn_id = RefTxnId{1, 1};
     birth.ops = {namespaceBirthOp(), publishCommittedOps("a", manifestRef(1, 1, 1))[0],
                  publishCommittedOps("a", manifestRef(1, 1, 1))[1]};
-    DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, birth);
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, birth);
 
     RefLogTxn mut;
     mut.ns = ns.string();
@@ -5086,8 +5232,8 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
     mut.prev_epoch_seal = RefTxnId{1, 2};
     mut.ops = {publishCommittedOps("b", manifestRef(2, 1, 1))[0],
                publishCommittedOps("b", manifestRef(2, 1, 1))[1]};
-    DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, mut);
-    DB::Cas::tests::writeRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, mut);
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         /// The namespace was born in epoch 1 and only `{1,1}` is fronted initially. Recovery must mint
         /// the missing required seal `{1,2}` before it may adopt the already durable `{2,1}` successor.
         .life_epoch = 1,
@@ -5102,10 +5248,12 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
 /// prior is an immediate certificate of death (`claimMountAwaitingExpiry` reclaims it on its FIRST
 /// attempt, no observation polling), so a fake-clocked successor `Pool::open` above it becomes
 /// unclean deterministically, without any real sleep.
-void seedUncleanPredecessorMount(Backend & backend, const Layout & layout, uint64_t epoch)
+void seedUncleanPredecessorMount(const BackendPtr & backend, const Layout & layout, uint64_t epoch)
 {
-    claimMount(backend, layout, "test", UInt128(1), epoch, /*now_ms=*/1000, /*ttl_ms=*/500);
-    fenceOutRefMount(backend, layout.mountKey("test"));
+    CasRequests requests(backend, Fence::open());
+    CasOperation op = requests.admit();
+    claimMount(op, layout, "test", UInt128(1), epoch, /*now_ms=*/1000, /*ttl_ms=*/500);
+    fenceOutRefMount(*backend, layout.mountKey("test"));
 }
 
 /// The budget every seal test's successor `Pool::open` uses: a 500ms lease TTL needs a scaled-down
@@ -5114,7 +5262,7 @@ void seedUncleanPredecessorMount(Backend & backend, const Layout & layout, uint6
 CasRequestBudget sealTestTinyBudget()
 {
     return CasRequestBudget{
-        .attempt_timeout_ms = 50, .operation_deadline_ms = kSingleAttemptDeadlineMs, .max_attempts = 1,
+        .attempt_timeout_ms = 50, .operation_deadline_ms = kSingleAttemptDeadlineMs,
         .lease_safety_margin_ms = 50};
 }
 
@@ -5153,8 +5301,8 @@ TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     const Layout layout("p");
     const RootNamespace ns{"srv1/retry_ok"};
 
-    seedSealFixtureDeadEpochs(*backend, layout, ns);
-    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+    seedSealFixtureDeadEpochs(backend, layout, ns);
+    seedUncleanPredecessorMount(backend, layout, /*epoch=*/2);
 
     uint64_t fake_now = 1'000'000;
 
@@ -5171,27 +5319,31 @@ TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
 
-    /// No-op backoff and a frozen clock: retries run until the transient faults are exhausted, and the
-    /// frozen clock keeps the mount fence alive across them (advancing it past the tiny lease TTL would
-    /// drop the fence and abort recovery -- exercising the fence path, which is the budget test's job).
-    store->setCasRetrySleepForTest([](uint64_t) {});
+    /// The engine's own clock advances (its sleep is what moves it), while `fake_now` -- the FENCE's
+    /// clock -- stays frozen, which is what keeps the mount alive across a retry: advancing it past the
+    /// tiny lease TTL would drop the fence and abort recovery, exercising the fence path instead.
+    VirtualRetryClock::installOn(store);
 
-    /// Fail the epoch seal's conditional create twice with a transient (timeout) error; the third
-    /// attempt lands. The seal is a LOG transaction at `{2,2}` -- the slot after the dead epoch's last
-    /// durable id -- because INV-2 closes an epoch in-band, at the key a straggler would have taken.
+    /// Fail the epoch seal's conditional create for the whole of ONE recovery attempt, then clear the
+    /// fault from the recovery retry seam -- the only point between two recovery attempts a test can
+    /// reach. A bounded fault count cannot express this: the write engine reissues within a call, so a
+    /// count of two is spent by that one call's own reissues and no recovery retry ever happens. The
+    /// seal is a LOG transaction at `{2,2}` -- the slot after the dead epoch's last durable id --
+    /// because INV-2 closes an epoch in-band, at the key a straggler would have taken.
     const RefTxnId seal_id{2, 2};
     backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
-    backend->fault_count = 2;
+    backend->fault_latched = true;
+    store->setRefRecoveryRetrySleepForTest([&backend](uint64_t, const auto &) { backend->disarmFaults(); });
 
     using ProfileEvents::global_counters;
     const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries].load();
     const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load();
 
-    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must succeed after retrying past the faults";
+    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must succeed after retrying past the fault";
 
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries].load(), retries_before + 2);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries].load(), retries_before + 1);
     /// TWO dead epochs (1 and 2) are closed by this walk, and a whole attempt is re-driven per transient
-    /// failure -- so the seals of the epochs a failed attempt already closed are ADOPTED on the retry
+    /// failure -- so the seals of the epochs the failed attempt already closed are ADOPTED on the retry
     /// rather than minted again. Exactly two are minted in total.
     EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load(), sealed_before + 2);
 }
@@ -5204,8 +5356,8 @@ TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
     const Layout layout("p");
     const RootNamespace ns{"srv1/retry_list"};
 
-    seedSealFixtureDeadEpochs(*backend, layout, ns);
-    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+    seedSealFixtureDeadEpochs(backend, layout, ns);
+    seedUncleanPredecessorMount(backend, layout, /*epoch=*/2);
 
     uint64_t fake_now = 1'000'000;
 
@@ -5244,8 +5396,8 @@ TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     const Layout layout("p");
     const RootNamespace ns{"srv1/retry_budget"};
 
-    seedSealFixtureDeadEpochs(*backend, layout, ns);
-    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+    seedSealFixtureDeadEpochs(backend, layout, ns);
+    seedUncleanPredecessorMount(backend, layout, /*epoch=*/2);
 
     uint64_t fake_now = 1'000'000;
 
@@ -5279,8 +5431,8 @@ TEST(CASRefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
     const Layout layout("p");
     const RootNamespace ns{"srv1/retry_fatal"};
 
-    seedSealFixtureDeadEpochs(*backend, layout, ns);
-    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+    seedSealFixtureDeadEpochs(backend, layout, ns);
+    seedUncleanPredecessorMount(backend, layout, /*epoch=*/2);
 
     PoolConfig config;
     config.server_id = UInt128(1);
@@ -5362,8 +5514,8 @@ TEST(CASRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
     const Layout layout("p");
     const RootNamespace ns{"srv1/retry_sleep_throw"};
 
-    seedSealFixtureDeadEpochs(*backend, layout, ns);
-    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+    seedSealFixtureDeadEpochs(backend, layout, ns);
+    seedUncleanPredecessorMount(backend, layout, /*epoch=*/2);
 
     PoolConfig config;
     config.server_id = UInt128(1);
@@ -5374,7 +5526,9 @@ TEST(CASRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
     auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
 
-    /// First touch: the seal PUT fails transiently -> the loop enters backoff -> the sleep THROWS.
+    /// First touch: the seal create fails transiently and the next thing either loop does is sleep on
+    /// this one seam -- the write engine's reissue pause is simply the first to reach it -- so the throw
+    /// lands while `recovery_in_progress` is set, which is the state this test is about.
     bool sleep_should_throw = true;
     store->setCasRetrySleepForTest([&sleep_should_throw](uint64_t)
     {

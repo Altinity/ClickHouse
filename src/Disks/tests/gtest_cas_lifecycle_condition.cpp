@@ -57,41 +57,39 @@ void fenceOutMount(Backend & backend, const String & mount_key)
     ASSERT_EQ(backend.putOverwrite(mount_key, encodeMountLease(m), got->token).outcome, PutOutcome::Done);
 }
 
-/// A Backend decorator whose head/get/list throw an untyped transport error while `fail` is armed. Starts
-/// DISARMED so `Pool::open` succeeds; a test arms it only to make the identity probe inconclusive. Mirrors
-/// gtest_cas_sentinel_probe.cpp's `TransportFaultBackend`, but toggleable AFTER open.
+/// A Backend decorator whose reads, heads and lists throw an untyped transport error while `fail` is
+/// armed. Starts DISARMED so `Pool::open` succeeds; a test arms it only to make the identity probe
+/// inconclusive. Mirrors gtest_cas_sentinel_probe.cpp's `TransportFaultBackend`, but toggleable AFTER open.
 class ToggleableTransportFaultBackend final : public InMemoryBackend
 {
 public:
-    /// Unhide the primitive overload that the legacy override below would otherwise hide.
-    using InMemoryBackend::head;
-    using InMemoryBackend::list;
-    /// Unhide the base convenience overloads, matching every other Backend subclass in this suite.
-    using Backend::get;
-    using Backend::getStream;
-    using Backend::putIfAbsent;
-    using Backend::putOverwrite;
-    using Backend::casPut;
+    /// Unhide the LEGACY convenience overloads that the primitive overrides below would otherwise hide.
+    using Backend::head;
+    using Backend::list;
 
-    HeadResult head(const String & key) override
+    /// The faults sit on the TRANSPORT PRIMITIVES, because that is where every caller reaches the store:
+    /// the lifecycle gate probes `_pool_meta` through `probeSentinelRaw`, which speaks only these. A
+    /// legacy caller still reaches the fault, through the forwarder, so arming it here covers both
+    /// surfaces rather than only one.
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (fail.load())
             throw std::runtime_error("injected fault: transport error");
-        return InMemoryBackend::head(key);
+        return InMemoryBackend::head(key, access);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (fail.load())
             throw std::runtime_error("injected fault: transport error");
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (fail.load())
             throw std::runtime_error("injected fault: transport error");
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 
     std::atomic<bool> fail{false};
@@ -131,8 +129,8 @@ TEST(CASLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
     backend->resetCounts();
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
-    EXPECT_EQ(backend->putTotal(), 0u) << "a terminal-IdentityLost gate probe must never claim, allocate, or write";
-    EXPECT_GE(backend->headRequestCount(meta_key), 1u) << "the gate still probes _pool_meta authoritatively";
+    EXPECT_EQ(backend->writeTotal(), 0u) << "a terminal-IdentityLost gate probe must never claim, allocate, or write";
+    EXPECT_GE(backend->headCount(meta_key), 1u) << "the gate still probes _pool_meta authoritatively";
 }
 
 /// (a2) rev.8 worker-exit: `IdentityLost` is terminal, so the persistent self-remount worker must self-exit
@@ -244,7 +242,7 @@ TEST(CASLifecycleCondition, ProbeTransportErrorStaysTransientAndRetries)
     auto store = DB::Cas::tests::openPoolForTest(backend);
     ASSERT_EQ(store->lifecycle(), PoolLifecycle::Live);
 
-    /// Arm the transport fault: the identity probe's head/get/list now throw → Indeterminate.
+    /// Arm the transport fault: every request the identity probe issues now throws → Indeterminate.
     backend->fail.store(true);
 
     EXPECT_FALSE(store->tryRemountOnce());

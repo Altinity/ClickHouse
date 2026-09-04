@@ -37,7 +37,7 @@ SourceEdgeRecord zero(const BlobRef & ref)
     return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = RunMarker::Zero};
 }
 
-SourceEdgeRecord condemned(const BlobRef & ref, const Token & token, uint64_t size, uint64_t round, bool pend)
+SourceEdgeRecord condemned(const BlobRef & ref, const PersistedIncarnation & token, uint64_t size, uint64_t round, bool pend)
 {
     return SourceEdgeRecord{.ref = ref, .source_id = UInt128(0), .marker = RunMarker::Condemned,
                             .delete_pending = pend, .token = token, .size = size, .condemn_round = round};
@@ -105,7 +105,7 @@ TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
     /// an edge; c has a zero marker. Blobs ascend a < b < c, so the sequence is already non-decreasing.
     std::vector<SourceEdgeRecord> recs = {
         edge(a, 10),
-        condemned(b, Token{"e-1", TokenType::ETag}, 4242, 7, /*pend*/ true),
+        condemned(b, PersistedIncarnation{"etag", "e-1"}, 4242, 7, /*pend*/ true),
         zero(c),
     };
     const String bytes = encodeRun(recs);
@@ -120,7 +120,8 @@ TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
     EXPECT_EQ(back[1].source_id, UInt128(0));
     EXPECT_EQ(back[1].marker, RunMarker::Condemned);
     EXPECT_TRUE(back[1].delete_pending);
-    EXPECT_EQ(back[1].token, (Token{"e-1", TokenType::ETag}));
+    EXPECT_EQ(back[1].token.dialect, "etag");
+    EXPECT_EQ(back[1].token.value, "e-1");
     EXPECT_EQ(back[1].size, 4242u);
     EXPECT_EQ(back[1].condemn_round, 7u);
 
@@ -145,7 +146,7 @@ TEST(CASRecordStream, ClosedSetPinsRunMarkerWords)
 /// which is a different retention decision than the writer recorded.
 TEST(CASRecordStream, CondemnedRowMissingOneOfItsSixFieldsFailsClosed)
 {
-    const String good = encodeRun({condemned(chRef(2), Token{"e-1", TokenType::ETag}, 4242, 7, /*pend*/ true)});
+    const String good = encodeRun({condemned(chRef(2), PersistedIncarnation{"etag", "e-1"}, 4242, 7, /*pend*/ true)});
     for (const std::string_view field : {R"(,"pending":true)", R"(,"token_type":"etag")", R"(,"token":"e-1")",
                                          R"(,"size":4242)", R"(,"condemn_round":"7")", R"(,"confirmed":false)"})
     {
@@ -196,7 +197,7 @@ TEST(CASRecordStream, WriterIsByteDeterministic)
     std::vector<SourceEdgeRecord> recs = {
         edge(chRef(1), 5),
         edge(chRef(1), 9),
-        condemned(chRef(2), Token{"t/with/slashes", TokenType::ETag}, 1, 2, false),
+        condemned(chRef(2), PersistedIncarnation{"etag", "t/with/slashes"}, 1, 2, false),
     };
     EXPECT_EQ(encodeRun(recs), encodeRun(recs));   /// pure function of the sorted record set
 }

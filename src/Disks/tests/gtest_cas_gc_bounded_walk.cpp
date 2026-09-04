@@ -138,8 +138,6 @@ std::map<String, UInt64> runRoundCapturingIntake(Gc & gc, UniversePolicy policy 
 class ChasingWriterBackend : public CountingBackend
 {
 public:
-    using CountingBackend::get;
-
     /// Start appending above `published_through` (writer epoch 1) whenever the tail is read, up to
     /// `max_appends` further records.
     void arm(const Layout * layout_, const RootNamespace & ns_, uint64_t published_through, uint64_t max_appends)
@@ -155,9 +153,9 @@ public:
 
     uint64_t publishedThrough() const { return published; }
 
-    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
-        auto result = CountingBackend::get(key, range);
+        auto result = CountingBackend::read(key, access);
         if (!layout || appending || published >= limit)
             return result;
         if (key != layout->refLogKey(fixture::fixtureLife(ns), RefTxnId{1, published}))

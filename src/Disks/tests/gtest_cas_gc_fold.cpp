@@ -533,6 +533,8 @@ TEST(CASGCFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJa
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const Layout & layout = store->layout();
     Gc gc(store, kGc);
 
@@ -560,7 +562,7 @@ TEST(CASGCFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJa
     /// which is the physical life that owns the eventual janitor work. Spelling the sentinel here instead
     /// would plant debris under the wrong life and make the retention assertion vacuous.
     const String debris_key
-        = layout.namespaceFilesPrefix(CasRefCatalog::lifeIfCataloged(*backend, layout, ns_removed).value())
+        = layout.namespaceFilesPrefix(CasRefCatalog::lifeIfCataloged(op, layout, ns_removed).value())
         + "leftover_verbatim_file";
     backend->putIfAbsent(debris_key, "debris");
     const ManifestRef removed_body = ref("srv-r:1", 1, 0xEE);

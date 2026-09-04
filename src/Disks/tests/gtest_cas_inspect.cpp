@@ -137,8 +137,8 @@ TEST(CASInspect, RendersRefOwnerKindWireWords)
     EXPECT_NE(json.find(R"("new_binding":{"kind":"precommit")"), String::npos) << json;
 }
 
-/// `TokenType` renders as its full wire word; the blob-target-run test below covers `emulated`, so
-/// this pins the other two (`etag`/`generation`) via a second condemned-row-only run.
+/// A recorded incarnation's dialect renders as its full wire word; the blob-target-run test below
+/// covers `emulated`, so this pins the other two (`etag`/`generation`) via a second condemned-row-only run.
 TEST(CASInspect, RendersTokenTypeWireWordsEtagAndGeneration)
 {
     const Layout layout("p");
@@ -147,13 +147,13 @@ TEST(CASInspect, RendersTokenTypeWireWordsEtagAndGeneration)
     etag_rec.ref = bh(1);
     etag_rec.source_id = UInt128{0};
     etag_rec.marker = RunMarker::Condemned;
-    etag_rec.token = Token{.value = "v-etag", .type = TokenType::ETag};
+    etag_rec.token = PersistedIncarnation{"etag", "v-etag"};
 
     SourceEdgeRecord gen_rec;
     gen_rec.ref = bh(1);
     gen_rec.source_id = UInt128{1};
     gen_rec.marker = RunMarker::Condemned;
-    gen_rec.token = Token{.value = "v-gen", .type = TokenType::Generation};
+    gen_rec.token = PersistedIncarnation{"generation", "v-gen"};
 
     DB::WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);
@@ -209,7 +209,7 @@ TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
     condemned_rec.source_id = UInt128{0};
     condemned_rec.marker = RunMarker::Condemned;
     condemned_rec.delete_pending = true;
-    condemned_rec.token = Token{.value = "etag-1", .type = TokenType::Emulated};
+    condemned_rec.token = PersistedIncarnation{"emulated", "etag-1"};
     condemned_rec.size = 123;
     condemned_rec.condemn_round = 7;
     condemned_rec.marker_confirmed = true;

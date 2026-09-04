@@ -374,6 +374,8 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/1);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
     const Layout & layout = store->layout();
     const NamespaceLifeId dead_a
         = NamespaceLifeId::fromCatalogEntry(RootNamespace{"dead/a"}, UInt128{0xDA});
@@ -387,10 +389,10 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     /// Establish real opaque backend progress rather than fabricating a cursor value. One key remains
     /// after this page and the durable cursor must be non-empty.
     const NamespaceJanitorResult first_page
-        = NamespaceJanitor(*backend, layout, 1).runOnePage(false, [] { return true; });
+        = NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return true; });
     ASSERT_EQ(first_page.pages, 1u);
     ASSERT_EQ(first_page.deleted, 1u);
-    const GcMaintenanceReadResult partial = readGcMaintenanceState(*backend, layout);
+    const GcMaintenanceReadResult partial = readGcMaintenanceState(op, layout);
     ASSERT_EQ(partial.status, GcMaintenanceReadStatus::Valid);
     ASSERT_TRUE(partial.state);
     ASSERT_FALSE(partial.state->janitor_cursor.empty());
@@ -435,7 +437,7 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     EXPECT_GE(cleanup->metrics.at("janitor_keys"), 1u);
     EXPECT_EQ(cleanup->metrics.at("janitor_deleted"), 0u);
 
-    const GcMaintenanceReadResult deferred_progress = readGcMaintenanceState(*backend, layout);
+    const GcMaintenanceReadResult deferred_progress = readGcMaintenanceState(op, layout);
     ASSERT_EQ(deferred_progress.status, GcMaintenanceReadStatus::Valid);
     ASSERT_TRUE(deferred_progress.state);
     EXPECT_EQ(deferred_progress.state->janitor_cursor, partial.state->janitor_cursor)
@@ -468,7 +470,7 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     EXPECT_EQ(folded_cleanup->metrics.at("janitor_deleted"), 1u);
     EXPECT_EQ(static_cast<uint64_t>(backend->head(key_a).exists) + static_cast<uint64_t>(backend->head(key_b).exists), 0u)
         << "the fold must retry and delete the exact page that DEFER left undecided";
-    const GcMaintenanceReadResult completed = readGcMaintenanceState(*backend, layout);
+    const GcMaintenanceReadResult completed = readGcMaintenanceState(op, layout);
     ASSERT_EQ(completed.status, GcMaintenanceReadStatus::Valid);
     ASSERT_TRUE(completed.state);
     EXPECT_TRUE(completed.state->janitor_cursor.empty());

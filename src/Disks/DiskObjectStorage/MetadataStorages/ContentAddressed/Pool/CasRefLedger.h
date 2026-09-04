@@ -1,6 +1,8 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
@@ -89,7 +91,9 @@ class CasRefLedger
 {
 public:
     CasRefLedger(
-        BackendPtr backend_ptr,
+        /// The mount plane. Every request this ledger makes is admitted on it, so a ref-lane write and
+        /// a mount-lease renewal are measured against the same fence and the same clock.
+        CasRequests & mount_requests_,
         const Layout & layout_,
         RefLedgerConfig config_,
         const CasEventSink & event_sink_,
@@ -100,23 +104,19 @@ public:
         /// unlike the mount-state functions below, because it is a fixed identity for this ledger's
         /// whole lifetime (mirrors `CasMountRuntime`'s own by-value `server_root_id`).
         String server_root_id_,
-        /// Monotonic mount clock used by the retry controller; it may be empty when the controller's
-        /// default clock is appropriate.
-        std::function<uint64_t()> controller_boot_ms_fn,
         /// Callbacks into mount and watermark state owned by `Pool`, bound for this ledger's lifetime:
         std::function<uint64_t()> live_epoch_fn_,
         std::function<bool()> fence_ok_fn_,
-        /// The two fence-GENERATION primitives (`CasMountRuntime::fenceGeneration`/`checkFenceOrThrow`),
-        /// injected exactly as `CasPlainObjects` takes them. `fence_ok_fn` above answers "may this mount
-        /// write AT ALL, right now"; these two answer the different question an append lane must ask
-        /// across an I/O window: "is this still the SAME mount incarnation that admitted the transaction
-        /// I am about to act on?" A wedge captures the generation at admission and presents it back on
-        /// every later retry and before every install, so a result that returns after a fence loss or a
-        /// re-arm is inert for the superseded runtime instead of installing a stale view (spec §3,
-        /// "the mount-fence generation is captured at admission and required on every slot-occupy and
-        /// install").
+        /// The fence-GENERATION primitive (`CasMountRuntime::fenceGeneration`), injected exactly as
+        /// `CasPlainObjects` takes it. `fence_ok_fn` above answers "may this mount write AT ALL, right
+        /// now"; this answers the different question an append lane must ask across an I/O window: "is
+        /// this still the SAME mount incarnation that admitted the transaction I am about to act on?" A
+        /// wedge captures the generation at admission and presents it back -- through `mount_requests`,
+        /// by resuming an operation under it -- on every later retry and before every install, so a
+        /// result that returns after a fence loss or a re-arm is inert for the superseded runtime instead
+        /// of installing a stale view (spec §3, "the mount-fence generation is captured at admission and
+        /// required on every slot-occupy and install").
         std::function<uint64_t()> fence_generation_fn_,
-        std::function<void(uint64_t)> check_fence_or_throw_,
         std::function<uint64_t()> boot_ms_now_fn_,
         std::function<bool()> may_mutate_,
         std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
@@ -288,26 +288,25 @@ public:
     /// mutation can appear after shutdown has taken its snapshot.
     bool drainRefLanesForShutdown(uint64_t wait_budget_ms);
 
-    /// Performs a staged conditional create through the ledger's retry controller and append-fence
-    /// predicate. Callers do not access either dependency directly, so every attempt observes the same
-    /// mount admission rule.
-    CasWriteOutcome stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token);
+    /// A staged conditional create on the mount plane. Callers reach the store only through these, so
+    /// every attempt observes the same mount admission rule. `Conflict` names what occupies the key; a
+    /// caller whose key is content-addressed decides for itself whether a different occupant is
+    /// corruption.
+    WriteResult stagingPutIfAbsent(const String & key, const String & bytes);
 
-    /// Same retry/fence policy as `stagingPutIfAbsent`, for a MUTABLE If-Match overwrite whose bytes
-    /// are deterministic (safe for GET-based resolution).
-    CasOverwriteResult stagingConditionalOverwrite(std::string_view key, std::string_view bytes, const Token & expected);
+    /// The If-Match sibling of `stagingPutIfAbsent`, for a MUTABLE marker.
+    WriteResult stagingConditionalOverwrite(const String & key, const String & bytes, const Incarnation & expected);
 
-    /// Same retry/fence policy as `stagingPutIfAbsent`, for a MUTABLE marker where an existing
-    /// DIFFERENT value at the key is a normal Conflict outcome, not corruption (see
-    /// `CasRequestController::putIfAbsentControlledMutable`).
-    CasOverwriteResult stagingPutIfAbsentMutable(std::string_view key, std::string_view bytes);
+    /// Create-if-absent for a MUTABLE marker, where a DIFFERENT value already at the key is an
+    /// ordinary `Conflict` for the caller to act on rather than corruption.
+    WriteResult stagingPutIfAbsentMutable(const String & key, const String & bytes);
 
     /// Hooks required by `EventEmitter`: events are delivered to the injected sink when one is present.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink); }
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }
 
-    /// Replaces the retry controller's delay seam for deterministic tests; production callers leave it
-    /// untouched.
+    /// Replaces the mount plane's inter-attempt delay seam for deterministic tests; production callers
+    /// leave it untouched.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
 
     /// Replaces only ref-table recovery's token-aware retry delay seam for deterministic tests.
@@ -406,6 +405,12 @@ public:
     /// Installs the negative control for the post-durable install region (see
     /// `install_region_probe_for_test`).
     void setInstallRegionProbeForTest(std::function<void()> probe) { install_region_probe_for_test = std::move(probe); }
+
+    /// Installs a probe at `ensureRefTableRecovered`'s step 8 -- the LAST admission recheck before a
+    /// materialized recovery result installs, after the final authority read and O(N) materialization
+    /// have already run. A test pausing here and then latching a stop token observes whether that stop
+    /// is honored before install (see `recovery_install_probe_for_test`).
+    void setRecoveryInstallProbeForTest(std::function<void()> probe) { recovery_install_probe_for_test = std::move(probe); }
 
     /// Installs the pre-tenure fault seam (see `ref_pre_tenure_hook_for_test`).
     void setRefPreTenureHookForTest(std::function<void()> hook) { ref_pre_tenure_hook_for_test = std::move(hook); }
@@ -630,10 +635,10 @@ public:
         String bytes;
         /// `CasMountRuntime::fenceGeneration()` as read at this transaction's ADMISSION -- the same
         /// critical section that snapshotted the state and derived the id, i.e. one atomic reading of
-        /// "what this attempt was allowed to do". Every later `slotOccupy` retry is gated on THIS value
-        /// (never the current one), and every install is preceded by presenting it back through
-        /// `checkFenceOrThrow`: a retry admitted under a dead incarnation must send nothing, and a
-        /// result that returns after a fence bump/re-arm must install nothing.
+        /// "what this attempt was allowed to do". Every later retry of this attempt is admitted by
+        /// resuming an operation under THIS value (never the current one), and every install is
+        /// preceded by presenting it back: a retry admitted under a dead incarnation must send
+        /// nothing, and a result that returns after a fence bump/re-arm must install nothing.
         uint64_t admitted_fence_generation = 0;
     };
 
@@ -697,7 +702,7 @@ public:
 private:
     /// Injected storage and mount environment. The member order is part of construction/destruction
     /// behavior because the callbacks and references are used by the runtime owned below.
-    Backend & backend;
+    CasRequests & mount_requests;
     const Layout & layout;
     RefLedgerConfig config;
     const CasEventSink & event_sink;
@@ -708,7 +713,6 @@ private:
     std::function<uint64_t()> live_epoch_fn;
     std::function<bool()> fence_ok_fn;
     std::function<uint64_t()> fence_generation_fn;
-    std::function<void(uint64_t)> check_fence_or_throw;
     std::function<uint64_t()> boot_ms_now_fn;
     std::function<bool()> may_mutate;
     std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference;
@@ -745,7 +749,7 @@ private:
     /// `ref_queue_mutex` (which only ever guards `pending`/`carved`/`leader_active`) so a reader (resolveRef/
     /// listRefs) can observe `state` without contending with the flush leader's network round trip --
     /// the leader only holds `state_mutex` for the brief copy-out-before-validate and the
-    /// apply-after-commit steps, never for the `putIfAbsentControlled` call itself.
+    /// apply-after-commit steps, never for the durable write itself.
     struct RefTableRuntime
     {
         /// An allocator can reuse an evicted predecessor's address for its successor. This monotone id
@@ -1000,13 +1004,6 @@ private:
         return rt.state.nextTxnId(live_epoch_fn());
     }
 
-    /// The CAS-owned retry controller this Pool's ref-log writer path uses for every conditional
-    /// log/snapshot `PUT` and uncertain-result resolution. It is also shared by the part-manifest
-    /// write and mutable freshness-meta writes. The controller is stateless per call (immutable
-    /// budget/clock/sleep — the sleep fn mutates only through the test-only seam, before traffic), so
-    /// concurrent lanes and builds use the one instance safely.
-    std::unique_ptr<CasRequestController> ref_request_controller;
-
     /// Test-only hook called before a compatible append batch is carved; null in production.
     std::function<void()> ref_pre_carve_hook_for_test;
 
@@ -1030,6 +1027,8 @@ private:
     /// otherwise non-throwing regions. A test that installs a throwing probe must therefore disarm it
     /// after the region it targets, or every later install throws too. Null in production.
     std::function<void()> install_region_probe_for_test;
+    /// See `setRecoveryInstallProbeForTest`. Null in production.
+    std::function<void()> recovery_install_probe_for_test;
     std::function<void()> append_after_runtime_capture_hook_for_test;
     std::function<void()> read_before_state_lock_hook_for_test;
     std::function<void()> readable_catalog_after_observation_hook_for_test;
@@ -1102,8 +1101,8 @@ private:
     /// cleanup could account for. Everything terminal throws.
     ///
     /// `admitted_generation` is the ONE fence generation this whole recovery was admitted under: the
-    /// walk presents it to every `slotOccupy` and to the `_ckpt` CAS, and the caller presents the same
-    /// value once more immediately before installing.
+    /// walk resumes its operation under it, so every request the walk makes is measured against it, and
+    /// the caller presents the same value once more immediately before installing.
     /// `retained_attempt` is copied under `state_mutex` before the unlocked walk. It is evidence from
     /// this runtime's admitted writer, not a second recovery authority: only the exact slot it names
     /// is compared byte-for-byte, and a successor seal remains the existing conclusive-loss case.
@@ -1121,8 +1120,7 @@ private:
     /// independently disqualify it. Throws; remount cancellation raises the retry-later class and
     /// LATCHES through `cancelled` so the caller's transient loop does not re-drive it.
     ///
-    /// The FENCE is deliberately absent: it gates the three sites that spend it (every `slotOccupy`, the
-    /// `_ckpt` CAS, the install), not every read. See the definition for why.
+    /// The FENCE is deliberately absent: the walk's own operation carries it. See the definition.
     void checkRecoveryStillAdmitted(
         const RootNamespace & ns, RefTableRuntime & rt, bool & cancelled,
         const std::optional<DetachedStopToken> & token = std::nullopt) const;
@@ -1173,8 +1171,8 @@ private:
     };
 
     /// ONE bounded resolution attempt for `rt`'s outstanding wedge (spec INV-1's every-attempt rule):
-    /// at most one `slotOccupy(wedge.key, wedge.bytes, ...)` per calling flush, gated on the wedge's
-    /// ORIGINAL `admitted_fence_generation` rather than the current one. There is deliberately NO
+    /// at most one conditional create of the wedge's exact key and bytes per calling flush, admitted by
+    /// resuming under the wedge's ORIGINAL `admitted_fence_generation` rather than the current one. There is deliberately NO
     /// background retry thread and no deadline-resetting loop: a permanently quiet wedged namespace
     /// waits for its next caller or for a remount, which is acceptable precisely because the wedged
     /// operation was never acknowledged.
@@ -1186,8 +1184,8 @@ private:
     /// "absent", which is not a rejection: the earlier ambiguous attempt could still land afterwards.
     ///
     /// Post-I/O recheck: the outcome is adjudicated on an I/O result, so before ANY action follows from
-    /// it (adopt, acknowledge, unwedge, fail the survivors) this re-acquires `state_mutex`, presents
-    /// `admitted_fence_generation` back through `checkFenceOrThrow`, and compares the full wedge
+    /// it (adopt, acknowledge, unwedge, fail the survivors) this re-acquires `state_mutex`, compares
+    /// `admitted_fence_generation` against the fence's CURRENT generation, and compares the full wedge
     /// identity against what is still installed. A result that returns after a fence bump/re-arm, or
     /// after the wedge it belonged to was replaced, is INERT for this runtime.
     WedgeResolutionResult resolveWedgeOnce(
@@ -1257,10 +1255,15 @@ private:
     ///   - `runRecoveryWalkOnce` contributes `last_epoch_seal` once its own CAS-walk minted or adopted
     ///     one -- it is the only writer that mints seals, so it is the only writer that can record
     ///     where the chain now ends.
-    CkptPublishOutcome publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
-                                               uint64_t admitted_generation,
-                                               const std::function<void(uint64_t)> & check_admission,
-                                               const std::function<void()> & admit_request = {});
+    CkptPublishOutcome publishCkptContribution(CasOperation & op, const NamespaceLifeId & life,
+                                               const RefCkpt & contribution);
+
+    /// The verdict points that guard a DECISION rather than a request: the engine refuses a request on
+    /// its own, but a result already in hand must not be acted on once `op` has stopped being admitted.
+    /// `op.admitted()` folds every reason together -- a moved mount incarnation, a lease with too little
+    /// time left, or a caller-supplied liveness term that has since gone false -- because none of them
+    /// leaves the caller anything more specific to act on than "this admission no longer holds".
+    void refuseUnlessAdmitted(const CasOperation & op, std::string_view what) const;
 
     /// Common candidate predicate for scheduler admission and execution after capture. Caller holds
     /// `rt.state_mutex`; an epoch seal is not state-bearing and cannot be snapshotted.

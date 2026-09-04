@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CatalogLifecycleReconciler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMetaWriter.h>
@@ -453,7 +454,7 @@ public:
         String key;
         uint64_t size = 0;
         String reason;          /// "unreachable" | "delete_pending" | "awaiting_graduation"
-        Token token;            /// stored condemn-time token (empty for "unreachable")
+        PersistedIncarnation token;   /// stored condemn-time incarnation (empty for "unreachable")
         uint64_t condemn_round = 0;
     };
 
@@ -509,10 +510,10 @@ public:
 
 private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds the
-    /// committed gc/state (with our lease) and `state_token` its backend token. `allow_steal=false`
-    /// suppresses only the steal CAS (see runRegularRound's doc comment) — acquiring a free lease and
-    /// renewing our own are unaffected.
-    bool acquireOrRenewLease(GcState & state, Token & state_token, bool allow_steal);
+    /// committed gc/state (with our lease) and `state_incarnation` the incarnation that write created.
+    /// `allow_steal=false` suppresses only the steal (see runRegularRound's doc comment) — acquiring a
+    /// free lease and renewing our own are unaffected.
+    bool acquireOrRenewLease(GcState & state, std::optional<Incarnation> & state_incarnation, bool allow_steal);
 
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
@@ -531,13 +532,13 @@ private:
     /// What one fold produced. The blob deltas are sealed
     /// into a write-once generation; `fold_seal` is the durable index of WHAT WAS FOLDED (a CasFoldSeal),
     /// `root_shards` the discovered universe, `mf_cleanup` the part-manifest cleanup work keyed by
-    /// ManifestId (owner-removed bodies whose exact-token delete is deferred until their decrements are
-    /// sealed), and `retired_merge` the per-gc-shard ack-floor retired-cursor outcome.
+    /// ManifestId (owner-removed bodies whose exact-incarnation delete is deferred until their
+    /// decrements are sealed), and `retired_merge` the per-gc-shard ack-floor retired-cursor outcome.
     struct FoldResult
     {
         CasFoldSeal fold_seal;
         std::vector<std::pair<RootNamespace, uint64_t>> root_shards;
-        std::map<ManifestId, Token> mf_cleanup;
+        std::map<ManifestId, Incarnation> mf_cleanup;
         /// Bounded orphan candidates exact-read before reduce. Their source retirements ride this
         /// fold's runs; their manifest tokens become deletable only after the round CAS adopts them.
         ManifestSweepResult orphan_sweep;
@@ -688,8 +689,6 @@ private:
     /// missing body or a true-removal old body missing at removal-fold => fail-closed FOR THAT DECISION
     /// (clamp the shard's last_folded_ref_id below it, record the anomaly, stop folding THIS shard) —
     /// never guess a delta and never wedge the round on a missing body.
-    /// On success `state` carries the committed snap_generation and `state_token` the committed gc/state
-    /// token. The committed pair is THREADED into retire, never re-read (zombie-steal protection).
     /// Round-paced graduation: `current_round` (= state.round + 1, the SAME basis condemn_round is
     /// stamped at) is the threshold the fold's two-cursor merge graduates/condemns against — an entry
     /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
@@ -697,7 +696,8 @@ private:
     /// in-memory; the SINGLE round CAS commits them.
     /// `walk_plan` owns the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`) and
     /// its catalog cut; the fold regroups those keys strictly rather than listing the prefix again.
-    FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
+    FoldResult fold(GcState & state, std::optional<Incarnation> & state_incarnation,
+                    RoundReport & report, uint64_t current_round,
                     const RefPlan & walk_plan, UniversePolicy policy,
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
@@ -780,13 +780,13 @@ private:
     std::optional<std::pair<uint64_t, uint64_t>> newestFoldSealRef();
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each
-    /// blob entry to `deltas`. On sign<0 queue (id -> token) into mf_cleanup. Returns whether a body was
+    /// blob entry to `deltas`. On sign<0 queue (id -> incarnation) into mf_cleanup. Returns whether a body was
     /// read+validated: false => ABSENT body (404; the caller decides per the 404 rule). A body that is
     /// PRESENT but fails refMatchesBody / manifestNamespaceMatches throws CORRUPTED_DATA.
     /// `txn_ordinal` stamps every delta this call pushes with the round-local ordinal of the ref
     /// transaction that emitted it (probe B2 — see `TxnApplyLedger`).
-    bool foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
-                           std::map<ManifestId, Token> & mf_cleanup, uint32_t txn_ordinal);
+    bool foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
+                           std::map<ManifestId, Incarnation> & mf_cleanup, uint32_t txn_ordinal);
 
 
 
@@ -880,6 +880,10 @@ private:
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 
+    /// Re-read `gc/state` and record whether this leader still holds the lease it was admitted under.
+    /// Fail-closed: an absent, unreadable or undecodable state reads as deposed.
+    void refreshAuthority(uint64_t admitted_generation);
+
     PoolPtr store;
     /// Where `GcPhaseTimer` sends one record per GC phase. Empty unless a `CasGcScheduler` installed one
     /// for the current round, in which case every phase of that round emits a row.
@@ -902,6 +906,18 @@ private:
     /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever
     /// a round folds; incremented on every DEFER. Bounds batching via `gc_fold_max_defer_rounds`.
     uint64_t rounds_since_last_fold_ = 0;
+
+    /// THIS LEADER'S OWN AUTHORITY VERDICT, and the reason it is a cached bool rather than a probe.
+    ///
+    /// It is what the `Liveness` predicates of the round's destructive operations sample -- the pre-fold
+    /// catalog drain and the namespace janitor page, both of which erase objects a deposed leader must
+    /// not touch. The engine samples a `Liveness` before EVERY request and before every sleep, so a
+    /// predicate that read `gc/state` itself would put one `GET` on the hot path of every listed key.
+    /// The read that sets this flag is therefore made by the round, at the granularity the old
+    /// hand-written fence check had (once per drain, once per janitor page), never from inside the
+    /// predicate. The staleness that buys is bounded by that granularity and stated where each caller
+    /// refreshes it.
+    bool authority_held = false;
 
     /// the contender's observation window (steal protocol)
     bool has_observation = false;

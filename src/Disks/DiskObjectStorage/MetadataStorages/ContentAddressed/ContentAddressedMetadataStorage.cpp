@@ -1235,9 +1235,15 @@ void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(con
     const Cas::PoolPtr pool = store();   /// Live here (past the op gate's Live, non-terminal admission).
 
     ++empty_proof_probe_count_for_test;
+    /// The open plane: this probe is what authorizes an empty answer, and a mount whose lease has
+    /// blipped must still be able to ask it.
+    Cas::CasOperation probe_op = pool->gcRequests().admit();
     const Cas::SentinelProbeResult probe = empty_proof_probe_override_for_test
         ? empty_proof_probe_override_for_test()
-        : Cas::probeSentinel(pool->backend(), pool->layout().poolMetaKey());
+        /// `once`: this probe is the gate that authorises an empty answer, and an inconclusive one is a
+        /// refusal the caller retries -- reissuing here would stall a directory listing for the whole
+        /// retry window instead.
+        : Cas::probeSentinel(probe_op, pool->layout().poolMetaKey(), Cas::Retry::once());
 
     switch (probe.outcome)
     {

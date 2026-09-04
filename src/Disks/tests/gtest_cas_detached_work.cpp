@@ -6,12 +6,14 @@
 #include <Common/ProfileEvents.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <future>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 using namespace DB::Cas;
@@ -25,12 +27,17 @@ namespace
 {
 
 /// A gate a test opens explicitly, so a task can be held in flight without a sleep.
+///
+/// The wait is BOUNDED and reports a failure rather than blocking for ever, and it names the gate it
+/// waited on: an unbounded wait on a premise that stopped holding hung the whole binary here, which
+/// hid every test that would have run after it.
 struct Gate
 {
-    void wait()
+    void wait(std::string_view name)
     {
         std::unique_lock lock(m);
-        cv.wait(lock, [this] { return open_; });
+        if (!cv.wait_for(lock, std::chrono::seconds(60), [this] { return open_; }))
+            ADD_FAILURE() << "timed out waiting for '" << name << "'";
     }
     void open()
     {
@@ -43,13 +50,23 @@ struct Gate
     bool open_ = false;
 };
 
-/// Completes the watched first `GET`, then withholds its return so teardown can latch before the
+/// Opens its gate on every exit from the scope, so a failing assertion cannot strand the thread
+/// parked behind it: the parked thread is joined during teardown, and a gate that stayed shut turned
+/// a reported failure into a whole-binary deadlock.
+struct GateOpenedOnExit
+{
+    explicit GateOpenedOnExit(Gate & gate_) : gate(gate_) {}
+    GateOpenedOnExit(const GateOpenedOnExit &) = delete;
+    GateOpenedOnExit & operator=(const GateOpenedOnExit &) = delete;
+    ~GateOpenedOnExit() { gate.open(); }
+    Gate & gate;
+};
+
+/// Completes the watched first read, then withholds its return so teardown can latch before the
 /// helper is able to issue its next raw request.
 class BetweenRecoveryGetsBackend : public DB::Cas::tests::OrderedFaultBackend
 {
 public:
-    using DB::Cas::tests::OrderedFaultBackend::get;
-
     void armBetweenGets(String first_key_, std::shared_ptr<Gate> first_completed_, std::shared_ptr<Gate> release_first_)
     {
         first_key = std::move(first_key_);
@@ -58,13 +75,13 @@ public:
         armed.store(true);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        auto result = DB::Cas::tests::OrderedFaultBackend::get(key, range);
+        auto result = DB::Cas::tests::OrderedFaultBackend::read(key, access);
         if (key == first_key && armed.exchange(false))
         {
             first_completed->open();
-            release_first->wait();
+            release_first->wait("release_first");
         }
         return result;
     }
@@ -77,14 +94,11 @@ private:
 };
 
 /// Identifies recovery's final authority read without changing the recovery implementation: after the
-/// recovered-frontier CAS, its first checkpoint `GET` verifies that contribution and its second is the
+/// recovered-frontier CAS, its first checkpoint read verifies that contribution and its second is the
 /// final authority read immediately preceding materialization.
 class FinalAuthorityBackend : public DB::Cas::tests::OrderedFaultBackend
 {
 public:
-    using DB::Cas::tests::OrderedFaultBackend::casPut;
-    using DB::Cas::tests::OrderedFaultBackend::get;
-
     void armFinalAuthorityRead(String checkpoint_key_)
     {
         checkpoint_key = std::move(checkpoint_key_);
@@ -94,20 +108,22 @@ public:
         armed.store(true);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
-        auto result = DB::Cas::tests::OrderedFaultBackend::get(key, range);
+        auto result = DB::Cas::tests::OrderedFaultBackend::read(key, access);
         if (armed.load() && checkpoint_cas_committed.load() && key == checkpoint_key
             && gets_after_checkpoint_cas.fetch_add(1) + 1 == 2)
             final_authority_returned.store(true);
         return result;
     }
 
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta) override
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
     {
-        CasResult result = DB::Cas::tests::OrderedFaultBackend::casPut(key, bytes, expected, meta);
-        if (armed.load() && key == checkpoint_key && result.outcome == CasOutcome::Committed)
+        auto result = DB::Cas::tests::OrderedFaultBackend::write(key, bytes, expected_value, access);
+        /// A value is the store's committed incarnation; a `RawConflict` is a refused precondition.
+        if (armed.load() && key == checkpoint_key && result.has_value())
             checkpoint_cas_committed.store(true);
         return result;
     }
@@ -132,16 +148,17 @@ CasRequestBudget oneAttemptBudget()
     return budget;
 }
 
-/// A ledger-level fixture keeps the real detached publisher but injects its already-public mount-fence
-/// callback. That callback is the existing deterministic boundary after recovery materialized its
+/// A ledger-level fixture keeps the real detached publisher but arms `CasRefLedger`'s recovery-install
+/// test probe. That probe is the existing deterministic boundary after recovery materialized its
 /// result and before `installRecoveryResult`.
 class ManualDetachedLedger
 {
 public:
     ManualDetachedLedger()
         : backend(std::make_shared<FinalAuthorityBackend>())
+        , mount_requests(DB::Cas::tests::openRequestsForTest(backend))
         , ledger(
-              backend,
+              mount_requests,
               layout,
               RefLedgerConfig{
                   .server_root_id = "test",
@@ -153,18 +170,9 @@ public:
               event_sink,
               oneAttemptBudget(),
               "test",
-              [] { return uint64_t{0}; },
               [] { return uint64_t{1}; },
               [] { return true; },
               [] { return uint64_t{1}; },
-              [this](uint64_t)
-              {
-                  if (backend->finalAuthorityReturned() && !final_install_gate_claimed.exchange(true))
-                  {
-                      final_install_reached.open();
-                      release_final_install.wait();
-                  }
-              },
               [] { return uint64_t{0}; },
               [] { return true; },
               [](const String &, const String &, const std::optional<String> &) {},
@@ -177,7 +185,27 @@ public:
               {},
               [](const RootNamespace &) {})
     {
-        CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
+        /// The engine's own retry pauses, on a clock the engine reads: one call reaches its retry
+        /// deadline against a latched fault with no real time passing. `setCasRetrySleepForTest`
+        /// installs the sleep on both `mount_requests` and the recovery retry loop.
+        auto clock = std::make_shared<DB::Cas::tests::VirtualRetryClock>();
+        mount_requests.setNowFnForTest(DB::Cas::tests::VirtualRetryClock::nowFnOf(clock));
+        ledger.setCasRetrySleepForTest(DB::Cas::tests::VirtualRetryClock::sleepFnOf(clock));
+
+        CasOperation op = mount_requests.admit();
+        CasRefCatalog::initializeEmptyForNewPool(op, layout);
+
+        /// The deterministic boundary a test pauses on: after recovery's final authority read and O(N)
+        /// materialization, immediately before a materialized result installs. A no-op for every test
+        /// that never arms `backend`'s final-authority read.
+        ledger.setRecoveryInstallProbeForTest([this]
+        {
+            if (backend->finalAuthorityReturned() && !final_install_gate_claimed.exchange(true))
+            {
+                final_install_reached.open();
+                release_final_install.wait("release_final_install");
+            }
+        });
     }
 
     std::function<void(DetachedStopToken)> takeDetachedTask()
@@ -203,6 +231,9 @@ public:
     std::shared_ptr<DetachedRegistryState> registry = std::make_shared<DetachedRegistryState>();
     Gate final_install_reached;
     Gate release_final_install;
+    /// The mount plane the ledger admits every request on. Declared before it, and never moved: the
+    /// ledger holds a reference to this member.
+    CasRequests mount_requests;
     CasRefLedger ledger;
 
 private:
@@ -295,8 +326,13 @@ RefTxnId publishRef(CasRefLedger & ledger, const RootNamespace & ns, const Strin
 }
 
 /// Leaves the runtime in `NeedsRecovery` while its first background publisher is held after capture.
-/// Releasing that publisher consumes the armed snapshot failure; zero backoff then makes settlement
+/// Releasing that publisher meets the latched snapshot failure; zero backoff then makes settlement
 /// redispatch the real token-carrying publisher, whose first action is recovery of this exact runtime.
+///
+/// Both faults are LATCHED and the engine's retry clock is virtual, because a write here must reach
+/// its own retry deadline without committing: the engine reissues one logical write until that
+/// deadline, so a counted fault the reissues outlive would let the call commit -- the parked publisher
+/// would then succeed, nothing would redispatch it, and no caller would ever reach recovery.
 void preparePendingRecoveryPublisher(
     const PoolPtr & store,
     const std::shared_ptr<DB::Cas::tests::OrderedFaultBackend> & backend,
@@ -305,6 +341,8 @@ void preparePendingRecoveryPublisher(
     const std::shared_ptr<Gate> & release_first_publisher,
     String & ckpt_key)
 {
+    DB::Cas::tests::VirtualRetryClock::installOn(store);
+
     auto capture_calls = std::make_shared<std::atomic<uint64_t>>(0);
     store->setSnapshotAfterCaptureHookForTest(
         [capture_calls, first_publisher_captured, release_first_publisher]
@@ -312,21 +350,23 @@ void preparePendingRecoveryPublisher(
             if (capture_calls->fetch_add(1) != 0)
                 return;
             first_publisher_captured->open();
-            release_first_publisher->wait();
+            release_first_publisher->wait("release_first_publisher");
         });
 
-    backend->armPutFailure("_snap/", 1);
+    backend->armLatchedWriteFailure("_snap/");
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
-    first_publisher_captured->wait();
+    first_publisher_captured->wait("first_publisher_captured");
 
-    const auto life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const auto life = CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns);
     ASSERT_TRUE(life);
     ckpt_key = store->layout().refCkptKey(*life);
 
     /// The log lands before the checkpoint conflict, leaving a real unfrontiered durable transaction.
-    backend->armCasConflict(ckpt_key, 100);
+    backend->armLatchedWriteConflict(ckpt_key);
     EXPECT_ANY_THROW(store->dropRef(ns, "ref_1"));
-    backend->armCasConflict(ckpt_key, 0);
+    backend->armLatchedWriteConflict({});
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 }
 
@@ -371,9 +411,9 @@ TEST(CASDetachedWork, DrainDoesNotReturnWhileWorkIsInFlight)
     ASSERT_TRUE(store->tryDispatchDetached([entered, release](DetachedStopToken)
     {
         entered->open();
-        release->wait();
+        release->wait("release");
     }));
-    entered->wait();
+    entered->wait("entered");
 
     auto drain = std::async(std::launch::async,
                             [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/60000); });
@@ -398,9 +438,9 @@ TEST(CASDetachedWork, ShutdownDoesNotReturnWhileWorkIsInFlight)
     ASSERT_TRUE(pool->tryDispatchDetached([entered, release](DetachedStopToken)
     {
         entered->open();
-        release->wait();
+        release->wait("release");
     }));
-    entered->wait();
+    entered->wait("entered");
 
     auto done = std::async(std::launch::async, [&storage] { storage->shutdown(); });
     awaitStopLatched(pool);
@@ -423,10 +463,10 @@ TEST(CASDetachedWork, ImplicitDestructionDrains)
     ASSERT_TRUE(pool->tryDispatchDetached([entered, release, &finished](DetachedStopToken)
     {
         entered->open();
-        release->wait();
+        release->wait("release");
         finished.store(true);
     }));
-    entered->wait();
+    entered->wait("entered");
 
     auto destroyed = std::async(std::launch::async, [&storage] { storage.reset(); });
     awaitStopLatched(pool);
@@ -462,9 +502,9 @@ TEST(CASDetachedWork, ExpiredDrainIncrementsTheTimeoutCounter)
     ASSERT_TRUE(pool->tryDispatchDetached([entered, release](DetachedStopToken)
     {
         entered->open();
-        release->wait();
+        release->wait("release");
     }));
-    entered->wait();
+    entered->wait("entered");
 
     const auto before = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts]
                             .load(std::memory_order_relaxed);
@@ -490,10 +530,10 @@ TEST(CASDetachedWork, TaskObservesStopTokenOnceLatched)
     ASSERT_TRUE(store->tryDispatchDetached([entered, release, &saw_stop](DetachedStopToken token)
     {
         entered->open();
-        release->wait();
+        release->wait("release");
         saw_stop.store(token.stopping());
     }));
-    entered->wait();
+    entered->wait("entered");
 
     auto drain = std::async(std::launch::async,
                             [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/60000); });
@@ -574,7 +614,7 @@ TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
 
     /// Arm the fault so the publisher's own PUT fails and its `catch` is entered. Use the same arming
     /// call the snapshot-ordering suite uses against this backend.
-    backend->armPutFailure("_snap/", 1);
+    backend->armWriteFailure("_snap/", 1);
 
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -609,9 +649,11 @@ TEST(CASDetachedWork, StopWakesRecoveryBackoffSleep)
         });
 
     /// Exhaust one checkpoint publication inside recovery so the outer retry loop enters backoff.
-    backend->armCasConflict(ckpt_key, 100);
+    /// Latched: the publication must meet the refusal on every reissue, or it commits and recovery
+    /// never reaches its backoff.
+    backend->armLatchedWriteConflict(ckpt_key);
     release_first_publisher->open();
-    sleeping->wait();
+    sleeping->wait("sleeping");
 
     const bool drained = store->stopAndDrainDetachedWork(/*deadline_ms=*/5000);
     release_sleep->store(true);
@@ -635,7 +677,7 @@ TEST(CASDetachedWork, StopWakesAConcurrentRecoveryWaiter)
         if (!recovery_hook_armed->load())
             return;
         recovery_entered->open();
-        release_recovery->wait();
+        release_recovery->wait("release_recovery");
     };
     auto store = openPublishingPool(backend, config);
     const RootNamespace ns{"srv1/concurrent_recovery"};
@@ -650,7 +692,10 @@ TEST(CASDetachedWork, StopWakesAConcurrentRecoveryWaiter)
     /// drain below waits only for the publisher parked behind it.
     recovery_hook_armed->store(true);
     auto first_recovery = std::async(std::launch::async, [&store, &ns] { store->listRefs(ns); });
-    recovery_entered->wait();
+    /// Declared AFTER the future, so it is destroyed BEFORE it: `first_recovery`'s destructor joins
+    /// the recovery thread, which cannot leave the hook until this gate is open.
+    GateOpenedOnExit recovery_released{*release_recovery};
+    recovery_entered->wait("recovery_entered");
 
     release_first_publisher->open();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -688,7 +733,7 @@ TEST(CASDetachedWork, StopIsObservedBeforeTheFirstRecoveryRequest)
         if (!recovery_hook_armed->load())
             return;
         at_boundary->open();
-        release->wait();
+        release->wait("release");
     };
     auto store = openPublishingPool(backend, config);
     const RootNamespace ns{"srv1/pre_first_request"};
@@ -701,7 +746,7 @@ TEST(CASDetachedWork, StopIsObservedBeforeTheFirstRecoveryRequest)
 
     recovery_hook_armed->store(true);
     release_first_publisher->open();
-    at_boundary->wait();
+    at_boundary->wait("at_boundary");
     const uint64_t gets_before = backend->getTotal();
 
     auto drain = std::async(std::launch::async,
@@ -769,14 +814,16 @@ TEST(CASDetachedWork, StopBetweenSnapshotBaseRequestsPreventsThePredecessorGet)
     preparePendingRecoveryPublisher(
         store, backend, ns, first_publisher_captured, release_first_publisher, ckpt_key);
 
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, store->layout(), ns).value();
     const String base_log_key = store->layout().refLogKey(life, base_id);
     const String predecessor_key = store->layout().refLogKey(life, predecessor_seal_id);
     auto first_get_completed = std::make_shared<Gate>();
     auto release_first_get = std::make_shared<Gate>();
     backend->armBetweenGets(base_log_key, first_get_completed, release_first_get);
     release_first_publisher->open();
-    first_get_completed->wait();
+    first_get_completed->wait("first_get_completed");
     const uint64_t predecessor_gets_before = backend->getCount(predecessor_key);
 
     auto drain = std::async(std::launch::async,
@@ -798,11 +845,15 @@ TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
     const RootNamespace ns{"srv1/stop_before_recovery_install"};
     ASSERT_NO_THROW(publishRef(fixture.ledger, ns, "ref_1", 1));
 
-    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*fixture.backend, fixture.layout, ns).value();
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(fixture.backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(catalog_op, fixture.layout, ns).value();
     const String ckpt_key = fixture.layout.refCkptKey(life);
-    fixture.backend->armCasConflict(ckpt_key, 100);
+    /// Latched: the checkpoint write is reissued until its retry window closes, so a counted refusal
+    /// the reissues outlive would let this drop commit and leave the lane Ready.
+    fixture.backend->armLatchedWriteConflict(ckpt_key);
     EXPECT_ANY_THROW(fixture.ledger.dropRef(ns, "ref_1"));
-    fixture.backend->armCasConflict(ckpt_key, 0);
+    fixture.backend->armLatchedWriteConflict({});
     ASSERT_EQ(fixture.ledger.laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     auto detached_publisher = fixture.takeDetachedTask();
@@ -813,8 +864,11 @@ TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
         {
             task(DetachedStopToken(fixture.registry));
         });
+    /// Released on every exit, before `running` is joined: the task parks behind this gate, and a
+    /// failed assertion that left it shut deadlocked the join.
+    GateOpenedOnExit final_install_released{fixture.release_final_install};
 
-    fixture.final_install_reached.wait();
+    fixture.final_install_reached.wait("final_install_reached");
     fixture.latchStop();
     fixture.release_final_install.open();
     EXPECT_NO_THROW(running.get());

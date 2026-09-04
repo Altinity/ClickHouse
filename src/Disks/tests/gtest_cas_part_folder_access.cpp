@@ -66,33 +66,26 @@ Cas::CachedPartFolderAccess::CacheParams cacheOn()
 
 /// Every mutating backend op throws once armed — models a correlated backend outage during the
 /// transaction's compensating rollback (dropRef must append a removal, which mutates the backend).
+/// While armed, the store is unreachable for every mutation: a transport-class failure, so the request
+/// engine settles it by a read (which fails too) and reissues until the call's own retry window closes.
+/// A test arming it therefore drives the engine's clock, or pays that window in real time.
 class RollbackFaultBackend final : public Cas::InMemoryBackend
 {
 public:
     std::atomic<bool> armed{false};
 
-    Cas::PutResult putIfAbsent(const String & k, const String & b, const Cas::ObjectMeta & m) override
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             Cas::TransportAccess & access) override
     {
         failIfArmed();
-        return InMemoryBackend::putIfAbsent(k, b, m);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 
-    Cas::PutResult putOverwrite(const String & k, const String & b, const Cas::Token & e, const Cas::ObjectMeta & m) override
+    RawRemoval remove(const String & key, const String & expected_value, Cas::TransportAccess & access) override
     {
         failIfArmed();
-        return InMemoryBackend::putOverwrite(k, b, e, m);
-    }
-
-    Cas::CasResult casPut(const String & k, const String & b, const std::optional<Cas::Token> & e, const Cas::ObjectMeta & m) override
-    {
-        failIfArmed();
-        return InMemoryBackend::casPut(k, b, e, m);
-    }
-
-    Cas::DeleteOutcome deleteExact(const String & k, const Cas::Token & t) override
-    {
-        failIfArmed();
-        return InMemoryBackend::deleteExact(k, t);
+        return InMemoryBackend::remove(key, expected_value, access);
     }
 
 private:
@@ -115,6 +108,9 @@ private:
 class PromoteConflictOnceBackend final : public Cas::InMemoryBackend
 {
 public:
+    /// Unhide the legacy `putIfAbsent` overloads the primitive override below would otherwise hide.
+    using InMemoryBackend::putIfAbsent;
+
     String fault_key_substr;
     int skip = 0;
     int fault_count = 0;
@@ -122,9 +118,13 @@ public:
     /// cleanup path ran its ref-log append at all, on a table where that append can no longer succeed.
     int matching_put_attempts = 0;
 
-    Cas::PutResult putIfAbsent(const String & key, const String & bytes, const Cas::ObjectMeta & meta) override
+    /// Sabotages the PRIMITIVE, which every legacy forwarder (including `putIfAbsent`) reaches too, so
+    /// the fault fires whichever surface issued the create.
+    std::expected<String, Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                            const std::optional<String> & expected_value,
+                                                            Cas::TransportAccess & access) override
     {
-        if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
+        if (!expected_value && !fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
         {
             ++matching_put_attempts;
             if (skip > 0)
@@ -132,13 +132,13 @@ public:
             else if (fault_count > 0)
             {
                 --fault_count;
-                /// The 3-arg qualified call bypasses virtual dispatch entirely (unlike a 2-arg
-                /// convenience overload, which would re-enter this very override through the vtable).
-                InMemoryBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"), meta);
+                /// The qualified call bypasses virtual dispatch entirely (unlike a re-entrant call
+                /// through the vtable), landing a foreign object at the key before the response is lost.
+                InMemoryBackend::write(key, bytes + String("\x01_FOREIGN_DIFFERENT"), expected_value, access);
                 throw Poco::TimeoutException("PromoteConflictOnceBackend: a foreign different object landed; response lost");
             }
         }
-        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 };
 
@@ -152,14 +152,20 @@ public:
 class PromoteDefiniteFailureBackend final : public Cas::InMemoryBackend
 {
 public:
+    /// Unhide the legacy `putIfAbsent` overloads the primitive override below would otherwise hide.
+    using InMemoryBackend::putIfAbsent;
+
     String fault_key_substr;
     int skip = 0;
     int fault_count = 0;
     int matching_put_attempts = 0;
 
-    Cas::PutResult putIfAbsent(const String & key, const String & bytes, const Cas::ObjectMeta & meta) override
+    /// Sabotages the PRIMITIVE, which every legacy forwarder (including `putIfAbsent`) reaches too.
+    std::expected<String, Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                            const std::optional<String> & expected_value,
+                                                            Cas::TransportAccess & access) override
     {
-        if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
+        if (!expected_value && !fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
         {
             ++matching_put_attempts;
             if (skip > 0)
@@ -171,7 +177,7 @@ public:
                                       Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
             }
         }
-        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 };
 
@@ -1011,6 +1017,9 @@ TEST(CASPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
 {
     auto backend = std::make_shared<RollbackFaultBackend>();
     auto store = openPoolForTest(backend);
+    /// Both drops below give up only when their own retry window closes, so the engine's inter-attempt
+    /// sleeps are paid in virtual time rather than by sleeping out the operation deadline for real.
+    auto clock = Cas::tests::VirtualRetryClock::installOn(store);
     Cas::CachedPartFolderAccess access(store, cacheOn());
 
     const Cas::RootNamespace ns_a{"srv/ta"};
@@ -1028,29 +1037,10 @@ TEST(CASPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
     access.dropRefBestEffort(Cas::PartRefKey{ns_b, "part_b"});
     const auto after = global_counters[ProfileEvents::CASRefRollbackBestEffortDropFailed].load();
     EXPECT_EQ(after, before + 1);
+    EXPECT_GT(clock->pauseCount(), 0u)
+        << "the give-up must be the call's own retry window, reached through the injected sleep";
 
     backend->armed = false;   /// let store teardown release its lease cleanly
-}
-
-namespace
-{
-
-/// A pool whose ref lane makes ONE attempt per append. That is what turns a single lost-response fault
-/// into a conclusive `Unresolved`: with retries allowed the controller's resolve-before-reissue would
-/// settle the ambiguity inside the same attempt and the lane would never wedge. Same budget shape, and
-/// the same reason, as `gtest_cas_ref_install_safety.cpp`'s `openPoolSingleAttempt`.
-Cas::PoolPtr openPoolSingleAttempt(const std::shared_ptr<Cas::InMemoryBackend> & backend)
-{
-    Cas::PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test"};
-    Cas::CasRequestBudget budget;
-    budget.max_attempts = 1;
-    budget.attempt_timeout_ms = 100;
-    budget.operation_deadline_ms = 5000;   /// strictly above attempt_timeout_ms: equality is a wall-clock race (validateCasRequestBudget)
-    budget.lease_safety_margin_ms = 100;
-    cfg.cas_request_budget = budget;
-    return Cas::Pool::open(backend, cfg);
-}
-
 }
 
 /// Part B review, MAJOR 3a: a promote whose ref-log append did not resolve MUST NOT be reported as
@@ -1068,8 +1058,9 @@ Cas::PoolPtr openPoolSingleAttempt(const std::shared_ptr<Cas::InMemoryBackend> &
 /// whose append never resolved.
 TEST(CASPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitted)
 {
-    auto backend = std::make_shared<Cas::tests::ChunkFaultBackend>();
-    auto store = openPoolSingleAttempt(backend);
+    auto backend = std::make_shared<Cas::tests::LatchedChunkFaultBackend>();
+    auto store = openPoolForTest(backend);
+    auto clock = Cas::tests::VirtualRetryClock::installOn(store);
     const Cas::RootNamespace ns{"srv/t1"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
     Cas::CachedPartFolderAccess access(store, cacheOn());
@@ -1080,18 +1071,29 @@ TEST(CASPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitt
 
     /// The promotion's own ref-log object lands; only the acknowledgement, and the controller's
     /// verifying read, are lost. Scoped to this namespace's ref log so nothing else consumes the fault.
+    /// A COUNTED fault cannot produce an unresolved outcome: the request engine settles the ambiguity
+    /// by an exact read that would find the landed object and report `Committed` inside the very same
+    /// call. Both legs therefore stay LATCHED for the whole call, and `VirtualRetryClock` pays the
+    /// retry window in virtual time instead of real wall-clock.
     backend->fault_substr = store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)) + "_log/";
     backend->mode = Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
-    backend->fault_count = 1;
+    backend->latched = true;
     expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { prepared.promote(); });
+    ASSERT_GT(clock->pauseCount(), 1u)
+        << "one attempt cannot exhaust the retry window: the fault must have outlasted every reissue";
 
     EXPECT_TRUE(prepared.commitIsUnresolved())
         << "a promote whose append may have landed must not be classified as a mechanism failure -- the "
            "receiver would fetch the bytes and publish the same part a second time";
 
     /// The hazard itself, stated as an assertion: the promote DID commit. Any further append into this
-    /// table resolves the wedge first, which is what makes the committed row visible.
+    /// table resolves the wedge first, which is what makes the committed row visible. Disarmed
+    /// COMPLETELY, because that flush must reach the store normally: a still-armed lost read would
+    /// fault the wedge's own settling read, and nothing would resolve.
+    backend->latched = false;
     backend->mode = Cas::tests::ChunkFaultBackend::Mode::None;
+    backend->fault_count = 0;
+    backend->fail_read_once_key.clear();
     access.prepareEntries({ns, "flush_driver"}, {inlineEntry("f", "two")}, Cas::ProvenanceOp::Insert).abort();
     EXPECT_TRUE(access.existsRef(key, Cas::Freshness::ForceFresh))
         << "the promotion object landed, so 'the promote failed' says nothing about the ref";
