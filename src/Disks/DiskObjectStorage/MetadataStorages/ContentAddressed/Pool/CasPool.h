@@ -410,6 +410,12 @@ public:
     ~Pool();
 
     bool tryDispatchDetached(std::function<void(DetachedStopToken)> task);
+    /// Marks this pool as being torn down. The open request plane refuses every further admission and
+    /// wakes a retry sleep on it, and no new detached task is accepted. Idempotent, and it frees,
+    /// nulls and swaps nothing: it can be called before any lock a teardown takes, so a GC round
+    /// holding such a lock is refused at its next request instead of being waited out.
+    void beginTeardown() noexcept;
+    bool teardownBegun() const noexcept;
     bool stopAndDrainDetachedWork(uint64_t deadline_ms);
     uint64_t detachedWorkInFlight() const;
     uint64_t detachedWorkInFlightForTest() const { return detachedWorkInFlight(); }
@@ -1138,6 +1144,20 @@ private:
     std::function<void(uint64_t)> mountPlaneSleepFn()
     {
         return [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); };
+    }
+
+    /// The open plane's inter-attempt sleep: woken by `beginTeardown`, so a retry backing off on the
+    /// GC plane cannot hold a teardown for a whole capped backoff. A predicate wait, so the detached
+    /// tasks' own completions -- which notify the same variable -- do not cut a sleep short. Named
+    /// for the same reason as `mountPlaneSleepFn`: the test seam has to be able to put it back.
+    std::function<void(uint64_t)> openPlaneSleepFn()
+    {
+        return [this](uint64_t ms)
+        {
+            std::unique_lock lock(detached_work->mutex);
+            detached_work->cv.wait_for(lock, std::chrono::milliseconds(ms),
+                                       [this] { return detached_work->stopping.load(std::memory_order_acquire); });
+        };
     }
 
     BackendPtr pool_backend;

@@ -465,15 +465,19 @@ CasLifecycleSnapshot ContentAddressedMetadataStorage::lifecycleSnapshot() const
 
 Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
 {
-    /// Unit tests pass a null context (no system logs); the scheduler then runs without a sink.
+    /// Unit tests pass a null context (no system logs); the scheduler then runs with the test hook
+    /// as its only sink, or without a sink.
+    const std::function<void(const Cas::GcRoundLogRecord &)> hook = gc_round_row_hook_for_test;
     if (!context)
-        return {};
+        return hook ? Cas::GcRoundLogger(hook) : Cas::GcRoundLogger{};
     const ContextWeakPtr weak_context = *context;
     /// The configured disk name (threaded from the metadata-storage factory); falls back to
     /// storage_path_prefix for callers that don't supply one (e.g. unit tests).
     const String disk = disk_name;
-    return [weak_context, disk](const Cas::GcRoundLogRecord & r)
+    return [weak_context, disk, hook](const Cas::GcRoundLogRecord & r)
     {
+        if (hook)
+            hook(r);
         auto ctx = weak_context.lock();
         if (!ctx)
         {
@@ -524,6 +528,9 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
                 break;
             case Cas::GcRoundLogRecord::Outcome::Aborted:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::ABORTED;
+                break;
+            case Cas::GcRoundLogRecord::Outcome::Stopped:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::STOPPED;
                 break;
         }
         e.round = r.round;
@@ -898,8 +905,17 @@ void ContentAddressedMetadataStorage::startup()
 
 void ContentAddressedMetadataStorage::shutdown()
 {
-    /// Wait for any in-flight synchronous round to finish cleanly first (gc_scheduler_mutex is held
-    /// for a round's whole duration) -- unchanged priority: clean GC completion over fast shutdown.
+    /// Arm the pool BEFORE waiting for `gc_scheduler_mutex`: a synchronous round holds that mutex
+    /// for its whole duration and releases it only once its next request is refused. The arm frees,
+    /// nulls and swaps nothing -- every pointer swap still happens below, under the same locks as
+    /// before -- so taking `pointer_mutex` alone here, before the outer lock, inverts no order.
+    Cas::PoolPtr pool;
+    {
+        std::lock_guard ptr_lock(pointer_mutex);
+        pool = cas_store;
+    }
+    if (pool)
+        pool->beginTeardown();
     std::lock_guard round_lock(gc_scheduler_mutex);
     shutdown_called = true;
     stopAndDrainForTeardown();
@@ -947,6 +963,10 @@ void ContentAddressedMetadataStorage::stopAndDrainForTeardown() noexcept
         }
     };
 
+    /// The destructor reaches here without `shutdown`'s arm: arm now, before the join, so a
+    /// background round is refused at its next request rather than joined at its end.
+    if (old_pool)
+        old_pool->beginTeardown();
     guarded([&] { if (old_scheduler) old_scheduler->stop(); }, "CAS storage teardown: stopping GC");
     guarded([&] { old_part_access.reset(); }, "CAS storage teardown: releasing part access");
     guarded([&]

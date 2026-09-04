@@ -549,6 +549,15 @@ public:
     /// default; production installs none.
     void setGcVerbAdmitWindowHookForTest(std::function<void()> fn) { gc_verb_admit_window_hook_for_test = std::move(fn); }
 
+    /// Test-only: sees every round-log row the storage's own scheduler emits (Start, Phase, Finish),
+    /// before and independently of the system-log path -- which a unit-test storage (null `Context`)
+    /// does not have at all. Lets a test park a synchronous round on a phase row while it holds
+    /// `gc_scheduler_mutex`, and read the round's outcome afterwards. Set before the first round.
+    void setGcRoundRowHookForTest(std::function<void(const Cas::GcRoundLogRecord &)> fn)
+    {
+        gc_round_row_hook_for_test = std::move(fn);
+    }
+
     /// Test-only fault-injection/hook seam for `ContentAddressedTransaction::publishStaging`'s
     /// promote/repoint call, keyed by the full `(ns, ref)` routed identity via `PartRefKey::cacheKey()`
     /// (mirrors `CasRefLedger::setRefPreCarveHookForTest`'s no-op-in-production shape) -- a bare ref
@@ -661,9 +670,9 @@ private:
     /// `gcStop`/`gcStart`. Serializes them against each other. Lock order when nested locks are needed:
     /// `lifecycle_mutex` -> `gc_scheduler_mutex` -> `pointer_mutex`, never the reverse.
     mutable std::mutex lifecycle_mutex;
-    /// Serializes ONE synchronous GC round at a time and makes `shutdown` wait for an in-flight round
-    /// to finish cleanly (clean GC completion has priority over fast shutdown) -- held for the WHOLE
-    /// round. Deliberately NOT the same mutex as `pointer_mutex` below: this one can be held for a
+    /// Serializes ONE synchronous GC round at a time. `shutdown` still takes it, but arms the pool
+    /// first, so a round in flight is refused at its next request once the pool is armed and the wait
+    /// is one request long -- held for the WHOLE round. Deliberately NOT the same mutex as `pointer_mutex` below: this one can be held for a
     /// long time, so nothing that only needs a brief pointer snapshot may share it.
     mutable std::mutex gc_scheduler_mutex;
     bool shutdown_called TSA_GUARDED_BY(gc_scheduler_mutex) = false;
@@ -791,6 +800,7 @@ private:
     /// TOCTOU tests). Empty in production; a `const` GC verb reads it and calls the const-qualified
     /// `std::function::operator()`, so it needs no `mutable`.
     std::function<void()> gc_verb_admit_window_hook_for_test;
+    std::function<void(const Cas::GcRoundLogRecord &)> gc_round_row_hook_for_test;
 };
 
 }
