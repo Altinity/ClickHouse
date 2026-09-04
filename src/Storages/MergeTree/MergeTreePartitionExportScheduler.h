@@ -43,9 +43,8 @@ public:
 
     using DataPartPtr = MergeTreePartExportManifest::DataPartPtr;
 
-    /// Registers and persists a new task, then triggers the scheduler. Throws
-    /// EXPORT_PARTITION_ALREADY_EXPORTED if a task with the same (partition, destination) key
-    /// already exists and `force` is false; otherwise the previous task (and its file) is replaced.
+    /// Registers and persists a new task, then triggers the scheduler.
+    /// Throws if a task with the same (partition, destination) key already exists;
     void addTask(MergeTreePartitionExportTask descriptor, std::vector<DataPartPtr> part_references, bool force);
 
     CancellationCode kill(const String & transaction_id);
@@ -128,6 +127,9 @@ private:
     /// composite key so a force-replace naturally overwrites the previous record. Always invoked
     /// while holding the registry `mutex` (write-through), so writes are serialized by that lock.
     void persist(const String & composite_key, const String & descriptor_json);
+
+    /// Relative path of the descriptor file for `composite_key` (hash + `.json`).
+    String descriptorRelativePath(const String & composite_key) const;
 
     String getExportsRelativePath() const;
 };

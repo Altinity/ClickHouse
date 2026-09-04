@@ -68,6 +68,11 @@ String MergeTreePartitionExportScheduler::getExportsRelativePath() const
     return fs::path(storage.getRelativeDataPath()) / "partition_exports";
 }
 
+String MergeTreePartitionExportScheduler::descriptorRelativePath(const String & composite_key) const
+{
+    return fs::path(getExportsRelativePath()) / (sipHash128String(composite_key) + ".json");
+}
+
 std::map<String, MergeTreePartitionExportScheduler::TaskEntry>::iterator
 MergeTreePartitionExportScheduler::findByTransactionId(const String & transaction_id)
 {
@@ -99,6 +104,22 @@ void MergeTreePartitionExportScheduler::addTask(
                     key_description);
 
             previous_transaction_id = it->second.getDescriptor().transaction_id;
+        }
+        else
+        {
+            /// Unreadable entries are not loaded into memory, therefore we need to check the disk as well
+            const auto path = descriptorRelativePath(composite_key);
+            if (storage.getDisks().front()->existsFile(path))
+            {
+                if (!force)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "A partition export descriptor for key {} exists on disk at {} but could not be loaded. "
+                        "Inspect the file or set `export_merge_tree_partition_force_export` to overwrite it.",
+                        key_description, path);
+
+                LOG_WARNING(storage.log,
+                    "ExportPartition: overwriting unread descriptor at {} for key {}", path, key_description);
+            }
         }
 
         TaskEntry entry;
@@ -627,12 +648,10 @@ void MergeTreePartitionExportScheduler::persist(const String & composite_key, co
     /// recomputed from the JSON body in loadFromDisk, so the name only needs to be deterministic and
     /// collision-free -- sipHash128 (matching FileCacheKey) provides both.
     auto disk = storage.getDisks().front();
-    const auto directory = getExportsRelativePath();
-    disk->createDirectories(directory);
+    disk->createDirectories(getExportsRelativePath());
 
-    const auto file_name = sipHash128String(composite_key) + ".json";
-    const auto final_path = fs::path(directory) / file_name;
-    const auto tmp_path = fs::path(directory) / (file_name + ".tmp");
+    const auto final_path = descriptorRelativePath(composite_key);
+    const auto tmp_path = final_path + ".tmp";
 
     {
         auto out = disk->writeFile(tmp_path, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, storage.getContext()->getWriteSettings());
