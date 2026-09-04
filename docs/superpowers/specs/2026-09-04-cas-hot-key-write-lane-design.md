@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 23, 2026-09-04. Brainstormed against the measurements in
+Revision 24, 2026-09-04. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
 this document supersedes where they differ. The revision history at the end records twenty-one
@@ -80,10 +80,13 @@ Non-goals:
 
 - Making the remembered object a source of truth. It is a hint: a stale hint costs one 412 and one
   resolve read on the write path, and one read on the verdict path, never correctness.
-- Pacing the lane to a store's documented per-object write rate. A store that finds the pool too
-  fast answers 429, which is a transport fault and takes the growing schedule, and combining
-  already makes one `PUT` carry every mutation that arrived meanwhile. If the `gcs` lane's
-  acceptance shows 429s on the catalog, spacing is a BACKLOG item there.
+- Pacing the lane to a store's documented per-object write rate. This is the owner's decision,
+  recorded here after two reviews argued the other way: GCS documents about one mutation per
+  second per object and says excess writes may be throttled; a store that finds the pool too fast
+  answers 429, which is a transport fault and takes the growing schedule, and combining already
+  makes one `PUT` carry every mutation that arrived meanwhile. The `gcs` lane's acceptance run
+  measures 429s on the catalog; if they rise, spacing is a BACKLOG item there, designed against the
+  measurement rather than the documentation.
 - Bringing the GC erase into the lane in this change. It writes the same key today by racing the
   mount plane and keeps doing so; what it costs the lane and what bringing it in requires are in
   [the GC erase](#the-gc-erase).
@@ -148,7 +151,7 @@ public:
 
 private:
     struct Item;   /// one queued submission, see "The ticket"
-    struct Lane    /// one key; created on first use, lives as long as this object
+    struct Lane    /// one key; created on first use, lives as long as this object (one key today; erasure is a prerequisite for per-namespace keys)
     {
         std::deque<std::shared_ptr<Item>> queue;     /// guarded by `mutex`; the first item not `done` is the holder-to-be
         std::optional<uint64_t> holder_since_ms;     /// guarded by `mutex`; for the log line
@@ -211,7 +214,10 @@ entry condition for any other key.
    calls `liveness()` directly, and the `std::function` object being immutable says nothing about
    what it closes over. The catalog meets it: `resolveNamespaceLife` admits with no closure
    (`mount_requests.resume(admitted_generation)`), and the ledger's other mount-plane closures read
-   only atomics with acquire loads.
+   only atomics with acquire loads. And its answer is consulted, for a member, before the member's
+   `decide` and after the landing, not before every physical attempt of the batch's write, which the
+   leader's gate covers; a caller whose `Liveness` must be consulted before every attempt of its
+   own write does not write through the lane.
 
 For `_ckpt`, `gc/state` or any other key, conditions 3, 5 and 6 are the ones to audit before its
 first `submit`; `publishCkpt`'s declines, `Gc::refreshAuthority`'s private operation and
@@ -319,18 +325,35 @@ first item not `done`.
    result. Any exception, not a chosen class: a refusal, a decode failure on bytes another writer
    stored, an allocation failure inside the decode, all get the same one re-run on a fresh read,
    because a `decide` is re-runnable by contract, and the only thing a refusal on a hint proves is
-   that a hint is not a proof.
+   that a hint is not a proof. One exception to the re-run: if the validating read cannot be made
+   because the caller's own gate refuses it (its fence, `Liveness` or lease), the exception
+   rendered on the cache is delivered as rendered rather than replaced by the read's give-up. The
+   caller is refused either way; delivering its own `decide`'s verdict keeps a typed outcome typed
+   (a `CatalogFenceMovedMarker` thrown on the cache still becomes `FencedOut`, as today, instead of
+   a read's transient exception), and a base-dependent verdict delivered to a fenced-out caller
+   costs it nothing it would not have paid.
 3. **Combine.** A hold whose base was absence takes no members: it is the bootstrap `create` of a
    key nobody has written, it is never contended, and a chained `Object` needs an etag. Otherwise,
-   under `mutex`: walk the queue behind the leader and take every item that is not `done` and
-   whose `bound.deadline_ms` is not earlier than the leader's; stop at the first that is not. Copy
-   the taken `shared_ptr`s into a vector, set each item's `taken`, allocate the batch's
-   `BatchOutcome`, all in the same critical section; the mutex is a leaf that calls nothing. The
-   batch is what is queued at that walk; nothing arriving later joins it, and there is no other
-   cap. Release the mutex. For each taken item in order: first `fits(reservedFor(0, 2), leader's
-   bound)`, and if the leader's remaining window no longer covers a write, stop taking and go to
-   step 4 with what the chain has (untouched items stay in the queue, never `taken`). Then the
-   item's own fence, `Liveness` and lease budget through its own operation's
+   under `mutex`: walk the queue behind the leader and select every item that is not `done`, was
+   submitted on the same `CasRequests` as the leader, is not under a `single_attempt` policy, and
+   whose `bound.deadline_ms` is not earlier than the leader's; stop at the first that is not. Same
+   plane, because the engine gates every physical attempt of the batch's write on the leader's
+   operation alone: on one plane the leader's fence is the member's fence (the same atomics), a
+   re-arm between the two admissions is caught by whichever generation is older at its own gate,
+   and so the leader's per-attempt gate covers every member for the write's whole duration; a
+   leader on another plane would carry a member's bytes past a fence the member's own engine would
+   have refused. Not `single_attempt`, because `Retry::once` permits one attempt and the batch's
+   write may reissue an ambiguous one; such an item runs alone, as its own holder. Allocation
+   before taking, as the ledger's carve does: reserve the vector for the selected items and
+   allocate the batch's `BatchOutcome` first; if either throws, nothing is taken and the exception
+   is the leader's. Only then set each selected item's `taken`, all in the same critical section;
+   the mutex is a leaf that calls nothing. The batch is what is queued at that walk; nothing
+   arriving later joins it, and there is no other cap. Release the mutex. For each taken item in
+   order: first `fits(reservedFor(0, 2), leader's bound)`, and if the leader's remaining window no
+   longer covers a write, stop the chain and go to step 4 with what it has; every taken item the
+   chain did not reach is settled, in its own `result`, as `Conflict{NotObserved}` (nothing of
+   theirs applied, they submit again), since a taken item may not leave and must be settled by
+   its leader. Then the item's own fence, `Liveness` and lease budget through its own operation's
    `gate(reservedFor(0, 2))`, the reservation its own write would make; `FenceLost` or `NoBudget`:
    write the `GaveUp` the engine would have returned, `sent_any = false`, into that item's own
    `result` now, and skip its `decide`. Otherwise `decide(Object{bytes = candidate, etag = base
@@ -382,10 +405,13 @@ first item not `done`.
      throws before any attempt, `valueFor`'s `LOGICAL_ERROR` for a token of another key or backend,
      is unreachable from the lane, whose base etag is its own read's or its cache's for this key on
      this pool's backend. The cache entry is dropped.
-   The leader writes the `BatchOutcome` and each taken item's `result` on its own thread, updates
-   the cache (outside `mutex`; `CacheBase` is its own leaf), then under `mutex` assigns the shared
-   pointer to every taken item, sets `done`, and does `cv.notify_all()`: no allocation and no copy
-   under the mutex. A member copies `seen` out of the shared outcome on its own thread.
+   The leader writes the `BatchOutcome` and each taken item's `result` on its own thread, then
+   updates the cache (outside `mutex`; `CacheBase` is its own leaf) inside a catch-all: `set`
+   allocates and may throw, and a failed hint fill after a proven `Committed` must not become the
+   leader's result, so the failure is logged, the entry is dropped, and the results already written
+   stand. Then under `mutex` it assigns the shared pointer to every taken item, sets `done`, and
+   does `cv.notify_all()`: no allocation and no copy under the mutex. A member copies `seen` out of
+   the shared outcome on its own thread.
 
 **Why this is the same as writing one at a time, for the lane's key.** Serial execution would apply
 mutation 1, land it, apply mutation 2 to what landed, land it. The batch applies mutation 2 to what
@@ -571,7 +597,7 @@ contract prescribes for such loops:
 
 ```cpp
 const Retry policy = op.freeze(Retry::standard());
-for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
+for (;;)
 {
     WriteResult result = op.hotKeys().submit(key, op, policy, decide);
     if (std::holds_alternative<Conflict>(result))
@@ -583,13 +609,16 @@ for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
     ...
     return std::move(*written);
 }
-throwCasWriteRetryLater(...);   /// the secondary bound, as the erase's loop has it
 ```
 
 The loop ends at the frozen deadline with today's retry-later, through the same `GaveUp{Deadline}`
-`submit` returns when the wait or the write runs out of window, and carries the file's existing
-`kMaxCatalogCasAttempts` as the secondary bound every hand-written catalog loop has. `casUpdate`, `casAdmitEntry` and the
-five lifecycle functions do not change: their `mutate`s, markers and outcomes are the same.
+`submit` returns when the wait or the write runs out of window, and has no attempt cap: today's
+`readModifyWrite` has none either, and a cap of `kMaxCatalogCasAttempts` (100) at a flat mean pause
+of 100 ms would end a writer after about ten seconds of cross-pool conflicts, well inside the
+window this change exists to make fair. The bare `op.pause` can overshoot the deadline by at most
+one pause, 200 ms, as the erase's loop already overshoots by one of its own; accepted. `casUpdate`,
+`casAdmitEntry` and the five lifecycle functions do not change: their `mutate`s, markers and
+outcomes are the same.
 `casAdmitEntry`'s duplicate-row `LOGICAL_ERROR`, thrown from the grammar check on a cached base, is
 re-rendered on a read like every other exception and is the same `LOGICAL_ERROR` on a read that
 shows the row; both functions are called only from tests. This is the first change in
@@ -761,7 +790,14 @@ tickets from `bytes` and appends its own, so order and membership are visible in
    member's deadline past its bound; both stay parked (`queueDepthForTest` unchanged), the leader
    skips the first's `decide` and runs the second's, and each returns only after `done` (INV-HK5).
    Under ASan the same test with the `taken` check removed is the use-after-free the check exists
-   to prevent.
+   to prevent. Siblings: a `Retry::once` submission behind a standard leader is not taken and runs
+   as its own holder with exactly one attempt; a submission from a second `CasRequests` of the same
+   pool is not taken by a leader of the first and waits its turn; a hook fails the `BatchOutcome`
+   allocation at the take and asserts nothing was taken and the leader received the exception; a
+   hook slows the first member's `decide` past the leader's remaining window and asserts the second
+   member, taken but never reached, receives `Conflict{NotObserved}` and lands in the next batch; a
+   hook makes `CacheBase::set` throw after a landed `PUT` and asserts the leader still receives
+   `Committed` and the next submission reads.
 5. Refusal on the cache, at the catalog level in `gtest_cas_ref_catalog.cpp`. The pool lands once.
    An external `CasRequests` changes a row. A caller reads fresh outside the lane and runs the real
    `beginRemoving` through a `CasRequests` with a cache: `Transitioned`, not `EntryChanged`, one
@@ -780,7 +816,9 @@ tickets from `bytes` and appends its own, so order and membership are visible in
    turn: `createNamespace` returns `FencedOut`, nothing was written, `resolveNamespaceLife` reports
    retry-later. Tripped between its landed step-1 `PUT` and the post-commit check: `FencedOut`
    again, with the `Creating` row durable for a later reconciler. `casAdmitEntry` under a tripped
-   fence throws `throwCasTransientUnavailable`'s class, never a bare marker.
+   fence throws `throwCasTransientUnavailable`'s class, never a bare marker. Tripped between a
+   cached-base `decide` that threw `CatalogFenceMovedMarker` and the validating read: the marker is
+   delivered, `beginRemoving` returns `FencedOut`, and no read was made.
 7. External writer. A second `CasRequests` writes between two submissions of the first. Assert
    exactly one resolve read and one retry write, `Committed`, the landed body is the external
    writer's bytes plus this call's ticket, and the submission after that starts from the cache. A
@@ -910,3 +948,19 @@ accessed outside the lane's mutex, is constructed "LRU" with two metrics; `frien
 `CasOperation` and its single-threaded sentence is amended; the clamp reports
 `Source::Policy`; the read-side change is stated; the `_ckpt` gate is twice its prediction; a
 stopped task is reported as `FenceLost`; INV-HK1 is test 11's.
+
+Revision 24 folds in a `codex` review of revision 23, the first since the account's spend cap
+lifted. Its critical was real and had been lost in the revision-21 rewrite: the engine gates every
+physical attempt of the batch's write on the leader's operation alone, so a leader on another
+plane could carry a member's bytes past a fence the member's own engine would refuse; a batch is
+again confined to one `CasRequests`, with the argument why the leader's gate then covers every
+member. Also lost in that rewrite and restored: a `single_attempt` submission is never combined.
+New and fixed: allocation before taking, so a failed allocation takes nothing; a taken item the
+chain never reaches is settled `Conflict{NotObserved}`; a cache fill that throws after a landed
+`PUT` is logged and dropped, never the leader's result; the attempt cap the sixth `opus` round had
+suggested for the catalog's loop is removed, since at a flat 100 ms mean it would end a writer in
+about ten seconds and today's `readModifyWrite` has none; a cached-base exception whose validating
+read the caller's own gate refuses is delivered as rendered, so `FencedOut` stays typed. Recorded
+as decisions rather than fixes: no pacing to GCS's documented rate (the owner's), and the bare
+conflict pause's overshoot of at most 200 ms. Lanes live as long as the object; erasure is a
+prerequisite for per-namespace keys.
