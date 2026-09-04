@@ -329,6 +329,289 @@ def test_wrong_cluster(started_cluster):
     assert "not found" in error
 
 
+def test_object_storage_cluster_fallback_to_local_if_empty(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+
+    pure_s3 = node.query(
+        f"""
+    SELECT count(*) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')"""
+    )
+
+    fallback_s3 = node.query(
+        f"""
+    SELECT count(*) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+    SETTINGS object_storage_cluster = 'non_existing_cluster', object_storage_cluster_fallback_to_local_if_empty = 1
+    """
+    )
+
+    assert TSV(pure_s3) == TSV(fallback_s3)
+
+    pure_sum = node.query(
+        f"""
+    SELECT sum(value) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')"""
+    )
+
+    fallback_sum = node.query(
+        f"""
+    SELECT sum(value) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+    SETTINGS object_storage_cluster = 'non_existing_cluster', object_storage_cluster_fallback_to_local_if_empty = 1
+    """
+    )
+
+    assert TSV(pure_sum) == TSV(fallback_sum)
+
+    # Asymmetric OSC: cluster name exists only on the remote initiator nodes (hidden_clusters.xml).
+    # Initiator must send plain s3() with object_storage_cluster as a query setting (not s3Cluster),
+    # so the remote can resolve the swarm even though the local node does not know that cluster.
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='hidden_cluster_with_username_and_password',
+            object_storage_remote_initiator_cluster='cluster_with_dots',
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """,
+        query_id=query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
+
+    pure_count = node.query(
+        f"""
+    SELECT count(*) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')"""
+    )
+
+    query_id = uuid.uuid4().hex
+    remote_initiator_count = node.query(
+        f"""
+    SELECT count(*) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+    SETTINGS
+        object_storage_remote_initiator=1,
+        object_storage_cluster='non_existing_cluster',
+        object_storage_remote_initiator_cluster='cluster_with_dots_and_user',
+        object_storage_cluster_fallback_to_local_if_empty=1
+    """,
+        query_id=query_id,
+    )
+
+    assert TSV(pure_count) == TSV(remote_initiator_count)
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator.
+    # object_storage_cluster is not exist on remote initiator, so it will not be able to run subqueries on replicas.
+    assert queries == ["2"]
+
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='non_existing_cluster',
+            object_storage_remote_initiator_cluster='cluster_with_dots',
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """,
+        query_id=query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator.
+    assert queries == ["2"]
+
+    # Without fallback, unknown OSC + RI-cluster still errors on remote (table function).
+    error = node.query_and_get_error(
+        f"""
+        SELECT count(*) from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+            'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='non_existing_cluster',
+            object_storage_remote_initiator_cluster='cluster_with_dots'
+        """
+    )
+    assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
+
+    # A missing remote-initiator cluster must not be masked by local OSC fallback.
+    error = node.query_and_get_error(
+        f"""
+        SELECT count(*) from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+            'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='cluster_remote',
+            object_storage_remote_initiator_cluster='non_existing_remote_initiator_cluster',
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
+
+    # Empty OSC + RI without RI-cluster must keep BAD_ARGUMENTS even with fallback enabled.
+    error = node.query_and_get_error(
+        f"""
+        SELECT count(*) from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+            'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert "BAD_ARGUMENTS" in error or "object_storage_remote_initiator" in error
+
+    # Case 1 for ENGINE: unknown OSC in table SETTINGS + fallback -> local.
+    node.query("DROP TABLE IF EXISTS engine_osc_fallback")
+    node.query(
+        f"""
+        CREATE TABLE engine_osc_fallback
+            (name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64))))
+            ENGINE=S3('http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV')
+            SETTINGS object_storage_cluster='non_existing_cluster'
+        """
+    )
+    error = node.query_and_get_error("SELECT count(*) FROM engine_osc_fallback")
+    assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
+
+    engine_fallback_count = node.query(
+        """
+        SELECT count(*) FROM engine_osc_fallback
+        SETTINGS object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert TSV(pure_count) == TSV(engine_fallback_count)
+
+    # Case 2 for ENGINE: unknown OSC + RI without RI-cluster + fallback -> local.
+    engine_case2_count = node.query(
+        """
+        SELECT count(*) FROM engine_osc_fallback
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert TSV(pure_count) == TSV(engine_case2_count)
+
+    # ENGINE empty OSC + RI without RI-cluster + fallback must keep BAD_ARGUMENTS.
+    node.query("DROP TABLE IF EXISTS engine_no_osc_ri")
+    node.query(
+        f"""
+        CREATE TABLE engine_no_osc_ri
+            (name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64))))
+            ENGINE=S3('http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV')
+        """
+    )
+    error = node.query_and_get_error(
+        """
+        SELECT count(*) FROM engine_no_osc_ri
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert "BAD_ARGUMENTS" in error or "object_storage_remote_initiator" in error
+    node.query("DROP TABLE IF EXISTS engine_no_osc_ri")
+
+    # Case 3-like for ENGINE: unknown OSC + RI-cluster + fallback -> pure send, remote local.
+    query_id = uuid.uuid4().hex
+    engine_case3_count = node.query(
+        """
+        SELECT count(*) FROM engine_osc_fallback
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_remote_initiator_cluster='cluster_with_dots',
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """,
+        query_id=query_id,
+    )
+    assert TSV(pure_count) == TSV(engine_case3_count)
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+    # initial node + remote initiator (remote cannot distribute: OSC unknown, fallback local)
+    assert queries == ["2"]
+
+    # Without fallback, ENGINE unknown OSC + RI-cluster still errors on remote.
+    error = node.query_and_get_error(
+        """
+        SELECT count(*) FROM engine_osc_fallback
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_remote_initiator_cluster='cluster_with_dots'
+        """
+    )
+    assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
+
+    node.query("DROP TABLE IF EXISTS engine_osc_fallback")
+
+
 def test_ambiguous_join(started_cluster):
     node = started_cluster.instances["s0_0_0"]
     result = node.query(
@@ -1024,6 +1307,72 @@ def test_object_storage_remote_initiator(started_cluster):
                      "s0_1_0\tfoo"]
 
 
+def test_object_storage_remote_initiator_with_object_storage_cluster_only(started_cluster):
+    """Alternative syntax with object_storage_cluster + remote_initiator, without remote_initiator_cluster.
+
+    Must default the initiator cluster to object_storage_cluster and send a clustered request,
+    not throw BAD_ARGUMENTS or fall back to a local read.
+    """
+    node = started_cluster.instances["s0_0_0"]
+
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='cluster_remote'
+        """,
+        query_id=query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
+
+    # Same config must not fall back locally when fallback setting is enabled.
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='cluster_remote',
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """,
+        query_id=query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    assert queries == ["4"]
+
+
 def test_remote_hedged(started_cluster):
     node = started_cluster.instances["s0_0_0"]
     pure_s3 = node.query(
@@ -1524,6 +1873,44 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
     # Random host from 'cluster_with_dots' for remote query
     assert users[0] in ["c2.s0_0_0\tdefault", "c2.s0_0_1\tdefault"]
     assert users[1:] == ["s0_0_0\tdefault"]
+
+    # ENGINE table without object_storage_cluster must also take the pure remote path.
+    node.query("DROP TABLE IF EXISTS engine_remote_initiator_no_cluster")
+    node.query(
+        f"""
+        CREATE TABLE engine_remote_initiator_no_cluster
+            (name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64))))
+            ENGINE=S3('http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV')
+        """
+    )
+
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        """
+        SELECT * FROM engine_remote_initiator_no_cluster ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_remote_initiator_cluster='cluster_with_dots'
+        """,
+        query_id=query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator
+    assert queries == ["2"]
+
+    node.query("DROP TABLE IF EXISTS engine_remote_initiator_no_cluster")
 
     # Remove initiator without cluster request
     # but with `object_storage_cluster` specified for user on remote cluster

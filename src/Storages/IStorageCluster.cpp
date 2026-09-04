@@ -63,7 +63,9 @@ namespace Setting
     extern const SettingsUInt64 object_storage_max_nodes;
     extern const SettingsBool object_storage_remote_initiator;
     extern const SettingsString object_storage_remote_initiator_cluster;
+    extern const SettingsString object_storage_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
+    extern const SettingsBool object_storage_cluster_fallback_to_local_if_empty;
 }
 
 namespace ErrorCodes
@@ -352,6 +354,124 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
 }
 
+bool IStorageCluster::shouldFallbackToLocalOnEmptyCluster(ContextPtr context) const
+{
+    return context->getSettingsRef()[Setting::object_storage_cluster_fallback_to_local_if_empty]
+        && usesObjectStorageClusterSettingSyntax()
+        && !getClusterName(context).empty();
+}
+
+bool IStorageCluster::shouldReadLocallyOnFallbackToPure(const ResolvedClusterRead & resolved, ContextPtr context) const
+{
+    if (!resolved.fallback_to_pure)
+        return false;
+
+    if (!context->getSettingsRef()[Setting::object_storage_remote_initiator])
+        return true;
+
+    if (resolved.remote_initiator_cluster)
+        return false;
+
+    if (resolved.local_fallback)
+        return true;
+
+    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+        "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
+}
+
+IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(ContextPtr context) const
+{
+    /// Decision matrix for object_storage_cluster_fallback_to_local_if_empty / remote initiator:
+    /// - s3()/iceberg() (or ENGINE ... SETTINGS object_storage_cluster) + empty/unknown cluster + setting
+    ///   -> read locally (fallback_to_pure).
+    /// - s3Cluster(...)/explicit *Cluster argument -> never fall back locally.
+    /// - object_storage_remote_initiator=1 with object_storage_remote_initiator_cluster set
+    ///   -> defer object_storage_cluster resolution on the initiator. For setting-syntax / ENGINE,
+    ///     always send plain s3()/iceberg() to the remote initiator with object_storage_cluster as a
+    ///     query SETTINGS value (not *Cluster). OSC may be unknown locally and defined only on the
+    ///     remote (or the reverse); *Cluster would bake the name into the function argument and
+    ///     would also ignore object_storage_cluster_fallback_to_local_if_empty on the remote.
+    ///     Empty local OSC is omitted so the remote can supply its own.
+    /// - object_storage_remote_initiator=1 with only object_storage_cluster (no remote_initiator_cluster)
+    ///   -> clustered remote path: default initiator cluster to object_storage_cluster, send *Cluster.
+    /// - writes -> never apply local fallback (see write()).
+    ResolvedClusterRead result;
+
+    if (!isClusterSupported())
+    {
+        result.fallback_to_pure = true;
+        return result;
+    }
+
+    auto cluster_name_from_settings = getClusterName(context);
+    const auto & settings = context->getSettingsRef();
+    result.local_fallback = shouldFallbackToLocalOnEmptyCluster(context);
+
+    /// Defer OSC resolution when a separate remote-initiator cluster is set: the initiator must not
+    /// require a locally known object_storage_cluster (it may exist only on the remote node).
+    const bool defer_object_storage_cluster_resolution
+        = settings[Setting::object_storage_remote_initiator]
+        && !settings[Setting::object_storage_remote_initiator_cluster].value.empty();
+
+    /// Under deferral, setting-syntax / ENGINE always take the pure remote path (plain s3() + query SETTINGS).
+    result.fallback_to_pure = cluster_name_from_settings.empty()
+        || (defer_object_storage_cluster_resolution && usesObjectStorageClusterSettingSyntax());
+
+    const bool try_resolve_with_local_fallback
+        = !defer_object_storage_cluster_resolution
+        && !result.fallback_to_pure
+        && result.local_fallback;
+
+    if (try_resolve_with_local_fallback)
+    {
+        result.object_storage_cluster = getClusterImpl(
+            context,
+            cluster_name_from_settings,
+            isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0,
+            /*allow_null*/ true);
+        if (!result.object_storage_cluster)
+            result.fallback_to_pure = true;
+    }
+
+    if (settings[Setting::object_storage_remote_initiator])
+    {
+        auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
+        if (!remote_initiator_cluster_name.empty())
+        {
+            /// Never soft-fail a missing/empty remote-initiator cluster via
+            /// object_storage_cluster_fallback_to_local_if_empty: that setting applies only to object_storage_cluster.
+            result.remote_initiator_cluster = getClusterImpl(
+                context,
+                remote_initiator_cluster_name,
+                /*max_hosts*/ 0);
+        }
+    }
+
+    return result;
+}
+
+void IStorageCluster::readFromRemoteInitiator(
+    QueryPlan & query_plan,
+    const Names & column_names,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info,
+    ContextPtr context,
+    QueryProcessingStage::Enum processed_stage,
+    size_t max_block_size,
+    size_t num_streams,
+    ASTPtr query_to_send,
+    ClusterPtr remote_initiator_cluster,
+    const String & remote_initiator_cluster_name)
+{
+    auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
+    auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
+    auto modified_query_info = query_info;
+    modified_query_info.cluster = src_distributed->getCluster();
+    auto new_storage_snapshot = storage_and_context.storage->getStorageSnapshot(storage_snapshot->metadata, storage_and_context.context);
+    storage_and_context.storage->read(
+        query_plan, column_names, new_storage_snapshot, modified_query_info, storage_and_context.context, processed_stage, max_block_size, num_streams);
+}
+
 /// The code executes on initiator
 void IStorageCluster::read(
     QueryPlan & query_plan,
@@ -373,32 +493,48 @@ void IStorageCluster::read(
     const auto & settings = context->getSettingsRef();
     ASTPtr query_to_send = query_info.query;
 
-    if (cluster_name_from_settings.empty())
+    auto resolved = resolveClusterRead(context);
+    ClusterPtr cluster = resolved.object_storage_cluster;
+
+    if (resolved.fallback_to_pure)
     {
-        if (settings[Setting::object_storage_remote_initiator])
+        if (shouldReadLocallyOnFallbackToPure(resolved, context))
         {
-            auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
-            if (remote_initiator_cluster_name.empty())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
-
-            /// rewrite query to execute `remote('remote_host', s3(...))`
-            /// remote_host can execute query itself or make on-cluster query depends on own `object_storage_cluster` setting
-            updateConfigurationIfNeeded(context);
-            updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
-            updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
-
-            auto remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
-            auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
-            auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
-            auto modified_query_info = query_info;
-            modified_query_info.cluster = src_distributed->getCluster();
-            auto new_storage_snapshot = storage_and_context.storage->getStorageSnapshot(storage_snapshot->metadata, storage_and_context.context);
-            storage_and_context.storage->read(query_plan, column_names, new_storage_snapshot, modified_query_info, storage_and_context.context, processed_stage, max_block_size, num_streams);
+            readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
             return;
         }
 
-        readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
+        auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
+
+        /// Send remote('host', s3(...)) with object_storage_cluster in query SETTINGS (not s3Cluster).
+        /// The remote may resolve OSC, fall back locally, or use its own OSC when local OSC is empty.
+        updateConfigurationIfNeeded(context);
+        updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
+        updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
+
+        /// ENGINE tables keep object_storage_cluster on the storage, not in the initiator query context.
+        /// Propagate it into the context copied for remote() so the remote sees the same OSC as alt-syntax.
+        auto context_for_remote = context;
+        if (!cluster_name_from_settings.empty()
+            && context->getSettingsRef()[Setting::object_storage_cluster].value.empty())
+        {
+            auto ctx = Context::createCopy(context);
+            ctx->setSetting("object_storage_cluster", cluster_name_from_settings);
+            context_for_remote = ctx;
+        }
+
+        readFromRemoteInitiator(
+            query_plan,
+            column_names,
+            storage_snapshot,
+            query_info,
+            context_for_remote,
+            processed_stage,
+            max_block_size,
+            num_streams,
+            query_to_send,
+            resolved.remote_initiator_cluster,
+            remote_initiator_cluster_name);
         return;
     }
 
@@ -438,17 +574,28 @@ void IStorageCluster::read(
         auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
         if (remote_initiator_cluster_name.empty())
             remote_initiator_cluster_name = cluster_name_from_settings;
-        auto remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
-        auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
-        auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
-        auto modified_query_info = query_info;
-        modified_query_info.cluster = src_distributed->getCluster();
-        auto new_storage_snapshot = storage_and_context.storage->getStorageSnapshot(storage_snapshot->metadata, storage_and_context.context);
-        storage_and_context.storage->read(query_plan, column_names, new_storage_snapshot, modified_query_info, storage_and_context.context, processed_stage, max_block_size, num_streams);
+        /// Prefer the cluster already resolved in resolveClusterRead (when remote_initiator_cluster was set).
+        ClusterPtr remote_initiator_cluster = resolved.remote_initiator_cluster;
+        if (!remote_initiator_cluster)
+            remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
+
+        readFromRemoteInitiator(
+            query_plan,
+            column_names,
+            storage_snapshot,
+            query_info,
+            context,
+            processed_stage,
+            max_block_size,
+            num_streams,
+            query_to_send,
+            remote_initiator_cluster,
+            remote_initiator_cluster_name);
         return;
     }
 
-    auto cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
+    if (!cluster)
+        cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
 
     RestoreQualifiedNamesVisitor::Data data;
     data.distributed_table = DatabaseAndTableWithAlias(*getTableExpression(query_to_send->as<ASTSelectQuery &>(), 0));
@@ -575,6 +722,8 @@ SinkToStoragePtr IStorageCluster::write(
 {
     auto cluster_name_from_settings = getClusterName(context);
 
+    // Intentionally do not apply object_storage_cluster_fallback_to_local_if_empty here.
+    // Cluster write is not supported; applying fallback would make INSERT depend on cluster availability.
     if (cluster_name_from_settings.empty())
         return writeFallBackToPure(query, metadata_snapshot, context, async_insert);
 
@@ -743,9 +892,18 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     return new_context;
 }
 
-ClusterPtr IStorageCluster::getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts)
+ClusterPtr IStorageCluster::getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts, bool allow_null)
 {
-    return context->getCluster(cluster_name_)->getClusterWithReplicasAsShards(context->getSettingsRef(), /* max_replicas_from_shard */ 0, max_hosts);
+    ClusterPtr cluster = nullptr;
+    if (allow_null)
+    {
+        cluster = context->tryGetCluster(cluster_name_);
+        if (!cluster || !cluster->getAllNodeCount())
+            return nullptr;
+    }
+    else
+        cluster = context->getCluster(cluster_name_);
+    return cluster->getClusterWithReplicasAsShards(context->getSettingsRef(), /* max_replicas_from_shard */ 0, max_hosts);
 }
 
 }

@@ -923,6 +923,14 @@ Cluster::Cluster(Cluster::SubclusterTag, const Cluster & from, const std::vector
     initMisc();
 }
 
+size_t Cluster::getAllNodeCount() const
+{
+    size_t count = 0;
+    for (const auto & shard : shards_info)
+        count += shard.getAllNodeCount();
+    return count;
+}
+
 std::vector<Strings> Cluster::getHostIDs() const
 {
     std::vector<Strings> host_ids;

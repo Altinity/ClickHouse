@@ -8325,6 +8325,12 @@ Trigger processor to spill data into external storage adpatively. grace join is 
     DECLARE(String, object_storage_cluster, "", R"(
 Cluster to make distributed requests to object storages with alternative syntax.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, object_storage_cluster_fallback_to_local_if_empty, false, R"(
+Execute the read locally if 'object_storage_cluster' is set but the cluster is empty or unknown.
+Does not apply to explicit *Cluster table functions, to 'object_storage_remote_initiator_cluster', or to writes.
+With remote initiator + remote_initiator_cluster, the initiator sends plain s3()/iceberg() and passes
+object_storage_cluster as a query setting so the remote can resolve or fall back (OSC may be unknown locally).
+)", EXPERIMENTAL) \
     DECLARE(UInt64, object_storage_max_nodes, 0, R"(
 Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
 Possible values:

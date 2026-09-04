@@ -117,7 +117,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
     , configuration{configuration_}
     , object_storage(object_storage_)
-    , cluster_name_in_settings(false)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
 
@@ -398,19 +397,23 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
     table_expression->table_function = function_ast_ptr;
     table_expression->children[0] = function_ast_ptr;
 
-    if (!make_cluster_function)
-        return false;
-
     auto cluster_name = getClusterName(context);
 
     if (cluster_name.empty())
     {
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Can't be here without cluster name, no cluster name in query {}",
-            query->formatForLogging());
+        /// Pure remote path without a local object_storage_cluster (remote may define it).
+        if (make_cluster_function)
+        {
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Can't be here without cluster name, no cluster name in query {}",
+                query->formatForLogging());
+        }
+        return false;
     }
 
+    /// Inject OSC into SELECT SETTINGS (query setting, not a table-function argument).
+    /// On the pure remote-initiator path this preserves ENGINE OSC so the remote can distribute or fall back.
     auto settings = select_query->settings();
     if (settings)
     {
@@ -434,7 +437,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     const ContextPtr & context,
     bool make_cluster_function)
 {
-    bool cluster_name_added_to_settings = updateQueryForDistributedEngineIfNeeded(query, context, make_cluster_function);
+    updateQueryForDistributedEngineIfNeeded(query, context, make_cluster_function);
 
     auto * table_function = extractTableFunctionFromSelectQuery(query);
     if (!table_function)
@@ -459,7 +462,8 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     }
 
     ASTPtr object_storage_type_arg;
-    configuration->extractDynamicStorageType(args, context, &object_storage_type_arg, !cluster_name_in_settings && !cluster_name_added_to_settings);
+    configuration->extractDynamicStorageType(
+        args, context, &object_storage_type_arg, cluster_name_from_function_argument);
 
     ASTPtr settings_temporary_storage = nullptr;
     for (auto it = args.begin(); it != args.end(); ++it)
@@ -473,14 +477,16 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
         }
     }
 
-    if (cluster_name_in_settings || cluster_name_added_to_settings || !endsWith(table_function->name, "Cluster"))
+    if (!cluster_name_from_function_argument || !endsWith(table_function->name, "Cluster"))
     {
         configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->getFormat(), context, /*with_structure=*/true);
 
         if (make_cluster_function)
         {
-            /// Convert to old-stype *Cluster table function.
-            /// This allows to use old clickhouse versions in cluster.
+            /// Convert to *Cluster for the non-deferred clustered path (initiator belongs to the
+            /// object-storage cluster). Not used under remote_initiator_cluster deferral, which must
+            /// keep plain s3()/iceberg() with object_storage_cluster as a query setting.
+            /// *Cluster also helps older ClickHouse versions that lack the object_storage_cluster setting.
             static std::unordered_map<std::string, std::string> function_to_cluster_function = {
                 {"s3", "s3Cluster"},
                 {"azureBlobStorage", "azureBlobStorageCluster"},
@@ -724,17 +730,21 @@ SinkToStoragePtr StorageObjectStorageCluster::writeFallBackToPure(
 String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
 {
     /// StorageObjectStorageCluster is always created for cluster or non-cluster variants.
-    /// User can specify cluster name in table definition or in setting `object_storage_cluster`
-    /// only for several queries. When it specified in both places, priority is given to the query setting.
-    /// When it is empty, non-cluster realization is used.
+    /// User can specify cluster name in table definition, in *Cluster table function argument,
+    /// or in setting `object_storage_cluster` for s3()/iceberg() alternative syntax.
+    /// Explicit *Cluster argument has priority over query setting; table engine and alternative-syntax use the setting path.
 
     if (!isClusterSupported())
         return "";
 
+    if (cluster_name_from_function_argument)
+        return getOriginalClusterName();
+
     auto cluster_name_from_settings = context->getSettingsRef()[Setting::object_storage_cluster].value;
-    if (cluster_name_from_settings.empty())
-        cluster_name_from_settings = getOriginalClusterName();
-    return cluster_name_from_settings;
+    if (!cluster_name_from_settings.empty())
+        return cluster_name_from_settings;
+
+    return getOriginalClusterName();
 }
 
 QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
@@ -743,18 +753,10 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     if (!isClusterSupported())
         return QueryProcessingStage::Enum::FetchColumns;
 
-    /// Full query if fall back to pure storage.
-    if (getClusterName(context).empty()  // Not cluster request
-        && context->getSettingsRef()[Setting::object_storage_remote_initiator_cluster].value.empty()) // Not request with remote initiator
-    {
-        if (context->getSettingsRef()[Setting::object_storage_remote_initiator])
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
-
+    auto resolved = resolveClusterRead(context);
+    if (shouldReadLocallyOnFallbackToPure(resolved, context))
         return QueryProcessingStage::Enum::FetchColumns;
-    }
 
-    /// Distributed storage.
     return IStorageCluster::getQueryProcessingStage(context, to_stage, storage_snapshot, query_info);
 }
 
