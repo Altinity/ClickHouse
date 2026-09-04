@@ -936,10 +936,6 @@ void IcebergMetadata::createInitial(
 
     if (catalog)
     {
-        /// The namespace default location must be the namespace base, not this table's directory, or
-        /// later tables created in the same namespace without an explicit location would land under it.
-        /// The engine clause names an arbitrary path, so the base is only derivable when that path ends
-        /// with `<namespace>/<table>`; otherwise there is no base to offer and the location stays empty.
         String namespace_location = location_path;
         while (namespace_location.ends_with('/'))
             namespace_location.pop_back();
