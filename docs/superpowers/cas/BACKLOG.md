@@ -123,7 +123,7 @@ disk (S3 operations and CAS conflicts per dropped table) as the first measuremen
 + conditional PUTs); third = skip `StackTrace` capture for expected 412s.
 
 Design for the first target: `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
-(revision 16, 2026-09-04), which supersedes the fix sketch below where they differ.
+(revision 17, 2026-09-04), which supersedes the fix sketch below where they differ.
 
 ### `[ref-catalog-cas-starvation-under-parallel-writers]` One process's CREATE/DROP writers starve each other on the ref-catalog compare-and-swap (2026-09-04) {#ref-catalog-cas-starvation}
 
@@ -175,7 +175,7 @@ Fix, two halves, in this order:
    winning (red today). Update the spec sentences at "Conflicts spend the same budget as errors".
 
 Superseded by the design `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
-(revision 16, 2026-09-04, after fourteen codex review rounds): the door lives in the request engine
+(revision 17, 2026-09-04, after fourteen codex review rounds and one opus round): the door lives in the request engine
 as one per-key FIFO per pool shared by its three planes, the queued `readModifyWrite`s are combined
 into one `PUT` with as-if-serial semantics (every member gets `Conflict` if the batch does not land),
 a `readModifyWrite` starts from the last committed candidate, a refusal is reported only from a
