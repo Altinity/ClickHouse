@@ -1,6 +1,7 @@
 #include <Columns/ColumnConst.h>
 #include <Columns/IColumn.h>
 #include <Core/Block.h>
+#include <Core/Joins.h>
 #include <Common/assert_cast.h>
 
 #include <Common/logger_useful.h>
@@ -495,15 +496,24 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
     const auto & left_stream_input_header = child->getInputHeaders().front();
     const auto & right_stream_input_header = child->getInputHeaders().back();
 
-    if (table_join_ptr && table_join_ptr->kind() == JoinKind::Full)
-        return 0;
-    if (logical_join && logical_join->getJoinOperator().kind == JoinKind::Full)
-        return 0;
+    JoinKind kind = JoinKind::Inner;
+    JoinStrictness strictness = JoinStrictness::Unspecified;
+    const bool have_join_kind = table_join_ptr || logical_join;
+    if (table_join_ptr)
+    {
+        kind = table_join_ptr->kind();
+        strictness = table_join_ptr->strictness();
+    }
+    else if (logical_join)
+    {
+        kind = logical_join->getJoinOperator().kind;
+        strictness = logical_join->getJoinOperator().strictness;
+    }
 
-    /// PASTE JOIN aligns rows from both sides by position, and pushing filters
-    /// to either side may change relative alignment
-    if ((table_join_ptr && table_join_ptr->kind() == JoinKind::Paste)
-        || (logical_join && logical_join->getJoinOperator().kind == JoinKind::Paste))
+    /// `FULL` / `PASTE` cannot prefilter either side (`canPrefilterJoinSide`).
+    if (have_join_kind
+        && !canPrefilterJoinSide(kind, strictness, JoinTableSide::Left)
+        && !canPrefilterJoinSide(kind, strictness, JoinTableSide::Right))
         return 0;
 
     std::unordered_map<std::string, ColumnWithTypeAndName> equivalent_left_stream_column_to_right_stream_column;
@@ -560,6 +570,10 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
         equivalent_expressions.append_range(std::move(extra_equivalent_expressions));
     }
 
+    NameSet filter_input_names;
+    for (const auto * input_node : filter->getExpression().getInputs())
+        filter_input_names.emplace(input_node->result_name);
+
     auto get_available_columns_for_filter = [&](bool push_to_left_stream, bool filter_push_down_input_columns_available, bool require_stable_types = false)
     {
         Names available_input_columns_for_filter;
@@ -568,11 +582,24 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
             return available_input_columns_for_filter;
 
         const auto & input_header = push_to_left_stream ? left_stream_input_header : right_stream_input_header;
-        const auto & input_columns_names = input_header->getNames();
+        NameSet already_added;
 
-        for (const auto & name : input_columns_names)
+        auto try_add = [&](const String & name)
         {
-            if (!join_header->has(name))
+            if (!already_added.insert(name).second)
+                return;
+
+            available_input_columns_for_filter.push_back(name);
+        };
+
+        for (const auto & name : input_header->getNames())
+        {
+            const bool in_join_output = join_header->has(name);
+
+            /// JOIN output may drop a left-only column (unused-column removal after
+            /// `count()` of `SELECT * … JOIN … WHERE left.col …`) while the Filter DAG
+            /// still references it. That name is still valid on this stream.
+            if (!in_join_output && (require_stable_types || !filter_input_names.contains(name)))
                 continue;
 
             /// For the legacy JoinStep (not JoinStepLogical), there is no mechanism to adjust
@@ -583,11 +610,44 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
             ///
             /// The disjunction (partial predicate) push-down path has no such type-fixup, so it
             /// passes require_stable_types to also exclude type-changing columns for JoinStepLogical.
-            if ((!logical_join || require_stable_types)
+            if (in_join_output
+                && (!logical_join || require_stable_types)
                 && !input_header->getByName(name).type->equals(*join_header->getByName(name).type))
                 continue;
 
-            available_input_columns_for_filter.push_back(name);
+            try_add(name);
+        }
+
+        /// JoinStepLogical may alias a side's input (`bid`) to a JOIN-output / filter name
+        /// (`__table1.bid`). `splitActionsForJOINFilterPushDown` matches filter inputs, so
+        /// the output name must be listed; `fix_predicate_for_join_logical_step` remaps it.
+        if (logical_join)
+        {
+            for (const auto & output_action : logical_join->getOutputActions())
+            {
+                if (push_to_left_stream ? !output_action.fromLeft() : !output_action.fromRight())
+                    continue;
+
+                const auto & output_name = output_action.getColumnName();
+                if (!join_header->has(output_name) && !filter_input_names.contains(output_name))
+                    continue;
+
+                if (require_stable_types)
+                {
+                    auto resolved = output_action.resolveAliases();
+                    if (resolved.getNode()->type != ActionsDAG::ActionType::INPUT
+                        || !input_header->has(resolved.getColumnName()))
+                        continue;
+
+                    const auto & output_type = join_header->has(output_name)
+                        ? join_header->getByName(output_name).type
+                        : output_action.getType();
+                    if (!input_header->getByName(resolved.getColumnName()).type->equals(*output_type))
+                        continue;
+                }
+
+                try_add(output_name);
+            }
         }
 
         return available_input_columns_for_filter;
@@ -596,25 +656,26 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
     bool left_stream_filter_push_down_input_columns_available = true;
     bool right_stream_filter_push_down_input_columns_available = true;
 
-    if (table_join_ptr && table_join_ptr->kind() == JoinKind::Left)
-        right_stream_filter_push_down_input_columns_available = false;
-    else if (table_join_ptr && table_join_ptr->kind() == JoinKind::Right)
-        left_stream_filter_push_down_input_columns_available = false;
+    if (have_join_kind)
+    {
+        left_stream_filter_push_down_input_columns_available = canPrefilterJoinSide(kind, strictness, JoinTableSide::Left);
+        right_stream_filter_push_down_input_columns_available = canPrefilterJoinSide(kind, strictness, JoinTableSide::Right);
+    }
 
-    if (logical_join && logical_join->getJoinOperator().kind == JoinKind::Left)
-        right_stream_filter_push_down_input_columns_available = false;
-    else if (logical_join && logical_join->getJoinOperator().kind == JoinKind::Right)
-        left_stream_filter_push_down_input_columns_available = false;
-
-    /** We disable push down to right table in cases:
+    /** `canPrefilterJoinSide` only decides whether this side's own columns may be
+      * used as ordinary filter inputs (false on the null-producing outer-JOIN side).
+      * Equivalent-key filters can still be attached to that child. That attach is
+      * gated by `allow_push_down_to_right`:
       * 1. Right side is already filled. Example: JOIN with Dictionary.
-      * 2. ASOF Right join is not supported.
+      * 2. `ASOF` right join is not supported.
       */
-    bool allow_push_down_to_right = join && join->allowPushDownToRight() && table_join_ptr && table_join_ptr->strictness() != JoinStrictness::Asof;
+    bool allow_push_down_to_right = join && join->allowPushDownToRight() && table_join_ptr
+        && table_join_ptr->strictness() != JoinStrictness::Asof;
     if (logical_join)
     {
         bool has_logical_lookup = typeid_cast<JoinStepLogicalLookup *>(child_node->children.back()->step.get());
-        allow_push_down_to_right = !has_logical_lookup && logical_join->getJoinOperator().strictness != JoinStrictness::Asof;
+        allow_push_down_to_right = !has_logical_lookup
+            && logical_join->getJoinOperator().strictness != JoinStrictness::Asof;
     }
 
     if (!allow_push_down_to_right)
@@ -911,22 +972,41 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
             return updated_steps;
         }
 
-        /// Unlike the main push-down above, addFilterOnTop builds the partial FilterStep directly
-        /// against the join input header without fix_predicate_for_join_logical_step. So a function
-        /// node whose type was computed for the join output (e.g. equals over a USING key widened to
-        /// Nullable) would be applied to the non-widened input column and trip the result-type check
-        /// in updateHeader. Restrict the partial predicate to columns with stable types across the join.
+        /// Restrict the partial predicate to columns with stable types across the join.
+        /// `addFilterOnTop` builds the FilterStep against the join input header, so
+        /// `fix_predicate_for_join_logical_step` remaps JOIN-output aliases
+        /// (`__table1.bid`) to the child's physical names (`bid`). Type-changing
+        /// columns still have no partial-path conversion, so they stay excluded.
         Names left_stream_stable_columns_to_push_down = get_available_columns_for_filter(
             true /*push_to_left_stream*/, left_stream_filter_push_down_input_columns_available, /*require_stable_types=*/true);
         Names right_stream_stable_columns_to_push_down = get_available_columns_for_filter(
             false /*push_to_left_stream*/, right_stream_filter_push_down_input_columns_available, /*require_stable_types=*/true);
 
+        auto remap_partial_predicate_for_logical_join = [&](ActionsDAG filter_dag) -> ActionsDAG
+        {
+            if (!logical_join)
+                return filter_dag;
+
+            auto required_actions = get_required_pre_actions(logical_join->getOutputActions(), filter_dag.getInputs());
+            if (required_actions.empty())
+                return filter_dag;
+
+            filter_dag = fix_predicate_for_join_logical_step(
+                std::move(filter_dag), JoinExpressionActions::getSubDAG(required_actions));
+            /// `fix_predicate_for_join_logical_step` projects unused inputs as extra outputs.
+            /// `addFilterOnTop` expects a single filter column and rebuilds the header itself.
+            filter_dag.getOutputs().resize(1);
+            filter_dag.removeUnusedActions();
+            return filter_dag;
+        };
+
         {
             auto left_partial_filter_dag = tryToExtractPartialPredicate(filter->getExpression(), filter->getFilterColumnName(), left_stream_stable_columns_to_push_down);
             if (left_partial_filter_dag.has_value())
             {
-                const auto partial_predicate_column_name = left_partial_filter_dag->getOutputs().front()->result_name;
-                addFilterOnTop(*child_node, 0, nodes, std::move(*left_partial_filter_dag));
+                auto remapped = remap_partial_predicate_for_logical_join(std::move(*left_partial_filter_dag));
+                const auto partial_predicate_column_name = remapped.getOutputs().front()->result_name;
+                addFilterOnTop(*child_node, 0, nodes, std::move(remapped));
                 ++updated_steps;
                 LOG_DEBUG(&Poco::Logger::get("QueryPlanOptimizations"),
                     "Pushed down partial filter {} to the {} side of join",
@@ -939,8 +1019,9 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
             auto right_partial_filter_dag = tryToExtractPartialPredicate(filter->getExpression(), filter->getFilterColumnName(), right_stream_stable_columns_to_push_down);
             if (right_partial_filter_dag.has_value())
             {
-                const auto partial_predicate_column_name = right_partial_filter_dag->getOutputs().front()->result_name;
-                addFilterOnTop(*child_node, 1, nodes, std::move(*right_partial_filter_dag));
+                auto remapped = remap_partial_predicate_for_logical_join(std::move(*right_partial_filter_dag));
+                const auto partial_predicate_column_name = remapped.getOutputs().front()->result_name;
+                addFilterOnTop(*child_node, 1, nodes, std::move(remapped));
                 ++updated_steps;
                 LOG_DEBUG(&Poco::Logger::get("QueryPlanOptimizations"),
                     "Pushed down partial filter {} to the {} side of join",
