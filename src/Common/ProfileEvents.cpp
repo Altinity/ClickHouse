@@ -78,6 +78,9 @@
     M(PageCacheResized, "Number of times the userspace page cache was auto-resized (typically happens a few times per second, controlled by memory_worker_period_ms).", ValueType::Number) \
     M(PageCacheOvercommitResize, "Number of times the userspace page cache was auto-resized to free memory during a memory allocation.", ValueType::Number) \
     M(PageCacheReadBytes, "Number of bytes read from userspace page cache.", ValueType::Bytes) \
+    M(PageCacheReadThroughBudgetSamples, "Times the userspace page cache recomputed its read-through budget from its own fitted bandwidth and round-trip time (once per source read)", ValueType::Number) \
+    M(PageCacheReadThroughBudgetBytesSum, "Sum of the read-through budgets the page cache computed; divide by `PageCacheReadThroughBudgetSamples` for the mean budget in bytes", ValueType::Bytes) \
+    M(PageCacheReadThroughBytes, "Number of bytes fetched from the source but thrown away because they cover cache blocks that were already present: the page cache read through a short island of cached blocks in order to serve two runs of missing blocks with one request", ValueType::Bytes) \
     M(MMappedFileCacheHits, "Number of times a file has been found in the MMap cache (for the 'mmap' read_method), so we didn't have to mmap it again.", ValueType::Number) \
     M(MMappedFileCacheMisses, "Number of times a file has not been found in the MMap cache (for the 'mmap' read_method), so we had to mmap it again.", ValueType::Number) \
     M(OpenedFileCacheHits, "Number of times a file has been found in the opened file cache, so we didn't have to open it again.", ValueType::Number) \
@@ -1646,6 +1649,14 @@ The server successfully detected this situation and will download merged part fr
     M(ParquetPrefetcherReadRandomRead, "The total number of reads with ReadMode::RandomRead by DB::Parquet::Prefetcher", ValueType::Number) \
     M(ParquetPrefetcherReadSeekAndRead, "The total number of reads with ReadMode::SeekAndRead by DB::Parquet::Prefetcher", ValueType::Number) \
     M(ParquetPrefetcherReadEntireFile, "The total number of read with ReadMode::EntireFileIsInMemory by DB::Parquet::Prefetcher", ValueType::Number) \
+    M(ParquetPartialReadsServed, "Times the Parquet reader started decoding from a coalesced read before that read had finished, because the requested bytes had already arrived", ValueType::Number) \
+    M(ParquetReadTasks, "Coalesced read tasks created by the Parquet reader", ValueType::Number) \
+    M(ParquetReadTaskBytes, "Bytes covered by `ParquetReadTasks`, including bytes read to close short gaps between requested ranges", ValueType::Bytes) \
+    M(ParquetReadFirstByteMicroseconds, "Sum of the time from starting a `DB::Parquet::Prefetcher` source read to its first progress callback (or to completion, if the transport never calls back), i.e. round-trip time to the first byte", ValueType::Microseconds) \
+    M(ParquetReadTransferMicroseconds, "Sum of the time spent transferring bytes in a `DB::Parquet::Prefetcher` source read after the first byte arrived", ValueType::Microseconds) \
+    M(ParquetPlannedReads, "Groups of Parquet reads (the index reads of one row group, or the data pages one row subgroup needs) issued by the reader's issue controller ahead of the stage that consumes them. Counts only the groups the controller itself issued: a group that the stage needing it took over first is not counted", ValueType::Number) \
+    M(ParquetPlannedReadsSkippedLocal, "Groups of Parquet reads the reader did not pre-issue because a local cache (filesystem or userspace page cache) already held every byte they would have fetched, so issuing them early could save no round trip; the stage that needs them reads them on demand at memcpy cost", ValueType::Number) \
+    M(ParquetIssueQueueStalls, "Times the Parquet reader's issue controller had to stop reading ahead because the bytes-in-flight target or the memory pool of the next planned read was full. Counted once per attempt, not per planned read left waiting; counted even if the attempt still issued a privileged read (one the reader cannot make progress without), since read-ahead was blocked either way", ValueType::Number) \
     M(ParquetRowsFilterExpression, "The total number of rows that were passed through filter", ValueType::Number) \
     M(ParquetColumnsFilterExpression, "The total number of columns that were passed through filter", ValueType::Number) \
     M(FilterTransformPassedRows, "Number of rows that passed the filter in the query", ValueType::Number) \

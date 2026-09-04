@@ -352,6 +352,16 @@ struct Reader
         size_t data_pages_idx = 0; // corresponding to `page`
         /// Index in data_pages up to which we checked which pages need to be read, after applying prewhere.
         size_t data_pages_prefetch_idx = 0;
+        /// Set when the read-path planner (`ReadManager::enqueueRowGroupPageReads`) put this column's
+        /// dictionary-page read and, if there's no offset index, its whole-column-chunk read into the
+        /// issue queue. The per-subgroup path then leaves those two handles alone, so that no handle
+        /// is ever started by two threads at once (`PrefetchHandle::memory` isn't atomic).
+        /// Load-bearing invariant: the planned entry that claimed them is always issued (by the pump
+        /// or by the demand path draining it), because the planner only claims them on a subgroup with
+        /// `rows_pass > 0`, and `rows_pass` can only be zeroed afterwards by `applyPrewhere` at a
+        /// later step than the one the planner plans -- so that subgroup always reaches
+        /// `ColumnDataPrefetch` and drains its entry. Asserted in `ReadManager::scheduleTask`.
+        bool dictionary_and_whole_chunk_planned = false;
 
         ReadStage stage{};
     };

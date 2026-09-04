@@ -1,0 +1,5 @@
+-- results identical
+19999900000	619996900000
+19999900000	619996900000
+-- the floor exempts these reads from the ratio: fewer, larger reads
+1	1

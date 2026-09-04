@@ -3,10 +3,14 @@
 #include <base/scope_guard.h>
 #include <Common/PODArray.h>
 #include <Common/ProfileEvents.h>
+#include <Common/Stopwatch.h>
 
 namespace ProfileEvents
 {
     extern const Event PageCacheReadBytes;
+    extern const Event PageCacheReadThroughBytes;
+    extern const Event PageCacheReadThroughBudgetSamples;
+    extern const Event PageCacheReadThroughBudgetBytesSum;
 }
 
 namespace DB
@@ -221,6 +225,71 @@ bool CachedInMemoryReadBufferFromFile::nextImpl()
     return true;
 }
 
+void CachedInMemoryReadBufferFromFile::updateReadStats(size_t read_bytes, uint64_t first_byte_us, uint64_t total_us) const
+{
+    /// Only reads whose transport reported progress mid-transfer separate latency from bandwidth; the
+    /// rest give one duration and nothing to attribute it to, so they are skipped rather than folded in
+    /// as an absurd bandwidth sample (the same rule the Parquet prefetcher's fitting uses).
+    if (first_byte_us == 0 || total_us <= first_byte_us || read_bytes == 0)
+        return;
+
+    constexpr double alpha = 0.2;
+    const double bandwidth_sample = static_cast<double>(read_bytes) / static_cast<double>(total_us - first_byte_us);
+
+    std::lock_guard lock(read_stats_mutex);
+    if (stat_samples == 0)
+    {
+        stat_rtt_us = static_cast<double>(first_byte_us);
+        stat_bandwidth_bytes_per_us = bandwidth_sample;
+    }
+    else
+    {
+        stat_rtt_us = stat_rtt_us * (1 - alpha) + static_cast<double>(first_byte_us) * alpha;
+        stat_bandwidth_bytes_per_us = stat_bandwidth_bytes_per_us * (1 - alpha) + bandwidth_sample * alpha;
+    }
+    stat_bandwidth_peak_bytes_per_us = std::max(stat_bandwidth_peak_bytes_per_us, stat_bandwidth_bytes_per_us);
+    ++stat_samples;
+}
+
+size_t CachedInMemoryReadBufferFromFile::readThroughBudgetBytes() const
+{
+    if (size_t override_bytes = read_through_budget_override.load(std::memory_order_relaxed))
+        return override_bytes;
+
+    double rtt_us, bandwidth;
+    size_t samples;
+    {
+        std::lock_guard lock(read_stats_mutex);
+        rtt_us = stat_rtt_us;
+        bandwidth = stat_bandwidth_bytes_per_us;
+        samples = stat_samples;
+    }
+    /// No evidence yet: don't spend bytes on a guess. The first reads of a scan pay the un-bridged cost
+    /// and pay for the fit.
+    if (samples < 4 || bandwidth <= 0 || rtt_us <= 0)
+        return 0;
+
+    /// Reading through an island of cached blocks costs `island / bandwidth` of transfer and saves one
+    /// round trip, so the break-even island is `bandwidth * rtt`: the bytes that move in the time the
+    /// avoided request would have spent waiting. Both terms are measured on this buffer's own source
+    /// reads, so the budget follows the storage (a 30 ms / 100 MiB/s object store gives ~3 MiB, a local
+    /// disk gives almost nothing).
+    ///
+    /// This bounds the *time* the extra bytes cost on one stream, which is not the whole story when
+    /// many streams share a saturated link -- there the bytes are taken from the other streams while
+    /// the saved round trip helps only this one. Measuring that from inside the cache does not work:
+    /// per-read bandwidth already includes the sharing, and comparing it to the peak seen in the same
+    /// query yields ~1 (measured: the fitted budget sat at its cap at 4, 16 and 64 concurrent reads
+    /// alike). So the byte cost is bounded directly instead, by the caller-visible quantity that
+    /// matters -- see `max_waste_fraction` in `populateBlockRange`.
+    constexpr double max_budget_bytes = 8.0 * 1024 * 1024;
+    const double budget = std::min(bandwidth * rtt_us, max_budget_bytes);
+
+    ProfileEvents::increment(ProfileEvents::PageCacheReadThroughBudgetSamples);
+    ProfileEvents::increment(ProfileEvents::PageCacheReadThroughBudgetBytesSum, static_cast<size_t>(std::max(0.0, budget)));
+    return static_cast<size_t>(std::max(0.0, budget));
+}
+
 VectorWithMemoryTracking<PageCache::MappedPtr> CachedInMemoryReadBufferFromFile::populateBlockRange(size_t offset, size_t n, const std::function<bool(PageCache::MappedPtr &)> & block_callback) const
 {
     if (n == 0 || offset >= file_size.value())
@@ -246,6 +315,16 @@ VectorWithMemoryTracking<PageCache::MappedPtr> CachedInMemoryReadBufferFromFile:
         cells[i] = cache->get(block_range.hash(cache_key_base_hash), inject_eviction);
     }
 
+    /// How much of this request is missing: the denominator for the read-through waste bound below.
+    /// Taken over the whole request rather than the run being built, because a run cannot accumulate
+    /// misses before it is allowed to bridge -- judging the bound on the run alone never permits the
+    /// first island and disables the read-through completely (measured).
+    size_t total_missing_blocks = 0;
+    for (size_t i = 0; i < num_blocks; ++i)
+        if (!cells[i])
+            ++total_missing_blocks;
+    size_t read_through_blocks_used = 0;
+
     /// Phase 2: fill missing blocks, coalescing consecutive misses into single reads.
     ///
     /// On object storage, each `in->readBigAt` is a separate HTTP request, so reading one
@@ -258,6 +337,19 @@ VectorWithMemoryTracking<PageCache::MappedPtr> CachedInMemoryReadBufferFromFile:
     /// Single-block misses bypass the buffer and read directly into the cache cell.
     const size_t max_blocks_per_fetch = std::max<size_t>(1, settings.max_coalesced_bytes / block_size);
 
+    /// A run of missing blocks may also read *through* a short island of blocks that are already
+    /// cached, so that two runs separated by such an island cost one request instead of two. The
+    /// bytes covering the island are fetched and thrown away (the cached cells are never
+    /// overwritten), which is worth it only while those bytes take less time to transfer than the
+    /// round trip they save -- about one bandwidth-delay product, the same reasoning as the Parquet
+    /// reader's `input_format_parquet_coalesce_gap_bytes`. Without it, a half-cached file read at
+    /// block granularity degenerates into one request per missing block: the alternating pattern a
+    /// partially warm cache produces is exactly the worst case.
+    /// Derived from this buffer's own fitted bandwidth and round-trip time, so it adapts to the
+    /// storage and to how contended the link currently is; zero (no samples yet, or a saturated pipe)
+    /// means no read-through, i.e. the behaviour before it existed.
+    const size_t max_read_through_blocks = readThroughBudgetBytes() / block_size;
+
     size_t i = 0;
     while (i < num_blocks)
     {
@@ -269,10 +361,37 @@ VectorWithMemoryTracking<PageCache::MappedPtr> CachedInMemoryReadBufferFromFile:
             continue;
         }
 
+        /// Grow the run: every missing block extends it; a cached block extends it only while the
+        /// read-through budget lasts, and only counts once the run reaches another missing block
+        /// (a run never ends on a cached block -- reading those bytes would save nothing).
+        /// Two bounds on the bytes fetched for cached blocks: the time model above (one round trip's
+        /// worth, per island) and a hard ceiling on the waste relative to the bytes the run actually
+        /// needs. The second is what protects a saturated link, where the extra bytes are the scarce
+        /// resource rather than the round trips: without it, a half-cached file nearly doubles the bytes
+        /// read (measured) and that loses whenever concurrency has already hidden the latency.
+        /// Bytes fetched for cached blocks, as a share of the bytes the request is missing; set by the
+        /// caller from its concurrency (see `setReadThroughWastePermille`).
+        const size_t max_waste_blocks = total_missing_blocks * read_through_waste_permille.load(std::memory_order_relaxed) / 1000;
         const size_t miss_begin = i;
-        while (i < num_blocks && !cells[i] && (i - miss_begin) < max_blocks_per_fetch)
-            ++i;
-        const size_t miss_end = i;
+        size_t miss_end = i + 1;
+        size_t bridged = 0;         // consecutive cached blocks under consideration
+        size_t bridged_total = 0;   // cached blocks already merged into this run
+        for (size_t j = i + 1; j < num_blocks && (j - miss_begin) < max_blocks_per_fetch; ++j)
+        {
+            if (!cells[j])
+            {
+                miss_end = j + 1;
+                bridged_total += bridged;
+                bridged = 0;
+                continue;
+            }
+            if (max_read_through_blocks == 0 || bridged + 1 > max_read_through_blocks
+                || read_through_blocks_used + bridged_total + bridged + 1 > max_waste_blocks)
+                break;
+            ++bridged;
+        }
+        i = miss_end;
+        read_through_blocks_used += bridged_total;
 
         if (miss_end - miss_begin == 1)
         {
@@ -285,7 +404,12 @@ VectorWithMemoryTracking<PageCache::MappedPtr> CachedInMemoryReadBufferFromFile:
                 cache_file, block_range, detached_if_missing, inject_eviction,
                 [&](const auto & c)
                 {
-                    size_t bytes_read = in->readBigAt(c->data(), block_range.size, block_range.offset, nullptr);
+                    Stopwatch watch;
+                    uint64_t first_byte_us = 0;
+                    size_t bytes_read = in->readBigAt(c->data(), block_range.size, block_range.offset,
+                        /// `false` means "keep going": a `true` return cancels the read.
+                        [&](size_t) { if (first_byte_us == 0) first_byte_us = watch.elapsedMicroseconds(); return false; });
+                    updateReadStats(bytes_read, first_byte_us, watch.elapsedMicroseconds());
                     if (bytes_read < block_range.size)
                         throw Exception(ErrorCodes::UNEXPECTED_END_OF_FILE, "File {} ended after {} bytes, but we expected {}",
                             cache_file.path, block_range.offset + bytes_read, file_size.value());
@@ -300,7 +424,12 @@ VectorWithMemoryTracking<PageCache::MappedPtr> CachedInMemoryReadBufferFromFile:
             const size_t range_size = range_end - range_start;
 
             PODArray<char> buf(range_size);
-            size_t bytes_read = in->readBigAt(buf.data(), range_size, range_start, nullptr);
+            Stopwatch watch;
+            uint64_t first_byte_us = 0;
+            size_t bytes_read = in->readBigAt(buf.data(), range_size, range_start,
+                /// `false` means "keep going": a `true` return cancels the read.
+                        [&](size_t) { if (first_byte_us == 0) first_byte_us = watch.elapsedMicroseconds(); return false; });
+            updateReadStats(bytes_read, first_byte_us, watch.elapsedMicroseconds());
             if (bytes_read < range_size)
                 throw Exception(ErrorCodes::UNEXPECTED_END_OF_FILE, "File {} ended after {} bytes, but we expected {}",
                     cache_file.path, range_start + bytes_read, file_size.value());
@@ -309,6 +438,15 @@ VectorWithMemoryTracking<PageCache::MappedPtr> CachedInMemoryReadBufferFromFile:
             {
                 block_range.offset = first_block_start + j * block_size;
                 block_range.size = std::min(block_size, file_size.value() - block_range.offset);
+
+                /// A block bridged by the read-through already has its cell; the bytes just fetched
+                /// for it are the price of the merge, not something to write anywhere.
+                if (cells[j])
+                {
+                    ProfileEvents::increment(ProfileEvents::PageCacheReadThroughBytes, block_range.size);
+                    continue;
+                }
+
                 const size_t buf_offset = block_range.offset - range_start;
                 UInt128 key_hash = block_range.hash(cache_key_base_hash);
 
@@ -395,6 +533,29 @@ VectorWithMemoryTracking<SeekableReadBuffer::CachedRegion> CachedInMemoryReadBuf
     }
 
     return regions;
+}
+
+bool CachedInMemoryReadBufferFromFile::isBigRangeCached(size_t offset, size_t n) const
+{
+    if (n == 0)
+        return true;
+    if (!file_size.has_value() || offset >= file_size.value())
+        return false;
+
+    const size_t block_size = settings.block_size;
+    const size_t end_offset = offset + std::min(n, file_size.value() - offset);
+    const size_t first_block_start = offset / block_size * block_size;
+    const size_t num_blocks = (end_offset - first_block_start + block_size - 1) / block_size;
+
+    PageCacheByteRange block_range;
+    for (size_t i = 0; i < num_blocks; ++i)
+    {
+        block_range.offset = first_block_start + i * block_size;
+        block_range.size = std::min(block_size, file_size.value() - block_range.offset);
+        if (!cache->contains(block_range.hash(cache_key_base_hash), settings.random_eviction_for_tests))
+            return false;
+    }
+    return true;
 }
 
 bool CachedInMemoryReadBufferFromFile::isContentCached(size_t offset, size_t /*size*/)

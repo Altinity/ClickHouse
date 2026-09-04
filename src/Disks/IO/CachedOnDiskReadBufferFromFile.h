@@ -74,6 +74,7 @@ public:
     bool isSeekCheap() override;
 
     bool isContentCached(size_t offset, size_t size) override;
+    bool isRangeLocal(size_t offset, size_t n) const override;
 
     std::optional<size_t> tryGetFileSize() override;
 

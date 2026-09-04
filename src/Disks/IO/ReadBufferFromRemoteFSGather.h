@@ -47,6 +47,7 @@ public:
     bool isSeekCheap() override;
 
     bool isContentCached(size_t offset, size_t size) override;
+    bool isRangeLocal(size_t offset, size_t n) const override;
 
 private:
     SeekableReadBufferPtr createImplementationBuffer(const StoredObject & object, size_t start_offset);
