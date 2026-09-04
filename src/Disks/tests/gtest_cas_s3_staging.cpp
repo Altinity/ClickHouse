@@ -274,7 +274,7 @@ public:
                 DB::Cas::tests::OperationForTest mint_op(*this);
                 const auto meta = (*mint_op).head(request.destination_key, DB::Cas::Retry::once());
                 if (meta)
-                    queued_delete_incarnation = meta->etag;
+                    queued_delete_etag = meta->etag;
             }
 
             if (script != FaultScript::CopyLandsThenCondemned)
@@ -291,7 +291,7 @@ public:
     size_t copy_publications = 0;
     size_t streaming_publications = 0;
     String queued_delete_token;
-    std::optional<DB::Cas::Etag> queued_delete_incarnation;
+    std::optional<DB::Cas::Etag> queued_delete_etag;
     DB::Cas::Backend::RawRemoval first_delete{};
 
 private:
@@ -389,10 +389,10 @@ TEST(CASS3Staging, StagedCopyCondemnedRetryRetagsBeforeQueuedDelete)
 
     EXPECT_EQ(backend->copy_publications, 1u);
     EXPECT_EQ(backend->streaming_publications, 1u);
-    ASSERT_TRUE(backend->queued_delete_incarnation.has_value());
+    ASSERT_TRUE(backend->queued_delete_etag.has_value());
     {
         DB::Cas::tests::OperationForTest op(*backend);
-        EXPECT_EQ((*op).remove(store->layout().blobKey(ref), *backend->queued_delete_incarnation, DB::Cas::Retry::once()),
+        EXPECT_EQ((*op).remove(store->layout().blobKey(ref), *backend->queued_delete_etag, DB::Cas::Retry::once()),
                   DB::Cas::Removal::Mismatch);
     }
     const auto current = readAt(*backend, store->layout().blobKey(ref));
@@ -424,10 +424,10 @@ TEST(CASS3Staging, StagedCopyDeletedBeforeAbsentRetryRetagsBeforeQueuedDelete)
     EXPECT_EQ(backend->copy_publications, 1u)
         << "the absent retry must not copy the original staged envelope again";
     EXPECT_EQ(backend->streaming_publications, 1u);
-    ASSERT_TRUE(backend->queued_delete_incarnation.has_value());
+    ASSERT_TRUE(backend->queued_delete_etag.has_value());
     {
         DB::Cas::tests::OperationForTest op(*backend);
-        EXPECT_EQ((*op).remove(store->layout().blobKey(ref), *backend->queued_delete_incarnation, DB::Cas::Retry::once()),
+        EXPECT_EQ((*op).remove(store->layout().blobKey(ref), *backend->queued_delete_etag, DB::Cas::Retry::once()),
                   DB::Cas::Removal::Mismatch)
             << "the second queued exact delete for the copied ETag must miss the retagged replacement";
     }
@@ -966,12 +966,31 @@ TEST(CASStagingSweeper, RemovesOnlyObjectsUnderGivenMountPrefix)
 /// nested `staging/` under `blobs/` (or vice versa) would violate.
 TEST(CASS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
 {
-    const DB::Cas::Layout layout("p");
-    const std::string blobs_prefix = layout.blobsPrefix();
-    const std::string staging_prefix = "p/staging/mountA/";
+    /// The REAL staging prefix, from the accessor every writer actually mints staging keys through
+    /// (`ContentAddressedMetadataStorage::stagingKeyPrefix`) -- not a hand-copied literal that a
+    /// staging-side rename would leave silently stale.
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountA");
+    metadata_storage->startup();
+    const std::string physical_root = object_storage->getCommonKeyPrefix();
+    const std::string full_staging_prefix = metadata_storage->stagingKeyPrefix();
+    ASSERT_TRUE(full_staging_prefix.starts_with(physical_root))
+        << full_staging_prefix << " vs root " << physical_root;
+    /// Strip the physical object-storage root (and the '/' `physicalKey` joins it to the pool key
+    /// with): `Layout` (below) is root-agnostic, and comparing a physically-rooted key against a bare
+    /// `Layout` key would pass for the wrong reason (both simply fail to share the unrelated root, not
+    /// because the pool-relative prefixes are disjoint).
+    std::string staging_prefix = full_staging_prefix.substr(physical_root.size());
+    if (!staging_prefix.empty() && staging_prefix.front() == '/')
+        staging_prefix.erase(0, 1);
+    staging_prefix += "/";
     const std::string staging_key = staging_prefix + "aaa.tmp";
 
-    EXPECT_EQ(blobs_prefix, "p/blobs/");
+    const DB::Cas::Layout layout(metadata_storage->poolForTest()->poolConfig().pool_prefix);
+    const std::string blobs_prefix = layout.blobsPrefix();
+
+    EXPECT_EQ(staging_prefix, "pool/staging/mountA/") << "sanity: the accessor's own shape";
+    EXPECT_EQ(blobs_prefix, "pool/blobs/");
     EXPECT_FALSE(staging_prefix.starts_with(blobs_prefix));
     EXPECT_FALSE(blobs_prefix.starts_with(staging_prefix));
     EXPECT_FALSE(staging_key.starts_with(blobs_prefix));
