@@ -9,7 +9,8 @@ doc_type: 'design'
 
 # CAS GC does not hold up teardown {#cas-gc-teardown-stop-design}
 
-**Status:** DRAFT for review, rev.4 (2026-09-04). rev.1–rev.3 were reviewed by `codex`
+**Status:** IMPLEMENTED, rev.5 (2026-09-04) — see the implementation record at the end for the
+three things the build changed. rev.4 was the last review draft. rev.1–rev.3 were reviewed by `codex`
 (`gpt-5.6-sol`, high, one resumed session) with Occam's razor as the first question; every accepted
 finding is folded in below and the record is at the end. rev.3's verdict: direction sound, joins and
 lifetimes preserved, first failing-first test named (T3). Line references are against `86b60a23de4` on `cas-gc-rebuild` and will drift; the symbol
@@ -424,6 +425,14 @@ a failed build is the wrong binary.
   not refuse an unrelated `system.content_addressed_mounts` query or a running FSCK. It needs a
   round-scoped liveness — one `CasOperation` threaded through every phase — and stays on the backlog
   as `CAS-049`'s remaining half.
+- **`SYSTEM CAS FORGET`**, moved here during implementation. Its GC join could be bounded the same
+  way, but a self-remount already latched when FORGET starts completes one more step before the loop
+  bails, and that step's pool-identity probe is admitted on the open plane. An arm early enough to
+  bound the join (the GC join is step 3/4, the remount join step 5a) refuses that probe, so the
+  reclaim FORGET's second fence trip exists to override could never happen —
+  `CASForget.ForgetReLatchesFenceAfterAReclaimReachesArmMountFence` proves it. No arm placement
+  satisfies both, and silently dropping a decommission step is a protocol change this design forbids.
+  FORGET therefore keeps today's wait.
 - **A single absolute teardown deadline** threaded through the drains and the farewell. The
   additive bound is accepted.
 - **A causal cancellation signal** from the engine to the scheduler. The honest `Stopped` is
@@ -470,3 +479,36 @@ post-`FORGET` consequence is corrected to "none visible"; T3 is reshaped to be r
 T2 gains the in-body and read-ahead cases; T4, T6, T7 are new. Declined as more mechanism than the
 problem needs: a global teardown deadline; a causal cancellation signal; per-catch suppression by
 cause across the advisory sites.
+
+## Implementation record {#implementation-record}
+
+Implemented on `cas-gc-teardown-stop` (branched from `cas-gc-rebuild`), six commits, gate `CAS*`
+2367/2367. Three things the build changed against rev.4:
+
+1. **FORGET left the scope**, for the reason now recorded under [out of scope](#out-of-scope). The
+   plane census in [which plane](#which-plane) was incomplete: besides the ref ledger (mount plane)
+   and the farewell (farewell plane), the mount runtime's **self-remount identity probe** is admitted
+   on the open plane, and `Pool::forgetDisk` joins that worker. Shutdown and the storage destructor
+   have no such step and keep their arms.
+
+2. **A `Stopped` row does not survive the restart that produced it.** It is emitted while `SystemLog`
+   is itself tearing down, so `system.cas_gc_log` is not a reliable witness across a restart; the
+   server's own log line is (`CA GC round stopped by the disk's teardown`, observed on a live
+   restart). The row remains correct and useful for a round cut by the storage destructor while the
+   server keeps running.
+
+3. **T8 was dropped and T9 was reshaped.** Measured: a leading GC round lasts a fraction of a second
+   (466 ms worst observed) against a paced loop, so a restart meets one about a percent of the time;
+   more namespaces do not lengthen a round because `GcRoundWorkBudget` caps its work; and driving
+   rounds by hand does not help, because a manual round may not steal the lease and returns
+   `NotALeader` in milliseconds (20 325 such rounds in one soak run). A hard witness at that
+   frequency is a flaky test, so the integration case was removed and S46 asserts the timing bound,
+   the absence of `Aborted`/`Error` rounds and a clean final fsck, recording the witness instead.
+   The deterministic proof of the cut is `CASGCTeardownStop`.
+
+What the unit suite pins (`src/Disks/tests/gtest_cas_gc_teardown_stop.cpp`, eight tests): the arm is
+idempotent and refuses new detached work; the open plane refuses after it while the mount plane does
+not; its retry sleep wakes; a read-ahead worker is refused at its first gate; a background round in
+flight is cut at its next request and recorded `Stopped` with no further backend request; `shutdown`
+returns while a synchronous round is parked (red before the change); a tick queued behind a manual
+round mints no Start row after the arm; and a stop swallowed by the janitor page stays `Deferred`.
