@@ -35,7 +35,7 @@ sequenceDiagram
     Note over R: advertising 11 is a promise to confirm before promoting
     Snd->>Snd: same disk pool uuid? identity, never endpoint plus prefix
     Snd->>S3: resolve the offer once -- manifest bytes and confirm token from the SAME view
-    Snd-->>R: cookies cas_relink = part_manifest_v2, cas_source_token = ..., cas_pool_uuid = the matched pool; body = manifest bytes
+    Snd-->>R: cookies cas_relink = part_manifest_v2, cas_source_token = ..., cas_pool_uuid = the matched pool -- body = manifest bytes
     Note over Snd: sender is fire-and-forget -- it releases the part here
 
     rect rgba(120,160,255,0.12)
@@ -91,17 +91,25 @@ receiver, and the sender is never loaded.
 
 Two things do not bend to the offer. A disk the caller supplied (zero-copy `MOVE` re-fetching a shared
 part onto the move's destination) is never overridden — a content-addressed disk cannot reach that path
-at all, since it does not support zero-copy replication. And a pool disk that is read-only is not a
-candidate and is not advertised, so the sender streams bytes and the ordinary placement applies.
+at all, since it does not support zero-copy replication. And a read-only disk is never a candidate: its
+pool is advertised only if some other disk of that pool in the policy is writable, and when none is, the
+sender streams bytes and the ordinary placement applies.
 
 A pool disk that is not live — its mount lease lost, its identity lost, or the storage shut down — is
-still the target. The relink's own write gate refuses it, the fetch fails, and the replication queue
-retries; the part is never quietly placed on another disk instead. This is the behaviour a single-disk
+still the target. The relink's own write gate refuses it and the fetch fails; a replication-queue fetch
+is retried by the queue, while a manual `FETCH PART` or `FETCH PARTITION` reports the error to the user.
+The part is never quietly placed on another disk instead. This is the behaviour a single-disk
 content-addressed policy always had, and a mixed policy now shares it.
 
-The byte-fetch fallback after a relink that failed for a mechanism reason (an undecodable manifest, a
+The byte-fetch fallback after a relink that failed for a mechanism reason (a corrupted manifest, a
 body-absent precommit, a ref conflict) re-requests the bytes on the same pool disk, where they
-content-address and deduplicate against the pool — the placement outlives the relink.
+content-address and deduplicate against the pool — the placement outlives the relink. A manifest of a
+newer format generation is not degraded to bytes today (a tracked gap, `[relink-fallback-unknown-format-version]`
+in the backlog).
+
+During a rolling upgrade a sender that predates the pool-set advertise compares the whole `cas_pool_uuid`
+value with its own pool id, so a receiver whose policy holds several pools gets bytes from such a sender
+until it is upgraded; a receiver with one pool is unaffected, its advertise is byte-for-byte the old one.
 
 ## What actually seals "commit before release" {#relink-seal}
 
