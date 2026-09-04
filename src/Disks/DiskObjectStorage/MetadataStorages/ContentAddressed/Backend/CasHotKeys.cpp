@@ -5,6 +5,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
+#include <base/defines.h>
 
 #include <algorithm>
 #include <chrono>
@@ -40,13 +41,6 @@ constexpr auto kWaitSlice = std::chrono::milliseconds(200);
 
 }
 
-size_t CasHotKeys::RememberedWeight::operator()(const Remembered & remembered) const
-{
-    /// Never zero: the key, the incarnation and the containers weigh something even when the object
-    /// is empty, so the byte budget bounds the entry count as well as the bytes.
-    return remembered.key_bytes + remembered.object.bytes.size() + remembered.object.etag.render().size() + 64;
-}
-
 CasHotKeys::CasHotKeys(uint64_t cache_budget_bytes_)
     : cache_budget_bytes(cache_budget_bytes_)
     , cache(cache_budget_bytes_ == 0
@@ -58,7 +52,12 @@ CasHotKeys::CasHotKeys(uint64_t cache_budget_bytes_)
 {
 }
 
-CasHotKeys::~CasHotKeys() = default;
+CasHotKeys::~CasHotKeys()
+{
+    /// A lane surviving the pool that owns it means some caller's stack still points into it: a
+    /// lifetime error, not a state this destructor could ever see in a correct program.
+    chassert(lanes.empty());
+}
 
 WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide)
 {
@@ -145,19 +144,31 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
 
 void CasHotKeys::leave(const String & key, Item & item, bool entered_hold, uint64_t entered_ms, CasOperation & op) noexcept
 {
-    const uint64_t now = op.owner.now_ms();
     /// The front item's ticket and how long it has held, when this caller left at its own bound behind
     /// it: what makes a stuck holder visible while it is stuck.
     std::optional<std::pair<uint64_t, uint64_t>> stuck_behind;
     {
         std::lock_guard lock(mutex);
         auto it = lanes.find(key);
+        chassert(it != lanes.end());
         Lane & lane = it->second;
         lane.queue.erase(std::find(lane.queue.begin(), lane.queue.end(), &item));
         if (entered_hold)
             lane.holder_since_ms.reset();
         else if (!lane.queue.empty() && lane.holder_since_ms)
-            stuck_behind = std::pair{lane.queue.front()->ticket, now - *lane.holder_since_ms};
+        {
+            /// `now_ms` is the pool's injected clock and can throw; the fallback is no snapshot, never
+            /// a throw out of this locked section, whose sole duty -- removing the item -- must complete
+            /// regardless.
+            try
+            {
+                const uint64_t now = op.owner.now_ms();
+                stuck_behind = std::pair{lane.queue.front()->ticket, now - *lane.holder_since_ms};
+            }
+            catch (...)
+            {
+            }
+        }
         if (lane.queue.empty())
             lanes.erase(it);
         else
@@ -166,7 +177,10 @@ void CasHotKeys::leave(const String & key, Item & item, bool entered_hold, uint6
     try
     {
         if (!entered_hold)
+        {
+            const uint64_t now = op.owner.now_ms();
             ProfileEvents::increment(ProfileEvents::CASHotKeyQueueWaitMicroseconds, (now - entered_ms) * 1000);
+        }
         if (stuck_behind)
             LOG_WARNING(getLogger("CasHotKeys"),
                 "hot key '{}': a writer left at its own bound while ticket {} has held the key for {} ms",
@@ -287,13 +301,17 @@ void CasHotKeys::remember(const String & key, Object object) noexcept
     {
         if (cache_fill_hook_for_test)
             cache_fill_hook_for_test();
-        auto remembered = std::make_shared<Remembered>(Remembered{std::move(object), key.size()});
+        /// Computed here, where a throw (allocation, `Etag::render`) is still just a failed fill: never
+        /// zero, since the key, the incarnation and the containers weigh something even when the object
+        /// is empty, so the byte budget bounds the entry count as well as the bytes.
+        const size_t weight = key.size() + object.bytes.size() + object.etag.render().size() + 64;
         /// An object above the budget is not a hint worth evicting everything else for.
-        if (RememberedWeight{}(*remembered) > cache_budget_bytes)
+        if (weight > cache_budget_bytes)
         {
             forget(key);
             return;
         }
+        auto remembered = std::make_shared<Remembered>(Remembered{std::move(object), weight});
         cache->set(key, remembered);
     }
     catch (...)

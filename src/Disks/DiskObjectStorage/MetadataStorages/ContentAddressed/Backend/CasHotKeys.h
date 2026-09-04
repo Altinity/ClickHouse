@@ -90,15 +90,17 @@ private:
         std::optional<uint64_t> holder_since_ms;     /// guarded by `mutex`; for the log line
         std::condition_variable cv;
     };
-    /// A remembered object together with its key's size, so the weight below is never zero.
+    /// A remembered object together with its precomputed weight: `Etag::render` allocates and can
+    /// throw, and the cache's own accounting calls the weight after it has already subtracted the
+    /// entry being replaced, so the weight itself must never throw.
     struct Remembered
     {
         Object object;
-        size_t key_bytes;
+        size_t weight;
     };
     struct RememberedWeight
     {
-        size_t operator()(const Remembered & remembered) const;
+        size_t operator()(const Remembered & remembered) const noexcept { return remembered.weight; }
     };
     using Cache = CacheBase<String, Remembered, std::hash<String>, RememberedWeight>;
 
