@@ -271,6 +271,12 @@ public:
     /// Merge partially aggregated chunks separated to buckets into one data structure.
     void mergeBlocks(BucketToChunks bucket_to_chunks, AggregatedDataVariants & result, std::atomic<bool> & is_cancelled);
 
+    /// Sorts (bucket_id, row_count) pairs by row_count descending, for longest-processing-time-
+    /// first parallel bucket-merge dispatch in mergeBlocks: starting the biggest buckets first,
+    /// while every merge thread is still free to help absorb them, keeps threads that would
+    /// otherwise luck into small buckets and go idle busy instead, under skewed bucket sizes.
+    static std::vector<Int32> sortBucketsByRowCountDescending(std::vector<std::pair<Int32, UInt64>> buckets_by_rows);
+
     /// Merge several partially aggregated chunks into one.
     /// Precondition: for all chunks the is_overflows flag must be the same.
     /// (either all chunks are from overflow data or none are).
