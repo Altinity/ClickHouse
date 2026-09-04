@@ -3557,12 +3557,15 @@ void Gc::cleanupRefObjects(
         /// incarnation, changed row/life, missing or unreadable authority object, or changed
         /// owner/sequence stops the whole cleanup pass. Continuing with another row/key would turn a
         /// refusal into a fallback.
-        const auto deleteRefObject = [&](const String & key)
+        /// Every irreversible delete is still licensed by the SAME complete catalog observation and GC
+        /// lease that adopted the fold, re-read immediately before the deletes it licenses. The unit
+        /// of licence is one chunk of write-once keys: a `_log` or `_snap` key is published once at a
+        /// life-qualified key and never rewritten, so there is nothing to HEAD, and the plan below is
+        /// derived from durable state a successor leader derives too. A moved incarnation, changed
+        /// row/life, missing or unreadable authority object, or changed owner/sequence stops the whole
+        /// cleanup pass; continuing with another chunk would turn a refusal into a fallback.
+        const auto authorityHolds = [&](const String & first_key) -> bool
         {
-            const std::optional<Meta> h = op.head(key, Retry::standard());
-            if (!h)
-                return true;
-
             try
             {
                 const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(op, layout);
@@ -3578,8 +3581,8 @@ void Gc::cleanupRefObjects(
                     || !current_life || *current_life != life)
                 {
                     LOG_DEBUG(logger,
-                        "CAS GC ref cleanup stopped before deleting '{}': catalog observation/life moved",
-                        key);
+                        "CAS GC ref cleanup stopped before the chunk starting at '{}': catalog observation/life moved",
+                        first_key);
                     return false;
                 }
 
@@ -3587,8 +3590,8 @@ void Gc::cleanupRefObjects(
                 if (!current_state_object)
                 {
                     LOG_WARNING(logger,
-                        "CAS GC ref cleanup stopped before deleting '{}': mandatory gc/state is absent",
-                        key);
+                        "CAS GC ref cleanup stopped before the chunk starting at '{}': mandatory gc/state is absent",
+                        first_key);
                     return false;
                 }
                 const GcState current_state = decodeGcState(current_state_object->bytes);
@@ -3596,21 +3599,17 @@ void Gc::cleanupRefObjects(
                     || current_state.lease.seq != adopted_lease.seq)
                 {
                     LOG_DEBUG(logger,
-                        "CAS GC ref cleanup stopped before deleting '{}': GC fence moved",
-                        key);
+                        "CAS GC ref cleanup stopped before the chunk starting at '{}': GC fence moved", first_key);
                     return false;
                 }
             }
             catch (const std::exception & e)
             {
                 LOG_WARNING(logger,
-                    "CAS GC ref cleanup stopped before deleting '{}': authority revalidation failed: {}",
-                    key, e.what());
+                    "CAS GC ref cleanup stopped before the chunk starting at '{}': authority revalidation failed: {}",
+                    first_key, e.what());
                 return false;
             }
-
-            op.remove(key, h->etag, Retry::standard());
-            ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted);   /// cleanup object deletion
             return true;
         };
 
@@ -3645,30 +3644,35 @@ void Gc::cleanupRefObjects(
 
         const RefCleanupPlan plan = planRefCleanup(
             listing, durable_cursor, checkpoint_snapshot_id, retained_log_proof);
+        std::vector<WriteOnceKey> cohort;
+        cohort.reserve(plan.deletable_logs.size() + plan.deletable_snapshots.size());
         for (const RefTxnId & log_id : plan.deletable_logs)
-        {
-            /// Cumulative per-round cap, never amortized against the per-key fail-close
-            /// validation `deleteRefObject` performs (HEAD + catalog re-read + gc/state re-read before
-            /// every exact delete stays exactly as expensive per key as before). Exhaustion simply stops
-            /// the round's cleanup pass here; `planRefCleanup` recomputes the SAME remaining candidates
-            /// from durable state next round, so nothing here needs its own cursor.
-            if (!work_budget.refCleanupAvailable())
-                return;
-            if (!deleteRefObject(layout.refLogKey(life, log_id)))
-                return;
-            ++work_budget.ref_cleanup_objects_used;
-        }
+            cohort.push_back(layout.writeOnceRefLogKey(life, log_id));
         for (const RefTxnId & snap_id : plan.deletable_snapshots)
         {
-            /// Task 5's rule, asserted where it is acted on rather than only where it is computed: the
-            /// snapshot the checkpoint names is the one a recovering reader will sample, so it must
+            /// The snapshot the checkpoint names is the one a recovering reader will sample, so it must
             /// survive every cleanup that the same checkpoint authorized.
             chassert(snap_id < checkpoint_snapshot_id);
+            cohort.push_back(layout.writeOnceRefSnapshotKey(life, snap_id));
+        }
+
+        const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
+        for (size_t begin = 0; begin < cohort.size(); begin += chunk_keys)
+        {
+            /// Cumulative per-round cap in KEYS, exactly as before; a chunk is cut to what remains. The
+            /// plan recomputes the same remaining candidates from durable state next round, so nothing
+            /// here needs its own cursor.
             if (!work_budget.refCleanupAvailable())
                 return;
-            if (!deleteRefObject(layout.refSnapshotKey(life, snap_id)))
+            size_t end = std::min(cohort.size(), begin + chunk_keys);
+            if (work_budget.max_ref_cleanup_objects != 0)
+                end = std::min(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
+            std::vector<WriteOnceKey> chunk(cohort.begin() + begin, cohort.begin() + end);
+            if (!authorityHolds(chunk.front().str()))
                 return;
-            ++work_budget.ref_cleanup_objects_used;
+            op.removeManyWriteOnce(chunk, Retry::standard());
+            work_budget.ref_cleanup_objects_used += chunk.size();
+            ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted, chunk.size());   /// cleanup object deletion
         }
     }
 }
