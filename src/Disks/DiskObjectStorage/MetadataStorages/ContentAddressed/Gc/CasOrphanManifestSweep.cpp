@@ -42,7 +42,8 @@ void onGcEnumerationPage()
 /// mount there is no deletion authority, so the caller must leave the prefix untouched. The mount's
 /// `writer_epoch` and `min_active_build_sequence` are the single durable epoch/floor pair used for eligibility, including
 /// across process replacement and the retired sentinel.
-std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns)
+std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns,
+                                            uint64_t * reads = nullptr)
 {
     const String & value = ns.string();
     size_t pos = value.size();
@@ -55,6 +56,8 @@ std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & la
         const String server_root_id = value.substr(0, pos);
         if (!server_root_id.empty())
         {
+            if (reads)
+                ++*reads;
             if (const auto got = op.read(layout.mountKey(server_root_id), Retry::standard()))
                 return decodeMountLease(got->bytes);
         }
@@ -480,7 +483,13 @@ namespace
 /// debris drains after a process restart even when its build_sequence is above the current min_active_build_sequence.
 bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix)
 {
-    const auto floor = floorForNamespace(op, layout, ns);
+    return prefixEligibleUnder(floorForNamespace(op, layout, ns), prefix);
+}
+
+}
+
+bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix)
+{
     if (!floor)
         return false;
 
@@ -492,8 +501,6 @@ bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamesp
     if (w.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
         return true;   /// farewell/retired sentinel: every seq is retired
     return w.min_active_build_sequence > prefix.build_sequence;
-}
-
 }
 
 bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
@@ -662,7 +669,10 @@ ManifestSweepResult planManifestCursorPage(
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     catalog_cut.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
 
-    std::map<String, bool> eligible_by_prefix;
+    /// One floor observation per namespace for the whole page. Every build of a namespace is judged
+    /// against the same mount body; reading it per build prefix would cost three requests per listed
+    /// key on a pool where every INSERT is its own build.
+    std::map<String, std::optional<MountLease>> floor_by_ns;
     std::map<String, NamespaceFoldView> view_by_ns;
     std::map<String, std::set<String>> active_by_ns;
     std::set<String> errored_namespaces;   /// protection view unavailable => skip, never delete
@@ -711,13 +721,13 @@ ManifestSweepResult planManifestCursorPage(
         const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
         if (catalog_entry)
         {
-            const String eligibility_key = parsed->ns.string() + "\n"
-                + std::to_string(parsed->prefix.writer_epoch) + "\n"
-                + std::to_string(parsed->prefix.build_sequence);
-            auto [eligible_it, eligible_inserted] = eligible_by_prefix.emplace(eligibility_key, false);
-            if (eligible_inserted)
-                eligible_it->second = prefixEligible(store, parsed->ns, parsed->prefix);
-            if (!eligible_it->second)
+            auto [floor_it, floor_inserted] = floor_by_ns.emplace(parsed->ns.string(), std::nullopt);
+            if (floor_inserted)
+            {
+                ++result.floor_lookups;
+                floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
+            }
+            if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
             {
                 ++result.skipped;
                 decided_through = listed.key;

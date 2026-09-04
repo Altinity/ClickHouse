@@ -1180,6 +1180,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("list_budget_keys", store->poolConfig().manifest_sweep_list_budget_keys);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
         t.metric("listed", sweep.listed);
+        t.metric("floor_lookups", sweep.floor_lookups);
+        t.metric("floor_reads", sweep.floor_reads);
         t.metric("deleted", sweep.deleted);
         t.metric("skipped", sweep.skipped);
         t.metric("undecodable", sweep.undecodable);
