@@ -253,7 +253,8 @@ bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypeP
         return false;
 
     Int32 unused_field_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
-    auto expected_type = Iceberg::getIcebergType(type, unused_field_id);
+    auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
+    auto expected_type = Iceberg::getIcebergType(type, unused_field_id, format_version);
 
     auto fields = current_schema->getArray(Iceberg::f_fields);
     for (UInt32 i = 0; i < fields->size(); ++i)
@@ -310,7 +311,8 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
         return false;
 
     Int32 unused_field_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
-    auto expected_type = Iceberg::getIcebergType(type, unused_field_id);
+    auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
+    auto expected_type = Iceberg::getIcebergType(type, unused_field_id, format_version);
 
     auto fields = current_schema->getArray(Iceberg::f_fields);
     for (UInt32 i = 0; i < fields->size(); ++i)
