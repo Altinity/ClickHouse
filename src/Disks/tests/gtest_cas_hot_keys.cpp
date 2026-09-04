@@ -440,14 +440,18 @@ TEST(CASHotKeys, AThrottledHolderKeepsTheWaitersQueuedThroughItsBackoff)
         results[0] = hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(1));
     });
     parked.wait();
+    /// Each waiter is spawned only once the previous one is seen queued, so arrival order -- and so
+    /// the order they write in once the holder releases -- is the spawn order.
     for (int i = 1; i < 3; ++i)
+    {
         threads.emplace_back([&, i]
         {
             auto op = requests.admit();
             results[i] = hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(i + 1));
         });
-    while (hot_keys.queueDepthForTest("k") < 3)
-        std::this_thread::yield();
+        while (hot_keys.queueDepthForTest("k") < static_cast<size_t>(i + 1))
+            std::this_thread::yield();
+    }
     release.count_down();
     for (auto & t : threads)
         t.join();
