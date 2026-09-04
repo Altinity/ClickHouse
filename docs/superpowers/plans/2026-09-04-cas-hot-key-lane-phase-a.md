@@ -304,8 +304,6 @@ TEST(CASRequests, CleanConflictsBeforeAFaultDoNotInflateTheFaultsFirstBackoff)
     RaceMaker races(backend, clock, "k", K, /*ambiguous=*/false);
     /// After the K clean races the next attempt is ambiguous with the precondition unchanged, so the
     /// engine reissues it; that reissue's pause must be the schedule's first, not its (K+1)-th.
-    int writes_seen = 0;
-    backend->onWriteCommitted("k", [&] { ++writes_seen; });
     bool armed = false;
     backend->onBeforeWrite("k", [&]
     {
@@ -505,6 +503,7 @@ Create `src/Disks/tests/gtest_cas_hot_keys.cpp`:
 #include <Poco/Exception.h>
 
 #include <atomic>
+#include <deque>
 #include <latch>
 #include <mutex>
 #include <optional>
@@ -604,8 +603,7 @@ TEST(CASHotKeys, SubmissionsOfOneKeyAreSerializedInArrivalOrder)
 
     std::vector<std::thread> threads;
     std::vector<std::optional<WriteResult>> results(N);
-    std::vector<std::latch> go;
-    go.reserve(N);
+    std::deque<std::latch> go;   /// a deque: `std::latch` is neither copyable nor movable
     for (int i = 0; i < N; ++i)
         go.emplace_back(1);
     for (int i = 0; i < N; ++i)
@@ -1874,15 +1872,20 @@ TEST(CASRefCatalog, ATrueRefusalOnTheReadIsTheSameAsWithoutACache)
     ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, creating), CasRefCatalog::NamespaceCreationOutcome::Live);
     const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
     const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
-    /// cancelStalledCreating against the Creating row the pool remembers: on the read it is Live.
-    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, creating, [](const CreatorFence &) { return true; }),
+    /// The caller believes it observed a Creating row under another incarnation. The pool's hint
+    /// (Creating, incarnation 1) differs from it, so the verdict is rendered on the hint and not
+    /// delivered; the read (Live, incarnation 1) differs from it too, and that verdict is the answer,
+    /// the one a cache-less call renders: one read, no write. (Had the hint matched `observed`, the
+    /// write path would run instead: a 412 and a resolve read, which the lane tests cover.)
+    const CatalogEntry observed_elsewhere = entryInState("a", NsState::Creating, 2);
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }),
               CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
     EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before) << "no write";
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
 }
 ```
 
-The remaining rows of the matrix follow the two shapes above exactly; write one test per row, named `AStaleHint...` / `ATrueRefusal...` with the function's name, using this table:
+The remaining rows of the matrix follow the two shapes above exactly; write one test per row, named `AStaleHint...` / `ATrueRefusal...` with the function's name, using this table. In every row the cached row must DIFFER from what the function was given as `observed` (or, for admission, the cached catalog must refuse) so that the verdict is rendered on the hint; when the hint agrees with `observed` the write path runs instead (a 412 and a resolve read), which `AnExternalWriterCostsOneResolveReadAndOneRetry` already covers:
 
 | function | cache holds | store holds (external) | stale-and-false expects | true-on-read expects |
 |---|---|---|---|---|
@@ -2031,14 +2034,15 @@ TEST(CASRefCatalog, TheGCEraseRacesTheLaneAsItRacesEverything)
     const CatalogEntry removing{.ns = RootNamespace{"a"}, .state = NsState::Removing,
                                 .incarnation = UInt128{7}, .removal_started_round = 13};
     CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("keep", 1));
-    /// Seed the Removing row through the external so the pool's cache is stale about it.
+    /// Seed the Removing row through the external, as raw bytes: `casUpdate` refuses to add rows, and
+    /// the point is that the pool's cache is stale about this one.
     CasOperation other = f.external.admit();
-    CasRefCatalog::casUpdate(other, layout, [&](const RefCatalog & cur)
     {
-        RefCatalog next = cur;
-        next.entries.insert(next.entries.begin(), removing);
-        return next;
-    });
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(other, layout);
+        RefCatalog with_removing = snap.catalog;
+        with_removing.entries.insert(with_removing.entries.begin(), removing);   /// "a" sorts before "keep"
+        (void)orThrow(other.replace(layout.refCatalogKey(), encodeRefCatalog(with_removing), *snap.etag, Retry::standard()), "seed");
+    }
     CasFoldSeal ready_parent;
     ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
