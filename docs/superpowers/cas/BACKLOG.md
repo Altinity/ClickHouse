@@ -59,6 +59,25 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### `[cas-s3-lane-put-timeout-logged-at-error]` A stalled single-attempt PUT is logged at Error and fails a stateless test whose write succeeded (2026-09-04) {#cas-s3-lane-put-timeout-logged-at-error}
+
+Seen on the local CA-s3 stateless lane (run 2 after the 404-scope fix): `<Error> WriteBufferFromS3:
+S3Exception … Timeout … key cas_s3/cas/ref_catalog` reaches the client's stderr and fails the test
+although stdout is right. Root cause (`docs/superpowers/cas/2026-09-04-put-timeout-error-log-rca.md`):
+the request engine issues writes through the single-attempt client with `attempt_timeout_ms` = 5000
+(`CasRequestBudget` default) and `WriteBufferFromS3` bounded to one attempt, so a stall past 5 s throws
+once and `WriteBufferFromS3.cpp` logs it at Error once; the engine then classifies the timeout as
+ambiguous, resolves by a read and reissues to the deadline — the write lands, the log line stays. This
+predates the request-contract migration (same client, timeout and log site before it); it surfaces
+locally under the full parallel suite hammering one S3 endpoint.
+
+Recommended fix (not applied — it touches the upstream slice `src/IO/WriteBufferFromS3.cpp`, consult
+first): a thread-local log-severity scope modelled on `Expect404ResponseScope`, opened by the request
+engine's write loop around its single-attempt writes, that downgrades only the timeout/network-stall
+class at that one `LOG_ERROR` site to Info while still counting `WriteBufferFromS3RequestsErrors`; an
+ordinary non-CAS timeout keeps logging at Error. The engine's ambiguity handling is untouched by design.
+Until then the class is attributable on the lane by its exact line and key.
+
 ### From the engine fix-round review (2026-09-04) {#engine-fix-round-review-2026-09-04}
 
 - **Spec drift.** `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md` (revision 13)
@@ -187,7 +206,7 @@ code before being touched; comments now state the reason and drop plan/review pr
 - `task-7-report.md` (workspace only): "no caller reaches them yet" — legacy write verbs reach `write`/`remove` through the forwarders; the accurate claim is that no assertion needs a per-key write counter.
 - U10 review prose batch (units/U10-review.md P7): the `PLANES` doc in `Pool/CasServerRoot.h` promising a `Liveness` no production caller passes — `CasMountRuntime::installRenewer` (renamed from `installKeeper`) supplies none either. `CasServerRoot.h` is a forbidden file for the source-comment pass; left for the engine-defect pass.
 - U9 prose (units/U9-rereview.md NEW-3): `Pool/CasPartWriteTxn.cpp`'s `reconcileMetaClean` create-first gate comment over-states what an absent observation implies (an absent body does not imply an absent marker). Forbidden file for the source-comment pass; left for the engine-defect pass.
-- LOCK TASK item: delete the callerless `stagingPutIfAbsentMutable` and `stagingConditionalOverwrite` on `Pool` and `CasRefLedger` (the mount-plane doors the U9 fix closed). Not a comment or a requested rename, and `Pool` is defined in the forbidden `Pool/CasPool.cpp`; left for a task authorized to touch it.
+- RESOLVED: the callerless `stagingPutIfAbsentMutable`/`stagingConditionalOverwrite` LOCK TASK item above is stale — `grep -rn` over `src/` and `programs/` finds no such symbol anywhere in the tree; the deletion already happened.
 - U6 re-review prose (units/U6-rereview.md F4, `Pool/CasRefCatalog.cpp`): its two internal-document-reference sites (the header and test-file sweep did not reach `.cpp`, a forbidden file for the source-comment pass); left for the engine-defect pass.
 - Engine test seam (if the checkpoint shows jitter-dependent reds): `Retry::backoff` draws full jitter with no test seam, so a test driving an ambiguity under `untilLeaseSafe` with a short remaining lease is a coin flip; a `setBackoffFnForTest` on `CasRequests` (used by `pauseAndReissue`) would make it deterministic. `MountLeaseRenewer::renewOn`'s (renamed from `MountLeaseKeeper`) `catch (...)` arm reports `attempts_sent = 0` — an exception that escaped the engine carries no count; document at the field. `Pool/CasServerRoot.h` is a forbidden file for the source-comment pass; left for the engine-defect pass.
 - Product question from the lock (2026-09-03): `CAS_WRITE_UNATTRIBUTED` is unreachable on the Native/S3 write path now — its only throw site was the deleted legacy minter, and the request engine settles a 2xx whose value fits no grammar by a resolve read (`GaveUp{Unresolved}` at the deadline). Decide whether a distinct unattributed-write signal is wanted (an event/counter) or the error code is retired; the three tests that pinned the throw now pin the give-up. (Spec revision 13 records this as an open product question rather than deciding it — see [the rulings doc](2026-09-03-request-contract-rulings.md).)
