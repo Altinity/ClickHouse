@@ -156,11 +156,20 @@ public:
     std::set<String> hidden_keys;
     std::set<String> phantom_list_keys;
 
-    /// Every CREATING write of a key containing this substring throws a PLAIN (non-`DB::Exception`)
-    /// error, which is ambiguous by construction -- never a proven refusal. Persistent rather than
-    /// one-shot on purpose: the subject is what recovery does when the store KEEPS refusing to say
-    /// whether the write landed.
+    /// Every CREATING write of a key containing this substring throws `Poco::TimeoutException`, the
+    /// class the request engine classifies as an unresolved transport fault and reissues under
+    /// `Retry::standard()` -- a plain `std::exception` is instead the engine's signal for "this could
+    /// not have landed" and propagates on the FIRST attempt (`CasRequests.cpp`'s
+    /// `!dynamic_cast<const Poco::Exception *>(&e)` arms), which is a proven-not-landed verdict, not the
+    /// ambiguity this fixture means to model. Persistent rather than one-shot on purpose: the subject is
+    /// what recovery does when the store KEEPS refusing to say whether the write landed.
     String ambiguous_put_substr;
+
+    /// Every attempt the `ambiguous_put_substr` fault intercepted, counted here because the throw below
+    /// happens before delegating to `CountingBackend::write` -- its own per-key counters never see a
+    /// faulted attempt at all. A test proves the engine actually reissued (rather than giving up after
+    /// one attempt) by reading this after the call.
+    std::atomic<uint64_t> ambiguous_put_attempts{0};
 
     /// Persistent thrown response for a matching CONDITIONAL replace of the mutable checkpoint. The
     /// ref-log create has already completed when tests arm this, producing the exact one-successor
@@ -204,7 +213,10 @@ public:
         if (!expected_value)
         {
             if (!ambiguous_put_substr.empty() && key.find(ambiguous_put_substr) != String::npos)
-                throw std::runtime_error("injected ambiguous create");
+            {
+                ambiguous_put_attempts.fetch_add(1);
+                throw Poco::TimeoutException("injected ambiguous create");
+            }
             return CountingBackend::write(key, bytes, expected_value, access);
         }
         if (before_cas_put)
@@ -371,9 +383,13 @@ PoolConfig walkTestConfig()
     return config;
 }
 
-PoolPtr openWalkPool(const BackendPtr & backend, PoolConfig config = walkTestConfig())
+template <typename BackendT>
+PoolPtr openWalkPool(const std::shared_ptr<BackendT> & backend, PoolConfig config = walkTestConfig())
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend, config.pool_prefix);
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the fence math the recovery walk drives matches what admits.
+    backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);
     return Pool::open(backend, std::move(config));
 }
 
@@ -1940,9 +1956,15 @@ TEST(CASRefRecoveryCasWalk, UnresolvedSealSlotFailsClosedWithoutInstalling)
     store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
     backend->ambiguous_put_substr = "/_log/";
 
+    const uint64_t fake_now_before = fake_now;
     EXPECT_ANY_THROW(store->listRefs(ns));
     EXPECT_FALSE(store->refTableRecoveredForTest(ns))
         << "a table whose dead epoch may or may not be closed must never be exposed as recovered";
+    /// The engine reissued -- more than one physical attempt -- and paid a real retry pause on the
+    /// injected clock before giving up; a fault settled by a single, unretried attempt would not
+    /// exercise the transient-retry path this test's own name and docstring claim to drive.
+    EXPECT_GT(backend->ambiguous_put_attempts.load(), 1u);
+    EXPECT_GT(fake_now, fake_now_before);
 }
 
 /// ---------------------------------------------------------------------------------------------
