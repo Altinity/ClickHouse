@@ -25,6 +25,7 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsBool gc_enabled;
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
+    extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsString scratch_path;
 }
 
@@ -184,6 +185,27 @@ TEST(CASContentAddressedSettings, InvalidBoundsDiagnosticNamesExternalConfigKeys
         ErrorCodes::BAD_ARGUMENTS,
         "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_read_concurrency must be >= 1 "
         "(got 60, 1, 0)");
+}
+
+TEST(CASSettings, BulkDeleteChunkKeysBoundsAreEnforced)
+{
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_bulk_delete_chunk_keys>1001</cas_gc_bulk_delete_chunk_keys>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "content_addressed disk: gc_bulk_delete_chunk_keys must be between 1 and 1000 (got 1001)");
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_bulk_delete_chunk_keys>0</cas_gc_bulk_delete_chunk_keys>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "content_addressed disk: gc_bulk_delete_chunk_keys must be between 1 and 1000 (got 0)");
+
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_bulk_delete_chunk_keys>1</cas_gc_bulk_delete_chunk_keys>");
+    ContentAddressedSettings s;
+    EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
+    EXPECT_EQ(s[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value, 1u);
 }
 
 TEST(CASContentAddressedSettings, InvalidEnumDiagnosticsNameExternalConfigKeys)

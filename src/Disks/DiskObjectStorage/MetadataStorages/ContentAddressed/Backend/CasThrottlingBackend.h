@@ -88,6 +88,13 @@ public:
         return inner->remove(key, expected_value, access);
     }
 
+    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override
+    {
+        for (const WriteOnceKey & key : keys)
+            refuseOrPass(key.str());
+        inner->removeManyWriteOnce(keys, access);
+    }
+
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {

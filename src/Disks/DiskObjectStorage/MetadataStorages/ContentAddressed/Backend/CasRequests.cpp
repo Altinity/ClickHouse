@@ -543,6 +543,23 @@ void CasOperation::forEachListedKey(const String & prefix, const ListedKeyFn & f
     }
 }
 
+void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, const Retry & policy)
+{
+    if (keys.size() > kBulkDeleteMaxKeys)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS removeManyWriteOnce: {} keys in one chunk, the limit is {}; the consumer chunks its input",
+            keys.size(), kBulkDeleteMaxKeys);
+    if (keys.empty())
+        return;
+    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const String subject = fmt::format("{} (+{} keys)", keys.front().str(), keys.size() - 1);
+    readLoop("removeManyWriteOnce", subject, policy, bound, [&](auto & access)
+    {
+        owner.backend->removeManyWriteOnce(keys, access);
+        return true;
+    });
+}
+
 Removal CasOperation::remove(const String & key, const Etag & seen, const Retry & policy)
 {
     return removeUnder(key, owner.valueFor(key, seen), policy, policy.bind(owner.now_ms()));

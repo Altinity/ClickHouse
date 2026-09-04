@@ -15,6 +15,8 @@ extern const Event CASBlobGetStream;
 extern const Event CASBlobDelete;
 extern const Event CASBlobList;
 
+extern const Event CASBulkDeleteRequests;
+
 extern const Event CASManifestPut;
 extern const Event CASManifestPutDeduplicated;
 extern const Event CASManifestOverwrite;
@@ -142,6 +144,14 @@ void InstrumentedBackend::publish(const BlobPublishRequest & request, TransportA
 {
     inner->publish(request, access);
     incrementCasEvent(classifyCasNs(request.destination_key), CasOp::Put);
+}
+
+void InstrumentedBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access)
+{
+    inner->removeManyWriteOnce(keys, access);
+    ProfileEvents::increment(ProfileEvents::CASBulkDeleteRequests);
+    for (const WriteOnceKey & key : keys)
+        incrementCasEvent(classifyCasNs(key.str()), CasOp::Delete);
 }
 
 }

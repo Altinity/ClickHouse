@@ -46,6 +46,19 @@ public:
     /// but its expected value is rechecked when it is landed.
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override;
 
+    /// Deletes every present key with no precondition; an absent key is success. Honours
+    /// `hold_deletes_` exactly as `remove` does: a held delete is queued and lands only on
+    /// `landPendingDelete`.
+    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
+    /// The next `removeManyWriteOnce` throws `error` instead of deleting anything; one-shot, like
+    /// `failNextWriteWith`.
+    void failNextBulkRemoveWith(std::exception_ptr error);
+    /// Runs before a `removeManyWriteOnce` applies, with no backend lock held, on the attempt that
+    /// will delete (an armed failure fires first and skips the hook).
+    void onBeforeBulkRemove(std::function<void()> hook);
+    /// How many `removeManyWriteOnce` calls reached the store, armed failures included.
+    size_t bulkRemoveCalls() const;
+
     /// Creates the key when `expected_value` is empty, or replaces the incarnation it names. A
     /// refused precondition leaves the store unchanged. Value enforcement can be disabled with
     /// `setEnforceTokens` to model a backend that incorrectly ignores the condition.
@@ -207,6 +220,9 @@ private:
     ArmedFailures head_failures_;
     Hooks before_write_hooks_;
     Hooks write_committed_hooks_;
+    std::vector<std::exception_ptr> armed_bulk_remove_failures_;
+    std::function<void()> before_bulk_remove_hook_;
+    size_t bulk_remove_calls_ = 0;
 };
 
 }

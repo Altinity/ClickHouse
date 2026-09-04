@@ -94,6 +94,10 @@ public:
     /// returning a write-response value. Streaming uses ordinary write settings; staged bytes require
     /// a native same-store copy.
     void publish(const BlobPublishRequest & request, TransportAccess & access) override;
+    /// Removes up to 1000 write-once keys in one request. Native mode issues one `DeleteObjects`
+    /// under the control-plane profile; `EmulatedSingleProcess` deletes each present key under the
+    /// emulation lock with the same token bookkeeping as the single-key delete.
+    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
     /// Native mints its store's own dialect (ETag or GCS generation); the emulated adapter mints its
     /// own values.
     Dialect dialect() const override { return mode == Mode::Native ? native_token_type : Dialect::Emulated; }
@@ -264,6 +268,8 @@ private:
     /// has been validated, and the rename keeps publication atomic. Takes `emu_mutex` itself (for the
     /// rename + token-state bump only); the caller must NOT hold it.
     void emuPublishBlobAtomically(const String & key, const String & envelope, ReadBuffer & payload, uint64_t payload_size);
+    /// Caller holds emu_mutex: the token bookkeeping after a delete at `key`.
+    void emuForgetDeletedToken(const String & key);
     /// Return the current emulated token for a key we just read/HEAD'd, reflecting its on-disk etag —
     /// does NOT advance the same-etag disambiguator (that only applies to a just-completed write).
     String emuObserveToken(const String & key);

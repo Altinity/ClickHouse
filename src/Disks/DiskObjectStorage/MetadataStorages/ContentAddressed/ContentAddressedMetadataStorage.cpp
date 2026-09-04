@@ -82,6 +82,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
     extern const ContentAddressedSettingsUInt64 gc_read_concurrency;
+    extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
@@ -302,6 +303,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
     , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
     , gc_read_concurrency(settings_[ContentAddressedSetting::gc_read_concurrency].value)
+    , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
     , staging_backend(settings_.stagingBackend())
@@ -775,6 +777,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.gc_read_concurrency = gc_read_concurrency;
+    pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
     pool_config.event_sink = makeCasEventSink();
