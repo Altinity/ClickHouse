@@ -90,6 +90,17 @@ budget as errors", motivated by GCS's ~1 write/s per-object budget) but never an
 many independent writers on one hot key. Pre-migration, the catalog loop retried a conflict at once,
 capped at 100 attempts. Verdict: spec-conformant, unfair by construction under sustained arrivals.
 
+DROP TABLE is the same starvation, measured on one 33.6 s drop (table `6f6ae69d…`, two parts): the
+query waited 18 s in the drop queue behind other drops, `dropAllData` then spent 1.0 s on two
+`delete_tmp` ref repoints (~0.5 s per part) and **15.4 s in "removing table directory recursive"**,
+which is ONE namespace-removal conditional write on `ref_catalog` that lost eight races in a row
+(`WriteBufferFromS3 was canceled` at +0.03, +0.21, +0.37, +0.71, +1.8, +4.5, +8.1, +12.3 s — the
+growing conflict backoff) before landing; the worker thread then immediately took the next table.
+Sixteen drop workers were active, all bottlenecked on that one key: drops complete in bursts of ~10 per
+5 s with gaps. The query thread itself issues zero S3/CAS calls (all per-query counters are 0); it only
+waits. So a DROP is, as designed, one catalog write plus one ref write per part — and the catalog
+write is what costs seconds.
+
 Fix, two halves, in this order:
 
 1. **Serialize within a process and remember the last committed state (user's proposal, primary).**
