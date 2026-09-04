@@ -85,8 +85,8 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   controller checks that one configured attempt still fits before each backend `PUT` or resolving
   `GET`, after each interruptible backoff, and before accepting success. A retry, `GET`, response
   timestamp, or wall-clock step never extends authority.
-- **Cadence.** The runtime normally starts a logical renewal every `mount_renew_period` (default
-  10 s), with TTL `mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
+- **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
+  10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
   catch-up beat when the nominal cadence has elapsed; it does not wait a fresh full period after the
   response.

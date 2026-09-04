@@ -77,6 +77,8 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_round_prefix_wholesale_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_handoff_prefix_wholesale_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_outcome_entry_budget;
+    extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
+    extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
@@ -294,6 +296,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_round_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_prefix_wholesale_budget].value)
     , gc_round_handoff_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_handoff_prefix_wholesale_budget].value)
     , gc_round_outcome_entry_budget(settings_[ContentAddressedSetting::gc_round_outcome_entry_budget].value)
+    , mount_lease_ttl(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_lease_ttl_ms].value))
+    , mount_renew_period(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_renew_period_ms].value))
     , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
     , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
@@ -790,6 +794,8 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
     pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
+    pool_config.mount_lease_ttl_ms = mount_lease_ttl;
+    pool_config.mount_renew_period = mount_renew_period;
     pool_config.event_sink = makeCasEventSink();
 
     PoolView view;

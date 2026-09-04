@@ -70,6 +70,8 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_round_prefix_wholesale_budget, 20000, "Generation-prefix wholesale delete (prune only) object cap per round (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_handoff_prefix_wholesale_budget, 5000, "Post-CAS hand-off generation-prefix reclaim object cap per round, reserved separately from gc_round_prefix_wholesale_budget so a prune-heavy round cannot starve the one-shot hand-off (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_outcome_entry_budget, 5000, "GcOutcomes per-round entry cap across the redelete/spared audit log (0 = unbounded)", 0) \
+    DECLARE(UInt64, mount_lease_ttl_ms, 30000, "Mount lease validity after a successful claim or renewal, in milliseconds", 0) \
+    DECLARE(UInt64, mount_renew_period_ms, 10000, "Interval between background mount lease renewals, in milliseconds", 0) \
     DECLARE(String, server_root_id, "", "REQUIRED explicit layout subtree identity; macros expand as in the s3 endpoint", 0) \
     DECLARE(UInt64, part_folder_cache_bytes, 64ULL << 20, "Part-folder view cache byte budget (0 disables retention)", 0) \
     DECLARE(UInt64, part_folder_cache_max_entries, 10000, "Part-folder view cache entry cap", 0) \
@@ -227,6 +229,16 @@ void ContentAddressedSettings::validate()
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "content_addressed disk: cas_gc_interval_sec and cas_gc_shards must be >= 1 (got {}, {})",
             settings[ContentAddressedSetting::gc_interval_sec].value, settings[ContentAddressedSetting::gc_shards].value);
+
+    if (settings[ContentAddressedSetting::mount_lease_ttl_ms] == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: cas_mount_lease_ttl_ms must be >= 1 (got {})",
+            settings[ContentAddressedSetting::mount_lease_ttl_ms].value);
+
+    if (settings[ContentAddressedSetting::mount_renew_period_ms] == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: cas_mount_renew_period_ms must be >= 1 (got {})",
+            settings[ContentAddressedSetting::mount_renew_period_ms].value);
 
     /// The layout subtree identity is explicit and REQUIRED — no default, so an ABSENT key throws a
     /// typed `NO_ELEMENTS_IN_CONFIG` (mirroring the `metadata_type` check in `MetadataStorageFactory`),
