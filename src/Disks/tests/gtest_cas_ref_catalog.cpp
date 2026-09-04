@@ -1,5 +1,6 @@
 #include "cas_format_test_battery.h"
 #include "cas_test_helpers.h"
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/ProfileEvents.h>
@@ -12,12 +13,14 @@
 #include <fmt/format.h>
 #include <algorithm>
 #include <expected>
+#include <latch>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -25,6 +28,8 @@
 #include <magic_enum.hpp>
 
 using namespace DB::Cas;
+using DB::Cas::tests::CountingBackend;
+using DB::Cas::tests::FakeClock;
 
 namespace ProfileEvents
 {
@@ -2135,4 +2140,581 @@ TEST(CASGCRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
     successor_lives.emplace(UInt128{9}, RefLifeFoldState{});
     EXPECT_EQ(plan.row(UInt128{2}).fold_state.coverage.last_folded_ref_id, (RefTxnId{2, 3}));
     EXPECT_FALSE(plan.contains(UInt128{9}));
+}
+
+/// ---------- Pool/CasRefCatalog: mutations through the pool's hot-key lane ----------
+
+namespace ProfileEvents
+{
+    extern const Event CASHotKeyReadStarts;
+    extern const Event CASHotKeyCacheVerdictsReread;
+    extern const Event CASRequestConflictPause;
+    extern const Event CASRequestReissue;
+}
+
+namespace
+{
+
+#if USE_AWS_S3
+std::exception_ptr s3Error(Aws::S3::S3Errors code, const String & name)
+{
+    return std::make_exception_ptr(DB::S3Exception("the store answered " + name, code, name));
+}
+#endif
+
+/// A pool's own engine: a `CasRequests` over the pool's shared lane with a cache, on a fake clock,
+/// beside a plain `CasRequests` that stands for another server.
+struct PoolAndExternal
+{
+    explicit PoolAndExternal(std::shared_ptr<CountingBackend> backend_)
+        : backend(std::move(backend_))
+        , hot_keys(16ULL << 20)
+        , pool(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys)
+        , external(DB::Cas::tests::openRequestsForTest(backend))
+    {
+    }
+    std::shared_ptr<CountingBackend> backend;
+    FakeClock clock;
+    CasHotKeys hot_keys;
+    CasRequests pool;
+    CasRequests external;
+};
+
+uint64_t eventCount(ProfileEvents::Event event)
+{
+    return ProfileEvents::global_counters[event].load();
+}
+
+}
+
+TEST(CASRefCatalog, AStaleHintNeverProducesAFalseEntryChanged)
+{
+    /// The pool's last catalog write left "a" Creating; another server completed it to Live. The
+    /// caller reads fresh, sees Live, and calls beginRemoving: the cached Creating row differs from
+    /// what it observed and would say EntryChanged. That verdict is not delivered.
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry creating = entryInState("a", NsState::Creating, 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, creating);   /// through the lane: the cache holds Creating
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, creating), CasRefCatalog::NamespaceCreationOutcome::Live);
+
+    const CatalogEntry observed = CasRefCatalog::read(other, layout).catalog.entries.at(0);
+    ASSERT_EQ(observed.state, NsState::Live);
+    const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
+    const uint64_t rereads_before = eventCount(ProfileEvents::CASHotKeyCacheVerdictsReread);
+    EXPECT_EQ(CasRefCatalog::beginRemoving(pool_op, layout, observed, 7), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
+    EXPECT_EQ(eventCount(ProfileEvents::CASHotKeyCacheVerdictsReread) - rereads_before, 1u);
+    EXPECT_EQ(CasRefCatalog::read(other, layout).catalog.entries.at(0).state, NsState::Removing);
+}
+
+TEST(CASRefCatalog, ATrueRefusalOnTheReadIsTheSameAsWithoutACache)
+{
+    /// The row really changed: the re-rendered verdict is the one a cache-less call renders.
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry creating = entryInState("a", NsState::Creating, 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, creating);
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, creating), CasRefCatalog::NamespaceCreationOutcome::Live);
+    const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
+    const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
+    /// The caller believes it observed a Creating row under another incarnation. The pool's hint
+    /// (Creating, incarnation 1) differs from it, so the verdict is rendered on the hint and not
+    /// delivered; the read (Live, incarnation 1) differs from it too, and that verdict is the answer,
+    /// the one a cache-less call renders: one read, no write. (Had the hint matched `observed`, the
+    /// write path would run instead: a 412 and a resolve read, which the lane tests cover.)
+    const CatalogEntry observed_elsewhere = entryInState("a", NsState::Creating, 2);
+    EXPECT_EQ(CasRefCatalog::cancelStalledCreating(pool_op, layout, observed_elsewhere, [](const CreatorFence &) { return true; }),
+              CasRefCatalog::StalledCreatingCancelOutcome::EntryChanged);
+    EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before) << "no write";
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
+}
+
+/// createNamespaceStep1 via createNamespace: the cache holds row "a" (Live), the external erased it
+/// via a completed removal.
+TEST(CASRefCatalog, AStaleHintCreateNamespaceStep1AdmitsANewIncarnation)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    ASSERT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
+              CasRefCatalog::NamespaceCreationOutcome::Live);   /// the cache now holds "a" Live
+
+    CasOperation other = f.external.admit();
+    const CatalogEntry observed = CasRefCatalog::read(other, layout).catalog.entries.at(0);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed, 9), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(observed.incarnation, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    const CatalogEntry removing{.ns = RootNamespace{"a"}, .state = NsState::Removing,
+                                .incarnation = observed.incarnation, .removal_started_round = 9};
+    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
+              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+
+    const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
+    EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
+              CasRefCatalog::NamespaceCreationOutcome::Live);
+    /// Two reads, not one: `createNamespace`'s own pre-check (`read`) never goes through the lane, so
+    /// it always issues its own request regardless of the cache; the lane's ONE read is the one
+    /// `createNamespaceStep1` pays for finding its cached hint stale.
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 2u) << "the pre-check read plus one lane read";
+}
+
+/// createNamespaceStep1: the store holds "a" Creating under another creator -- Superseded on the read.
+TEST(CASRefCatalog, ATrueRefusalCreateNamespaceStep1SeesASuperseder)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    ASSERT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
+              CasRefCatalog::NamespaceCreationOutcome::Live);
+
+    CasOperation other = f.external.admit();
+    const CatalogEntry observed = CasRefCatalog::read(other, layout).catalog.entries.at(0);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed, 9), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(observed.incarnation, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    const CatalogEntry removing{.ns = RootNamespace{"a"}, .state = NsState::Removing,
+                                .incarnation = observed.incarnation, .removal_started_round = 9};
+    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
+              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    /// Admitted directly, rather than through a full `createNamespace` (which would also run
+    /// `completeCreation` and land "a" Live): the store must hold a plain Creating row under
+    /// `other_creator`, the shape this matrix row names.
+    const CreatorFence other_creator{.server_root_id = "other", .writer_epoch = 1, .fence_generation = 1};
+    CatalogEntry other_creating = entryInState("a", NsState::Creating, 5);
+    other_creating.creator = other_creator;
+    CasRefCatalog::casAdmitEntry(other, layout, 1, other_creating);
+
+    /// The pool's cache still holds its own stale "a" (deleted above); this second create races the
+    /// namespace against a fresh Creating row from a different creator, which the pre-check read in
+    /// `createNamespace` always sees fresh -- the case this row of the matrix documents does not need
+    /// the lane's own cache to differ from the store to prove.
+    EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, 1, RootNamespace{"a"}, creator),
+              CasRefCatalog::NamespaceCreationOutcome::Superseded);
+}
+
+/// completeCreation: the cache holds "a" Creating (incarnation 1) matching the store's row for "a",
+/// but the store also gained row "b" -- the cache is stale only elsewhere, so the write goes through.
+TEST(CASRefCatalog, AStaleHintCompleteCreationLandsWhenItsOwnRowIsUnchanged)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry a_creating = entryInState("a", NsState::Creating, 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a_creating);   /// cache: "a" Creating
+
+    CasOperation other = f.external.admit();
+    const CreatorFence other_creator{.server_root_id = "other", .writer_epoch = 1, .fence_generation = 1};
+    ASSERT_EQ(CasRefCatalog::createNamespace(other, layout, 1, RootNamespace{"b"}, other_creator),
+              CasRefCatalog::NamespaceCreationOutcome::Live);
+
+    EXPECT_EQ(CasRefCatalog::completeCreation(pool_op, layout, a_creating), CasRefCatalog::NamespaceCreationOutcome::Live);
+    EXPECT_EQ(CasRefCatalog::read(other, layout).catalog.entries.size(), 2u);
+}
+
+/// completeCreation: "a" was completed to Live by the external -- Superseded on the read.
+TEST(CASRefCatalog, ATrueRefusalCompleteCreationSeesItsOwnRowCompletedElsewhere)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry a_creating = entryInState("a", NsState::Creating, 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a_creating);
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, a_creating), CasRefCatalog::NamespaceCreationOutcome::Live);
+
+    EXPECT_EQ(CasRefCatalog::completeCreation(pool_op, layout, a_creating), CasRefCatalog::NamespaceCreationOutcome::Superseded);
+}
+
+/// reconcileStaleCreator: the cache holds "a" Creating under creator X; the store's row for "a" is
+/// unchanged but the catalog gained "b" -- Reconciled.
+TEST(CASRefCatalog, AStaleHintReconcileStaleCreatorLandsWhenItsOwnRowIsUnchanged)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry a_creating = entryInState("a", NsState::Creating, 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a_creating);   /// cache: "a" Creating under creator X
+
+    CasOperation other = f.external.admit();
+    const CreatorFence other_creator{.server_root_id = "other", .writer_epoch = 1, .fence_generation = 1};
+    ASSERT_EQ(CasRefCatalog::createNamespace(other, layout, 1, RootNamespace{"b"}, other_creator),
+              CasRefCatalog::NamespaceCreationOutcome::Live);
+
+    const CreatorFence new_creator{.server_root_id = "srv2", .writer_epoch = 1, .fence_generation = 1};
+    EXPECT_EQ(CasRefCatalog::reconcileStaleCreator(pool_op, layout, a_creating, new_creator,
+                  [](const CreatorFence &) { return true; }),
+              CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
+    EXPECT_EQ(CasRefCatalog::read(other, layout).catalog.entries.size(), 2u);
+}
+
+/// reconcileStaleCreator: "a" was completed to Live by the external -- EntryChanged on the read.
+TEST(CASRefCatalog, ATrueRefusalReconcileStaleCreatorSeesItsOwnRowCompletedElsewhere)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry a_creating = entryInState("a", NsState::Creating, 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a_creating);
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::completeCreation(other, layout, a_creating), CasRefCatalog::NamespaceCreationOutcome::Live);
+
+    const CreatorFence new_creator{.server_root_id = "srv2", .writer_epoch = 1, .fence_generation = 1};
+    EXPECT_EQ(CasRefCatalog::reconcileStaleCreator(pool_op, layout, a_creating, new_creator,
+                  [](const CreatorFence &) { return true; }),
+              CasRefCatalog::ReconcileCreatorOutcome::EntryChanged);
+}
+
+/// Admission refusal (LIMIT_EXCEEDED): the pool's cache holds a catalog at the namespace limit, but
+/// the external erased one row, so the fresh catalog admits.
+TEST(CASRefCatalog, AStaleHintAdmissionRefusalAdmitsWhenTheFreshCatalogHasRoom)
+{
+    const Layout layout("p");
+    constexpr uint64_t gc_shards = 1;
+    const uint64_t cap = foldSealCaps().object_cap;
+    const uint64_t fixed = foldSealFixedBytes();
+    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
+    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, gc_shards)
+        + widestCondemnedSummaryReservationBytes(gc_shards);
+    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
+
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    CasOperation pool_op = f.pool.admit();
+    RefCatalog full;
+    full.entries.reserve(max_entries);
+    for (uint64_t i = 0; i < max_entries; ++i)
+        full.entries.push_back(liveEntry(fmt::format("ns{:012}", i), i + 1));
+    seedObject(pool_op, layout.refCatalogKey(), encodeRefCatalog(full));
+    /// Prime the cache with the full catalog: any further admission through the pool refuses on it.
+    CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, full.entries[0], 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    const CasRefCatalog::Snapshot after_remove = CasRefCatalog::read(other, layout);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(full.entries[0].incarnation, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    const CatalogEntry removing{.ns = full.entries[0].ns, .state = NsState::Removing,
+                                .incarnation = full.entries[0].incarnation, .removal_started_round = 5};
+    ASSERT_EQ(CasRefCatalog::deleteCompletedRemovingAtSnapshot(other, layout, after_remove, removing, ready_parent, noAuthorityRefresh).outcome,
+              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+
+    const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
+    EXPECT_EQ(CasRefCatalog::createNamespace(pool_op, layout, gc_shards, RootNamespace{"fresh"}, creator),
+              CasRefCatalog::NamespaceCreationOutcome::Live);
+}
+
+/// Admission refusal (LIMIT_EXCEEDED): the fresh catalog is also full -- thrown, no write.
+TEST(CASRefCatalog, ATrueRefusalAdmissionRefusalThrowsWhenTheFreshCatalogIsAlsoFull)
+{
+    const Layout layout("p");
+    constexpr uint64_t gc_shards = 1;
+    const uint64_t cap = foldSealCaps().object_cap;
+    const uint64_t fixed = foldSealFixedBytes();
+    const uint64_t reservation = worstCaseEntryFoldReservationBytes();
+    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, gc_shards)
+        + widestCondemnedSummaryReservationBytes(gc_shards);
+    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
+
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    CasOperation pool_op = f.pool.admit();
+    RefCatalog full;
+    full.entries.reserve(max_entries);
+    for (uint64_t i = 0; i < max_entries; ++i)
+        full.entries.push_back(liveEntry(fmt::format("ns{:012}", i), i + 1));
+    seedObject(pool_op, layout.refCatalogKey(), encodeRefCatalog(full));
+    CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });   /// prime the cache
+
+    const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
+    const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&]
+    {
+        (void)CasRefCatalog::createNamespace(pool_op, layout, gc_shards, RootNamespace{"overflow"}, creator);
+    });
+    EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before) << "no write";
+}
+
+/// casAdmitEntry: the cache holds "a"; the external erased it -- admits it again on the fresh read.
+TEST(CASRefCatalog, AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoom)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry a = liveEntry("a", 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a);   /// cache: "a"
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(a.incarnation, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    const CatalogEntry removing{.ns = a.ns, .state = NsState::Removing,
+                                .incarnation = a.incarnation, .removal_started_round = 5};
+    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
+              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+
+    const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
+    EXPECT_NO_THROW(CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)));
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
+}
+
+/// casAdmitEntry: "a" is still present in the fresh read (Removing, not the Live hint the cache
+/// holds) -- re-admitting it duplicates the namespace, and `encodeRefCatalog`'s own canonical-order
+/// check aborts with `LOGICAL_ERROR` under debug/sanitizer builds -- split like the blocks above.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASRefCatalog, ATrueRefusalCasAdmitEntrySeesItsRowStillPresent)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry a = liveEntry("a", 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a);
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a); });
+}
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASRefCatalogDeathTest, ATrueRefusalCasAdmitEntrySeesItsRowStillPresentAborts)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry a = liveEntry("a", 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a);
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+
+    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a); }, "not canonically ordered");
+}
+#endif
+
+TEST(CASRefCatalog, AFenceLostDuringStepOneIsFencedOutNotABareMarker)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation seed = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(seed, layout);
+    const CreatorFence creator{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1};
+
+    /// Tripped before its turn: the lane's wait refuses it, nothing is written.
+    {
+        bool alive = true;
+        CasOperation op = f.pool.admit([&] { return alive; });
+        f.hot_keys.enter_after_lane_hook_for_test = [&] { alive = false; };
+        const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
+        EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, 1, RootNamespace{"a"}, creator),
+                  CasRefCatalog::NamespaceCreationOutcome::FencedOut);
+        f.hot_keys.enter_after_lane_hook_for_test = {};
+        EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()), writes_before);
+    }
+    /// Tripped between the landed step-1 write and the post-commit check: FencedOut, and the Creating
+    /// row is durable for a later reconciler.
+    {
+        bool alive = true;
+        CasOperation op = f.pool.admit([&] { return alive; });
+        f.backend->onWriteCommitted(layout.refCatalogKey(), [&] { alive = false; });
+        EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, 1, RootNamespace{"b"}, creator),
+                  CasRefCatalog::NamespaceCreationOutcome::FencedOut);
+        f.backend->onWriteCommitted(layout.refCatalogKey(), {});
+        const auto snap = CasRefCatalog::read(seed, layout);
+        ASSERT_EQ(snap.catalog.entries.size(), 1u);
+        EXPECT_EQ(snap.catalog.entries[0].state, NsState::Creating);
+    }
+    /// casAdmitEntry under a tripped fence throws the transient-unavailable class, never a bare marker.
+    {
+        CasOperation op = f.pool.admit([] { return false; });
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
+            [&] { CasRefCatalog::casAdmitEntry(op, layout, 1, liveEntry("c", 3)); });
+    }
+}
+
+#if USE_AWS_S3
+TEST(CASRefCatalog, TheStoresAnswerToAHintsWriteIsDeliveredAndTheRetryLearnsTheRest)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    f.backend->setRefreshCredentialsResult(false);
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry observed = liveEntry("a", 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, observed);   /// the cache holds "a" Live
+
+    /// Another server moved the row on; the hint still matches what this caller observed, so a write
+    /// goes out, and the store refuses it definitively.
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, observed, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    f.backend->failNextWriteWith(layout.refCatalogKey(), s3Error(Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied"));
+    const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
+    const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::S3_ERROR,
+        [&] { (void)CasRefCatalog::beginRemoving(pool_op, layout, observed, 5); });
+    EXPECT_EQ(f.backend->writeCount(layout.refCatalogKey()) - writes_before, 1u);
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 0u);
+    /// The caller's ordinary retry after a fresh observation learns the row moved.
+    EXPECT_EQ(CasRefCatalog::beginRemoving(pool_op, layout, observed, 5), CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving);
+
+    /// The same stale hint, and the fence trips between the refused write and its resolve read.
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("b", 2));
+    const CatalogEntry b = liveEntry("b", 2);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, b, 6), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    bool alive = true;
+    CasOperation fenced = f.pool.admit([&] { return alive; });
+    f.backend->onBeforeWrite(layout.refCatalogKey(), [&] { alive = false; });
+    EXPECT_EQ(CasRefCatalog::beginRemoving(fenced, layout, b, 6), CasRefCatalog::BeginRemovingOutcome::FencedOut);
+    f.backend->onBeforeWrite(layout.refCatalogKey(), {});
+    EXPECT_EQ(CasRefCatalog::read(other, layout).catalog.entries.at(1).state, NsState::Removing) << "nothing of ours landed";
+    CasOperation readmitted = f.pool.admit();
+    EXPECT_EQ(CasRefCatalog::beginRemoving(readmitted, layout, b, 6), CasRefCatalog::BeginRemovingOutcome::AlreadyRemoving);
+}
+#endif
+
+TEST(CASRefCatalog, TheCatalogLoopPacesAConflictByWhetherItSettledAFault)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 1));
+    CasOperation other = f.external.admit();
+    const String key = layout.refCatalogKey();
+
+    /// K clean races: the external moves the catalog before each of the pool's first K writes. The
+    /// two scenarios below admit under DIFFERENT namespace prefixes -- the first scenario's "x" rows
+    /// are still on the catalog when the second starts, and re-admitting the same namespace would
+    /// duplicate it rather than race it.
+    constexpr int K = 3;
+    int moved = 0;
+    bool inside = false;
+    bool ambiguous = false;
+    String prefix = "x";
+    uint64_t incarnation_base = 10;
+    f.backend->onBeforeWrite(key, [&]
+    {
+        if (inside || moved >= K)
+            return;
+        inside = true;
+        CasRefCatalog::casAdmitEntry(other, layout, 1, liveEntry(prefix + std::to_string(moved), incarnation_base + moved));
+        if (ambiguous)
+            f.backend->injectAmbiguousWrite(key);
+        ++moved;
+        inside = false;
+    });
+    const auto pauses_before = eventCount(ProfileEvents::CASRequestConflictPause);
+    CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur)
+    {
+        RefCatalog next = cur;
+        for (auto & e : next.entries)
+            if (e.ns.string() == "a") { e.state = NsState::Removing; e.removal_started_round = 1; }
+        return next;
+    });
+    ASSERT_EQ(f.clock.sleeps.size(), static_cast<size_t>(K));
+    for (uint64_t s : f.clock.sleeps)
+        EXPECT_LE(s, 200u);
+    EXPECT_EQ(eventCount(ProfileEvents::CASRequestConflictPause) - pauses_before, 0u) << "the lane's caller pauses itself; the engine's counter is for its own loops";
+
+    /// K conflicts that each settled a fault: the growing schedule, on the loop's own count.
+    f.clock.sleeps.clear();
+    moved = 0;
+    ambiguous = true;
+    prefix = "y";
+    incarnation_base = 20;
+    CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });
+    ASSERT_EQ(f.clock.sleeps.size(), static_cast<size_t>(K));
+    for (size_t i = 0; i < f.clock.sleeps.size(); ++i)
+        EXPECT_LE(f.clock.sleeps[i], std::min<uint64_t>(5000, 200ull << i));
+}
+
+TEST(CASRefCatalog, TheGCEraseRacesTheLaneAsItRacesEverything)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry removing{.ns = RootNamespace{"a"}, .state = NsState::Removing,
+                                .incarnation = UInt128{7}, .removal_started_round = 13};
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("keep", 1));
+    /// Seed the Removing row through the external, as raw bytes: `casUpdate` refuses to add rows, and
+    /// the point is that the pool's cache is stale about this one.
+    CasOperation other = f.external.admit();
+    {
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(other, layout);
+        RefCatalog with_removing = snap.catalog;
+        with_removing.entries.insert(with_removing.entries.begin(), removing);   /// "a" sorts before "keep"
+        (void)orThrow(other.replace(layout.refCatalogKey(), encodeRefCatalog(with_removing), *snap.etag, Retry::standard()), "seed");
+    }
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    /// The erase runs on an open plane of the same pool while a lane holder is parked in its write:
+    /// it does not wait.
+    CasRequests open_plane(f.backend, Fence::open(), f.clock.nowFn(), f.clock.sleepFn(), &f.hot_keys);
+    CasOperation erase_op = open_plane.admit();
+    std::latch parked(1);
+    std::latch release(1);
+    int seen = 0;
+    f.backend->onBeforeWrite(layout.refCatalogKey(), [&]
+    {
+        if (seen++ != 0)
+            return;
+        parked.count_down();
+        release.wait();
+    });
+    std::thread holder([&]
+    {
+        CasRefCatalog::casUpdate(pool_op, layout, [](const RefCatalog & cur) { return cur; });
+    });
+    parked.wait();
+    const auto result = CasRefCatalog::deleteCompletedRemovingAtSnapshot(
+        erase_op, layout, CasRefCatalog::read(other, layout), removing, ready_parent, noAuthorityRefresh);
+    EXPECT_EQ(result.outcome, CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    EXPECT_EQ(f.hot_keys.queueDepthForTest(layout.refCatalogKey()), 1u) << "the holder is still parked";
+    release.count_down();
+    holder.join();
+    f.backend->onBeforeWrite(layout.refCatalogKey(), {});
+
+    /// The pool's next submission pays exactly one resolve read and one retry write for the erase.
+    const uint64_t reads_before = f.backend->getCount(layout.refCatalogKey());
+    const uint64_t writes_before = f.backend->writeCount(layout.refCatalogKey());
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("c", 3));
+    EXPECT_LE(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u);
+    EXPECT_LE(f.backend->writeCount(layout.refCatalogKey()) - writes_before, 2u);
+    const uint64_t reads_after = f.backend->getCount(layout.refCatalogKey());
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("d", 4));
+    EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()), reads_after) << "the one after starts from the cache";
 }
