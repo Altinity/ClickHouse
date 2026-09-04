@@ -273,11 +273,12 @@ TEST(CASBackendPrimitives, EveryBackendInstanceHasItsOwnId)
     EXPECT_EQ(a->dialect(), Dialect::Emulated);
 }
 
-/// `EveryLegacyVerbReachesAnOverrideOfThePrimitiveItForwardsTo` pinned the legacy verbs
-/// (`putIfAbsent`/`casPut`/`putOverwrite`) forwarding through the primitive `write`. Those verbs are
-/// gone -- `CasOperation` is the only caller of `Backend` now -- so the property is a type-level
-/// guarantee rather than a runtime check; every fault double in this file that overrides `write` (e.g.
-/// `EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite` below) is what proves a double sees every write.
+/// The legacy verbs (`putIfAbsent`/`casPut`/`putOverwrite`) that used to forward through the primitive
+/// `write` are gone -- `CasOperation` is the only caller of `Backend` now -- so that forwarding is a
+/// type-level guarantee rather than a runtime check. What remains to prove is that every fault double
+/// in this file that overrides `write` sees an ATTEMPT under either shape `CasOperation` can send:
+/// unconditional (`create`) and Etag-conditioned (`replace`).
+/// `EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite` below covers both.
 
 TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite)
 {
@@ -308,6 +309,19 @@ TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite)
     EXPECT_TRUE(std::holds_alternative<GaveUp>(op.create("k4", "v", Retry::once())));
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k4", "v", Retry::once())));
     EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k4", "v", Retry::once())));
+
+    /// The Etag-conditioned shape: every write above was unconditional (`create`), so none of them
+    /// could have caught a fault double that only intercepts `write` when it carries an
+    /// `expected_value` -- the shape `replace` alone sends.
+    const std::optional<Etag> k5_first = orThrow(op.create("k5", "v", Retry::once()), "create");
+    ASSERT_TRUE(k5_first);
+    b->refuseNextWrite("k5");
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("k5", "v2", *k5_first, Retry::once())))
+        << "consumed here";
+    const std::optional<Etag> k5_second
+        = orThrow(op.replace("k5", "v2", *k5_first, Retry::once()), "replace");   /// and only once
+    ASSERT_TRUE(k5_second);
+    expectBytes(b, "k5", "v2");
 }
 
 TEST(CASBackendPrimitives, ReadRefusesAValueThatIsNotAnIncarnation)
