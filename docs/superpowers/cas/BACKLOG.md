@@ -62,7 +62,8 @@ as a confirmation note rather than inserted separately. Full triage record:
 ### `[gc-manifests-are-immutable-so-reduce-and-deletes-can-be-cheap]` The orphan sweep re-reads every listed manifest and deletes manifests one conditional request at a time; manifest keys cannot be reborn, so neither is needed (2026-09-04, user) {#gc-manifests-immutable-cheap-reduce}
 
 Measured on the 15-minute real-GCS soak (leader ch1, `system.cas_gc_log`): rounds 1.2 s → 18.8 s → 128 s →
-466 s; round 3 = `fold_reduce` 380 s (3840 sequential GETs, 294 s of S3 latency at ~76 ms each; 1966 of
+466 s → 584 s (round 4: `fold_reduce` 587 s, 204 manifests deleted; round 5 still running when the
+15-minute driver reached its drain wait); round 3 = `fold_reduce` 380 s (3840 sequential GETs, 294 s of S3 latency at ~76 ms each; 1966 of
 them absent-key misses), `fold_ref_intake` 46 s (read-ahead engaged: 1159 hits), `manifest_deletes` 37 s
 (188 conditional deletes at ~196 ms, sequential). The reduce's GETs are the orphan manifest sweep
 (`CasOrphanManifestSweep.cpp` `planManifestCursorPage`, one `read` per listed key) plus the ref-log
