@@ -333,10 +333,11 @@ public:
 TEST(CASGCLog, TransientThrowIsClassifiedAborted)
 {
     auto backend = std::make_shared<NetworkThrowingBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     /// A PERSISTENT transient fault is reissued for the whole retry window, so the window has to run
-    /// on a clock this test advances -- otherwise one read spends ninety real seconds.
+    /// on a clock this test advances -- otherwise one read spends ninety real seconds. Declared BEFORE
+    /// the store: the store's teardown still calls the now-function, so the clock must outlive it.
     std::atomic<uint64_t> engine_now_ms{0};
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     store->setCasRequestNowFnForTest([&] { return engine_now_ms.fetch_add(10'000) + 10'000; });
     store->setCasRetrySleepForTest([](uint64_t) {});
 
@@ -475,10 +476,10 @@ public:
 TEST(CASGCScheduler, TransientRoundFailureKeepsLeadershipAndHeartbeat)
 {
     auto backend = std::make_shared<ModalThrowingBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     /// See `TransientThrowIsClassifiedAborted`: the transient mode is persistent while it is armed, so
-    /// the retry window runs on a clock this test advances.
+    /// the retry window runs on a clock this test advances, declared before the store it outlives.
     std::atomic<uint64_t> engine_now_ms{0};
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     store->setCasRequestNowFnForTest([&] { return engine_now_ms.fetch_add(10'000) + 10'000; });
     store->setCasRetrySleepForTest([](uint64_t) {});
 

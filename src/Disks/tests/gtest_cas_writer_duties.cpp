@@ -114,7 +114,13 @@ void driveToNetworkErrorGiveUp(LatchedChunkFaultBackend & backend, DB::Cas::test
     const size_t pauses_before = clock.pauseCount();
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, f);
     EXPECT_GE(backend.fault_hits - fault_hits_before, 1) << "the fault double must actually have fired";
-    EXPECT_GT(clock.pauseCount() - pauses_before, 1u)
+    /// ONE pause is the whole discriminator: a reissue is paced by a backoff the engine sleeps
+    /// through, and a `once` policy -- which reaches this same give-up by propagating its first
+    /// failure -- never sleeps at all. How many MORE pauses follow is deliberately not asserted: the
+    /// backoff is full jitter, so the reissues that fit before the call gives up are a random small
+    /// number, and demanding two of them failed about one run in eight against a schedule that was
+    /// behaving exactly as designed.
+    EXPECT_GE(clock.pauseCount() - pauses_before, 1u)
         << "a give-up after a single attempt cannot distinguish a retrying `standard` policy from one "
         << "that never reissues at all";
     EXPECT_GT(clock.longestPause(), 0u) << "at least one of the retry's pauses must be a real, nonzero backoff";
@@ -451,6 +457,13 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     /// regardless of epoch/coverage.
     const RootNamespace ns{"test/writer_duty_rejected_sweep"};
 
+    /// The mount fence's own budget is read off the BOOT clock, while the retry window below is read
+    /// off the virtual one `VirtualRetryClock` installs -- so with a real boot clock the wall time
+    /// this test spends publishing the anchor and staging the manifest is subtracted from a 500 ms
+    /// lease, and on a loaded machine the give-up below stops being a retry give-up and becomes a
+    /// no-budget refusal before the first attempt. Freeze the boot clock, exactly as the successor
+    /// pool further down already does, so the only bound on that give-up is the one it asserts.
+    uint64_t predecessor_boot = 0;
     auto predecessor = Pool::open(backend, PoolConfig{
         .pool_prefix = "p",
         .server_id = UInt128(1),
@@ -462,6 +475,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
         .mount_lease_ttl_ms = std::chrono::milliseconds(500),
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = budget,
+        .boot_ms_fn = [&] { return predecessor_boot; },
     });
     auto clock = DB::Cas::tests::VirtualRetryClock::installOn(predecessor);
 

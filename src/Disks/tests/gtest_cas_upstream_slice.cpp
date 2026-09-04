@@ -25,6 +25,7 @@
 #include <aws/s3/model/DeleteObjectResult.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/GetObjectResult.h>
+#include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/HeadObjectResult.h>
 
@@ -363,7 +364,9 @@ public:
         Aws::S3::Model::GetObjectResult result;
         result.SetETag(step.etag);
         result.SetContentLength(static_cast<long long>(step.body.size()));
-        result.ReplaceBody(new ScriptedBodyStream(step.body, step.fail_mid_body));
+        /// The SDK releases the body through `Aws::Delete`, which frees with the SDK's allocator, so
+        /// the stream must come from `Aws::New`; a plain `new` here is an alloc-dealloc mismatch.
+        result.ReplaceBody(Aws::New<ScriptedBodyStream>("ScriptedBodyStream", step.body, step.fail_mid_body));
         return Aws::S3::Model::GetObjectOutcome(std::move(result));
     }
 

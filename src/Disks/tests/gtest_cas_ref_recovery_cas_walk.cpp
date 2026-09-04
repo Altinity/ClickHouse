@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <base/scope_guard.h>
+
 #include "config.h"
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -1793,6 +1795,9 @@ TEST(CASRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPriv
     /// `{1,3}` and publish its frontier before recovery's own checkpoint CAS. The stale private
     /// candidate contains only `b`; it must restart and replay `c`, not accept an `IdenticalSkip` and
     /// install below the exact checkpoint it just observed.
+    /// The hook captures locals declared after the store, and the store's teardown still performs
+    /// checkpoint writes, so the hook is cleared before those locals die.
+    SCOPE_EXIT({ backend->before_cas_put = {}; });
     backend->before_cas_put = [&](const String & key, const String &, const std::optional<String> & expected)
     {
         if (injected || key != ckpt_key)

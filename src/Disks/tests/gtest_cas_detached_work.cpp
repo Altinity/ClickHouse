@@ -696,18 +696,16 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
     EXPECT_GE(error_hook_calls.load(), 1u) << "the injected throw never reached the error handler";
 
     /// One step of the schedule per iteration: the tail is still over threshold, so each mutation
-    /// re-evaluates admission, and exactly one attempt may pass per elapsed backoff interval.
+    /// re-evaluates admission, and AT MOST one attempt may pass per elapsed backoff interval. At most,
+    /// not exactly: a publisher dispatched by a mutation whose append has not yet returned the lane to
+    /// `Ready` is refused at that gate, and the refusal arms the same backoff without the attempt ever
+    /// reaching the hook below -- so a step can legitimately elapse with no attempt of its own. The
+    /// regression this test exists for is the opposite, an unpaced redispatch storm, and the ceiling
+    /// is what catches it; progress is asserted once after the loop.
     for (uint64_t step = 1; step <= 3; ++step)
     {
         fake_boot.fetch_add(step_ms);
         ASSERT_NO_THROW(publishRef(store, ns, "ref_" + std::to_string(step + 1), step + 1));
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (attempts.load() < 1 + step)
-        {
-            ASSERT_LT(std::chrono::steady_clock::now(), deadline)
-                << "the elapsed backoff never admitted the next publish attempt";
-            std::this_thread::yield();
-        }
         /// Bounded poll rather than `waitForSnapshotPublishSettleForTest`: that call waits on a condvar
         /// predicate with no deadline, and on an unpaced-redispatch regression the reservation count
         /// never rests at zero long enough for the predicate to observe it, hanging the test instead of
@@ -720,8 +718,24 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
                 << "pending_snapshot_publishes stayed nonzero";
             std::this_thread::yield();
         }
-        EXPECT_EQ(attempts.load(), 1 + step) << "more than one publish attempt ran within one backoff step";
+        EXPECT_LE(attempts.load(), 1 + step) << "more than one publish attempt ran within one backoff step";
     }
+
+    /// Progress, on the injected clock so it is deterministic rather than a race with a worker: an
+    /// elapsed backoff must eventually admit a further attempt, or the pacing gate would be a wedge.
+    for (uint64_t extra = 0; attempts.load() < 2 && extra < 20; ++extra)
+    {
+        fake_boot.fetch_add(step_ms);
+        ASSERT_NO_THROW(publishRef(store, ns, "ref_progress_" + std::to_string(extra), 100 + extra));
+        const auto settle = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (store->pendingSnapshotPublishesForTest(ns) != 0)
+        {
+            ASSERT_LT(std::chrono::steady_clock::now(), settle) << "a publish never settled";
+            std::this_thread::yield();
+        }
+    }
+    EXPECT_GE(attempts.load(), 2u)
+        << "no elapsed backoff ever admitted a further publish attempt: the gate is a wedge, not a pace";
 
     EXPECT_EQ(error_hook_calls.load(), attempts.load());
     store->setSnapshotAfterCaptureHookForTest(nullptr);

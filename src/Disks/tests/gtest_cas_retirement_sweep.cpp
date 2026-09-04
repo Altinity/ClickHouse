@@ -354,6 +354,10 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     uint64_t fake_boot = 1'000'000;
     std::vector<uint64_t> waits;
+    /// The append's own retry clock and its sleep log, installed further down; declared here, before
+    /// the store, because the store's teardown still calls the now-function they back.
+    uint64_t fake_retry = 0;
+    std::vector<uint64_t> retry_sleeps;
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
@@ -383,8 +387,6 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     /// give-up is the append's own retry window -- paced on ITS OWN virtual clock, separate from
     /// `fake_boot` (the mount fence's), so the standard policy's full window is available to reissue
     /// against rather than being cut short by the 30s lease `fake_boot` also measures.
-    uint64_t fake_retry = 0;
-    std::vector<uint64_t> retry_sleeps;
     store->setCasRequestNowFnForTest([&fake_retry] { return fake_retry; });
     store->setCasRetrySleepForTest([&fake_retry, &retry_sleeps](uint64_t ms)
     {
