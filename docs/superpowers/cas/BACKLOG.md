@@ -59,6 +59,27 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### `[cas-transient-lease-fence-surfaces-to-clients]` A transient mount-lease fence surfaces to synchronous client calls as `NETWORK_ERROR` (2026-09-04) {#cas-transient-lease-fence-surfaces-to-clients}
+
+Local CA-s3 stateless lane, run 2 (`docs/superpowers/cas/2026-09-04-stateless-lane-triage.md`, 11137
+tests): under the same S3-endpoint saturation that produces the PUT-timeout class, the renewer logged
+`CAS mount renewal 'stateless-ca-s3' fenced after 3 physical attempts in 9068 ms
+(classification=external_lease_deadline)`; 371 "mount lease not held" lines followed, almost all
+background retries that self-healed (drop retries, merge-tree executor), but two tests surfaced the
+window to a synchronous client call and failed with `Code: 210 … mount lease not held`:
+`01128_generate_random_nested` (the INSERT path's ref-log append: "NEEDS RECOVERY at committed-frontier
+publication fence") and `02581_share_big_sets_between_mutation_tasks` (`StorageMergeTree::waitForMutation`).
+The fence itself is correct and fail-close (unit-tested at `CasServerRoot.cpp`, `gtest_cas_heartbeat.cpp`,
+`gtest_cas_pool.cpp`). The open question is client-facing semantics: whether a query that hits a
+CAS-transient fence should wait for the remount (bounded by the query's own timeout) rather than fail
+with `NETWORK_ERROR`, and where that wait belongs (the ref-lane append, `waitForMutation`, or a
+disk-level "mount recovering" retry). Needs a design call, not a mechanical fix; frequency 2/11137 on
+this lane.
+
+Measured frequencies from the same run for the recorded items: PUT-timeout Error log
+(`{#cas-s3-lane-put-timeout-logged-at-error}`) 42/11137; ref-catalog starvation
+(`{#ref-catalog-cas-starvation}`) 1/11137. Class B (404 on stderr) = 0 after 6830b73af27.
+
 ### `[snapshot-publish-error-hook-busy-loop]` An exception before any write-failure arm in the background snapshot publisher redispatches with no backoff (2026-09-04) {#snapshot-publish-error-hook-busy-loop}
 
 **FIXED 2026-09-04 in b3ac09f1c6f:** the detached task's `catch (...)` in `dispatchSnapshotPublisher` now arms `advancePublishBackoff` under `state_mutex` before the error hook runs (the only site that knows an exception escaped; `settleSnapshotPublish` carries no outcome). Red-first: `CASDetachedWork.ThrowingPublishAttemptIsPacedByTheBackoff` — 6,921,818 attempts in 300 s on the old code, 513 ms green after. The remount-path wall clock at `Pool/CasPool.cpp:1258` that the fix report flagged is stamping-only and never enters the reclaim or fence decisions (those read the injectable clocks) — not a trap, nothing to do.
