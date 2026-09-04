@@ -201,14 +201,16 @@ bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & 
 /// every build of a namespace against one read.
 bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix);
 
-/// Plan one cursor page without deleting. Every candidate is exact-GET, decoded and identity-validated;
-/// its exact manifest-source edges are returned for accounting-neutral retirement in the next fold.
+/// Plan one cursor page without deleting. A key is decided from key-derived facts first; only a
+/// candidate's body is read, after the catalog cut, then decoded and identity-validated; its exact
+/// manifest-source edges are returned for accounting-neutral retirement in the next fold.
 /// Catalog-named namespaces are retain-only unless the caller explicitly authorizes recovery from its
 /// frozen catalog cut and the exact `_ckpt` frontier of the life named there.
 ///
-/// `work_budget`, when set, bounds the body-GET/retention fan-out to `nomination_budget` well-formed
-/// candidates (never the whole `list_budget`-sized page), caps how many DISTINCT namespaces this page
-/// may build a fresh protection view for, and caps the committed-tail recovery walk's ref-log GET
+/// `nomination_budget` is a candidate budget: the page stops deciding once it has that many
+/// candidates, and reads exactly that many bodies at most. `work_budget`, when set, additionally
+/// caps how many DISTINCT namespaces this page may build a fresh protection view for, and caps the
+/// committed-tail recovery walk's ref-log GET
 /// count cumulatively across the round (shared with every other destructive-work family via the same
 /// `GcRoundWorkBudget` instance). Exhausting either cap retains every remaining candidate belonging to
 /// the affected namespace on THIS page rather than deciding it without a complete protection view;

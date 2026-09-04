@@ -110,6 +110,16 @@ TEST(CASOrphanSweepRequests, AbsentFloorRetainsEverythingWithOneLookup)
     EXPECT_EQ(result.retained_no_coverage, 0u) << "an absent floor admits nothing, so no key reaches the premise";
 }
 
+TEST(CASOrphanSweepRequests, RetainedKeysCostNoBodyRead)
+{
+    PageFixture f(/*manifests=*/50, /*min_active=*/25);
+    const Layout & layout = f.store->layout();
+    const ManifestSweepResult result = f.page();
+    EXPECT_EQ(result.retained_no_coverage, 24u);
+    for (uint64_t seq = 1; seq <= 50; ++seq)
+        EXPECT_EQ(f.backend->getCount(layout.manifestKey(ManifestId{kNs, build(seq)})), 0u) << seq;
+}
+
 TEST(CASOrphanSweepRequests, PrefixEligibleUnderIsTheFourComparisons)
 {
     MountLease floor;

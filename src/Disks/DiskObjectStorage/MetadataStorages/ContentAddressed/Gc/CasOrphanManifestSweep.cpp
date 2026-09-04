@@ -635,34 +635,6 @@ ManifestSweepResult planManifestCursorPage(
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
 
-    /// Freeze every possible destructive candidate BEFORE the later catalog cut. A same-name rebirth can
-    /// replace this logical manifest key between the observations; classifying the old bytes against the
-    /// later lifecycle cut is safe only when deletion retains the old exact incarnation, so the
-    /// replacement fails the caller's re-observation. Do not take a fresh read after the catalog read:
-    /// that would splice new-life bytes into old candidate selection and authorize their deletion with
-    /// the new incarnation.
-    ///
-    /// Bounded to `nomination_budget` well-formed keys — never the whole `list_budget`-sized
-    /// page — since `nomination_budget` is the hard ceiling on how many of them this call can ever
-    /// nominate. A well-formed key beyond this cap has no frozen body; it is retained where its absence
-    /// is discovered below, in the exact same "budget exhausted, cursor does not step over it" shape the
-    /// nomination-count exhaustion already uses.
-    std::map<String, std::optional<Object>> observed_candidates;
-    if (nomination_budget > 0)
-    {
-        uint64_t frozen = 0;
-        for (const ListedKey & listed : page.keys)
-        {
-            if (frozen >= nomination_budget)
-                break;
-            if (parseListedManifestObject(layout, listed.key))
-            {
-                observed_candidates.emplace(listed.key, op.read(listed.key, Retry::standard()));
-                ++frozen;
-            }
-        }
-    }
-
     /// One seal and one later catalog cut for the whole page; every namespace joins through those same
     /// immutable observations.
     const std::optional<CasFoldSeal> adopted_seal = readAdoptedFoldSeal(op, layout);
@@ -683,6 +655,11 @@ ManifestSweepResult planManifestCursorPage(
     String decided_through;
     bool budget_exhausted = false;
 
+    /// Keys that passed every retain check. Their bodies are read AFTER the loop, and after the
+    /// catalog cut: a manifest key is write-once, so its bytes do not depend on when they are read,
+    /// and the only thing a later read can observe differently is absence, which retains.
+    std::vector<ListedManifestObject> candidates;
+
     for (const ListedKey & listed : page.keys)
     {
         ++result.listed;
@@ -695,7 +672,7 @@ ManifestSweepResult planManifestCursorPage(
         /// A budget of ZERO is not exhaustion but a list-only pass: nothing is ever deletable, so
         /// freezing the cursor on it would make the sweep spin on one page forever. That pass keeps
         /// its pre-existing behaviour and advances.
-        if (budget_exhausted || (nomination_budget > 0 && result.nominations.size() >= nomination_budget))
+        if (budget_exhausted || (nomination_budget > 0 && candidates.size() >= nomination_budget))
         {
             budget_exhausted = true;
             ++result.skipped;
@@ -875,26 +852,18 @@ ManifestSweepResult planManifestCursorPage(
             }
         }
 
-        /// This exact incarnation and bytes were captured before the catalog cut (see above). A missing
-        /// body has no deletion authority; a later replacement no longer matches what is recorded here,
-        /// so the caller's re-observation refuses the delete.
-        ///
-        /// A well-formed key can legitimately be ABSENT here: the freeze loop above caps
-        /// fan-out at `nomination_budget` candidates, so a key beyond that cap was never frozen. Treat
-        /// it exactly like nomination-count exhaustion -- retain, and do NOT advance the cursor past
-        /// it, so the very next page/round examines it with a fresh budget instead of losing it.
-        const auto observed_it = observed_candidates.find(parsed->key);
-        if (observed_it == observed_candidates.end())
-        {
-            budget_exhausted = true;
-            ++result.skipped;
-            continue;
-        }
-        const std::optional<Object> & got = observed_it->second;
+        candidates.push_back(*parsed);
+        decided_through = listed.key;
+    }
+
+    for (const ListedManifestObject & candidate : candidates)
+    {
+        const std::optional<Object> got = op.read(candidate.key, Retry::standard());
         if (!got)
         {
+            /// Gone since the LIST: a fresh writer never reuses the key, so there is nothing to
+            /// nominate and nothing to retain. The key was decided above; the cursor stands.
             ++result.skipped;
-            decided_through = listed.key;
             continue;
         }
         std::optional<PartManifest> body;
@@ -911,21 +880,20 @@ ManifestSweepResult planManifestCursorPage(
             /// reclamation for the whole pool rather than for this one key.
             LOG_ERROR(getLogger("CasOrphanManifestSweep"),
                 "CAS orphan sweep: manifest at {} cannot be decoded and was retained; run cas-fsck to "
-                "enumerate such objects", parsed->key);
+                "enumerate such objects", candidate.key);
             ++result.undecodable;
             ++result.skipped;
-            decided_through = listed.key;
             continue;
         }
-        const ManifestId id{parsed->ns, parsed->ref};
+        const ManifestId id{candidate.ns, candidate.ref};
         if (!refMatchesBody(id.ref, *body) || !manifestNamespaceMatches(id.root_namespace, *body))
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS orphan sweep: manifest identity mismatch at {} while deriving exact source edges",
-                parsed->key);
+                candidate.key);
 
         ManifestSweepResult::Nomination nomination{
             .id = id,
-            .key = parsed->key,
+            .key = candidate.key,
             .token = PersistedEtag::capture(got->etag),
             .source_retirements = {}};
         for (const ManifestEntry & entry : body->entries)
@@ -934,7 +902,6 @@ ManifestSweepResult planManifestCursorPage(
                     .ref = entry.ref,
                     .source_id = sourceEdgeId(id, entry.path)});
         result.nominations.push_back(std::move(nomination));
-        decided_through = listed.key;
     }
 
     if (budget_exhausted)
