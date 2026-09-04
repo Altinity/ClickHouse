@@ -130,6 +130,29 @@ TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
     }
 }
 
+/// `cas_part_folder_validate` paced a manifest `HEAD` that no longer exists. A config still asking
+/// for it must fail the disk open, not be quietly accepted and ignored.
+TEST(CASContentAddressedSettings, RetiredPartFolderValidateIsRejected)
+{
+    for (const std::string & value : {"always", "never", "age 5"})
+    {
+        SCOPED_TRACE(value);
+        auto cfg = makeConfig(
+            "<cas_server_root_id>srv1</cas_server_root_id>"
+            "<cas_part_folder_validate>" + value + "</cas_part_folder_validate>");
+        ContentAddressedSettings settings;
+        try
+        {
+            settings.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+            FAIL() << "expected the retired setting cas_part_folder_validate to be rejected as unknown";
+        }
+        catch (const Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_SETTING);
+        }
+    }
+}
+
 TEST(CASContentAddressedSettings, UnknownKeyRejected)
 {
     expectLoadFailureWithExactMessage(
@@ -164,10 +187,6 @@ TEST(CASContentAddressedSettings, InvalidEnumDiagnosticsNameExternalConfigKeys)
         "<cas_server_root_id>srv1</cas_server_root_id><cas_staging_backend>remote</cas_staging_backend>",
         ErrorCodes::BAD_ARGUMENTS,
         "Unknown cas_staging_backend value 'remote' (expected 'local' or 's3')");
-    expectLoadFailureWithExactMessage(
-        "<cas_server_root_id>srv1</cas_server_root_id><cas_part_folder_validate>sometimes</cas_part_folder_validate>",
-        ErrorCodes::BAD_ARGUMENTS,
-        "Unknown cas_part_folder_validate value 'sometimes' (expected 'always', 'never', or 'age <non-negative integer seconds>')");
 }
 
 /// The point of this test is that none of these names appears anywhere in CAS code. It is not an

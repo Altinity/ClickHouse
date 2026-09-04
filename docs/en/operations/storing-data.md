@@ -485,7 +485,6 @@ Configuration:
     <cas_gc_interval_sec>60</cas_gc_interval_sec>
     <cas_gc_shards>1</cas_gc_shards>
     <cas_part_folder_cache_bytes>67108864</cas_part_folder_cache_bytes>
-    <cas_part_folder_validate>always</cas_part_folder_validate>
 </s3_cas>
 ```
 
@@ -542,10 +541,6 @@ disk-level and server-level settings surface.
   view cache.
 - `cas_part_folder_cache_max_entry_bytes` — `16` MiB by default. Maximum size of a single cached
   part-folder view entry.
-- `cas_part_folder_validate` — `always` (default), `never`, or `age <seconds>`. Controls how often a
-  `ForceFresh` read re-proves a cached manifest body via a `HEAD` request: `always` re-proves every
-  time (the original, pre-optimization behavior), `never` trusts the cache without re-proving, and
-  `age <seconds>` re-proves only once the cached entry is older than the given number of seconds.
 - `cas_manifest_decode_cache_bytes` — `128` MiB by default. Byte bound for the decoded-manifest cache.
   `0` disables decode caching entirely (a diagnostic mode).
 - `cas_gc_meta_pool_size` — `16` by default. Bounded thread-pool size for the GC's per-hash freshness-meta

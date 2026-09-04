@@ -1208,8 +1208,9 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
 
     /// Carry forward from the COMMITTED source part: read the source manifest, find the named entry,
     /// record a TOKENLESS W-EVIDENCE dep for its blob (no HEAD before precommit; promote re-proves it).
-    /// ForceFresh getView == resolveRef(allow_stale=false) + readManifestShared, so this is the same
-    /// request pattern as before, now instrumented via the facade.
+    /// ForceFresh getView == resolveRef(allow_stale=false) + readManifestShared; the decode is served
+    /// from the manifest cache when warm, so a burst of hardlinks from one source part costs no
+    /// manifest request after the first.
     auto view = metadata_storage.partAccess()->getView(src->refKey(), Cas::Freshness::ForceFresh);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
@@ -1615,9 +1616,9 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
         std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
         if (!staged_here)
         {
-            /// One mandatory body-HEAD per (transaction, ref), not per file: the MergeTree fast-removal
-            /// path unlinks every file of the part through THIS transaction right before removeDirectory.
-            /// The first unlink re-proves the body ForceFresh; the rest of the burst reuses that proof.
+            /// One fresh resolve per (transaction, ref), not per file: the MergeTree fast-removal path
+            /// unlinks every file of the part through THIS transaction right before removeDirectory.
+            /// The first unlink resolves ForceFresh; the rest of the burst reads the retained view.
             const String memo_key = r->refKey().cacheKey();
             const bool already_proven = force_fresh_validated_refs.contains(memo_key);
             const auto view = metadata_storage.partAccess()->getView(

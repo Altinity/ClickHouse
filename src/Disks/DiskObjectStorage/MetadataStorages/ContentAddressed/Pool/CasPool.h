@@ -555,15 +555,16 @@ public:
     {
         return ref_ledger.confirmExactRef(ns, ref_name, manifest_ref);
     }
-    /// Read the single immutable part manifest named by `id`. Derives the key via CasLayout::manifestKey,
-    /// decodes the body, and fails CLOSED: a committed ref naming a missing body throws FILE_DOESNT_EXIST
-    /// (INV-NO-DANGLE surfaced on the read path); a body whose `ref` ≠ id.ref (refMatchesBody) or whose
+    /// Read the single immutable part manifest named by `id`. Serves the cached decode when the id
+    /// is cached (no request); otherwise derives the key via CasLayout::manifestKey, GETs and decodes
+    /// the body, and fails CLOSED: an absent body throws FILE_DOESNT_EXIST (a committed ref naming a
+    /// missing body is a dangling reference); a body whose `ref` ≠ id.ref (refMatchesBody) or whose
     /// `root_namespace_id` ≠ id.root_namespace (manifestNamespaceMatches) throws CORRUPTED_DATA — the
-    /// ref is addressing the wrong object, or a cross-namespace dangle. Token-gated decode cache below.
+    /// ref is addressing the wrong object, or a cross-namespace dangle. Id-keyed decode cache below.
     PartManifest readManifest(const ManifestId & id);
-    /// Identical to `readManifest` (same mandatory HEAD, same fail-closed validation, same decode
-    /// cache) but returns the SHARED immutable decode the manifest cache holds — no per-call copy.
-    /// The wiring read path uses this variant.
+    /// Identical to `readManifest` (same fail-closed validation, same decode cache) but returns the
+    /// SHARED immutable decode the manifest cache holds — no per-call copy. The wiring read path
+    /// uses this variant.
     std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
     BlobLocation locate(const ManifestEntry & entry) const;       /// Blob placement only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);

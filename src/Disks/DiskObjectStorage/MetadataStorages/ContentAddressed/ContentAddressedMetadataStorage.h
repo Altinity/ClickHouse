@@ -167,15 +167,6 @@ public:
     /// thin wrapper around the string-taking overload for callers that still hold a config reference.
     static Cas::StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
-    /// Parses a `part_folder_validate` value (`always` | `never` | `age <seconds>`). The `age` form
-    /// accepts only a non-negative integer number of seconds; malformed input and unknown modes throw
-    /// `BAD_ARGUMENTS` instead of silently selecting a policy.
-    static Cas::PartFolderValidate parsePartFolderValidate(const std::string & value);
-
-    /// Reads `part_folder_validate` from `config`, defaulting to `always`, and parses it. Kept only as
-    /// a thin wrapper around the string-taking overload for callers that still hold a config reference.
-    static Cas::PartFolderValidate parsePartFolderValidate(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
-
     /// Returns the content-addressed metadata storage backing `disk`, or nullptr if `disk` is not
     /// content-addressed. Plain (non-object-storage) disks do not implement `getMetadataStorage` at
     /// all and throw `NOT_IMPLEMENTED`; that is treated as "not content-addressed" rather than
@@ -627,8 +618,6 @@ private:
     const bool blob_hash_allow_new;
     /// Per-disk `<skip_access_check>` policy passed to `Cas::PoolConfig`.
     const bool skip_access_check;
-    /// Policy controlling when retained part-folder views revalidate their manifest body.
-    const Cas::PartFolderValidate part_folder_validate;
     /// A single coherent snapshot of the pool and its cached part-folder facade, taken under ONE
     /// `pointer_mutex` acquisition (see `poolAccess()`) so no caller can observe `pool` from one mount
     /// generation and `part_access` from another -- the two used to be fetched by two separate calls

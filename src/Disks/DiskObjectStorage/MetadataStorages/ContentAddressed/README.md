@@ -112,7 +112,7 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
   `CasDecommission`, `CasInspect`.
 - **`Parts/`** — part semantics over the pool: `PartPathParser` (the
   ClickHouse-path classifier), `PartFolderAccess` (`PartRefKey` + `Freshness`
-  + `PartFolderValidate` + `PartFolderView` + `CachedPartFolderAccess`).
+  + `PartFolderView` + `CachedPartFolderAccess`).
 - **Top level (facade)** — the entry points: `ContentAddressedMetadataStorage`
   (the `IMetadataStorage` facade), `ContentAddressedTransaction` (the
   `IMetadataTransaction`, including the write buffers), `ContentAddressedExchange`
