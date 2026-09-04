@@ -124,13 +124,16 @@ WriteResult CasHotKeys::submit(const String & key, CasOperation & op, const Retr
         if (!leaving && !op.fits(0, bound))
             leaving = op.gaveUp(GaveUp::Why::Deadline, sourceFor(bound), nothing_sent);
 
+        /// Read outside the mutex, as `leave` already does: the mutex is a leaf that calls nothing,
+        /// and `now_ms` is a closure the pool injects, not a fixed clock.
+        const uint64_t now = op.owner.now_ms();
         std::unique_lock lock(mutex);
         if (leaving)
             return std::move(*leaving);   /// the lock is released before the guard erases the item
         Lane & lane = lanes.at(key);
         if (lane.queue.front() == &item)
         {
-            lane.holder_since_ms = op.owner.now_ms();
+            lane.holder_since_ms = now;
             entered_hold = true;
             break;
         }

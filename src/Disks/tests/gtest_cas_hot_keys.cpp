@@ -6,7 +6,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
 #include "cas_test_helpers.h"
 
 #include <Common/ProfileEvents.h>
@@ -412,27 +411,52 @@ TEST(CASHotKeys, WaitersLeaveOnTheirOwnFenceLeaseAndDeadline)
 TEST(CASHotKeys, AThrottledHolderKeepsTheWaitersQueuedThroughItsBackoff)
 {
     SyncClock clock;
-    auto inner = std::make_shared<CountingBackend>();
-    /// The first request naming each key is refused with a 429, so the holder's first `PUT` is
-    /// ambiguous and reissued after the growing schedule; the waiters' windows outlast it.
-    auto backend = std::make_shared<ThrottlingBackend>(inner, ThrottlingBackend::Mode::FirstPerKey, 1, 429);
+    auto backend = std::make_shared<CountingBackend>();
     CasHotKeys hot_keys(0);
     CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
 
+    /// The holder's own `PUT` parks here on its first attempt; once the two waiters are proven
+    /// queued behind it, the release makes that attempt ambiguous instead of letting it through, so
+    /// its resolve read (the key still absent) drives one reissue on the growing schedule while the
+    /// waiters sit queued through it.
+    std::latch parked{1};
+    std::latch release{1};
+    std::atomic<int> seen{0};
+    backend->onBeforeWrite("k", [&]
+    {
+        if (seen.fetch_add(1) != 0)
+            return;
+        parked.count_down();
+        release.wait();
+        EXPECT_EQ(hot_keys.queueDepthForTest("k"), 3u);
+        backend->injectAmbiguousWrite("k");
+    });
+
     std::vector<std::thread> threads;
     std::vector<std::optional<WriteResult>> results(3);
-    for (int i = 0; i < 3; ++i)
+    threads.emplace_back([&]
+    {
+        auto op = requests.admit();
+        results[0] = hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(1));
+    });
+    parked.wait();
+    for (int i = 1; i < 3; ++i)
         threads.emplace_back([&, i]
         {
             auto op = requests.admit();
             results[i] = hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(i + 1));
         });
+    while (hot_keys.queueDepthForTest("k") < 3)
+        std::this_thread::yield();
+    release.count_down();
     for (auto & t : threads)
         t.join();
 
     for (const auto & result : results)
         EXPECT_TRUE(std::holds_alternative<Committed>(*result));
-    EXPECT_GE(clock.sleepCount(), 1u) << "the throttled write slept its backoff inside the hold";
-    EXPECT_EQ(inner->writeCount("k"), 3u);
+    ASSERT_EQ(clock.sleepCount(), 1u) << "the one reissue pause, taken while the two waiters were queued";
+    EXPECT_LE(clock.sleeps[0], 200u);
+    EXPECT_EQ(backend->writeCount("k"), 4u) << "the ambiguous attempt counts, then three landed";
     EXPECT_EQ(hot_keys.laneCountForTest(), 0u);
+    DB::Cas::tests::expectBytes(*backend, "k", "1,2,3");
 }
