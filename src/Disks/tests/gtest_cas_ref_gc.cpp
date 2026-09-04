@@ -172,7 +172,10 @@ public:
     /// alone -- is what actually lands the move inside that SAME call, well after `round_commit`.
     static void moveRefCleanupAuthorityBeforeFirstChunk(Authority authority_, CasOperation & op, const Layout & layout)
     {
-        chassert(authority_ != Authority::GcFence);
+        if (authority_ == Authority::GcFence)
+            throw std::logic_error(
+                "moveRefCleanupAuthorityBeforeFirstChunk is for Authority::Catalog/CatalogRebirth only -- "
+                "use armGcFenceMoveOnAuthorityHoldsRevalidationForTest for Authority::GcFence");
         /// Same-content rewrite: only the catalog's TOKEN moves (mints a fresh etag), never its
         /// parsed content -- the pure "someone else touched this row" race `Authority::Catalog`
         /// models, as opposed to `Authority::CatalogRebirth`'s actual incarnation bump.
@@ -180,20 +183,38 @@ public:
         op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), *snap.etag, Retry::standard());
     }
 
-    /// Arms the seam `read` below fires on: see the doc comment above.
+    /// Arms the seam `read` below fires on: see the doc comment above. Called from the test body
+    /// before the round (and so before any read-ahead worker exists), but still under the mutex, so
+    /// this method and `read`'s critical sections never race even under future reordering.
     void armGcFenceMoveOnAuthorityHoldsRevalidationForTest(const Layout & layout)
     {
         catalog_key = layout.refCatalogKey();
         gc_state_key = layout.gcStateKey();
+        std::lock_guard lock(seam_mutex);
         catalog_seam_armed = true;
     }
 
+    /// `read` also runs on the GC read-ahead pool's threads (`CasGcReadAhead.cpp` schedules
+    /// `CasOperation::read` there; `gc_read_concurrency` defaults to 16), concurrently with the round
+    /// thread's own reads -- `catalog_seam_armed` and `last_control_key_read` below are shared mutable
+    /// state a pool thread's read can land between `authorityHolds`'s two reads, so both are read AND
+    /// written only under `seam_mutex`. `last_control_key_read` tracks only the catalog and `gc/state`
+    /// keys, never any other key a read-ahead worker fetches: those workers never touch either control
+    /// key (they fetch ref-log/manifest bodies), so an unrelated concurrent read can never perturb the
+    /// adjacency signal even though it runs lock-free between this method's two critical sections.
     std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
-        const bool fires_here = catalog_seam_armed && key == gc_state_key && last_read_key == catalog_key;
+        bool fires_here = false;
+        {
+            std::lock_guard lock(seam_mutex);
+            fires_here = catalog_seam_armed && key == gc_state_key && last_control_key_read == catalog_key;
+            if (fires_here)
+                catalog_seam_armed = false;
+            if (key == catalog_key || key == gc_state_key)
+                last_control_key_read = key;
+        }
         if (fires_here)
         {
-            catalog_seam_armed = false;
             const auto current = CountingBackend::read(key, access);
             if (!current)
                 throw std::runtime_error("test-injected cleanup authority object is absent");
@@ -201,10 +222,8 @@ public:
             ++moved.lease.seq;
             if (!write(key, encodeGcState(moved), current->value, access).has_value())
                 throw std::runtime_error("test-injected cleanup authority move lost its CAS");
-            last_read_key = key;
             return CountingBackend::read(key, access);   /// the FRESH, post-move bytes, for THIS read
         }
-        last_read_key = key;
         return CountingBackend::read(key, access);
     }
 
@@ -291,6 +310,18 @@ private:
             if (!write(layout.refSnapshotKey(reborn_life, reborn_log_id),
                     sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(reborn_snap)), std::nullopt, access).has_value())
                 throw std::runtime_error("test-injected reborn-life snapshot seed lost its CAS");
+            /// A checkpoint too, naming the seeded log/snapshot: without one, the NEXT round's recovery
+            /// grounding for this namespace finds "no usable checkpoint", which SUPPRESSES that round's
+            /// destructive work ENTIRELY (every namespace, not just this one) -- a test relying on the
+            /// old cohort surviving round 2 would then be observing a no-op round, not the plan moving
+            /// to the reborn life. `writeRecoverableCkptForRawFixture` resolves its own fresh catalog
+            /// read, which already sees the incarnation bump the write just above landed.
+            writeRecoverableCkptForRawFixture(*this, layout, *reborn_ns, RefCkpt{
+                .life_epoch = 1,
+                .committed_through = reborn_log_id,
+                .checkpoint_snapshot_id = reborn_log_id,
+                .last_epoch_seal = std::nullopt,
+            });
         }
     }
 
@@ -302,12 +333,16 @@ private:
     std::optional<RootNamespace> reborn_ns;
     const Layout * layout_for_rebirth_seed = nullptr;
     bool armed = false;
+    /// Guards both members below: `read` runs concurrently on the GC read-ahead pool's threads, see
+    /// the doc comment on `read` itself.
+    std::mutex seam_mutex;
     /// Independent of `armed`/`timing`/`authority` above: `armGcFenceMoveOnAuthorityHoldsRevalidationForTest`
     /// arms this, and the `read` override consumes it once.
     bool catalog_seam_armed = false;
-    /// The previous call's key, so `read` can recognize the catalog-then-`gc/state` ADJACENCY
+    /// The most recent CONTROL key (catalog or `gc/state`) read -- every other key a read-ahead
+    /// worker reads is ignored, so `read` can recognize the catalog-then-`gc/state` ADJACENCY
     /// `authorityHolds` alone produces -- see the doc comment above `moveRefCleanupAuthorityBeforeFirstChunk`.
-    String last_read_key;
+    String last_control_key_read;
 };
 
 struct RefCleanupFixture
@@ -850,10 +885,53 @@ TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
     }
 
     /// The next round revalidates against the NEW catalog row: the old (dead) life is no longer named
-    /// by any entry `cleanupRefObjects` walks, so the old cohort's untouched second key survives too.
+    /// by any entry `cleanupRefObjects` walks, so its plan/cohort mechanism -- the thing THIS task
+    /// changes -- has nothing of the old life's to touch. What actually happens to the old cohort's
+    /// second key, once the round runs unsuppressed, is that the NAMESPACE JANITOR
+    /// (`CasNamespaceJanitor.cpp:131`, `catalog_cut.life_index.resolve(*life_id)` failing for a
+    /// physical life the catalog no longer names) reclaims it as leaked dead-life debris -- exactly
+    /// spec §D's own words: "a moved catalog row means either a dropped life, whose keys the
+    /// namespace janitor deletes anyway, or a reborn one". So the key does NOT survive; it survives
+    /// past `cleanupRefObjects` specifically, then is reclaimed by a wholly separate, pre-existing
+    /// mechanism this task never touches. Attribute the delete precisely rather than asserting
+    /// "survives" and being right for an unrelated reason: capture the `ref_object_cleanup` phase's
+    /// `suppressed` metric (to confirm the round actually ran, not merely suppressed everything, which
+    /// an unusable checkpoint ANYWHERE would do -- see the checkpoint seeded above) and the
+    /// `namespace_cleanup` phase's `janitor_deleted` metric, and independently confirm `cleanupRefObjects`
+    /// itself deleted nothing this round via the GLOBAL `CASRefCleanupObjectsDeleted` counter (the
+    /// `GcPhaseRecord::profile_events` delta is unavailable here: it needs a `CurrentThread` with an
+    /// attached `ThreadStatus`, which a bare gtest thread does not have).
+    std::optional<uint64_t> ref_cleanup_suppressed;
+    std::optional<uint64_t> janitor_deleted;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "ref_object_cleanup")
+            if (const auto it = rec.metrics.find("suppressed"); it != rec.metrics.end())
+                ref_cleanup_suppressed = it->second;
+        if (rec.phase == "namespace_cleanup")
+            if (const auto it = rec.metrics.find("janitor_deleted"); it != rec.metrics.end())
+                janitor_deleted = it->second;
+    });
+    using ProfileEvents::global_counters;
+    const auto ref_cleanup_deleted_before = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
-    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value())
-        << "the old cohort's second key must survive: the next round's plan is for the reborn life, not the dead one";
+    ASSERT_TRUE(ref_cleanup_suppressed.has_value()) << "the ref_object_cleanup phase row never fired";
+    EXPECT_EQ(*ref_cleanup_suppressed, 0u)
+        << "round two must actually run destructive work, not merely leave everything alone because it was suppressed";
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load(), ref_cleanup_deleted_before)
+        << "cleanupRefObjects' own plan/cohort must delete NOTHING this round: the old life is not in it "
+           "(no catalog entry names it) and the reborn life's own checkpoint-named log is not yet deletable";
+    ASSERT_TRUE(janitor_deleted.has_value()) << "the namespace_cleanup phase row never fired";
+    EXPECT_GE(*janitor_deleted, 1u)
+        << "the old cohort's second key is expected to be reclaimed by the namespace janitor, not to survive";
+    EXPECT_FALSE((*raw_op).head(keys.second_log_key, Retry::once()).has_value())
+        << "the old cohort's second key is dead-life debris once its life no longer resolves in the "
+           "catalog -- the namespace janitor reclaims it, exactly as spec §D says it would";
+    /// The reborn life's own objects are untouched: round two's plan, cleanup and cohort are about the
+    /// reborn life now, and none of what it seeded for itself is in that plan. The namespace janitor
+    /// leaves them alone too, since they resolve fine against the CURRENT catalog entry.
+    for (const ListedKey & listed : page.keys)
+        EXPECT_TRUE((*raw_op).head(listed.key, Retry::once()).has_value()) << listed.key;
 }
 
 TEST(CASRefGc, RefObjectCleanupDeletesExactlyThePlannedSet)
