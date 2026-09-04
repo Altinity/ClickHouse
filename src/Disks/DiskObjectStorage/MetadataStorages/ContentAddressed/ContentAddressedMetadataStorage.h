@@ -610,6 +610,8 @@ private:
     const uint64_t manifest_decode_cache_bytes;
     /// Bounded pool size for GC's per-hash freshness-metadata writes.
     const uint64_t gc_meta_pool_size;
+    /// Bounded pool size for the GC fold's read-ahead; 1 disables it.
+    const uint64_t gc_read_concurrency;
     /// The budget for one HTTP attempt of a writable Native mount's control-plane requests; feeds
     /// `Cas::PoolConfig::cas_request_budget.attempt_timeout_ms` and the backend's own
     /// `attemptTimeoutMs()`.

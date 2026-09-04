@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CatalogLifecycleReconciler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMetaWriter.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcReadAhead.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
@@ -745,7 +746,8 @@ private:
         /// (`HoldReason::CheckpointUndecodable`) and folds every other namespace normally.
         std::map<String, String> undecodable;
     };
-    CheckpointWitnesses readCheckpointWitnesses(const std::map<String, RefTableListing> & ref_tables,
+    CheckpointWitnesses readCheckpointWitnesses(GcReadAhead & reads,
+                                                const std::map<String, RefTableListing> & ref_tables,
                                                 const CasRefCatalog::Snapshot & catalog_cut);
 
     /// What ONE generation's prefix says about itself: whether the generation exists at all, and the
@@ -785,7 +787,7 @@ private:
     /// PRESENT but fails refMatchesBody / manifestNamespaceMatches throws CORRUPTED_DATA.
     /// `txn_ordinal` stamps every delta this call pushes with the round-local ordinal of the ref
     /// transaction that emitted it (probe B2 — see `TxnApplyLedger`).
-    bool foldManifestEdges(CasOperation & op, const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
+    bool foldManifestEdges(GcReadAhead & reads, const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
                            std::map<ManifestId, Etag> & mf_cleanup, uint32_t txn_ordinal);
 
 
@@ -951,6 +953,11 @@ private:
     /// only be read after the constructor body has validated `store` -- a direct member would be
     /// initialized before that check.
     std::unique_ptr<GcMetaWriter> meta_writer;
+
+    /// The fold's read-ahead pool, sized by `gc_read_concurrency`. A `unique_ptr` for the same reason
+    /// as `meta_writer`: the size comes from `store->poolConfig()`, which may only be read after the
+    /// constructor body has validated `store`.
+    std::unique_ptr<ThreadPool> read_pool;
 
     /// Probe B1's two numbers for the round: the ref-log POSITIONS the sealed coverage declares covered
     /// (counted arithmetically over each namespace's cut -- not by listed ids, which under arithmetic
