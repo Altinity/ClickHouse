@@ -9,8 +9,9 @@ doc_type: 'design'
 
 # CAS GC round cost on write-once keys {#cas-gc-immutable-key-round-cost-design}
 
-**Status:** rev.2 (2026-09-04), review draft. Nothing here is implemented. rev.1 was reviewed
-against the code; every finding is folded in and listed in the review record at the end. The
+**Status:** rev.3 (2026-09-04), APPROVED for planning. Nothing here is implemented. rev.1 and
+rev.2 were reviewed against the code; every finding is folded in and listed in the review record
+at the end. Implementation happens on a new branch off `cas-gc-rebuild` in the `lane-g` worktree. The
 measurements are from the 15-minute real-GCS soak of 2026-09-04 (leader `ca-live-gcs-ch1-1`,
 `system.cas_gc_log`, phase rows joined to their `Finish` row through `round_id`). Line references
 are against `97da4f0c796` on `cas-gc-rebuild` and will drift; the symbol names will not.
@@ -82,9 +83,12 @@ them was wasted because no page nominated anything.
   server root (`Pool/CasRefCkpt.cpp:77`), the build sequence is monotone within an epoch, the ordinal
   within a build. A reborn namespace continues its server root's epoch counter; a recreated server
   root is refused as a foreign owner, and a decommissioned root is retired permanently by its owner
-  tombstone (`Tools/CasDecommission.cpp:389-420`). The same manifest key is therefore never written
-  twice with different bytes, and a key observed present carries the bytes it will carry until
-  deleted.
+  tombstone (`Tools/CasDecommission.cpp:389-420`). **Global uniqueness of a manifest key therefore
+  rests on decommission being irreversible**: a server root id that could be decommissioned and
+  then mounted again with a fresh epoch counter would be able to mint an old key again. That is a
+  precondition this design inherits, not one it establishes. Under it the same manifest key is
+  never written twice with different bytes, and a key observed present carries the bytes it will
+  carry until deleted.
 - **I2, ref logs and snapshots are write-once and life-qualified.** Every `_log` and `_snap` body is
   published with `op.create` (`Pool/CasRefLedger.cpp:1154`, `:3731`, `:4544`) at a key that carries
   the namespace life id, so a reborn namespace never reuses a dead life's keys.
@@ -273,40 +277,37 @@ the reduce of rounds 3 and 4 in the 20 to 40 s range. Prediction, to be measured
 
 ### The key type {#c-key-type}
 
-The verb accepts only keys of the three write-once families, enforced twice:
-
-- **At compile time.** A new value type `WriteOnceKey` (`Formats/CasLayout.h`) wraps a `String`
-  and has no public constructor. `Layout` is its only minter, through three factories:
-  `writeOnceManifestKey(const ManifestId &)`, `writeOnceRefLogKey(const NamespaceLifeId &, const
-  RefTxnId &)`, `writeOnceRefSnapshotKey(const NamespaceLifeId &, const RefTxnId &)`, each
-  returning the same string the existing `manifestKey`, `refLogKey` and `refSnapshotKey` return.
-  No other code can produce one.
-- **At run time, before the first request.** The engine verb re-parses every key of its input with
-  `Layout::parseManifestKey` (`Formats/CasLayout.h:284`) or `Layout::parseRefObjectKey` (`:207`,
-  kind `Log` or `Snap`) and throws `LOGICAL_ERROR` naming the first offending key if any key is
-  not one of the three, with nothing deleted. `classifyCasNs` is not used for this: it is a
-  substring classifier for counters and would pass every mutable control object under `cas/ns/`
-  and `gc/` (`Backend/CasInstrumentedBackend.cpp:117-133`).
+The verb accepts only keys of the three write-once families, enforced by the type: a new value
+type `WriteOnceKey` (`Formats/CasLayout.h`) wraps a `String` and has no public constructor.
+`Layout` is its only minter, through three factories built from typed identities rather than from
+strings: `writeOnceManifestKey(const ManifestId &)`, `writeOnceRefLogKey(const NamespaceLifeId &,
+const RefTxnId &)`, `writeOnceRefSnapshotKey(const NamespaceLifeId &, const RefTxnId &)`, each
+returning the same string the existing `manifestKey`, `refLogKey` and `refSnapshotKey` return. No
+other code can produce one, so nothing else can reach the verb, and the engine, which has no
+`Layout`, does not re-parse. `classifyCasNs` is not used for this: it is a substring classifier
+for counters and would pass every mutable control object under `cas/ns/` and `gc/`
+(`Backend/CasInstrumentedBackend.cpp:117-133`).
 
 ### Contract, three layers {#c-contract}
 
 **Object storage.** `IObjectStorage` gains
 `removeObjectsIfExistUnderProfile(const StoredObjects &, ObjectStorageRetryProfile, uint64_t request_timeout_ms)`,
-returning `BatchRemoveResult { size_t delete_markers; }`, the batch sibling of
-`removeObjectIfTokenMatches`'s profile overload
+returning nothing, the batch sibling of `removeObjectIfTokenMatches`'s profile overload
 (`src/Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h:372`). The S3 implementation issues
 exactly one `DeleteObjects` for the objects it is given (the caller passes at most 1000) on
-`clientForRetryProfile(profile, request_timeout_ms)`, with **`Quiet` set to false** so the
-response lists every key in `Deleted` or in `Errors` (the existing helper sets `Quiet` to true,
-`src/IO/S3/deleteFileFromS3.cpp:134`, and cannot see delete markers). It records each key in
-`system.blob_storage_log` as the single-key path does (`S3ObjectStorage.cpp:568-600`), and:
+`clientForRetryProfile(profile, request_timeout_ms)`, in quiet mode as the existing helper does
+(`src/IO/S3/deleteFileFromS3.cpp:134`), records each key in `system.blob_storage_log` as the
+single-key path does (`S3ObjectStorage.cpp:568-600`), and:
 
-- requires every requested key to appear exactly once in `Deleted` or `Errors`; a key in neither is
-  a contract violation and throws;
 - treats a per-key `NoSuchKey` error as success;
 - throws on a request-level failure, and on a response with any other per-key error, naming the
-  failed keys in the message;
-- counts the `Deleted` entries whose `DeleteMarker` flag is set and returns that count.
+  failed keys in the message.
+
+Delete markers are outside this contract. The mount's capability probe refuses a bucket verified
+as versioned, so a batch delete that archives instead of reclaiming cannot happen on a mounted
+pool; the single-key path's `CAS_DELETE_MARKER` refusal stays where it is for the single-key
+verbs. Accepted residual, the same one the mount already carries: a bucket whose versioning
+configuration cannot be read is mounted with a warning.
 
 It does not consult or settle `S3Capabilities::isBatchDeleteSupported` and has no singular fallback:
 a backend that refuses the batch shape fails the round with that refusal in the error. Every
@@ -317,8 +318,7 @@ its own test below. The default implementation in `IObjectStorage` throws `NOT_I
 **Backend.** `Backend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &)`,
 at most 1000 keys, returns nothing, throws on failure. Implementations:
 
-- `ObjectStorageBackend`, `Mode::Native`: the call above; a nonzero delete-marker count throws
-  `CAS_DELETE_MARKER`, the same refusal `removeUnder` makes for one key.
+- `ObjectStorageBackend`, `Mode::Native`: the call above.
 - `ObjectStorageBackend`, `Mode::EmulatedSingleProcess` (local object storage, which every local
   CAS disk uses, `ContentAddressedMetadataStorage.cpp:690-694`): under `emu_mutex`, per key, if
   `emuExists` then `object_storage->removeObjectIfExists(StoredObject(emuPath(key)))` and the same
@@ -326,15 +326,13 @@ at most 1000 keys, returns nothing, throws on failure. Implementations:
   (`Backend/CasObjectStorageBackend.cpp`, the emulated tail of `removeUnder`); no token is observed
   or compared; an absent key is success.
 - `InMemoryBackend`: per key, the same `hold_deletes_` queue and `applyDelete` as `remove`, with no
-  expected value; an absent key is success; `simulate_delete_markers_` makes the verb throw
-  `CAS_DELETE_MARKER` as the single-key path returns `DeleteMarker`.
+  expected value; an absent key is success.
 - `InstrumentedBackend`: one `CasOp::Delete` per key on its class, plus one new
   `CASBulkDeleteRequests` per call.
 - `ThrottlingBackend`: `refuseOrPass` on every key; one refusal fails the call.
 
 **Engine.** `CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, const Retry & policy)`
-takes **one chunk**: at most 1000 keys, validated as above before any request, sent as one logical
-request through the same attempt loop as `remove` (`readLoop`: admission, fence, budget, deadline,
+takes **one chunk**: at most 1000 keys, sent as one logical request through the same attempt loop as `remove` (`readLoop`: admission, fence, budget, deadline,
 backoff, reissue counted as `CASRequestReissue`). A reissue resends the whole chunk: by write-once
 and idempotence a key deleted by the failed attempt is absent on the reissue, which is success.
 The verb returns nothing and throws when the policy is exhausted. It does not split a larger input;
@@ -362,18 +360,16 @@ The column comment in `src/Interpreters/ContentAddressedGarbageCollectionLog.cpp
 `docs/en/operations/system-tables/cas_gc_log.md` change with it.
 
 **Tests.** Engine gtest on the in-memory backend: 1001 keys throw `LOGICAL_ERROR` before any
-request; a mixed input with one `_ckpt`, one catalog, one `gc/state` and one blob key each throw
-`LOGICAL_ERROR` before any request; an injected throw on the first attempt is reissued and the
-already-deleted keys succeed as absent; `simulate_delete_markers_` throws `CAS_DELETE_MARKER`; the
-throttling backend's refusal is reissued under the policy. Local-disk gtest: the emulated mode
+request; an injected throw on the first attempt is reissued and the already-deleted keys succeed
+as absent; the throttling backend's refusal is reissued under the policy. The key type needs no
+runtime test: a `WriteOnceKey` cannot be spelled outside `Layout`. Local-disk gtest: the emulated mode
 deletes a chunk of manifests and leaves `emu_token_state` as `removeUnder` would. GC test: a round
 with N owner-removed manifests shows `CASBulkDeleteRequests` equal to ⌈N/1000⌉ and
 `manifests_deleted` equal to N; a round with a throw injected into the second of three chunks
 records the first chunk's N₁ events and metrics and aborts; a round under `suppress_destructive`
-makes no request. Wire test: an integration test on a MinIO bucket with versioning enabled, calling
-the object-storage overload through the backend directly (the mount refuses versioned buckets, so
-not through a mount), asserts `CAS_DELETE_MARKER`; on the ordinary bucket it asserts that a batch
-containing an already-absent key succeeds and that the response accounted for every key.
+makes no request. Wire test: an integration test against MinIO asserts that a batch containing an
+already-absent key succeeds and that a batch with a request-level failure injected by the proxy is
+reissued under the policy.
 
 **Expected effect.** Round 5's 3250 deletes at 190 ms become four requests: 617 s to under 2 s.
 
@@ -438,6 +434,8 @@ counters; it is not part of this design because its fix touches the fold, and th
 3. C: `WriteOnceKey` and its factories, the object-storage overload with its S3 implementation, the
    backend verb in both modes and the three wrapper backends, the engine verb, and
    `manifest_deletes` as the consumer; the `cas_gc_log` column text and the user page.
+   Implementation order inside C: the type, then the object-storage overload, then the backends,
+   then the engine verb, then the consumer, each with its tests before the next.
 4. D, after its review.
 
 Each step passes the `CAS*` gtest gate, then a 15-minute GCS soak whose phase table is re-read the
@@ -497,8 +495,7 @@ way this document's was, and the measured row replaces the prediction in the BAC
 - B2 is wrong if the sweep's ref-stream reads on the reduce row do not drop to about one window
   per walk, or if a two-epoch fixture shows `CASGCReadAheadWasted` above one window per crossing.
 - C is wrong if `manifest_deletes` shows more than ⌈N/1000⌉ `CASBulkDeleteRequests` for N keys,
-  if a versioned bucket does not fail the round with `CAS_DELETE_MARKER`, or if any key outside the
-  three families reaches a backend.
+  or if any key outside the three families reaches a backend.
 - D is wrong if the oracle test finds a key deleted by D that the per-key implementation retains,
   or if test (4) finds a new-life key gone.
 
@@ -527,3 +524,10 @@ Non-blocking: the budget is a candidate budget, named so; the `manifests_deleted
 as intentional. Kept against the review: the 3002 and 2006 arithmetic holds for rounds 4 and 5
 both, since both rounds' `CASGCGet` and read-error counters are identical; the table now shows
 round 5's breakdown so the claim can be checked.
+
+Review of rev.2: no blockers. Three edits make rev.3: the engine has no `Layout`, so the runtime
+re-parse is gone and the closed `WriteOnceKey` factories are the whole guard; delete markers leave
+the batch contract because the mount's capability probe refuses versioned buckets, so the verb runs
+quiet like the existing helper and the versioned-bucket test is dropped; I1 now states that global
+manifest-key uniqueness rests on decommission being irreversible, a precondition inherited rather
+than established. Approved for planning.
