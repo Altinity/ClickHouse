@@ -85,7 +85,10 @@ std::shared_ptr<ParsedManifestFileEntry> makePositionDeleteEntry(
         /*row_number=*/0,
         ManifestEntryStatus::ADDED,
         /*written_sequence_number=*/std::nullopt,
+<<<<<<< HEAD
         /*written_file_sequence_number=*/std::nullopt,
+=======
+>>>>>>> cc5dca0442e (Merge pull request #2271 from Altinity/iceberg-delta-bin-deletion-vectors)
         /*written_snapshot_id=*/std::nullopt,
         DB::Row{},
         std::unordered_map<Int32, ColumnInfo>{},
