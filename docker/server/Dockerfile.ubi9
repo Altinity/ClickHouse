@@ -1,0 +1,88 @@
+ARG UBI_IMAGE=registry.access.redhat.com/ubi9/ubi:9.8
+FROM --platform=${BUILDPLATFORM} ${UBI_IMAGE} AS artifacts
+
+ARG DIRECT_DOWNLOAD_URLS=""
+
+WORKDIR /tmp/clickhouse-install
+
+RUN if [ -z "${DIRECT_DOWNLOAD_URLS}" ]; then \
+        echo "DIRECT_DOWNLOAD_URLS is required" >&2; exit 1; \
+    fi \
+    && command -v curl gzip tar sha512sum >/dev/null \
+    && for url in ${DIRECT_DOWNLOAD_URLS}; do \
+        echo "Downloading ${url}" \
+        && curl --fail --location --retry 5 --retry-delay 1 --remote-name "${url}"; \
+    done \
+    && sed 's:/output/:/tmp/clickhouse-install/:' ./*.tgz.sha512 | sha512sum --check \
+    && mkdir -p /opt/clickhouse-root/lib \
+    && for archive in ./*.tgz; do \
+        tar xzf "${archive}" --strip-components=1 -C /opt/clickhouse-root; \
+    done
+
+FROM ${UBI_IMAGE}
+
+ARG VERSION
+ARG RELEASE=1
+
+LABEL name="Altinity ClickHouse Server" \
+    vendor="Altinity" \
+    maintainer="Altinity <support@altinity.com>" \
+    version="${VERSION}" \
+    release="${RELEASE}" \
+    summary="ClickHouse Server built and supported by Altinity" \
+    description="A Red Hat UBI-based ClickHouse Server container image." \
+    io.k8s.display-name="Altinity ClickHouse Server" \
+    io.openshift.tags="clickhouse,database,analytics"
+
+ARG DEFAULT_UID=101
+ARG DEFAULT_GID=101
+
+RUN command -v curl gzip tar sha512sum >/dev/null \
+    && groupadd --system --gid "${DEFAULT_GID}" clickhouse \
+    && useradd --system --uid "${DEFAULT_UID}" --gid clickhouse \
+        --home-dir /var/lib/clickhouse --shell /sbin/nologin clickhouse
+
+COPY --from=artifacts /opt/clickhouse-root/etc/ /etc/
+COPY --from=artifacts /opt/clickhouse-root/lib/ /usr/lib/
+COPY --from=artifacts /opt/clickhouse-root/usr/ /usr/
+
+ARG DEFAULT_CLIENT_CONFIG_DIR=/etc/clickhouse-client
+ARG DEFAULT_SERVER_CONFIG_DIR=/etc/clickhouse-server
+ARG DEFAULT_DATA_DIR=/var/lib/clickhouse
+ARG DEFAULT_LOG_DIR=/var/log/clickhouse-server
+
+RUN clickhouse-local -q 'SELECT * FROM system.build_options' \
+    && mkdir -p \
+        "${DEFAULT_DATA_DIR}" \
+        "${DEFAULT_LOG_DIR}" \
+        "${DEFAULT_CLIENT_CONFIG_DIR}" \
+        "${DEFAULT_SERVER_CONFIG_DIR}/config.d" \
+        "${DEFAULT_SERVER_CONFIG_DIR}/users.d" \
+        /docker-entrypoint-initdb.d \
+    && chown -R clickhouse:clickhouse \
+        "${DEFAULT_DATA_DIR}" \
+        "${DEFAULT_LOG_DIR}" \
+        "${DEFAULT_CLIENT_CONFIG_DIR}" \
+        "${DEFAULT_SERVER_CONFIG_DIR}" \
+        /docker-entrypoint-initdb.d \
+    && chmod -R ugo+Xrw \
+        "${DEFAULT_DATA_DIR}" \
+        "${DEFAULT_LOG_DIR}" \
+        "${DEFAULT_CLIENT_CONFIG_DIR}" \
+        "${DEFAULT_SERVER_CONFIG_DIR}"
+
+COPY docker/server/docker_related_config.xml /etc/clickhouse-server/config.d/
+COPY LICENSE /licenses/LICENSE
+
+ENV CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml \
+    CLICKHOUSE_WATCHDOG_ENABLE=0 \
+    LANG=C.UTF-8 \
+    TZ=UTC
+
+EXPOSE 9000 8123 9009
+VOLUME ["/var/lib/clickhouse", "/var/log/clickhouse-server"]
+
+USER 101:101
+WORKDIR /var/lib/clickhouse
+
+ENTRYPOINT ["/usr/bin/clickhouse", "docker-init"]

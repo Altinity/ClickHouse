@@ -1,6 +1,7 @@
 self-hosted-runner:
   labels:
     - altinity-builder
+    - altinity-on-demand
     - altinity-func-tester
     - altinity-func-tester-aarch64
     - fuzzer-unit-tester
