@@ -800,6 +800,10 @@ The server successfully detected this situation and will download merged part fr
     M(CASRefBatchedMutations, "Number of CAS ref mutations committed through the per-namespace batching queue. Growth indicates reference-write activity.", ValueType::Number) \
     M(CASRefBatchScopeCuts, "Number of CAS ref batches cut short by scope limits. Growing values indicate smaller batches and more write overhead.", ValueType::Number) \
     M(CASRefQueueWaitMicroseconds, "Total time CAS ref writers spent queued, in microseconds. A rising value indicates ref-write contention or backend latency.", ValueType::Microseconds) \
+    M(CASHotKeyQueueWaitMicroseconds, "Total time CAS writers of a shared key spent queued in the hot-key lane before holding it or leaving, in microseconds. A rising value with a flat write rate means the holder is slow, not the store.", ValueType::Microseconds) \
+    M(CASHotKeyCacheStarts, "Number of hot-key lane holds that started from the pool's last known object instead of a read.", ValueType::Number) \
+    M(CASHotKeyReadStarts, "Number of hot-key lane holds that started from a read of the key.", ValueType::Number) \
+    M(CASHotKeyCacheVerdictsReread, "Number of verdicts (a refusal or a decline) a hot-key lane decide rendered on a cached object and that were re-rendered on a fresh read instead of delivered.", ValueType::Number) \
     M(CASRefRecoveryRestarts, "Number of CAS ref-table recovery retries after a snapshot or log vanished during reading. A non-zero value indicates concurrent cleanup or backend inconsistency.", ValueType::Number) \
     M(CASRefRecoveryRetries, "Number of CAS ref-table recovery attempts retried after a transient object-store error before the table's load fails. A non-zero value indicates transient object-store disruption during table startup.", ValueType::Number) \
     M(CASRefAppendWedged, "Number of CAS ref-log append lanes that exhausted retries after an uncertain PUT. A non-zero value indicates ref-log progress may be stalled.", ValueType::Number) \

@@ -236,12 +236,15 @@ bool isDefinitelyRefusedWrite([[maybe_unused]] const std::exception & e)
 }
 
 CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
-                         std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_)
+                         std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_,
+                         CasHotKeys * hot_keys_)
     : backend(std::move(backend_))
     , fence(std::move(fence_))
     , now_ms(now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs))
     , sleep_ms(sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds))
     , attempt_reservation_ms(backend->attemptTimeoutMs())
+    , own_hot_keys(hot_keys_ ? nullptr : std::make_unique<CasHotKeys>(0))
+    , hot_keys(hot_keys_ ? hot_keys_ : own_hot_keys.get())
 {
 }
 
