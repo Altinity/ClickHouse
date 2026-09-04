@@ -41,9 +41,12 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 
 #include <Common/filesystemHelpers.h>
+#include <Common/logger_useful.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
 
+#include <Poco/AutoPtr.h>
+#include <Poco/StreamChannel.h>
 #include <Poco/TemporaryFile.h>
 
 
@@ -552,6 +555,15 @@ struct PutObjectFailIngection: InjectionModel
     }
 };
 
+/// A conditional-write 412, matched by `S3::isPreconditionFailedError` on the canonical `<Code>` name.
+struct PutObjectPreconditionFailedIngection: InjectionModel
+{
+    std::optional<Aws::S3::Model::PutObjectOutcome> call(const Aws::S3::Model::PutObjectRequest & /*request*/) override
+    {
+        return Aws::Client::AWSError<Aws::Client::CoreErrors>(Aws::Client::CoreErrors::UNKNOWN, "PreconditionFailed", "precondition failed", false);
+    }
+};
+
 struct HeadObjectFailIngection: InjectionModel
 {
     std::optional<Aws::S3::Model::HeadObjectOutcome> call(const Aws::S3::Model::HeadObjectRequest & /*request*/) override
@@ -675,6 +687,44 @@ struct SimpleAsyncTasks : BaseSyncPolicy
 }
 
 using namespace DB;
+
+namespace
+{
+
+/// Captures what `WriteBufferFromS3` logs at `threshold` and above (default: Error). A message
+/// logged below the threshold never reaches the channel, so an empty capture proves the site logged
+/// below it rather than merely that this particular text was absent.
+class ScopedWriteBufferS3ErrorLogCapture
+{
+public:
+    explicit ScopedWriteBufferS3ErrorLogCapture(const std::string & threshold = "error")
+        : logger(getLogger("WriteBufferFromS3"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel(threshold);
+    }
+
+    ~ScopedWriteBufferS3ErrorLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    std::string captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream;
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// `shared=true` is load-bearing: `AutoPtr(ptr)` would steal a reference the fixture never owned.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
+
+}
 
 static void writeAsOneBlock(WriteBuffer& buf, size_t size)
 {
@@ -904,6 +954,71 @@ TEST_P(SyncAsync, ExceptionOnPut) {
         }
       }, DB::S3Exception);
 
+}
+
+/// A non-412 `PutObject` failure on the ordinary (Default) retry profile is a genuine error: the
+/// client's one attempt IS the final answer, so the site logs it at Error.
+TEST_P(SyncAsync, PutObjectErrorLogsErrorForDefaultProfile)
+{
+    setInjectionModel(std::make_shared<MockS3::PutObjectFailIngection>());
+
+    ScopedWriteBufferS3ErrorLogCapture log_capture;
+    EXPECT_THROW({
+        auto buffer = getWriteBuffer("put_object_error_default_profile");
+        buffer->write('A');
+        buffer->next();
+
+        getAsyncPolicy().setAutoExecute(true);
+        buffer->finalize();
+    }, DB::S3Exception);
+
+    EXPECT_THAT(log_capture.captured(), testing::HasSubstr("S3Exception name FailInjection"));
+    EXPECT_THAT(log_capture.captured(), testing::HasSubstr("PutObjectFailIngection"));
+}
+
+/// The same failure on the SingleAttempt profile (the CAS conditional-write client) is owned by an
+/// outer retry loop that resolves the outcome and reissues; the one failed attempt is not terminal,
+/// so nothing here reaches Error.
+TEST_P(SyncAsync, PutObjectErrorLogsDebugForSingleAttemptProfile)
+{
+    setInjectionModel(std::make_shared<MockS3::PutObjectFailIngection>());
+
+    WriteSettings write_settings;
+    write_settings.object_storage_retry_profile = ObjectStorageRetryProfile::SingleAttempt;
+
+    ScopedWriteBufferS3ErrorLogCapture log_capture;
+    EXPECT_THROW({
+        auto buffer = getWriteBuffer("put_object_error_single_attempt_profile", write_settings);
+        buffer->write('A');
+        buffer->next();
+
+        getAsyncPolicy().setAutoExecute(true);
+        buffer->finalize();
+    }, DB::S3Exception);
+
+    EXPECT_TRUE(log_capture.captured().empty());
+}
+
+/// A conditional write losing its precondition (412) is the caller's expected answer, handled one
+/// frame up -- it says nothing to the operator, so it must stay below Information, independent of the
+/// retry profile. The capture threshold is Information so that an Info-level line from the site would
+/// be caught; the cancel path logs its own Info lines, so the assertion is on the site's text, not on
+/// an empty capture.
+TEST_P(SyncAsync, PreconditionFailedNeverLogsAtError)
+{
+    setInjectionModel(std::make_shared<MockS3::PutObjectPreconditionFailedIngection>());
+
+    ScopedWriteBufferS3ErrorLogCapture log_capture("information");
+    EXPECT_THROW({
+        auto buffer = getWriteBuffer("put_object_precondition_failed");
+        buffer->write('A');
+        buffer->next();
+
+        getAsyncPolicy().setAutoExecute(true);
+        buffer->finalize();
+    }, DB::S3Exception);
+
+    EXPECT_THAT(log_capture.captured(), testing::Not(testing::HasSubstr("S3Exception name")));
 }
 
 TEST_P(SyncAsync, ExceptionOnCreateMPU) {

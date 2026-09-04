@@ -50,36 +50,36 @@ public:
         LandThenThrow,
     };
 
-    using InMemoryBackend::putOverwrite;
-
     Fault fault = Fault::None;
 
-    PutResult putOverwrite(
+    /// The fault sits on the WRITE PRIMITIVE, and only on a CONDITIONAL one: the renewal issues
+    /// `op.replace`, which reaches the store here, and a create on the same key must not consume the
+    /// one-shot fault.
+    std::expected<String, RawConflict> write(
         const String & key,
         const String & bytes,
-        const Token & expected,
-        const ObjectMeta & meta) override
+        const std::optional<String> & expected_value,
+        TransportAccess & access) override
     {
+        if (!expected_value)
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+
         const Fault current = std::exchange(fault, Fault::None);
         if (current == Fault::ThrowBefore)
             throw Poco::TimeoutException("injected renewal timeout before commit");
 
-        PutResult result = InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+        auto result = InMemoryBackend::write(key, bytes, expected_value, access);
         if (current == Fault::LandThenThrow)
             throw Poco::TimeoutException("injected renewal response loss after commit");
         return result;
     }
 };
 
-CasRequestBudget renewalCounterBudget(uint32_t max_attempts = 2)
+CasRequestBudget renewalCounterBudget(uint32_t /*max_attempts*/ = 2)
 {
     return CasRequestBudget{
         .attempt_timeout_ms = 10,
-        .operation_deadline_ms = 500,
-        .max_attempts = max_attempts,
         .lease_safety_margin_ms = 20,
-        .retry_initial_backoff_ms = 0,
-        .retry_max_backoff_ms = 0,
     };
 }
 
@@ -148,6 +148,7 @@ TEST(CASObservability, RenewalCountersHaveExactPhysicalAndLogicalDeltas)
     const auto run = [](RenewalCounterBackend::Fault fault, uint64_t attempts, uint64_t retries, uint64_t resolved, uint64_t recovered)
     {
         auto backend = std::make_shared<RenewalCounterBackend>();
+        backend->setAttemptTimeoutMs(renewalCounterBudget().attempt_timeout_ms);
         uint64_t boot_ms = 100;
         auto store = Pool::open(backend, PoolConfig{
             .pool_prefix = "renewal-counter-" + std::to_string(attempts) + "-" + std::to_string(resolved),
@@ -171,6 +172,7 @@ TEST(CASObservability, RenewalCountersHaveExactPhysicalAndLogicalDeltas)
 TEST(CASObservability, ExternalLeaseDeadlineCountsOnceWithoutReconstructingAttempts)
 {
     auto backend = std::make_shared<RenewalCounterBackend>();
+    backend->setAttemptTimeoutMs(renewalCounterBudget().attempt_timeout_ms);
     uint64_t boot_ms = 100;
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "renewal-deadline-counter",
@@ -180,9 +182,11 @@ TEST(CASObservability, ExternalLeaseDeadlineCountsOnceWithoutReconstructingAttem
         .boot_ms_fn = [&] { return boot_ms; },
     });
 
-    /// The confirmed external safety deadline is 1080. At 1071 a ten-millisecond physical attempt
-    /// no longer fits, so the logical renewal ends without reconstructing a sent attempt.
-    boot_ms = 1071;
+    /// The fence deadline is 1100 and the safety margin 20, so admission refuses once fewer than
+    /// twenty milliseconds of lease remain. At 1090 only ten milliseconds remain, short of the margin
+    /// however much a single attempt reserves, so nothing can be started and the logical renewal ends
+    /// without reconstructing a sent attempt.
+    boot_ms = 1090;
     const RenewalCounterSnapshot before = renewalCounters();
     EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
     const RenewalCounterSnapshot after = renewalCounters();
@@ -300,10 +304,12 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     const RootNamespace ns{"test/tbl"};
     const String P = "republish-payload-audit";
 
+    DB::Cas::tests::OperationForTest head_op(*b);
+
     /// 1. Publish ref r1 -> token A referenced; drop it; ONE GC round condemns A (retired, not deleted).
     publishOneBlobPart(s, ns, "r1", P);
-    const HeadResult hA = b->head(s->layout().blobKey(idOf(P)));
-    ASSERT_TRUE(hA.exists);
+    const auto hA = (*head_op).head(s->layout().blobKey(idOf(P)), Retry::standard());
+    ASSERT_TRUE(hA.has_value());
     s->dropRef(ns, "r1");
     s->renewWatermarkOnce();
 
@@ -320,9 +326,10 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 
     /// 2. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B; drop it too.
     publishOneBlobPart(s, ns, "r2", P);
-    const HeadResult hB = b->head(s->layout().blobKey(idOf(P)));
-    ASSERT_TRUE(hB.exists);
-    ASSERT_NE(hB.token.value, hA.token.value) << "republication must mint a new incarnation token B";
+    const auto hB = (*head_op).head(s->layout().blobKey(idOf(P)), Retry::standard());
+    ASSERT_TRUE(hB.has_value());
+    ASSERT_NE(PersistedEtag::capture(hB->etag).value, PersistedEtag::capture(hA->etag).value)
+        << "republication must mint a new incarnation token B";
     s->dropRef(ns, "r2");
     s->renewWatermarkOnce();
 
@@ -354,10 +361,13 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     std::copy_if(seen.begin(), seen.end(), std::back_inserter(replaced_events),
         [&](const CasEvent & e){ return is_this_blob(e) && e.type == CasEventType::BlobRetireReplaced; });
     ASSERT_EQ(replaced_events.size(), 1u) << "exactly one blob_retire_replaced for the supersede";
-    EXPECT_EQ(replaced_events[0].token, hB.token.value) << "the event's own token is the fresh CURRENT token B";
+    /// The event's token text is dialect-qualified ("emulated:<value>", matching `Etag::render`
+    /// and `PersistedEtag`'s wire word).
+    EXPECT_EQ(replaced_events[0].token, hB->etag.render())
+        << "the event's own token is the fresh CURRENT token B";
     ASSERT_TRUE(replaced_events[0].detail.count("superseded_token"));
     EXPECT_FALSE(replaced_events[0].detail.at("superseded_token").empty());
-    EXPECT_EQ(replaced_events[0].detail.at("superseded_token"), hA.token.value)
+    EXPECT_EQ(replaced_events[0].detail.at("superseded_token"), hA->etag.render())
         << "superseded_token must name the stale token (A) that republication replaced";
 
     EXPECT_EQ(replaced_after - replaced_before, 1u) << "CASGCRetireReplaced increments exactly once";
@@ -375,7 +385,7 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     const auto it = std::find_if(retired.begin(), retired.end(),
         [&](const RetiredEntry & e){ return e.kind == ObjectKind::Blob && e.ref == DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(P))}; });
     ASSERT_NE(it, retired.end()) << "the superseded entry must be present in the current retired set";
-    EXPECT_EQ(it->token.value, hB.token.value) << "the persisted entry names the fresh CURRENT token B";
+    EXPECT_EQ(it->token.value, PersistedEtag::capture(hB->etag).value) << "the persisted entry names the fresh CURRENT token B";
     EXPECT_EQ(it->size, P.size())
         << "supersede must persist the LOGICAL size (payload length, header stripped), matching what "
            "a fresh condemn of the same blob would carry -- not the raw physical (header-included) size";
@@ -428,7 +438,7 @@ TEST(CASObservability, CaInspectDecodesRefLogToJson)
     const String json = caInspectToJson(
         layout, key, encodeRefLogTxn(txn), DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find("ref_log"), String::npos);
-    EXPECT_NE(json.find("OwnerTransition"), String::npos);
+    EXPECT_NE(json.find("owner_transition"), String::npos);
     EXPECT_NE(json.find("all_0_0_0"), String::npos);
 }
 
@@ -440,11 +450,16 @@ TEST(CASObservability, CaInspectDecodesPartManifestToJson)
     PartManifest m;
     m.ref = ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 3};
     m.root_namespace_id = ns;
-    ManifestEntry e;
-    e.path = "data.bin";
-    e.placement = EntryPlacement::Inline;
-    e.inline_bytes = "hello";
-    m.entries = {e};
+    ManifestEntry inline_entry;
+    inline_entry.path = "data.bin";
+    inline_entry.placement = EntryPlacement::Inline;
+    inline_entry.inline_bytes = "hello";
+    ManifestEntry blob_entry;
+    blob_entry.path = "payload.bin";
+    blob_entry.placement = EntryPlacement::Blob;
+    blob_entry.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload.bin"))};
+    blob_entry.blob_size = 5;
+    m.entries = {inline_entry, blob_entry};
     m.payload_digest = computePayloadDigest(m);
 
     const ManifestId id{.root_namespace = ns, .ref = m.ref};
@@ -453,6 +468,9 @@ TEST(CASObservability, CaInspectDecodesPartManifestToJson)
     EXPECT_NE(json.find("\"root_namespace_id\""), String::npos);
     EXPECT_NE(json.find("data.bin"), String::npos);
     EXPECT_NE(json.find("\"manifest_ordinal\":3"), String::npos);
+    /// `EntryPlacement` renders as its full wire word (`inline`/`blob`), not the enumerator spelling.
+    EXPECT_NE(json.find(R"("placement":"inline")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("placement":"blob")"), String::npos) << json;
 }
 
 TEST(CASObservability, CaInspectDecodesMountLeaseToJson)
@@ -483,6 +501,36 @@ TEST(CASObservability, CaInspectDecodesGcStateToJson)
     const String json = caInspectToJson(layout, key, encodeGcState(state));
     EXPECT_NE(json.find("\"round\":42"), String::npos);
     EXPECT_NE(json.find("\"gc_shards\":4"), String::npos);
+}
+
+/// `ObjectKind`/`ProvenanceOp` render as their full wire words, not the enumerator spelling. Loops
+/// over every `ProvenanceOp` value so each one ends up pinned, not just whichever one a single case
+/// would have picked.
+TEST(CASObservability, CaInspectDecodesEnvelopeHeaderWithEveryProvenanceOpWord)
+{
+    Layout layout("p");
+    const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("envelope-inspect"))};
+    const String key = layout.blobKey(ref);
+
+    const std::vector<std::pair<ProvenanceOp, String>> ops = {
+        {ProvenanceOp::Other, "other"},
+        {ProvenanceOp::Insert, "insert"},
+        {ProvenanceOp::Merge, "merge"},
+        {ProvenanceOp::Mutation, "mutation"},
+        {ProvenanceOp::Attach, "attach"},
+        {ProvenanceOp::Repack, "repack"},
+    };
+    for (const auto & [op, word] : ops)
+    {
+        EnvelopeHeader h;
+        h.kind = ObjectKind::Blob;
+        h.provenance = Provenance{.op = op};
+        const String bytes = encodeEnvelopeHeader(h, 256);
+
+        const String json = caInspectToJson(layout, key, bytes);
+        EXPECT_NE(json.find(R"("kind":"blob")"), String::npos) << json;
+        EXPECT_NE(json.find("\"op\":\"" + word + "\""), String::npos) << json;
+    }
 }
 
 TEST(CASObservability, CaInspectUnknownKeyThrows)

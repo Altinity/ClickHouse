@@ -506,6 +506,14 @@ def main():
 
     # for local run check if stateful tests are present to skip prepare_stateful_data and start faster if not
     has_stateful_tests = True
+    if info.is_local_run and not tests:
+        # A local run of the WHOLE suite cannot prepare the stateful datasets: `create.sql` attaches
+        # them from a web disk on `dockerhub-proxy.dockerhub-proxy-zone`, which resolves only inside
+        # CI, so the step dies with DNS_ERROR before a single test runs. Skipping it lets the
+        # stateless suite run locally; the tests that genuinely need `test.hits`/`test.visits` fail
+        # and are triaged as environment rather than taking the whole job with them.
+        print("Local full-suite run: skipping stateful data preparation (datasets are CI-hosted)")
+        has_stateful_tests = False
     if tests and info.is_local_run:
         from glob import glob
 

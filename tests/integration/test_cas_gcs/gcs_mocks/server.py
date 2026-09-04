@@ -27,10 +27,23 @@ Control surface, reserved under the bucket name ``_control``:
   - ``POST /_control/condemn?bucket=B&key=K`` — rewrite blob ``K``'s existing ``.meta`` sibling from
     ``Clean`` to ``Condemned`` without adding a captured storage request. This is a deterministic
     state seam for the writer retry test, not a model of the GC request sequence;
-  - ``POST /_control/reset`` — drop the capture log and the counters (objects are kept);
+  - ``POST /_control/reset`` — drop the capture log and the counters (objects are kept), and clear the
+    delay knob below;
+  - ``POST /_control/delay?substr=S&ms=N`` — every PUT whose key contains ``S`` sleeps ``N``
+    milliseconds before it is served, outside the store lock so other requests keep flowing. A fixed
+    per-request delay, not a modelled per-object rate cap: it charges an isolated write the same as a
+    burst. Each delayed PUT also increments the ``DelayedPut`` counter (visible at
+    ``/_control/counters``), so a caller can prove the knob fired rather than infer it from timing.
+    ``substr=&ms=0`` clears it;
   - ``POST /_control/mode?if_match=reject|ignore&omit_generation=0|1`` — select the adversarial
     behaviours below. Global, not per bucket: the client reuses connections across buckets and a
     per-bucket switch would invite a test to believe it had isolated something it had not.
+  - ``POST /_control/first_per_key_throttle?enabled=0|1`` — while enabled, the FIRST request naming
+    any given ``(bucket, key)`` -- of any method, ``_control/*`` excluded -- answers ``429 SlowDown``
+    and touches nothing; every later request to that same key is served normally. Models a real
+    store's transient per-object throttling: the caller must resolve the refusal by reissuing, never
+    by treating it as a definite failure. ``enabled=0`` clears the seen-key set along with the flag, so
+    a later ``enabled=1`` throttles every key again from scratch.
 
 Adversarial behaviours, each off by default:
 
@@ -124,6 +137,16 @@ class Store:
         # Adversarial behaviour, off by default — see the module docstring.
         self.if_match_mode = "reject"
         self.omit_generation = False
+        # `/_control/delay`: every PUT whose key contains `delay_substr` sleeps `delay_ms` before it is
+        # served, outside the store lock so other requests keep flowing. A fixed per-request delay, not
+        # a modelled rate cap — see the module docstring's `/_control/delay` bullet.
+        self.delay_substr = ""
+        self.delay_ms = 0
+        # `/_control/first_per_key_throttle`: while enabled, every key in `throttled_keys_seen` has
+        # already been refused once and is now served normally; a key not yet in the set gets added
+        # and refused with 429 instead of being dispatched.
+        self.first_per_key_throttle = False
+        self.throttled_keys_seen = set()
         self._next_generation = _GENERATION_SEED
         self._next_etag_ordinal = 1
         self._next_upload_ordinal = 1
@@ -197,6 +220,14 @@ def _unsupported(what):
 def _bad_request(message):
     return Reply(
         400, _error_xml("InvalidArgument", message), {"Content-Type": "application/xml"}
+    )
+
+
+def _slow_down(key):
+    return Reply(
+        429,
+        _error_xml("SlowDown", "throttled by /_control/first_per_key_throttle: " + key),
+        {"Content-Type": "application/xml"},
     )
 
 
@@ -784,7 +815,7 @@ def handle_control(path, method, query):
             return _no_such_key(meta_key)
         text = entry["body"].decode("utf-8", "strict")
         rewritten, replacements = re.subn(
-            r'"st":"clean","cr":"[0-9]+"', '"st":"condemned","cr":"1"', text, count=1
+            r'"state":"clean","condemn_round":"[0-9]+"', '"state":"condemned","condemn_round":"1"', text, count=1
         )
         if replacements != 1:
             return _bad_request("blob metadata is not Clean: " + meta_key)
@@ -797,9 +828,29 @@ def handle_control(path, method, query):
             json.dumps({"bucket": bucket, "key": blob_key, "state": "condemned"}).encode(),
             {"Content-Type": "application/json"},
         )
+    if path == "/_control/delay" and method == "POST":
+        STORE.delay_substr = query.get("substr", [""])[0]
+        STORE.delay_ms = int(query.get("ms", ["0"])[0])
+        return Reply(
+            200,
+            json.dumps({"substr": STORE.delay_substr, "ms": STORE.delay_ms}).encode(),
+            {"Content-Type": "application/json"},
+        )
+    if path == "/_control/first_per_key_throttle" and method == "POST":
+        STORE.first_per_key_throttle = query.get("enabled", ["0"])[0] == "1"
+        STORE.throttled_keys_seen = set()
+        return Reply(
+            200,
+            json.dumps({"enabled": STORE.first_per_key_throttle}).encode(),
+            {"Content-Type": "application/json"},
+        )
     if path == "/_control/reset" and method == "POST":
         STORE.requests = []
         STORE.counters = {}
+        STORE.delay_substr = ""
+        STORE.delay_ms = 0
+        STORE.first_per_key_throttle = False
+        STORE.throttled_keys_seen = set()
         return Reply(200, b"OK")
     return Reply(404, _error_xml("NoSuchControl", "unknown control path " + path))
 
@@ -847,51 +898,83 @@ class Handler(http.server.BaseHTTPRequestHandler):
         stripped = path.lstrip("/")
         bucket, _, key = stripped.partition("/")
 
+        delayed = method == "PUT" and STORE.delay_ms and STORE.delay_substr and STORE.delay_substr in key
+        if delayed:
+            time.sleep(STORE.delay_ms / 1000.0)
+
         with _LOCK:
             STORE.count("method_" + method)
-            request_class = _request_class(bucket, key)
-            operation = _request_operation(bucket, request_class, method, query, headers)
-            if method == "PUT":
-                if "partNumber" in query:
-                    STORE.count("UploadPart")
-                reply = handle_put(bucket, key, query, headers, body)
-            elif method == "DELETE":
-                reply = handle_delete(bucket, key, query, headers)
-            elif method == "POST":
-                if "delete" in query:
-                    STORE.count("DeleteObjects")
-                    reply = handle_batch_delete(bucket, body)
+            # A caller that only checks queue drainage cannot tell a delay that fired from a delay
+            # knob that silently stopped matching (a renamed endpoint, a renamed query param, a
+            # substring that no longer matches the key) — this counter is the caller's proof the
+            # sleep above actually ran.
+            if delayed:
+                STORE.count("DelayedPut")
+            throttled = STORE.first_per_key_throttle and (bucket, key) not in STORE.throttled_keys_seen
+            if throttled:
+                STORE.throttled_keys_seen.add((bucket, key))
+                STORE.count("FirstPerKeyThrottled")
+                reply = _slow_down(key)
+                STORE.requests.append(
+                    {
+                        "seq": len(STORE.requests),
+                        "method": method,
+                        "bucket": bucket,
+                        "key": key,
+                        "query": parsed.query,
+                        "headers": headers,
+                        "request_class": _request_class(bucket, key),
+                        "operation": "first_per_key_throttled",
+                        "request_body": "",
+                        "status": reply.status,
+                        "response_generation": None,
+                        "response_etag": None,
+                    }
+                )
+            if not throttled:
+                request_class = _request_class(bucket, key)
+                operation = _request_operation(bucket, request_class, method, query, headers)
+                if method == "PUT":
+                    if "partNumber" in query:
+                        STORE.count("UploadPart")
+                    reply = handle_put(bucket, key, query, headers, body)
+                elif method == "DELETE":
+                    reply = handle_delete(bucket, key, query, headers)
+                elif method == "POST":
+                    if "delete" in query:
+                        STORE.count("DeleteObjects")
+                        reply = handle_batch_delete(bucket, body)
+                    else:
+                        if "uploads" in query:
+                            STORE.count("CreateMultipartUpload")
+                        if "uploadId" in query:
+                            STORE.count("CompleteMultipartUpload")
+                        reply = handle_post(bucket, key, query, headers, body)
+                elif method in ("GET", "HEAD"):
+                    reply = handle_get_or_head(bucket, key, query, headers)
                 else:
-                    if "uploads" in query:
-                        STORE.count("CreateMultipartUpload")
-                    if "uploadId" in query:
-                        STORE.count("CompleteMultipartUpload")
-                    reply = handle_post(bucket, key, query, headers, body)
-            elif method in ("GET", "HEAD"):
-                reply = handle_get_or_head(bucket, key, query, headers)
-            else:
-                reply = _unsupported(method)
+                    reply = _unsupported(method)
 
-            STORE.requests.append(
-                {
-                    "seq": len(STORE.requests),
-                    "method": method,
-                    "bucket": bucket,
-                    "key": key,
-                    "query": parsed.query,
-                    "headers": headers,
-                    "request_class": request_class,
-                    "operation": operation,
-                    "request_body": (
-                        body.decode("utf-8", "replace")
-                        if request_class in ("blob_meta", "cas_control")
-                        else ""
-                    ),
-                    "status": reply.status,
-                    "response_generation": reply.headers.get("x-goog-generation"),
-                    "response_etag": reply.headers.get("ETag"),
-                }
-            )
+                STORE.requests.append(
+                    {
+                        "seq": len(STORE.requests),
+                        "method": method,
+                        "bucket": bucket,
+                        "key": key,
+                        "query": parsed.query,
+                        "headers": headers,
+                        "request_class": request_class,
+                        "operation": operation,
+                        "request_body": (
+                            body.decode("utf-8", "replace")
+                            if request_class in ("blob_meta", "cas_control")
+                            else ""
+                        ),
+                        "status": reply.status,
+                        "response_generation": reply.headers.get("x-goog-generation"),
+                        "response_etag": reply.headers.get("ETag"),
+                    }
+                )
 
         self._send(reply, want_body)
 
@@ -923,8 +1006,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1])
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    # `bind_and_activate=False`, then raise the listen backlog, then bind+activate by hand: the base
+    # class calls `socket.listen()` (which locks in the backlog) from inside `__init__` when
+    # `bind_and_activate` is left at its default, before this line could change it.
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler, bind_and_activate=False)
     server.daemon_threads = True
+    # The default listen backlog (5) starves unrelated connections once `/_control/delay` holds a
+    # few dozen handler threads asleep at once: a caller under `test_cas_gcs_relink_liveness`
+    # measured `connect timed out` on keys the delay knob was never meant to slow.
+    server.request_queue_size = 128
+    server.server_bind()
+    server.server_activate()
     server.serve_forever()
 
 

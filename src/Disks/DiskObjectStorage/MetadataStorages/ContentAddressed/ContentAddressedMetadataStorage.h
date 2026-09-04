@@ -167,15 +167,6 @@ public:
     /// thin wrapper around the string-taking overload for callers that still hold a config reference.
     static Cas::StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
-    /// Parses a `part_folder_validate` value (`always` | `never` | `age <seconds>`). The `age` form
-    /// accepts only a non-negative integer number of seconds; malformed input and unknown modes throw
-    /// `BAD_ARGUMENTS` instead of silently selecting a policy.
-    static Cas::PartFolderValidate parsePartFolderValidate(const std::string & value);
-
-    /// Reads `part_folder_validate` from `config`, defaulting to `always`, and parses it. Kept only as
-    /// a thin wrapper around the string-taking overload for callers that still hold a config reference.
-    static Cas::PartFolderValidate parsePartFolderValidate(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
-
     /// Returns the content-addressed metadata storage backing `disk`, or nullptr if `disk` is not
     /// content-addressed. Plain (non-object-storage) disks do not implement `getMetadataStorage` at
     /// all and throw `NOT_IMPLEMENTED`; that is treated as "not content-addressed" rather than
@@ -558,6 +549,15 @@ public:
     /// default; production installs none.
     void setGcVerbAdmitWindowHookForTest(std::function<void()> fn) { gc_verb_admit_window_hook_for_test = std::move(fn); }
 
+    /// Test-only: sees every round-log row the storage's own scheduler emits (Start, Phase, Finish),
+    /// before and independently of the system-log path -- which a unit-test storage (null `Context`)
+    /// does not have at all. Lets a test park a synchronous round on a phase row while it holds
+    /// `gc_scheduler_mutex`, and read the round's outcome afterwards. Set before the first round.
+    void setGcRoundRowHookForTest(std::function<void(const Cas::GcRoundLogRecord &)> fn)
+    {
+        gc_round_row_hook_for_test = std::move(fn);
+    }
+
     /// Test-only fault-injection/hook seam for `ContentAddressedTransaction::publishStaging`'s
     /// promote/repoint call, keyed by the full `(ns, ref)` routed identity via `PartRefKey::cacheKey()`
     /// (mirrors `CasRefLedger::setRefPreCarveHookForTest`'s no-op-in-production shape) -- a bare ref
@@ -619,6 +619,17 @@ private:
     const uint64_t manifest_decode_cache_bytes;
     /// Bounded pool size for GC's per-hash freshness-metadata writes.
     const uint64_t gc_meta_pool_size;
+    /// Bounded pool size for the GC fold's read-ahead; 1 disables it.
+    const uint64_t gc_read_concurrency;
+    /// Keys per batch delete request for the write-once families.
+    const uint64_t gc_bulk_delete_chunk_keys;
+    /// The budget for one HTTP attempt of a writable Native mount's control-plane requests; feeds
+    /// `Cas::PoolConfig::cas_request_budget.attempt_timeout_ms` and the backend's own
+    /// `attemptTimeoutMs()`.
+    const uint64_t cas_attempt_timeout_ms;
+    /// Startup-only margin validated against the mount lease TTL; feeds
+    /// `Cas::PoolConfig::cas_request_budget.lease_safety_margin_ms`.
+    const uint64_t cas_lease_safety_margin_ms;
     /// Configured staging backend; `Local` preserves the existing write path.
     const Cas::StagingBackend staging_backend;
     /// Blob content-hash function passed to `Cas::PoolConfig`.
@@ -627,8 +638,6 @@ private:
     const bool blob_hash_allow_new;
     /// Per-disk `<skip_access_check>` policy passed to `Cas::PoolConfig`.
     const bool skip_access_check;
-    /// Policy controlling when retained part-folder views revalidate their manifest body.
-    const Cas::PartFolderValidate part_folder_validate;
     /// A single coherent snapshot of the pool and its cached part-folder facade, taken under ONE
     /// `pointer_mutex` acquisition (see `poolAccess()`) so no caller can observe `pool` from one mount
     /// generation and `part_access` from another -- the two used to be fetched by two separate calls
@@ -653,7 +662,7 @@ private:
     /// native_token_type`) -- immutable afterwards. `startup` also hands it to the object storage as a
     /// pin, which is what refuses a reload that would flip the dialect under this live pool; the check
     /// belongs there because only the object storage knows the effective `http_client`.
-    Cas::TokenType native_token_type = Cas::TokenType::ETag;
+    Cas::Dialect native_token_type = Cas::Dialect::ETag;
     /// shared_ptr so `runGarbageCollectionRoundNow`/`runOneGcRoundForTest` can take a snapshot under
     /// `pointer_mutex`, release it, and run the (long) round via the snapshot -- never holding
     /// `pointer_mutex` itself for the round's duration, so `gcHealth`/`store`/`partAccess` never
@@ -663,9 +672,9 @@ private:
     /// `gcStop`/`gcStart`. Serializes them against each other. Lock order when nested locks are needed:
     /// `lifecycle_mutex` -> `gc_scheduler_mutex` -> `pointer_mutex`, never the reverse.
     mutable std::mutex lifecycle_mutex;
-    /// Serializes ONE synchronous GC round at a time and makes `shutdown` wait for an in-flight round
-    /// to finish cleanly (clean GC completion has priority over fast shutdown) -- held for the WHOLE
-    /// round. Deliberately NOT the same mutex as `pointer_mutex` below: this one can be held for a
+    /// Serializes ONE synchronous GC round at a time. `shutdown` still takes it, but arms the pool
+    /// first, so a round in flight is refused at its next request once the pool is armed and the wait
+    /// is one request long -- held for the WHOLE round. Deliberately NOT the same mutex as `pointer_mutex` below: this one can be held for a
     /// long time, so nothing that only needs a brief pointer snapshot may share it.
     mutable std::mutex gc_scheduler_mutex;
     bool shutdown_called TSA_GUARDED_BY(gc_scheduler_mutex) = false;
@@ -750,7 +759,7 @@ private:
         /// captured while the concrete backend is still in scope. Reading it back through `pool`
         /// would mean unwrapping the instrumentation decorator `Pool::open` adds, so it is returned
         /// here instead.
-        Cas::TokenType native_token_type = Cas::TokenType::ETag;
+        Cas::Dialect native_token_type = Cas::Dialect::ETag;
     };
 
     /// Builds the backend + `Cas::PoolConfig` and opens a pool exactly as `startup()` does. A read-only
@@ -793,6 +802,7 @@ private:
     /// TOCTOU tests). Empty in production; a `const` GC verb reads it and calls the const-qualified
     /// `std::function::operator()`, so it needs no `mutable`.
     std::function<void()> gc_verb_admit_window_hook_for_test;
+    std::function<void(const Cas::GcRoundLogRecord &)> gc_round_row_hook_for_test;
 };
 
 }

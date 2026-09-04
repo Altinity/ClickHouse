@@ -54,12 +54,13 @@ using CountingHintHoleBackend = DB::Cas::tests::HintHoleBackendOn<DB::Cas::tests
 /// than a fold seal).
 std::optional<RefCoverage> coverageOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
+    DB::Cas::tests::OperationForTest op(backend);
     const uint64_t gen = currentGenerationOf(backend, layout);
     const uint64_t attempt = currentAttemptOf(backend, layout);
     const UInt128 life_id = catalogLifeIdForTest(backend, layout, ns);
     for (uint64_t g = gen; ; --g)
     {
-        if (const auto got = backend.get(layout.foldSealKey(g, attempt)))
+        if (const auto got = (*op).read(layout.foldSealKey(g, attempt), Retry::standard()))
         {
             const CasFoldSeal seal = decodeFoldSeal(got->bytes);
             const auto it = seal.ref_lives.find(life_id);
@@ -138,8 +139,6 @@ std::map<String, UInt64> runRoundCapturingIntake(Gc & gc, UniversePolicy policy 
 class ChasingWriterBackend : public CountingBackend
 {
 public:
-    using CountingBackend::get;
-
     /// Start appending above `published_through` (writer epoch 1) whenever the tail is read, up to
     /// `max_appends` further records.
     void arm(const Layout * layout_, const RootNamespace & ns_, uint64_t published_through, uint64_t max_appends)
@@ -155,9 +154,9 @@ public:
 
     uint64_t publishedThrough() const { return published; }
 
-    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
-        auto result = CountingBackend::get(key, range);
+        auto result = CountingBackend::read(key, access);
         if (!layout || appending || published >= limit)
             return result;
         if (key != layout->refLogKey(fixture::fixtureLife(ns), RefTxnId{1, published}))
@@ -230,7 +229,7 @@ TEST(CASGCBoundedWalk, ARoundFoldsThroughItsRoundStartTailAndLeavesTheStragglers
     EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{1, planted}))
         << "the walk must fold through the round-start tail and no further -- it chased the writer";
     EXPECT_FALSE(cov->hold.has_value()) << "reaching the committed frontier is not a hold";
-    EXPECT_NE(cov->classification, 4) << "reaching the committed frontier is not a clamp";
+    EXPECT_NE(cov->classification, CoverageClass::Clamped) << "reaching the committed frontier is not a clamp";
     EXPECT_EQ(metric(intake, "tails_advanced"), 1u);
     EXPECT_EQ(metric(intake, "logs_applied"), planted) << "exactly the round-start backlog was folded";
 
@@ -394,7 +393,10 @@ TEST(CASGCBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruc
     EXPECT_EQ(backend->deleteTotal(), 1u)
         << "the committed frontier permits the round's immediate manifest cleanup. Deleted:"
         << deletedKeysMessage(*backend);
-    EXPECT_TRUE(backend->head(layout.blobKey(legacyMetaTestRef(blob))).exists);
+    {
+        DB::Cas::tests::OperationForTest head_op(*backend);
+        EXPECT_TRUE((*head_op).head(layout.blobKey(legacyMetaTestRef(blob)), Retry::standard()).has_value());
+    }
 
     /// The raw F+1 record remains outside the CTE; it cannot defer the normal destructive pipeline.
     backend->disarm();
@@ -505,7 +507,7 @@ TEST(CASGCBoundedWalk, AnAbsentManifestBodyStillHoldsWithoutAHead)
     ASSERT_TRUE(cov->hold.has_value()) << "an absent committed manifest body raises the fold barrier";
     EXPECT_EQ(cov->hold->reason, HoldReason::ManifestBodyMissing);
     EXPECT_EQ(cov->hold->offending_position, (RefTxnId{1, 2}));
-    EXPECT_EQ(cov->classification, 4);
+    EXPECT_EQ(cov->classification, CoverageClass::Clamped);
     EXPECT_EQ(backend->headCount(layout.manifestKey(gone)), 0u)
         << "absence is decided by the GET, so the missing body costs no HEAD either";
 }
@@ -558,13 +560,13 @@ TEST(CASGCBoundedWalk, ANamespaceThatFoldedNothingKeepsItsSealedCursor)
     ASSERT_TRUE(after.has_value())
         << "the coverage row was DROPPED -- the next round would re-fold this namespace from {0,0}";
     /// The CURSOR and the HOLD are what the next round trusts, and both ride unchanged.
-    /// `classification` legitimately moves from 2 ("this round folded records") to 1 ("unchanged"),
+    /// `classification` legitimately moves from `Folded` ("this round folded records") to `Unchanged`,
     /// because that is what the round did — it is the one field that may differ, so it is the one field
     /// asserted loosely.
     EXPECT_EQ(after->last_folded_ref_id, before->last_folded_ref_id)
         << "a namespace that folded nothing must keep the cursor it had";
     EXPECT_EQ(after->hold, before->hold);
-    EXPECT_NE(after->classification, 4) << "folding nothing is not a clamp";
+    EXPECT_NE(after->classification, CoverageClass::Clamped) << "folding nothing is not a clamp";
     EXPECT_EQ(metric(intake, "frontier_namespaces"), 2u)
         << "it stays in the round's universe, so its proof is still owed";
 }

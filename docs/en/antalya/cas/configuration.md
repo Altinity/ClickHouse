@@ -98,9 +98,11 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_part_folder_cache_bytes` | 64 MiB | Part-folder view cache byte budget (`0` disables retention) |
 | `cas_part_folder_cache_max_entries` | `10000` | Part-folder view cache entry cap |
 | `cas_part_folder_cache_max_entry_bytes` | 16 MiB | Oversized part-folder views bypass retention above this size |
-| `cas_part_folder_validate` | `always` | Cache body re-proof policy (`always` \| `never` \| `age <seconds>`). **Leave at `always`**: the other modes trade the fail-closed body-existence check for an optimization — this is a trust decision about unverified data, not a performance knob |
 | `cas_manifest_decode_cache_bytes` | 128 MiB | Manifest decode cache byte budget (`0` disables) |
 | `cas_gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
+| `cas_gc_read_concurrency` | `16` | Bounded pool size for the GC fold's read-ahead of checkpoints, ref logs, manifests and zero-candidate HEADs; `1` disables |
+| `cas_attempt_timeout_ms` | `5000` | Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove) |
+| `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: `cas_attempt_timeout_ms + cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, or the disk refuses to open writable |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
 
 ## Advanced GC pacing settings {#advanced-gc-pacing-settings}

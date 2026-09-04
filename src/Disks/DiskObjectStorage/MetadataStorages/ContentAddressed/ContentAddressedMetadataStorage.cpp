@@ -5,7 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <IO/S3/Client.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
@@ -29,7 +29,6 @@
 #include <Poco/String.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <base/sleep.h>
-#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <ctime>
@@ -82,6 +81,10 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
+    extern const ContentAddressedSettingsUInt64 gc_read_concurrency;
+    extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
+    extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
+    extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
 }
 
@@ -137,7 +140,7 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///   serverRootId, scratchPath, stagingBackend, objectStorage, gcHealth,
 ///   lifecycleSnapshot (both non-store()-gated introspection reads for system.cas_mounts --
 ///   readable in EVERY lifecycle state including a not-live/vanished/null pool, spec §7),
-///   parseStagingBackend/parsePartFolderValidate/
+///   parseStagingBackend/
 ///   tryFromDisk (static), checkNotReadOnly, the *ForTest seams, serverPrefix/liveNamespace/
 ///   shadowNamespace/shadowScope/route/classifyDirectory (pure path computation, no pool I/O),
 ///   ownsNamespace (the relink-confirm routing predicate -- a string comparison against
@@ -299,11 +302,14 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
     , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
+    , gc_read_concurrency(settings_[ContentAddressedSetting::gc_read_concurrency].value)
+    , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
+    , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
+    , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
     , staging_backend(settings_.stagingBackend())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
     , skip_access_check(settings_.skipAccessCheck())
-    , part_folder_validate(settings_.partFolderValidate())
 {
 }
 
@@ -326,35 +332,6 @@ Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
     const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
 {
     return parseStagingBackend(config.getString(config_prefix + ".staging_backend", "local"));
-}
-
-Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(const std::string & value)
-{
-    using PartFolderValidate = Cas::PartFolderValidate;
-    if (value == "always")
-        return {PartFolderValidate::Mode::Always, 0};
-    if (value == "never")
-        return {PartFolderValidate::Mode::Never, 0};
-    if (value.starts_with("age "))
-    {
-        /// `std::from_chars` against an UNSIGNED type never accepts a leading '-' (unlike
-        /// `std::stoull`, which silently negates modulo 2^64) -- a malformed/negative/non-digit/empty
-        /// suffix falls through to the terminal throw below instead of wrapping into an astronomical
-        /// age_seconds that behaves as skip-forever.
-        const std::string age_str = value.substr(4);
-        uint64_t age_seconds = 0;
-        const auto [ptr, ec] = std::from_chars(age_str.data(), age_str.data() + age_str.size(), age_seconds);
-        if (ec == std::errc{} && ptr == age_str.data() + age_str.size())
-            return {PartFolderValidate::Mode::Age, age_seconds};
-    }
-    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "Unknown cas_part_folder_validate value '{}' (expected 'always', 'never', or 'age <non-negative integer seconds>')", value);
-}
-
-Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(
-    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
-{
-    return parsePartFolderValidate(config.getString(config_prefix + ".part_folder_validate", "always"));
 }
 
 ContentAddressedMetadataStorage * ContentAddressedMetadataStorage::tryFromDisk(const DiskPtr & disk)
@@ -490,15 +467,19 @@ CasLifecycleSnapshot ContentAddressedMetadataStorage::lifecycleSnapshot() const
 
 Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
 {
-    /// Unit tests pass a null context (no system logs); the scheduler then runs without a sink.
+    /// Unit tests pass a null context (no system logs); the scheduler then runs with the test hook
+    /// as its only sink, or without a sink.
+    const std::function<void(const Cas::GcRoundLogRecord &)> hook = gc_round_row_hook_for_test;
     if (!context)
-        return {};
+        return hook ? Cas::GcRoundLogger(hook) : Cas::GcRoundLogger{};
     const ContextWeakPtr weak_context = *context;
     /// The configured disk name (threaded from the metadata-storage factory); falls back to
     /// storage_path_prefix for callers that don't supply one (e.g. unit tests).
     const String disk = disk_name;
-    return [weak_context, disk](const Cas::GcRoundLogRecord & r)
+    return [weak_context, disk, hook](const Cas::GcRoundLogRecord & r)
     {
+        if (hook)
+            hook(r);
         auto ctx = weak_context.lock();
         if (!ctx)
         {
@@ -547,6 +528,12 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
             case Cas::GcRoundLogRecord::Outcome::Deferred:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::DEFERRED;
                 break;
+            case Cas::GcRoundLogRecord::Outcome::Aborted:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::ABORTED;
+                break;
+            case Cas::GcRoundLogRecord::Outcome::Stopped:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::STOPPED;
+                break;
         }
         e.round = r.round;
         e.candidates_marked = r.candidates_marked;
@@ -562,6 +549,7 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.anomalies = r.anomalies;
         e.duration_ms = r.duration_ms;
         e.error = r.error;
+        e.error_code = r.error_code;
         e.profile_events = r.profile_events;
         e.round_id = r.round_id;
         e.phase = r.phase;
@@ -708,8 +696,6 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     const auto mode = object_storage->getType() == ObjectStorageType::Local
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
         : Cas::ObjectStorageBackend::Mode::Native;
-    auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode);
-    const Cas::TokenType backend_token_type = backend->nativeTokenType();
 
     /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
@@ -790,12 +776,25 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
     pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
+    pool_config.gc_read_concurrency = gc_read_concurrency;
+    pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
+    pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
+    pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
     pool_config.event_sink = makeCasEventSink();
+
+    /// Built here rather than above so it carries the budget the pool was configured with. Only a
+    /// WRITABLE Native mount takes the single-attempt profile for its control-plane requests: it owns
+    /// its own deadline and retry policy, and a transparently retried request would outlive them. A
+    /// read-only mount has no such deadline, so it keeps the storage's default.
+    auto backend = std::make_shared<Cas::ObjectStorageBackend>(
+        object_storage, mode,
+        /*single_attempt_control_plane_=*/!read_only && mode == Cas::ObjectStorageBackend::Mode::Native,
+        pool_config.cas_request_budget.attempt_timeout_ms);
 
     PoolView view;
     view.physical_key_prefix = physical_key_prefix_local;
     view.pool_prefix = pool_prefix;
-    view.native_token_type = backend_token_type;
+    view.native_token_type = backend->nativeTokenType();
     view.pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
     return view;
 }
@@ -845,8 +844,7 @@ void ContentAddressedMetadataStorage::startup()
         Cas::CachedPartFolderAccess::CacheParams{
             .cache_bytes = cas_part_folder_cache_bytes,
             .max_entries = cas_part_folder_cache_max_entries,
-            .max_entry_bytes = cas_part_folder_cache_max_entry_bytes,
-            .validate = part_folder_validate});
+            .max_entry_bytes = cas_part_folder_cache_max_entry_bytes});
 
     /// Reclaim this mount's leaked `staging/<server_root_id>/` debris after an explicit, writable S3
     /// staging mount has passed the native-copy check above. The prefix is keyed by this mount's own
@@ -905,13 +903,22 @@ void ContentAddressedMetadataStorage::startup()
     /// that swapped the client under that state would leave persisted tokens uncomparable. The refusal
     /// has to happen in the object storage: only there is the effective `http_client` known, merged from
     /// the storage's current settings, any endpoint-level block and the disk's own section.
-    object_storage->pinConditionalOpsGenerationDialect(native_token_type == Cas::TokenType::Generation);
+    object_storage->pinConditionalOpsGenerationDialect(native_token_type == Cas::Dialect::Generation);
 }
 
 void ContentAddressedMetadataStorage::shutdown()
 {
-    /// Wait for any in-flight synchronous round to finish cleanly first (gc_scheduler_mutex is held
-    /// for a round's whole duration) -- unchanged priority: clean GC completion over fast shutdown.
+    /// Arm the pool BEFORE waiting for `gc_scheduler_mutex`: a synchronous round holds that mutex
+    /// for its whole duration and releases it only once its next request is refused. The arm frees,
+    /// nulls and swaps nothing -- every pointer swap still happens below, under the same locks as
+    /// before -- so taking `pointer_mutex` alone here, before the outer lock, inverts no order.
+    Cas::PoolPtr pool;
+    {
+        std::lock_guard ptr_lock(pointer_mutex);
+        pool = cas_store;
+    }
+    if (pool)
+        pool->beginTeardown();
     std::lock_guard round_lock(gc_scheduler_mutex);
     shutdown_called = true;
     stopAndDrainForTeardown();
@@ -959,6 +966,10 @@ void ContentAddressedMetadataStorage::stopAndDrainForTeardown() noexcept
         }
     };
 
+    /// The destructor reaches here without `shutdown`'s arm: arm now, before the join, so a
+    /// background round is refused at its next request rather than joined at its end.
+    if (old_pool)
+        old_pool->beginTeardown();
     guarded([&] { if (old_scheduler) old_scheduler->stop(); }, "CAS storage teardown: stopping GC");
     guarded([&] { old_part_access.reset(); }, "CAS storage teardown: releasing part access");
     guarded([&]
@@ -1256,9 +1267,15 @@ void ContentAddressedMetadataStorage::confirmPoolIdentityForEmptyEnumeration(con
     const Cas::PoolPtr pool = store();   /// Live here (past the op gate's Live, non-terminal admission).
 
     ++empty_proof_probe_count_for_test;
+    /// The open plane: this probe is what authorizes an empty answer, and a mount whose lease has
+    /// blipped must still be able to ask it.
+    Cas::CasOperation probe_op = pool->openRequests().admit();
     const Cas::SentinelProbeResult probe = empty_proof_probe_override_for_test
         ? empty_proof_probe_override_for_test()
-        : Cas::probeSentinel(pool->backend(), pool->layout().poolMetaKey());
+        /// `once`: this probe is the gate that authorises an empty answer, and an inconclusive one is a
+        /// refusal the caller retries -- reissuing here would stall a directory listing for the whole
+        /// retry window instead.
+        : Cas::probeSentinel(probe_op, pool->layout().poolMetaKey(), Cas::Retry::once());
 
     switch (probe.outcome)
     {

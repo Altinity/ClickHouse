@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <Core/Defines.h>
 #include <IO/DistributedCacheSettings.h>
+#include <IO/ObjectStorageRequestMode.h>
 #include <IO/ReadMethod.h>
+#include <IO/WriteSettings.h>
 #include <Interpreters/FileCache/FileCache_fwd.h>
 #include <Common/Priority.h>
 #include <Common/Scheduler/ResourceLink.h>
@@ -158,6 +160,14 @@ struct ReadSettings
 
     bool read_through_distributed_cache = false;
     DistributedCacheSettings distributed_cache_settings;
+
+    /// Selects the object storage request mode this read should carry; see ObjectStorageRequestMode.
+    ObjectStorageRequestMode object_storage_request_mode = ObjectStorageRequestMode::Default;
+
+    /// Selects the retry profile the object storage should execute this read under, and the request
+    /// timeout of the client it picks for it; see ObjectStorageRetryProfile. 0 = the storage's own.
+    ObjectStorageRetryProfile object_storage_retry_profile = ObjectStorageRetryProfile::Default;
+    uint64_t object_storage_attempt_timeout_ms = 0;
 
     ReadSettings adjustBufferSize(size_t file_size) const;
 
