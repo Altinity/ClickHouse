@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 5. Brainstormed 2026-09-04 against the measurements in
+Revision 6. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
 supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
@@ -42,6 +42,12 @@ Revision history, kept because each step removed something a review proved unsou
   its recovery, copies rather than moves what the memory keeps, narrows the liveness rule to the
   operations that write the hot key, and stops claiming that 429s alone hold a store's per-object
   write budget.
+- Revision 6 keeps the engine's rule that an exception from `decide` propagates unchanged: only a
+  `nullopt` rendered on memory is re-rendered on an observation, and the catalog's own verdict
+  exceptions travel as `nullopt` plus a captured marker inside `casUpdateImpl`. A ticket guard
+  covers every exit from the moment of enqueue, a holder that outlives its own worst case no
+  longer wedges the key (waiters escape to un-ticketed writes, which the precondition keeps safe),
+  and the memory start reserves one attempt like the read it replaces.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -88,6 +94,7 @@ Goals:
   conflict that settled one.
 - No change to the catalog's API, to the semantics of any conditional write or of any verdict a
   `decide` renders, to the 90 s windows, to any read path, or to the GC erase's authority window.
+  One internal change in `CasRefCatalog.cpp` (how `casUpdateImpl` carries its markers, below).
   Every existing catalog test stays green unchanged.
 
 Non-goals:
@@ -115,8 +122,8 @@ predicate naming its hot keys, and every write verb it admits on such a key take
 and runs only when its ticket is at the front; a waiter leaves on its own fence or deadline. The
 lane remembers the last object this `CasRequests` committed, so a `readModifyWrite` can start from
 it instead of a `GET`. A `decide`'s refusal is reported only from a proven base. `Pool` gives the
-predicate to `mount_requests` only, naming `refCatalogKey()`; nothing in `CasRefCatalog`,
-`CasRefLedger` or GC changes.
+predicate to `mount_requests` only, naming `refCatalogKey()`; the catalog's API, `CasRefLedger`
+and GC do not change, and `casUpdateImpl` changes only how it carries its own markers.
 
 **Half 2, conflict pacing.** In `readModifyWrite` and `readModifyWriteOnPresence`, a clean
 refused precondition is repaid after `Retry::conflictBackoff()`, a flat uniform(0, 200 ms), and no
@@ -142,6 +149,7 @@ private:
     {
         std::deque<uint64_t> tickets;                /// guarded by `mutex`; front = the holder or the next holder
         bool holder_active = false;                  /// guarded by `mutex`
+        uint64_t holder_worst_case_ms = 0;           /// guarded by `mutex`; the holder's deadline plus one attempt
         std::condition_variable cv;
         std::optional<Object> remembered;            /// guarded by `mutex`; the last object this plane committed
         uint64_t next_ticket = 0;                    /// guarded by `mutex`
@@ -199,23 +207,39 @@ that row. A `decide` that refuses on such a base (the catalog's markers, or a `n
 reporting a verdict about a state the store has left, and with no write sent nothing would catch
 it.
 
-The rule that closes it: **a verdict (a `decide` that returns `nullopt` or throws) is reported to
-its caller only when it was rendered on an observation of this call**, a `GET` or the resolve read
-after a `Conflict`. A verdict rendered on memory is not a result: the memory is cleared, the key is
-observed, and `decide` runs again on the observation; what it renders then is the result. A
-contribution (a `decide` that returns bytes) needs no such rule: the conditional `PUT` validates the
-base it was decided on, as today, and a refused precondition is settled by the resolve read, as
-today.
+The rule that closes it: **a `nullopt` from `decide` is reported as `Declined` only when it was
+rendered on an observation of this call**, a `GET` or the resolve read after a `Conflict`. A
+`nullopt` rendered on memory is not a result: the memory is cleared, the key is observed, and
+`decide` runs again on the observation; what it renders then is the result. A contribution (a
+`decide` that returns bytes) needs no such rule: the conditional `PUT` validates the base it was
+decided on, as today, and a refused precondition is settled by the resolve read, as today.
+
+**An exception from `decide` propagates unchanged, whatever the base, exactly as today.** The
+engine cannot tell a verdict thrown as control flow from a fault (an allocation failure, a
+cancellation, a nested read's error), and re-running `decide` after a fault could land a write
+where today the exception ends the call with nothing sent. So the engine discards only `nullopt`,
+and a site whose verdicts are exceptions must carry them as `nullopt` itself. The catalog does:
+`casUpdateImpl`'s `decide` catches its own verdict exceptions, the four markers
+(`CatalogFenceMovedMarker`, `CatalogEntryMismatchMarker`, `CatalogCreatorStillLiveMarker`,
+`CatalogEntryAlreadyPresentMarker`) and the admission refusal (`LIMIT_EXCEEDED` from
+`checkCatalogAdmission`), stores the `exception_ptr` in a local that every run of `decide` first
+clears, and returns `nullopt`. After `readModifyWrite` returns `Declined`, `casUpdateImpl` rethrows
+the captured exception, and its callers catch the same types at the same places as today; a
+`Declined` with nothing captured stays the `LOGICAL_ERROR` it is today. Every other exception,
+decode corruption and `identityPreserving`'s `LOGICAL_ERROR` among them, propagates from wherever
+it is thrown. This is the one change inside `CasRefCatalog.cpp`, and no signature moves.
 
 With that rule the safety of the lane does not depend on what a `decide` does with `current`. The
 contract a participating site must meet is mechanical:
 
 1. `decide` tolerates being run again on a different `current`, which `readModifyWrite` already
-   requires of it (it re-decides on every `Conflict`), and tolerates a verdict it rendered on memory
-   being discarded and re-rendered.
-2. `decide` issues no write on the same key through the same plane. A write from inside the holder
-   would wait for the holder. Reads are fine, as today, and a `decide` that reads holds the lane for
-   that read (see [effects to name](#effects-to-name)).
+   requires of it (it re-decides on every `Conflict`), and tolerates a `nullopt` it rendered on
+   memory being discarded and re-rendered. A verdict it wants re-rendered on stale memory is a
+   `nullopt`, never a throw.
+2. `decide` issues no write on any hot key of the same plane. A write from inside the holder
+   would wait for the holder, and two holders entering each other's keys would wait forever. Reads
+   are fine, as today, and a `decide` that reads holds the lane for that read (see
+   [effects to name](#effects-to-name)).
 3. No operation that writes the hot key carries a `Liveness` closure whose truth a wait could
    stale. The catalog writers (`resolveNamespaceLife`'s and `dropNamespaceImpl`'s operations) carry
    none. Other mount-plane operations do: the ref-log append lane resumes under closures that read
@@ -236,7 +260,12 @@ around its existing body. Nothing runs under `mutex` except the steps marked.
 (`policy.bind(now)`), as every verb does today at entry, so time spent waiting spends the caller's
 own window. Under `mutex`: push `next_ticket` at the back of `tickets` (the one allocation of the
 lane), then increment `next_ticket`. If the push throws, the number is not consumed, a lane the
-lookup created for this call is erased again, and the exception propagates.
+lookup created for this call is erased again, and the exception propagates. The moment the push
+succeeds, a ticket guard is installed: on every exit from here on, normal or by unwinding (the gate
+calls `std::function`s, `wait_for` may throw), it erases exactly this ticket from `tickets` (a
+`std::deque::erase` by value, no allocation), clears `holder_active` if this ticket was the holder,
+and does `cv.notify_all()`. It is `noexcept`. The leave step below is this guard running on the
+normal path.
 
 **Wait.** Loop, in this order:
 
@@ -248,7 +277,10 @@ lookup created for this call is erased again, and the exception propagates.
    mutex because it may call the operation's `Liveness` closure, and the lane mutex must stay a
    leaf that calls nothing.
 2. Under `mutex`: if the ticket is at the front and `holder_active` is false, set
-   `holder_active = true` and leave the loop as the holder. Otherwise `cv.wait_for(lock, slice)`
+   `holder_active = true`, record the holder's own worst case (its bound's deadline plus one
+   attempt reservation) as `holder_worst_case_ms`, and leave the loop as the holder. Otherwise, if
+   the engine's clock is past `holder_worst_case_ms`, the lane is wedged (below): erase this
+   ticket, clear the memory, and leave the loop un-ticketed. Otherwise `cv.wait_for(lock, slice)`
    with a short slice (the pattern of `recovery_cv.wait_for(lock, 200ms)` in the ledger), release
    the mutex, and go to step 1.
 
@@ -258,13 +290,14 @@ per-attempt gate and `fits` still run before anything is sent, as today.
 **Hold.** Run the verb's body on the caller's own thread, with the caller's own operation, policy,
 bound and result type, exactly as today, plus the memory step below.
 
-**Leave.** A guard on every exit, normal or exceptional, that under `mutex` moves the prepared
-memory value into `remembered` or clears it, pops the front ticket, sets `holder_active = false`,
-and does `cv.notify_all()`. It is `noexcept` and allocates nothing: the memory value is prepared
-before the guard runs (below), and a `std::deque::pop_front` does not allocate.
+**Leave.** The ticket guard, on every exit: under `mutex`, move the prepared memory value into
+`remembered` or clear it (a holder that unwinds clears), erase this ticket, set
+`holder_active = false` if it was the holder, `cv.notify_all()`. It is `noexcept` and allocates
+nothing: the memory value is prepared before the guard runs (below), and erasing from a
+`std::deque` does not allocate.
 
 A holder never waits for another ticket and never runs anyone else's closure: a ticket is settled
-only by its own caller. No ticket outlives its caller's stack in the queue: the caller removes it on
+only by its own caller. No ticket outlives its caller's stack in the queue: the guard removes it on
 every exit path, and nothing else references it.
 
 ### The memory {#the-memory}
@@ -289,14 +322,15 @@ value cannot be assembled, the guard forgets. The guard only moves.
 remembered object, used in place of its initial observation:
 
 1. Base := `remembered` if present, else `observe` as today. A memory start is gated exactly like
-   the observation it replaces: the operation's gate and the bound's `fits` are checked first, so a
-   caller past its deadline or its fence never runs `decide` on memory, exactly as it would not have
-   been allowed to observe.
-2. `decide(base)`. Bytes: proceed to the inner write against the base's etag, as today. A verdict
-   on an observed base: return it, as today. A verdict on memory: clear the memory, `observe`,
-   `decide` again on the observation, and return what that renders. This restart happens at most
-   once per call, and the first verdict is discarded without being seen by anyone: it was rendered
-   on a hint.
+   the observation it replaces: `gate(reservedFor(0, 1))`, one attempt envelope, and
+   `fits(reservedFor(0, 1), bound)`, the same two checks the read loop makes before its first
+   attempt, with the same three-way outcome. A caller past its deadline, its lease or its fence
+   never runs `decide` on memory, exactly as it would not have been allowed to observe.
+2. `decide(base)`. Bytes: proceed to the inner write against the base's etag, as today. A
+   `nullopt` on an observed base: `Declined`, as today. A `nullopt` on memory: clear the memory,
+   `observe`, `decide` again on the observation, and return what that renders. This restart happens
+   at most once per call, and the first `nullopt` is discarded without being seen by anyone: it was
+   rendered on a hint. An exception from `decide` propagates, whatever the base.
 3. The inner write and the `Conflict` loop are today's, with the pause of Half 2. A `Conflict`'s
    resolve read is an observation, so what `decide` renders on it is a result.
 
@@ -323,16 +357,20 @@ write are checked against.
 A stopping plane or a lost fence reaches waiters through their own gate, checked every slice, and
 reaches the holder through its own attempts' gates, as today.
 
-**A stalled holder.** The engine calls the transport synchronously and cannot cancel it; it
-reserves `Backend::attemptTimeoutMs()` per attempt, and that timeout is what bounds a stalled
-attempt in practice. The backend request contract already states that an attempt which trickles
-rather than stalls is not bounded, today or after that design. The lane changes who that costs:
-today a trickling attempt stalls only its own caller; in the lane it stalls the hot key, and every
-later writer expires at its own deadline with retry-later until the transport returns and the
-holder's leave guard runs. This is accepted as fail-stop: nothing lands that should not, the
-failures are the same typed retry-later the writer itself would report, and the recovery is the
-transport's own timeout. No holder lease or forced handover is added; a second write in flight
-under a still-running first one is what the lane exists to prevent.
+**A stalled holder, and the wedge escape.** The engine calls the transport synchronously and
+cannot cancel it. A stalled attempt ends at the backend's attempt timeout, which the engine reserves
+per attempt; an attempt that trickles rather than stalls has no bound, today or after the backend
+request contract, and today it traps only its own caller. In the lane it would trap the key. So the
+lane gives exclusivity up before it gives liveness up: the holder's own worst case, its bound's
+deadline plus one attempt reservation, is recorded when it takes the ticket, and a waiter that finds
+the engine's clock past it treats the lane as wedged. It erases its ticket, clears the memory, and
+runs its verb un-ticketed, exactly as on a cold key: a fresh observation, its own conditional
+`PUT`. This is safe because exclusivity was never the safety argument; the precondition is. The
+stuck write may still land later, or first, and whichever of the two loses its precondition is
+settled by its resolve read, as any two servers' writes are. When the stuck holder finally returns,
+its guard erases its ticket and clears `holder_active`, and the lane is a lane again. Nothing is
+forced and nothing is cancelled; the degraded mode is today's behaviour, entered only after a
+holder has exceeded the longest time the engine could have let it run.
 
 ### Lock order {#lock-order}
 
@@ -368,14 +406,17 @@ ledger-visible reads and a waiter must not hold what the holder needs. Today's c
 - INV-HK4. The memory of a hot key is either absent or a `(bytes, etag)` pair that was durable at
   some moment, taken from a `Committed` of this plane or from the engine's resolve read. It never
   changes the semantics of a conditional write: a stale memory costs one 412 and one resolve read.
-- INV-HK5. A verdict (a `decide` returning `nullopt` or throwing) reaches its caller only when it
-  was rendered on an observation of that call.
+- INV-HK5. A `nullopt` from `decide` reaches its caller as `Declined` only when it was rendered on
+  an observation of that call; an exception from `decide` reaches its caller unchanged, whatever
+  the base, and no write is sent after it.
 - INV-HK6. A ticket is removed only by its own caller, on every exit path; no ticket references a
   stack that may have unwound.
 - INV-HK7. `CasHotKeys::mutex` is held across no callback, no I/O and no `decide`, and the leave
   guard neither allocates nor throws.
 - INV-HK8. A waiter is promoted to holder only in an iteration whose gate and bound checks passed,
-  and a memory start passes the same gate and `fits` an observation would.
+  and a memory start passes the same one-attempt gate and `fits` an observation would.
+- INV-HK9. A holder holds exclusivity for at most its own worst case (deadline plus one attempt
+  reservation); past it, waiters write un-ticketed and the precondition alone orders the writes.
 
 ### Effects to name {#effects-to-name}
 
@@ -409,8 +450,10 @@ attempt 2 on), so the number has one home next to the schedule it departs from.
   instead of `pauseAndReissue` (which sleeps `Retry::backoff(++state.reissues)`), a
   `pauseForConflict` that performs the same `gate` and `fits` checks with `conflictBackoff()` and
   leaves `state.reissues` untouched. It records a new profile event, `CASRequestConflictPause`,
-  and not `CASRequestReissue`, which from then on counts transport reissues only; a test tells the
-  two schedules apart by the counters, not by sampling the jitter.
+  and not `CASRequestReissue`; in these two loops the reissue counter then counts transport
+  reissues only (`removeCurrent` and the read loops keep recording it as they do today, so its
+  global description stays "reissues, contention among them"). A test tells the two schedules
+  apart by the counters, not by sampling the jitter.
 - A `Conflict` whose inner write had an ambiguous attempt (`state.any_ambiguous`: a transport
   fault, a 429 among them, that the resolve read then settled as a lost race because the key had
   moved) keeps `pauseAndReissue` and its growing schedule. The race was lost, but the fault is the
@@ -453,7 +496,9 @@ In `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md`:
    throttles) reaches the loop that way, and is not otherwise held by this loop. Inside one plane a
    hot key never conflicts with itself: see the hot-key write lane."
 2. In the hand-written loop rule, after "sleeps with the engine's jitter between iterations", add:
-   "the flat `conflictBackoff` after a refused precondition, `backoff(attempt)` after a fault".
+   "the flat `conflictBackoff` after a refused precondition when the loop can tell it from a
+   settled fault, `backoff(attempt)` otherwise and after a fault; `deleteCompletedRemoving`'s
+   `replace` cannot tell and keeps `backoff(attempt)`".
 3. In the `readModifyWrite` section, one paragraph: on a hot key the initial observation may be
    the lane's remembered object, gated like an observation, and a verdict rendered on it is
    re-rendered on an observation before it is reported; pointer to this document.
@@ -472,7 +517,10 @@ CA-s3 lane, `system.query_log` for `DROP TABLE` and `CREATE TABLE` percentiles, 
 
 ## Tests {#tests}
 
-Engine level, in `gtest_cas_requests.cpp`'s harness: fake clock, counting backend, write hooks. The
+Engine level, in `gtest_cas_requests.cpp`'s harness: counting backend, write hooks, and a clock.
+The harness's `FakeClock` is single-threaded; the multi-threaded cases below use a synchronized
+clock (a mutex-guarded `now` advanced by the test thread, sleeps recorded under the same mutex)
+added for them, and a case that asserts nothing about time may use the real clock. The
 `CasRequests` under test is built with a predicate naming the test key. Each `decide` in these
 tests decodes a list of tickets from `bytes` and appends its own, so order is visible in the object.
 
@@ -484,13 +532,14 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    hook that records overlapping calls, that no two writes on the key were ever in flight together.
 2. Verdict on stale memory. The plane commits once (memory set). A second `CasRequests` over the
    same backend writes a row. A caller reads the key fresh outside the lane and runs a
-   `beginRemoving`-shaped `decide` (throw unless the row equals what it observed). Assert: no
-   exception, exactly one read by the lane, `Committed`, the row transitioned, and the discarded
-   first verdict is visible only as `CASHotKeyVerdictRestarts` (INV-HK5). A sibling uses a
-   `decide` that returns `nullopt` on the stale base and bytes on the observation, and asserts
-   `Committed`, never `Declined`.
-3. Verdict on an observation. Same shape, but the row really changed. Assert: the exception is
-   delivered, one read, no write; and for the `nullopt` shape, `Declined` with `seen` intact.
+   `beginRemoving`-shaped `decide` (`nullopt` unless the row equals what it observed, the way
+   `casUpdateImpl` carries its marker). Assert: `Committed`, exactly one read by the lane, the row
+   transitioned, and the discarded first `nullopt` is visible only as `CASHotKeyVerdictRestarts`
+   (INV-HK5). A catalog-level sibling in `gtest_cas_ref_catalog.cpp` drives the real
+   `beginRemoving` through a hot `CasRequests` and asserts `Transitioned`, not `EntryChanged`.
+3. Verdict on an observation. Same shape, but the row really changed. Assert: `Declined` with
+   `seen` intact, one read, no write; and at the catalog level, `EntryChanged` with one read and no
+   write, the same as today.
 4. External writer on the write path. A second `CasRequests` writes between two writes of the
    first. Assert the first's next `readModifyWrite` does exactly one resolve read and one retry
    write and ends `Committed`, and the write after that starts from memory with zero reads. A
@@ -507,8 +556,17 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    (INV-HK6).
 7. Expiry at handover. A waiter's deadline passes in the same slice in which the holder leaves.
    Assert the waiter never becomes holder, never runs `decide`, reads nothing, and leaves with
-   `GaveUp{Deadline}` (INV-HK8, the first half). A holder-to-be past its deadline with memory
-   present never runs `decide` on it (INV-HK8, the second half).
+   `GaveUp{Deadline}` (INV-HK8, the first half). A holder-to-be whose remaining window is smaller
+   than one attempt reservation, with memory present, never runs `decide` on it and reports the
+   same outcome an observation would (INV-HK8, the second half), under a plain, a frozen and a
+   lease-bound policy.
+7a. Exceptional exits. A `Liveness` closure that throws from the gate, and a `decide` that throws a
+   non-verdict exception on memory. Assert: the exception reaches the caller unchanged, no write was
+   sent for the second, the ticket is gone, and the next waiter is promoted (INV-HK6).
+7b. Wedge escape. The holder is parked in a `PUT` that never returns; the clock is advanced past
+   the holder's worst case. Assert: the next waiter proceeds un-ticketed with a fresh read and lands;
+   when the parked `PUT` is released it is refused and settled by its resolve read; the lane is
+   exclusive again afterwards (a third writer waits for a fourth).
 8. Open plane overlaps. A second `CasRequests` with no predicate (the open-plane shape) does a
    `replace` while the hot plane's holder is parked; it does not wait; whichever write is refused is
    settled by its resolve read; after an open-plane win the hot plane's next `readModifyWrite` pays
@@ -534,7 +592,8 @@ design's prepare-before-guard order and forget-on-failure are the argument).
 
 Regression: every existing test in `gtest_cas_ref_catalog.cpp` and its siblings runs unchanged,
 without a hot predicate, and must stay green. That is the check that the catalog API was not
-touched.
+touched and that the marker transport inside `casUpdateImpl` preserves every outcome: the existing
+tests already cover each marker and the admission refusal against a cold key.
 
 ## Placement of what this does not do {#placement-of-what-this-does-not-do}
 
