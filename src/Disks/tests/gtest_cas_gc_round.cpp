@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
+#include "config.h"
 
 namespace DB::ErrorCodes
 {
@@ -2252,3 +2253,72 @@ TEST(CASGc, RoundCommitConflictDropsTheRound)
     EXPECT_GT(after.lease.seq, before.lease.seq)
         << "the lease renewal that opened the round is a separate, earlier write and stays committed";
 }
+
+#if USE_AWS_S3
+/// A refused `gc/state` precondition whose resolve read was ITSELF refused: nothing observed the key,
+/// so the round must not report a competing leader nobody saw. It still aborts, and the next round
+/// re-reads -- the behaviour is unchanged, only the claim the message makes.
+///
+/// The S3 gate is the fault's, not the site's: the definitive-refusal classification that makes a
+/// resolve read settle nothing rather than be reissued exists only for S3 errors.
+TEST(CASGc, RoundCommitUnobservedConflictNamesNoCompetingLeader)
+{
+    class UnobservedCommitBackend : public InMemoryBackend
+    {
+    public:
+        std::expected<String, RawConflict> write(
+            const String & key, const String & bytes, const std::optional<String> & expected_value,
+            TransportAccess & access) override
+        {
+            /// Only the ROUND COMMIT advances `round`; the lease renewal writes the same key and must
+            /// pass through untouched.
+            if (arm && expected_value && key == gc_state_key)
+            {
+                const auto stored = InMemoryBackend::read(key, access);
+                if (stored && decodeGcState(bytes).round > decodeGcState(stored->bytes).round)
+                {
+                    arm = false;
+                    refuse_read = true;
+                    return std::unexpected(RawConflict{});
+                }
+            }
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        }
+
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
+        {
+            if (refuse_read && key == gc_state_key)
+            {
+                refuse_read = false;
+                throw DB::S3Exception("UnobservedCommitBackend: the settling read is definitively refused",
+                                      Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+            }
+            return InMemoryBackend::read(key, access);
+        }
+
+        String gc_state_key;
+        bool arm = false;
+        bool refuse_read = false;
+    };
+
+    auto backend = std::make_shared<UnobservedCommitBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    backend->gc_state_key = store->layout().gcStateKey();
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    backend->arm = true;
+    try
+    {
+        gc.runRegularRound();
+        FAIL() << "a refused round commit must end the round";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+        EXPECT_NE(e.message().find("resolve read observed nothing"), String::npos) << e.message();
+        EXPECT_EQ(e.message().find("another leader advanced it"), String::npos)
+            << "nothing observed the key, so no competing leader may be named: " << e.message();
+    }
+}
+#endif
