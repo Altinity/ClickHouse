@@ -7,6 +7,7 @@
 #include <Disks/createVolume.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Storages/MergeTree/DataPartsExchangeCasRouting.h>
 #include <Storages/MergeTree/MergeTreeDataPartBuilder.h>
 #include <Formats/NativeWriter.h>
 #include <IO/HTTPCommon.h>
@@ -54,6 +55,12 @@ namespace FailPoints
     /// neither is reachable from configuration, so an integration test cannot produce them any other way.
     extern const char cas_relink_receiver_force_mechanism_failure[];
     extern const char cas_relink_receiver_pause_before_confirm[];
+    /// Stands in for a sender that predates the `cas_pool_uuid` response cookie: the offer is made
+    /// without naming the pool, and the receiver has to fall back on "the single advertised pool".
+    extern const char cas_relink_sender_omit_pool_cookie[];
+    /// Stands in for an offer this policy has no disk for: the receiver forgets the forced disk it
+    /// resolved and must take the ordinary placement and a byte fetch.
+    extern const char cas_relink_receiver_drop_forced_disk[];
 }
 
 namespace MergeTreeSetting
@@ -112,8 +119,10 @@ std::string getEndpointId(const std::string & node_id)
     return "DataPartsExchange:" + node_id;
 }
 
-/// CAS replication 2b. The receiver advertises its target pool's identity under this request param so
-/// the sender can decide whether a fetch-by-relink (same pool) is possible.
+/// CAS replication 2b. The receiver advertises the pool ids of its candidate content-addressed disks
+/// under this request param (one id, or several joined with ", ", see `encodeCasPoolAdvertise`) so the
+/// sender can decide whether a fetch-by-relink (same pool) is possible. On the offer the same name is a
+/// response cookie naming the pool the sender matched.
 constexpr auto CA_POOL_UUID_PARAM = "cas_pool_uuid";
 /// Set on the response when the sender chose the relink path; the receiver then reads the relink payload
 /// (the opaque encoded PartManifest body — self-contained, see part_manifest_v2 below) instead of the
@@ -227,21 +236,23 @@ CasConfirmAnswer Service::resolveContentAddressedConfirm(
     /// Routing. A pool UUID identifies the shared pool, not the mount: every server root writing into it
     /// reports the same one, so the namespace's owner decides which instance may answer. EXACTLY one
     /// match is required — zero means this table has no such disk, several mean the question is
-    /// ambiguous, and both are `Unknown` rather than a guess.
-    const IContentAddressedExchange * matched = nullptr;
-    DiskPtr matched_disk;
+    /// ambiguous, and both are `Unknown` rather than a guess. A cache disk over a content-addressed disk
+    /// shares the base disk's exchange object, so the two are one mount and count once.
+    std::vector<CasConfirmRoutingCandidate> routing;
+    Disks routing_disks;
     for (const auto & disk : data.getDisks())
     {
         const auto * ca_meta = tryGetContentAddressedExchange(disk);
-        if (!ca_meta || ca_meta->getPoolUUID() != pool_uuid || !ca_meta->ownsNamespace(server_root_id, root_namespace))
+        if (!ca_meta)
             continue;
-        if (matched)
-            return CasConfirmAnswer::Unknown;
-        matched = ca_meta;
-        matched_disk = disk;
+        routing.push_back({ca_meta, ca_meta->getPoolUUID(), ca_meta->ownsNamespace(server_root_id, root_namespace)});
+        routing_disks.push_back(disk);
     }
-    if (!matched)
+    const auto routed = resolveConfirmRoutingCandidate(routing, pool_uuid);
+    if (!routed)
         return CasConfirmAnswer::Unknown;
+    const IContentAddressedExchange * matched = tryGetContentAddressedExchange(routing_disks[*routed]);
+    DiskPtr matched_disk = routing_disks[*routed];
 
     /// Gate 0 — the part-anchored fast filter. It is an AVAILABILITY filter and never a proof (spec
     /// §confirm-primitive, demoted in rev.5): `rollbackDeletingParts` puts a part back to `Outdated`
@@ -389,8 +400,8 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         }
 
         /// CAS replication 2b — fetch-by-relink (spec §4). If the part is on a content-addressed disk and
-        /// the receiver advertised a `cas_pool_uuid` equal to THIS server's own pool_uuid
-        /// (same shared pool), send only the part's content id + the mutable header — no file bytes — so
+        /// the pool of the disk this part sits on is among the pools the receiver advertised in
+        /// `cas_pool_uuid`, send only the part's content id + the mutable header — no file bytes — so
         /// the receiver can "fetch" by publishing its own ref to the blobs already in the shared pool.
         /// Strictly gated on a matching pool_uuid: a non-CA part, a CA part on a different pool, or a
         /// receiver without the capability all fall through to the unchanged byte path below.
@@ -404,21 +415,34 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         if (client_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM
             && part->getDataPartStorage().isContentAddressed())
         {
-            const String receiver_pool_uuid = parse<String>(params.get(CA_POOL_UUID_PARAM, ""));
+            /// The receiver advertises every pool its storage policy has a writable content-addressed
+            /// disk for, as one list; this server's decision stays local — is the pool of the disk THIS
+            /// part sits on among them. The matched pool goes back as a cookie so a receiver with several
+            /// pools can place the part on that pool's disk instead of guessing which disk the offer is for.
+            const Strings receiver_pools = decodeCasPoolAdvertise(parse<String>(params.get(CA_POOL_UUID_PARAM, "")));
             DiskPtr part_disk = data.getStoragePolicy()->tryGetDiskByName(part->getDataPartStorage().getDiskName());
             auto * ca_meta = tryGetContentAddressedExchange(part_disk);
-            if (ca_meta && !receiver_pool_uuid.empty() && receiver_pool_uuid == ca_meta->getPoolUUID())
+            const String matched_pool = ca_meta ? ca_meta->getPoolUUID() : String{};
+            if (ca_meta && !matched_pool.empty()
+                && std::find(receiver_pools.begin(), receiver_pools.end(), matched_pool) != receiver_pools.end())
             {
                 auto offer = ca_meta->getRelinkOffer(part->getDataPartStorage().getRelativePath());
                 if (offer)
                 {
                     LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), manifest payload {} bytes",
-                        part_name, receiver_pool_uuid, offer->manifest_bytes.size());
+                        part_name, matched_pool, offer->manifest_bytes.size());
                     response.addCookie({CA_RELINK_COOKIE, CA_RELINK_COOKIE_VALUE});
                     /// The source token for the confirm request the receiver makes before it promotes
                     /// (spec §wire-protocol). It always accompanies the offer, and its ABSENCE is what
                     /// tells a confirm-capable receiver that this sender predates the handshake.
                     response.addCookie({CA_CONFIRM_TOKEN_COOKIE, offer->confirm_token});
+                    /// Which of the advertised pools this offer is for. A receiver with one pool does not
+                    /// need it (an offer can only be for that pool); the failpoint stands in for a sender
+                    /// that predates the cookie.
+                    bool omit_pool_cookie = false;
+                    fiu_do_on(FailPoints::cas_relink_sender_omit_pool_cookie, { omit_pool_cookie = true; });
+                    if (!omit_pool_cookie)
+                        response.addCookie({CA_POOL_UUID_PARAM, matched_pool});
                     /// The relink payload (B7 part_manifest_v2, all-tree task 7): the opaque encoded
                     /// PartManifest body (the receiver decodes it, ignores the sender identity, and
                     /// stages its OWN local manifest over the shared-pool blobs; the legacy part_id wire
