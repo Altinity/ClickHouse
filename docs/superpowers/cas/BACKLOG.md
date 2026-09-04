@@ -59,6 +59,43 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### `[gc-manifests-are-immutable-so-reduce-and-deletes-can-be-cheap]` The orphan sweep re-reads every listed manifest and deletes manifests one conditional request at a time; manifest keys cannot be reborn, so neither is needed (2026-09-04, user) {#gc-manifests-immutable-cheap-reduce}
+
+Measured on the 15-minute real-GCS soak (leader ch1, `system.cas_gc_log`): rounds 1.2 s → 18.8 s → 128 s →
+466 s; round 3 = `fold_reduce` 380 s (3840 sequential GETs, 294 s of S3 latency at ~76 ms each; 1966 of
+them absent-key misses), `fold_ref_intake` 46 s (read-ahead engaged: 1159 hits), `manifest_deletes` 37 s
+(188 conditional deletes at ~196 ms, sequential). The reduce's GETs are the orphan manifest sweep
+(`CasOrphanManifestSweep.cpp` `planManifestCursorPage`, one `read` per listed key) plus the ref-log
+chain probes of `activeManifestKeys`.
+
+Why the reads and the per-key conditional deletes are not needed (user, 2026-09-04): a manifest key is
+`<prefix>/cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst` with `writer_epoch` durable-monotone
+per server root, `build_sequence` monotone per epoch, the ordinal per build; a reborn namespace continues
+the epoch counter and a recreated server root is refused as a foreign owner. So the same manifest key is
+never written twice with different bytes — manifests are unique and immutable by construction. The
+sweep's "freeze the exact incarnation before the catalog cut" (`:631`) guards a rebirth that cannot
+happen, and the exact-etag delete of a manifest guards the same non-event. (Blobs are different: a
+content-addressed blob key CAN be re-uploaded, so blob deletes keep the exact-incarnation condition.)
+
+Three changes, cheapest first:
+1. **Read-ahead the sweep page** — reuse `GcReadAhead` (`hintRead`/`takeRead`, window `4 × concurrency`)
+   over the LIST page in `planManifestCursorPage`, and the next-N ids in `activeManifestKeys`. Pure
+   reads, no semantic change; ~10× on GCS.
+2. **Take `source_retirements` from the in-degree source-edge runs instead of the manifest body.** The
+   body is read (`:921`) only to compute the blob in-degree decrements of a nominated orphan; those edges
+   are exactly what the fold's `SourceEdgeRun`s recorded when the manifest was folded, and an orphan that
+   never reached precommit has no edges to retire. Then the sweep needs only the LIST (existence), no
+   GET per key — removes the reduce's read volume entirely except honest tail probes. Requires confirming
+   that precommit is the only way an orphan acquires `+1` edges.
+3. **Bulk-delete manifests** — with immutable keys `manifest_deletes` can use S3 `DeleteObjects` (up to
+   1000 keys per request) instead of one `remove(key, etag)` per manifest: 188 requests → 1. Needs a
+   `removeMany(keys)` verb in the backend contract (the engine treats a batch as one request with
+   per-key outcomes; a timeout after a partial delete is benign because deletes are idempotent). Dialect
+   caveat: the GCS XML API has no multi-object delete (batch exists only in the JSON API), so on GCS the
+   gain is parallelism, not batching.
+Placement: after the request-contract plan; items 1 and 3 are contract-visible (a new verb), item 2 is
+GC-internal.
+
 ### `[cas-transient-lease-fence-surfaces-to-clients]` A transient mount-lease fence surfaces to synchronous client calls as `NETWORK_ERROR` (2026-09-04) {#cas-transient-lease-fence-surfaces-to-clients}
 
 Local CA-s3 stateless lane, run 2 (`docs/superpowers/cas/2026-09-04-stateless-lane-triage.md`, 11137
