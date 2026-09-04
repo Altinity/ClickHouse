@@ -17,7 +17,10 @@
 
 #include <boost/algorithm/string/split.hpp>
 
+#include <Poco/AutoPtr.h>
+#include <Poco/Exception.h>
 #include <Poco/Net/HTTPResponse.h>
+#include <Poco/StreamChannel.h>
 #include <Poco/URI.h>
 
 #include <aws/core/client/AWSError.h>
@@ -29,6 +32,7 @@
 #include <aws/s3/model/Delete.h>
 #include <aws/s3/model/ObjectIdentifier.h>
 
+#include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Common/RemoteHostFilter.h>
 #include <IO/ReadBufferFromS3.h>
@@ -55,6 +59,7 @@ namespace DB::S3RequestSetting
 namespace ProfileEvents
 {
     extern const Event S3SingleAttemptRetryConsultations;
+    extern const Event S3WriteRequestsErrors;
 }
 
 /*
@@ -256,6 +261,180 @@ TEST(IOTestAwsS3Client, SingleAttemptRetryStrategyRefusesAndCounts)
     EXPECT_FALSE(strategy.ShouldRetry(retryable_5xx, /*attempted=*/1));
     EXPECT_EQ(strategy.GetMaxAttempts(), 1);
     EXPECT_EQ(global_counters[ProfileEvents::S3SingleAttemptRetryConsultations].load() - before, 2u);
+}
+
+namespace
+{
+
+/// Captures what the `S3Client` logger (`Client::log`) writes at ERROR and above. A message logged
+/// below Error (e.g. Debug) never reaches the channel at this threshold, so an empty capture proves
+/// the site logged below Error rather than merely that this particular text was absent.
+class ScopedS3ClientErrorLogCapture
+{
+public:
+    ScopedS3ClientErrorLogCapture()
+        : logger(getLogger("S3Client"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("error");
+    }
+
+    ~ScopedS3ClientErrorLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    std::string captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream;
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// `shared=true` is load-bearing: `AutoPtr(ptr)` would steal a reference the fixture never owned.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
+
+/// A `Client` whose `PutObject` always fails as though the connection dropped while the response body
+/// was being read -- the scenario `Client::doRequestWithRetryNetworkErrors`'s `net_exception_handler`
+/// exists for (the comment on that function: "network error happens when XML document is being read
+/// from the response body"). Throwing here, through the same virtual `Aws::S3::S3Client::PutObject`
+/// slot `Client::PutObject`'s retry loop calls, reaches `net_exception_handler` exactly as a genuine
+/// mid-body network failure would, without adding a test seam to production code -- the protected
+/// `Client` constructor is already exposed "for testing" (see `RecordingClient` above).
+class NetworkFailingClient : public DB::S3::Client
+{
+public:
+    NetworkFailingClient(
+        size_t max_redirects_,
+        DB::S3::ServerSideEncryptionKMSConfig sse_kms_config_,
+        const std::shared_ptr<Aws::Auth::AWSCredentialsProvider> & credentials_provider_,
+        const DB::S3::PocoHTTPClientConfiguration & client_configuration_,
+        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy sign_payloads_,
+        const DB::S3::ClientSettings & client_settings_)
+        : DB::S3::Client(max_redirects_, std::move(sse_kms_config_), credentials_provider_, client_configuration_, sign_payloads_, client_settings_)
+    {
+    }
+
+    Aws::S3::Model::PutObjectOutcome PutObject(const Aws::S3::Model::PutObjectRequest &) const override
+    {
+        ++attempts;
+        throw Poco::TimeoutException("mock timeout reading the response body");
+    }
+
+    mutable size_t attempts = 0;
+};
+
+std::shared_ptr<NetworkFailingClient> makeNetworkFailingClient(std::shared_ptr<Aws::Client::RetryStrategy> retry_strategy)
+{
+    DB::RemoteHostFilter remote_host_filter;
+    DB::S3::PocoHTTPClientConfiguration client_configuration = DB::S3::ClientFactory::instance().createClientConfiguration(
+        /*force_region=*/"us-east-1",
+        remote_host_filter,
+        /*s3_max_redirects=*/100,
+        DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 0},
+        /*s3_slow_all_threads_after_network_error=*/false,
+        /*s3_slow_all_threads_after_retryable_error=*/false,
+        /*enable_s3_requests_logging=*/false,
+        /*for_disk_s3=*/false,
+        /*opt_disk_name=*/{},
+        /*request_throttler=*/{});
+    /// `PutObject` never reaches the wire (it is overridden below), so the endpoint is irrelevant --
+    /// only the installed retry strategy, which is what `usesSingleAttemptRetryStrategy` inspects.
+    client_configuration.retryStrategy = std::move(retry_strategy);
+
+    DB::S3::ClientSettings client_settings{
+        .use_virtual_addressing = true,
+        .disable_checksum = false,
+        .gcs_issue_compose_request = false,
+        .is_s3express_bucket = false,
+    };
+
+    Aws::Auth::AWSCredentials credentials("ACCESS_KEY_ID", "SECRET_ACCESS_KEY");
+    auto credentials_provider = DB::S3::getCredentialsProvider(
+        client_configuration,
+        credentials,
+        DB::S3::CredentialsConfiguration{.use_environment_credentials = false, .use_insecure_imds_request = false});
+
+    return std::make_shared<NetworkFailingClient>(
+        /*max_redirects_=*/100,
+        DB::S3::ServerSideEncryptionKMSConfig{},
+        credentials_provider,
+        client_configuration,
+        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+        client_settings);
+}
+
+}
+
+/// The client's own retry strategy still says "do not retry" (`SingleAttemptRetryStrategy::ShouldRetry`
+/// always false, see `SingleAttemptRetryStrategyRefusesAndCounts` above); `usesSingleAttemptRetryStrategy`
+/// is a separate, purely descriptive check of which strategy is installed, tested directly here.
+TEST(IOTestAwsS3Client, UsesSingleAttemptRetryStrategyIdentifiesTheInstalledStrategy)
+{
+    auto single_attempt_client = makeNetworkFailingClient(std::make_shared<DB::S3::SingleAttemptRetryStrategy>());
+    EXPECT_TRUE(single_attempt_client->usesSingleAttemptRetryStrategy());
+
+    DB::S3::PocoHTTPClientConfiguration::RetryStrategy zero_retries{.max_retries = 0};
+    auto ordinary_client = makeNetworkFailingClient(std::make_shared<DB::S3::Client::RetryStrategy>(zero_retries));
+    EXPECT_FALSE(ordinary_client->usesSingleAttemptRetryStrategy());
+}
+
+/// A client carrying the `SingleAttemptRetryStrategy` (the CAS conditional-write client, see
+/// `S3ObjectStorage::getSingleAttemptClient`) is owned by an outer retry loop that resolves the outcome
+/// and reissues; its one failed attempt is not terminal, so the network-error log site must not reach
+/// Error.
+TEST(IOTestAwsS3Client, NetworkErrorLogsDebugForSingleAttemptStrategy)
+{
+    using ProfileEvents::global_counters;
+    const auto errors_before = global_counters[ProfileEvents::S3WriteRequestsErrors].load();
+
+    auto client = makeNetworkFailingClient(std::make_shared<DB::S3::SingleAttemptRetryStrategy>());
+    DB::S3::PutObjectRequest request;
+
+    /// Call through the `DB::S3::Client&` interface, exactly as production code (which only ever
+    /// holds a `Client`, never `NetworkFailingClient`) does: `NetworkFailingClient::PutObject` hides
+    /// `Client::PutObject(PutObjectRequest&)` -- the retry-loop wrapper under test -- from lookup on
+    /// the derived type, so calling through the base is what makes this test exercise that wrapper
+    /// rather than the override directly.
+    const DB::S3::Client & base_client = *client;
+    ScopedS3ClientErrorLogCapture log_capture;
+    const auto outcome = base_client.PutObject(request);
+
+    EXPECT_FALSE(outcome.IsSuccess());
+    EXPECT_EQ(outcome.GetError().GetErrorType(), Aws::S3::S3Errors::NETWORK_CONNECTION);
+    EXPECT_EQ(client->attempts, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::S3WriteRequestsErrors].load() - errors_before, 1u);
+    EXPECT_TRUE(log_capture.captured().empty());
+}
+
+/// `max_retries = 0` on the ORDINARY strategy is a supported user configuration (`s3_retry_attempts`)
+/// with no outer retry loop: its one failed attempt IS the final answer, so it must keep logging at
+/// Error -- this is exactly the case a signal keyed on `max_retries == 0` alone would misclassify.
+TEST(IOTestAwsS3Client, NetworkErrorLogsErrorForOrdinaryZeroRetryStrategy)
+{
+    using ProfileEvents::global_counters;
+    const auto errors_before = global_counters[ProfileEvents::S3WriteRequestsErrors].load();
+
+    DB::S3::PocoHTTPClientConfiguration::RetryStrategy zero_retries{.max_retries = 0};
+    auto client = makeNetworkFailingClient(std::make_shared<DB::S3::Client::RetryStrategy>(zero_retries));
+    DB::S3::PutObjectRequest request;
+
+    /// See the comment in `NetworkErrorLogsDebugForSingleAttemptStrategy`: calling through the base
+    /// is what reaches `Client::PutObject`'s retry-loop wrapper rather than the override directly.
+    const DB::S3::Client & base_client = *client;
+    ScopedS3ClientErrorLogCapture log_capture;
+    const auto outcome = base_client.PutObject(request);
+
+    EXPECT_FALSE(outcome.IsSuccess());
+    EXPECT_EQ(outcome.GetError().GetErrorType(), Aws::S3::S3Errors::NETWORK_CONNECTION);
+    EXPECT_EQ(client->attempts, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::S3WriteRequestsErrors].load() - errors_before, 1u);
+    EXPECT_NE(log_capture.captured().find("Network error on S3 request, attempt 1 of 1"), std::string::npos);
 }
 
 struct ConditionalPutWireObservation

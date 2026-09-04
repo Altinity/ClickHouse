@@ -249,6 +249,10 @@ public:
         return client_configuration.for_disk_s3;
     }
 
+    /// True when this client's one and only attempt is not the final answer: it belongs to an
+    /// outer retry loop (e.g. a conditional write) that resolves the outcome and reissues.
+    bool usesSingleAttemptRetryStrategy() const;
+
     ProviderType getProviderType() const { return provider_type; }
 
     std::string getGCSOAuthToken() const;
