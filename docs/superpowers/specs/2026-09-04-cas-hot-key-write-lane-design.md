@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 28, 2026-09-04. Phase A. Brainstormed against the measurements in
+Revision 29, 2026-09-04. Phase A. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
 this document supersedes where they differ. Revisions 1 to 26 designed a larger change (combining
@@ -183,11 +183,17 @@ A caller may write a key through the lane when every `decide` it will ever submi
 meets three conditions. The catalog's meet them today; they are the entry condition for any other
 key.
 
-1. Running it again on the same base yields the same result, and running it on a different base
-   has no externally visible effect that a second run would double. The lane runs a `decide`
-   twice when the first run was on a cached base and rendered a verdict, and the `decide` neither
-   observes nor cares which run is reported. The catalog's `decide`s are pure functions of `base`
-   plus idempotent reads.
+1. It may be run more than once, and a later run on a fresh read is the decision that counts.
+   Running it has no externally visible effect that a second run would double, and its verdict on
+   a fresh read is a valid serial verdict at that moment whatever an earlier run on a hint said.
+   Its reads of other keys may answer differently between two runs; then the later run decides on
+   the later state, as a caller that retried after the earlier verdict would. The lane runs a
+   `decide` twice only when the first run was on a cached base and rendered a verdict. The
+   catalog's `decide`s are functions of `base` plus reads that are idempotent but not frozen: the
+   creator-fence check of `cancelStalledCreating` and `reconcileStaleCreator` (`CasRefCatalog.cpp:539`,
+   `:689`), whose answer can change from "still live" to "terminal" between two runs and never
+   back (the three certificates `classifyFenceCertificate` recognises, `GcFenced`, `CleanFarewell`
+   and `SupersededEpoch`, are states a lease does not leave).
 2. It refuses by throwing and declines by returning nothing, and either is the verdict
    `readModifyWrite` would render on the same base. The lane reports a verdict only when it was
    rendered on a fresh read; one rendered on a cached base is discarded and the `decide` runs
@@ -209,18 +215,23 @@ steps marked.
 
 **Enter.** `submit` binds the policy to an absolute deadline on the engine's clock, as every verb
 does at entry, so time in the queue spends the caller's window. Under `mutex`: find or create the
-key's lane, push the item (the one allocation; a failure leaves the lane as it was and
-propagates). The moment the push succeeds a ticket guard is installed: on every exit, normal or
-by unwinding, it runs the leave step below. It is `noexcept`, allocates nothing, and is the only
+key's lane, push the item. Two allocations can fail there, the lane's map node when the key has no
+lane and the deque's growth; if the push throws after the lane was created, the empty lane is
+erased in the same critical section and the exception propagates, so a failure leaves the map as
+it was. The moment the push succeeds a ticket guard is installed: on every exit, normal or by
+unwinding, it runs the leave step below. It is `noexcept`, allocates nothing, and is the only
 thing that removes an item from the queue.
 
 **Wait.** Loop:
 
-1. Outside `mutex`: the engine's own `gate(0)` on the caller's operation (fence, then `Liveness`,
-   which the engine reports as `FenceLost` and deliberately does not tell apart; then the lease
-   budget, `NoBudget`), then the caller's bound against the engine's clock, in that order so a lost
-   fence or a stopped task is not reported as a policy deadline, and an exhausted lease is
-   reported as the lease. Any of the three means the caller leaves.
+1. Outside `mutex`: the engine's own `gate(0)` on the caller's operation, in the engine's own
+   order (`CasRequests.cpp:361`, `CasMountRuntime::admit`): the fence generation, then the lease
+   budget, `NoBudget`, then `Liveness`, which the engine reports as `FenceLost` and deliberately
+   does not tell apart from the fence; then the caller's bound against the engine's clock. In that
+   order so a lost fence or a stopped task is not reported as a policy deadline, an exhausted
+   lease is reported as the lease, and a stopped task whose lease is also exhausted is reported as
+   the lease, as the engine reports it before every attempt today. Any of the three means the
+   caller leaves.
 2. Under `mutex`: if step 1 decided to leave, leave with the `GaveUp` the engine would have
    returned for the same condition (`FenceLost`; `Deadline` with `Source::Lease`; `Deadline` with
    the bound's own source), which the caller handles as it handles the engine's; a waiter that has
@@ -263,9 +274,20 @@ snapshot was taken, inside a catch-all in the `tryLogCurrentException` shape.
    another writer has since repaired, or a catalog marker about a row that has since moved, and a
    caller that cannot read is told what the engine tells a caller that cannot read. Any exception,
    not a chosen class: a refusal, a decode failure on bytes another writer stored, an allocation
-   failure inside the decode, all get the same one re-run on a fresh read, because a `decide` is
-   re-runnable by contract, and the only thing a verdict on a hint proves is that a hint is not a
-   proof.
+   failure inside the decode, all get the same one re-run on a fresh read, because a `decide` may
+   be run again by contract, and the only thing a verdict on a hint proves is that a hint is not a
+   proof. What the re-run relies on is not that the two runs agree; it is that the second run is
+   a serial execution at the time of the fresh read: its base is that read, its other reads are
+   made then, and its write is conditional on that read's etag. When a `decide`'s other reads
+   changed in between, as the creator-fence check can from "still live" to "terminal", the second
+   run renders the later verdict, exactly what a caller that retried after the first would get,
+   and the first verdict, rendered on a hint, was never delivered and never written; the fence's
+   certificates do not revert, so no run says "terminal" and a later one "live". A transient
+   exception in the first run (an allocation failure) followed by a landing second run is the
+   landing today's caller gets on its retry. Delivering the hint's verdict whenever the fresh
+   bytes equal the cached ones would be no safer (the two runs can still differ when the bytes
+   differ) and would reopen the one rule this design has: a verdict rendered on a hint is never
+   delivered.
 3. **Write.** One engine call: `op.replace(key, candidate, base->etag, policy)`, or
    `op.create(key, candidate, policy)` when the base was absence and the `decide` returned bytes
    for it, under the caller's operation and frozen policy. The engine's verb is one logical write:
@@ -291,9 +313,12 @@ snapshot was taken, inside a catch-all in the `tryLogCurrentException` shape.
    - An exception out of the engine's write: the entry is dropped and the exception propagates;
      the guard hands the key over.
 
-**Read your writes.** A `Committed` names the caller's own candidate under its own etag, and at
-that moment the cache holds that object. The caller's next submission starts from it, and a plain
-`GET` returns it too (S3 and GCS are read-after-write consistent for overwritten objects).
+**Read your writes.** A `Committed` names the caller's own candidate under its own etag, and
+when `remember` admitted it (it fits the budget and the fill did not throw) the cache holds that
+object and the caller's next submission starts from it; otherwise the next submission reads, and
+a plain `GET` returns the same object either way (S3 and GCS are read-after-write consistent for
+overwritten objects). The goal's "no `GET` when the pool wrote the object last" is stated for an
+admitted object.
 
 **Effects to name.** A `decide` that reads holds the lane for those reads, under the policy its
 caller chose. A transport fault inside the hold is repaid by the engine's growing schedule, up to
@@ -380,6 +405,7 @@ ticket is held across that mutex. Audit of every acquisition of `driver_mutex` i
 | `renewalLoop`, `remountLoop`, `sleepInterruptibly` | condition-variable waits and state reads; `remount_attempt()` runs after the lock is released |
 | `lockTerminalPublication` and its three callers | atomic stores of terminal state; no backend request |
 | `scheduleRemount` | a generation bump and a notify |
+| three test-only hooks: `renewal_parked_predicate_false_hook_for_test` (inside the renewal wait's predicate, `CasMountRuntime.cpp:672`), `remount_parked_hook_for_test` (`:776`), `terminal_publication_driver_lock_acquired_hook_for_test` (`:929`) | whatever a test installs; their contract, to be stated at their `PoolConfig` declarations: no backend request and no wait on the lane, or the test deadlocks itself. Empty in production; outside the proof below |
 
 Twenty-nine acquisition sites (`grep -c "lock(driver_mutex\|lock(runtime.driver_mutex"` on
 `CasMountRuntime.cpp` at brainstorm time, one of them `try_to_lock`), every one in the rows above.
@@ -419,8 +445,9 @@ submits to the lane.
   erased only while its queue is empty; `CasHotKeys::mutex` is held across no callback, no I/O
   and no `decide`; the guard neither allocates nor throws.
 - INV-6 (Half 2). A clean lost race is repaid after `conflictBackoff()` and does not advance the
-  reissue counter; a conflict that settled an ambiguous attempt keeps the growing schedule, in the
-  engine's two loops and in the lane's callers alike.
+  reissue counter; a conflict that settled an ambiguous attempt is repaid on the growing schedule,
+  in the engine's two loops on their call-wide counter and in the lane's callers on their own
+  count of such conflicts, the engine's internal reissues restarting per submission.
 
 ### Kinship with `appendRefOps` {#kinship-with-appendrefops}
 
@@ -502,12 +529,16 @@ conflict that settled a transport fault, exactly what the erase's loop already a
 own growing pause (`CasRefCatalog.cpp:456`); a fence lost during the pause is caught by the next
 submission's first gate before anything is sent. Accepted, on a path that is already failing.
 
-Two things differ from one `readModifyWrite` call, both the semantics every hand-written loop of
-the contract already has: each submission is one engine call with its own `WriteState`, so a
-credential refresh may happen once per submission rather than once per catalog mutation (the GC
-erase's `replace` per attempt and the ref-log lane's `create`s are the precedent; a `Conflict`
-between two submissions means the store answered in between, so the credentials the last refresh
-installed worked); and `attempts_sent` in a result counts that submission's attempts. `casUpdate`, `casAdmitEntry` and the five lifecycle
+Three things differ from one `readModifyWrite` call, all the semantics every hand-written loop of
+the contract already has, the GC erase's `replace` per attempt above all: each submission is one
+engine call with its own `WriteState`, so a credential refresh may happen once per submission
+rather than once per catalog mutation (a `Conflict` between two submissions means the store
+answered in between, so the credentials the last refresh installed worked); `attempts_sent` in a
+result counts that submission's attempts; and the engine's internal reissue counter restarts per
+submission, so a submission whose write suffered K transport faults before a settled `Conflict`
+slept the growing schedule up to `backoff(K)` inside the engine, and the caller's pause after it
+is `backoff(++faults)` on the caller's own count of such conflicts, not `backoff(K + 1)`. The
+erase loop paces its attempts on its own counter the same way. `casUpdate`, `casAdmitEntry` and the five lifecycle
 functions do not change: their `mutate`s, markers and outcomes are the same. `casAdmitEntry`'s
 duplicate-row `LOGICAL_ERROR`, thrown from the grammar check on a cached base, is re-rendered on a
 read like every other exception and is the same `LOGICAL_ERROR` on a read that shows the row;
@@ -636,7 +667,10 @@ tickets from `bytes` and appends its own, so order is visible in the object.
    `Conflict`, the final object lists all tickets in arrival order, every caller received
    `Committed` with its own candidate's etag, and a following submission starts from the cache
    with zero reads. A sibling installs a hook asserting `CasHotKeys::mutex` is not held whenever
-   `decide`, a `Liveness` closure or a backend hook runs (INV-5).
+   `decide`, a `Liveness` closure or a backend hook runs (INV-5). Another fails each of Enter's two
+   allocations in turn, the lane's map node and the deque's push after the lane was created:
+   `laneCountForTest` and the key's `queueDepthForTest` are as before and the exception reaches
+   the caller (INV-5).
 2. Results are the engine's (INV-4). A hook makes the write `Refused` by the store: the caller
    receives that `Refused` with the store's code and message, and the catalog-level caller throws
    it at once with no resubmission. A hook makes the write lose to an external `CasRequests`: the
@@ -677,7 +711,13 @@ tickets from `bytes` and appends its own, so order is visible in the object.
    nothing on a cached base an external writer has since replaced: the entry is dropped, one read,
    the `decide` runs again and this time writes, `Committed`, the decline never reported; on a
    fresh read: `Declined{Object}` with that read, no write, the next submission starts from the
-   cache with that object; on an absent key, `Declined{ProvenAbsent}`.
+   cache with that object; on an absent key, `Declined{ProvenAbsent}`. Reads that change between
+   the two runs: the real `cancelStalledCreating` on a cached base whose creator fence is live at
+   the first run and terminal at the second (the test flips the certificate between them): the
+   second run cancels and lands, `Cancelled`, one lane read, and the same two calls of today's
+   `cancelStalledCreating` around the same flip end the same way; a transient exception thrown by
+   the first run only (a hook) and a landing second run: `Committed`, and today's caller retrying
+   after that exception lands the same object.
 4. Base read failures (INV-4). A base read that exhausts its transport retries returns the
    `GaveUp{Deadline}` `readModifyWrite` returns for the same read on the same harness, equal in
    class, `Source`, `sent_any` and `last_seen`; one whose fence is lost during it returns
@@ -705,7 +745,9 @@ tickets from `bytes` and appends its own, so order is visible in the object.
    read: a waiter whose deadline passes leaves with `GaveUp{Deadline}` carrying its own source and
    the keyed log line naming the holder; a waiter whose fence is tripped or whose `Liveness` flips
    leaves with `GaveUp{FenceLost}`; a waiter whose lease budget runs out leaves with
-   `GaveUp{Deadline, Lease}`. The item is gone in every case. A waiter at the front whose deadline
+   `GaveUp{Deadline, Lease}`; a waiter whose `Liveness` is false and whose lease budget is exhausted
+   at the same slice leaves with `GaveUp{Deadline, Lease}`, the engine's order. The item is gone in
+   every case. A waiter at the front whose deadline
    passed in the same slice the holder left never holds, never runs `decide`, reads nothing. After
    the last item of a key leaves, `laneCountForTest` is 0 and `queueDepthForTest` of the key is 0;
    a hook parks a waiter between its wait slices while the holder leaves, and the waiter's next
@@ -800,9 +842,8 @@ re-checks its own fence, `Liveness`, lease and deadline every slice, in that ord
 200 ms pause overshoot accepted (24); eviction of a stalled holder rejected (11, 12); the
 `driver_mutex` audit (14); the step-1 marker catch (12).
 
-Revision 28 folds in the first `codex` review of the phase A document: five findings, against
-eighteen to twenty-two per round on the phase A plus B document, one of them a real critical and
-a one-line fix. The catalog loop honours `single_attempt`: a first `Conflict` under `Retry::once`
+Revision 28 folds in the first `codex` review of the phase A document: one critical and four
+minors, the critical a one-line fix. The catalog loop honours `single_attempt`: a first `Conflict` under `Retry::once`
 is the result, as `readModifyWrite` returns it today, and never a second attempt. The two ways a
 submission differs from one `readModifyWrite` call, a per-submission `WriteState` (one credential
 refresh per submission) and per-submission `attempts_sent`, are named as the hand-written-loop
@@ -811,3 +852,23 @@ no-throw `remember`, tested after `Committed`, `Conflict` and `Declined`; the pa
 stated as up to 5 s after a settled fault, the erase loop's own; `any_ambiguous` is carried where
 `readModifyWriteOnPresence` rebuilds a bodyless `Conflict`; the Half 2 rate is an expectation and
 the `_ckpt` gate is on the measured one-second peak.
+
+Revision 29 folds in the second `codex` review of the phase A document: one critical, argued
+against, and five minors, folded. The critical: `cancelStalledCreating` and `reconcileStaleCreator`
+read the creator fence inside their `decide`, so a run on a cached base can say "still live" and
+the re-run on a fresh read can say "terminal" and land the cancel, where today's single run would
+have reported "still live". The document now says what the re-run relies on: not that two runs
+agree, but that the second is a serial execution at the fresh read, with its other reads made
+then and its write conditional on that read's etag; the later verdict is the one a caller
+retrying after the first would get, the certificates do not revert, and the hint's verdict was
+never delivered. The reviewer's alternative, delivering the hint's verdict when the fresh bytes
+equal the cached ones, is refused: it does not remove the flip when the bytes differ and it
+reopens the one rule the cache has. Condition 1 of the contract says "may be run again" instead
+of "yields the same result", and test 3 pins the flip and the transient exception against two
+calls of today's function. Minors: the waiter's gate order is the engine's (fence generation,
+lease budget, `Liveness`), tested with both refusing at once; the engine's internal reissue
+counter restarting per submission is the third named difference from one `readModifyWrite` call,
+with the erase loop as precedent, and INV-6 says so; three test-only hooks that run under
+`driver_mutex` are in the audit with the contract they must keep; read-your-writes is stated for
+an admitted object; Enter's two allocations and the rollback of an empty lane are stated and
+tested.
