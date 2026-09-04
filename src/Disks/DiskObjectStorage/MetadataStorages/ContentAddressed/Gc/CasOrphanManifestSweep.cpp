@@ -176,9 +176,13 @@ struct NamespaceProtection
 /// invalid transaction (via the authority-grounded recovery / `decodeRefLogTxn`); the caller SKIPS the
 /// namespace's deletions on such a throw rather than substituting an empty owner set.
 ///
-/// `work_budget`, when set, bounds the committed-tail walk below: each ref-log GET the walk issues
-/// consumes one unit of `GcRoundWorkBudget::sweep_recovery_op_budget`, shared with every other
-/// namespace this round touches. Exhaustion sets `NamespaceProtection::recovery_incomplete` and stops
+/// `work_budget`, when set, bounds the committed-tail walk below: each ref-log the walk TAKES (decodes
+/// and applies) consumes one unit of `GcRoundWorkBudget::sweep_recovery_op_budget`, shared with every
+/// other namespace this round touches. A hinting reader may prefetch up to one window of logs beyond
+/// the charged position before the walk reaches them -- those prefetches are not charged, since the
+/// budget bounds decoded work, not requests in flight -- and a hint issued past an epoch's seal is
+/// discarded rather than taken, bounding the waste of one crossing to one window, counted in
+/// `CASGCReadAheadWasted`. Exhaustion sets `NamespaceProtection::recovery_incomplete` and stops
 /// the walk — it is deliberately NOT plumbed into `recoverRefTableDetailedFromAuthority` itself: that
 /// function is a shared recovery primitive also used by `fsck` (which needs a COMPLETE table to audit)
 /// and the GC rebuild path (which needs a complete table to reconstruct in-degree from scratch), so
@@ -291,6 +295,37 @@ NamespaceProtection activeManifestKeys(
         }
     }
 
+    /// Guards the walk's most recently hinted-but-not-yet-taken range (from `arm`'s `from` up to one
+    /// window) so that an early exit from the loop below -- the work-budget `break`, the corrupted-tail
+    /// `throw`, or the missing-cursor epoch cross -- frees it instead of leaving it pinned against the
+    /// SAME reader for whatever this page reads next (later candidates, later namespaces). An ordinary
+    /// same-epoch advance re-arms it on the new position without discarding: those hints are still
+    /// wanted. A seal crossing discards explicitly, right where the crossing happens, and disarms so
+    /// this guard's own destructor does not repeat it.
+    struct OutstandingHintGuard
+    {
+        KeyReader & reader;
+        const Layout & layout;
+        const NamespaceLifeId & life;
+        RefTxnId from{};
+        RefTxnId committed_through{};
+        bool armed = false;
+
+        void arm(const RefTxnId & from_, const RefTxnId & committed_through_)
+        {
+            from = from_;
+            committed_through = committed_through_;
+            armed = true;
+        }
+        void discardNow()
+        {
+            if (armed)
+                discardRefLogHintsOfEpoch(reader, layout, life, from, committed_through);
+            armed = false;
+        }
+        ~OutstandingHintGuard() { discardNow(); }
+    } outstanding_hints{reader, layout, life};
+
     while (id <= *ckpt.committed_through)
     {
         /// UNCERTAINTY, work-budget arm: the committed-tail walk is a finite but potentially huge range
@@ -298,14 +333,18 @@ NamespaceProtection activeManifestKeys(
         /// namespace it touches. Stopping HERE — before the next GET — leaves `active`/
         /// `tail_removal_targets` genuinely partial, so the caller must treat the whole namespace as
         /// undecided this page (fail-closed retain), never authorize a deletion from what was collected
-        /// so far.
+        /// so far. `outstanding_hints`'s destructor frees whatever the walk hinted ahead of this point.
         if (work_budget && !work_budget->sweepRecoveryOpAvailable())
         {
             protection.recovery_incomplete = true;
             break;
         }
         if (id.ref_sequence < std::numeric_limits<uint64_t>::max())
-            hintRefLogsWithinEpoch(reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1}, *ckpt.committed_through);
+        {
+            const RefTxnId hint_from{id.writer_epoch, id.ref_sequence + 1};
+            hintRefLogsWithinEpoch(reader, layout, life, hint_from, *ckpt.committed_through);
+            outstanding_hints.arm(hint_from, *ckpt.committed_through);
+        }
         const auto got = reader.take(layout.refLogKey(life, id));
         if (work_budget)
             ++work_budget->sweep_recovery_ops_used;
@@ -318,6 +357,9 @@ NamespaceProtection activeManifestKeys(
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS orphan sweep: committed tail log {} is absent under the supplied _ckpt frontier",
                     renderRefTxnId(id));
+            /// The old epoch's hints past this missing cursor do not exist either; discard them before
+            /// crossing, exactly as the seal path below does.
+            outstanding_hints.discardNow();
             id = cross_from_missing_cursor(*prior);
             prior.reset();
             prior_is_seal.reset();
@@ -338,8 +380,7 @@ NamespaceProtection activeManifestKeys(
         {
             if (is_seal)
             {
-                if (id.ref_sequence < std::numeric_limits<uint64_t>::max())
-                    discardRefLogHintsOfEpoch(reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1}, *ckpt.committed_through);
+                outstanding_hints.discardNow();
                 prior.reset();
                 prior_is_seal.reset();
             }

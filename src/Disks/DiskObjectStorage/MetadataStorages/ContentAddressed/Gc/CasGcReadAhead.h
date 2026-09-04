@@ -26,7 +26,10 @@ namespace DB::Cas
 /// durable before the round began (it is a gap whenever it is read), and a manifest body still being
 /// uploaded when the early read lands yields the same hold a slightly earlier sequential read yields
 /// today. Nothing is hinted above `committed_through`, so no request is issued that the sequential
-/// walk would not issue.
+/// walk would not issue -- with one bounded exception: a ref-log hinting site does not yet know where
+/// an epoch's closing seal is (it learns that only by decoding the log at that position), so it may
+/// hint ids past the seal, inside the SAME epoch, that turn out not to exist. Those are discarded
+/// rather than taken, overshooting by at most one window per epoch crossing, and counted wasted.
 ///
 /// Memory is the CALLER's to bound: `pending` counts hinted-but-untaken slots and `window` is how
 /// many a hinting site keeps in flight. A key hinted twice is one request. Results never taken are

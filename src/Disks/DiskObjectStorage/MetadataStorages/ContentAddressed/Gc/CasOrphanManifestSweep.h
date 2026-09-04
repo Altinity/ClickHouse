@@ -216,6 +216,12 @@ bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPre
 /// `GcRoundWorkBudget` instance). Exhausting either cap retains every remaining candidate belonging to
 /// the affected namespace on THIS page rather than deciding it without a complete protection view;
 /// `nullptr` (the default) reproduces the pre-budget unbounded behavior.
+///
+/// `read_pool` and `read_concurrency` (default `nullptr`/1, i.e. every read inline on the caller's
+/// operation) drive the page's read-ahead: with a pool and a concurrency above one, the candidates'
+/// bodies and the catalog-recovery/committed-tail ref-log walks overlap their round trips on `read_pool`
+/// instead of serializing request by request. Every decision this function makes is unchanged by that
+/// choice; see `GcReadAhead` for what may be fetched early and why.
 ManifestSweepResult planManifestCursorPage(
     Pool & store,
     const String & cursor,

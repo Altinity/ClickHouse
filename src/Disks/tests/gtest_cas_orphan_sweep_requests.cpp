@@ -224,34 +224,119 @@ std::map<String, uint64_t> getsOf(CountingBackend & backend)
 
 struct PageOutcome
 {
-    uint64_t listed, skipped, nominations, retained_no_coverage, retained_hold, retained_tail_removal, floor_lookups;
+    uint64_t listed, skipped, deleted, undecodable, retained_no_coverage, retained_hold,
+        retained_unconsumed_seal, retained_tail_removal, retained_work_budget, floor_lookups, floor_reads;
+    bool wrapped;
     String next_cursor;
     bool operator==(const PageOutcome &) const = default;
 };
 
 PageOutcome outcomeOf(const ManifestSweepResult & r)
 {
-    return {r.listed, r.skipped, r.nominations.size(), r.retained_no_coverage, r.retained_hold,
-            r.retained_tail_removal, r.floor_lookups, r.next_cursor};
+    return {r.listed, r.skipped, r.deleted, r.undecodable, r.retained_no_coverage, r.retained_hold,
+            r.retained_unconsumed_seal, r.retained_tail_removal, r.retained_work_budget,
+            r.floor_lookups, r.floor_reads, r.wrapped, r.next_cursor};
 }
+
+bool sameNomination(const ManifestSweepResult::Nomination & a, const ManifestSweepResult::Nomination & b)
+{
+    if (!(a.id == b.id) || a.key != b.key || a.token.dialect != b.token.dialect || a.token.value != b.token.value)
+        return false;
+    if (a.source_retirements.size() != b.source_retirements.size())
+        return false;
+    for (size_t i = 0; i < a.source_retirements.size(); ++i)
+        if (!(a.source_retirements[i].ref == b.source_retirements[i].ref)
+            || !(a.source_retirements[i].source_id == b.source_retirements[i].source_id))
+            return false;
+    return true;
+}
+
+/// Both runs decide candidates from the SAME listed order and append nominations in that same order,
+/// whichever reader fetched their bytes, so an index-wise comparison is exact -- no sort needed.
+bool sameNominations(const std::vector<ManifestSweepResult::Nomination> & a,
+                     const std::vector<ManifestSweepResult::Nomination> & b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!sameNomination(a[i], b[i]))
+            return false;
+    return true;
+}
+
+/// A fixture whose sweep has REAL candidates and a committed-tail walk long enough to hint ahead,
+/// entirely WITHOUT crossing an epoch: this life is born directly at epoch 2 (`{2,1}`, no
+/// `prev_epoch_seal` needed -- genesis, not a chain link), and `kDebrisManifests` unowned raw
+/// manifests sit at prefix epoch 1 -- a legacy build-prefix number, never part of this life's own ref
+/// stream, but eligible under the floor (an old epoch is always eligible) and covered by the folded
+/// cursor sitting in epoch 2 (rule 1) all the same, so they become genuine nominations. `kEpochTwoLogs`
+/// ordinary committed grants after the birth give the committed-tail walk (and the recovery walk, which
+/// starts at this same genesis) a range comfortably longer than one read-ahead window, all inside the
+/// ONE epoch neither walk ever leaves -- unlike the epoch-crossing fixture below, whose hints legitimately
+/// overshoot a seal and so cannot be expected to read the identical key set at every concurrency, this
+/// fixture's GET set is invariant to concurrency, which is what the comparison after it needs.
+constexpr uint64_t kDebrisManifests = 6;
+constexpr uint64_t kEpochTwoLogs = 80;
+
+struct CandidateFixture
+{
+    std::shared_ptr<CountingBackend> backend = std::make_shared<CountingBackend>();
+    PoolPtr store;
+
+    CandidateFixture()
+    {
+        PoolConfig config;
+        config.pool_prefix = "p";
+        config.server_root_id = "test";
+        config.manifest_sweep_list_budget_keys = 1000;
+        config.manifest_sweep_delete_budget_keys = 100;
+        config.gc_fold_max_defer_rounds = 0;
+        store = Pool::open(backend, config);
+        const Layout & layout = store->layout();
+        casAdmitEntry(*backend, layout, kNs);
+
+        for (uint64_t seq = 1; seq <= kDebrisManifests; ++seq)
+            writeManifestRaw(*backend, layout, kNs, build(seq), {blobEntryFor("a", DB::UInt128(0x100 + seq))});
+        publishAt(*backend, layout, kNs, RefTxnId{2, 1}, "live", /*build_sequence=*/2000,
+                  DB::UInt128(0x7001), /*birth=*/true);
+        for (uint64_t seq = 2; seq <= kEpochTwoLogs; ++seq)
+            publishAt(*backend, layout, kNs, RefTxnId{2, seq}, "epoch2-" + std::to_string(seq),
+                      2000 + seq, DB::UInt128(0x9000 + seq), /*birth=*/false);
+        writeRecoverableCkptForRawFixture(*backend, layout, kNs, RefCkpt{
+            .life_epoch = 2, .committed_through = RefTxnId{2, kEpochTwoLogs},
+            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
+        seedFoldCursorForTest(*backend, layout, kNs, RefTxnId{2, 1});
+        setWatermarkMinActive(*backend, layout, "test", /*writer_epoch=*/2, /*min_active=*/1);
+        backend->resetCounts();
+    }
+};
 
 }
 
-/// The read-ahead reader must issue the same GETs against the same keys as the inline reader and
-/// decide the same way; only when the bytes arrive moves.
+/// The read-ahead reader must issue the same GETs against the same keys as the inline reader, decide
+/// the same way, and nominate the exact same candidates; only when the bytes arrive moves. The fixture
+/// gives the page real candidates and a committed-tail walk spanning more than one window, so the
+/// comparison actually exercises the read-ahead instead of vacuously agreeing over nothing.
 TEST(CASOrphanSweepRequests, PageIsIdenticalInlineAndWithReadAhead)
 {
-    PageFixture inline_f(/*manifests=*/40, /*min_active=*/30);
-    const ManifestSweepResult inline_r = inline_f.page();
+    CandidateFixture inline_f;
+    const ManifestSweepResult inline_r = planManifestCursorPage(*inline_f.store, "", 1000, 100, true, nullptr);
     const auto inline_gets = getsOf(*inline_f.backend);
+    ASSERT_EQ(inline_r.nominations.size(), kDebrisManifests)
+        << "the fixture must actually produce candidates, or this test proves nothing";
 
-    PageFixture ahead_f(/*manifests=*/40, /*min_active=*/30);
+    CandidateFixture ahead_f;
     ThreadPool pool = makeReadPool(4);
+    const uint64_t hits_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load();
     const ManifestSweepResult ahead_r = planManifestCursorPage(
         *ahead_f.store, "", 1000, 100, true, nullptr, &pool, /*read_concurrency=*/16);
+    const uint64_t hits = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load() - hits_before;
     const auto ahead_gets = getsOf(*ahead_f.backend);
 
+    EXPECT_GT(hits, 0u) << "the fixture's committed-tail walk and candidates must actually hit the "
+                            "read-ahead, or this oracle could never catch a hinting regression";
     EXPECT_EQ(outcomeOf(inline_r), outcomeOf(ahead_r));
+    EXPECT_TRUE(sameNominations(inline_r.nominations, ahead_r.nominations));
     EXPECT_EQ(inline_gets, ahead_gets);
 }
 
