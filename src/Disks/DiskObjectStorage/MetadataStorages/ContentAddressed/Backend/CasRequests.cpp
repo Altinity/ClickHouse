@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 
 #include <Common/Exception.h>
+#include <IO/ReadBuffer.h>
 #include <Common/LoggingHelpers.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
@@ -282,6 +283,81 @@ const String & CasRequests::valueFor(const String & key, const Etag & inc) const
     return inc.value();
 }
 
+namespace
+{
+
+/// The one mapping from a refused admission to the exception a read-class caller sees. The request
+/// gate and the streamed body below both refuse through it, so a body refused mid-transfer reads
+/// exactly like an open refused before it: `NoBudget` is the retry-later class, everything else the
+/// tripped-fence class. Free, not a member: the body's copy must not reference an operation.
+[[noreturn]] void throwReadRefused(Fence::Admit admit, std::string_view verb, const String & subject,
+                                   std::string_view when)
+{
+    if (admit == Fence::Admit::NoBudget)
+        throwCasWriteRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, when));
+    throwCasTransientUnavailable(fmt::format("CAS {} of '{}'", verb, subject),
+                                 fmt::format("mount fence tripped {}", when));
+}
+
+/// The body of a streamed object, re-admitted at every refill. `Backend::stream` bounds only the
+/// open; the SDK reads the body at the consumer's pace, under the storage's ordinary settings, long
+/// after the attempt that opened it returned -- so a fold parked in a multi-gigabyte run body would
+/// outlive the fence that refused every other request of its operation. The check is the operation's
+/// own admission, asked once per SDK buffer, and its refusal is the exception a refused open produces.
+///
+/// The predicate is held BY VALUE -- the fence's `admit` closure, the admitted generation, the
+/// caller's liveness -- never through the operation: `CasOperation::stream` returns a buffer that can
+/// outlive the operation object (S3 staging opens its stream under a local mount-plane operation and
+/// hands the buffer to the backend). Modelled on `LimitReadBuffer`: no byte is copied, the SDK's
+/// window is exposed as this buffer's own.
+class AdmittedBodyReadBuffer : public ReadBuffer
+{
+public:
+    AdmittedBodyReadBuffer(std::unique_ptr<ReadBuffer> in_, String key_,
+                           std::function<Fence::Admit(uint64_t, uint64_t)> admit_,
+                           uint64_t admitted_generation_, Liveness liveness_)
+        /// The open already loaded a window (`Backend::stream` forces the first GET): adopt it, so
+        /// the first refill this buffer asks for is the SECOND window and the SDK buffer is never
+        /// asked to advance over pending data.
+        : ReadBuffer(in_->position(), in_->available(), 0)
+        , in(std::move(in_))
+        , key(std::move(key_))
+        , admit(std::move(admit_))
+        , admitted_generation(admitted_generation_)
+        , liveness(std::move(liveness_))
+    {
+    }
+
+private:
+    bool nextImpl() override
+    {
+        /// Let the SDK buffer account the bytes the consumer took from the shared window.
+        in->position() = position();
+
+        Fence::Admit verdict = admit(admitted_generation, 0);
+        if (verdict == Fence::Admit::Ok && liveness && !liveness())
+            verdict = Fence::Admit::LostOrRearmed;
+        if (verdict != Fence::Admit::Ok)
+            throwReadRefused(verdict, "stream body", key, "mid-body");
+
+        if (!in->next())
+        {
+            BufferBase::set(in->position(), 0, 0);
+            return false;
+        }
+        BufferBase::set(in->position(), in->available(), 0);
+        return true;
+    }
+
+    std::unique_ptr<ReadBuffer> in;
+    String key;
+    std::function<Fence::Admit(uint64_t, uint64_t)> admit;
+    uint64_t admitted_generation;
+    Liveness liveness;
+};
+
+}
+
 CasOperation::Gate CasOperation::gate(uint64_t needed_ms) const
 {
     switch (owner.fence.admit(admitted_generation, needed_ms))
@@ -354,14 +430,13 @@ bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & 
 void CasOperation::giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when)
 {
     last_read_stop = ReadStop::FenceLost;
-    throwCasTransientUnavailable(fmt::format("CAS {} of '{}'", verb, subject),
-                                 fmt::format("mount fence tripped {}", when));
+    throwReadRefused(Fence::Admit::LostOrRearmed, verb, subject, when);
 }
 
 void CasOperation::giveUpReadNoBudget(std::string_view verb, const String & subject, std::string_view what)
 {
     last_read_stop = ReadStop::NoBudgetLease;
-    throwCasWriteRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, what));
+    throwReadRefused(Fence::Admit::NoBudget, verb, subject, what);
 }
 
 void CasOperation::giveUpReadDeadline(std::string_view verb, const String & subject,
@@ -572,10 +647,15 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
 std::unique_ptr<ReadBuffer> CasOperation::stream(const String & key, const Retry & policy)
 {
     const Retry::Bound bound = policy.bind(owner.now_ms());
-    return readLoop("stream", key, policy, bound, [&](auto & access)
+    std::unique_ptr<ReadBuffer> body = readLoop("stream", key, policy, bound, [&](auto & access)
     {
         return owner.backend->stream(key, access);
     });
+    if (!body)
+        return nullptr;   /// absent: the open already answered
+    /// By value, deliberately: nothing the buffer holds may reference this operation or its owner.
+    return std::make_unique<AdmittedBodyReadBuffer>(std::move(body), key, owner.fence.admit,
+                                                    admitted_generation, liveness);
 }
 
 void CasOperation::publish(const BlobPublishRequest & request, const Retry & policy)

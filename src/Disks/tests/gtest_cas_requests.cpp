@@ -10,11 +10,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
 #include "cas_test_helpers.h"
 
+#include <IO/ReadHelpers.h>
+
 #include "config.h"
 
 #include <Poco/Exception.h>
 #include <base/defines.h>
 
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -1814,3 +1817,101 @@ TEST(CASRequests, AWriteReservesTwoEnvelopesSoOneOfSurplusStartsNothing)
     EXPECT_TRUE(clock.sleeps.empty());
 }
 
+
+/// The body of a streamed object is read at the consumer's pace, long after the opening attempt
+/// returned; the wrapper re-admits it at every refill. The window the open already loaded is served
+/// first -- the SDK buffer arrives with pending data -- and the check first fires on advancing past it.
+TEST(CASRequests, StreamBodyKeepsThePreloadedWindowAndRefusesOnTheNextRefill)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    std::atomic<bool> torn_down{false};
+    Fence fence{[] { return uint64_t{0}; },
+                [&](uint64_t, uint64_t) { return torn_down.load() ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
+                [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto op = requests.admit();
+    orThrow(op.create("k", "0123456789", Retry::once()), "create");
+    backend->setStreamChunkForTest(4);   /// the body arrives as "0123", "4567", "89"
+
+    auto body = op.stream("k", Retry::once());
+    ASSERT_TRUE(body);
+    String first(4, '\0');
+    body->readStrict(first.data(), 4);
+    EXPECT_EQ(first, "0123") << "the window the open already loaded is served, not skipped";
+
+    torn_down.store(true);
+    char c;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { body->readStrict(&c, 1); });
+    EXPECT_TRUE(body->isCanceled()) << "a refused refill leaves the buffer the consumer holds unusable";
+}
+
+TEST(CASRequests, StreamBodyServesEveryWindowThenEof)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "0123456789", Retry::once()), "create");
+    backend->setStreamChunkForTest(4);
+
+    auto body = op.stream("k", Retry::once());
+    ASSERT_TRUE(body);
+    String all;
+    DB::readStringUntilEOF(all, *body);
+    EXPECT_EQ(all, "0123456789");
+    EXPECT_TRUE(body->eof());
+    EXPECT_FALSE(op.stream("absent", Retry::once())) << "an absent object is still the open's answer";
+}
+
+/// The mount plane's fence can answer `NoBudget`; a body refused for that reason must read like a
+/// refused open on the same plane -- the retry-later class, not a tripped fence.
+TEST(CASRequests, StreamBodyRefusalKeepsTheNoBudgetMapping)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    std::atomic<bool> out_of_budget{false};
+    Fence fence{[] { return uint64_t{0}; },
+                [&](uint64_t, uint64_t) { return out_of_budget.load() ? Fence::Admit::NoBudget : Fence::Admit::Ok; },
+                [](uint64_t) {}};
+    auto requests = makeRequests(backend, clock, fence);
+    auto op = requests.admit();
+    orThrow(op.create("k", "0123456789", Retry::once()), "create");
+    backend->setStreamChunkForTest(4);
+
+    auto body = op.stream("k", Retry::once());
+    ASSERT_TRUE(body);
+    String first(4, '\0');
+    body->readStrict(first.data(), 4);
+    out_of_budget.store(true);
+    char c;
+    try
+    {
+        body->readStrict(&c, 1);
+        FAIL() << "the refill must be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_NE(e.message().find("no lease budget"), String::npos) << e.message();
+    }
+}
+
+/// The caller's liveness is the second half of admission for the body too, in the gate's order.
+TEST(CASRequests, StreamBodyHonoursTheCallersLiveness)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    std::atomic<bool> alive{true};
+    auto op = requests.admit([&] { return alive.load(); });
+    orThrow(op.create("k", "0123456789", Retry::once()), "create");
+    backend->setStreamChunkForTest(4);
+
+    auto body = op.stream("k", Retry::once());
+    ASSERT_TRUE(body);
+    String first(4, '\0');
+    body->readStrict(first.data(), 4);
+    alive.store(false);
+    char c;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { body->readStrict(&c, 1); });
+}
