@@ -122,6 +122,9 @@ disk (S3 operations and CAS conflicts per dropped table) as the first measuremen
 `{#ref-catalog-cas-starvation}` follow-up; second target = the part-commit round trips (upload fan-out
 + conditional PUTs); third = skip `StackTrace` capture for expected 412s.
 
+Design for the first target: `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
+(revision 15, 2026-09-04), which supersedes the fix sketch below where they differ.
+
 ### `[ref-catalog-cas-starvation-under-parallel-writers]` One process's CREATE/DROP writers starve each other on the ref-catalog compare-and-swap (2026-09-04) {#ref-catalog-cas-starvation}
 
 Seen on the local CA-s3 stateless lane (run 2, ~10 parallel jobs): `01039_mergetree_exec_time`'s
@@ -170,6 +173,13 @@ Fix, two halves, in this order:
    with half 1 in place, conflicts come only from other servers and are rare. Pin with an N-writer fake-clock
    test asserting the earliest writer's consecutive-loss streak stays bounded while new arrivals keep
    winning (red today). Update the spec sentences at "Conflicts spend the same budget as errors".
+
+Superseded by the design `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
+(revision 15, 2026-09-04, fourteen codex review rounds): the door lives in the request engine as a
+per-key FIFO ticket on the mount plane, an opted-in `readModifyWrite` starts from the last committed
+candidate, a refusal is reported only from an observation, and the conflict pause is flat per dialect.
+Combining writers into one `PUT` was found unsound over closures and is placed there as a typed-delta
+follow-up; the stalled-holder case is recorded there as an accepted availability tradeoff.
 
 ### `[cas-s3-lane-put-timeout-logged-at-error]` A stalled single-attempt PUT is logged at Error and fails a stateless test whose write succeeded (2026-09-04) {#cas-s3-lane-put-timeout-logged-at-error}
 
