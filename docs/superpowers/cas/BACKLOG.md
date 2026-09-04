@@ -59,6 +59,35 @@ as a confirmation note rather than inserted separately. Full triage record:
 
 ## Inbox {#inbox}
 
+### Real-GCS 15-minute soak (2026-09-04, binary 03ccdd795d9) — return items {#gcs-soak-2026-09-04-return-items}
+
+Report: `docs/superpowers/cas/2026-09-04-gcs-soak-15min.md`. Correctness PASS: `dangling=0` on both
+checkpoints, the aggregate oracle held (node1 = node2 = model, count 40883), GC's retired pipeline closed
+(`CASGCRetiredCondemned = Graduated = Redeleted = 5458`), `GaveUp` 2 (leader) / 1, zero dangling/corrupt
+rows in `cas_log`, RSS plateau 1.4–1.7 GB per node. The driver reported FAIL on its final converge
+checkpoint ("unreachable never stabilized within 1092 s", history 4909 → 287 strictly monotone) and its
+own post-failure fsck already showed `unreachable=0`: a timing miss, not non-convergence.
+
+- **Harness: `fixpoint_timeout_s` assumes a GC round every ~2 s** (`gc_interval_s=2` default) and gave
+  1092 s for ~98 rounds; real GCS rounds took 18.8 s to 1250 s (round 7: 1114 s of its 1125 s in
+  `pending_deletes`, 5000 throttled deletes). Derive the bound from observed round durations, as
+  `wait_for_pool_drain` already does; otherwise every real-GCS soak with a backlog fails falsely.
+  Owner: `utils/ca-soak/soak/run.py`.
+- **GC round cost on GCS** — the measurement behind `{#gc-manifests-immutable-cheap-reduce}`: five leader
+  rounds 1827 s total, `fold_reduce` 1383 s of it; sequential per-object phases (`fold_reduce`,
+  `ref_object_cleanup`, `manifest_deletes`, `pending_deletes`) are the whole budget.
+- **429 `SlowDown` hot spot on one key per node: the mount-lease checkpoint object
+  `cas/ns/state/<mount-id>/_ckpt`** (269 on ch1, 340 on ch2) — GCS's ~1 mutation/s per object; the
+  renewer/checkpoint writer exceeds it. Question: can `_ckpt` writes be paced to the object budget or
+  coalesced, and does the 429 backoff ever threaten the lease deadline? (Not in this run: no lease loss
+  from 429.)
+- **DNS resolution outage to `storage.googleapis.com` at 11:07:01–11:08:49Z** (repeated
+  `Poco::TimeoutException`/DNS errors, zero 429s in the window) caused a simultaneous lease loss and a
+  six-attempt remount storm on BOTH nodes (attempt 7 succeeded) and the 53.9 s lease phase on ch2's
+  round 191. The fencing protocol did its job; the item is observability: the remount log should name
+  the DNS failure class distinctly, and the host's Docker resolver flakiness is the suspect (unconfirmed
+  against host DNS logs).
+
 ### `[gc-manifests-are-immutable-so-reduce-and-deletes-can-be-cheap]` The orphan sweep re-reads every listed manifest and deletes manifests one conditional request at a time; manifest keys cannot be reborn, so neither is needed (2026-09-04, user) {#gc-manifests-immutable-cheap-reduce}
 
 Measured on the 15-minute real-GCS soak (leader ch1, `system.cas_gc_log`): rounds 1.2 s → 18.8 s → 128 s →
