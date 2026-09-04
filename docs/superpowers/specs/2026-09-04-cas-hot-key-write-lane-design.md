@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 12. Brainstormed 2026-09-04 against the measurements in
+Revision 13. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
 supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
@@ -93,6 +93,13 @@ Revision history, kept because each step removed something a review proved unsou
   case is recorded instead as an explicit release-level availability tradeoff, with what bounds
   it in practice, how it is observed, and the fix that belongs in the transport. The bounded
   tenure, the one-sleep helper and the keyed observability stay.
+- Revision 13 states the acceptance outright rather than pending a confirmation, and drops the
+  invariant that contradicted it. It also closes a leak the lane would widen: `casUpdateImpl`
+  turns a lost fence into a private marker that `createNamespace` never caught around step 1, so
+  a creator fenced while queued would have thrown a bare `std::exception` instead of returning
+  `FencedOut`; the same translation `casUpdate` already performs is applied there and in
+  `casAdmitEntry`. The ticket guard is the sole remover of a ticket, and the spacing timestamp
+  is an `optional`.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -140,10 +147,10 @@ Goals:
   conflict that settled one.
 - No change to the catalog's API, to the semantics of any conditional write or of any verdict a
   `decide` renders, to the 90 s windows, to any read path, or to the GC erase's authority window.
-  One internal change in `CasRefCatalog.cpp` (how `casUpdateImpl` carries its markers, below) and
-  one line in `CasRefLedger::dropNamespaceImpl` (the cancellation's terminality read under a
-  frozen policy, as the reconciliation's already is). Every existing catalog test stays green
-  unchanged.
+  Two internal changes in `CasRefCatalog.cpp` (how `casUpdateImpl` carries its markers, and the
+  fence marker caught where it was not, both below) and one line in
+  `CasRefLedger::dropNamespaceImpl` (the cancellation's terminality read under a frozen policy, as
+  the reconciliation's already is). Every existing catalog test stays green unchanged.
 
 Non-goals:
 
@@ -199,7 +206,7 @@ private:
     {
         std::deque<uint64_t> tickets;                /// guarded by `mutex`; the front ticket is the holder
         uint64_t holder_since_ms = 0;                /// guarded by `mutex`; when the front ticket became the holder, for the log line
-        uint64_t last_write_attempt_end_ms = 0;      /// guarded by `mutex`; for the Generation dialect's spacing
+        std::optional<uint64_t> last_write_attempt_end_ms;   /// guarded by `mutex`; for the Generation dialect's spacing; absent before the first attempt
         std::condition_variable cv;
         std::optional<Object> remembered;            /// guarded by `mutex`; the last candidate this plane committed
         uint64_t next_ticket = 0;                    /// guarded by `mutex`
@@ -297,7 +304,19 @@ clears, and returns `nullopt`. After `readModifyWrite` returns `Declined`, `casU
 the captured exception, and its callers catch the same types at the same places as today; a
 `Declined` with nothing captured stays the `LOGICAL_ERROR` it is today. Every other exception,
 decode corruption and `identityPreserving`'s `LOGICAL_ERROR` among them, propagates from wherever
-it is thrown. This is the one change inside `CasRefCatalog.cpp`, and no signature moves.
+it is thrown. No signature moves.
+
+One catch that is missing today is added, because the lane widens the window it covers.
+`casUpdateImpl` turns the engine's `GaveUp{FenceLost}`, before an attempt or after a landed
+`PUT`, into `CatalogFenceMovedMarker`; `casUpdate` translates that marker into
+`throwCasTransientUnavailable`, and the lifecycle functions catch it and return `FencedOut`. But
+`createNamespace` catches only `CatalogEntryAlreadyPresentMarker` around step 1, so a creator
+whose fence moves during step 1 throws the bare marker, a `std::exception` no caller names, up
+through `resolveNamespaceLife`. Today that needs the fence to move inside one short call; in the
+lane it can move during the queue wait. Step 1 therefore catches `CatalogFenceMovedMarker` and
+returns `NamespaceCreationOutcome::FencedOut`, which `resolveNamespaceLife` already handles, and
+the public `casAdmitEntry` translates it exactly as `casUpdate` does. This is the second change
+inside `CasRefCatalog.cpp`.
 
 **Memory is opt-in per call site, not per key.** The ticket applies to every write on a hot key;
 the memory start applies only where the caller asks for it, `readModifyWrite(key, decide, policy,
@@ -366,17 +385,17 @@ leave step below is this guard running on the normal path.
 
 1. Outside `mutex`: `gate(0)` on the caller's own operation, then the caller's own bound against
    the engine's clock, in that order so a lost fence or an exhausted lease is reported as itself
-   and not as a policy deadline. `FenceLost`: under `mutex`, erase the ticket (no allocation),
-   return `GaveUp{FenceLost}`. `NoBudget`: erase, return `GaveUp{Deadline, Lease}`. Bound passed:
-   erase, return `GaveUp{Deadline}` with the bound's own source. The gate runs outside the lane
-   mutex because it may call the operation's `Liveness` closure, and the lane mutex must stay a
-   leaf that calls nothing.
+   and not as a policy deadline. `FenceLost`: return `GaveUp{FenceLost}`. `NoBudget`: return
+   `GaveUp{Deadline, Lease}`. Bound passed: return `GaveUp{Deadline}` with the bound's own
+   source. Returning runs the ticket guard, which is the only thing that ever removes the ticket.
+   The gate runs outside the lane mutex because it may call the operation's `Liveness` closure,
+   and the lane mutex must stay a leaf that calls nothing.
 2. Under `mutex`: if the ticket is at the front, set `holder_since_ms` to the clock value read in
    step 1 and leave the loop as the holder. Otherwise `cv.wait_for(lock, slice)` with a short
    slice (the pattern of `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the mutex,
    and go to step 1. The clock is read in step 1, never under the mutex. A waiter that leaves on
-   its deadline in step 1 snapshots the front ticket and `holder_since_ms` under the mutex while
-   erasing itself, and logs them after releasing it.
+   its deadline in step 1 records that fact for its guard, which snapshots the front ticket and
+   `holder_since_ms` under the mutex and logs them after releasing it.
 
 A ticket is promoted only after its checks passed in the same iteration. The engine's own
 per-attempt gate and `fits` still run before anything is sent, as today.
@@ -396,11 +415,14 @@ recorded in `last_write_attempt_end_ms`. Credential-refresh reissues and ambiguo
 reissues take the same helper, so a hot `Generation` key never sleeps twice before one attempt and
 never issues one inside the boundary.
 
-**Leave.** The ticket guard, on every exit: under `mutex`, move the prepared memory value into
-`remembered` or clear it (a holder that unwinds clears), erase this ticket, `cv.notify_all()`;
-after releasing the mutex, record the queue time to the profile event. It is `noexcept` and
-allocates nothing: the memory value is prepared before the guard runs (below), and erasing from a
-`std::deque` does not allocate.
+**Leave.** The ticket guard, on every exit, holder or waiter, normal or unwinding, in this
+order: under `mutex`, if this ticket was the holder, move the prepared memory value into
+`remembered` or clear it (a holder that unwinds clears); erase this ticket; if the caller left on
+its deadline behind a holder, snapshot the front ticket and `holder_since_ms`;
+`cv.notify_all()`; after releasing the mutex, record the queue time to the profile event and
+emit the log line if a snapshot was taken. It is the sole remover of a ticket and the sole
+notifier. It is `noexcept` and allocates nothing: the memory value is prepared before the guard
+runs (below), and erasing from a `std::deque` does not allocate.
 
 A holder never waits for another ticket and never runs anyone else's closure: a ticket is settled
 only by its own caller. No ticket outlives its caller's stack in the queue: the guard removes it
@@ -493,8 +515,9 @@ fail with that error until the attempt ends, which happens when the transport re
 connection is closed by either side, or when the process restarts. Nothing in the lane ends it,
 because nothing in the engine can.
 
-This is accepted, as a release-level availability tradeoff, for the following reasons, and the
-project owner confirms it at spec review:
+This design accepts that, as a release-level availability tradeoff: for a trickling transport
+attempt, and for that case only, the lane turns one trapped writer into a trapped catalog key on
+this pool until the attempt ends. The reasons:
 
 - Nothing lands that should not, and no second write is started under a running first one; the
   failure is retry-later, the same error the trapped writer alone reports today.
@@ -557,8 +580,10 @@ ledger-visible reads and a waiter must not hold what the holder needs. Today's c
 - INV-HK9. On the `Generation` dialect, write attempts on a hot key from one plane are at least
   one second apart, and the spacing sleep starts only when it and the attempt after it fit the
   operation's bound.
-- INV-HK10. A holder whose transport answers holds the front for at most its deadline plus one
-  attempt timeout, and every read its `decide` issues ends inside its window.
+
+A holder's tenure is not an invariant: it is bounded by its deadline plus one attempt timeout
+whenever the transport answers within that timeout, and unbounded otherwise, which is the
+accepted tradeoff above.
 
 ### Effects to name {#effects-to-name}
 
@@ -751,8 +776,13 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    the holder's ticket remains in the lane, and when the `PUT` is finally released the holder
    commits and the next writer proceeds normally. Sibling: `cancelStalledCreating` through
    `dropNamespaceImpl` issues its terminality read under the frozen policy (its deadline is not
-   later than the outer one), so a holder parked in that read gives up by the outer deadline
-   (INV-HK10).
+   later than the outer one), so a holder parked in that read gives up by the outer deadline.
+7g. Fence during step 1. A creator queued behind a parked holder has its fence tripped before its
+   turn: `createNamespace` returns `FencedOut`, nothing was written, and `resolveNamespaceLife`
+   reports retry-later. Its fence tripped between its landed step-1 `PUT` and the post-commit
+   check: `FencedOut` again, with the `Creating` row durable for a later reconciler, as today's
+   `completeCreation` fence case leaves it. `casAdmitEntry` under a tripped fence throws
+   `throwCasTransientUnavailable`'s class, as `casUpdate` does, never a bare marker.
 7d. Cache fill failure. A hook makes the post-commit etag copy throw. Assert: the caller receives
    its `Committed` unchanged, the memory is empty, and the next opted-in call reads. A memory
    start whose inner write is refused at the gate before sending reports `GaveUp` with
