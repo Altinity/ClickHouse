@@ -300,6 +300,9 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
 {
     const auto open_store = [](const std::shared_ptr<RenewalLogBackend> & backend, uint64_t & boot_ms, const String & prefix)
     {
+        /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
+        /// budget field alone; pair the two so the fence math below matches what admits.
+        backend->setAttemptTimeoutMs(renewalLogBudget().attempt_timeout_ms);
         return Pool::open(backend, PoolConfig{
             .pool_prefix = prefix,
             .server_root_id = "test",
@@ -347,8 +350,8 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto store = open_store(backend, boot_ms, "renewal-log-fenced");
         ScopedRenewalLogCapture capture("information");
         /// The lease was claimed at boot 100 with the 1000 ms TTL above, so it expires at 1100. The
-        /// fence admits only while the remaining time is strictly above the safety margin, and this
-        /// backend declares no attempt timeout, so the engine reserves nothing on top of that margin.
+        /// fence admits only while the remaining time strictly clears the safety margin plus whatever
+        /// the attempt reserves, so exactly `margin` remaining (with the reservation on top) refuses.
         boot_ms = 1100 - renewalLogBudget().lease_safety_margin_ms;
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
         const String output = capture.captured();

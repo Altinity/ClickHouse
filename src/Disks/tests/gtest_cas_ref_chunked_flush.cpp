@@ -823,6 +823,9 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
     budget.attempt_timeout_ms = 100;
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     auto store = openPoolWith(backend, cfg);
     auto clock = VirtualRetryClock::installOn(store);
     const DB::Cas::Layout & layout = store->layout();
