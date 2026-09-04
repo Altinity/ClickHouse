@@ -105,6 +105,7 @@ namespace Setting
     extern const SettingsMap additional_table_filters;
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
     extern const SettingsBool async_socket_for_remote;
+    extern const SettingsDistributedProductMode distributed_product_mode;
     extern const SettingsBool empty_result_for_aggregation_by_empty_set;
     extern const SettingsBool enable_unaligned_array_join;
     extern const SettingsBool join_use_nulls;
@@ -117,6 +118,7 @@ namespace Setting
     extern const SettingsUInt64 max_parser_depth;
     extern const SettingsUInt64 max_query_size;
     extern const SettingsNonZeroUInt64 max_parallel_replicas;
+    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
     extern const SettingsFloat max_streams_to_max_threads_ratio;
     extern const SettingsMaxThreads max_threads;
     extern const SettingsUInt64 max_threads_min_free_memory_per_thread;
@@ -130,6 +132,7 @@ namespace Setting
     extern const SettingsBool parallel_replicas_for_non_replicated_merge_tree;
     extern const SettingsUInt64 parallel_replicas_min_number_of_rows_per_replica;
     extern const SettingsUInt64 parallel_replica_offset;
+    extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool optimize_move_to_prewhere;
     extern const SettingsBool optimize_move_to_prewhere_if_final;
     extern const SettingsBool use_concurrency_control;
@@ -155,6 +158,47 @@ namespace ErrorCodes
 
 namespace
 {
+
+const StorageDistributed * getDistributedStorageFromTableExpression(const QueryTreeNodePtr & table_expression)
+{
+    const auto * table_node = table_expression->as<TableNode>();
+    if (!table_node)
+        return nullptr;
+
+    return typeid_cast<const StorageDistributed *>(table_node->getStorage().get());
+}
+
+void tryRewriteGlobalRightJoinAsLeftJoin(QueryNode & query_node, const ContextPtr & context)
+{
+    auto * join_node = query_node.getJoinTree()->as<JoinNode>();
+    if (!join_node
+        || join_node->getKind() != JoinKind::Right
+        || join_node->getStrictness() != JoinStrictness::All
+        || !join_node->isOnJoinExpression())
+        return;
+
+    const auto & settings = context->getSettingsRef();
+    const auto distributed_product_mode = settings[Setting::distributed_product_mode];
+    const bool is_global = join_node->getLocality() == JoinLocality::Global
+        || distributed_product_mode == DistributedProductMode::GLOBAL
+        || (distributed_product_mode != DistributedProductMode::LOCAL && settings[Setting::prefer_global_in_and_join]);
+    if (!is_global)
+        return;
+
+    const auto * left_storage = getDistributedStorageFromTableExpression(join_node->getLeftTableExpression());
+    const auto * right_storage = getDistributedStorageFromTableExpression(join_node->getRightTableExpression());
+    if (!left_storage || !right_storage || left_storage->getShardCount() < 2 || right_storage->getShardCount() < 2)
+        return;
+
+    /** A `GLOBAL RIGHT JOIN` cannot run with the left table sharded and the right table broadcast.
+      * Every shard would independently emit unmatched rows from the complete right table.
+      * Swap the inputs before choosing the `Distributed` table that will execute the query, so the
+      * preserved side stays sharded and the original left table is broadcast instead.
+      * Projection nodes are already resolved and keep the user-visible column order unchanged.
+      */
+    std::swap(join_node->getLeftTableExpression(), join_node->getRightTableExpression());
+    join_node->setKind(JoinKind::Left);
+}
 
 /// Check if current user has privileges to SELECT columns from table
 /// Throws an exception if access to any column from `column_names` is not granted
@@ -2114,7 +2158,10 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     const ColumnIdentifierSet & outer_scope_columns,
     PlannerContextPtr & planner_context)
 {
-    const QueryTreeNodePtr & join_tree_node = query_node->as<QueryNode &>().getJoinTree();
+    auto & query_node_typed = query_node->as<QueryNode &>();
+    tryRewriteGlobalRightJoinAsLeftJoin(query_node_typed, planner_context->getQueryContext());
+
+    const QueryTreeNodePtr & join_tree_node = query_node_typed.getJoinTree();
     auto table_expressions_stack = buildTableExpressionsStack(join_tree_node);
     size_t table_expressions_stack_size = table_expressions_stack.size();
     bool is_single_table_expression = table_expressions_stack_size == 1;
@@ -2134,6 +2181,7 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
 
     size_t joins_count = 0;
     bool is_full_join = false;
+    bool is_right_join = false;
     bool is_global_join = false;
     bool is_right_join_with_remote_table = false;
     int first_join_pos = -1;
@@ -2162,6 +2210,8 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
 
             if (join_kind == JoinKind::Full)
                 is_full_join = true;
+            if (join_kind == JoinKind::Right)
+                is_right_join = true;
 
             if (join_node.getLocality() == JoinLocality::Global)
                 is_global_join = true;
@@ -2232,21 +2282,32 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
       */
     auto left_table_expression = table_expressions_stack.front();
 
-    /** If the leftmost table uses IStorageCluster (e.g., s3Cluster, hdfsCluster)
-      * and there are multiple tables (indicating a JOIN), we must wrap it in a subquery.
-      * This prevents IStorageCluster from receiving the full JOIN query, which it cannot handle.
+    /** If the leftmost table uses `IStorageCluster` (e.g., `s3Cluster`, `hdfsCluster`)
+      * and there are multiple tables (indicating a JOIN), we normally wrap it in a subquery.
+      * This prevents `IStorageCluster` from receiving the full JOIN query, which it cannot handle.
       *
-      * IStorageCluster is a simple storage that just forwards queries to remote nodes.
-      * Unlike StorageDistributed, it cannot decompose and handle JOINs across multiple tables,
+      * `IStorageCluster` is a simple storage that just forwards queries to remote nodes.
+      * Unlike `StorageDistributed`, it cannot decompose and handle JOINs across multiple tables,
       * because remote nodes don't have access to other tables in the JOIN.
       *
-      * StorageDistributed has sophisticated query planning logic to handle JOINs and should
+      * With `object_storage_cluster_join_mode = 'global'`, `IStorageCluster` must receive a
+      * supported full query so it can materialize the right side and send a `GLOBAL JOIN` to
+      * remote nodes. `RIGHT JOIN` and `FULL JOIN` stay on the initiator because broadcasting their
+      * preserved right side would make every shard emit the same unmatched rows.
+      *
+      * `StorageDistributed` has sophisticated query planning logic to handle JOINs and should
       * NOT be wrapped (wrapping breaks tests like 03577_server_constant_folding).
       */
     bool should_wrap_left_table = false;
-    bool has_multiple_tables = table_expressions_stack.size() > 1;
+    const bool has_multiple_tables = table_expressions_stack.size() > 1;
+    const bool use_global_join
+        = planner_context->getQueryContext()->getSettingsRef()[Setting::object_storage_cluster_join_mode]
+            == ObjectStorageClusterJoinMode::GLOBAL
+        && joins_count > 0
+        && !is_right_join
+        && !is_full_join;
 
-    if (has_multiple_tables)
+    if (has_multiple_tables && !use_global_join)
     {
         // Get the actual storage to check its type
         auto * table_node = left_table_expression->as<TableNode>();

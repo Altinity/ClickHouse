@@ -1078,6 +1078,45 @@ def test_remote_no_hedged(started_cluster):
     assert TSV(pure_s3) == TSV(s3_distributed)
 
 
+def test_global_join_executes_on_shards(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+
+    node.query("DROP TABLE IF EXISTS join_table SYNC")
+    node.query(
+        """
+        CREATE TABLE join_table (
+            id UInt32,
+            name String
+        ) ENGINE=Memory()
+        """
+    )
+
+    query = f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN join_table AS t2 ON t1.value = t2.id
+    """
+
+    global_pipeline = node.query(
+        f"EXPLAIN PIPELINE {query} SETTINGS object_storage_cluster_join_mode='global'"
+    )
+    assert "JoiningTransform" not in global_pipeline
+
+    allow_pipeline = node.query(
+        f"EXPLAIN PIPELINE {query} SETTINGS object_storage_cluster_join_mode='allow'"
+    )
+    assert "JoiningTransform" in allow_pipeline
+
+    for join_kind in ("RIGHT", "FULL"):
+        outer_join_query = query.replace("JOIN join_table", f"{join_kind} JOIN join_table")
+        outer_join_pipeline = node.query(
+            f"EXPLAIN PIPELINE {outer_join_query} SETTINGS object_storage_cluster_join_mode='global'"
+        )
+        assert "JoiningTransform" in outer_join_pipeline
+
+
 @pytest.mark.parametrize("join_mode", ["local", "global"])
 def test_joins(started_cluster, join_mode):
     node = started_cluster.instances["s0_0_0"]
