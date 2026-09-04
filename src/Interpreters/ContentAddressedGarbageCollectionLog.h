@@ -17,8 +17,10 @@ struct ContentAddressedGarbageCollectionLogElement
     /// tell a round that genuinely folded and found nothing apart from one that never folded at all.
     /// `ABORTED`: the round threw an exception whose code names a transient condition (backend
     /// unavailability, a lost lease, a concurrent leader); the next scheduled round retries it.
+    /// `STOPPED`: a transient failure observed after the disk's teardown began -- the round was cut
+    /// short by a shutdown, FORGET or the storage's destructor; `error` carries the engine's refusal.
     /// `FAILED` is everything else -- fail-closed, an unclassified error reads as real.
-    enum Outcome   : int8_t { UNKNOWN = 1, SUCCESS = 2, NOT_A_LEADER = 3, FAILED = 4, DEFERRED = 5, ABORTED = 6 };
+    enum Outcome   : int8_t { UNKNOWN = 1, SUCCESS = 2, NOT_A_LEADER = 3, FAILED = 4, DEFERRED = 5, ABORTED = 6, STOPPED = 7 };
     enum Trigger   : int8_t { SCHEDULED = 1, MANUAL = 2 };
 
     time_t event_time = 0;

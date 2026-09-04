@@ -266,7 +266,11 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     catch (...)
     {
         fin.error_code = getCurrentExceptionCode();
-        fin.outcome = isTransientGcRoundError(fin.error_code) ? Rec::Outcome::Aborted : Rec::Outcome::Failed;
+        /// Non-transient first, so a bug that coincides with a restart is never masked; then the
+        /// teardown flag, the only witness of a refused teardown fence (see `Outcome::Stopped`).
+        fin.outcome = !isTransientGcRoundError(fin.error_code) ? Rec::Outcome::Failed
+                    : store->teardownBegun()                    ? Rec::Outcome::Stopped
+                                                                : Rec::Outcome::Aborted;
         fin.error = getCurrentExceptionMessage(false);
         fill_counters(rep);
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -334,6 +338,13 @@ void CasGcScheduler::loop()
             /// correctness issue.
             std::lock_guard round_lock(gc_round_mutex);
 
+            /// A round that starts after the pool's teardown began would emit a Start row and be
+            /// refused at its first lease request -- a row that says nothing. Checked here, under the
+            /// round mutex, so it also covers the tick queued behind a manual round; the extra round
+            /// on a plain `stop` (above) is a different race and stays as described.
+            if (store->teardownBegun())
+                return;
+
             /// runRoundLogged emits the Start + Finish table rows (incl. the per-round
             /// ProfileEvents delta) and rethrows on a round exception (after an Aborted Finish).
             /// on_lease_acquired (onLeaseAcquired, shared with runOneRoundNow) fires the instant the
@@ -378,6 +389,13 @@ void CasGcScheduler::loop()
         }
         catch (...)
         {
+            if (store->teardownBegun() && isTransientGcRoundError(getCurrentExceptionCode()))
+            {
+                /// The disk is being torn down and the round was cut at its next request: expected,
+                /// recorded as `Stopped` by `runRoundLogged`, not an error to raise.
+                LOG_INFO(log, "CA GC round stopped by the disk's teardown: {}", getCurrentExceptionMessage(false));
+                continue;
+            }
             /// Idempotent round - the next tick retries; failures must never kill the pacing thread.
             /// runRoundLogged already emitted the classified (Aborted/Failed) Finish row before rethrowing.
             ///
@@ -434,6 +452,10 @@ void CasGcScheduler::heartbeatLoop()
         }
         catch (...)
         {
+            /// A pulse refused by the open plane during teardown is the expected end of this loop,
+            /// not a failure to report; `stop` joins it moments later.
+            if (store->teardownBegun())
+                return;
             tryLogCurrentException(log, "CA GC heartbeat pulse failed (advisory; will retry)");
         }
     }

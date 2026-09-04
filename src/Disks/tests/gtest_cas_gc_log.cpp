@@ -9,6 +9,7 @@
 #include <Common/Exception.h>
 
 #include <condition_variable>
+#include <functional>
 #include <thread>
 #include <string>
 #include <vector>
@@ -28,6 +29,7 @@
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CORRUPTED_DATA;
     extern const int NETWORK_ERROR;
 }
 
@@ -737,4 +739,87 @@ TEST(CASGCHealth, ReflectsLeadershipAndPendingReclaim)
               static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted));
     EXPECT_EQ(h1.wedged_namespace_count, 0u);
     EXPECT_LT(h1.last_success_age_seconds, 60u);
+}
+
+namespace
+{
+
+/// A backend that arms the pool's teardown the moment a chosen key has been read -- after the read
+/// returned, before the round can act on it -- so the arm lands mid-round at a known point.
+class ArmAfterReadBackend : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::read;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        auto result = InMemoryBackend::read(key, access);
+        if (key == arm_key && on_read)
+            on_read();
+        return result;
+    }
+
+    String arm_key;
+    std::function<void()> on_read;
+};
+
+}
+
+/// `Stopped` is a transient failure observed after the pool's teardown began -- a correlation the row
+/// records honestly. The arm lands right after the lease read; the round's next request is refused by
+/// the open plane's fence, which the engine reports like any lost fence (a transient code).
+TEST(CASGCLog, TransientFailureAfterTeardownBeganIsStopped)
+{
+    auto backend = std::make_shared<ArmAfterReadBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    store->setCasRetrySleepForTest([](uint64_t) {});
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    backend->arm_key = store->layout().gcStateKey();
+    backend->on_read = [&store] { store->beginTeardown(); };
+    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+
+    const std::vector<Rec> round_rows = roundRowsOnly(rows);
+    ASSERT_EQ(round_rows.size(), 2u);
+    EXPECT_EQ(round_rows[1].event_type, Rec::EventType::Finish);
+    EXPECT_EQ(round_rows[1].outcome, Rec::Outcome::Stopped)
+        << "a transient refusal after the arm is the teardown cutting the round short, not an incident";
+    EXPECT_EQ(round_rows[1].error_code, DB::ErrorCodes::NETWORK_ERROR);
+    EXPECT_FALSE(round_rows[1].error.empty());
+}
+
+/// The rule is fail-closed: a non-transient failure that coincides with the arm stays `Failed`. An
+/// undecodable `gc/state` throws `CORRUPTED_DATA` out of the lease phase after the very read that arms.
+TEST(CASGCLog, NonTransientFailureCoincidingWithTeardownStaysFailed)
+{
+    auto backend = std::make_shared<ArmAfterReadBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    store->setCasRetrySleepForTest([](uint64_t) {});
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    {
+        /// `gc/state` does not exist until a round writes it, so the undecodable value is planted,
+        /// not substituted: the lease phase's own decode is what must fail.
+        DB::Cas::tests::OperationForTest raw_op(*backend);
+        const auto current = (*raw_op).read(store->layout().gcStateKey(), Retry::once());
+        const WriteResult planted = current
+            ? (*raw_op).replace(store->layout().gcStateKey(), "not a gc state", current->etag, Retry::once())
+            : (*raw_op).create(store->layout().gcStateKey(), "not a gc state", Retry::once());
+        ASSERT_TRUE(std::holds_alternative<Committed>(planted));
+    }
+    backend->arm_key = store->layout().gcStateKey();
+    backend->on_read = [&store] { store->beginTeardown(); };
+    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+
+    const std::vector<Rec> round_rows = roundRowsOnly(rows);
+    ASSERT_EQ(round_rows.size(), 2u);
+    EXPECT_EQ(round_rows[1].outcome, Rec::Outcome::Failed)
+        << "a bug that coincides with a restart is not masked as Stopped";
+    EXPECT_EQ(round_rows[1].error_code, DB::ErrorCodes::CORRUPTED_DATA);
 }
