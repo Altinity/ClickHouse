@@ -1157,3 +1157,58 @@ def test_offer_without_pool_cookie_resolves_to_single_advertised_pool():
         drop_everywhere(two_pools)
     finally:
         node1.query("SYSTEM DISABLE FAILPOINT cas_relink_sender_omit_pool_cookie")
+
+
+def test_relink_wins_over_ttl_then_mover_converges():
+    """A `TTL ... TO DISK` rule that names the LOCAL disk for this (already expired) part does not stop the
+    relink: the part lands on the pool's disk at zero byte cost, and the background mover — which sees a
+    part that is not in its TTL destination — carries it to `default` afterwards. Moves are stopped on
+    node2 around the fetch so the intermediate placement is observable, exactly as `test_ttl_move` does.
+
+    `IF EXISTS` precedes the disk name in the grammar. It is there for node1, whose policy has no
+    `default` disk: without it every reservation on node1 would log a warning about the missing disk.
+    """
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+    table = "tiered_ttl"
+    drop_everywhere(table)
+    create_sql = (
+        "CREATE TABLE " + table + " (id Int64, v UInt64, s String, ts DateTime) "
+        "ENGINE = ReplicatedMergeTree('/clickhouse/tables/" + table + "', '{{replica}}') ORDER BY id "
+        "TTL ts TO DISK IF EXISTS 'default' "
+        "SETTINGS storage_policy = '{policy}'"
+    )
+    node1.query(create_sql.format(policy=STORAGE_POLICY))
+    node2.query(create_sql.format(policy=TIERED_STORAGE_POLICY))
+
+    node2.query("SYSTEM STOP MOVES {}".format(table))
+    node2.query("SYSTEM STOP FETCHES {}".format(table))
+    try:
+        node1.query(
+            "INSERT INTO {table} SELECT number, number * 10, toString(number), now() - INTERVAL 1 DAY "
+            "FROM numbers({rows})".format(table=table, rows=NUM_ROWS)
+        )
+        part = active_part_names(node1, table)[0]
+        assert part_disk(node1, table, part) == CA_DISK  # the sender holds it in the pool
+
+        node2.query("SYSTEM START FETCHES {}".format(table))
+        node2.query("SYSTEM SYNC REPLICA {}".format(table), timeout=90)
+
+        # The TTL rule says `default`; the relink put it on the pool's disk anyway, and moves are stopped.
+        assert_relinked(node2, table, part)
+        assert part_disk(node2, table, part) == CA_DISK
+        rows_before = node2.query("SELECT count(), sum(v) FROM {}".format(table))
+
+        node2.query("SYSTEM START MOVES {}".format(table))
+        wait_until(
+            lambda: part_disk(node2, table, part) == LOCAL_DISK,
+            timeout=120,
+            what="the background mover carrying {} to {}".format(part, LOCAL_DISK),
+        )
+        assert node2.query("SELECT count(), sum(v) FROM {}".format(table)) == rows_before
+        assert node2.query("SELECT count(), sum(v) FROM {}".format(table)) == node1.query(
+            "SELECT count(), sum(v) FROM {}".format(table)
+        )
+    finally:
+        node2.query("SYSTEM START MOVES {}".format(table))
+    drop_everywhere(table)
