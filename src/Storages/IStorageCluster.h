@@ -63,13 +63,19 @@ public:
     const String & getOriginalClusterName() const { return cluster_name; }
     virtual String getClusterName(ContextPtr /* context */) const { return getOriginalClusterName(); }
 
+    /// Old interpreter: rewrite JOIN / IN to GLOBAL JOIN / GLOBAL IN so GlobalSubqueriesVisitor can broadcast right tables.
+    static void rewriteASTForGlobalJoin(ASTPtr & query);
+
 protected:
     virtual void updateQueryToSendIfNeeded(
         ASTPtr & /*query*/,
         const StorageSnapshotPtr & /*storage_snapshot*/,
         const ContextPtr & /*context*/,
         bool /*make_cluster_function*/) {}
-    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
+    void updateQueryWithJoinToSendIfNeeded(
+        ASTPtr & query_to_send,
+        SelectQueryInfo query_info,
+        const ContextPtr & context);
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
 
@@ -127,6 +133,14 @@ private:
     };
 
     static QueryTreeInfo getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context);
+    static QueryTreeInfo getQueryJoinInfoFromAST(const ASTPtr & query);
+    static QueryTreeInfo getQueryJoinInfo(const SelectQueryInfo & query_info, const ContextPtr & context);
+    static bool needsInitiatorLocalJoin(const QueryTreeInfo & info);
+    static void rewriteQueryForInitiatorLocalJoin(
+        ASTPtr & query_to_send,
+        const SelectQueryInfo & query_info,
+        const QueryTreeInfo & info,
+        const ContextPtr & context);
 };
 
 

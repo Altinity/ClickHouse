@@ -30,14 +30,20 @@
 #include <TableFunctions/TableFunctionRemote.h>
 #include <Poco/URI.h>
 #include <Storages/extractTableFunctionFromSelectQuery.h>
-#include <Planner/Utils.h>
-#include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/ColumnNode.h>
-#include <Analyzer/ConstantNode.h>
-#include <Analyzer/JoinNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/Utils.h>
+#include <Interpreters/TreeRewriter.h>
+#include <Core/Joins.h>
+#include <Parsers/ASTExpressionList.h>
+#include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
 
 #include <Common/ProfileEvents.h>
 
@@ -113,49 +119,6 @@ namespace
 {
 
 /*
-Helping class to find in query tree first node of required type
-*/
-class SearcherVisitor : public InDepthQueryTreeVisitorWithContext<SearcherVisitor>
-{
-public:
-    using Base = InDepthQueryTreeVisitorWithContext<SearcherVisitor>;
-    using Base::Base;
-
-    explicit SearcherVisitor(std::unordered_set<QueryTreeNodeType> types_, size_t entry_, ContextPtr context)
-        : Base(context)
-        , types(types_)
-        , entry(entry_) {}
-
-    bool needChildVisit(QueryTreeNodePtr & /*parent*/, QueryTreeNodePtr & /*child*/)
-    {
-        return getSubqueryDepth() <= 2 && !passed_node && !current_entry;
-    }
-
-    void enterImpl(QueryTreeNodePtr & node)
-    {
-        if (passed_node)
-            return;
-
-        auto node_type = node->getNodeType();
-
-        if (types.contains(node_type))
-        {
-            ++current_entry;
-            if (current_entry == entry)
-                passed_node = node;
-        }
-    }
-
-    QueryTreeNodePtr getNode() const { return passed_node; }
-
-private:
-    std::unordered_set<QueryTreeNodeType> types;
-    size_t entry;
-    size_t current_entry = 0;
-    QueryTreeNodePtr passed_node;
-};
-
-/*
 Helping class to find all used columns with specific source
 */
 class CollectUsedColumnsForSourceVisitor : public InDepthQueryTreeVisitorWithContext<CollectUsedColumnsForSourceVisitor>
@@ -205,7 +168,117 @@ private:
     bool collect_columns_from_other_sources;
 };
 
-};
+bool astContainsSubquery(const ASTPtr & node)
+{
+    if (!node)
+        return false;
+
+    if (node->as<ASTSelectQuery>() || node->as<ASTSelectWithUnionQuery>() || node->as<ASTSubquery>())
+        return true;
+
+    for (const auto & child : node->children)
+    {
+        if (astContainsSubquery(child))
+            return true;
+    }
+
+    return false;
+}
+
+bool astContainsInTableIdentifier(const ASTPtr & node)
+{
+    if (!node)
+        return false;
+
+    if (const auto * function = node->as<ASTFunction>())
+    {
+        if (isNameOfInFunction(function->name) && function->arguments && function->arguments->children.size() >= 2)
+        {
+            const auto & rhs = function->arguments->children[1];
+            /// GLOBAL IN is rewritten to an external table (`_subqueryN`) as `ASTTableIdentifier`.
+            /// `as<ASTIdentifier>` is an exact typeid match and does not see that subclass.
+            if (rhs && (rhs->as<ASTIdentifier>() || rhs->as<ASTTableIdentifier>()))
+                return true;
+        }
+    }
+
+    for (const auto & child : node->children)
+    {
+        if (astContainsInTableIdentifier(child))
+            return true;
+    }
+
+    return false;
+}
+
+bool astIsNestedSelect(const ASTPtr & node)
+{
+    return node && (node->as<ASTSelectQuery>() || node->as<ASTSelectWithUnionQuery>() || node->as<ASTSubquery>());
+}
+
+void rewriteASTInFunctionsToGlobalIn(ASTPtr & node)
+{
+    if (!node)
+        return;
+
+    if (auto * function = node->as<ASTFunction>())
+    {
+        if (isNameOfLocalInFunction(function->name) && function->arguments && function->arguments->children.size() >= 2)
+        {
+            const auto & rhs = function->arguments->children[1];
+            if (rhs
+                && (rhs->as<ASTSubquery>() || rhs->as<ASTSelectQuery>() || rhs->as<ASTSelectWithUnionQuery>()
+                    || rhs->as<ASTIdentifier>() || rhs->as<ASTTableIdentifier>()))
+            {
+                function->name = getGlobalInFunctionNameForLocalInFunctionName(function->name);
+            }
+        }
+    }
+
+    for (auto & child : node->children)
+    {
+        if (astIsNestedSelect(child))
+            continue;
+        rewriteASTInFunctionsToGlobalIn(child);
+    }
+}
+
+void rewriteASTJoinsToGlobal(ASTPtr & query)
+{
+    ASTSelectQuery * select_query = query->as<ASTSelectQuery>();
+    if (!select_query)
+    {
+        if (auto * union_query = query->as<ASTSelectWithUnionQuery>())
+        {
+            if (union_query->list_of_selects)
+            {
+                for (auto & child : union_query->list_of_selects->children)
+                    rewriteASTJoinsToGlobal(child);
+            }
+        }
+        return;
+    }
+
+    if (auto tables = select_query->tables())
+    {
+        auto & tables_in_select_query = tables->as<ASTTablesInSelectQuery &>();
+        for (auto & child : tables_in_select_query.children)
+        {
+            auto & tables_element = child->as<ASTTablesInSelectQueryElement &>();
+            if (tables_element.table_join)
+                tables_element.table_join->as<ASTTableJoin &>().locality = JoinLocality::Global;
+        }
+    }
+
+    rewriteASTInFunctionsToGlobalIn(query);
+}
+
+}
+
+void IStorageCluster::rewriteASTForGlobalJoin(ASTPtr & query)
+{
+    rewriteASTJoinsToGlobal(query);
+}
 
 /*
 Try to make subquery to send on nodes
@@ -218,7 +291,7 @@ Converts
     localtable as t
   ON s3.key == t.key
 
-to (object_storage_cluster_join_mode='local')
+to (object_storage_cluster_join_mode='allow' or 'local')
 
   SELECT s3.c1, s3.c2, s3.key
   FROM
@@ -241,94 +314,24 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
     switch (object_storage_cluster_join_mode)
     {
-    case ObjectStorageClusterJoinMode::LOCAL:
+    case ObjectStorageClusterJoinMode::LOCAL: /// Legacy alias of `allow`
+    case ObjectStorageClusterJoinMode::ALLOW:
     {
-        if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true");
+        auto info = getQueryJoinInfo(query_info, context);
+        if (!needsInitiatorLocalJoin(info))
+            return;
 
-        auto info = getQueryTreeInfo(query_info.query_tree, context);
-
-        if (info.has_join || info.has_cross_join || info.has_local_columns_in_where)
-        {
-            auto modified_query_tree = query_info.query_tree->clone();
-
-            SearcherVisitor left_table_expression_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, 1, context);
-            left_table_expression_searcher.visit(modified_query_tree);
-            auto table_function_node = left_table_expression_searcher.getNode();
-            if (!table_function_node)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find left table function node");
-
-            QueryTreeNodePtr query_tree_distributed;
-
-            auto & query_node = modified_query_tree->as<QueryNode &>();
-
-            if (info.has_join)
-            {
-                auto join_node = query_node.getJoinTree();
-                query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
-            }
-            else if (info.has_cross_join)
-            {
-                SearcherVisitor join_searcher({QueryTreeNodeType::CROSS_JOIN}, 1, context);
-                join_searcher.visit(modified_query_tree);
-                auto cross_join_node = join_searcher.getNode();
-                if (!cross_join_node)
-                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find CROSS JOIN node");
-                // CrossJoinNode contains vector of nodes. 0 is left expression, always exists.
-                query_tree_distributed = cross_join_node->as<CrossJoinNode>()->getTableExpressions()[0]->clone();
-            }
-
-            // Find add used columns from table function to make proper projection list
-            // Need to do before changing WHERE condition
-            CollectUsedColumnsForSourceVisitor collector(table_function_node, context);
-            collector.visit(modified_query_tree);
-            const auto & columns = collector.getColumns();
-
-            if (columns.empty())
-            {
-                auto column_nodes_to_select = std::make_shared<ListNode>();
-                column_nodes_to_select->getNodes().reserve(1);
-                column_nodes_to_select->getNodes().emplace_back(std::make_shared<ConstantNode>(1));
-                query_node.getProjectionNode() = column_nodes_to_select;
-            }
-            else
-            {
-                query_node.resolveProjectionColumns(columns);
-                auto column_nodes_to_select = std::make_shared<ListNode>();
-                column_nodes_to_select->getNodes().reserve(columns.size());
-                for (auto & column : columns)
-                    column_nodes_to_select->getNodes().emplace_back(std::make_shared<ColumnNode>(column, table_function_node));
-                query_node.getProjectionNode() = column_nodes_to_select;
-            }
-
-            if (info.has_local_columns_in_where)
-            {
-                if (query_node.getPrewhere())
-                    removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), table_function_node, context);
-                if (query_node.getWhere())
-                    removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), table_function_node, context);
-            }
-
-            query_node.getOrderByNode() = std::make_shared<ListNode>();
-            query_node.getGroupByNode() = std::make_shared<ListNode>();
-
-            if (query_tree_distributed)
-            {
-                // Left only table function to send on cluster nodes
-                modified_query_tree = modified_query_tree->cloneAndReplace(query_node.getJoinTree(), query_tree_distributed);
-            }
-
-            query_to_send = queryNodeToDistributedSelectQuery(modified_query_tree);
-        }
-
+        rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
         return;
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
     {
+        if (!query_info.query_tree)
+            return;
+
         auto info = getQueryTreeInfo(query_info.query_tree, context);
 
-        if (info.has_join || info.has_cross_join || info.has_local_columns_in_where)
+        if (needsInitiatorLocalJoin(info))
         {
             auto modified_query_tree = query_info.query_tree->clone();
 
@@ -347,8 +350,6 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
 
         return;
     }
-    case ObjectStorageClusterJoinMode::ALLOW: // Do nothing special
-        return;
     }
 }
 
@@ -462,9 +463,11 @@ void IStorageCluster::read(
 
     auto this_ptr = std::static_pointer_cast<IStorageCluster>(shared_from_this());
 
-    std::optional<Tables> external_tables = std::nullopt;
+    std::optional<Tables> external_tables;
     if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
         external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
+    if (!external_tables || external_tables->empty())
+        external_tables = context->getExternalTables();
 
     auto reading = std::make_unique<ReadFromCluster>(
         column_names,
@@ -657,23 +660,22 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
     QueryTreeInfo info;
 
     auto & query_node = query_tree->as<QueryNode &>();
-    if (auto join_node = query_node.getJoinTree())
-    {
-        if (join_node->getNodeType() == QueryTreeNodeType::JOIN)
-            info.has_join = true;
-        else if (join_node->getNodeType() == QueryTreeNodeType::CROSS_JOIN)
-            info.has_cross_join = true;
-    }
+    auto join_tree = query_node.getJoinTree();
+    if (!join_tree)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
 
-    SearcherVisitor left_table_expression_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, 1, context);
-    left_table_expression_searcher.visit(query_tree);
-    auto table_function_node = left_table_expression_searcher.getNode();
-    if (!table_function_node)
+    if (join_tree->getNodeType() == QueryTreeNodeType::JOIN)
+        info.has_join = true;
+    else if (join_tree->getNodeType() == QueryTreeNodeType::CROSS_JOIN)
+        info.has_cross_join = true;
+
+    auto left_table_expression = extractLeftTableExpression(join_tree);
+    if (!left_table_expression)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
 
     if (query_node.hasWhere() || query_node.hasPrewhere())
     {
-        CollectUsedColumnsForSourceVisitor collector_where(table_function_node, context, true);
+        CollectUsedColumnsForSourceVisitor collector_where(left_table_expression, context, true);
         if (query_node.hasPrewhere())
             collector_where.visit(query_node.getPrewhere());
         if (query_node.hasWhere())
@@ -689,23 +691,164 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
     return info;
 }
 
+bool IStorageCluster::needsInitiatorLocalJoin(const QueryTreeInfo & info)
+{
+    return info.has_join || info.has_cross_join || info.has_local_columns_in_where;
+}
+
+IStorageCluster::QueryTreeInfo IStorageCluster::getQueryJoinInfoFromAST(const ASTPtr & query)
+{
+    QueryTreeInfo info;
+    if (!query)
+        return info;
+
+    const ASTSelectQuery * select_query = query->as<ASTSelectQuery>();
+    if (!select_query)
+    {
+        if (const auto * union_query = query->as<ASTSelectWithUnionQuery>())
+        {
+            if (union_query->list_of_selects && union_query->list_of_selects->children.size() == 1)
+                select_query = union_query->list_of_selects->children[0]->as<ASTSelectQuery>();
+        }
+    }
+    if (!select_query)
+        return info;
+
+    if (select_query->hasJoin())
+        info.has_join = true;
+
+    if (astContainsSubquery(select_query->where()) || astContainsSubquery(select_query->prewhere())
+        || astContainsInTableIdentifier(select_query->where()) || astContainsInTableIdentifier(select_query->prewhere()))
+        info.has_local_columns_in_where = true;
+
+    return info;
+}
+
+IStorageCluster::QueryTreeInfo IStorageCluster::getQueryJoinInfo(const SelectQueryInfo & query_info, const ContextPtr & context)
+{
+    if (query_info.query_tree && query_info.query_tree->as<QueryNode>())
+        return getQueryTreeInfo(query_info.query_tree, context);
+
+    return getQueryJoinInfoFromAST(query_info.query);
+}
+
+void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
+    ASTPtr & query_to_send,
+    const SelectQueryInfo & query_info,
+    const QueryTreeInfo & info,
+    const ContextPtr & context)
+{
+    /// Analyzer path: reuse extractLeftTableExpression + buildQueryToReadColumnsFromTableExpression
+    /// (same helpers the planner uses when wrapping IStorageCluster in a subquery).
+    if (query_info.query_tree)
+    {
+        auto modified_query_tree = query_info.query_tree->clone();
+        auto & query_node = modified_query_tree->as<QueryNode &>();
+        auto join_tree = query_node.getJoinTree();
+        if (!join_tree)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
+
+        auto left_table_expression = extractLeftTableExpression(join_tree);
+        if (!left_table_expression)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
+
+        CollectUsedColumnsForSourceVisitor collector(left_table_expression, context);
+        collector.visit(modified_query_tree);
+
+        if (query_node.getPrewhere())
+            removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), left_table_expression, context);
+        if (query_node.getWhere())
+            removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), left_table_expression, context);
+
+        auto rewritten_query_tree = buildQueryToReadColumnsFromTableExpression(
+            collector.getColumns(), left_table_expression, context);
+        auto & rewritten_query_node = rewritten_query_tree->as<QueryNode &>();
+        rewritten_query_node.getPrewhere() = query_node.getPrewhere();
+        rewritten_query_node.getWhere() = query_node.getWhere();
+
+        query_to_send = queryNodeToDistributedSelectQuery(rewritten_query_tree);
+        return;
+    }
+
+    /// Old interpreter: reuse removeJoin used by StorageDistributed / StorageMerge / StorageWindowView.
+    if (!query_to_send)
+        return;
+
+    query_to_send = query_to_send->clone();
+    if (auto * union_query = query_to_send->as<ASTSelectWithUnionQuery>())
+    {
+        if (union_query->list_of_selects && union_query->list_of_selects->children.size() == 1)
+            query_to_send = union_query->list_of_selects->children[0]->clone();
+    }
+
+    auto * select_query = query_to_send->as<ASTSelectQuery>();
+    if (!select_query)
+        return;
+
+    if (select_query->hasJoin())
+    {
+        if (!query_info.syntax_analyzer_result)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Query is not analyzed: no syntax analyzer result");
+
+        TreeRewriterResult rewriter_result = *query_info.syntax_analyzer_result;
+        if (!removeJoin(*select_query, rewriter_result, context))
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to strip JOIN from query sent to cluster nodes");
+
+        /// `removeJoin` keeps left-table WHERE, including `GLOBAL IN (_subqueryN)`, which remotes cannot resolve.
+        if (astContainsInTableIdentifier(select_query->where()) || astContainsInTableIdentifier(select_query->prewhere())
+            || astContainsSubquery(select_query->where()) || astContainsSubquery(select_query->prewhere()))
+        {
+            select_query->setExpression(ASTSelectQuery::Expression::PREWHERE, {});
+            select_query->setExpression(ASTSelectQuery::Expression::WHERE, {});
+        }
+    }
+    else if (info.has_local_columns_in_where)
+    {
+        if (!query_info.syntax_analyzer_result)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Query is not analyzed: no syntax analyzer result");
+
+        auto select_expression_list = make_intrusive<ASTExpressionList>();
+        const auto & required_columns = query_info.syntax_analyzer_result->required_source_columns;
+        if (required_columns.empty())
+        {
+            select_expression_list->children.push_back(make_intrusive<ASTLiteral>(Field{static_cast<UInt64>(1)}));
+        }
+        else
+        {
+            select_expression_list->children.reserve(required_columns.size());
+            for (const auto & column : required_columns)
+                select_expression_list->children.push_back(make_intrusive<ASTIdentifier>(column.name));
+        }
+        select_query->setExpression(ASTSelectQuery::Expression::SELECT, std::move(select_expression_list));
+        select_query->setExpression(ASTSelectQuery::Expression::PREWHERE, {});
+        select_query->setExpression(ASTSelectQuery::Expression::WHERE, {});
+        select_query->setExpression(ASTSelectQuery::Expression::GROUP_BY, {});
+        select_query->group_by_all = false;
+        select_query->setExpression(ASTSelectQuery::Expression::HAVING, {});
+        select_query->setExpression(ASTSelectQuery::Expression::ORDER_BY, {});
+        select_query->order_by_all = false;
+    }
+
+    /// FetchColumns on remotes must not apply initiator-only LIMIT / WINDOW / QUALIFY.
+    select_query->setExpression(ASTSelectQuery::Expression::WINDOW, {});
+    select_query->setExpression(ASTSelectQuery::Expression::QUALIFY, {});
+    select_query->setExpression(ASTSelectQuery::Expression::LIMIT_BY_OFFSET, {});
+    select_query->setExpression(ASTSelectQuery::Expression::LIMIT_BY_LENGTH, {});
+    select_query->setExpression(ASTSelectQuery::Expression::LIMIT_BY, {});
+    select_query->setExpression(ASTSelectQuery::Expression::LIMIT_OFFSET, {});
+    select_query->setExpression(ASTSelectQuery::Expression::LIMIT_LENGTH, {});
+    select_query->setExpression(ASTSelectQuery::Expression::INTERPOLATE, {});
+}
+
 QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & query_info) const
 {
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
 
-    if (object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::ALLOW)
+    if (object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
+        && needsInitiatorLocalJoin(getQueryJoinInfo(query_info, context)))
     {
-        if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true");
-
-        if (object_storage_cluster_join_mode == ObjectStorageClusterJoinMode::LOCAL)
-        {
-            auto info = getQueryTreeInfo(query_info.query_tree, context);
-            if (info.has_join || info.has_cross_join || info.has_local_columns_in_where)
-                return QueryProcessingStage::Enum::FetchColumns;
-        }
+        return QueryProcessingStage::Enum::FetchColumns;
     }
 
     /// Initiator executes query on remote node.
