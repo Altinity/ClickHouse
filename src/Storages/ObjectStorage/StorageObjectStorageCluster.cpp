@@ -777,6 +777,15 @@ void StorageObjectStorageCluster::drop()
     IStorageCluster::drop();
 }
 
+/// `drop` forwards to `pure_storage`, so the capture `drop` reads has to land on the same object.
+/// Without this the query-level `data_lake_delete_data_on_drop` never reaches the storage and the
+/// data of a dropped table is kept.
+void StorageObjectStorageCluster::prepareForDrop(ContextPtr query_context)
+{
+    if (pure_storage)
+        pure_storage->prepareForDrop(query_context);
+}
+
 void StorageObjectStorageCluster::dropInnerTableIfAny(bool sync, ContextPtr context)
 {
     if (getClusterName(context).empty())

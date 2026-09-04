@@ -520,6 +520,12 @@ It is currently only implemented in StorageObjectStorage.
       */
     virtual void drop() {}
 
+    /** Called by `DROP TABLE` while the query is still running. `drop` itself can run much later in a
+      * background thread, where only the global context is available, so a storage that needs
+      * query-level settings while dropping (for example `data_lake_delete_data_on_drop`) captures them here.
+      */
+    virtual void prepareForDrop(ContextPtr /* query_context */) {}
+
     virtual void dropInnerTableIfAny(bool /* sync */, ContextPtr /* context */) {}
 
     /// Return true if the storage supports TRUNCATE operation.

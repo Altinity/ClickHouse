@@ -121,6 +121,7 @@ extern const int NOT_IMPLEMENTED;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
 extern const int S3_ERROR;
 extern const int TABLE_ALREADY_EXISTS;
+extern const int FILE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
 extern const int METADATA_MISMATCH;
 extern const int UNFINISHED;
@@ -145,7 +146,6 @@ extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
-extern const SettingsBool iceberg_delete_data_on_drop;
 }
 
 static constexpr size_t MAX_TRANSACTION_RETRIES = 100;
@@ -879,6 +879,11 @@ void IcebergMetadata::createInitial(
     if (!configuration_ptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to create Iceberg table, but storage configuration is expired");
 
+    String namespace_name;
+    String table_name;
+    if (catalog)
+        std::tie(namespace_name, table_name) = DataLake::parseTableName(table_id_.getTableName());
+
     std::vector<String> metadata_files;
     try
     {
@@ -890,11 +895,22 @@ void IcebergMetadata::createInitial(
     }
     if (!metadata_files.empty())
     {
-        if (if_not_exists)
-            return;
-        else
+        /// Without a catalog `IF NOT EXISTS` attaches to the metadata already there. With a catalog
+        /// nothing gets registered, so success would report an invisible table; the thrown
+        /// `TableAlreadyExistsInCatalogException` becomes the `IF NOT EXISTS` no-op instead.
+        if (!catalog)
+        {
+            if (if_not_exists)
+                return;
             throw Exception(
                 ErrorCodes::TABLE_ALREADY_EXISTS, "Iceberg table with path {} already exists", configuration_ptr->getPathForRead().path);
+        }
+        throw DataLake::TableAlreadyExistsInCatalogException(
+            "The catalog has no table {}.{} registered, but Iceberg metadata files are already present at {}, "
+            "so creating the table there would clash with them. This is usually left behind by a previous "
+            "`DROP TABLE` without `data_lake_delete_data_on_drop`, which keeps the data and metadata in "
+            "place: remove the leftover files, or create the table at a different location",
+            namespace_name, table_name, configuration_ptr->getPathForRead().path);
     }
 
     String location_path = configuration_ptr->getRawPath().path;
@@ -912,7 +928,31 @@ void IcebergMetadata::createInitial(
     if (!compression_suffix.empty())
         compression_suffix = "." + compression_suffix;
 
-    auto filename = fmt::format("{}metadata/v1{}.metadata.json", configuration_ptr->getRawPath().path, compression_suffix);
+    auto table_uuid = metadata_content_object->getValue<String>(Iceberg::f_table_uuid);
+    auto metadata_file_name = (catalog && catalog->isTransactional())
+        ? fmt::format("v1-{}{}.metadata.json", table_uuid, compression_suffix)
+        : fmt::format("v1{}.metadata.json", compression_suffix);
+    auto filename = fmt::format("{}metadata/{}", configuration_ptr->getRawPath().path, metadata_file_name);
+
+    if (catalog)
+    {
+        String namespace_location = location_path;
+        while (namespace_location.ends_with('/'))
+            namespace_location.pop_back();
+
+        String namespace_path = namespace_name;
+        std::replace(namespace_path.begin(), namespace_path.end(), '.', '/');
+        if (namespace_location.ends_with("/" + namespace_path + "/" + table_name))
+            namespace_location.resize(namespace_location.size() - table_name.size() - 1);
+        else
+            namespace_location.clear();
+
+        /// Register the namespace before any file is written (but after all local validation, so a
+        /// rejected `CREATE` leaves no trace in the catalog): a catalog that shares its storage view
+        /// with the data (e.g. SeaweedFS) refuses to create a namespace over the plain directory
+        /// those files would leave behind.
+        catalog->createNamespaceIfNotExists(namespace_name, namespace_location);
+    }
 
     try
     {
@@ -920,27 +960,76 @@ void IcebergMetadata::createInitial(
     }
     catch (const Exception & e)
     {
-        /// The write uses `If-None-Match: *`, so S3 returns PreconditionFailed when the metadata file
-        /// already exists (e.g. leftover data after `DROP TABLE` with `iceberg_delete_data_on_drop` off,
-        /// or a concurrent creation). When `IF NOT EXISTS` was specified, this is expected.
-        if (if_not_exists && e.code() == ErrorCodes::S3_ERROR
-            && e.message().find("PreconditionFailed") != String::npos)
-            return;
+        /// The write uses `If-None-Match: *`, so S3 answers `PreconditionFailed` when the metadata
+        /// file is already there: leftovers from an earlier drop, or a concurrent creation.
+        const bool precondition_failed
+            = (e.code() == ErrorCodes::S3_ERROR && e.message().contains("PreconditionFailed"))
+            || e.code() == ErrorCodes::FILE_ALREADY_EXISTS;
+        if (if_not_exists && precondition_failed)
+        {
+            /// As in the `metadata_files` probe above: with a catalog nothing was registered.
+            if (!catalog)
+                return;
+            throw DataLake::TableAlreadyExistsInCatalogException(
+                "The catalog has no table {}.{} registered, but Iceberg metadata files are already present at {}, "
+                "so creating the table there would clash with them. This is usually left behind by a previous "
+                "`DROP TABLE` without `data_lake_delete_data_on_drop`, which keeps the data and metadata in "
+                "place: remove the leftover files, or create the table at a different location",
+                namespace_name, table_name, configuration_ptr->getPathForRead().path);
+        }
         throw;
     }
 
-    if (configuration_ptr->getDataLakeSettings()[DataLakeStorageSetting::iceberg_use_version_hint].value)
+    String filename_version_hint;
+    try
     {
-        auto filename_version_hint = configuration_ptr->getRawPath().path + "metadata/version-hint.text";
-        writeMessageToFile("1", filename_version_hint, object_storage, local_context, "*", "");
+        if (configuration_ptr->getDataLakeSettings()[DataLakeStorageSetting::iceberg_use_version_hint].value)
+        {
+            auto version_hint_path = configuration_ptr->getRawPath().path + "metadata/version-hint.text";
+            writeMessageToFile("1", version_hint_path, object_storage, local_context, "*", "");
+            filename_version_hint = version_hint_path;
+        }
+    }
+    catch (...)
+    {
+        /// Nothing is registered in the catalog yet, so removing the files we just wrote loses nothing,
+        /// and a leftover `.metadata.json` would make the next `CREATE` report an existing table. The
+        /// rollback fails closed: a failed removal propagates in place of the original exception, which
+        /// is logged here.
+        tryLogCurrentException(__PRETTY_FUNCTION__, "Removing the files of the Iceberg table that failed to be created");
+        object_storage->removeObjectIfExists(StoredObject(filename));
+        if (!filename_version_hint.empty())
+            object_storage->removeObjectIfExists(StoredObject(filename_version_hint));
+        throw;
     }
 
     if (catalog)
     {
         auto catalog_filename = configuration_ptr->getTypeName() + "://" + configuration_ptr->getNamespace() + "/"
-            + configuration_ptr->getRawPath().path + "metadata/v1.metadata.json";
-        const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id_.getTableName());
-        catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object);
+            + configuration_ptr->getRawPath().path + "metadata/" + metadata_file_name;
+
+        /// The registration sits outside any rollback: a failed `createTable` is ambiguous, because the
+        /// HTTP layer retries connection failures and the request may have succeeded with only its response
+        /// lost. Removing the metadata file would then leave the catalog pointing at an object that is gone,
+        /// with no earlier version to fall back to; an orphaned file is recoverable, so it stays.
+        if (!catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object, compression_method, if_not_exists))
+        {
+            /// Unlike an exception, this answer is definitive: the catalog did not create the table, so the
+            /// files we wrote are ours to remove - a transactional catalog's file name carries our own table
+            /// UUID, and otherwise the `If-None-Match: *` write already proved that we created them.
+            LOG_INFO(
+                getLogger("IcebergMetadata"),
+                "Table {}.{} was registered in the catalog by another client, removing the initial metadata file {} "
+                "written by this `CREATE`",
+                namespace_name,
+                table_name,
+                filename);
+            object_storage->removeObjectIfExists(StoredObject(filename));
+            if (!filename_version_hint.empty())
+                object_storage->removeObjectIfExists(StoredObject(filename_version_hint));
+            throw DataLake::TableAlreadyExistsInCatalogException(
+                "Table {}.{} already exists in the catalog", namespace_name, table_name);
+        }
     }
 }
 
@@ -1537,10 +1626,14 @@ SinkToStoragePtr IcebergMetadata::write(
     }
 }
 
-void IcebergMetadata::drop(ContextPtr context)
+void IcebergMetadata::drop(bool delete_data)
 {
-    if (!context->getSettingsRef()[Setting::iceberg_delete_data_on_drop].value)
+    if (!delete_data)
         return;
+
+    /// The drop runs in the background, when the query context is already gone; `delete_data` was
+    /// resolved from it by `StorageObjectStorage::drop`.
+    auto context = Context::getGlobalContextInstance();
 
     /// Files outside `table_path` (secondary storage, or base storage elsewhere in the bucket) are only
     /// discoverable through the metadata graph the base wipe below removes, so enumerate them first. Let

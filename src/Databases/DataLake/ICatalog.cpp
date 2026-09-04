@@ -81,6 +81,25 @@ StorageType parseStorageTypeFromString(const std::string & type)
     return *storage_type;
 }
 
+std::string storageTypeToScheme(StorageType type)
+{
+    switch (type)
+    {
+        case StorageType::S3:
+            return "s3";
+        case StorageType::Azure:
+            return "abfss";
+        case StorageType::Local:
+            return "file";
+        case StorageType::HDFS:
+            return "hdfs";
+        case StorageType::Other:
+            throw DB::Exception(
+                DB::ErrorCodes::BAD_ARGUMENTS,
+                "Cannot determine URI scheme for storage type 'Other'");
+    }
+}
+
 void TableMetadata::setLocation(const std::string & location_)
 {
     if (!with_location)
@@ -335,9 +354,17 @@ DB::SettingsChanges CatalogSettings::allChanged() const
     return changes;
 }
 
-void ICatalog::createTable(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*metadata_content*/) const
+bool ICatalog::createTable(
+    const String & /*namespace_name*/,
+    const String & /*table_name*/,
+    const String & /*new_metadata_path*/,
+    Poco::JSON::Object::Ptr /*metadata_content*/,
+    DB::CompressionMethod /*metadata_compression_method*/,
+    bool /*if_not_exists*/) const
 {
-    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createTable is not implemented");
+    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
+        "CREATE TABLE is not supported for this DataLakeCatalog catalog type; "
+        "it is available only for Iceberg REST (including OneLake, BigLake, Delta Sharing) and Glue catalogs");
 }
 
 bool ICatalog::updateMetadata(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*new_snapshot*/) const
@@ -357,9 +384,16 @@ bool ICatalog::updateSchema(
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateSchema is not implemented");
 }
 
-void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/) const
+void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/) const
 {
-    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "dropTable is not implemented");
+    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createNamespaceIfNotExists is not implemented");
+}
+
+void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/, bool /*purge*/, bool /*if_exists*/) const
+{
+    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
+        "DROP TABLE is not supported for this DataLakeCatalog catalog type; "
+        "it is available only for Iceberg REST (including OneLake, BigLake, Delta Sharing) and Glue catalogs");
 }
 
 }
