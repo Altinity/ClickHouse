@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 14. Brainstormed 2026-09-04 against the measurements in
+Revision 15. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
 supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
@@ -105,6 +105,13 @@ Revision history, kept because each step removed something a review proved unsou
   the verb's own envelope count, not always two; the moment a ticket enters its hold is a local
   fact that decides whether its ending touches the memory; and the deadline and conflict tests
   are stated so they can run.
+- Revision 15 corrects the lock-order section with an audit instead of a claim: the mount
+  plane's interruptible sleep takes `CasMountRuntime::driver_mutex`, and the mount fence's
+  `admit` calls the clock function, so a ticket is logically held across both; every holder of
+  that mutex was read, and none reaches the ledger, the catalog key or a mount-plane write. Also:
+  deterministic argument validation runs before the ticket is taken, the stalled-holder
+  acceptance covers any non-returning holder code, the cache-fill test names its seam, the FIFO
+  test stages its threads, and the holder timestamp is an `optional`.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -210,7 +217,7 @@ private:
     struct Lane    /// one hot key; created on first use, lives as long as this object
     {
         std::deque<uint64_t> tickets;                /// guarded by `mutex`; the front ticket is the holder
-        uint64_t holder_since_ms = 0;                /// guarded by `mutex`; when the front ticket became the holder, for the log line
+        std::optional<uint64_t> holder_since_ms;     /// guarded by `mutex`; when the front ticket entered its hold, for the log line; absent until then
         std::optional<uint64_t> last_write_attempt_end_ms;   /// guarded by `mutex`; for the Generation dialect's spacing; absent before the first attempt
         std::condition_variable cv;
         std::optional<Object> remembered;            /// guarded by `mutex`; the last candidate this plane committed
@@ -227,7 +234,7 @@ until its own guard runs, so "my ticket is the front" is the whole exclusion, an
 ticket's own caller ever removes it. Whether the front ticket has actually entered its hold (run
 its checks and started the verb's body) is a fact its caller keeps in a local, `entered_hold`,
 and reports to its guard; between the previous guard's erase and that moment the front ticket
-holds nothing, and `holder_since_ms` is 0.
+holds nothing, and `holder_since_ms` is absent.
 
 `CasRequests`'s constructor gains an optional `CasHotKeys::IsHot`. Every existing constructor call
 (every test, the offline tools, the pool factory's local bootstrap `CasRequests`) passes none and
@@ -379,9 +386,13 @@ waiting is reported in the verb's own result family: the `WriteResult` verbs ret
 named below; `remove` and `removeCurrent`, which return `Removal`, throw the same fence or
 deadline exception their read-class loops throw today for the same condition.
 
-**Enter.** The caller binds its policy to an absolute deadline on the engine's clock
-(`policy.bind(now)`), as every verb does today at entry, so time spent waiting spends the caller's
-own window. Under `mutex`: push `next_ticket` at the back of `tickets` (the one allocation of the
+**Enter.** Everything a verb validates deterministically today before touching the store runs
+first, before any ticket: `valueFor` on a `replace`'s or `remove`'s etag (a `LOGICAL_ERROR` for a
+token of another key or backend), and whatever else a verb refuses without a request. A caller
+that would fail those checks today fails them identically, at once, and never waits. Then the
+caller binds its policy to an absolute deadline on the engine's clock (`policy.bind(now)`), as
+every verb does today at entry, so time spent waiting spends the caller's own window. Under
+`mutex`: push `next_ticket` at the back of `tickets` (the one allocation of the
 lane), then increment `next_ticket`. If the push throws, the number is not consumed, a lane the
 lookup created for this call is erased again, and the exception propagates. The moment the push
 succeeds, a ticket guard is installed: on every exit from here on, normal or by unwinding (the gate
@@ -404,8 +415,8 @@ leave step below is this guard running on the normal path.
    `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the mutex, and go to step 1. The
    clock is read in step 1, never under the mutex. A waiter that leaves on its deadline in step 1
    records that fact for its guard, which snapshots the front ticket and `holder_since_ms` under
-   the mutex and logs them after releasing it (a `holder_since_ms` of 0 means the front has not
-   entered its hold yet).
+   the mutex and logs them after releasing it (an absent `holder_since_ms` means the front has
+   not entered its hold yet).
 
 A ticket is promoted only after its checks passed in the same iteration. The engine's own
 per-attempt gate and `fits` still run before anything is sent, as today.
@@ -430,7 +441,7 @@ inside the boundary.
 
 **Leave.** The ticket guard, on every exit, holder or waiter, normal or unwinding, in this
 order: under `mutex`, if `entered_hold` is set, move the prepared memory value into
-`remembered` or clear it (a holder that unwinds clears) and set `holder_since_ms = 0`; if it is
+`remembered` or clear it (a holder that unwinds clears) and reset `holder_since_ms`; if it is
 not set, the memory is untouched, because a ticket that never held wrote nothing and learned
 nothing; erase this ticket; if the caller left on its deadline behind a front ticket, snapshot
 that ticket and `holder_since_ms`; `cv.notify_all()`; after releasing the mutex, record the
@@ -523,15 +534,18 @@ frozen before the holder's window began (`resolveNamespaceLife` freezes one and 
 `cancelStalledCreating` with the one line this design adds). So a holder whose transport answers
 leaves by its deadline plus one attempt timeout, and so does every waiter behind it.
 
-**A stalled holder: an accepted availability tradeoff.** What can outlive that bound is a
-transport attempt that trickles rather than stalls, delivering bytes slowly enough that no socket
-timeout fires. The engine cannot cancel it, and the S3 transport's timeouts are per socket
-operation, not per request. Today such an attempt traps only its own caller and its query. In the
-lane it traps the hot key on this plane: every later catalog writer waits to its own deadline and
-reports the same typed retry-later the trapped writer would, so `CREATE` and `DROP` on this pool
-fail with that error until the attempt ends, which happens when the transport returns, when the
-connection is closed by either side, or when the process restarts. Nothing in the lane ends it,
-because nothing in the engine can.
+**A stalled holder: an accepted availability tradeoff.** What can outlive that bound is holder
+code that does not return: a transport attempt that trickles rather than stalls, delivering
+bytes slowly enough that no socket timeout fires (the engine cannot cancel it, and the S3
+transport's timeouts are per socket operation, not per request); a `decide`, a backend hook or a
+`Liveness` closure that never returns; or a lock one of them cannot get. Today any of those traps
+only its own caller and its query. In the lane it traps the hot key on this plane: every later
+catalog writer waits to its own deadline and reports the same typed retry-later the trapped
+writer would, so `CREATE` and `DROP` on this pool fail with that error until the holder returns,
+which for a transport attempt happens when the transport answers, when the connection is closed
+by either side, or when the process restarts. Nothing in the lane ends it, because nothing in the
+engine can, and the lane does not try to distinguish the causes: the keyed log line names the
+holder and its hold time, and the cause is read from that holder's own stack.
 
 This design accepts that, as a release-level availability tradeoff: for a trickling transport
 attempt, and for that case only, the lane turns one trapped writer into a trapped catalog key on
@@ -559,16 +573,37 @@ Verified for the two mount-plane production writers at brainstorm time:
 | `CasRefLedger::namespaceLife` → `resolveNamespaceLife` (CREATE) | none; `ref_queue_mutex` scope closes before, `state_mutex` is taken after |
 | `CasRefLedger::dropNamespaceImpl` → `cancelStalledCreating`, `beginRemoving` (DROP) | none; the queue lock scope closes before `removal_op` |
 
-Inside a write: the mount fence's `admit`, `generation` and `check_or_throw` read atomics only;
-the in-memory backend holds its mutex only for the duration of one operation and runs hooks
-without it; the mount plane's sleep is `CasMountRuntime::sleepInterruptibly`, a leaf; `decide`s
-call `op.admitted()` (atomics) and issue reads (backend leaf). No `decide` takes a ledger mutex.
+Inside a write, while the ticket is logically held: the mount fence's `generation` and
+`check_or_throw` read atomics; `admit` reads atomics and calls the clock function
+(`config.boot_ms_fn`, `clock_gettime` in production, the synchronized test clock's own leaf mutex
+in the lane tests); the in-memory backend holds its mutex only for the duration of one operation
+and runs hooks without it; `decide`s call `op.admitted()` and issue reads (backend leaf). No
+`decide` takes a ledger mutex. The mount plane's sleep, `CasMountRuntime::sleepInterruptibly`,
+takes `driver_mutex` for a condition-variable wait, so the ticket is held across that mutex, and
+the question is whether any holder of `driver_mutex` can ever enter the lane. Audit of every
+acquisition in `CasMountRuntime.cpp` at brainstorm time:
+
+| `driver_mutex` holder | what runs under it |
+|---|---|
+| `renewalWorkerMayRenew`, `renewalLive`, `renewalCancelled`, the `*ForTest` accessors | reads of driver state |
+| `DriverLease::finish`, `admitRenewerCall`, `installRenewer`, `startRenewer`, `renewerReset` | driver state transitions, no I/O |
+| `startBackgroundWorkers`, `stopBackgroundWorkers` | worker handles; joins happen with the lock released |
+| `renewalLoop`, `remountLoop` | condition-variable waits and state reads; `remount_attempt()` runs after the lock is released |
+| `lockTerminalPublication` and its three callers | atomic stores of terminal state; no backend request |
+| `scheduleRemount` | a generation bump and a notify |
+
+None reaches `CasRefLedger`, the catalog key, or any request on the mount plane, so no
+`driver_mutex` holder ever waits for a ticket, and the ticket may be held across `driver_mutex`.
+The rule for future runtime code follows: nothing under `driver_mutex` issues a mount-plane
+write.
 
 `CasHotKeys::mutex` is a leaf that calls nothing: it is held only to push, inspect or erase a
 ticket, to read or set the spacing timestamp, and to move or clear `remembered`. The gate, the
-`Liveness` closure, the clock, the verb's body and every `decide` run with it released. The order is therefore: caller
-(no locks) → `CasHotKeys::mutex` → nothing; and separately caller (no locks) → backend mutex. The
-one rule this imposes on future callers, stated where the catalog API is documented: a catalog
+`Liveness` closure, the clock, the verb's body and every `decide` run with it released. The order
+is therefore: caller (no locks) → `CasHotKeys::mutex` → nothing; and, with the ticket logically
+held, caller (no locks) → `driver_mutex` (a condition-variable wait whose other holders never
+enter the lane) → nothing, and caller (no locks) → backend mutex → nothing. The one rule this
+imposes on future callers, stated where the catalog API is documented: a catalog
 mutation is not entered while holding a ledger mutex, because the holder's `decide` may take
 ledger-visible reads and a waiter must not hold what the holder needs. Today's callers hold nothing.
 
@@ -732,8 +767,10 @@ added for them, and a case that asserts nothing about time may use the real cloc
 tests decodes a list of tickets from `bytes` and appends its own, so order is visible in the object.
 
 1. Serialization and memory. N threads call `readModifyWrite` on the hot key; a write hook parks
-   the first holder until all N are waiting. Assert: reads of the key 1, writes N, no write
-   returned `Conflict`, the final object lists the tickets in arrival order (INV-HK1, HK2, HK3).
+   the first holder, and each further thread is released only after the test observes its ticket
+   queued (a `queueDepthForTest(key)` accessor on `CasHotKeys`), so the arrival order is the
+   release order and not the scheduler's. Assert: reads of the key 1, writes N, no write returned
+   `Conflict`, the final object lists the tickets in that order (INV-HK1, HK2, HK3).
    A sibling mixes the six verbs (`create` on a fresh key, `replace`, `remove`, `removeCurrent`,
    `readModifyWriteOnPresence`, `readModifyWrite`) from N threads and asserts, through a backend
    hook that records overlapping calls, that no two writes on the key were ever in flight together.
@@ -804,9 +841,11 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    check: `FencedOut` again, with the `Creating` row durable for a later reconciler, as today's
    `completeCreation` fence case leaves it. `casAdmitEntry` under a tripped fence throws
    `throwCasTransientUnavailable`'s class, as `casUpdate` does, never a bare marker.
-7d. Cache fill failure. A hook makes the post-commit etag copy throw. Assert: the caller receives
-   its `Committed` unchanged, the memory is empty, and the next opted-in call reads. A memory
-   start whose inner write is refused at the gate before sending reports `GaveUp` with
+7d. Cache fill failure. `CasHotKeys` carries a `memory_prepare_hook_for_test`, empty in
+   production and invoked immediately before the post-commit etag copy, in the pattern of the
+   runtime's `*_hook_for_test` seams; the test installs one that throws. Assert: the caller
+   receives its `Committed` unchanged, the memory is empty, and the next opted-in call reads. A
+   memory start whose inner write is refused at the gate before sending reports `GaveUp` with
    `last_seen == NotObserved`.
 7c. Generation spacing. On a backend whose dialect is `Generation`, N writes through the lane:
    assert consecutive write attempts on the key are at least one second apart on the clock, that
@@ -851,8 +890,9 @@ Pool level, through the ledger:
 12. A second `Pool` over the same backend as the external writer: the first `Pool`'s next catalog
     mutation costs exactly one extra read and one retry write.
 
-Not tested: an allocation failure while preparing the memory value (no injection point; the
-design's prepare-before-guard order and forget-on-failure are the argument).
+Not tested: a genuine allocation failure inside the etag copy; the hook of test 7d exercises the
+same path by throwing where the copy would, and the prepare-before-guard order is the argument
+for the rest.
 
 Regression: every existing test in `gtest_cas_ref_catalog.cpp` and its siblings runs unchanged,
 without a hot predicate, and must stay green. That is the check that the catalog API was not
