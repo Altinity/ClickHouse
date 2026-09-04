@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasTransportAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasWriteOnceKey.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <Common/Exception.h>
@@ -192,6 +193,13 @@ public:
     /// Executes one unconditional blob publication and returns once the complete destination is
     /// visible. Transport only: it observes no destination state and produces no incarnation.
     virtual void publish(const BlobPublishRequest & request, TransportAccess &) = 0;
+
+    /// Removes up to 1000 WRITE-ONCE keys in one request with no per-key precondition; an absent key
+    /// is success. The caller proves the keys are write-once by minting them as `WriteOnceKey`, so a
+    /// backend never sees a mutable control key through this verb. Throws on any failure; the whole
+    /// chunk is reissued by the engine, which is sound because a key already deleted is absent, and
+    /// absence is success.
+    virtual void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &) = 0;
 
     /// Authoritative, cache-bypassing probe of one key -- see `ProbeOutcome`. DEFAULT (used by every
     /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`read`

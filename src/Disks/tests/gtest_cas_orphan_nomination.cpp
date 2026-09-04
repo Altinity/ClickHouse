@@ -81,7 +81,7 @@ size_t condemnedCount(CasOperation & op, const Layout & layout)
     return count;
 }
 
-class NominationBackend : public InMemoryBackend
+class NominationBackend : public CountingBackend
 {
 public:
     /// The sweep's exact-token delete reaches the store through the keyed removal, so the fault is
@@ -101,7 +101,7 @@ public:
                     static_cast<void>(InMemoryBackend::write(key, got->bytes, got->value, access));
             }
         }
-        return InMemoryBackend::remove(key, expected_value, access);
+        return CountingBackend::remove(key, expected_value, access);
     }
 
     Layout layout{"p"};
@@ -246,6 +246,31 @@ TEST(CASOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
     EXPECT_EQ(fold_reduce->metrics.at("transactions_unapplied"), 0u)
         << "the retirement input rides the reducer alongside ordinary deltas without stranding a "
            "committed+produced ref transaction unapplied";
+}
+
+/// A page reads the body of a candidate only. Five live manifests share the namespace with the one
+/// orphan candidate; they are active under the floor, are retained from their keys alone, and cost no
+/// GET. The candidate costs exactly one.
+TEST(CASOrphanNomination, OnlyCandidatesCostABodyRead)
+{
+    ReadyFixture f = makeReadyFixture();
+    const Layout & layout = f.store->layout();
+    std::vector<String> live_keys;
+    for (uint32_t ordinal = 1; ordinal <= 5; ++ordinal)
+    {
+        const ManifestRef live{.writer_epoch = kCandidateEpoch, .build_sequence = 7, .manifest_ordinal = ordinal};
+        writeManifestRaw(*f.backend, layout, f.ns, live, {blobEntryFor("live", DB::UInt128(0xA000 + ordinal))});
+        live_keys.push_back(layout.manifestKey(ManifestId{f.ns, live}));
+    }
+    f.backend->resetCounts();
+
+    const ManifestSweepResult result = planManifestCursorPage(
+        *f.store, "", /*list_budget=*/100, /*nomination_budget=*/100, /*catalog_recovery_authoritative=*/true, nullptr);
+
+    ASSERT_EQ(result.nominations.size(), 1u);
+    EXPECT_EQ(f.backend->getCount(layout.manifestKey(f.candidate)), 1u);
+    for (const String & key : live_keys)
+        EXPECT_EQ(f.backend->getCount(key), 0u) << key;
 }
 
 /// A nomination must exact-GET and decode the manifest before it can derive any source-edge identity.

@@ -10,11 +10,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcKeyReader.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <set>
 #include <limits>
 
@@ -42,7 +45,8 @@ void onGcEnumerationPage()
 /// mount there is no deletion authority, so the caller must leave the prefix untouched. The mount's
 /// `writer_epoch` and `min_active_build_sequence` are the single durable epoch/floor pair used for eligibility, including
 /// across process replacement and the retired sentinel.
-std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns)
+std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns,
+                                            uint64_t * reads = nullptr)
 {
     const String & value = ns.string();
     size_t pos = value.size();
@@ -55,6 +59,8 @@ std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & la
         const String server_root_id = value.substr(0, pos);
         if (!server_root_id.empty())
         {
+            if (reads)
+                ++*reads;
             if (const auto got = op.read(layout.mountKey(server_root_id), Retry::standard()))
                 return decodeMountLease(got->bytes);
         }
@@ -170,9 +176,13 @@ struct NamespaceProtection
 /// invalid transaction (via the authority-grounded recovery / `decodeRefLogTxn`); the caller SKIPS the
 /// namespace's deletions on such a throw rather than substituting an empty owner set.
 ///
-/// `work_budget`, when set, bounds the committed-tail walk below: each ref-log GET the walk issues
-/// consumes one unit of `GcRoundWorkBudget::sweep_recovery_op_budget`, shared with every other
-/// namespace this round touches. Exhaustion sets `NamespaceProtection::recovery_incomplete` and stops
+/// `work_budget`, when set, bounds the committed-tail walk below: each ref-log the walk TAKES (decodes
+/// and applies) consumes one unit of `GcRoundWorkBudget::sweep_recovery_op_budget`, shared with every
+/// other namespace this round touches. A hinting reader may prefetch up to one window of logs beyond
+/// the charged position before the walk reaches them -- those prefetches are not charged, since the
+/// budget bounds decoded work, not requests in flight -- and a hint issued past an epoch's seal is
+/// discarded rather than taken, bounding the waste of one crossing to one window, counted in
+/// `CASGCReadAheadWasted`. Exhaustion sets `NamespaceProtection::recovery_incomplete` and stops
 /// the walk — it is deliberately NOT plumbed into `recoverRefTableDetailedFromAuthority` itself: that
 /// function is a shared recovery primitive also used by `fsck` (which needs a COMPLETE table to audit)
 /// and the GC rebuild path (which needs a complete table to reconstruct in-degree from scratch), so
@@ -180,8 +190,8 @@ struct NamespaceProtection
 /// Reaching the budget before even calling `recoverRefTableDetailedFromAuthority` (already spent by an
 /// earlier namespace) skips that call entirely and reports incomplete immediately.
 NamespaceProtection activeManifestKeys(
-    CasOperation & op, const Layout & layout, const CatalogEntry & catalog_entry, const RefCkpt & ckpt,
-    const std::optional<RefCoverage> & coverage, GcRoundWorkBudget * work_budget = nullptr)
+    CasOperation & op, KeyReader & reader, const Layout & layout, const CatalogEntry & catalog_entry,
+    const RefCkpt & ckpt, const std::optional<RefCoverage> & coverage, GcRoundWorkBudget * work_budget = nullptr)
 {
     NamespaceProtection protection;
     if (work_budget && !work_budget->sweepRecoveryOpAvailable())
@@ -197,7 +207,7 @@ NamespaceProtection activeManifestKeys(
     /// The exact row and `_ckpt` come from the caller's frozen catalog cut. Do not resolve `ns` here:
     /// a later catalog cut can name a reborn life and turn this old life into an apparent orphan.
     const RecoveredRefTable recovered = recoverRefTableDetailedFromAuthority(
-        op, layout, catalog_entry, ckpt);
+        op, layout, catalog_entry, ckpt, &reader);
     if (work_budget)
         ++work_budget->sweep_recovery_ops_used;   /// one coarse unit for the snapshot+tail recovery itself
     const RefTableState & state = recovered.state;
@@ -285,6 +295,37 @@ NamespaceProtection activeManifestKeys(
         }
     }
 
+    /// Guards the walk's most recently hinted-but-not-yet-taken range (from `arm`'s `from` up to one
+    /// window) so that an early exit from the loop below -- the work-budget `break`, the corrupted-tail
+    /// `throw`, or the missing-cursor epoch cross -- frees it instead of leaving it pinned against the
+    /// SAME reader for whatever this page reads next (later candidates, later namespaces). An ordinary
+    /// same-epoch advance re-arms it on the new position without discarding: those hints are still
+    /// wanted. A seal crossing discards explicitly, right where the crossing happens, and disarms so
+    /// this guard's own destructor does not repeat it.
+    struct OutstandingHintGuard
+    {
+        KeyReader & reader;
+        const Layout & layout;
+        const NamespaceLifeId & life;
+        RefTxnId from{};
+        RefTxnId committed_through{};
+        bool armed = false;
+
+        void arm(const RefTxnId & from_, const RefTxnId & committed_through_)
+        {
+            from = from_;
+            committed_through = committed_through_;
+            armed = true;
+        }
+        void discardNow()
+        {
+            if (armed)
+                discardRefLogHintsOfEpoch(reader, layout, life, from, committed_through);
+            armed = false;
+        }
+        ~OutstandingHintGuard() { discardNow(); }
+    } outstanding_hints{reader, layout, life};
+
     while (id <= *ckpt.committed_through)
     {
         /// UNCERTAINTY, work-budget arm: the committed-tail walk is a finite but potentially huge range
@@ -292,13 +333,19 @@ NamespaceProtection activeManifestKeys(
         /// namespace it touches. Stopping HERE — before the next GET — leaves `active`/
         /// `tail_removal_targets` genuinely partial, so the caller must treat the whole namespace as
         /// undecided this page (fail-closed retain), never authorize a deletion from what was collected
-        /// so far.
+        /// so far. `outstanding_hints`'s destructor frees whatever the walk hinted ahead of this point.
         if (work_budget && !work_budget->sweepRecoveryOpAvailable())
         {
             protection.recovery_incomplete = true;
             break;
         }
-        const auto got = op.read(layout.refLogKey(life, id), Retry::standard());
+        if (id.ref_sequence < std::numeric_limits<uint64_t>::max())
+        {
+            const RefTxnId hint_from{id.writer_epoch, id.ref_sequence + 1};
+            hintRefLogsWithinEpoch(reader, layout, life, hint_from, *ckpt.committed_through);
+            outstanding_hints.arm(hint_from, *ckpt.committed_through);
+        }
+        const auto got = reader.take(layout.refLogKey(life, id));
         if (work_budget)
             ++work_budget->sweep_recovery_ops_used;
         if (!got)
@@ -310,6 +357,9 @@ NamespaceProtection activeManifestKeys(
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS orphan sweep: committed tail log {} is absent under the supplied _ckpt frontier",
                     renderRefTxnId(id));
+            /// The old epoch's hints past this missing cursor do not exist either; discard them before
+            /// crossing, exactly as the seal path below does.
+            outstanding_hints.discardNow();
             id = cross_from_missing_cursor(*prior);
             prior.reset();
             prior_is_seal.reset();
@@ -330,6 +380,7 @@ NamespaceProtection activeManifestKeys(
         {
             if (is_seal)
             {
+                outstanding_hints.discardNow();
                 prior.reset();
                 prior_is_seal.reset();
             }
@@ -480,7 +531,13 @@ namespace
 /// debris drains after a process restart even when its build_sequence is above the current min_active_build_sequence.
 bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix)
 {
-    const auto floor = floorForNamespace(op, layout, ns);
+    return prefixEligibleUnder(floorForNamespace(op, layout, ns), prefix);
+}
+
+}
+
+bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPrefix & prefix)
+{
     if (!floor)
         return false;
 
@@ -492,8 +549,6 @@ bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamesp
     if (w.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
         return true;   /// farewell/retired sentinel: every seq is retired
     return w.min_active_build_sequence > prefix.build_sequence;
-}
-
 }
 
 bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
@@ -541,7 +596,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
                 warnings->push_back(warning);
             return 0;
         }
-        protection = activeManifestKeys(op, layout, *catalog_entry, ckpt->ckpt, view.coverage);
+        InlineKeyReader reader(op);
+        protection = activeManifestKeys(op, reader, layout, *catalog_entry, ckpt->ckpt, view.coverage);
         view.tail_removal_targets = protection.tail_removal_targets;
 
     }
@@ -614,7 +670,9 @@ ManifestSweepResult planManifestCursorPage(
     uint64_t list_budget,
     uint64_t nomination_budget,
     bool catalog_recovery_authoritative,
-    GcRoundWorkBudget * work_budget)
+    GcRoundWorkBudget * work_budget,
+    ThreadPool * read_pool,
+    size_t read_concurrency)
 {
     ManifestSweepResult result;
     result.next_cursor = cursor;
@@ -623,38 +681,22 @@ ManifestSweepResult planManifestCursorPage(
 
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
+    /// The page's reader. With a pool and concurrency above one the candidates' bodies and the two
+    /// ref-stream walks overlap their round trips; otherwise every read is inline and the page is the
+    /// sequential one, request for request.
+    std::optional<GcReadAhead> read_ahead;
+    std::unique_ptr<KeyReader> reader;
+    if (read_pool && read_concurrency > 1)
+    {
+        read_ahead.emplace(op, store.openRequests(), *read_pool, read_concurrency);
+        reader = std::make_unique<ReadAheadKeyReader>(*read_ahead);
+    }
+    else
+        reader = std::make_unique<InlineKeyReader>(op);
     const ListPage page = op.list(layout.casManifestsPrefix(), cursor, list_budget, Retry::standard());
     /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
-
-    /// Freeze every possible destructive candidate BEFORE the later catalog cut. A same-name rebirth can
-    /// replace this logical manifest key between the observations; classifying the old bytes against the
-    /// later lifecycle cut is safe only when deletion retains the old exact incarnation, so the
-    /// replacement fails the caller's re-observation. Do not take a fresh read after the catalog read:
-    /// that would splice new-life bytes into old candidate selection and authorize their deletion with
-    /// the new incarnation.
-    ///
-    /// Bounded to `nomination_budget` well-formed keys — never the whole `list_budget`-sized
-    /// page — since `nomination_budget` is the hard ceiling on how many of them this call can ever
-    /// nominate. A well-formed key beyond this cap has no frozen body; it is retained where its absence
-    /// is discovered below, in the exact same "budget exhausted, cursor does not step over it" shape the
-    /// nomination-count exhaustion already uses.
-    std::map<String, std::optional<Object>> observed_candidates;
-    if (nomination_budget > 0)
-    {
-        uint64_t frozen = 0;
-        for (const ListedKey & listed : page.keys)
-        {
-            if (frozen >= nomination_budget)
-                break;
-            if (parseListedManifestObject(layout, listed.key))
-            {
-                observed_candidates.emplace(listed.key, op.read(listed.key, Retry::standard()));
-                ++frozen;
-            }
-        }
-    }
 
     /// One seal and one later catalog cut for the whole page; every namespace joins through those same
     /// immutable observations.
@@ -662,7 +704,10 @@ ManifestSweepResult planManifestCursorPage(
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(op, layout);
     catalog_cut.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
 
-    std::map<String, bool> eligible_by_prefix;
+    /// One floor observation per namespace for the whole page. Every build of a namespace is judged
+    /// against the same mount body; reading it per build prefix would cost three requests per listed
+    /// key on a pool where every INSERT is its own build.
+    std::map<String, std::optional<MountLease>> floor_by_ns;
     std::map<String, NamespaceFoldView> view_by_ns;
     std::map<String, std::set<String>> active_by_ns;
     std::set<String> errored_namespaces;   /// protection view unavailable => skip, never delete
@@ -672,6 +717,11 @@ ManifestSweepResult planManifestCursorPage(
     /// stays ahead of the cursor and is examined next pass. See the budget rule below.
     String decided_through;
     bool budget_exhausted = false;
+
+    /// Keys that passed every retain check. Their bodies are read AFTER the loop, and after the
+    /// catalog cut: a manifest key is write-once, so its bytes do not depend on when they are read,
+    /// and the only thing a later read can observe differently is absence, which retains.
+    std::vector<ListedManifestObject> candidates;
 
     for (const ListedKey & listed : page.keys)
     {
@@ -685,7 +735,7 @@ ManifestSweepResult planManifestCursorPage(
         /// A budget of ZERO is not exhaustion but a list-only pass: nothing is ever deletable, so
         /// freezing the cursor on it would make the sweep spin on one page forever. That pass keeps
         /// its pre-existing behaviour and advances.
-        if (budget_exhausted || (nomination_budget > 0 && result.nominations.size() >= nomination_budget))
+        if (budget_exhausted || (nomination_budget > 0 && candidates.size() >= nomination_budget))
         {
             budget_exhausted = true;
             ++result.skipped;
@@ -711,13 +761,13 @@ ManifestSweepResult planManifestCursorPage(
         const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
         if (catalog_entry)
         {
-            const String eligibility_key = parsed->ns.string() + "\n"
-                + std::to_string(parsed->prefix.writer_epoch) + "\n"
-                + std::to_string(parsed->prefix.build_sequence);
-            auto [eligible_it, eligible_inserted] = eligible_by_prefix.emplace(eligibility_key, false);
-            if (eligible_inserted)
-                eligible_it->second = prefixEligible(store, parsed->ns, parsed->prefix);
-            if (!eligible_it->second)
+            auto [floor_it, floor_inserted] = floor_by_ns.emplace(parsed->ns.string(), std::nullopt);
+            if (floor_inserted)
+            {
+                ++result.floor_lookups;
+                floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
+            }
+            if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
             {
                 ++result.skipped;
                 decided_through = listed.key;
@@ -789,7 +839,7 @@ ManifestSweepResult planManifestCursorPage(
                     else
                     {
                         NamespaceProtection protection = activeManifestKeys(
-                            op, layout, *catalog_entry, ckpt->ckpt, view_it->second.coverage, work_budget);
+                            op, *reader, layout, *catalog_entry, ckpt->ckpt, view_it->second.coverage, work_budget);
                         if (protection.recovery_incomplete)
                         {
                             /// The committed-tail walk stopped early: `active`/`tail_removal_targets`
@@ -865,26 +915,21 @@ ManifestSweepResult planManifestCursorPage(
             }
         }
 
-        /// This exact incarnation and bytes were captured before the catalog cut (see above). A missing
-        /// body has no deletion authority; a later replacement no longer matches what is recorded here,
-        /// so the caller's re-observation refuses the delete.
-        ///
-        /// A well-formed key can legitimately be ABSENT here: the freeze loop above caps
-        /// fan-out at `nomination_budget` candidates, so a key beyond that cap was never frozen. Treat
-        /// it exactly like nomination-count exhaustion -- retain, and do NOT advance the cursor past
-        /// it, so the very next page/round examines it with a fresh budget instead of losing it.
-        const auto observed_it = observed_candidates.find(parsed->key);
-        if (observed_it == observed_candidates.end())
-        {
-            budget_exhausted = true;
-            ++result.skipped;
-            continue;
-        }
-        const std::optional<Object> & got = observed_it->second;
+        candidates.push_back(*parsed);
+        decided_through = listed.key;
+    }
+
+    size_t next_body_hint = 0;
+    for (const ListedManifestObject & candidate : candidates)
+    {
+        while (next_body_hint < candidates.size() && reader->pending() < reader->window())
+            reader->hint(candidates[next_body_hint++].key);
+        const std::optional<Object> got = reader->take(candidate.key);
         if (!got)
         {
+            /// Gone since the LIST: a fresh writer never reuses the key, so there is nothing to
+            /// nominate and nothing to retain. The key was decided above; the cursor stands.
             ++result.skipped;
-            decided_through = listed.key;
             continue;
         }
         std::optional<PartManifest> body;
@@ -901,21 +946,20 @@ ManifestSweepResult planManifestCursorPage(
             /// reclamation for the whole pool rather than for this one key.
             LOG_ERROR(getLogger("CasOrphanManifestSweep"),
                 "CAS orphan sweep: manifest at {} cannot be decoded and was retained; run cas-fsck to "
-                "enumerate such objects", parsed->key);
+                "enumerate such objects", candidate.key);
             ++result.undecodable;
             ++result.skipped;
-            decided_through = listed.key;
             continue;
         }
-        const ManifestId id{parsed->ns, parsed->ref};
+        const ManifestId id{candidate.ns, candidate.ref};
         if (!refMatchesBody(id.ref, *body) || !manifestNamespaceMatches(id.root_namespace, *body))
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS orphan sweep: manifest identity mismatch at {} while deriving exact source edges",
-                parsed->key);
+                candidate.key);
 
         ManifestSweepResult::Nomination nomination{
             .id = id,
-            .key = parsed->key,
+            .key = candidate.key,
             .token = PersistedEtag::capture(got->etag),
             .source_retirements = {}};
         for (const ManifestEntry & entry : body->entries)
@@ -924,7 +968,6 @@ ManifestSweepResult planManifestCursorPage(
                     .ref = entry.ref,
                     .source_id = sourceEdgeId(id, entry.path)});
         result.nominations.push_back(std::move(nomination));
-        decided_through = listed.key;
     }
 
     if (budget_exhausted)

@@ -88,6 +88,8 @@ struct PoolConfig
     /// per completed GC round; the delete budget separately bounds exact-token destructive work.
     uint64_t manifest_sweep_list_budget_keys = 1000;
     uint64_t manifest_sweep_delete_budget_keys = 100;
+    /// Keys per batch delete request for the write-once families; tests lower it to exercise chunk boundaries.
+    uint64_t gc_bulk_delete_chunk_keys = 1000;
     /// Per-round blob-deletion work envelope: caps how many entries the fold's graduation
     /// (condemned -> delete_pending) and redelete (exact-token delete of a prior delete_pending row)
     /// arms move out of the durable retired pipeline in one round. Excess entries are carried

@@ -372,6 +372,13 @@ public:
     virtual ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms);
 
+    /// Removes every object in ONE request with no per-key precondition; an absent object is success.
+    /// Content-addressed callers use it for write-once keys only, at most 1000 per call. Throws on a
+    /// request-level failure and on any per-key error other than "not found", naming the failed keys.
+    /// Same profile note as `iterate`. Backends without a batch delete keep the default, which refuses.
+    virtual void removeObjectsIfExistUnderProfile(
+        const StoredObjects & objects, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms);
+
     /// Copy object with different attributes if required
     virtual void copyObject( /// NOLINT
         const StoredObject & object_from,

@@ -1714,6 +1714,16 @@ public:
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
+    /// One `removeManyWriteOnce` call is one bulk-delete request that names every key it carried; the
+    /// per-key `delete_counts` grow by one for each key named, exactly as a single-key `remove` would,
+    /// so `deleteCount(key)` reads the same whichever verb deleted it.
+    void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, DB::Cas::TransportAccess & access) override
+    {
+        for (const DB::Cas::WriteOnceKey & key : keys)
+            tick(delete_counts, delete_total, key.str());
+        InMemoryBackend::removeManyWriteOnce(keys, access);
+    }
+
     /// A blob publication reaches the store through `publish`, not `write` -- a "zero backend requests"
     /// assertion built only from the primitives above would miss one landing.
     void publish(const DB::Cas::BlobPublishRequest & request, DB::Cas::TransportAccess & access) override

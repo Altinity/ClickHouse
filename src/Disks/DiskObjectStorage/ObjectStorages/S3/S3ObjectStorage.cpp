@@ -623,6 +623,80 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatchesImpl(
         err.GetMessage(), static_cast<size_t>(err.GetErrorType()), err.GetExceptionName(), object.remote_path);
 }
 
+void S3ObjectStorage::removeObjectsIfExistUnderProfile(
+    const StoredObjects & objects, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms)
+{
+    refreshAndRetryOnExpiredCredentials([&]
+    {
+        removeObjectsIfExistImpl(objects, clientForRetryProfile(profile, request_timeout_ms));
+        return 0;
+    });
+}
+
+void S3ObjectStorage::removeObjectsIfExistImpl(const StoredObjects & objects, const std::shared_ptr<const S3::Client> & used_client)
+{
+    if (objects.empty())
+        return;
+
+    std::vector<Aws::S3::Model::ObjectIdentifier> identifiers; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+    identifiers.reserve(objects.size());
+    for (const auto & object : objects)
+    {
+        Aws::S3::Model::ObjectIdentifier identifier;
+        identifier.SetKey(object.remote_path);
+        identifiers.push_back(std::move(identifier));
+    }
+    Aws::S3::Model::Delete to_delete;
+    to_delete.SetObjects(std::move(identifiers));
+    /// Quiet: only failed keys come back. A key that is gone or was never there is not a failure here
+    /// (`NoSuchKey` below), and the caller has no use for the per-key successes.
+    to_delete.SetQuiet(true);
+
+    S3::DeleteObjectsRequest request;
+    request.SetBucket(uri.bucket);
+    request.SetDelete(std::move(to_delete));
+
+    ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
+    auto outcome = used_client->DeleteObjects(request);
+
+    /// Every key lands in system.blob_storage_log, as the single-key paths do; the batch's outcome is
+    /// stamped on each of them.
+    if (auto blob_storage_log = BlobStorageLogWriter::create(disk_name))
+    {
+        for (const auto & object : objects)
+            blob_storage_log->addEvent(BlobStorageLogElement::EventType::Delete,
+                                       uri.bucket, object.remote_path,
+                                       object.local_path, object.bytes_size,
+                                       /* elapsed_microseconds */ 0,
+                                       outcome.IsSuccess() ? 0 : static_cast<Int32>(outcome.GetError().GetErrorType()),
+                                       outcome.IsSuccess() ? "" : outcome.GetError().GetMessage());
+    }
+
+    if (!outcome.IsSuccess())
+    {
+        const auto & err = outcome.GetError();
+        throw S3Exception(err.GetErrorType(), "{} (Code: {}) while removing {} objects from S3 in one request",
+                          err.GetMessage(), static_cast<size_t>(err.GetErrorType()), objects.size());
+    }
+
+    String failed_keys;
+    std::optional<Aws::S3::S3Errors> first_error_type;
+    for (const auto & err : outcome.GetResult().GetErrors())
+    {
+        const auto error_type = static_cast<Aws::S3::S3Errors>(
+            Aws::S3::S3ErrorMapper::GetErrorForName(err.GetCode().c_str()).GetErrorType());
+        if (S3::isNotFoundError(error_type))
+            continue;
+        if (!failed_keys.empty())
+            failed_keys += ", ";
+        failed_keys += err.GetKey() + " (" + err.GetCode() + ": " + err.GetMessage() + ")";
+        if (!first_error_type)
+            first_error_type = error_type;
+    }
+    if (first_error_type)
+        throw S3Exception(*first_error_type, "batch removal left objects behind: [{}]", failed_keys);
+}
+
 bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const
 {
     return client->get()->supportsGcsNativeConditionalRequests();

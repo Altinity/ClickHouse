@@ -125,6 +125,12 @@ public:
         return outcome;
     }
 
+    /// Delegate the batch removal, count the request once, and count each key it named as a `Delete`
+    /// in its own namespace class -- the per-key counters say how many keys of each class one request
+    /// carried, the request counter says how many requests it took. Out of line, like `publish`, so
+    /// the header need not declare the `CASBulkDeleteRequests` extern.
+    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
+
     /// Count a create and a replacement separately, and each of them separately from its refusal:
     /// they cost the same one request, but a pool whose creates are mostly refused and one whose
     /// replacements mostly conflict are different problems.
