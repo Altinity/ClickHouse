@@ -96,14 +96,14 @@ public:
     std::optional<RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
     {
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::head(key, access);
     }
 
     std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::read(key, access);
     }
 
@@ -111,7 +111,7 @@ public:
                                        DB::Cas::TransportAccess & access) override
     {
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 
