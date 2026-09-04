@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 31, 2026-09-04. Phase A. Brainstormed against the measurements in
+Revision 32, 2026-09-04. Phase A. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
 this document supersedes where they differ. Revisions 1 to 26 designed a larger change (combining
@@ -68,9 +68,13 @@ Goals:
 - The lane serves any hot compare-and-swap object, not the catalog only: its `decide` is the
   engine's own `DecideOnObject`, it returns the engine's own `WriteResult`, and a caller moves to
   it by changing one call. The catalog is the first caller.
-- No change to the catalog's API, to the semantics of any conditional write or of any result or
-  verdict a caller sees, to the 90 s windows, to what any read returns, or to a single line of GC.
-  In the request engine, four changes: a pointer carried by `CasRequests` and exposed as
+- No change to the catalog's API, to the semantics of any conditional write, to what any result
+  class means, to the 90 s windows, to what any read returns, or to a single line of GC. One
+  addition to what a caller can receive, stated in [The hold](#the-hold): a write may be decided
+  on the pool's last known object, so the store's answer to that write (a 412 settled into
+  `Conflict`, a `Refused`, a `GaveUp`) can reach a caller whose fresh read would have rendered a
+  verdict without writing; each is an answer every caller handles today, and none is false. In
+  the request engine, four changes: a pointer carried by `CasRequests` and exposed as
   `CasOperation::hotKeys()`; `friend class CasHotKeys` on `CasOperation`, for its private `gate`,
   `fits`, `reservedFor`, `observe` and `gaveUpAfterFailedObservation`; one field on `Conflict`,
   `any_ambiguous`, set where `writeLoop` returns it from the `WriteState` it already keeps and
@@ -84,7 +88,9 @@ Goals:
 Non-goals:
 
 - Making the remembered object a source of truth. It is a hint: a stale hint costs one 412 and one
-  resolve read on the write path, and one read on the verdict path, never correctness.
+  resolve read on the write path, one read on the verdict path, and, when the store answers the
+  hint's write with something other than the 412, that answer where a fresh read would have
+  rendered a verdict; never correctness.
 - Combining queued mutations into one `PUT`. Phase B, designed; its gate is the measured queue
   wait after this lands.
 - Pacing writes to a store's documented per-object rate. Phase B, for the `gcs` lane, on its own
@@ -143,8 +149,8 @@ public:
     using Decide = DecideOnObject;
 
     /// One hold on `key`: wait for the turn, obtain a base, run `decide`, one engine write,
-    /// remember. Returns what `readModifyWrite` would return for the same call, in class and
-    /// content, and propagates a `decide`'s exception as that verb does, never from a cached base.
+    /// remember. Returns the engine's own result for that write, in class and content, and
+    /// propagates a `decide`'s exception as `readModifyWrite` does, never from a cached base.
     WriteResult submit(const String & key, CasOperation & op, const Retry & policy, const Decide & decide);
 
     /// Test seams: items in the key's queue, the holder included (0 for a key with no lane);
@@ -317,10 +323,16 @@ snapshot was taken, inside a catch-all in the `tryLogCurrentException` shape.
    - An exception out of the engine's write: the entry is dropped and the exception propagates;
      the guard hands the key over.
 
-**What a hint can and cannot change.** The lane never delivers the `decide`'s verdict on a hint,
-and always delivers the store's answer to a write. The two are different in kind: a verdict is
-the caller's reasoning about bytes that may be stale, and can therefore be false; the store's
-answer is a fact about the store at that moment, whatever the caller thought, and is never false.
+**What a hint can and cannot change.** This is the cache's contract, and the one place the lane's
+results differ from a fresh read's. A miss on the write path is a 412: the engine settles it by
+its resolve read into `Conflict{seen}` and the caller decides again on `seen`, the path every
+caller already has for a precondition that moved. What a 412 cannot correct is a refusal without
+a write: a `decide` that throws a marker on a stale hint sends nothing, so nothing would ever
+refresh the hint; hence the rule that a verdict is rendered only on a fresh read. Beyond those
+two, the lane never delivers the `decide`'s verdict on a hint, and always delivers the store's
+answer to a write. The two are different in kind: a verdict is the caller's reasoning about bytes
+that may be stale, and can therefore be false; the store's answer is a fact about the store at
+that moment, whatever the caller thought, and is never false.
 `Committed` says the precondition held, so the hint was the store's state. `Conflict` says it did
 not, so the hint was stale, and sends the caller back with `seen`. `Refused` says the store
 refused that request. `GaveUp` says the fence, the lease, the deadline or the transport ended the
@@ -946,3 +958,14 @@ scenarios are named in "What a hint can and cannot change" and pinned by test 2.
 byte-weighted cache holding empty objects grows without bound; the entry weight now includes the
 key, the etag and a fixed allowance, so the byte budget bounds the count. The `single_attempt`
 fresh-read rule from revision 30 stays.
+
+Revision 32 removes a promise the cache cannot keep and that four review rounds had held the
+document to: Goals no longer say "no change to the semantics of any result or verdict a caller
+sees", and `submit`'s sketch no longer says it returns what `readModifyWrite` would for the same
+call. What the cache actually adds to a caller's experience is stated as its contract in the
+hold: a miss on the write path is a 412 settled into `Conflict`, the path every caller has; a
+verdict is rendered only on a fresh read, because a refusal without a write would never correct
+the hint; and the store's answer to a hint's write, whatever it is, is delivered, so a caller
+can receive `Refused` or `GaveUp` where a fresh read would have thrown a marker. Nothing else
+changed; the review prompt asks for scenarios against that contract instead of against
+equivalence with a fresh read.
