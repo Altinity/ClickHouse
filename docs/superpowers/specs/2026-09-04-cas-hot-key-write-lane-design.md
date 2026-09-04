@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 32, 2026-09-04. Phase A. Brainstormed against the measurements in
+Revision 33, 2026-09-04. Phase A. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
 this document supersedes where they differ. Revisions 1 to 26 designed a larger change (combining
@@ -333,8 +333,16 @@ two, the lane never delivers the `decide`'s verdict on a hint, and always delive
 answer to a write. The two are different in kind: a verdict is the caller's reasoning about bytes
 that may be stale, and can therefore be false; the store's answer is a fact about the store at
 that moment, whatever the caller thought, and is never false.
-`Committed` says the precondition held, so the hint was the store's state. `Conflict` says it did
-not, so the hint was stale, and sends the caller back with `seen`. `Refused` says the store
+`Committed` says the object at the key is the candidate: the precondition held, or, after an
+ambiguous attempt whose answer was lost, the store holds the candidate's bytes under a moved
+incarnation, which the backend contract treats as the write landing (`CasRequests.cpp:908-918`; in
+the contract's words, only once the precondition has moved does byte equality settle whether the
+new occupant is our own write). That rule is the engine's, not the lane's, and it applies today in
+the window between the verb's read and its write; a hint widens the window in which another actor
+may have written the identical candidate, and the outcome is the same: the state the caller asked
+for is durable under the store's etag, which is what `Committed` reports. Changing that rule would
+be a change to the backend contract, outside this design. `Conflict` says the precondition did
+not hold, so the hint was stale, and sends the caller back with `seen`. `Refused` says the store
 refused that request. `GaveUp` says the fence, the lease, the deadline or the transport ended the
 call, with `sent_any` saying whether an attempt went out. A write decided on a stale hint is
 conditional on the stale etag and cannot land; what it costs is one 412 and one resolve read, and
@@ -449,7 +457,7 @@ ticket is held across that mutex. Audit of every acquisition of `driver_mutex` i
 | `renewalLoop`, `remountLoop`, `sleepInterruptibly` | condition-variable waits and state reads; `remount_attempt()` runs after the lock is released |
 | `lockTerminalPublication` and its three callers | atomic stores of terminal state; no backend request |
 | `scheduleRemount` | a generation bump and a notify |
-| three test-only hooks: `renewal_parked_predicate_false_hook_for_test` (inside the renewal wait's predicate, `CasMountRuntime.cpp:672`), `remount_parked_hook_for_test` (`:776`), `terminal_publication_driver_lock_acquired_hook_for_test` (`:929`) | whatever a test installs; their contract, to be stated at their `PoolConfig` declarations: no backend request and no wait on the lane, or the test deadlocks itself. Empty in production; outside the proof below |
+| three test-only hooks: `renewal_parked_predicate_false_hook_for_test` (inside the renewal wait's predicate, `CasMountRuntime.cpp:672`), `remount_parked_hook_for_test` (`:776`), `terminal_publication_driver_lock_acquired_hook_for_test` (`:929`) | whatever a test installs; their contract, to be stated at their `MountConfig` declarations (`CasMountRuntime.h:79`, `:91`, `:99`): no backend request and no wait on the lane, or the test deadlocks itself. Empty in production; outside the proof below |
 
 Twenty-nine acquisition sites (`grep -c "lock(driver_mutex\|lock(runtime.driver_mutex"` on
 `CasMountRuntime.cpp` at brainstorm time, one of them `try_to_lock`), every one in the rows above.
@@ -723,7 +731,14 @@ tickets from `bytes` and appends its own, so order is visible in the object.
    real `beginRemoving` re-decides and resolves `AlreadyRemoving`, never `EntryChanged`. A hook
    fails the resolve read at the transport after a clean refusal: `Conflict{NotObserved}`, the
    caller pauses `conflictBackoff` and its next hold reads. A hook makes the write ambiguous and
-   refuses the resolve read by the bound: `GaveUp{Unresolved}`, the cache entry dropped. The
+   refuses the resolve read by the bound: `GaveUp{Deadline}` with the bound's source, or
+   `GaveUp{FenceLost}` when the fence refused it, `sent_any = true` (`gaveUpForReadStop`), the
+   cache entry dropped; a hook makes the write ambiguous and fails the resolve read at the
+   transport under `Retry::once`: `GaveUp{Unresolved, sent_any = true}`. A stale hint, another
+   server having written the identical candidate meanwhile, and the 412's response lost: the
+   resolve read finds the candidate's bytes under the moved incarnation and the caller receives
+   `Committed{the other's etag, resolved_by_read}`, the engine's own answer for the same sequence
+   in today's read-to-write window; the cache holds that object. The
    fence is tripped before the write: `GaveUp{FenceLost, sent_any = false}`, and the catalog caller
    returns `FencedOut`. The fence is tripped after the landed `PUT`: `GaveUp{FenceLost, sent_any =
    true}`, the object carries the ticket, the entry dropped. The engine call throws: the exception
@@ -969,3 +984,17 @@ the hint; and the store's answer to a hint's write, whatever it is, is delivered
 can receive `Refused` or `GaveUp` where a fresh read would have thrown a marker. Nothing else
 changed; the review prompt asks for scenarios against that contract instead of against
 equivalence with a fresh read.
+
+Revision 33 folds in the fifth `codex` review of the phase A document: one critical, argued, and
+two minors, folded. The critical: after an ambiguous attempt whose 412 was lost, the engine's
+resolve read treats the candidate's bytes under a moved incarnation as the write landing, so a
+stale hint and another server's identical candidate can end in `Committed` for a write that did
+not itself land. That is the backend contract's own rule (`CasRequests.cpp:908-918`, the
+contract's "only once the precondition has moved does byte equality settle whether the new
+occupant is our own write"), it applies today in the verb's read-to-write window, and the state
+the caller asked for is durable either way; the lane inherits it and changes nothing about it,
+the hint paragraph now says so, and test 2 pins the sequence to the engine's answer. Changing
+the rule is a change to the backend contract, not to this design. Minors: a resolve read refused
+by a bound is `GaveUp{Deadline}` or `GaveUp{FenceLost}` through `gaveUpForReadStop`, not
+`Unresolved`, and test 2 says which; the three test-only hooks under `driver_mutex` are
+`MountConfig`'s, not `PoolConfig`'s.
