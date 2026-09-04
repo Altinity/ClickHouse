@@ -1298,18 +1298,29 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
     const RootNamespace & ns, uint64_t admitted_generation, uint64_t live_epoch,
     bool * lifecycle_refusal)
 {
-    /// Bounded exactly like `CasRefCatalog::casUpdateImpl`'s own live-lock brake, but against THIS
-    /// loop's re-read cycle only -- every primitive called below already bounds its OWN retry against
-    /// the catalog's single contended object. A duel between two openers (one creating, one
-    /// reconciling a stale creator) converges in a handful of rounds; this guards only against a
-    /// pathologically un-converging sequence of them.
+    /// The SECONDARY bound. Wall-clock time is already bounded by the frozen policy below, which
+    /// every verb of every iteration shares; this cap exists so a sequence that somehow converges on
+    /// neither a resolution nor the deadline still ends. A duel between two openers (one creating, one
+    /// reconciling a stale creator) converges in a handful of rounds.
     static constexpr size_t kMaxResolveAttempts = 32;
     const CreatorFence our_fence{server_root_id, live_epoch, admitted_generation};
     CasOperation op = mount_requests.resume(admitted_generation);
 
+    /// ONE bound for the whole loop, frozen before the first iteration: every read and every protocol
+    /// call below shares this deadline, so a namespace whose catalog entry keeps moving gives up
+    /// retry-later within one standard window rather than spending a fresh window per verb per
+    /// iteration. The paced re-read below is a bare sleep that does not consult the deadline, so the
+    /// loop can sleep one backoff (at most 5 s) past it before the next read refuses to start.
+    const Retry policy = op.freeze(Retry::standard());
+
     for (size_t attempt = 0; attempt < kMaxResolveAttempts; ++attempt)
     {
-        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
+        /// Paces ONLY the re-reads a competing actor forced. A `Live` outcome is this open's own
+        /// success and its single confirming re-read is not contention, so it is never delayed. The
+        /// argument is the number of collisions so far, so the first one waits the shortest draw.
+        const auto paceReRead = [&] { op.pause(Retry::backoff(static_cast<uint32_t>(attempt) + 1)); };
+
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout, policy);
         const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
             [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
 
@@ -1321,12 +1332,14 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             /// catalog on the next loop iteration to learn it -- one extra GET, paid once per birth,
             /// never per write.
             const auto outcome = CasRefCatalog::createNamespace(
-                op, layout, config.gc_shards, ns, our_fence);
+                op, layout, config.gc_shards, ns, our_fence, policy);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
                     "birthing its catalog entry; the last attempt's fate is unresolved and nothing is "
                     "installed", ns.string()));
+            if (outcome == CasRefCatalog::NamespaceCreationOutcome::Superseded)
+                paceReRead();
             continue;   /// Live or Superseded: re-read (Superseded means a DIFFERENT actor won birth)
         }
 
@@ -1351,13 +1364,15 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// not dead), so this case is checked FIRST and unconditionally, before any terminality probe.
         if (it->creator->server_root_id == server_root_id && it->creator->writer_epoch == live_epoch)
         {
-            const auto outcome = CasRefCatalog::completeCreation(op, layout, *it);
+            const auto outcome = CasRefCatalog::completeCreation(op, layout, *it, policy);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
                     "resuming its own stalled creation; the last attempt's fate is unresolved and nothing "
                     "is installed",
                     ns.string()));
+            if (outcome == CasRefCatalog::NamespaceCreationOutcome::Superseded)
+                paceReRead();
             continue;   /// Live or Superseded: re-read either way
         }
 
@@ -1366,7 +1381,8 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
         /// steals it onto our own fence and this open resumes `completeCreation` itself.
         const auto reconcile_outcome = CasRefCatalog::reconcileStaleCreator(
             op, layout, *it, our_fence,
-            [&](const CreatorFence & f) { return isCreatorFenceTerminal(op, layout, f.server_root_id, f.writer_epoch); });
+            [&](const CreatorFence & f) { return isCreatorFenceTerminal(op, layout, f.server_root_id, f.writer_epoch, policy); },
+            policy);
         switch (reconcile_outcome)
         {
             case CasRefCatalog::ReconcileCreatorOutcome::FencedOut:
@@ -1381,13 +1397,15 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             {
                 CatalogEntry resumed = *it;
                 resumed.creator = our_fence;
-                const auto outcome = CasRefCatalog::completeCreation(op, layout, resumed);
+                const auto outcome = CasRefCatalog::completeCreation(op, layout, resumed, policy);
                 if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                     throwCasWriteRetryLater(fmt::format(
                         "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "
                         "completing a reconciled creation; the last attempt's fate is unresolved and "
                         "nothing is installed",
                         ns.string()));
+                if (outcome == CasRefCatalog::NamespaceCreationOutcome::Superseded)
+                    paceReRead();
                 continue;   /// Live or Superseded: re-read either way
             }
             case CasRefCatalog::ReconcileCreatorOutcome::CreatorFenceStillLive:
@@ -1397,7 +1415,9 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
                     "CAS ref-table recovery for namespace '{}': its catalog entry is still Creating "
                     "under a creator fence that is not yet provably dead; retry later", ns.string()));
             case CasRefCatalog::ReconcileCreatorOutcome::EntryChanged:
-                continue;   /// token-exactness failed: someone else already moved this entry; re-read
+                /// Token-exactness failed: someone else already moved this entry. Pace before re-reading.
+                paceReRead();
+                continue;
         }
     }
 

@@ -1243,9 +1243,9 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 }
 
 bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const String & server_root_id,
-                            uint64_t writer_epoch)
+                            uint64_t writer_epoch, const Retry & policy)
 {
-    const auto got = op.read(layout.mountKey(server_root_id), Retry::standard());
+    const auto got = op.read(layout.mountKey(server_root_id), policy);
     if (!got)
         return false;   /// absence proves nothing about liveness -- see the header doc
 

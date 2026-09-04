@@ -485,7 +485,7 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
 /// "unknown" (`false`, refuse) is the fail-closed choice on every path already listed above; there is
 /// no path where this function answers `true` on evidence weaker than one of the three certificates.
 bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const String & server_root_id,
-                            uint64_t writer_epoch);
+                            uint64_t writer_epoch, const Retry & policy = Retry::standard());
 
 /// Synchronous owner of the durable mount lease and merged build-watermark body. The stable
 /// `CasMountRuntime` is the sole driver: this class never creates a thread, invokes a callback into the

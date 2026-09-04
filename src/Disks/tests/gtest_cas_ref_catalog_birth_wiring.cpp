@@ -592,3 +592,85 @@ TEST(CASRefCatalogBirthWiring, ExactOldLifeCannotCancelReplacementTerminalCreati
     EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{successor});
 }
+
+namespace
+{
+
+/// Leaves the catalog holding a body no previously observed entry equals: every read first bumps each
+/// entry's creator fence generation, so `reconcileStaleCreator`'s token-exactness check refuses on
+/// every attempt and `resolveNamespaceLife`'s state machine can never converge.
+class ChurningCatalogBackend final : public InMemoryBackend
+{
+public:
+    explicit ChurningCatalogBackend(String catalog_key_)
+        : catalog_key(std::move(catalog_key_))
+    {
+    }
+
+    bool churning = false;
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (churning && key == catalog_key)
+            bumpEveryCreatorFence(access);
+        return InMemoryBackend::read(key, access);
+    }
+
+private:
+    /// Qualified calls, never the virtual ones: this must not re-enter its own churn.
+    void bumpEveryCreatorFence(DB::Cas::TransportAccess & access)
+    {
+        const std::optional<Raw> got = InMemoryBackend::read(catalog_key, access);
+        if (!got)
+            return;
+        RefCatalog catalog = decodeRefCatalog(got->bytes);
+        for (CatalogEntry & entry : catalog.entries)
+            if (entry.creator)
+                ++entry.creator->fence_generation;
+        (void)InMemoryBackend::write(catalog_key, encodeRefCatalog(catalog), got->value, access);
+    }
+
+    const String catalog_key;
+};
+
+}
+
+/// A catalog entry that moves under every read drives `resolveNamespaceLife`'s state machine for ever.
+/// One `Retry` frozen before the loop bounds the WHOLE resolution to a single standard window, and
+/// every re-read a competing actor forces is paced by a jittered sleep -- so a permanently churning
+/// catalog costs one window, not one fresh window per verb per iteration hammered with no wait between
+/// them.
+///
+/// What the clock bound below does NOT check: it bounds this call's own wall time, not the number of
+/// requests the loop sent, and it says nothing about the paths that converge.
+TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsWithinOneWindow)
+{
+    auto backend = std::make_shared<ChurningCatalogBackend>(Layout{"p"}.refCatalogKey());
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"churning_creating"};
+
+    /// A FOREIGN creator, so the loop takes the reconciliation branch on every iteration.
+    const CatalogEntry creating{
+        .ns = ns,
+        .state = NsState::Creating,
+        .incarnation = UInt128{0xc001},
+        .creator = CreatorFence{.server_root_id = "foreign-creator", .writer_epoch = 7, .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
+
+    auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
+    backend->churning = true;
+    const size_t pauses_before = clock->pauseCount();
+    const uint64_t now_before = clock->nowMs();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->namespaceLife(ns); });
+
+    /// Sixteen jittered draws cannot exhaust a 90 s window even at their ceiling, so an unpaced loop
+    /// reaches its iteration cap having slept nothing at all.
+    EXPECT_GE(clock->pauseCount() - pauses_before, 16u) << "each forced re-read is paced";
+    /// The frozen window, plus at most one backoff draw the pace does not consult the deadline for,
+    /// plus the virtual clock's one extra millisecond per pause.
+    EXPECT_LE(clock->nowMs() - now_before, 95'100u) << "one standard window bounds the whole loop";
+}

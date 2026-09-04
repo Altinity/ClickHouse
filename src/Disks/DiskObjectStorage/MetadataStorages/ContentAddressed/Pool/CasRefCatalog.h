@@ -246,7 +246,8 @@ public:
     /// creation's) and still throws `LOGICAL_ERROR` naming the observed state.
     static NamespaceCreationOutcome createNamespace(
         CasOperation & op, const Layout & layout, uint64_t gc_shards,
-        const RootNamespace & ns, const CreatorFence & creator);
+        const RootNamespace & ns, const CreatorFence & creator,
+        const Retry & policy = Retry::standard());
 
     /// Fires once, synchronously, right after `createNamespace`'s own pre-check read observed no
     /// entry and right before its step 1 performs its own (first) catalog read -- the exact window a
@@ -280,7 +281,8 @@ public:
     /// `publishCkpt`); a caller that manages to make BOTH stale sees `FencedOut`, not `Superseded` --
     /// both are truthful refusals of a CAS that was never sent.
     static NamespaceCreationOutcome completeCreation(
-        CasOperation & op, const Layout & layout, const CatalogEntry & observed);
+        CasOperation & op, const Layout & layout, const CatalogEntry & observed,
+        const Retry & policy = Retry::standard());
 
     /// Stale-`Creating` reconciliation (spec INV-3: "stalled creators occupy entries until
     /// fence-terminal reconciliation"; token-exactness is enforced right here, at this call site).
@@ -318,7 +320,8 @@ public:
     static ReconcileCreatorOutcome reconcileStaleCreator(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
         const CreatorFence & new_creator,
-        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
+        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+        const Retry & policy = Retry::standard());
 
     /// Spec §3: "`Creating` forbids publication -- no ref writes admitted while the entry is
     /// Creating." Throws `throwCasWriteRetryLater`'s class (transient: `Creating` resolves once the
