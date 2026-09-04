@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
@@ -148,7 +149,8 @@ constexpr size_t kMaxCatalogCasAttempts = 100;
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
 /// bytes to write: the plain path just grammar-checks (`encodeRefCatalog`), the admitting path also
 /// runs both admission predicates (`checkCatalogAdmission`) first. A refused precondition re-runs
-/// `mutate` against the FRESH body -- never re-encoding the stale candidate.
+/// `mutate` against the resolve read's fresh body -- the one the pool's hot-key lane remembers and
+/// the next hold starts from -- never re-encoding the stale candidate.
 RefCatalog casUpdateImpl(
     CasOperation & op, const Layout & layout,
     const std::function<RefCatalog(const RefCatalog &)> & mutate,
@@ -174,16 +176,31 @@ RefCatalog casUpdateImpl(
         return bytes;
     };
 
-    WriteResult result = op.readModifyWrite(key, decide, policy);
-    /// The fence can be lost in two places and both mean the same to a lifecycle caller: inside
-    /// `decide`, which throws the marker itself, and between two attempts, where the engine notices it
-    /// first and no further `decide` runs. Normalising the second onto the first is what keeps "the
-    /// fence moved" a returned outcome rather than an exception.
-    if (const auto * gave_up = std::get_if<GaveUp>(&result); gave_up && gave_up->why == GaveUp::Why::FenceLost)
-        throw CatalogFenceMovedMarker{};
-    if (!std::holds_alternative<Committed>(result))
-        throwCatalogWriteFailure(std::move(result), fmt::format("CAS ref catalog '{}' update", key));
-    return std::move(*written);
+    /// One hold at a time per pool on this key, from the pool's last known catalog when the lane holds
+    /// one. The loop is this function's: a `Conflict` is a lost race against another server (the lane
+    /// never conflicts with itself), repaid after the flat jitter, or after the growing schedule when
+    /// the conflict settled a transport fault. Under a single-attempt policy the first `Conflict` is
+    /// the answer, as the engine's own verb answers it.
+    const Retry frozen = op.freeze(policy);
+    uint32_t settled_faults = 0;
+    for (;;)
+    {
+        WriteResult result = op.hotKeys().submit(key, op, frozen, decide);
+        if (const auto * conflict = std::get_if<Conflict>(&result); conflict && !frozen.single_attempt)
+        {
+            op.pause(conflict->any_ambiguous ? Retry::backoff(++settled_faults) : Retry::conflictBackoff());
+            continue;
+        }
+        /// The fence can be lost in two places and both mean the same to a lifecycle caller: inside
+        /// `decide`, which throws the marker itself, and between two attempts, where the engine
+        /// notices it first and no further `decide` runs. Normalising the second onto the first is
+        /// what keeps "the fence moved" a returned outcome rather than an exception.
+        if (const auto * gave_up = std::get_if<GaveUp>(&result); gave_up && gave_up->why == GaveUp::Why::FenceLost)
+            throw CatalogFenceMovedMarker{};
+        if (!std::holds_alternative<Committed>(result))
+            throwCatalogWriteFailure(std::move(result), fmt::format("CAS ref catalog '{}' update", key));
+        return std::move(*written);
+    }
 }
 
 /// `casUpdate`'s own guard, shared with the two lifecycle callers that need to catch the fence marker
@@ -337,11 +354,22 @@ RefCatalog CasRefCatalog::casAdmitEntry(
         next.entries.insert(it, entry);
         return next;
     };
-    return casUpdateImpl(op, layout, mutate,
-        [&entry, gc_shards, &layout](const RefCatalog & c)
-        {
-            return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
-        });
+    try
+    {
+        return casUpdateImpl(op, layout, mutate,
+            [&entry, gc_shards, &layout](const RefCatalog & c)
+            {
+                return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
+            });
+    }
+    catch (const CatalogFenceMovedMarker &)
+    {
+        /// The marker is this file's private signal; a caller outside it gets the exception class every
+        /// other admission refusal raises.
+        throwCasTransientUnavailable(
+            fmt::format("CAS ref catalog '{}' update", layout.refCatalogKey()),
+            "mount fence tripped: the update was admitted under an incarnation this node no longer holds");
+    }
 }
 
 CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
@@ -663,6 +691,12 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     catch (const CatalogEntryAlreadyPresentMarker &)
     {
         return NamespaceCreationOutcome::Superseded;
+    }
+    catch (const CatalogFenceMovedMarker &)
+    {
+        /// The creator's own admission moved while step 1 waited its turn or wrote: an answer, not a
+        /// failure, and the same one the two later steps already give.
+        return NamespaceCreationOutcome::FencedOut;
     }
     return completeCreation(op, layout, entry, policy);
 }

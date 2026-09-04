@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasFence.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <IO/ReadBuffer.h>
@@ -122,6 +123,7 @@ namespace detail
 /// The engine's per-attempt counters, behind functions so the header need not declare the events.
 void recordAttempt();
 void recordReissue();
+void recordConflictPause();
 }
 
 class CasOperation;
@@ -140,9 +142,12 @@ public:
     /// `now_ms` defaults to `CLOCK_BOOTTIME` milliseconds -- the same clock a mount lease deadline is
     /// expressed on, so `Retry::untilLeaseSafe` and this engine compare like with like. `sleep_ms`
     /// defaults to a real sleep. `attempt_reservation_ms` is taken from the backend's own attempt
-    /// timeout: it is what the engine reserves before it starts anything.
+    /// timeout: it is what the engine reserves before it starts anything. `hot_keys` is the pool's
+    /// write lane, shared by its planes; without one this object owns a private lane with no cache,
+    /// so a write through it costs today's read and write.
     CasRequests(BackendPtr backend_, Fence fence_,
-                std::function<uint64_t()> now_ms_ = {}, std::function<void(uint64_t)> sleep_ms_ = {});
+                std::function<uint64_t()> now_ms_ = {}, std::function<void(uint64_t)> sleep_ms_ = {},
+                CasHotKeys * hot_keys_ = nullptr);
 
     /// Both may be called concurrently on one `CasRequests`: neither writes a member, and the only
     /// state either reads is the backend and the fence -- whose closures must therefore be thread-safe
@@ -168,6 +173,10 @@ public:
 
 private:
     friend class CasOperation;
+    /// `CasOperation::owner` is a `CasRequests &`: `CasOperation`'s own friendship with `CasHotKeys`
+    /// does not extend to what that reference points at, so the lane needs its own grant to reach the
+    /// clock and sleep it reads and paces through `op.owner`.
+    friend class CasHotKeys;
 
     /// The one place a transport key is created. Every verb reaches the store through this, so no
     /// engine code -- and nothing outside it -- can name the key's type, let alone construct one.
@@ -194,6 +203,9 @@ private:
     std::function<uint64_t()> now_ms;
     std::function<void(uint64_t)> sleep_ms;
     uint64_t attempt_reservation_ms;
+    /// The private lane of a `CasRequests` built without a pool; null when `hot_keys` is the pool's.
+    std::unique_ptr<CasHotKeys> own_hot_keys;
+    CasHotKeys * hot_keys;
 };
 
 /// The cap on one `removeManyWriteOnce` chunk -- also the ceiling a batch-delete request can carry.
@@ -221,6 +233,9 @@ public:
     /// The verdict point: is this operation still admitted? For the sites that guard a decision rather
     /// than a request.
     bool admitted() const { return gate(0) == Gate::Ok; }
+
+    /// The write lane for keys several writers of this pool share.
+    CasHotKeys & hotKeys() const { return *owner.hot_keys; }
 
     /// `policy` with its window turned into an absolute deadline on this operation's clock, taken NOW.
     /// A hand-written loop freezes its policy once before it starts and passes the frozen value to
@@ -272,6 +287,9 @@ public:
 
 private:
     friend class CasRequests;
+    /// The lane waits on this operation's own admission and reads and writes through its verbs; it
+    /// needs the gate, the reservation, the resolve read and the give-up helpers, never the transport.
+    friend class CasHotKeys;
 
     CasOperation(CasRequests & owner_, uint64_t admitted_generation_, Liveness liveness_)
         : owner(owner_), admitted_generation(admitted_generation_), liveness(std::move(liveness_))
@@ -357,6 +375,10 @@ private:
     /// Admission, then the jittered sleep. A value means the call ended during it; nullopt means the
     /// caller may send another attempt.
     std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry::Bound & bound);
+    /// The sibling for a clean lost race: the same admission and the same reservation, a flat
+    /// `Retry::conflictBackoff` sleep, and `state.reissues` untouched, so a transport fault that follows
+    /// starts its own schedule at the beginning.
+    std::optional<WriteResult> pauseForConflict(WriteState & state, const Retry::Bound & bound);
 
     /// `sleep_ms` plus `envelopes` attempt reservations, saturating.
     uint64_t reservedFor(uint64_t sleep_ms, uint32_t envelopes) const;

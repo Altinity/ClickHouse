@@ -26,6 +26,7 @@ namespace ProfileEvents
 {
     extern const Event CASRequestAttempt;
     extern const Event CASRequestReissue;
+    extern const Event CASRequestConflictPause;
     extern const Event CASRequestResolveRead;
     extern const Event CASRequestGaveUp;
     extern const Event CASRequestRefused;
@@ -56,6 +57,11 @@ void recordAttempt()
 void recordReissue()
 {
     ProfileEvents::increment(ProfileEvents::CASRequestReissue);
+}
+
+void recordConflictPause()
+{
+    ProfileEvents::increment(ProfileEvents::CASRequestConflictPause);
 }
 
 }
@@ -230,12 +236,15 @@ bool isDefinitelyRefusedWrite([[maybe_unused]] const std::exception & e)
 }
 
 CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
-                         std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_)
+                         std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_,
+                         CasHotKeys * hot_keys_)
     : backend(std::move(backend_))
     , fence(std::move(fence_))
     , now_ms(now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs))
     , sleep_ms(sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds))
     , attempt_reservation_ms(backend->attemptTimeoutMs())
+    , own_hot_keys(hot_keys_ ? nullptr : std::make_unique<CasHotKeys>(0))
+    , hot_keys(hot_keys_ ? hot_keys_ : own_hot_keys.get())
 {
 }
 
@@ -803,6 +812,23 @@ std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, con
     return std::nullopt;
 }
 
+std::optional<WriteResult> CasOperation::pauseForConflict(WriteState & state, const Retry::Bound & bound)
+{
+    const uint64_t pause_ms = Retry::conflictBackoff();
+    const uint64_t needed = reservedFor(pause_ms, 2);
+    switch (gate(needed))
+    {
+        case Gate::FenceLost: return gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), state);
+        case Gate::NoBudget:  return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
+        case Gate::Ok: break;
+    }
+    if (!fits(needed, bound))
+        return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
+    detail::recordConflictPause();
+    owner.sleep_ms(pause_ms);
+    return std::nullopt;
+}
+
 WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
                                     const Retry & policy, const Retry::Bound & bound, WriteState & state,
                                     ResolveWith resolve_refusal_with)
@@ -923,7 +949,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// Identical bytes here are somebody else's object, and the caller that owns the key's meaning
         /// decides what that means.
         if (!state.any_ambiguous)
-            return Conflict{state.last_seen, state.attempts_sent};
+            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous};
 
         if (!preconditionStillSatisfiable(state.last_seen, expected))
         {
@@ -934,7 +960,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             if (const auto * obj = std::get_if<Object>(&state.last_seen); obj && obj->bytes == bytes)
                 return postCommit(obj->etag, /*resolved_by_read=*/true, state, bound);
             /// Nothing of this inner write's is at the key, and a reissue would be refused too.
-            return Conflict{state.last_seen, state.attempts_sent};
+            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous};
         }
 
         /// Unresolved but repeatable: the precondition would still be met -- or nothing was observed at
@@ -996,7 +1022,10 @@ WriteResult CasOperation::readModifyWrite(const String & key, const DecideOnObje
 
         if (policy.single_attempt)
             return result;
-        if (auto given_up = pauseAndReissue(state, bound))
+        /// A clean lost race is settled: the resolve read holds the fresh object and the next
+        /// iteration decides on it. Only a conflict that settled a transport fault is paced by the
+        /// growing schedule.
+        if (auto given_up = state.any_ambiguous ? pauseAndReissue(state, bound) : pauseForConflict(state, bound))
             return *given_up;
 
         /// Only when the resolve settled nothing is a fresh read owed; otherwise `current` already is
@@ -1049,8 +1078,11 @@ WriteResult CasOperation::readModifyWriteOnPresence(const String & key, const De
             current.reset();
 
         if (policy.single_attempt)
-            return Conflict{state.last_seen, state.attempts_sent};
-        if (auto given_up = pauseAndReissue(state, bound))
+            return Conflict{state.last_seen, state.attempts_sent, state.any_ambiguous};
+        /// A clean lost race is settled: the resolve read holds the fresh object and the next
+        /// iteration decides on it. Only a conflict that settled a transport fault is paced by the
+        /// growing schedule.
+        if (auto given_up = state.any_ambiguous ? pauseAndReissue(state, bound) : pauseForConflict(state, bound))
             return *given_up;
 
         if (std::holds_alternative<NotObserved>(state.last_seen))

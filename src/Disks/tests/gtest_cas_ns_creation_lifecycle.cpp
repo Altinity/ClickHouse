@@ -361,8 +361,10 @@ TEST(CASNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndL
     /// `completeCreation` performs, since step 2 touches only the `_ckpt`. `decide` therefore receives
     /// the POST-steal body and refuses it without sending anything, which is what the entry check is
     /// for. The steal itself must succeed (asserted), so the mismatch is the entry ACTUALLY changing,
-    /// not a contrived stub. It runs on its own operation, because it is a different actor.
-    CasOperation thief_op = requests.admit();
+    /// not a contrived stub. It runs on its own operation and its own `CasRequests` (a rival is
+    /// another server; one server's writers never race each other on the pool's hot-key lane).
+    CasRequests rival_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation thief_op = rival_requests.admit();
     backend->hook_before_read_of = layout.refCatalogKey();
     backend->on_read = [&]
     {
@@ -414,7 +416,10 @@ TEST(CASNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheck
     /// check from that `mutate` and the entry check answers `Superseded` instead, because `decide`
     /// refuses the stale entry before any write is sent and the engine's own gate never speaks. The
     /// assertions below confirm the entry really did change too.
-    CasOperation thief_op = requests.admit();
+    /// The rival gets its own `CasRequests`, on its own hot-key lane (a rival is another server; one
+    /// server's writers never race each other on the pool's lane).
+    CasRequests rival_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation thief_op = rival_requests.admit();
     CasOperation creator_op = requests.admit([&backend] { return backend->admitted; });
     backend->hook_before_read_of = layout.refCatalogKey();
     backend->withdraw_on_read = true;

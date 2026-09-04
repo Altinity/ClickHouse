@@ -4122,3 +4122,59 @@ TEST(CASPool, MountpointObjectRoundTrip)
     EXPECT_FALSE(store->getMountpointObject(key).has_value());
     EXPECT_FALSE(store->mountpointObjectExists(key));
 }
+
+namespace ProfileEvents
+{
+    extern const Event CASHotKeyReadStarts;
+    extern const Event CASRequestResolveRead;
+    extern const Event CASRequestConflictPause;
+}
+
+TEST(CASPool, ConcurrentNamespaceCreationsNeverRaceEachOtherOnTheCatalog)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto pool = DB::Cas::tests::openPoolForTest(backend);
+    const DB::Cas::Layout layout("p");
+    const String key = layout.refCatalogKey();
+    constexpr int N = 6;
+
+    /// Drain whatever the pool's own bootstrap touched on the catalog key before measuring.
+    (void)pool->namespaceLife(DB::Cas::RootNamespace{"warmup"});
+
+    const uint64_t writes_before = backend->writeCount(key);
+    const auto reads_before = ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load();
+    const auto resolves_before = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load();
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N; ++i)
+        threads.emplace_back([&, i] { (void)pool->namespaceLife(DB::Cas::RootNamespace{"ns" + std::to_string(i)}); });
+    for (auto & t : threads)
+        t.join();
+
+    EXPECT_EQ(backend->writeCount(key) - writes_before, 2u * N) << "two catalog steps per creation, each one write";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load() - resolves_before, 0u)
+        << "no refused precondition, so no resolve read";
+    EXPECT_LE(ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load() - reads_before, 1u)
+        << "at most one lane read; every later hold started from the cache";
+
+    /// Another server writes the catalog between two of this pool's mutations: one extra read and one
+    /// retry write, then the cache is current again. Raw `getCount` cannot isolate that cost: a
+    /// `namespaceLife` call on a fresh namespace also issues the ledger's own snapshot reads
+    /// (`CasRefCatalog::read`), which are outside the lane by design and fire the same number of times
+    /// whether or not an external write happened. The lane's own signals are what the external write
+    /// actually moves.
+    {
+        auto external_requests = DB::Cas::tests::openRequestsForTest(backend);
+        auto external = external_requests.admit();
+        DB::Cas::CasRefCatalog::casAdmitEntry(external, layout, 1,
+            DB::Cas::CatalogEntry{.ns = DB::Cas::RootNamespace{"zz"}, .state = DB::Cas::NsState::Live, .incarnation = UInt128{99}});
+    }
+    const uint64_t writes_mid = backend->writeCount(key);
+    const auto resolves_mid = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load();
+    const auto lane_reads_mid = ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load();
+    (void)pool->namespaceLife(DB::Cas::RootNamespace{"after"});
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load() - resolves_mid, 1u)
+        << "one resolve read for the external write";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load() - lane_reads_mid, 0u)
+        << "the next hold starts from what the resolve read saw";
+    EXPECT_EQ(backend->writeCount(key) - writes_mid, 3u) << "one refused, two landed";
+}
