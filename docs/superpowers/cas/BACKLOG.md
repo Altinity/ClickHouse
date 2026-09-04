@@ -195,13 +195,13 @@ Until then the class is attributable on the lane by its exact line and key.
 - **Spec drift.** `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md` (revision 13)
   still prescribes `op.publish(…, Retry::once())` and "never the shared `standard`" for
   `ensureBlobPresent`; since the loop-deadline fix the publish runs under the loop's frozen policy made
-  single-attempt (one physical attempt, bounded by the loop's one deadline). Reword the spec sentence.
+  single-attempt (one physical attempt, bounded by the loop's one deadline). Reword the spec sentence. Owner: the spec's next revision (revision 14), one editing pass for all three recorded drifts (this one, `{#spec-drift-ref-lane-once}`, and the `isAccessTokenExpiredError` sentence under `{#codex-prod-review-2026-09-03-residue}`).
 - **`CasRefLedger::resolveNamespaceLife` is a third hand-written loop of the forbidden shape:** 32
   iterations, a fresh `Retry::standard()` window per verb, no pacing — the shape the spec's inventory
   rule forbids ("a hand-written loop captures one `Retry` before it starts, shares it across every call
   it makes"). Pre-existing, outside the fix round's brief. Placement: the same freeze-at-entry treatment
   as `deleteCompletedRemovingAtSnapshot` / `ensureBlobPresent` (commit 1effe101617), with a red-first
-  test that a perpetual conflict ends within one window; owner = the next engine task on this branch.
+  test that a perpetual conflict ends within one window; owner = the final fix round of the request-contract plan (2026-09-04), which freezes one policy at entry and paces the re-read arms.
 
 ### Spec drift: the ref-lane inventory row says `standard`, the coverage-gate paragraph and the code say `once` (2026-09-04) {#spec-drift-ref-lane-once}
 
