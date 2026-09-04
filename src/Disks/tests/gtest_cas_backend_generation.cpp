@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Disks/WriteMode.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 
@@ -36,6 +38,7 @@ using namespace DB::Cas;
 namespace DB::ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
+    extern const int CAS_WRITE_UNATTRIBUTED;
 }
 
 #if USE_AWS_S3
@@ -183,35 +186,49 @@ TEST(CASBackendGeneration, NativeHeadUsesNativeTokenMetadataApi)
     auto storage = makeRecordingObjectStorageForTest();
     auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
 
-    ASSERT_EQ(b->putIfAbsent("p/native-head/key", "v1").outcome, PutOutcome::Done);
+    /// Placed through the object storage: a Native write over a local storage has no response
+    /// incarnation to attribute itself to. Native passes the key verbatim, so this is the object the
+    /// HEAD below reads -- anchored under the storage's own root, since a bare relative key would
+    /// resolve beside the test process.
+    const String key = DB::Cas::tests::nativeKeyUnder(storage, "p/native-head/key");
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(key), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("v1"), *out);
+        out->finalize();
+    }
 
-    /// `putIfAbsent`'s HEAD-fallback stamping path calls the ordinary API;
-    /// reset the counters so only nativeHead's call, below, is observed.
+    /// Only nativeHead's own call may be observed.
     storage->ordinary_calls = 0;
     storage->native_calls = 0;
 
-    const auto hr = b->head("p/native-head/key");
+    const auto hr = b->head(key);
     ASSERT_TRUE(hr.exists);
     EXPECT_EQ(storage->native_calls, 1);
     EXPECT_EQ(storage->ordinary_calls, 0);
 }
 
-/// Every Token{...} the backend mints must carry native_token_type instead of a hardcoded
-/// TokenType::ETag (Task 5). Mode::Native over a LocalObjectStorage has no write-time ETag, so
-/// putIfAbsent's PutResult falls back to a HEAD internally — that HEAD is also a stamping site,
-/// so the assertion below exercises both the direct-etag and the HEAD-fallback mint paths.
+/// Every token the backend mints carries native_token_type rather than a hardcoded TokenType::ETag.
+/// The HEAD mint is the site exercised here; the write-response mint has its own tests over the fake
+/// S3 client below, which is the only place a Native write can produce a response incarnation.
 TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
 {
-    auto b = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
     b->setNativeTokenTypeForTest(TokenType::Generation);
 
-    const auto put = b->putIfAbsent("p/gen/tok", "v1");
-    EXPECT_EQ(put.token.type, TokenType::Generation);
+    /// A local file's etag is its mtime in nanoseconds, which is also a valid generation value.
+    const String key = DB::Cas::tests::nativeKeyUnder(storage, "p/gen/tok");
+    {
+        auto out = storage->writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite);
+        DB::writeString(String("v1"), *out);
+        out->finalize();
+    }
 
-    const auto hr = b->head("p/gen/tok");
+    const auto hr = b->head(key);
     ASSERT_TRUE(hr.exists);
     EXPECT_EQ(hr.token.type, TokenType::Generation);
+    EXPECT_EQ(b->dialect(), TokenType::Generation);
 }
 
 /// A generation-dialect (GCS) mount wants bucket versioning to be verifiably off: a token-exact
@@ -666,6 +683,27 @@ TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
     EXPECT_EQ(client->objects.at("p/gen/publish-no-generation"), "freshpayload");
 }
 
+/// The write-response half of the incarnation grammar: a write response that carries no ETag at all
+/// must not fall back to a HEAD -- there is no HEAD that can attribute the write with certainty, since
+/// the object it would read back might not even be the one this call just wrote. This is the
+/// ETag-dialect sibling of PublishBlobSucceedsWithoutResponseGeneration above: a publication has no
+/// incarnation to attribute in the first place, so it is unaffected by this guard. Default (ETag)
+/// dialect here, deliberately NOT stamped Generation, whose own two cases are covered by
+/// CASBackendGenerationS3.WriteEmptyGenerationIsUnattributed and WriteNonNumericGenerationIsUnattributed.
+TEST(CASBackendGrammar, NamelessWriteResponseThrowsWriteUnattributed)
+{
+    (void)getContext();
+    FakeGenerationS3Client * client = nullptr;
+    auto storage = makeGenerationS3ObjectStorageForTest(client);
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    ASSERT_EQ(backend.nativeTokenType(), TokenType::ETag);
+    client->put_returns_no_etag = true;
+
+    DB::Cas::tests::expectThrowsCode(
+        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED, [&] { backend.putIfAbsent("p/gen/nameless-write", "v"); });
+    EXPECT_EQ(client->put_object_calls, 1u);
+}
+
 /// The moved cap, end to end: a conditional write on a generation store stays in ONE PUT up to the
 /// cap the OBJECT STORAGE carries, and refuses rather than silently taking the multipart path above
 /// it -- GCS enforces no precondition on CompleteMultipartUpload.
@@ -682,7 +720,7 @@ TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPut
     EXPECT_NO_THROW(backend.casPut("p/gen/under-cap", small, std::nullopt, ObjectMeta{}));
     EXPECT_EQ(client->put_object_calls, 1u);
     EXPECT_EQ(client->create_multipart_calls, 0u);
-    const auto single_attempt_client = storage->getSingleAttemptClient();
+    const auto single_attempt_client = storage->getSingleAttemptClient(/*request_timeout_ms=*/0);
     EXPECT_NE(dynamic_cast<const FakeGenerationS3Client *>(single_attempt_client.get()), nullptr);
     EXPECT_NE(
         dynamic_cast<const DB::S3::SingleAttemptRetryStrategy *>(
@@ -711,20 +749,26 @@ TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPut
 /// the CAS layer receives in the shape production actually produces, which is why a mount that could
 /// never succeed passed every unit test. These three tests are that crossing.
 
-TEST_F(CASBackendGenerationS3, WriteEmptyGenerationThrows)
+TEST_F(CASBackendGenerationS3, WriteEmptyGenerationIsUnattributed)
 {
     backend = makeBackend();
+    client->next_put_etag = "";
+    /// The write may well have landed -- an empty response value says nothing about that -- so this is
+    /// the resolve-by-reading class, not the corrupt-response one.
     DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { backend->tokenFromWriteResult("p/gen/no-etag", String{}); });
+        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED,
+        [&] { backend->putIfAbsent("p/gen/no-etag", "v"); });
 }
 
-TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationThrows)
+TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationIsUnattributed)
 {
     backend = makeBackend();
+    /// An MD5-shaped ETag where a generation belongs: the store answered, but not with an incarnation
+    /// this dialect can use, and no follow-up read can attribute the write on its behalf.
+    client->next_put_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
     DB::Cas::tests::expectThrowsCode(
-        DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { backend->tokenFromWriteResult("p/gen/bad-etag", "\"d41d8cd98f00b204e9800998ecf8427e\""); });
+        DB::ErrorCodes::CAS_WRITE_UNATTRIBUTED,
+        [&] { backend->putIfAbsent("p/gen/bad-etag", "v"); });
 }
 
 /// A mutable conditional write whose response generation arrives quoted -- exactly what
@@ -733,8 +777,10 @@ TEST_F(CASBackendGenerationS3, WriteNonNumericGenerationThrows)
 TEST_F(CASBackendGenerationS3, WriteGenerationTokenStripsTransportQuoting)
 {
     backend = makeBackend();
-    const Token tok = backend->tokenFromWriteResult("p/gen/quoted-write", "\"1783078552147137\"");
-    EXPECT_EQ(tok, (Token{"1783078552147137", TokenType::Generation}));
+    client->next_put_etag = "\"1783078552147137\"";
+    const auto put = backend->putIfAbsent("p/gen/quoted-write", "v");
+    ASSERT_EQ(put.outcome, PutOutcome::Done);
+    EXPECT_EQ(put.token, (Token{"1783078552147137", TokenType::Generation}));
 }
 
 /// The same crossing on the read side: a marked HEAD whose ETag field carries a quoted generation

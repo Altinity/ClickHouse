@@ -63,6 +63,9 @@ void fenceOutMount(Backend & backend, const String & mount_key)
 class ToggleableTransportFaultBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::head;
+    using InMemoryBackend::list;
     /// Unhide the base convenience overloads, matching every other Backend subclass in this suite.
     using Backend::get;
     using Backend::getStream;
@@ -129,7 +132,7 @@ TEST(CASLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
     EXPECT_EQ(backend->putTotal(), 0u) << "a terminal-IdentityLost gate probe must never claim, allocate, or write";
-    EXPECT_GE(backend->headCount(meta_key), 1u) << "the gate still probes _pool_meta authoritatively";
+    EXPECT_GE(backend->headRequestCount(meta_key), 1u) << "the gate still probes _pool_meta authoritatively";
 }
 
 /// (a2) rev.8 worker-exit: `IdentityLost` is terminal, so the persistent self-remount worker must self-exit

@@ -143,6 +143,8 @@ bool pollUntil(Pred pred)
 class VanishMidTailOnceBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     using InMemoryBackend::get;   /// keep the one-arg convenience overload visible past our override
 
     String target_log_key;
@@ -172,6 +174,8 @@ public:
 class CorruptLogOnGetBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     using InMemoryBackend::get;   /// keep the one-arg convenience overload visible past our override
 
     String target_log_key;
@@ -202,6 +206,8 @@ public:
 class BlockingFirstLogGetBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     using InMemoryBackend::get;
 
     String refs_prefix;

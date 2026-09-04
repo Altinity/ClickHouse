@@ -120,9 +120,9 @@ void assertPartReads(
     const auto * entry = findEntry(manifest.entries, path);
     ASSERT_TRUE(entry != nullptr);
     auto loc = s->locate(*entry);
-    auto got = b->get(loc.key, Range{loc.offset, loc.length});
+    auto got = b->get(loc.key);
     ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->bytes, payload);
+    EXPECT_EQ(got->bytes.substr(static_cast<size_t>(loc.offset), static_cast<size_t>(loc.length)), payload);
 }
 
 }

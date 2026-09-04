@@ -141,6 +141,27 @@ inline DB::ContentAddressedSettings makeSettingsForTest(const std::string & serv
     return settings;
 }
 
+/// A clock that only ever moves when something sleeps on it, plus the record of every sleep it
+/// served. Injected into `CasRequests` so a policy's whole 90-second deadline is exercised in a test
+/// that takes no wall-clock time, and so the schedule itself -- how many pauses, how long -- becomes
+/// an assertion rather than a wait. Single-threaded by construction: two threads sharing one would
+/// race on both fields, so a concurrency test uses the real clock instead.
+struct FakeClock
+{
+    uint64_t now = 1'000'000;
+    std::vector<uint64_t> sleeps;
+
+    std::function<uint64_t()> nowFn() { return [this] { return now; }; }
+    std::function<void(uint64_t)> sleepFn()
+    {
+        return [this](uint64_t ms)
+        {
+            sleeps.push_back(ms);
+            now += ms;
+        };
+    }
+};
+
 /// Run `fn`, expect a DB::Exception with EXACTLY `expected_code` (CORRUPTED_DATA-vs-NOT_IMPLEMENTED
 /// is part of the fail-closed contract: an unknown future format must be NOT_IMPLEMENTED, never
 /// misreported as corruption).
@@ -1448,13 +1469,91 @@ inline std::vector<DB::Cas::RefOp> publishCommittedOps(const String & ref_name, 
 class CountingBackend : public DB::Cas::InMemoryBackend
 {
 public:
-    /// Unhide the base convenience overloads (omitted Range/ObjectMeta/expected-token forms): the
-    /// overrides below would otherwise shadow them for callers holding a concrete backend type.
+    /// Unhide the base overloads the legacy overrides below would otherwise shadow: the convenience
+    /// forms that omit Range/ObjectMeta/expected-token, and the transport primitives that share the
+    /// `head` and `list` names.
     using DB::Cas::Backend::get;
     using DB::Cas::Backend::getStream;
+    using DB::Cas::Backend::head;
+    using DB::Cas::Backend::list;
     using DB::Cas::Backend::putIfAbsent;
     using DB::Cas::Backend::putOverwrite;
     using DB::Cas::Backend::casPut;
+
+    /// ---- The transport primitives: every PHYSICAL request, whichever surface it entered through ----
+    ///
+    /// Counted apart from the legacy counters below, which split by the surface the CALLER used. A
+    /// `CasRequests` call speaks only these, so an engine test asserting `putTotal` would assert on a
+    /// surface the engine never touches. Each counter ticks BEFORE the request is served, so an
+    /// injected failure still counts as a request issued.
+    ///
+    /// A legacy call is counted here TOO, because it reaches the store through its primitive -- with
+    /// the two exceptions `InMemoryBackend` documents, `putIfAbsent` and `casPut`, which route around
+    /// the primitive to keep their write knobs' verb identity and so land only on the legacy counters.
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++read_requests;
+            ++read_request_counts[key];
+        }
+        return InMemoryBackend::read(key, access);
+    }
+
+    std::optional<DB::Cas::Backend::RawMeta> head(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++head_requests;
+            ++head_request_counts[key];
+        }
+        return InMemoryBackend::head(key, access);
+    }
+
+    DB::Cas::Backend::RawListPage list(const String & prefix, const String & cursor, size_t limit,
+                                       DB::Cas::TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++list_requests;
+            ++list_request_counts[prefix];
+        }
+        return InMemoryBackend::list(prefix, cursor, limit, access);
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++write_requests;
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+
+    DB::Cas::Backend::RawRemoval remove(const String & key, const String & expected_value,
+                                        DB::Cas::TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(count_mutex);
+            ++remove_requests;
+        }
+        return InMemoryBackend::remove(key, expected_value, access);
+    }
+
+    /// Per-key counterparts of the three READ primitives. The aggregate counters above cannot say
+    /// WHICH key a request went to, and the legacy per-key counters below never see a caller that
+    /// speaks the primitives -- `probeSentinelRaw` is one, so a probe is invisible to `headCount`.
+    uint64_t readRequestCount(const String & key) const { return lookup(read_request_counts, key); }
+    uint64_t headRequestCount(const String & key) const { return lookup(head_request_counts, key); }
+    uint64_t listRequestCount(const String & prefix) const { return lookup(list_request_counts, prefix); }
+
+    uint64_t readRequests() const { std::lock_guard lock(count_mutex); return read_requests; }
+    uint64_t headRequests() const { std::lock_guard lock(count_mutex); return head_requests; }
+    uint64_t listRequests() const { std::lock_guard lock(count_mutex); return list_requests; }
+    uint64_t writeRequests() const { std::lock_guard lock(count_mutex); return write_requests; }
+    uint64_t removeRequests() const { std::lock_guard lock(count_mutex); return remove_requests; }
 
     DB::Cas::HeadResult head(const String & key) override
     {
@@ -1651,7 +1750,10 @@ public:
         whole_get_counts.clear();
         head_total = get_total = put_total = cas_put_total = get_stream_total = list_total = delete_total = 0;
         put_overwrite_total = 0;
-
+        read_requests = head_requests = list_requests = write_requests = remove_requests = 0;
+        read_request_counts.clear();
+        head_request_counts.clear();
+        list_request_counts.clear();
     }
 
 private:
@@ -1681,6 +1783,14 @@ private:
     uint64_t get_stream_total = 0;
     uint64_t list_total = 0;
     uint64_t delete_total = 0;
+    std::map<String, uint64_t> read_request_counts;
+    std::map<String, uint64_t> head_request_counts;
+    std::map<String, uint64_t> list_request_counts;
+    uint64_t read_requests = 0;
+    uint64_t head_requests = 0;
+    uint64_t list_requests = 0;
+    uint64_t write_requests = 0;
+    uint64_t remove_requests = 0;
 };
 
 /// Records the ORDER of body-PUT / `_ckpt`-CAS operations (so a test can compare indices) and lets a
@@ -1809,6 +1919,8 @@ template <typename Base>
 class HintHoleBackendOn : public Base
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using Base::list;
     /// Hide every key under `prefix` from LIST -- a whole namespace, including objects a later publish
     /// adds.
     void hidePrefix(const String & prefix)

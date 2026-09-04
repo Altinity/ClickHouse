@@ -44,6 +44,8 @@ const String kProbeUid2 = "fedcba9876543210fedcba9876543210";
 class RecordingBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     using Backend::get;
     using Backend::getStream;
     using Backend::putIfAbsent;

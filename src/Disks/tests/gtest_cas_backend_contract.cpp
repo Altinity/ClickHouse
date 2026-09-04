@@ -76,14 +76,17 @@ TEST_P(CASBackendContract, DeleteNotFound)
     EXPECT_EQ(b->deleteExact("k", t1).kind, DeleteOutcome::Kind::NotFound);
 }
 
-TEST_P(CASBackendContract, RangeGet)
+/// `Range` is retired for materialized reads: a non-whole window is REFUSED rather than served, so
+/// no caller can silently receive a partial body where it expected the object.
+TEST_P(CASBackendContract, RangedGetIsRefusedAndTheWholeReadStillServes)
 {
     auto b = GetParam()();
     b->putIfAbsent("k", "0123456789");
     Range r;
     r.offset = 2;
     r.length = 3u;
-    EXPECT_EQ(b->get("k", r)->bytes, "234");
+    EXPECT_THROW(b->get("k", r), DB::Exception);
+    EXPECT_EQ(b->get("k")->bytes, "0123456789");
 }
 
 TEST_P(CASBackendContract, Head)

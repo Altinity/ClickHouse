@@ -1217,6 +1217,21 @@ public:
     ListPage list(const String & prefix, const String & cursor, size_t limit) override { return inner->list(prefix, cursor, limit); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
+    /// The transport primitives forward to `inner`; the legacy overrides above are what this
+    /// double injects through. Declared because `Backend` declares them pure.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override { return inner->read(key, access); }
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        return inner->write(key, bytes, expected_value, access);
+    }
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override { return inner->stream(key, access); }
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override { inner->publish(request, access); }
+    DB::Cas::Dialect dialect() const override { return inner->dialect(); }
+
 private:
     std::shared_ptr<InMemoryBackend> inner;
     String fail_prefix;

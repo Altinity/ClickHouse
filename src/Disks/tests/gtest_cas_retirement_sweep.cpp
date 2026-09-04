@@ -63,6 +63,8 @@ namespace
 class HoleyListBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     void omitFromNthListCall(const String & key, size_t nth)
     {
         std::lock_guard lock(m);
@@ -114,6 +116,8 @@ private:
 class RefPrefixListCountingBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     String refs_prefix;
     String janitor_prefix;
     std::atomic<size_t> ref_prefix_lists{0};

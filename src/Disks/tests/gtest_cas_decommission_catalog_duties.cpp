@@ -56,6 +56,8 @@ bool slotObjectExists(Backend & backend, const String & leaf)
 class AddVictimEntryDuringRootDrainBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     void arm() { armed = true; }
     bool fired() const { return added; }
 
@@ -89,6 +91,8 @@ private:
 class MutateCatalogBetweenRetirementReadsBackend final : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     void arm() { armed = true; }
     bool fired() const { return added; }
 

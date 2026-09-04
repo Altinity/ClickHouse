@@ -8,7 +8,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/WriteMode.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/WriteHelpers.h>
 
 #include <atomic>
 #include <filesystem>
@@ -32,39 +34,37 @@ namespace
 
 using DB::Cas::tests::nativeKeyUnder;
 
-/// A Backend decorator whose head/get/list all throw an untyped runtime error when armed — modelling
+/// A Backend decorator whose read/head/list all throw an untyped runtime error when armed — modelling
 /// a backend with no sharper evidence than "something went wrong" (a network timeout, a 5xx, an
-/// unclassifiable failure). Mirrors the existing MetaWriteFaultBackend fault-injection pattern
-/// (cas_test_helpers.h): every other operation delegates to InMemoryBackend unchanged.
+/// unclassifiable failure). The fault is injected on the PRIMITIVES, which is what
+/// `Backend::probeSentinelRaw`'s default derives its answer from; every other operation delegates to
+/// InMemoryBackend unchanged.
 class TransportFaultBackend final : public InMemoryBackend
 {
 public:
-    /// Unhide the base convenience overloads, matching every other Backend subclass in this suite.
-    using Backend::get;
     using Backend::getStream;
-    using Backend::putIfAbsent;
-    using Backend::putOverwrite;
-    using Backend::casPut;
+    using Backend::head;
+    using Backend::list;
 
-    HeadResult head(const String & key) override
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (fail.load())
             throw std::runtime_error("injected fault: transport error");
-        return InMemoryBackend::head(key);
+        return InMemoryBackend::head(key, access);
     }
 
-    std::optional<GetResult> get(const String & key, Range range) override
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (fail.load())
             throw std::runtime_error("injected fault: transport error");
-        return InMemoryBackend::get(key, range);
+        return InMemoryBackend::read(key, access);
     }
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
         if (fail.load())
             throw std::runtime_error("injected fault: transport error");
-        return InMemoryBackend::list(prefix, cursor, limit);
+        return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 
     std::atomic<bool> fail{true};
@@ -129,7 +129,14 @@ TEST(CASSentinelProbe, NativePresentKeyReturnsPresentWithBody)
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
     const String key = nativeKeyUnder(storage, "some/key");
 
-    ASSERT_EQ(backend.putIfAbsent(key, "native body").outcome, PutOutcome::Done);
+    /// Placed through the object storage: a Native write over a local storage has no response
+    /// incarnation to attribute itself to. Native passes the key verbatim, so this is the object the
+    /// probe reads.
+    {
+        auto out = storage->writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite);
+        DB::writeString(String("native body"), *out);
+        out->finalize();
+    }
 
     const auto result = probeSentinel(backend, key);
     EXPECT_EQ(result.outcome, ProbeOutcome::Present);
@@ -152,30 +159,44 @@ TEST(CASSentinelProbe, TransportErrorNeverClassifiesAsAbsent)
 namespace
 {
 
-/// A `LocalObjectStorage` whose `getObjectMetadata` can be armed to throw a configurable synthetic
+/// A `LocalObjectStorage` whose object ACCESS can be armed to throw a configurable synthetic
 /// `S3Exception` — the same technique `gtest_cas_backend.cpp`'s `NativeReadThrowsNoSuchKeyObjectStorage`
 /// uses to exercise S3 error codes without a live S3 endpoint. Constructing `ObjectStorageBackend` in
 /// `Mode::Native` over this fake is the established pattern for testing the Native/S3 raw-error classifier
 /// in isolation (see also `gtest_cas_backend.cpp`'s `NativeRejectsWrongDialectTokenBeforeTouchingTheWire`).
-class ThrowingS3MetadataObjectStorage final : public DB::LocalObjectStorage
+/// Both the read and the metadata surface throw: the Native sentinel probe issues one READ, and a
+/// store that answers an error for a key answers it however the key is touched.
+class ThrowingS3ObjectStorage final : public DB::LocalObjectStorage
 {
 public:
     using DB::LocalObjectStorage::LocalObjectStorage;
 
-    void throwOnGetObjectMetadata(Aws::S3::S3Errors code) { metadata_error = code; }
+    void throwOnObjectAccess(Aws::S3::S3Errors code) { access_error = code; }
+
+    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
+        const DB::StoredObject & object,
+        const DB::ReadSettings & read_settings,
+        std::optional<size_t> read_hint,
+        bool use_external_buffer,
+        bool restrict_seek) const override
+    {
+        if (access_error)
+            throw DB::S3Exception("injected fault: " + object.remote_path, *access_error);
+        return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
+    }
 
     DB::ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
     {
-        if (metadata_error)
-            throw DB::S3Exception("injected fault: " + path, *metadata_error);
+        if (access_error)
+            throw DB::S3Exception("injected fault: " + path, *access_error);
         return DB::LocalObjectStorage::getObjectMetadata(path, with_tags);
     }
 
 private:
-    std::optional<Aws::S3::S3Errors> metadata_error;
+    std::optional<Aws::S3::S3Errors> access_error;
 };
 
-DB::ObjectStoragePtr makeThrowingS3MetadataStorageForTest()
+DB::ObjectStoragePtr makeThrowingS3StorageForTest()
 {
     static std::atomic<uint64_t> counter{0};
     const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
@@ -186,7 +207,7 @@ DB::ObjectStoragePtr makeThrowingS3MetadataStorageForTest()
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<ThrowingS3MetadataObjectStorage>(std::move(settings));
+    return std::make_shared<ThrowingS3ObjectStorage>(std::move(settings));
 }
 
 }
@@ -195,8 +216,8 @@ DB::ObjectStoragePtr makeThrowingS3MetadataStorageForTest()
 /// error must classify EXACTLY, and anything unmodeled must fail closed to Indeterminate.
 TEST(CASSentinelProbe, NativeClassifiesNoSuchKeyAsKeyAbsent)
 {
-    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
-    storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_KEY);
+    auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
+    storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_KEY);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
@@ -208,8 +229,8 @@ TEST(CASSentinelProbe, NativeClassifiesNoSuchKeyAsKeyAbsent)
 /// `NO_SUCH_KEY`. Without classifying it, every real-S3 absence would be `Indeterminate` forever.
 TEST(CASSentinelProbe, NativeClassifiesResourceNotFoundAsKeyAbsent)
 {
-    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
-    storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
+    auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
+    storage->throwOnObjectAccess(Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
@@ -217,8 +238,8 @@ TEST(CASSentinelProbe, NativeClassifiesResourceNotFoundAsKeyAbsent)
 
 TEST(CASSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
 {
-    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
-    storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_BUCKET);
+    auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
+    storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_BUCKET);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
@@ -226,8 +247,8 @@ TEST(CASSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
 
 TEST(CASSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
 {
-    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
-    storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::ACCESS_DENIED);
+    auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
+    storage->throwOnObjectAccess(Aws::S3::S3Errors::ACCESS_DENIED);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::AccessDenied);
@@ -235,8 +256,8 @@ TEST(CASSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
 
 TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
 {
-    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
-    storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::SERVICE_UNAVAILABLE);
+    auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
+    storage->throwOnObjectAccess(Aws::S3::S3Errors::SERVICE_UNAVAILABLE);
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
 
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::Indeterminate);
@@ -252,8 +273,8 @@ TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
 /// reached through the wrapper.
 TEST(CASSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
 {
-    auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
-    storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_BUCKET);
+    auto storage = std::static_pointer_cast<ThrowingS3ObjectStorage>(makeThrowingS3StorageForTest());
+    storage->throwOnObjectAccess(Aws::S3::S3Errors::NO_SUCH_BUCKET);
     auto inner = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
     InstrumentedBackend instrumented(inner);
 

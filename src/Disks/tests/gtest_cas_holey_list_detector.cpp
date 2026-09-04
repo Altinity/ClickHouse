@@ -56,6 +56,8 @@ namespace
 class HoleyListBackend : public InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using InMemoryBackend::list;
     /// Omit `key` from the `nth` (0-based) subsequent qualifying `list` call. Resets the counter.
     void omitFromNthListCall(const String & key, size_t nth)
     {

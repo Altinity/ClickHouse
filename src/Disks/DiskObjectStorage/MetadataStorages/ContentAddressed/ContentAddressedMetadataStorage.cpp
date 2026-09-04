@@ -681,8 +681,6 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     const auto mode = object_storage->getType() == ObjectStorageType::Local
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
         : Cas::ObjectStorageBackend::Mode::Native;
-    auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode);
-    const Cas::TokenType backend_token_type = backend->nativeTokenType();
 
     /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
@@ -765,10 +763,19 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.event_sink = makeCasEventSink();
 
+    /// Built here rather than above so it carries the budget the pool was configured with. Only a
+    /// WRITABLE Native mount takes the single-attempt profile for its control-plane requests: it owns
+    /// its own deadline and retry policy, and a transparently retried request would outlive them. A
+    /// read-only mount has no such deadline, so it keeps the storage's default.
+    auto backend = std::make_shared<Cas::ObjectStorageBackend>(
+        object_storage, mode,
+        /*single_attempt_control_plane_=*/!read_only && mode == Cas::ObjectStorageBackend::Mode::Native,
+        pool_config.cas_request_budget.attempt_timeout_ms);
+
     PoolView view;
     view.physical_key_prefix = physical_key_prefix_local;
     view.pool_prefix = pool_prefix;
-    view.native_token_type = backend_token_type;
+    view.native_token_type = backend->nativeTokenType();
     view.pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
     return view;
 }

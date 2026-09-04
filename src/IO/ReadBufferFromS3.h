@@ -91,6 +91,10 @@ public:
     /// This method returns metadata from the last request. If there were no requests, it will throw exception.
     ObjectMetadata getObjectMetadataFromTheLastRequest() const;
 
+    /// True when a reissued GET answered with a different ETag than the first one did, i.e. the bytes
+    /// this buffer produced may come from more than one incarnation of the object.
+    bool responseIdentityChanged() const { return response_identity_changed; }
+
     size_t getReadUntilPosition() const { return read_until_position; }
 
     std::string getStopReason() const { return stop_reason; }
@@ -110,6 +114,9 @@ private:
     size_t getObjectSizeFromS3() const;
 
     Aws::S3::Model::GetObjectResult sendRequest(size_t attempt, size_t range_begin, std::optional<size_t> range_end_incl) const;
+
+    std::optional<String> first_response_etag;
+    bool response_identity_changed = false;
 
     ReadSettings read_settings;
 

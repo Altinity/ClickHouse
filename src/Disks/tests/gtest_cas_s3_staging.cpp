@@ -202,6 +202,10 @@ public:
 
     explicit EtagFaithfulPublicationBackend(FaultScript script_) : script(script_) {}
 
+    /// Unhide the transport primitive that shares this name; the legacy override below is what the
+    /// production sites this double instruments still call.
+    using DB::Cas::Backend::head;
+
     DB::Cas::HeadResult head(const String & key) override
     {
         DB::Cas::HeadResult result = DB::Cas::InMemoryBackend::head(key);
@@ -1035,6 +1039,47 @@ public:
         return tryGetObjectMetadata(path, with_tags);
     }
 
+    /// This fake advertises every retry profile, and an in-memory store has no retry behaviour to
+    /// vary, so the profile-aware overloads simply forward. A storage that claimed the capability
+    /// without implementing them would refuse every control-plane request of a writable mount.
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadataWithNativeToken(
+        const std::string & path, bool with_tags, DB::ObjectStorageRetryProfile, uint64_t) const override
+    {
+        return tryGetObjectMetadata(path, with_tags);
+    }
+
+    DB::ObjectStorageIteratorPtr iterate(
+        const std::string & path_prefix, size_t max_keys, bool with_tags, const std::optional<std::string> & start_after,
+        DB::ObjectStorageRetryProfile, uint64_t) const override
+    {
+        return DB::LocalObjectStorage::iterate(path_prefix, max_keys, with_tags, start_after);
+    }
+
+    DB::ConditionalRemoveResult removeObjectIfTokenMatches(
+        const DB::StoredObject & object, const std::string & etag, DB::ObjectStorageRetryProfile, uint64_t) override
+    {
+        return removeObjectIfTokenMatches(object, etag);
+    }
+    using DB::LocalObjectStorage::removeObjectIfTokenMatches;
+
+    /// A real S3 GET answers with the object's incarnation, which is what the backend reads its
+    /// bytes AND its generation from in one request. Quoted, the way the SDK's ETag field carries a
+    /// generation across the HTTP boundary.
+    DB::SmallObjectDataWithMetadata readSmallObjectAndGetObjectMetadata(
+        const DB::StoredObject & object, const DB::ReadSettings &, size_t, std::optional<size_t>) const override
+    {
+        std::lock_guard lock(mutex);
+        auto it = objects.find(object.remote_path);
+        if (it == objects.end())
+            throw DB::S3Exception("FakeGenerationObjectStorage: object does not exist",
+                                   Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
+        DB::SmallObjectDataWithMetadata result;
+        result.data = it->second.bytes;
+        result.metadata.size_bytes = it->second.bytes.size();
+        result.metadata.etag = "\"" + std::to_string(it->second.generation) + "\"";
+        return result;
+    }
+
     void removeObjectIfExists(const DB::StoredObject & object) override
     {
         std::lock_guard lock(mutex);
@@ -1093,7 +1138,9 @@ public:
     /// stores `bytes` and mints the next generation. Throws an `S3Exception` naming `PreconditionFailed`
     /// on a lost condition -- the one signal `finalizeConditionalWrite` classifies as
     /// `PutOutcome::PreconditionFailed` rather than an ordinary failure.
-    void commitConditionalWrite(const std::string & key, const std::string & bytes,
+    /// Returns the generation it minted, the way a real store returns it in the write response: the
+    /// backend attributes the write to that generation and nothing reads it back.
+    uint64_t commitConditionalWrite(const std::string & key, const std::string & bytes,
                                  const std::string & if_none_match, const std::string & if_match)
     {
         std::lock_guard lock(mutex);
@@ -1106,7 +1153,9 @@ public:
             throw DB::S3Exception("FakeGenerationObjectStorage: if-match precondition failed",
                                    Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed");
 
-        objects[key] = Entry{bytes, next_generation++};
+        const uint64_t generation = next_generation++;
+        objects[key] = Entry{bytes, generation};
+        return generation;
     }
 
 private:
@@ -1132,6 +1181,10 @@ private:
         void sync() override {}
         std::string getFileName() const override { return key; }
 
+        /// The write response's own incarnation, quoted the way the SDK's ETag field carries a GCS
+        /// generation across the HTTP boundary -- the backend is what strips that transport syntax.
+        std::optional<std::string> getResultObjectETag() const override { return committed_generation; }
+
     protected:
         void nextImpl() override
         {
@@ -1143,7 +1196,7 @@ private:
         void finalizeImpl() override
         {
             next();
-            storage.commitConditionalWrite(key, buffered, if_none_match, if_match);
+            committed_generation = "\"" + std::to_string(storage.commitConditionalWrite(key, buffered, if_none_match, if_match)) + "\"";
         }
 
     private:
@@ -1152,6 +1205,7 @@ private:
         std::string if_none_match;
         std::string if_match;
         std::string buffered;
+        std::optional<std::string> committed_generation;
     };
 
     mutable std::mutex mutex;

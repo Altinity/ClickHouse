@@ -3,6 +3,7 @@
 #include <Common/IThrottler.h>
 #include <Common/Scheduler/ResourceLink.h>
 #include <IO/DistributedCacheSettings.h>
+#include <IO/ObjectStorageRequestMode.h>
 
 #include <optional>
 
@@ -26,16 +27,6 @@ enum class ObjectStorageCopyMode : uint8_t
 {
     Default,
     NativeOnly,
-};
-
-/// Per-request GCS conditional-dialect opt-in, carried alongside the write itself so it survives
-/// into the object storage request that ends up on the wire (see `RequestWithNativeConditionalMode`).
-/// NativeConditional: this write is content-addressed-storage-owned and may use GCS generation
-/// tokens instead of the AWS-style ETag plumbing, when the client's HTTP layer supports it.
-enum class ObjectStorageRequestMode : uint8_t
-{
-    Default,
-    NativeConditional,
 };
 
 /// Settings to be passed to IDisk::writeFile()
@@ -89,6 +80,10 @@ struct WriteSettings
     /// Selects the retry profile the object storage should execute this write under; see
     /// ObjectStorageRetryProfile.
     ObjectStorageRetryProfile object_storage_retry_profile = ObjectStorageRetryProfile::Default;
+
+    /// Request timeout (send/receive inactivity bound) for the single-attempt client selected by
+    /// `object_storage_retry_profile == SingleAttempt`. 0 = the storage's configured timeout.
+    uint64_t object_storage_attempt_timeout_ms = 0;
 
     /// Selects the transport requirement for an object storage copy; see `ObjectStorageCopyMode`.
     ObjectStorageCopyMode object_storage_copy_mode = ObjectStorageCopyMode::Default;

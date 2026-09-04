@@ -493,9 +493,12 @@ TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     EXPECT_GE(e1, 1u);                                             // 0 is a reserved sentinel
     EXPECT_GT(e2, e1);                                             // strictly increasing
 
-    /// Deleting the (separate) mount object must NOT reset the epoch. No mount has been written in
-    /// Task 4, so deleteExact of a non-existent mount is a NotFound no-op that touches nothing.
-    const auto del = b->deleteExact(l.mountKey("r"), b->head(l.mountKey("r")).token);
+    /// Deleting the (separate) mount object must NOT reset the epoch. No mount has been written yet,
+    /// so deleteExact of it is a NotFound no-op that touches nothing -- exercised with a well-formed
+    /// placeholder token, not the absent HeadResult's empty one: InMemoryBackend refuses a malformed
+    /// token as a caller bug before it ever looks the key up, exactly like the production backend.
+    ASSERT_FALSE(b->head(l.mountKey("r")).exists);
+    const auto del = b->deleteExact(l.mountKey("r"), Token{"absent", TokenType::Emulated});
     EXPECT_EQ(del.kind, DeleteOutcome::Kind::NotFound);
     EXPECT_GT(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), e2);
 }
@@ -983,6 +986,21 @@ public:
     DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, b, e, m); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+    /// The transport primitives forward to `inner`; the legacy overrides above are what this
+    /// double injects through. Declared because `Backend` declares them pure.
+    std::optional<Raw> read(const String & key, TransportAccess & access) override { return inner->read(key, access); }
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        return inner->write(key, bytes, expected_value, access);
+    }
+    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override { return inner->stream(key, access); }
+    void publish(const BlobPublishRequest & request, TransportAccess & access) override { inner->publish(request, access); }
+    Dialect dialect() const override { return inner->dialect(); }
 
 private:
     std::shared_ptr<DB::Cas::Backend> inner;

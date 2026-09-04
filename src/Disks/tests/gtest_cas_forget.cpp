@@ -82,6 +82,9 @@ void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
 class ToggleableTransportFaultBackend final : public DB::Cas::InMemoryBackend
 {
 public:
+    /// Unhide the primitive overload that the legacy override below would otherwise hide.
+    using DB::Cas::InMemoryBackend::head;
+    using DB::Cas::InMemoryBackend::list;
     using Backend::get;
     using Backend::getStream;
     using Backend::putIfAbsent;

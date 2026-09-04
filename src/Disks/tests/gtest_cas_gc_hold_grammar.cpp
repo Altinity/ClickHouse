@@ -1485,6 +1485,8 @@ TEST(CASGCHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
     class BroadListHoleBackend : public InMemoryBackend
     {
     public:
+        /// Unhide the primitive overload that the legacy override below would otherwise hide.
+        using InMemoryBackend::list;
         String hide_under_prefix;
         String hidden_key_infix;
         size_t holes_served = 0;
