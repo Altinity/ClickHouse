@@ -141,13 +141,19 @@ class UnresolvedPutBackend final : public InMemoryBackend
 {
 public:
     String fault_key_substr;
+    /// How many matching writes actually hit the fault, so a caller can prove the engine reissued
+    /// rather than infer it from a give-up that a non-retrying policy would also reach.
+    int fault_hits = 0;
 
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value,
                                              TransportAccess & access) override
     {
         if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
+        {
+            ++fault_hits;
             throw Poco::TimeoutException("UnresolvedPutBackend: simulated ambiguous result (response lost)");
+        }
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 };
@@ -374,13 +380,25 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     /// Drive the next ref-log append into the Unresolved/wedge outcome: every attempt it makes fails
     /// ambiguously, so this process can never learn whether its conditional PUT landed. That
     /// undecidability is the whole reason the resolution is a conditional CREATE and not a GET. The
-    /// give-up is the append's own retry window, and the engine's inter-attempt sleeps pay it on the
-    /// same injected boot clock the fence and the deadline are measured against, so it costs no real
-    /// time and no lease.
-    store->setCasRetrySleepForTest([&fake_boot](uint64_t ms) { fake_boot += ms + 1; });
+    /// give-up is the append's own retry window -- paced on ITS OWN virtual clock, separate from
+    /// `fake_boot` (the mount fence's), so the standard policy's full window is available to reissue
+    /// against rather than being cut short by the 30s lease `fake_boot` also measures.
+    uint64_t fake_retry = 0;
+    std::vector<uint64_t> retry_sleeps;
+    store->setCasRequestNowFnForTest([&fake_retry] { return fake_retry; });
+    store->setCasRetrySleepForTest([&fake_retry, &retry_sleeps](uint64_t ms)
+    {
+        fake_retry += ms + 1;
+        retry_sleeps.push_back(ms);
+    });
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    EXPECT_GT(backend->fault_hits, 1)
+        << "the append must have reissued more than once against the persistent fault before giving up "
+           "-- a single attempt would not distinguish this from a non-retrying policy";
+    EXPECT_GT(retry_sleeps.size(), 1u) << "more than one paced retry must have occurred before the give-up";
+    EXPECT_GT(fake_retry, 0u) << "the retry clock must have advanced past the policy's own deadline";
 
     /// The id the straggler would occupy: one past the greatest record that is actually durable in the
     /// dying epoch. That is also, by construction, where the recovery seal goes.
