@@ -334,6 +334,13 @@ void RestCatalog::validateAuthHeaders(const DB::HTTPHeaderEntry & header) const
 DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
     const CatalogState & catalog_state,
     bool update_token,
+<<<<<<< HEAD
+=======
+    const String & /*method*/,
+    const Poco::URI & /*url*/,
+    const DB::HTTPHeaderEntries & /*extra_headers*/,
+    const String & /*body*/,
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
     bool * used_cached_oauth_token) const
 {
     fiu_do_on(DB::FailPoints::check_database_datalake_negative,
@@ -582,6 +589,7 @@ AccessToken OneLakeCatalog::getValidAccessToken(const CatalogState & catalog_sta
 
 std::pair<std::string, std::chrono::system_clock::time_point> OneLakeCatalog::getCurrentAccessToken() const
 {
+<<<<<<< HEAD
     const auto state_snapshot = state.get();
     const auto token = getValidAccessToken(*state_snapshot, /* force_update */ false);
     /// A token without a known expiration is reported as expiring shortly, so that the
@@ -794,6 +802,8 @@ namespace
 
 AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const
 {
+=======
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
 
@@ -1055,6 +1065,13 @@ BigLakeCatalog::BigLakeCatalog(
 DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
     const CatalogState & catalog_state,
     bool update_token,
+<<<<<<< HEAD
+=======
+    const String & method,
+    const Poco::URI & url,
+    const DB::HTTPHeaderEntries & extra_headers,
+    const String & body,
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
     bool * used_cached_oauth_token) const
 {
     /// Google Cloud OAuth2 for BigLake.
@@ -1094,7 +1111,11 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
         return headers;
     }
 
+<<<<<<< HEAD
     return RestCatalog::getAuthHeaders(catalog_state, update_token, used_cached_oauth_token);
+=======
+    return RestCatalog::getAuthHeaders(update_token, method, url, extra_headers, body, used_cached_oauth_token);
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 }
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
@@ -1118,6 +1139,25 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 {
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+<<<<<<< HEAD
+=======
+
+    if (!google_adc_client_id.empty() && !google_adc_client_secret.empty() && !google_adc_refresh_token.empty())
+    {
+        try
+        {
+            return retrieveGoogleCloudAccessTokenFromRefreshToken();
+        }
+        catch (const DB::Exception & e)
+        {
+            LOG_DEBUG(log, "Failed to use ADC credentials, falling back to metadata service: {}", e.what());
+        }
+    }
+
+    /// Fallback to GCP metadata service (works inside GCP infrastructure)
+    /// https://cloud.google.com/compute/docs/metadata/overview
+    static constexpr auto DEFAULT_REQUEST_TOKEN_PATH = "/computeMetadata/v1/instance/service-accounts";
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 
     const auto & context = getContext();
 
@@ -1252,7 +1292,11 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
 
     auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
+<<<<<<< HEAD
         auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(catalog_state, update_token, &used_cached_oauth_token);
+=======
+        auto result_headers = getAuthHeaders(update_token, Poco::Net::HTTPRequest::HTTP_GET, url, headers, {}, &used_cached_oauth_token);
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
 
         return DB::BuilderRWBufferFromHTTP(url)
@@ -1917,11 +1961,35 @@ void RestCatalog::sendRequest(const CatalogState & catalog_state, const String &
             .create(credentials);
     };
 
+<<<<<<< HEAD
     try
     {
         bool used_cached_oauth_token = false;
         auto wb = create_buffer(false, used_cached_oauth_token);
 
+=======
+    auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
+    {
+        DB::HTTPHeaderEntries headers = getAuthHeaders(update_token, method, url, extra_headers, body_str, &used_cached_oauth_token);
+        headers.emplace_back("Content-Type", "application/json");
+        return DB::BuilderRWBufferFromHTTP(url)
+            .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
+            .withMethod(method)
+            .withSettings(context->getReadSettings())
+            .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
+            .withHostFilter(&context->getRemoteHostFilter())
+            .withHeaders(headers)
+            .withOutCallback(out_stream_callback)
+            .withSkipNotFound(false)
+            .create(credentials);
+    };
+
+    try
+    {
+        bool used_cached_oauth_token = false;
+        auto wb = create_buffer(false, used_cached_oauth_token);
+
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
         String response_str;
         if (!ignore_result)
             readJSONObjectPossiblyInvalid(response_str, *wb);
