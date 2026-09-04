@@ -1212,7 +1212,7 @@ def test_relink_wins_over_ttl_then_mover_converges():
     node2 around the fetch so the intermediate placement is observable, exactly as `test_ttl_move` does.
 
     `IF EXISTS` precedes the disk name in the grammar. It is there for node1, whose policy has no
-    `default` disk: without it every reservation on node1 would log a warning about the missing disk.
+    `default` disk: without it `CREATE TABLE` on node1 fails with `BAD_TTL_EXPRESSION`.
     """
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
