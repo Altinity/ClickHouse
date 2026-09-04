@@ -15,13 +15,8 @@
                 <disk>azure</disk>
                 <path>azure_cache/</path>
                 <cache_policy>LRU</cache_policy>
-                <!-- Sequential azure FT fills an 8 GiB cache with held
-                     segments; later tests then hit NOT_ENOUGH_SPACE. -->
-                <max_size>21Gi</max_size>
+                <max_size>8589934592</max_size>
                 <cache_on_write_operations>1</cache_on_write_operations>
-                <keep_free_space_size_ratio>0.15</keep_free_space_size_ratio>
-                <keep_free_space_elements_ratio>0.15</keep_free_space_elements_ratio>
-                <keep_free_space_eviction_threads>4</keep_free_space_eviction_threads>
             </cached_azure>
             <cached_azure_encrypted>
                 <type>encrypted</type>

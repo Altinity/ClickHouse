@@ -2,5 +2,7 @@
     <merge_tree>
         <storage_policy>azure_cache</storage_policy>
     </merge_tree>
-    <temporary_data_in_cache>cached_azure</temporary_data_in_cache>
+    <!-- Temp spills stay on the local disk. Sharing cached_azure with
+         MergeTree cache-on-write fills the cache with non-releasable
+         holds and later tests hit NOT_ENOUGH_SPACE. -->
 </clickhouse>
