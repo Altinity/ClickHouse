@@ -16,6 +16,7 @@
 #include <IO/WriteSettings.h>
 
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 
 #include "config.h"
 
@@ -51,8 +52,11 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 
 /// See Backend::checkPoolPreconditions. Only the Native, generation-dialect (GCS) combination has
 /// anything to check: a token-exact DELETE on a versioned bucket archives a noncurrent generation
-/// instead of reclaiming storage, so GC "reclaim" would silently stop reclaiming. Both an enabled
-/// bucket and an unverifiable probe refuse the mount.
+/// instead of reclaiming storage, so GC "reclaim" would silently stop reclaiming. A bucket VERIFIED
+/// to have versioning enabled refuses the mount. A probe that cannot answer does not: it is not
+/// evidence of a versioned bucket, its usual cause is a credential without permission to read the
+/// bucket configuration, and refusing on it would turn a missing IAM grant into a hard outage. The
+/// mount proceeds with a warning that names what was not verified and how the operator can verify it.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
     if (mode != Mode::Native || native_token_type != TokenType::Generation)
@@ -61,20 +65,15 @@ void ObjectStorageBackend::checkPoolPreconditions()
     const auto versioned = object_storage->isBucketVersioningEnabled();
     if (!versioned.has_value())
     {
-        /// An unverifiable probe fails the mount, exactly like a confirmed Enabled below. Proceeding
-        /// on the ASSUMPTION that versioning is off was the earlier behaviour and it is not
-        /// defensible: what GC does on a versioned bucket is delete objects it believes it reclaimed,
-        /// so the assumption is silently wrong in precisely the case that matters, and it is wrong
-        /// without bound (a warning at mount does not stop the next round). The operator can prove
-        /// the bucket's state with one call and grant the permission the probe needs.
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        LOG_WARNING(getLogger("CasObjectStorageBackend"),
             "CAS on GCS: could not VERIFY the bucket-versioning precondition (the versioning check "
-            "request failed — e.g. the credential lacks permission to read it — or this backend "
-            "cannot answer it) — refusing to mount writable. CAS cannot assume versioning is off: if "
-            "it is actually enabled, token-exact DELETEs archive noncurrent generations instead of "
-            "reclaiming storage and GC silently stops reclaiming space. Grant the credential "
-            "permission to read the bucket's versioning configuration, confirm versioning is "
-            "disabled, and retry the mount.");
+            "request failed, e.g. the credential lacks permission to read the bucket configuration, "
+            "or this backend cannot answer it). Mounting anyway. If versioning IS enabled on this "
+            "bucket, token-exact DELETEs archive noncurrent generations instead of reclaiming storage "
+            "and GC silently stops reclaiming space. Confirm by hand that versioning is disabled, or "
+            "grant the credential permission to read the bucket's versioning configuration "
+            "(storage.buckets.get on GCS) so the next mount can verify it.");
+        return;
     }
 
     if (*versioned)

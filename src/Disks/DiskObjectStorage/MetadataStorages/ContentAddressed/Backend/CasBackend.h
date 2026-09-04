@@ -315,10 +315,11 @@ public:
     virtual bool supportsListTokens() const = 0;
 
     /// Pool-level preconditions beyond per-op conditional semantics — checked by the capability
-    /// probe BEFORE the op battery. Default: nothing to check. The S3 backend fails closed here
-    /// unless a generation-dialect (GCS) bucket is VERIFIABLY free of object versioning: a
-    /// token-exact DELETE against a versioned bucket archives a noncurrent generation instead of
-    /// reclaiming storage, so GC "reclaim" would silently stop reclaiming.
+    /// probe BEFORE the op battery. Default: nothing to check. The S3 backend refuses here when a
+    /// generation-dialect (GCS) bucket is verified to have object versioning enabled: a token-exact
+    /// DELETE against a versioned bucket archives a noncurrent generation instead of reclaiming
+    /// storage, so GC "reclaim" would silently stop reclaiming. A probe that cannot answer is not
+    /// evidence of that, so it warns and the mount proceeds.
     virtual void checkPoolPreconditions() {}
 
     /// Fail-closed precondition: may this backend serve a WRITABLE mount that skips the access-check
