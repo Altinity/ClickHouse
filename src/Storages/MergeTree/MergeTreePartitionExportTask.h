@@ -13,6 +13,11 @@
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int INCORRECT_DATA;
+}
+
 /// On-disk descriptor for a plain (non-replicated) `MergeTree` partition export task.
 ///
 /// Unlike the replicated variant, there is a single node and no cross-replica coordination,
@@ -223,8 +228,11 @@ struct MergeTreePartitionExportTask
         task.destination_table = json->getValue<String>("destination_table");
         task.create_time = json->getValue<time_t>("create_time");
 
-        if (const auto status = magic_enum::enum_cast<Status>(json->getValue<String>("status")))
+        const auto status_str = json->getValue<String>("status");
+        if (const auto status = magic_enum::enum_cast<Status>(status_str))
             task.status = status.value();
+        else
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Unknown status '{}' in partition export descriptor", status_str);
 
         const auto parts_array = json->getArray("parts");
         for (size_t i = 0; i < parts_array->size(); ++i)
@@ -257,8 +265,11 @@ struct MergeTreePartitionExportTask
         task.max_bytes_per_file = json->getValue<size_t>("max_bytes_per_file");
         task.max_rows_per_file = json->getValue<size_t>("max_rows_per_file");
 
-        if (const auto policy = magic_enum::enum_cast<FileAlreadyExistsPolicy>(json->getValue<String>("file_already_exists_policy")))
+        const auto policy_str = json->getValue<String>("file_already_exists_policy");
+        if (const auto policy = magic_enum::enum_cast<FileAlreadyExistsPolicy>(policy_str))
             task.file_already_exists_policy = policy.value();
+        else
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Unknown file_already_exists_policy '{}' in partition export descriptor", policy_str);
 
         task.filename_pattern = json->getValue<String>("filename_pattern");
         task.write_full_path_in_iceberg_metadata = json->getValue<bool>("write_full_path_in_iceberg_metadata");
@@ -280,8 +291,11 @@ struct MergeTreePartitionExportTask
         /// an absent value as `POSITION` with `ignore_extra_source_columns = false`.
         if (json->has("schema_match_mode"))
         {
-            if (const auto mode = magic_enum::enum_cast<MergeTreePartExportSchemaMatchMode>(json->getValue<String>("schema_match_mode")))
+            const auto mode_str = json->getValue<String>("schema_match_mode");
+            if (const auto mode = magic_enum::enum_cast<MergeTreePartExportSchemaMatchMode>(mode_str))
                 task.schema_match_mode = mode;
+            else
+                throw Exception(ErrorCodes::INCORRECT_DATA, "Unknown schema_match_mode '{}' in partition export descriptor", mode_str);
         }
         if (json->has("ignore_extra_source_columns"))
             task.ignore_extra_source_columns = json->getValue<bool>("ignore_extra_source_columns");
