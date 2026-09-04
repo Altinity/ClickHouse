@@ -73,6 +73,57 @@ implementation); one asks for an audit record on any force-claim path; one asks 
 distinguish post-mortem recovery from live-server misuse. None change the open status above — folded
 in as detail on the same unimplemented design choice.
 
+## Removing and re-adding a replica under a k8s operator walks into an unrecoverable identity refusal (field report 2026-09-04) {#operator-replica-readd-uuid-trap}
+
+**HARD.** Field evidence, not a review finding: a `clickhouse-operator` cluster (`chi-cas-demo`) had
+replica `cas-demo-0-1` removed one day and re-added the next. The `server_root_id` is derived from the
+pod name and is therefore stable, while the pod's local `uuid` file (`<path>/uuid`, written by
+`ServerUUID::load` in `programs/server/Server.cpp:1753`) was regenerated because the data dir did not
+survive. `claimOwnerOrThrow` (`CasServerRoot.cpp:547`) then refuses with
+`CAS server-root '...' is owned by a different server (owner server_uuid=..., ours=...)`, raised during
+startup metadata load — the same node-fatal class as [`[POOL-REFUSAL-NODE-FATAL]`](#pool-refusal-node-fatal).
+This is the concrete instance of the open design choice recorded in
+[operator recovery above](#operator-uuid-recovery); what follows is what the field run added to it.
+
+**1. Our own refusal message leads the operator into a strictly worse state.** The third recovery it
+names — "manually delete the owner object `.../gc/server-roots/<srid>/owner` and restart" — is only
+valid when that root never held data. Over a non-empty subtree the next claim hits the second refusal,
+`has no owner anchor but its data subtree is non-empty (identity lost over existing data)`
+(`CasServerRoot.cpp:559`), which offers **no** recovery advice at all. The operator followed the
+message and landed there. Minimum fix: qualify the delete-owner advice, name
+`SYSTEM CAS DROP POOL MEMBER` / `clickhouse-disks cas-drop-member` as the supported verb in both
+messages, and give the identity-lost refusal a recovery sentence of its own.
+
+**2. The hand-delete also destroys the cheapest recovery input.** `Pool::openForDecommission`
+(`CasPool.cpp:907-919`) resolves the victim uuid from the owner anchor and falls back to the mount
+lease. An operator who deletes both by hand — a plausible next step after the advice above fails —
+gets `unknown pool member (no owner anchor and no mount lease)`, and the victim's `roots/<srid>/`,
+`cas/manifests/<srid>/` and its catalog namespaces are then unreachable by every supported command.
+
+**3. Decommission does not make the srid reusable either.** The retirement tail tombstones the owner in
+place (`CasDecommission.cpp:446`: `retired_at_ms` set, `server_uuid` **unchanged**). A pod later
+recreated with the same `server_root_id` and a new uuid does not even reach `throwIfOwnerRetired` — the
+uuid comparison fires first and it gets the same "owned by a different server" wall. So the sequence a
+k8s operator would naturally run (`SYSTEM DROP REPLICA` + `SYSTEM CAS DROP POOL MEMBER`, then re-add the
+pod) does not work today. Only the accidental path — owner hand-deleted, subtree then emptied by
+decommission — leaves a claimable slot, which is the opposite of what the messages recommend.
+
+**4. The ask (user, 2026-09-04).** "Оператор уже делает `SYSTEM DROP REPLICA`, должно быть что-то
+похожее для CAS." A supported replica-removal verb the operator can call, plus the guarantee this entry
+adds to the [open design choice](#operator-uuid-recovery): **after the supported removal, re-adding the
+same `server_root_id` with a new `server_uuid` must succeed without hand-editing the object store.**
+Whichever of the two options is chosen (rebind the owner uuid, or adopt the pool's existing uuid),
+that is the acceptance criterion. Until it exists, the only advice that actually holds for k8s is
+"keep the `uuid` file on a persistent volume", and it is written down nowhere operator-facing —
+`operations/migration.md#decommission` documents permanent removal only, not remove-and-re-add.
+
+**Interim recovery that does work** (record it in the docs as such until the verb exists): with the
+victim's mount object still present, run `SYSTEM CAS DROP POOL MEMBER '<srid>' FROM DISK '<disk>'` from
+a surviving pool member (or `clickhouse-disks --disk <disk> cas-drop-member '<srid>'` offline) **while
+the victim is down**; with the owner anchor already gone, the run adopts the uuid from the mount lease,
+empties the subtree, and reports a `slot tombstone failed: ... object absent before tombstone write`
+warning — harmless here, and precisely the absence that lets the re-added pod claim the srid cleanly.
+
 ## `life_epoch` monotonicity holds PER SERVER ROOT — decommission must not break it {#life-epoch-monotone-per-server-root}
 
 Recorded 2026-07-31 from Task 4c, which made a decreasing `_ckpt.life_epoch` contribution `CORRUPTED_DATA`
