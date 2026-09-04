@@ -123,7 +123,7 @@ disk (S3 operations and CAS conflicts per dropped table) as the first measuremen
 + conditional PUTs); third = skip `StackTrace` capture for expected 412s.
 
 Design for the first target: `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
-(revision 21, 2026-09-04), which supersedes the fix sketch below where they differ.
+(revision 22, 2026-09-04), which supersedes the fix sketch below where they differ.
 
 ### `[ref-catalog-cas-starvation-under-parallel-writers]` One process's CREATE/DROP writers starve each other on the ref-catalog compare-and-swap (2026-09-04) {#ref-catalog-cas-starvation}
 
@@ -175,13 +175,13 @@ Fix, two halves, in this order:
    winning (red today). Update the spec sentences at "Conflicts spend the same budget as errors".
 
 Superseded by the design `docs/superpowers/specs/2026-09-04-cas-hot-key-write-lane-design.md`
-(revision 21, 2026-09-04, after fourteen codex and four opus review rounds): a per-pool write lane
+(revision 22, 2026-09-04, after fourteen codex and five opus review rounds): a per-pool write lane
 above the request engine for any hot compare-and-swap object, the catalog first; one FIFO per key
 shared by the pool's planes, the queued mutations combined into one `PUT` with as-if-serial
-semantics (every member gets `Refused` if the batch does not land), an LRU of last known objects so
-the next write needs no read, a refusal reported only from a fresh read, the GC erase as a submission
-like every writer, and a flat conflict pause. The stalled-holder case is recorded there as an
-accepted availability tradeoff.
+semantics, the engine's `WriteResult` returned unchanged (members told the leader's class, never a
+stronger one), an LRU of last known objects so the next write needs no read, a refusal reported only
+from a fresh read, and a flat conflict pause. The GC erase joins the lane in a follow-up with five
+named prerequisites; the stalled-holder case is recorded there as an accepted availability tradeoff.
 
 ### `[cas-s3-lane-put-timeout-logged-at-error]` A stalled single-attempt PUT is logged at Error and fails a stateless test whose write succeeded (2026-09-04) {#cas-s3-lane-put-timeout-logged-at-error}
 
