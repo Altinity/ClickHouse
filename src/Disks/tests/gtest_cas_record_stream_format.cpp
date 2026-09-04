@@ -5,6 +5,7 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <fmt/format.h>
+#include <algorithm>
 #include <vector>
 
 #include <magic_enum.hpp>
@@ -192,14 +193,42 @@ TEST(CASRecordStream, ActiveRowCarryingACondemnedFieldFailsClosed)
     }
 }
 
+/// `CasBlobInDegree.cpp`'s fold (`SourceEdgeRunWriter writer(out); // sorted NDJSON; byte-deterministic
+/// for write-once adoption`) sorts by `(ref, source_id)` before writing, so the run this fixture emits
+/// is the writer's own straight-line append, never a reorder -- the property the run must actually have
+/// is that whichever order the SAME set of edges was DISCOVERED in, the canonical `(ref, source_id)`
+/// sort before the writer sees them converges on identical bytes. A bare `f(x) == f(x)` on one fixed,
+/// already-sorted vector cannot fail on anything but genuine cross-call nondeterminism (a clock, a
+/// pointer, hash randomization) -- none of which this format has -- so it passed vacuously; two
+/// differently-DISCOVERED inputs, sorted by the same comparator production uses, is the real claim.
 TEST(CASRecordStream, WriterIsByteDeterministic)
 {
-    std::vector<SourceEdgeRecord> recs = {
+    const auto byRefThenSource = [](const SourceEdgeRecord & a, const SourceEdgeRecord & b)
+    {
+        if (a.ref != b.ref)
+            return a.ref < b.ref;
+        return a.source_id < b.source_id;
+    };
+
+    std::vector<SourceEdgeRecord> discovered_ascending = {
         edge(chRef(1), 5),
         edge(chRef(1), 9),
         condemned(chRef(2), PersistedEtag{"etag", "t/with/slashes"}, 1, 2, false),
     };
-    EXPECT_EQ(encodeRun(recs), encodeRun(recs));   /// pure function of the sorted record set
+    /// The SAME three edges, as if a different GC shard or a different LIST page order had surfaced
+    /// them: reverse discovery order, still every one of them present.
+    std::vector<SourceEdgeRecord> discovered_reverse = {
+        condemned(chRef(2), PersistedEtag{"etag", "t/with/slashes"}, 1, 2, false),
+        edge(chRef(1), 9),
+        edge(chRef(1), 5),
+    };
+    ASSERT_NE(discovered_ascending.front().ref, discovered_reverse.front().ref)
+        << "the two discovery orders must actually differ";
+
+    std::sort(discovered_ascending.begin(), discovered_ascending.end(), byRefThenSource);
+    std::sort(discovered_reverse.begin(), discovered_reverse.end(), byRefThenSource);
+    EXPECT_EQ(encodeRun(discovered_ascending), encodeRun(discovered_reverse))
+        << "the run must be a pure function of the edge SET, not of the order it was discovered in";
 }
 
 /// The run `ref` carries the algorithm as a raw leading BYTE, a second representation of the same
