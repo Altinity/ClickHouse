@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 8. Brainstormed 2026-09-04 against the measurements in
+Revision 9. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
 supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
@@ -64,6 +64,14 @@ Revision history, kept because each step removed something a review proved unsou
   inside `decide` after matching the row, do not opt in; the three hot decisions do. The
   `Generation` spacing sleep is budgeted like every engine sleep, removal verbs keep their
   exception-based refusals, and the GC authority window is described as it is.
+- Revision 9 pins four details: a failure to copy the memory value after a commit is swallowed
+  and the caller still receives its `Committed`; a memory start leaves `WriteState::last_seen` as
+  `NotObserved` until a real read, so no `GaveUp` reports remembered bytes as observed; on the
+  `Generation` dialect the conflict jitter is added on top of the one-second boundary rather than
+  absorbed by it; and the GC erase's own internal reissue after an ambiguous attempt is named as an
+  existing authority gap, outside this design and a prerequisite for ever ticketing the open plane.
+  The memory has a size cap, since the catalog's enforced cap is the 256 MiB object cap, and three
+  test expectations were corrected.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -183,9 +191,13 @@ behaves byte-for-byte as today. `CasRequests` remains a class that writes no mem
 construction: the lane has its own mutex, and `CasOperation` reaches it through its owner.
 
 A lane exists while it has a ticket, an active holder, or a memory, and is erased when the last of
-the three goes. There is no eviction and no byte budget: the predicate names the hot keys, today
-exactly one, and its object is under 1 MiB. A bound becomes necessary when a per-namespace key such
-as `_ckpt` is declared hot; that declaration brings it.
+the three goes. There is no eviction: the predicate names the hot keys, today exactly one. The
+memory has a size cap, an engine constant of 16 MiB (about a hundred thousand catalog rows at
+today's row size): a committed candidate above it is not remembered, and the next opted-in call
+reads, which is today's cost. The catalog's only enforced bound is the 256 MiB object cap, so
+without this cap one remembered catalog could be that large. A per-key budget across many hot
+keys becomes necessary when a per-namespace key such as `_ckpt` is declared hot; that
+declaration brings it.
 
 `Pool` passes the predicate "`key == Layout(config.pool_prefix).refCatalogKey()`" to
 `mount_requests` and to no other plane.
@@ -193,13 +205,22 @@ as `_ckpt` is declared hot; that declaration brings it.
 ### The open plane stays out {#the-open-plane-stays-out}
 
 The GC erase runs on `openRequests()` under a `Liveness` closure that returns a cached flag, and
-the reconciler refreshes that flag by one `gc/state` read at the top of every erase attempt. That
-refresh is the authority argument of the GC drain. Between it and the `replace` today there is
-only local work, the exactness check, the copy, the erase and the encode of the catalog, and no
-I/O and no wait; the engine's gate before the `PUT` consults the cached flag, not the store. A
-ticket would put an unbounded wait in that gap, and a leader deposed during the wait would still
-erase when its turn came. Mount-plane writers have no such flag: their fence is three atomics the
-engine re-reads before every attempt, so a wait cannot stale it.
+the reconciler refreshes that flag by one `gc/state` read at the top of every erase attempt of its
+own loop. That refresh is the authority argument of the GC drain. Between it and the `replace`
+today there is only local work, the exactness check, the copy, the erase and the encode of the
+catalog, and no I/O and no wait; the engine's gate before the `PUT` consults the cached flag, not
+the store. A ticket would put an unbounded wait in that gap, and a leader deposed during the wait
+would still erase when its turn came. Mount-plane writers have no such flag: their fence is three
+atomics the engine re-reads before every attempt, so a wait cannot stale it.
+
+One gap in that argument exists today and is not this design's: the `replace` runs under
+`Retry::standard()`, and after an ambiguous attempt its `writeLoop` may resolve, sleep and
+reissue the same bytes under the same precondition, gated only by the cached flag. A leader
+deposed between the refresh and that reissue erases under stale authority. The window is one
+ambiguous transport outcome wide, the erase is one a parent seal already proved safe, and closing
+it (a refresh before every physical attempt, which needs an engine hook the reconciler's
+`refresh_authority` could fill) is a BACKLOG item and a prerequisite for ever ticketing the open
+plane. This design neither widens nor narrows it.
 
 So the open plane has no lane. Consequences, all of them today's behaviour:
 
@@ -360,10 +381,19 @@ candidate this loop encoded, and the next opted-in call pays one read for it. An
 never reads or writes the memory, and absence is never remembered. A `GaveUp{FenceLost}` after a
 landed `PUT` forgets: the memory is a hint, and forgetting is the fail-close direction.
 
-**Preparing the value.** The `(bytes, etag)` pair is assembled outside the mutex, before the leave
-guard: the bytes by moving the engine's own candidate string, which the engine owns once `decide`
-returned it, and the etag by copying from the `Committed` the caller will receive, which stays
-intact. If the copy fails, the guard forgets. The guard only moves.
+**Preparing the value.** The `(bytes, etag)` pair is assembled outside the mutex, after
+`postCommit` produced the `Committed` and before the leave guard: the bytes by moving the engine's
+own candidate string, which the engine owns once `decide` returned it, and the etag by copying
+from the `Committed` the caller will receive, which stays intact. The copy runs inside its own
+`try`: if it throws, the exception is swallowed, the guard forgets, and the caller still receives
+the original `Committed`, because its write landed and a failed cache fill is not an ending of the
+write. A candidate above the memory size cap is not copied at all. The guard only moves.
+
+**What a memory start is not.** It is not an observation. `WriteState::last_seen` stays
+`NotObserved` until this call performs a real read (the `observe` of a verdict restart, or the
+resolve read of a `Conflict`), so a `GaveUp` produced before any read, at the gate before the
+inner write or at its `fits`, reports `NotObserved` and never the remembered bytes as something
+this call saw.
 
 **Where memory is used.** Only `readModifyWrite`, and only for a call that passed
 `MemoryStart::Allowed`. Its body gains one optional input, the remembered object, used in place of
@@ -532,8 +562,12 @@ object name, says excess writes may be throttled, and asks applications not to e
 latency is not paced by 429s it does not receive, and today's code is not either. So on the
 `Generation` dialect the lane spaces write attempts itself: no conditional write attempt on a hot
 key starts sooner than one second after the previous write attempt on that key from this plane
-ended, successful or not, waited through the plane's interruptible sleep with the attempt's own
-gate and `fits` checked after the wait. The dialect is `Backend::dialect()`, which the engine
+ended, successful or not. The wait is one sleep, not two: its length is the time to that
+one-second boundary plus, when the attempt follows a clean `Conflict`, the flat jitter of
+`conflictBackoff()`, so that two servers whose boundaries coincide do not retry at the same
+instant forever; the jitter is added to the boundary, never absorbed by it. The sleep goes
+through the plane's interruptible sleep after the engine's pre-sleep check and with the attempt's
+own gate and `fits` checked again after it. The dialect is `Backend::dialect()`, which the engine
 already consults; the S3 and emulated dialects get no spacing. This holds the documented budget by
 construction for one plane; two pools or two servers on one object still share it, as they do
 today. Go/no-go for the `gcs` lane: the count of 429s on `ref_catalog` in `system.text_log` over
@@ -598,8 +632,9 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    (INV-HK5). A catalog-level sibling in `gtest_cas_ref_catalog.cpp` drives the real
    `beginRemoving` through a hot `CasRequests` and asserts `Transitioned`, not `EntryChanged`.
 3. Verdict on an observation. Same shape, but the row really changed. Assert: `Declined` with
-   `seen` intact, one read, no write; and at the catalog level, `EntryChanged` with one read and no
-   write, the same as today.
+   `seen` intact, one read by the lane, no write; and at the catalog level, `EntryChanged` with no
+   write and exactly the reads today's path makes (the lane's one, plus the read `beginRemoving`
+   itself performs after a mismatch to tell `AlreadyRemoving` from `EntryChanged`).
 4. External writer on the write path. A second `CasRequests` writes between two writes of the
    first. Assert the first's next `readModifyWrite` does exactly one resolve read and one retry
    write and ends `Committed`, that the committed body is the external writer's bytes plus this
@@ -642,19 +677,26 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    sent for the second, the ticket is gone, and the next waiter is promoted (INV-HK6).
 7b. Stalled holder. The holder is parked inside a `PUT` that does not return; the clock is
    advanced past every waiter's deadline. Assert: each waiter leaves with its own `GaveUp`, no
-   second write was started, the queue is empty, and when the `PUT` is finally released the holder
-   commits and the next writer proceeds normally (fail-stop, then recovery).
+   second write was started, only the holder's ticket remains in the lane, and when the `PUT` is
+   finally released the holder commits and the next writer proceeds normally (fail-stop, then
+   recovery).
+7d. Cache fill failure. A hook makes the post-commit etag copy throw. Assert: the caller receives
+   its `Committed` unchanged, the memory is empty, and the next opted-in call reads. A memory
+   start whose inner write is refused at the gate before sending reports `GaveUp` with
+   `last_seen == NotObserved`.
 7c. Generation spacing. On a backend whose dialect is `Generation`, N writes through the lane:
    assert consecutive write attempts on the key are at least one second apart on the clock, that
    the sleeps went through the plane's sleep function, that a fence tripped during the spacing
    sleep ends the holder with `GaveUp{FenceLost}` and no attempt, and that a holder whose bound
    cannot fit the sleep plus one attempt (plain, frozen and lease-bound policies) gives up before
-   sleeping (INV-HK9). On the `ETag` dialect the same test records no spacing sleep.
+   sleeping (INV-HK9). On the `ETag` dialect the same test records no spacing sleep. A two-plane
+   sibling on `Generation` has both planes lose a race at the same boundary and asserts their next
+   attempts are separated by a recorded jitter, not issued at the same instant.
 8. Open plane overlaps. A second `CasRequests` with no predicate (the open-plane shape) does a
    `replace` while the hot plane's holder is parked; it does not wait; whichever write is refused is
    settled by its resolve read; after an open-plane win the hot plane's next opted-in
-   `readModifyWrite` pays exactly one resolve read and one retry write, and the one after that
-   reads again, because a resolve read is never remembered.
+   `readModifyWrite` pays exactly one resolve read and one retry write, commits, and the one after
+   that starts from memory, because the committed retry candidate is this plane's own.
 9. Half 2, clean conflict. One writer loses K clean races in a row (a hook mutates the key before
    every attempt). Assert `CASRequestConflictPause` advanced K times, `CASRequestReissue` not at
    all, and every recorded sleep is at most 200 ms.
@@ -690,9 +732,11 @@ tests already cover each marker and the admission refusal against a cold key.
   the write. Motivation: the `Generation` dialect, where this design's one-second spacing bounds
   the lane to one mutation per second and only combining makes that second carry every mutation
   that arrived meanwhile.
-- Ticketing the GC erase: a BACKLOG note. It needs the reconciler's authority refresh to run after
-  the ticket is held and before the `PUT`, which is a hook the engine does not offer; the benefit
-  is one avoided 412 per GC erase.
+- The GC erase's authority gap across its own internal reissue (see
+  [the open plane](#the-open-plane-stays-out)): a BACKLOG item, existing today, closed by a refresh
+  before every physical attempt through an engine hook.
+- Ticketing the GC erase: a BACKLOG note, gated on the item above; the benefit is one avoided 412
+  per GC erase.
 - Remembering a resolve read's object, so that one external conflict costs one read rather than
   two: a BACKLOG note, gated on validating the bytes (a decode) before remembering them.
 - A holder lease that hands exclusivity on after a stuck attempt: rejected, see
