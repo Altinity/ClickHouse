@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 17, 2026-09-04. Brainstormed against the measurements in
+Revision 18, 2026-09-04. Brainstormed against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`, whose fix sketch
 this document supersedes where they differ. The revision history is at the end; it matters,
@@ -89,9 +89,10 @@ last object the pool committed, so the next `readModifyWrite` starts from it ins
 write and changes nothing about how it decides.
 
 **Half 2, conflict pacing.** In `readModifyWrite` and `readModifyWriteOnPresence`, a clean refused
-precondition is repaid after `Retry::conflictBackoff(dialect)`, flat: uniform(0, 200 ms), or one
-second plus that on the `Generation` dialect, and no longer advances the transport-fault counter.
-The GC erase loop keeps its pacing. Two sentences of the backend request contract change.
+precondition is repaid after `Retry::conflictBackoff()`, a flat uniform over [0, 200] ms, and no
+longer advances the transport-fault counter; on the `Generation` dialect the hot keys are spaced to
+the store's rate by the lane. The GC erase loop keeps its pacing. Two sentences of the backend
+request contract change.
 
 ## Half 1: the lane {#half-1-the-lane}
 
@@ -161,8 +162,24 @@ struct Item
     Retry policy;                            /// as passed; a `single_attempt` item is never combined
     Retry::Bound bound;                      /// bound at entry, so queue time spends the caller's window
     const DecideOnObject * decide = nullptr; /// a `readModifyWrite`'s decide; null for a single-verb ticket
+    bool taken = false;                      /// guarded by `mutex`; set by a leader in the same critical section
+                                             /// that takes the item; a taken item's caller may not leave until `done`
     bool done = false;                       /// guarded by `mutex`
-    std::optional<WriteResult> result;       /// guarded by `mutex`; set only for a combined member
+    std::shared_ptr<const BatchOutcome> outcome;   /// guarded by `mutex`; set with `done` for a combined member
+    std::exception_ptr error;                /// guarded by `mutex`; a held `decide` exception, delivered by its owner
+};
+
+/// One per batch, allocated by the leader before its write, shared by every member it settles:
+/// the ending's class and the one observation it carries. A member copies what it needs out of it
+/// on its own thread, so settlement under `mutex` assigns pointers and flags and allocates nothing.
+struct BatchOutcome
+{
+    enum class Kind : uint8_t { Committed, Conflict, Unresolved };
+    Kind kind;
+    std::optional<Etag> etag;                /// `Committed`: the combined object's
+    uint32_t attempts_sent = 0;
+    bool resolved_by_read = false;
+    Observation last_seen;                   /// `Conflict`: what the resolve read saw, or `NotObserved`
 };
 ```
 
@@ -182,20 +199,32 @@ removes an item from the queue.
    the mount plane and always open on the other two, then the `Liveness` closure, a flag read for
    every closure in the tree today), then the caller's own bound against the engine's clock, in
    that order so a lost fence, a stopped task or an exhausted lease is reported as itself and not
-   as a policy deadline. `FenceLost`: return `GaveUp{FenceLost}`. `NoBudget`: return
-   `GaveUp{Deadline, Lease}`. Bound passed: return `GaveUp{Deadline}` with the bound's own source.
+   as a policy deadline. On any of the three the caller intends to leave, and leaving is decided
+   under `mutex` in step 2: a caller whose item a leader has meanwhile `taken` may not leave,
+   because its `decide` may be running on the leader's thread against this caller's stack; it stays
+   parked until `done` and then returns what the leader settled, which for a fence lost or a lease
+   exhausted is the same `GaveUp` the leader's own per-member gate renders. A caller whose item is
+   not taken leaves with `GaveUp{FenceLost}`, `GaveUp{Deadline, Lease}`, or `GaveUp{Deadline}` with
+   the bound's own source. Which operations the `Liveness` part of this reaches today: the GC
+   erase's, whose closure is `Gc`'s cached flag; the ledger's two catalog writers admit without a
+   closure (`mount_requests.resume(admitted_generation)`), so while waiting their escapes are the
+   fence generation and the deadline, as they are today between attempts.
    What this step touches of the caller's `CasOperation` is disjoint from anything a leader running
    this item's `decide` may touch: `admitted_generation` and `liveness` are immutable after
    construction, and the fence and clock closures are the ones `CasRequests` already requires to be
    thread-safe; a leader's reads from inside `decide` write only `last_read_stop`, and the
    `written` local and the captured marker of `casUpdateImpl` live on this caller's stack and are
    touched only by the leader while this caller is parked here.
-2. Under `mutex`: if `done` (a leader combined this item, below): leave the loop with `result`. If
-   the item is the first in the queue that is not `done` (settled members stay queued until their
-   own guards run): set `holder_since_ms` from the clock value read in step 1, set a local
+2. Under `mutex`: if `done` (a leader combined this item, below): leave the loop with the
+   settled outcome. If step 1 decided to leave and the item is not `taken`: leave with that
+   `GaveUp`. If step 1 decided to leave and the item is `taken`: fall through to the wait. If the
+   item is the first in the queue that is not `done` (settled members stay queued until their own
+   guards run): set `holder_since_ms` from the clock value read in step 1, set a local
    `entered_hold`, and leave the loop as the holder. Otherwise `cv.wait_for(lock, slice)` with a
    short slice (the pattern of `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the
-   mutex, and go to step 1. The clock is read in step 1, never under the mutex.
+   mutex, and go to step 1. The clock is read in step 1, never under the mutex. The two decisions
+   that matter for memory safety, "a leader takes this item" and "this item's caller leaves", are
+   both made under `mutex` against the same `taken` flag, so they are exclusive (INV-HK7).
 
 **Hold.** Run the verb's body on the caller's own thread, with the caller's own operation, policy,
 bound and result type, exactly as today, plus the batch and memory steps below. While holding, the
@@ -221,17 +250,28 @@ reporting tail can neither throw out of a guard nor terminate an unwinding threa
 
 A holder never waits for another ticket. An item is settled only by its own caller or, for a
 combined member, by the leader that took it; it is removed only by its own guard, and its `decide`
-lives on its caller's stack, which is alive as long as the item is in the queue.
+lives on its caller's stack, which is alive as long as the item is in the queue and, once the item
+is `taken`, until the leader has settled it, because a taken item's caller does not leave.
+
+**One ticket per write attempt.** For `readModifyWrite` the ticket wraps one iteration of its
+loop, not the call: a hold begins with the base, runs `decide` inside the hold, sends the one
+write, and ends; a `Conflict` ends the hold, the loop pauses `conflictBackoff`, and the next
+iteration takes a new ticket. On entering a hold the loop's carried `current` is not the base: the
+base is `remembered` if present (the pool's last commit, which a same-pool holder may have produced
+since this caller's last resolve read), else the object this call's own last resolve read saw, if
+it has one, else an observation. Either hint is validated by the `PUT`; preferring memory is
+preferring the common case in a lane, a same-pool commit since this caller last looked.
 
 ### The batch {#the-batch}
 
 A `readModifyWrite` holder is a leader. Its one write attempt is:
 
-1. **Base.** `remembered`, if present and the policy may reissue; otherwise `observe`, as today.
-   A memory start is gated exactly like the observation it replaces: `gate(reservedFor(0, 1))` and
-   `fits`, the same checks the read loop makes before its first attempt, so a caller past its
-   deadline, lease or fence never runs `decide` on memory. `WriteState::last_seen` stays
-   `NotObserved` until this call performs a real read.
+1. **Base.** `remembered`, if present and the policy may reissue; else this call's own last
+   resolve-read object, if any; otherwise `observe`, as today. A memory start is gated exactly like
+   the observation it replaces: `gate(reservedFor(0, 1))` and `fits`, the same checks the read loop
+   makes before its first attempt, so a caller past its deadline, lease or fence never runs
+   `decide` on memory. `WriteState::last_seen` stays `NotObserved` until this call performs a real
+   read.
 2. **The leader's decide** on the base. Bytes: the candidate. A `nullopt` on an observed base:
    `Declined`, as today. A `nullopt` on memory: not a result; clear the memory, `observe`, `decide`
    again on the observation, and continue with what that renders (at most one restart per attempt).
@@ -239,12 +279,18 @@ A `readModifyWrite` holder is a leader. Its one write attempt is:
 3. **Combine.** Under `mutex`, walk the queue behind the leader and take every item that is
    compatible: not `done`, a `readModifyWrite` (`decide != nullptr`), `policy.single_attempt ==
    false`, and `bound.deadline_ms` not earlier than the leader's; stop at the first item that is
-   not. The leader copies the taken `shared_ptr`s into a vector under the mutex, which is a leaf
-   that calls nothing, exactly as the ledger's carve does; an allocation failure there propagates
-   to the leader before anything was taken. The batch is what is queued at that walk; nothing
-   arriving later joins it, and there is no other cap: its cost is one `decide` per member on the
-   leader's thread, a decode and an encode of the catalog each, about a millisecond per ten
-   thousand rows, against a 90 s window. Release the mutex. For each taken item in order: the
+   not. The leader copies the taken `shared_ptr`s into a vector and sets each item's `taken` in
+   the same critical section, under the mutex, which is a leaf that calls nothing, exactly as the
+   ledger's carve does; it also allocates the batch's `BatchOutcome` there, so nothing after this
+   point allocates on the settlement path; an allocation failure propagates to the leader before
+   anything was taken. The batch is what is queued at that walk; nothing arriving later joins it,
+   and there is no other cap. Its cost has two parts: one `decide` per member on the leader's
+   thread, a decode and an encode of the catalog each, about a millisecond per ten thousand rows;
+   and, for the two decisions that read inside `decide` (`reconcileStaleCreator`,
+   `cancelStalledCreating`, both rare: a stalled creation), one serialized read of the mount key
+   each under the hold, which is why their reads running under a policy frozen before the outer
+   window is a precondition of combining, not a detail (the reconciliation's already does; the
+   cancellation's is the one line this design adds). Release the mutex. For each taken item in order: the
    item's own fence and `Liveness`, through its own operation's `gate(0)`; lost or exhausted:
    settle it now with the corresponding `GaveUp` and skip its `decide`. Otherwise
    `decide(Object{bytes = candidate, etag = base etag})`. Bytes: the item contributes and the
@@ -254,37 +300,58 @@ A `readModifyWrite` holder is a leader. Its one write attempt is:
    absence), under the leader's operation, policy and bound, with the pause helper above.
 5. **Settle.** A held error is delivered to its owner on every ending: the member contributed
    nothing, so throwing is exactly what its own call would have done, and a `decide` that threw is
-   never run again (INV-HK5). For the rest:
+   never run again (INV-HK5). Every other taken member is told the class the leader's ending
+   belongs to, never a stronger one (INV-HK11):
    - `Committed`: each contributor is gated once more on its own operation, `gate(0)`; lost:
      `GaveUp{FenceLost}` with `sent_any = true`, the engine's own rule for a single write whose
      fence was lost in flight; otherwise `Committed{etag, attempts_sent, resolved_by_read}` with the
      batch's values. Each held `nullopt` is delivered as `Declined{seen = base}`: `seen` is the base
      the verdict was rendered on, deliberately, not the key's state after the commit.
-   - An ending that proves nothing of the batch applied, which is what `writeLoop` promises for
-     `Conflict` and `Refused` (both returned only with no ambiguous attempt of this inner write
-     outstanding) and for a `GaveUp` with `state.any_ambiguous == false`: the leader receives it
-     as its own; every contributor and every held `nullopt` receives
-     `Conflict{seen = the batch's last_seen}`, the resolve read's object after a lost race and
-     `NotObserved` otherwise.
-   - An ending that leaves the batch's fate unknown, a `GaveUp` with `state.any_ambiguous == true`
-     (`Unresolved`, a refused resolve read after an ambiguous attempt, a fence lost in `postCommit`)
-     or an exception out of `writeLoop` after an attempt was sent: the leader receives it as its
-     own; every contributor and every held `nullopt` receives
-     `GaveUp{Unresolved, sent_any = true, last_seen = the batch's last_seen}` with its own bound's
-     `Source`. A member is never told more about the batch's fate than the leader knows
-     (INV-HK11): `Conflict` is a proof in this engine that nothing of ours landed, and manufacturing
-     it after an ambiguous `PUT` would send a member to re-decide against a state its own mutation
-     may already be in, and re-apply.
-   All settlement is under `mutex` in one pass, followed by `cv.notify_all()`; the memory is
-   touched only by the leader's guard.
+   - `Conflict`: every contributor and every held `nullopt` receives the same `Conflict{seen}`. This
+     is the class the engine gives a solo writer in the same position, and it has the engine's own
+     meaning, which is two-sided: `writeLoop` returns `Conflict` both when no attempt of this inner
+     write was ambiguous (nothing of ours applied) and, after an ambiguous attempt, when the
+     precondition has moved and the object is not our bytes, which means ours may have landed and
+     been superseded. A solo `readModifyWrite` re-decides on `seen` in both cases today, so every
+     `decide` on a hot key already tolerates re-deciding against a state its own mutation may be
+     in; the catalog's are token-exact and resolve exactly that shape (`beginRemoving` answers
+     `AlreadyRemoving`, creation answers `Superseded` and resumes on its own `Creating` row). A
+     member told `Conflict` is therefore told no more than the leader was.
+   - `Refused`: every contributor and every held `nullopt` receives `Conflict{last_seen}`.
+     `writeLoop` returns `Refused` only with no ambiguous attempt of this inner write outstanding,
+     so nothing applied.
+   - `GaveUp`, or an exception out of `writeLoop`, with `state.sent_any == false`: nothing was
+     sent; every contributor and every held `nullopt` receives `Conflict{NotObserved}` and their
+     own loops observe and re-queue.
+   - `GaveUp`, or an exception out of `writeLoop`, with `state.sent_any == true`: the batch's fate
+     is unknown; every contributor and every held `nullopt` receives
+     `GaveUp{Unresolved, sent_any = true, last_seen}` with its own bound's `Source`. This
+     over-reports in one corner, deliberately: after an inner `Conflict` that proved nothing applied,
+     a later `GaveUp` in the outer loop still carries `sent_any`, and members are told `Unresolved`
+     where `Conflict` would have been true; the safe direction, and not to be "fixed" by weakening
+     the discriminator.
+   The leader writes the batch's `BatchOutcome`, allocated in step 3, on its own thread, then under
+   `mutex` assigns the pointer to every taken item, sets `done`, and does `cv.notify_all()`: no
+   allocation and no copy under the mutex. Each member copies what it needs (the observation, for
+   its own loop) on its own thread after waking; an allocation failure there is that member's own
+   exception, as an allocation in its own loop would be. The memory is touched only by the leader's
+   guard.
+
+   The leader's guard settles too. If the leader unwinds with members taken and not yet settled (a
+   throw before any attempt, from `valueFor` or from `observe`'s rethrow of a local fault, or from
+   its own step-2 `decide`), the guard, under `mutex`, delivers every held error to its owner and
+   gives every other taken member `Conflict{NotObserved}` if nothing was sent and
+   `GaveUp{Unresolved}` if something was, using a `BatchOutcome` the leader allocated in step 3 for
+   exactly this. No taken member is ever left `!done` behind a departed leader.
 
 A member that received `Conflict` is back in its own `readModifyWrite` loop, exactly where a loser
-of a race lands today: the loop re-decides on `seen` (or observes first when nothing was seen),
-pauses `conflictBackoff`, and takes a new ticket. The queue re-forms by itself; the members of a
-failed batch wake together and stand in roughly their old order behind whoever arrived meanwhile.
-A member that received `GaveUp{Unresolved}` returns it, as its own call would: for the catalog that
-is `throwCasWriteRetryLater`, and the client's retry reads a catalog that either carries the
-mutation (`AlreadyRemoving`, `Superseded`) or does not.
+of a race lands today: the loop keeps `seen` as its own last observation, pauses `conflictBackoff`,
+takes a new ticket, and on entering its next hold re-decides on the base that hold provides
+(memory, or `seen`, or a read). The queue re-forms by itself; the members of a failed batch wake
+together and stand in roughly their old order behind whoever arrived meanwhile. A member that
+received `GaveUp{Unresolved}` returns it, as its own call would: for the catalog that is
+`throwCasWriteRetryLater`, and the client's retry reads a catalog that either carries the mutation
+(`AlreadyRemoving`, `Superseded`) or does not.
 
 **Why this is the same as writing one at a time.** Serial execution would apply mutation 1, land
 it, apply mutation 2 to what landed, land it. The batch applies mutation 2 to what mutation 1
@@ -328,10 +395,12 @@ under a policy frozen before its window, the cancellation's gets the same one li
 **Memory rule.** Applied in the ticket guard and nowhere else. After a hold ends: a `Committed` of
 a `readModifyWrite` remembers the candidate that write landed, combined or not, and the etag the
 store returned for it, if the candidate is within the size cap; every other ending of every verb
-forgets. That is the only source. A remembered candidate decodes and passes the life-ambiguity
-check because the store holds the same bytes: whatever `decodeRefCatalog` or `throwIfAmbiguous`
-would say about them from memory, they would say from a fresh read of the object this pool just
-committed, so memory adds no verdict a read would not give. Bytes that
+forgets. That is the only source. A remembered candidate decodes and passes
+`CatalogLifeIndex::throwIfAmbiguous`, which `casUpdateImpl` runs on every base and which is a
+throw, not a verdict: the base the candidate was built from had already passed it, every catalog
+mutation preserves each existing `(ns, incarnation)` pair or inserts one freshly minted 128-bit
+incarnation, and `encodeRefCatalog` and `checkCatalogAdmission` ran on the candidate before the
+`PUT`. So the memory never presents a base that a fresh read of the same commit would not. Bytes that
 came from the store, a resolve read's `Conflict::seen` among them, are never remembered: another
 writer's malformed object, remembered and then repaired in the store, would otherwise reach a
 `decide` as a stale base and become a corruption verdict where today's observation sees the repair.
@@ -368,8 +437,9 @@ and the admission refusal (`LIMIT_EXCEEDED` from `checkCatalogAdmission`), store
 `exception_ptr` in a local that every run of `decide` first clears, and returns `nullopt`; after
 `readModifyWrite` returns `Declined`, it rethrows the captured exception, and its callers catch the
 same types at the same places as today. A `Declined` with nothing captured stays the
-`LOGICAL_ERROR` it is today. Decode corruption and `identityPreserving`'s `LOGICAL_ERROR` propagate
-from wherever they are thrown.
+`LOGICAL_ERROR` it is today, with `throwCatalogWriteFailure`'s message reworded, since "the write
+was declined, which this call cannot produce" stops being true of a captured marker. Decode
+corruption and `identityPreserving`'s `LOGICAL_ERROR` propagate from wherever they are thrown.
 
 The second internal change: `casAdmitEntry` checks presence itself before inserting, like
 `createNamespaceStep1`, and carries the duplicate as the same marker, translating it back to its
@@ -471,7 +541,7 @@ ticket is held across that mutex. Audit of every acquisition of `driver_mutex` i
 
 | `driver_mutex` acquirer | what runs under it |
 |---|---|
-| `renewalLive`, `renewalCancelled`, the `*ForTest` accessors (`renewalWorkerMayRenew` is a helper called with the lock already held) | reads of driver state |
+| `renewalLive`, `renewalCancelled`, the `*ForTest` accessors and setters (`renewalWorkerMayRenew` is a helper called with the lock already held) | reads and test-only writes of driver state |
 | `DriverLease::finish`, `DriverLease::~DriverLease`, `admitRenewerCall`, `installRenewer`, `startRenewer`, `renewerReset` | driver state transitions and notifies, no I/O |
 | `startBackgroundWorkers`, `stopBackgroundWorkers` | worker handles; joins happen with the lock released |
 | `renewalLoop`, `remountLoop`, `sleepInterruptibly` | condition-variable waits and state reads; `remount_attempt()` runs after the lock is released |
@@ -497,8 +567,9 @@ is not entered while holding a ledger mutex, and no callback that runs while a t
 
 - INV-HK1. Per pool and hot key, at most one conditional write is in flight at any moment, from
   any plane.
-- INV-HK2. Writes of one pool to a hot key are applied in arrival order, a batch counting as its
-  members in order.
+- INV-HK2. Writes of one pool to a hot key are applied in the order their holds were entered, a
+  batch counting as its members in queue order; a member re-queued by a failed batch enters a new
+  hold behind whoever arrived meanwhile.
 - INV-HK3. A `readModifyWrite` that follows a `Committed` of this pool on a hot key, with no other
   ending in between and a candidate within the memory cap, obtains its base from memory and
   issues no read for it. A lost race's resolve read is not a base read.
@@ -511,11 +582,12 @@ is not entered while holding a ledger mutex, and no callback that runs while a t
 - INV-HK6. Every member of a batch sees, as its input, exactly the object it would have seen had
   the members before it committed one at a time with no external write between; a member's
   contribution or `nullopt` is delivered only from a batch that committed, and otherwise becomes
-  `Conflict` or `GaveUp{Unresolved}` according to what the leader's ending proved; a member's
-  exception is delivered on every ending.
+  the class the leader's ending belongs to; a member's exception is delivered on every ending,
+  including the leader's unwind; no taken member is left unsettled.
 - INV-HK7. An item is removed only by its own guard; no item references a stack that may have
-  unwound; a member's `decide` runs only while its caller is parked in the wait, and what the
-  parked caller touches of its own operation is disjoint from what the leader touches.
+  unwound; "a leader takes this item" and "this item's caller leaves" are decided under one mutex
+  against one flag and are exclusive, so a member's `decide` runs only while its caller is parked,
+  and what the parked caller touches of its own operation is disjoint from what the leader touches.
 - INV-HK8. `CasHotKeys::mutex` is held across no callback, no I/O and no `decide`, and the guard
   neither allocates nor throws.
 - INV-HK9. A member's own fence is checked before its `decide` runs and again after the commit it
@@ -524,8 +596,10 @@ is not entered while holding a ledger mutex, and no callback that runs while a t
 - INV-HK10. On the `Generation` dialect, write attempts on a hot key from one pool are at least
   one second apart, and the spacing sleep starts only when it and what follows it fit the
   operation's bound.
-- INV-HK11. A member is never told more about the batch's fate than the leader knows: `Conflict`
-  only when the leader's ending proves nothing applied, `Unresolved` otherwise.
+- INV-HK11. A member is told the class the leader's ending belongs to and never a stronger one:
+  `Committed` only from a landed batch, `Conflict` with the engine's own two-sided meaning only
+  when the leader was told `Conflict` or nothing was sent, `Unresolved` whenever something was sent
+  and the fate is unknown.
 
 ### Kinship with `appendRefOps` {#kinship-with-appendrefops}
 
@@ -544,12 +618,13 @@ part of this design.
 
 ## Half 2: conflict pacing {#half-2-conflict-pacing}
 
-`Retry::conflictBackoff(Dialect)` returns, on the `ETag` and `Emulated` dialects, `backoff(1)`,
-uniform(0, 200 ms) (`backoff` doubles from attempt 2 on); on the `Generation` dialect, 1000 ms plus
-`backoff(1)`. Both are flat: they do not grow with the writer's loss count. The `Generation` value is
-the store's documented rate for one writer, applied to every key the loop serves, hot or not:
-`_ckpt` and `gc/state` writers on GCS that lose a clean race retry no faster than once a second
-each, without relying on a 429 the store only might send.
+`Retry::conflictBackoff()` returns `backoff(1)`, uniform over [0, 200] ms inclusive (`backoff`
+draws `thread_local_rng() % (ceiling + 1)` and doubles the ceiling from attempt 2 on). It is flat:
+it does not grow with the writer's loss count, and it knows no dialect, which keeps `Retry` free of
+the backend as it is today. The `Generation` dialect's per-object budget is held where it matters,
+on the hot keys, by the lane's spacing below; on keys written by one or two writers, blob metas and
+plain objects among them, a one-second floor per lost race would pay a rate budget nobody is
+spending, on the insert path.
 
 - `CasOperation::readModifyWrite` and `readModifyWriteOnPresence`: on a `Conflict` whose inner
   write had no ambiguous attempt (a clean refused precondition, settled by the resolve read), a
@@ -592,13 +667,15 @@ object name, says excess writes may be throttled, and asks applications not to e
 lane that drains holders at `PUT` latency is not paced by 429s it does not receive, so on that
 dialect the lane spaces write attempts on a hot key itself, across holders: no attempt starts sooner
 than one second after the previous attempt on that key from this pool ended, successful or not. The
-wait is one sleep, the larger of the time to that boundary and, after a clean `Conflict`, the
-dialect's conflict pause, so the jitter is never absorbed by the boundary and two servers whose
-boundaries coincide do not retry at the same instant forever. The S3 and emulated dialects get no
-spacing. Go/no-go for the `gcs` lane: the count of 429s on `ref_catalog` in `system.text_log` over
-the acceptance run must not exceed today's, and the count of 412s must fall; both recorded in
-`docs/superpowers/cas/BACKLOG/gcs.md`. With combining, one second carries every mutation that
-arrived meanwhile, which is what makes that budget sufficient.
+wait is one sleep: the time to that boundary plus, after a clean `Conflict`, the flat conflict
+jitter, so the jitter is never absorbed by the boundary and two servers whose boundaries coincide
+do not retry at the same instant forever. The S3 and emulated dialects get no spacing. Go/no-go for
+the `gcs` lane: the count of 429s on `ref_catalog` and on `_ckpt` keys in `system.text_log` over
+the acceptance run must not exceed today's, and the count of 412s on `ref_catalog` must fall; all
+recorded in `docs/superpowers/cas/BACKLOG/gcs.md`. If `_ckpt` fails that gate on GCS, declaring it
+hot is the answer. With combining, one second carries every mutation that arrived meanwhile, which
+is what makes that budget sufficient. The spacing sleep goes through the plane's own sleep
+function, which is interruptible on the mount plane and a plain sleep on the other two.
 
 ### Edits to the backend request contract {#edits-to-the-backend-request-contract}
 
@@ -608,11 +685,10 @@ In `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md`:
    failure, and it must end — GCS bounds mutations of one object at about one per second, and today's
    `_ckpt` and catalog loops reissue without a sleep." with: "Conflicts spend the same deadline as
    errors but not the same pace: a clean lost race is settled by the resolve read and reissued after
-   `Retry::conflictBackoff(dialect)`, flat: uniform(0, 200 ms) on the `ETag` and `Emulated`
-   dialects, one second plus that on `Generation`, the store's documented rate for one writer;
-   neither grows with the writer's loss count. The growing schedule belongs to transport faults, and
-   to a conflict that settled one. Inside one pool a hot key never conflicts with itself: see the
-   hot-key write lane."
+   `Retry::conflictBackoff()`, a flat uniform over [0, 200] ms that does not grow with the writer's
+   loss count. The growing schedule belongs to transport faults, and to a conflict that settled
+   one. Inside one pool a hot key never conflicts with itself, and on the `Generation` dialect a
+   hot key's attempts are spaced to the store's rate: see the hot-key write lane."
 2. In the hand-written loop rule, after "sleeps with the engine's jitter between iterations", add:
    "the flat `conflictBackoff` after a refused precondition when the loop can tell it from a
    settled fault, `backoff(attempt)` otherwise and after a fault; `deleteCompletedRemoving`'s
@@ -668,7 +744,14 @@ visible in the object.
    re-decide on it without a further read. A third sibling makes the `PUT` ambiguous (the transport
    throws after the store applied it) and refuses the resolve read by the bound: the leader
    receives `GaveUp{Unresolved}`, every member receives `GaveUp{Unresolved, sent_any = true}` with
-   its own `Source`, no member re-decides, and the object carries every ticket (INV-HK11).
+   its own `Source`, no member re-decides, and the object carries every ticket (INV-HK11). A
+   fourth sibling makes the `PUT` ambiguous and then has an external `CasRequests` overwrite the
+   landed object before the resolve read: the leader receives the engine's precondition-moved
+   `Conflict`, members receive the same, and each member's re-decide through the real
+   `beginRemoving` resolves `AlreadyRemoving`, never `EntryChanged`. A fifth makes the leader's
+   `writeLoop` throw before any attempt (a token of another key) with members taken: every member
+   receives `Conflict{NotObserved}` from the leader's guard, a member whose `decide` had thrown
+   receives its exception, and none is left waiting (INV-HK6).
 3. Verdicts and errors in a batch. A member's `decide` returns `nullopt` because the leader's
    chained change made its row differ from what it observed. Batch commits: the member receives
    `Declined` after the commit and its marker (through `casUpdateImpl`) is the one a serial
@@ -676,11 +759,17 @@ visible in the object.
    read, sees its row unchanged, and lands. A member's `decide` that throws a non-verdict exception
    receives that exception whether the batch commits or fails, its `decide` runs exactly once (a
    counter), and it contributes nothing (INV-HK5, HK6).
-4. Member fences. A combined member whose operation was resumed under a stale generation receives
-   `GaveUp{FenceLost}` with `sent_any = false` and its `decide` never ran; a member whose fence is
-   tripped between the `PUT` and the post-commit check receives `GaveUp{FenceLost}` with
-   `sent_any = true` while the object carries its ticket (INV-HK9). A `Retry::once` item and an
-   item with an earlier deadline are not combined and run as their own holders.
+4. Member fences, and the take/leave race. A combined member whose operation was resumed under a
+   stale generation receives `GaveUp{FenceLost}` with `sent_any = false` and its `decide` never
+   ran; a member whose fence is tripped between the `PUT` and the post-commit check receives
+   `GaveUp{FenceLost}` with `sent_any = true` while the object carries its ticket (INV-HK9). A
+   `Retry::once` item and an item with an earlier deadline are not combined and run as their own
+   holders. The race: a hook parks the leader between taking the members and running their
+   `decide`s, and the test trips one member's fence and advances another member's deadline past
+   its bound while parked; both members stay parked (the queue depth does not change), the leader
+   runs the first's `gate(0)` and skips its `decide` with `GaveUp{FenceLost}`, runs the second's
+   `decide` normally, and each returns only after `done` (INV-HK7). Under ASan the same test with
+   the `taken` check removed is the use-after-free the check exists to prevent.
 5. Verdict on stale memory, at the catalog level in `gtest_cas_ref_catalog.cpp`. The pool commits
    once. An external `CasRequests` changes a row. A caller reads fresh outside the lane and runs
    the real `beginRemoving` through a hot `CasRequests`: `Transitioned`, not `EntryChanged`, one
@@ -731,9 +820,9 @@ visible in the object.
     issues its terminality read under the frozen policy: with that read answering retryable
     failures, the holder gives up at the outer deadline, not 90 s later.
 12. Half 2, parameterized over `readModifyWrite` and `readModifyWriteOnPresence`. K clean lost
-    races: `CASRequestConflictPause` K, `CASRequestReissue` 0, every sleep at most 200 ms on
-    `Emulated` and within [1000, 1200] ms on `Generation`. K races each preceded by a 429-class
-    fault: `CASRequestReissue` K, `CASRequestConflictPause` 0, the growing schedule.
+    races on a non-hot key: `CASRequestConflictPause` K, `CASRequestReissue` 0, every sleep within
+    [0, 200] ms on every dialect. K races each preceded by a 429-class fault: `CASRequestReissue`
+    K, `CASRequestConflictPause` 0, the growing schedule.
 13. `Generation` spacing. N writes: consecutive attempts at least one second apart on the clock,
     through the plane's sleep function; a fence tripped during the spacing sleep ends the holder
     with `GaveUp{FenceLost}` and no attempt; a holder whose bound cannot fit the sleep plus its
@@ -787,8 +876,8 @@ exception from `decide` propagates unchanged; the catalog's markers travel as `n
 read's bytes are never remembered; a `single_attempt` policy never starts from memory; the memory
 start is gated like the read it replaces; the guard is the sole remover and never allocates; a
 member's fence is checked before its `decide` and after the commit; `driver_mutex` was audited
-rather than assumed; the conflict pause is flat per dialect and a conflict that settled a fault
-keeps the growing schedule; the `Generation` dialect is spaced to its documented rate; a holder
+rather than assumed; the conflict pause is flat and a conflict that settled a fault keeps the
+growing schedule; the `Generation` dialect's hot keys are spaced to its documented rate; a holder
 whose transport never answers is an accepted tradeoff with its fix placed in the transport; and
 the step-1 fence marker is caught where it was not.
 
@@ -806,3 +895,24 @@ cap; the memory is written in the guard only; the guard's reporting tail is insi
 the lane pointer the sleep helper reads is named; `Declined{seen}` is the base on purpose; the
 `driver_mutex` audit lists every acquirer and its count; the `CREATE` percentiles cite both
 windows; `casAdmitEntry` is named as test-only; `removeCurrent` holds one ticket around its loop.
+
+Revision 18 folds in a second `opus` review, of revision 17, which checked the previous round's
+nineteen findings one by one and found one critical: nothing made "a leader takes this item" and
+"this item's caller leaves" exclusive, so a caller leaving on its fence or deadline in the instant
+after being taken would have had its `decide` run on a dead stack (revision 2 had "a carved item
+cannot leave" and the rewrites lost it). Fixed by a `taken` flag set in the take's own critical
+section and checked under the same mutex before any departure (INV-HK7). Its majors, all fixed:
+`writeLoop` returns `Conflict` in a second, ambiguous-then-superseded arm, so the settlement now
+tells members the class the leader was told, with that arm's two-sided meaning argued from what a
+solo writer already tolerates, instead of a discriminator that was false for it (INV-HK11); a
+leader that unwinds with members taken settles them from its guard; the ticket boundary inside
+`readModifyWrite` is stated (one ticket per attempt, the base chosen at the hold); settlement
+shares one pre-allocated `BatchOutcome` and copies nothing under the mutex; the batch's cost is
+stated in two clauses with the frozen-policy line as a precondition; and the `Generation`
+one-second conflict floor is gone, since the lane's spacing already holds the budget on the hot
+keys and the floor would have landed on blob metas and plain objects for nothing. Minors: which
+operations the wait's `Liveness` check reaches; `Unresolved` over-reported after an inner
+`Conflict`, deliberately; INV-HK2 speaks of holds; the memory's round-trip argument is the real
+one; `conflictBackoff` knows no dialect and its interval is inclusive; `throwCatalogWriteFailure`'s
+message; two `driver_mutex` rows relabelled; the spacing sleep is interruptible on the mount
+plane only.
