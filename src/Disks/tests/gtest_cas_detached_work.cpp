@@ -653,6 +653,9 @@ TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
     EXPECT_TRUE(handler_ran.load()) << "the injected throw must have reached the (throwing) error handler";
     EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 0);
 
+    /// Same lifetime rule as below: the detached publisher reads the hooks' captured locals, so it is
+    /// stopped and drained before they go out of scope.
+    ASSERT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/10000));
     store->setSnapshotAfterCaptureHookForTest(nullptr);
 }
 
@@ -738,6 +741,10 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
         << "no elapsed backoff ever admitted a further publish attempt: the gate is a wedge, not a pace";
 
     EXPECT_EQ(error_hook_calls.load(), attempts.load());
+    /// The publisher is detached work: a redispatch admitted by the last elapsed backoff can still be
+    /// running when this body returns, and it reads `fake_boot` through `boot_ms_fn`. Stop and drain it
+    /// while the locals it reads are alive.
+    ASSERT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/10000));
     store->setSnapshotAfterCaptureHookForTest(nullptr);
 }
 

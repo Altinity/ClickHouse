@@ -115,6 +115,12 @@ struct Caller
 {
     std::thread t;
     std::future<std::exception_ptr> fut;
+
+    /// A fatal `ASSERT_*` between launch and the explicit `t.join()` below returns from `TestBody` with
+    /// `t` still joinable; `std::thread::~thread` on a joinable thread calls `std::terminate`, aborting
+    /// the whole binary and discarding every later test. This destructor is the backstop: on every
+    /// success path the explicit join already ran and left nothing for it to do.
+    ~Caller() { if (t.joinable()) t.join(); }
 };
 
 Caller launchAppend(const PoolPtr & store, const RootNamespace & ns, MutationScope scope,
@@ -583,6 +589,10 @@ struct AppendCaller
 {
     std::thread t;
     std::future<AppendResult> fut;
+
+    /// Same hazard as `Caller` above (see its destructor comment): a fatal `ASSERT_*` before the
+    /// explicit join leaves `t` joinable, and a joinable thread's destructor calls `std::terminate`.
+    ~AppendCaller() { if (t.joinable()) t.join(); }
 };
 
 AppendCaller launchAppendOps(const PoolPtr & store, const RootNamespace & ns, MutationScope scope,
@@ -1022,18 +1032,63 @@ TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
     auto store = openPoolWith(backend, cfg);
     const DB::Cas::Layout & layout = store->layout();
     const RootNamespace ns{"srv1/chunk_snapshot_coalesce"};
-    publishEmptyPart(store, ns, "seed");
+    /// NOT `publishEmptyPart`: that helper makes `precommitAdd` (which folds an implicit
+    /// `namespace_birth` and the add into ONE transaction, since the namespace is not yet `Live`) and
+    /// `promote` two separate, back-to-back `appendRefOps` calls. `precommitAdd`'s own post-commit
+    /// trigger (`maybeScheduleSnapshotPublish` at the end of `commitRefChunk`) dispatches a background
+    /// publisher for what it just committed; with `snapshot_log_count_threshold` at 0 (every single
+    /// commit is eligible -- never reachable through a normal, 256-count threshold) that publisher can
+    /// still be in flight when `promote`, moments later, becomes lane leader for its OWN write and
+    /// moves the lane to `Writing` -- a real, reachable race between that capture and this transition.
+    /// A lost race backs the publisher off, and this pool's frozen `boot_ms_fn` (see `openPool`'s
+    /// comment) never advances past that deadline, so the backoff never clears on its own, poisoning
+    /// every later dispatch on `ns` for the rest of the test, including chunk 1's. Draining
+    /// (`waitForSnapshotPublishSettleForTest`) between the two commits removes the in-flight publisher
+    /// `promote` would otherwise race, and driving one explicitly
+    /// (`tryPublishSnapshotAndAdvanceCheckpointOnce`, the direct synchronous seam built for exactly this
+    /// -- "public so tests can drive one attempt deterministically without depending on the background
+    /// dispatch's timing") covers anything a dispatch was never even admitted for.
+    DB::Cas::tests::casAdmitRecoverableEntry(*store->poolBackendPtr(), store->layout(), ns, store->liveWriterEpoch());
+    PartWriteInfo seed_info;
+    seed_info.intended_namespace = ns;
+    seed_info.intended_ref = ns.string() + "/seed";
+    auto seed_build = store->beginPartWrite(seed_info);
+    const ManifestId seed_manifest_id = seed_build->stageManifest({});
+    seed_build->precommitAdd(ns, "seed", seed_manifest_id);
+    store->waitForSnapshotPublishSettleForTest(ns);
+    store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
+    seed_build->promote(ns, "seed", seed_build->buildId(), seed_manifest_id);
     store->waitForSnapshotPublishSettleForTest(ns);   /// drain the seed's publish chain -> tail == 0
+    store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
 
     /// Latch the FIRST `_snap/` PUT (chunk 1's publisher) at its conditional PUT -- i.e. AFTER it has
     /// captured chunk 1's prefix under state_mutex.
     backend->armBlock(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_snap/");
-    /// Gate the leader at the chunk boundary until that publisher has parked on its PUT, so its captured
-    /// candidate is EXACTLY chunk 1's prefix (not chunk 1 + chunk 2).
-    store->setCarveHookForTest([backend](CasRefLedger::CarvePhaseForTest ph)
+    /// Gate the leader at the chunk boundary on the publisher's CAPTURE (`snapshot_after_capture_hook_for_test`,
+    /// fired the moment the publish attempt has read `rt->state` under `state_mutex` and passed the
+    /// `lane_state == Ready` admission check), not on the publisher's later blocked PUT. Capture is
+    /// causally prior to the PUT the block intercepts -- it is the OTHER side of the very check
+    /// (`CasRefLedger.cpp`'s `tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl`) whose failure logs
+    /// "refusing snapshot publication while the append lane is not Ready" -- so waiting for it is the
+    /// exact fact the boundary needs, whereas waiting for the PUT also waits on however long it takes the
+    /// dispatched publish to be scheduled onto a worker thread at all. Under contention that scheduling
+    /// delay can outlast a bounded wait, and a leader released by the wait's own timeout (rather than by
+    /// the capture it was meant to prove) can start chunk 2 -- moving the lane to `Writing` -- before the
+    /// not-yet-scheduled publisher ever captures, so it captures Writing and is refused.
+    auto captured = std::make_shared<CaseSync>();
+    store->setSnapshotAfterCaptureHookForTest([captured]
     {
-        if (ph == CasRefLedger::CarvePhaseForTest::ChunkReseed)
-            backend->awaitBlockEntered();
+        std::lock_guard lk(captured->m);
+        captured->entered = true;
+        captured->cv.notify_all();
+    });
+    store->setCarveHookForTest([captured](CasRefLedger::CarvePhaseForTest ph)
+    {
+        if (ph != CasRefLedger::CarvePhaseForTest::ChunkReseed)
+            return;
+        std::unique_lock lk(captured->m);
+        captured->cv.wait_for(lk, std::chrono::seconds(10), [&] { return captured->entered; });
+        ASSERT_TRUE(captured->entered) << "chunk 1's snapshot publisher never captured its candidate within 10s";
     });
 
     auto sync = std::make_shared<CaseSync>();
@@ -1057,11 +1112,18 @@ TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
     ++chunk2_id.ref_sequence;
     EXPECT_EQ(rb.id, chunk2_id);
 
+    /// Independently confirm the latched publisher actually reached its blocked PUT, on the main test
+    /// thread rather than as the leader's own gate: without this, a wiring regression that never parks
+    /// the publisher would let the settlement assertion below pass VACUOUSLY (a direct, non-coalesced
+    /// dispatch can still cover chunk 2).
+    backend->awaitBlockEntered();
+
     /// Release the latched chunk-1 publisher. Its settlement must re-fire the chunk-2 trigger the
     /// single-flight gate dropped -> a follow-up publication covers chunk 2.
     backend->releaseBlock();
     store->waitForSnapshotPublishSettleForTest(ns);
     store->setCarveHookForTest(nullptr);
+    store->setSnapshotAfterCaptureHookForTest(nullptr);
     store->setRefPreCarveHookForTest(nullptr);
 
     const std::optional<RefTxnId> newest = store->newestPublishedSnapshotIdForTest(ns);
