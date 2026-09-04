@@ -75,14 +75,20 @@ capped at 100 attempts. Verdict: spec-conformant, unfair by construction under s
 
 Fix, two halves, in this order:
 
-1. **Serialize and combine within a process (user's proposal, primary).** Compare-and-swap is needed
-   only against other servers; inside one server every catalog mutation goes through one FIFO writer per
-   pool in `CasRefCatalog` that drains the queue, applies every pending change to a fresh snapshot and
-   issues ONE conditional PUT — write-combining, so N concurrent `CREATE`s cost one round trip, and the
-   GCS per-object budget is served better, not worse. A lost race (another server) re-reads and replays
-   the whole queue. GC/reconciler catalog updates take the same door. Tests: N threads on the in-memory
-   backend under an injected clock — at most one CAS in flight, bounded maximum wait, FIFO order; and a
-   second `Pool` on the same backend as the external writer whose win forces one replay.
+1. **Serialize within a process and remember the last committed state (user's proposal, primary).**
+   Compare-and-swap is needed only against other servers. Inside one server every catalog mutation
+   takes one FIFO door per pool in `CasRefCatalog`: one write at a time, no combining. The door keeps
+   the last COMMITTED snapshot and its etag from the previous successful write, applies the next change
+   to that snapshot and issues the conditional PUT against the remembered etag — no read before the
+   write. Only a lost race (another server's write, a 412 that the engine settles by its resolve read)
+   refreshes the remembered state from `Conflict::seen` and retries; any outcome that does not prove
+   what is durable (`GaveUp`, `Conflict{NotObserved}`, a fence loss or remount) invalidates the memory,
+   so the next writer reads first — fail-close. GC, the reconciler and decommission take the same door,
+   otherwise their writes stale the memory and cost one extra round trip each. Effect on this lane: N
+   concurrent `CREATE`s become N sequential PUTs with no reads and no intra-process 412s. Tests: N
+   threads on the in-memory backend under an injected clock — at most one CAS in flight, FIFO order,
+   zero reads between consecutive committed writes, bounded maximum wait; and a second `Pool` on the
+   same backend as the external writer whose win forces exactly one re-read and one retry.
 2. **Decouple conflict pacing from transport-fault backoff (secondary, spec change).** A `Conflict`
    already carries the fresh object; pace its reissue with a flat small jitter (the RCA suggests
    uniform(0, 250 ms)) instead of the growing `reissues`-driven schedule, keeping the capped exponential
