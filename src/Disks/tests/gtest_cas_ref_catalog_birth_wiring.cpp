@@ -87,10 +87,14 @@ private:
 /// still be allowed to prove a new pool, and the failed first attempt must not have published
 /// `_pool_meta` without the catalog it makes mandatory.
 ///
-/// A plain `std::runtime_error`, not a `Poco::Exception`: the engine's write loop treats any
-/// `Poco`/transport exception as an ambiguity it settles itself with one resolve read, and a one-shot
-/// fault of that class is retried and silently succeeds within the SAME `Pool::open` call -- it never
-/// reaches the caller at all. A non-`Poco` `std::exception` is the engine's own signal for "this could
+/// A plain `std::runtime_error`, not a `Poco::Exception`, and deliberately so: a `Poco`/transport
+/// exception here would exercise the write loop's OWN ambiguity resolution rather than this suite's
+/// subject, which is what `FailedCatalogBootstrapDoesNotPublishPoolMetaAndRetryConverges` actually
+/// needs -- a fault that propagates out of the FIRST `Pool::open` call so a SEPARATE retry can be the
+/// one that converges. The engine's write loop treats any `Poco`/transport exception as an ambiguity it
+/// settles itself with one resolve read, and a one-shot fault of that class is retried and silently
+/// succeeds within the SAME `Pool::open` call -- it never reaches the caller at all. A non-`Poco`
+/// `std::exception` is the engine's own signal for "this could
 /// not have landed" and propagates unresolved, which is what "before it reaches durable storage" means.
 class CatalogBootstrapWriteFailsOnceBackend final : public WriteCountingBackend
 {
