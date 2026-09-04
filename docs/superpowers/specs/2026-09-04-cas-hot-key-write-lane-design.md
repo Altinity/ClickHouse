@@ -9,7 +9,7 @@ doc_type: 'guide'
 
 # CAS hot-key write lane {#cas-hot-key-write-lane}
 
-Revision 10. Brainstormed 2026-09-04 against the measurements in
+Revision 11. Brainstormed 2026-09-04 against the measurements in
 `docs/superpowers/cas/2026-09-04-ref-catalog-starvation-rca.md` and the two BACKLOG items
 `{#stateless-lane-wall-time-is-drop-table}` and `{#ref-catalog-cas-starvation}`. This document
 supersedes the fix sketch in those items where they differ: the door lives in the engine, not in
@@ -79,6 +79,14 @@ Revision history, kept because each step removed something a review proved unsou
   timestamp survives every forgetful ending, and `holder_active` is gone: the holder is the front
   ticket. INV-HK3 is qualified by the memory cap, callbacks run during a ticket's tenure may not
   write a hot key, and the two-plane jitter test asserts a range, not distinct instants.
+- Revision 11 replaces the accepted stalled-holder outage with eviction. A holder's whole tenure
+  is bounded by its own budget plus one attempt once every read it issues is under a policy frozen
+  before its window (reconciliation already does this; cancellation gets the same one line), so a
+  holder found past that bound can only be a trickling transport attempt, and a waiter evicts its
+  ticket and takes over while the stuck request finishes on its own operation, untouched. One
+  pre-attempt wait helper composes transport backoff, conflict pause and the `Generation` boundary
+  into one sleep; queue time is recorded on every departure; eviction and expiry behind a holder
+  are logged by key.
 
 ## The problem, as measured {#the-problem-as-measured}
 
@@ -126,8 +134,10 @@ Goals:
   conflict that settled one.
 - No change to the catalog's API, to the semantics of any conditional write or of any verdict a
   `decide` renders, to the 90 s windows, to any read path, or to the GC erase's authority window.
-  One internal change in `CasRefCatalog.cpp` (how `casUpdateImpl` carries its markers, below).
-  Every existing catalog test stays green unchanged.
+  One internal change in `CasRefCatalog.cpp` (how `casUpdateImpl` carries its markers, below) and
+  one line in `CasRefLedger::dropNamespaceImpl` (the cancellation's terminality read under a
+  frozen policy, as the reconciliation's already is). Every existing catalog test stays green
+  unchanged.
 
 Non-goals:
 
@@ -155,8 +165,8 @@ and runs only when its ticket is at the front; a waiter leaves on its own fence 
 lane remembers the last object this `CasRequests` committed, so a `readModifyWrite` whose call
 site opted in can start from it instead of a `GET`. A `decide`'s refusal is reported only from a
 proven base. `Pool` gives the predicate to `mount_requests` only, naming `refCatalogKey()`; the
-catalog's API, `CasRefLedger` and GC do not change, and `casUpdateImpl` changes only how it
-carries its own markers and which of its callers opt into memory.
+catalog's API and GC do not change, `casUpdateImpl` changes only how it carries its own markers
+and which of its callers opt into memory, and the ledger changes one line.
 
 **Half 2, conflict pacing.** In `readModifyWrite` and `readModifyWriteOnPresence`, a clean
 refused precondition is repaid after `Retry::conflictBackoff(dialect)`, a flat pause that does not
@@ -182,6 +192,7 @@ private:
     struct Lane    /// one hot key; created on first use, lives as long as this object
     {
         std::deque<uint64_t> tickets;                /// guarded by `mutex`; the front ticket is the holder
+        uint64_t holder_evict_after_ms = 0;          /// guarded by `mutex`; the holder's bound plus two attempt timeouts, 0 = no eviction
         uint64_t last_write_attempt_end_ms = 0;      /// guarded by `mutex`; for the Generation dialect's spacing
         std::condition_variable cv;
         std::optional<Object> remembered;            /// guarded by `mutex`; the last candidate this plane committed
@@ -193,8 +204,9 @@ private:
 ```
 
 The front ticket is the holder; there is no separate holder flag. A ticket reaches the front only
-when every earlier ticket's guard has erased it, and a holder's own ticket stays at the front until
-its guard runs, so "my ticket is the front" is the whole exclusion.
+when every earlier ticket has been erased, by its own guard or, for a holder found past its
+bound, by an evicting waiter (below), and a holder's own ticket stays at the front until one of
+those, so "my ticket is the front" is the whole exclusion.
 
 `CasRequests`'s constructor gains an optional `CasHotKeys::IsHot`. Every existing constructor call
 (every test, the offline tools, the pool factory's local bootstrap `CasRequests`) passes none and
@@ -353,31 +365,45 @@ leave step below is this guard running on the normal path.
    erase, return `GaveUp{Deadline}` with the bound's own source. The gate runs outside the lane
    mutex because it may call the operation's `Liveness` closure, and the lane mutex must stay a
    leaf that calls nothing.
-2. Under `mutex`: if the ticket is at the front, leave the loop as the holder. Otherwise
-   `cv.wait_for(lock, slice)` with a short slice (the pattern of
-   `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the mutex, and go to step 1. The
-   clock is read in step 1, never under the mutex.
+2. Under `mutex`: if the ticket is at the front, set `holder_evict_after_ms` to this caller's
+   `bound.deadline_ms` plus twice the backend's attempt timeout (0, meaning never, when the
+   backend reports no timeout), and leave the loop as the holder. Otherwise, if
+   `holder_evict_after_ms` is not 0 and the clock read in step 1 is past it, evict: pop the front
+   ticket, clear `remembered`, set `holder_evict_after_ms = 0`, log the eviction with the key and
+   the evicted ticket, and go to step 1 (the new front is promoted on its next iteration, which
+   `cv.notify_all()` triggers). Otherwise `cv.wait_for(lock, slice)` with a short slice (the
+   pattern of `recovery_cv.wait_for(lock, 200ms)` in the ledger), release the mutex, and go to
+   step 1. The clock is read in step 1, never under the mutex.
 
 A ticket is promoted only after its checks passed in the same iteration. The engine's own
 per-attempt gate and `fits` still run before anything is sent, as today.
 
 **Hold.** Run the verb's body on the caller's own thread, with the caller's own operation, policy,
-bound and result type, exactly as today, plus the memory step below. On the `Generation` dialect,
-each write attempt on the hot key is preceded by the spacing wait of
-[Half 2](#half-2-conflict-pacing): the holder snapshots `last_write_attempt_end_ms` under
-`mutex`, computes the delay outside it, and before sleeping runs the engine's own pre-sleep check,
-`gate(reservedFor(delay, 2))` and `fits`, exactly as `pauseAndReissue` does, so the sleep never
-starts unless the sleep and the attempt after it fit the operation's bound; a refusal there is the
-engine's usual `GaveUp`. After the attempt ends, successful or not, it records its end there.
+bound and result type, exactly as today, plus the memory step below. Every sleep the body takes
+before a write attempt goes through one helper, `pauseBeforeAttempt`: it takes the larger of the
+pause the loop owes (the growing transport backoff after a fault or an ambiguous attempt, the
+flat conflict pause after a clean lost race, or nothing before a first attempt) and, on the
+`Generation` dialect and a hot key, the time to the one-second boundary after
+`last_write_attempt_end_ms` (snapshotted under `mutex`, computed outside it); runs the engine's
+pre-sleep check, `gate(reservedFor(delay, 2))` and `fits`, exactly as `pauseAndReissue` does, so
+the sleep never starts unless the sleep and the attempt after it fit the operation's bound; sleeps
+once through the plane's interruptible sleep; and re-checks the gate after. A refusal there is the
+engine's usual `GaveUp`. After every write attempt on a hot key ends, successful or not, its end is
+recorded in `last_write_attempt_end_ms`. Credential-refresh reissues and ambiguous-attempt
+reissues take the same helper, so a hot `Generation` key never sleeps twice before one attempt and
+never issues one inside the boundary.
 
-**Leave.** The ticket guard, on every exit: under `mutex`, move the prepared memory value into
-`remembered` or clear it (a holder that unwinds clears), erase this ticket, `cv.notify_all()`. It
-is `noexcept` and allocates nothing: the memory value is prepared before the guard runs (below),
-and erasing from a `std::deque` does not allocate.
+**Leave.** The ticket guard, on every exit: under `mutex`, erase this ticket by value; if it was
+still present (the caller was not evicted), move the prepared memory value into `remembered` or
+clear it (a holder that unwinds clears), set `holder_evict_after_ms = 0`, and record the queue
+time; if it was absent (evicted), touch neither the memory nor the spacing state, so a late
+ending cannot overwrite what the survivors installed. Then `cv.notify_all()`. It is `noexcept`
+and allocates nothing: the memory value is prepared before the guard runs (below), and erasing
+from a `std::deque` does not allocate.
 
 A holder never waits for another ticket and never runs anyone else's closure: a ticket is settled
-only by its own caller. No ticket outlives its caller's stack in the queue: the guard removes it on
-every exit path, and nothing else references it.
+only by its own caller. No ticket outlives its caller's stack in the queue: the guard removes it
+on every exit path, an evicting waiter removes it only earlier, and nothing else references it.
 
 ### The memory {#the-memory}
 
@@ -438,7 +464,7 @@ sleeps already spend.
 | who | bounded by | worst case |
 |---|---|---|
 | a waiter | its own gate and its own deadline, re-checked every slice | its window plus one slice |
-| the holder | its own deadline; the engine starts no attempt that cannot finish inside it | its window, plus one attempt timeout, plus the windows of reads its own `decide` issues |
+| the holder | its own deadline; the engine starts no attempt that cannot finish inside it, and its `decide`'s reads run under a policy frozen before its window | its window plus one attempt timeout; past that plus one more timeout, it is evicted |
 
 Nothing copies a verdict from one operation to another: every `GaveUp` is the reporting operation's
 own, with its own `Source`. A frozen policy (`op.freeze`) and a lease-bound policy
@@ -448,22 +474,28 @@ write are checked against.
 A stopping plane or a lost fence reaches waiters through their own gate, checked every slice, and
 reaches the holder through its own attempts' gates, as today.
 
-**A stalled holder.** The engine calls the transport synchronously and cannot cancel it. A
-stalled attempt ends at the backend's attempt timeout, which the engine reserves per attempt. An
-attempt that trickles rather than stalls, delivering bytes slowly enough that no socket timeout
-fires, has no bound in the engine, today or after the backend request contract, and the S3
-transport's request timeouts are per socket operation, not per request. Today such an attempt
-traps only its own caller and its query. In the lane it traps the hot key on this plane: every
-later catalog writer waits to its own deadline and reports the same typed retry-later the trapped
-writer would, and `CREATE`/`DROP` on this pool fail with that error until the attempt ends. The
-attempt ends when the transport returns, when the connection is closed by either side, or when
-the process restarts; nothing in the lane ends it, because nothing in the engine can. This is
-accepted as fail-stop: nothing lands that should not, no second write is started under a running
-first one, and the failure mode is observable (`CASHotKeyQueueWaitMicroseconds` climbs while
-`CASRequestAttempt` on the key does not). A holder lease that hands exclusivity to a waiter while
-the first write is still running was designed and rejected: it is safe under the precondition,
-but its lifetime and spacing rules cost more than the trickle case is worth, and a trickle that
-defeats every socket timeout is a transport fault to fix in the transport.
+**A holder's tenure is bounded, and a holder found past it is evicted.** Everything a holder
+does through the engine is under its own bound: no attempt and no sleep starts unless it fits, an
+attempt is reserved at the backend's attempt timeout, and every read a catalog `decide` issues
+runs under a policy frozen before the holder's window began (`resolveNamespaceLife` freezes one
+and passes it through `reconcileStaleCreator` into `isCreatorFenceTerminal`; `dropNamespaceImpl`
+does the same for `cancelStalledCreating` with the one line this design adds). So a healthy
+holder leaves by its deadline plus one attempt timeout. The one thing that can outlive that is a
+transport attempt that trickles rather than stalls, delivering bytes slowly enough that no
+socket timeout fires; the engine cannot cancel it, the S3 transport's timeouts are per socket
+operation, and today it traps only its own caller and its query.
+
+In the lane it would trap the key, so a waiter that finds the holder past its deadline plus
+twice the attempt timeout evicts it: pops its ticket, clears the memory, logs the key and the
+ticket, and lets the queue move. The evicted holder is not interrupted and not cancelled; it keeps
+running on its own operation, its attempt ends when the transport lets it, and its guard finds
+its ticket gone and leaves the memory and the spacing state alone. What the eviction gives up is
+exclusivity between exactly two writers, the evicted one and the current holder, and the
+precondition orders those as it orders any two servers' writes: whichever loses is settled by its
+resolve read. On the `Generation` dialect the evicted holder's late attempt may fall inside the
+boundary once; that is the store's rate exceeded by one attempt after a transport fault, and it
+is logged. No healthy holder is ever evicted, because a healthy holder cannot reach the eviction
+time, and a backend without an attempt timeout (the in-memory backend) never evicts.
 
 ### Lock order {#lock-order}
 
@@ -512,16 +544,22 @@ ledger-visible reads and a waiter must not hold what the holder needs. Today's c
   and a memory start passes the same one-attempt gate and `fits` an observation would.
 - INV-HK9. On the `Generation` dialect, write attempts on a hot key from one plane are at least
   one second apart, and the spacing sleep starts only when it and the attempt after it fit the
-  operation's bound.
+  operation's bound; an evicted holder's last attempt is the one stated exception.
+- INV-HK10. A holder's ticket is at the front for at most its deadline plus twice the backend's
+  attempt timeout; past that, any waiter evicts it. No holder within its own bound is ever
+  evicted. An evicted holder's ending changes no lane state.
 
 ### Effects to name {#effects-to-name}
 
 - A `decide` that issues reads holds the lane for those reads. `reconcileStaleCreator` and
-  `cancelStalledCreating` call `isCreatorFenceTerminal` inside `decide`, and that reads the mount
-  key under a fresh `Retry::standard()` on the caller's operation. Today that window is the
-  caller's own; in the lane it is also every waiter's, each of which still leaves on its own
-  deadline. Passing a frozen policy into `isCreatorFenceTerminal` would bound it and is a follow-up
-  outside this design.
+  `cancelStalledCreating` call `isCreatorFenceTerminal` inside `decide`. `resolveNamespaceLife`
+  already freezes one policy before its loop and passes it through `reconcileStaleCreator` into
+  that read; `dropNamespaceImpl` today lets the cancellation's read take a fresh
+  `Retry::standard()`, and this design gives it the same frozen policy (one line: the closure
+  captures `cancel_op.freeze(Retry::standard())` and passes it). With both bounded, a holder's
+  reads end inside its own window, which is what makes the eviction time exact. The wait those
+  reads impose on waiters is bounded by the same window, and each waiter still leaves on its own
+  deadline.
 - A verdict rendered on memory costs one `GET` before the real verdict, which is what every
   `readModifyWrite` costs today.
 - The `Committed` a caller receives is its own write's, with its own `attempts_sent`.
@@ -615,11 +653,17 @@ In `docs/superpowers/specs/2026-09-02-cas-backend-token-contract-design.md`:
 
 ## Observability {#observability}
 
-Three profile events, mirroring the ref-log lane's `CASRefQueueWaitMicroseconds`:
+Profile events, mirroring the ref-log lane's `CASRefQueueWaitMicroseconds`:
 
-- `CASHotKeyQueueWaitMicroseconds`: time from enter to hold, per ticket.
+- `CASHotKeyQueueWaitMicroseconds`: time from enter to departure, per ticket, recorded by the
+  guard on every exit, including a waiter that left on its deadline or fence without holding.
 - `CASHotKeyMemoryStarts` and `CASHotKeyReadStarts`: how a `readModifyWrite` obtained its base.
 - `CASHotKeyVerdictRestarts`: verdicts rendered on memory and re-rendered on an observation.
+- `CASHotKeyEvictions`: holders evicted past their bound.
+
+Two log lines, each naming the key: a waiter that left on its deadline while a holder was at the
+front (with the holder's ticket and how long it has held), and an eviction. The first is what makes
+a stuck holder visible while it is stuck, since the profile event only counts departures.
 
 The acceptance measurement is the existing one: ten minutes of the parallel stateless suite on the
 CA-s3 lane, `system.query_log` for `DROP TABLE` and `CREATE TABLE` percentiles, and the count of
@@ -691,11 +735,17 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
 7a. Exceptional exits. A `Liveness` closure that throws from the gate, and a `decide` that throws a
    non-verdict exception on memory. Assert: the exception reaches the caller unchanged, no write was
    sent for the second, the ticket is gone, and the next waiter is promoted (INV-HK6).
-7b. Stalled holder. The holder is parked inside a `PUT` that does not return; the clock is
-   advanced past every waiter's deadline. Assert: each waiter leaves with its own `GaveUp`, no
-   second write was started, only the holder's ticket remains in the lane, and when the `PUT` is
-   finally released the holder commits and the next writer proceeds normally (fail-stop, then
-   recovery).
+7b. Eviction. On a backend reporting an attempt timeout, the holder is parked inside a `PUT` that
+   does not return; the clock is advanced past its deadline plus twice the timeout. Assert: the
+   next waiter evicts it (`CASHotKeyEvictions` 1, the log line, memory cleared), becomes the
+   holder, reads, and commits; when the parked `PUT` is released it is refused and settled by its
+   resolve read, its guard finds no ticket, and the memory the survivor installed is intact; a
+   third writer waits for the survivor, so exclusivity holds among the non-evicted (INV-HK10).
+   Siblings: a holder parked inside a `decide`'s nested read under the frozen policy, with the
+   clock at its deadline plus one timeout, is not evicted; a holder past that on a backend with no
+   attempt timeout is not evicted and the waiters expire on their own deadlines with the keyed log
+   line; `cancelStalledCreating` through `dropNamespaceImpl` issues its terminality read under the
+   frozen policy (its deadline is not later than the outer one).
 7d. Cache fill failure. A hook makes the post-commit etag copy throw. Assert: the caller receives
    its `Committed` unchanged, the memory is empty, and the next opted-in call reads. A memory
    start whose inner write is refused at the gate before sending reports `GaveUp` with
@@ -714,6 +764,10 @@ tests decodes a list of tickets from `bytes` and appends its own, so order is vi
    that loses K clean races records K sleeps of one second plus jitter each.
 7e. Memory cap. A committed candidate of exactly the cap is remembered; one byte above is not,
    and the next opted-in call reads.
+7f. One sleep per attempt on a hot `Generation` key. A credential-refresh reissue and an
+   ambiguous-attempt reissue each record exactly one sleep before the next attempt, of length
+   `max(transport backoff, boundary)`, attributed to the operation's own bound; a clean conflict
+   records one sleep of `max(conflict pause, boundary)`.
 8. Open plane overlaps. A second `CasRequests` with no predicate (the open-plane shape) does a
    `replace` while the hot plane's holder is parked; it does not wait; whichever write is refused is
    settled by its resolve read; after an open-plane win the hot plane's next opted-in
@@ -762,9 +816,9 @@ tests already cover each marker and the admission refusal against a cold key.
   per GC erase.
 - Remembering a resolve read's object, so that one external conflict costs one read rather than
   two: a BACKLOG note, gated on validating the bytes (a decode) before remembering them.
-- A holder lease that hands exclusivity on after a stuck attempt: rejected, see
-  [a stalled holder](#deadlines-and-fences); revisit only with evidence of a trickling transport.
+- A whole-request deadline in the transport, which would make a trickling attempt end on its own
+  and the eviction a dead branch: a BACKLOG note for the S3 client configuration.
 - Declaring the `_ckpt` keys hot, with the memory bound that many hot keys need: a BACKLOG item.
-- Bounding the reads a catalog `decide` issues (`isCreatorFenceTerminal` under a frozen policy): a
-  BACKLOG item.
+- Bounding the reads a catalog `decide` issues: done for both sites by this design and the
+  existing reconciliation code; nothing remains.
 - The two remaining `DROP TABLE` costs stay in `{#stateless-lane-wall-time-is-drop-table}`.
