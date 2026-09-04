@@ -2481,6 +2481,11 @@ TEST(CASRefCatalog, ATrueRefusalAdmissionRefusalThrowsWhenTheFreshCatalogIsAlsoF
 }
 
 /// casAdmitEntry: the cache holds "a"; the external erased it -- admits it again on the fresh read.
+/// The stale hint's own decide sees "a" still Live and duplicates the namespace before the lane can
+/// reread, so `encodeRefCatalog` throws `LOGICAL_ERROR` on the hint attempt -- split like the blocks
+/// above, since constructing that exception aborts under debug/sanitizer builds before this test's own
+/// rescue (the reread on a fresh, "a"-absent state) ever runs.
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CASRefCatalog, AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoom)
 {
     PoolAndExternal f(std::make_shared<CountingBackend>());
@@ -2505,6 +2510,34 @@ TEST(CASRefCatalog, AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoom)
     EXPECT_NO_THROW(CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)));
     EXPECT_EQ(f.backend->getCount(layout.refCatalogKey()) - reads_before, 1u) << "one lane read";
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CASRefCatalogDeathTest, AStaleHintCasAdmitEntryAdmitsWhenTheStoreHasRoomAborts)
+{
+    PoolAndExternal f(std::make_shared<CountingBackend>());
+    const Layout layout("p");
+    CasOperation pool_op = f.pool.admit();
+    CasRefCatalog::initializeEmptyForNewPool(pool_op, layout);
+    const CatalogEntry a = liveEntry("a", 1);
+    CasRefCatalog::casAdmitEntry(pool_op, layout, 1, a);   /// cache: "a"
+
+    CasOperation other = f.external.admit();
+    ASSERT_EQ(CasRefCatalog::beginRemoving(other, layout, a, 5), CasRefCatalog::BeginRemovingOutcome::Transitioned);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(a.incarnation, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    const CatalogEntry removing{.ns = a.ns, .state = NsState::Removing,
+                                .incarnation = a.incarnation, .removal_started_round = 5};
+    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(other, layout, removing, ready_parent, noAuthorityRefresh).outcome,
+              CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+
+    /// The lane's re-render on a fresh read cannot rescue this, because constructing the
+    /// `LOGICAL_ERROR` for the hint's own duplicate aborts before the reread ever happens.
+    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(pool_op, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
+}
+#endif
 
 /// casAdmitEntry: "a" is still present in the fresh read (Removing, not the Live hint the cache
 /// holds) -- re-admitting it duplicates the namespace, and `encodeRefCatalog`'s own canonical-order

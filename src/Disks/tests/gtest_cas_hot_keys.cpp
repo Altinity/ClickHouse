@@ -168,7 +168,8 @@ TEST(CASHotKeys, ADecideRunsWithTheLaneMutexReleased)
     CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn(), &hot_keys);
     auto op = requests.admit();
     /// `queueDepthForTest` takes the lane's mutex; a `decide` run under it would deadlock this test,
-    /// which the runner's per-test timeout reports. The call is the assertion.
+    /// which hangs the whole `CAS*` gate rather than being reported by a per-test timeout. The call is
+    /// the assertion.
     WriteResult result = hot_keys.submit("k", op, op.freeze(Retry::standard()),
         [&](const std::optional<Object> &) -> std::optional<String>
         {
@@ -614,13 +615,15 @@ TEST(CASHotKeys, TheCacheForgetsWhatItCannotVouchFor)
     ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(1))));
     const auto reads = [&] { return backend->getCount("k"); };
 
+    uint64_t before = reads();
+#if USE_AWS_S3
     /// Refused: dropped, the next hold reads.
     backend->failNextWriteWith("k", s3Error(Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied"));
-    uint64_t before = reads();
     ASSERT_TRUE(std::holds_alternative<Refused>(hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(2))));
     EXPECT_EQ(reads(), before);
     ASSERT_TRUE(std::holds_alternative<Committed>(hot_keys.submit("k", op, op.freeze(Retry::standard()), appendTicket(2))));
     EXPECT_EQ(reads(), before + 1);
+#endif
 
     /// Unresolved after a send: dropped. A single-attempt submission never starts from the cache, so
     /// arming the ambiguity and the resolve-read failure up front would let the hold's own base read
