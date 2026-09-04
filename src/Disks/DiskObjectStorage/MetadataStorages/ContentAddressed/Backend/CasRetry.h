@@ -28,6 +28,13 @@ struct Retry
     /// `attempt == 0` returns 0.
     static uint64_t backoff(uint32_t attempt);
 
+    /// The flat pause after a clean lost race: `backoff(1)`, uniform over [0, 200] ms. It does not grow
+    /// with the writer's loss count, because a settled conflict has nothing to wait for but
+    /// desynchronisation from its competitors, and growing it with the loss count made the oldest
+    /// loser the slowest and the likeliest to lose again. A conflict that settled a transport fault
+    /// keeps `backoff(attempt)`: the fault is what must pace the loop.
+    static uint64_t conflictBackoff() { return backoff(1); }
+
     /// A policy with `ms` milliseconds of its own budget and no lease bound.
     static Retry within(uint64_t ms) { return {.window_ms = ms, .lease_deadline_ms = std::nullopt, .single_attempt = false}; }
     /// `within(90'000)` -- the default write policy.

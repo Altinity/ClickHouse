@@ -185,6 +185,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
     , config(std::move(config_))
     , meta(std::move(meta_))
+    , hot_keys(config.hot_key_cache_bytes)
     /// The mount plane's fence reaches `mount_runtime`, declared far below: the closures capture
     /// `this` and run only after construction, exactly like `ref_ledger`'s callbacks. All three planes
     /// take the fence's own clock, so a policy bound to a mount-lease deadline and the fence that
@@ -194,8 +195,9 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this](uint64_t g, uint64_t needed) { return mount_runtime.admit(g, needed); },
           [this](uint64_t g) { mount_runtime.checkFenceOrThrow(g); }},
           config.boot_ms_fn,
-          mountPlaneSleepFn())
-    , farewell_requests(pool_backend, Fence::open(), config.boot_ms_fn)
+          mountPlaneSleepFn(),
+          &hot_keys)
+    , farewell_requests(pool_backend, Fence::open(), config.boot_ms_fn, {}, &hot_keys)
     /// The open plane's fence is the pool's teardown flag: generation 0 forever, exactly like
     /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
     /// flight is then refused at its next request instead of running to completion under a disk that
@@ -211,7 +213,8 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this](uint64_t, uint64_t) { return teardownBegun() ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
           [](uint64_t) {}},
           config.boot_ms_fn,
-          openPlaneSleepFn())
+          openPlaneSleepFn(),
+          &hot_keys)
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
     /// established (fresh create, steady-state member, or a just-completed admission union) --
     /// register-before-first-write means this Pool's own `writeAlgo()` is ALWAYS a

@@ -75,6 +75,10 @@ struct PoolConfig
     /// was count-bounded only (16384 entries) — decoded manifests carry inline bytes, so the worst
     /// case was multi-GB. 0 disables decode caching (every read decodes fresh — diagnostic mode).
     uint64_t manifest_decode_cache_bytes = 128ULL << 20;
+    /// Byte bound for the hot-key lane's cache of last known objects (the catalog today). 0 disables
+    /// the cache and every catalog write reads first. 16 MiB: the catalog is under 1 MiB, and the
+    /// bound exists so a later opt-in of per-namespace keys has one.
+    uint64_t hot_key_cache_bytes = 16ULL << 20;
     /// How many superseded snapshot generations to retain. After committing
     /// generation G, generations <= G - this are pruned (bounded per round). 0 = keep ALL
     /// (debug/forensics — replay GC's in-degree view as-of a past round). Default 3 = the safety
@@ -1165,6 +1169,11 @@ private:
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
+
+    /// The pool's write lane for keys several of its writers share, declared before the three planes
+    /// that carry a pointer to it, so it outlives every operation they admit. `mutable` for the same
+    /// reason the planes are.
+    mutable CasHotKeys hot_keys;
 
     /// The three planes' engines, declared before every component that is handed one and after the
     /// config they take their clock from. `mutable` because issuing a request is not a change to the

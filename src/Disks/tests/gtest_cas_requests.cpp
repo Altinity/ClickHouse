@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
 #include "cas_test_helpers.h"
+#include <Common/ProfileEvents.h>
 
 #include <IO/ReadHelpers.h>
 
@@ -36,6 +37,12 @@ extern const int CORRUPTED_DATA;
 extern const int LOGICAL_ERROR;
 extern const int S3_ERROR;
 extern const int NETWORK_ERROR;
+}
+
+namespace ProfileEvents
+{
+    extern const Event CASRequestReissue;
+    extern const Event CASRequestConflictPause;
 }
 
 using namespace DB::Cas;
@@ -1416,6 +1423,182 @@ TEST(CASRequests, ReadModifyWriteLosesNoIncrementUnderContentionAndBoundsAHotKey
     EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
     EXPECT_TRUE(gave_up->sent_any);
     EXPECT_FALSE(clock.sleeps.empty());   /// it paced its retries rather than spinning
+}
+
+namespace
+{
+
+/// Moves `key` under the caller before each of its first `moves` write attempts, and optionally makes
+/// each of those attempts ambiguous (the store never answers it) so the resolve read is what settles
+/// the race.
+struct RaceMaker
+{
+    RaceMaker(std::shared_ptr<CountingBackend> backend_, FakeClock & clock, String key_, int moves_, bool ambiguous_)
+        : backend(std::move(backend_)), key(std::move(key_)), moves(moves_), ambiguous(ambiguous_)
+        , rival_requests(makeRequests(backend, clock)), rival(rival_requests.admit())
+    {
+        backend->onBeforeWrite(key, [this]
+        {
+            if (inside || made >= moves)
+                return;
+            inside = true;
+            if (const auto current = rival.read(key, Retry::once()))
+                (void)rival.replace(key, current->bytes + "r", current->etag, Retry::once());
+            else
+                (void)rival.create(key, "r", Retry::once());
+            if (ambiguous)
+                backend->injectAmbiguousWrite(key);
+            ++made;
+            inside = false;
+        });
+    }
+
+    std::shared_ptr<CountingBackend> backend;
+    String key;
+    int moves;
+    bool ambiguous;
+    int made = 0;
+    bool inside = false;
+    CasRequests rival_requests;
+    CasOperation rival;
+};
+
+DecideOnObject appendX()
+{
+    return [](const std::optional<Object> & current) -> std::optional<String>
+    {
+        return current ? current->bytes + "x" : String("x");
+    };
+}
+
+}
+
+TEST(CASRequests, CleanConflictsArePacedFlatAndDoNotAdvanceTheReissueCounter)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    constexpr int K = 4;
+    RaceMaker races(backend, clock, "k", K, /*ambiguous=*/false);
+    const auto pauses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause].load();
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load();
+
+    WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause].load() - pauses_before, K);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load() - reissues_before, 0u);
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
+    for (uint64_t s : clock.sleeps)
+        EXPECT_LE(s, 200u);   /// flat: every pause is one `backoff(1)` draw, whatever the loss count
+    EXPECT_EQ(backend->writeCount("k"), 1u + K + 1u + K);   /// seed, K refused, K rival moves, the one that landed
+}
+
+TEST(CASRequests, AConflictThatSettledAFaultKeepsTheGrowingSchedule)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    constexpr int K = 3;
+    RaceMaker races(backend, clock, "k", K, /*ambiguous=*/true);
+    const auto pauses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause].load();
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load();
+
+    WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause].load() - pauses_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load() - reissues_before, K);
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
+    for (size_t i = 0; i < clock.sleeps.size(); ++i)
+        EXPECT_LE(clock.sleeps[i], std::min<uint64_t>(5000, 200ull << i)) << "reissue " << i;
+}
+
+TEST(CASRequests, ReplaceReportsWhetherAConflictSettledAFault)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seed = *orThrow(op.create("k", "v", Retry::standard()), "seed");
+    {
+        RaceMaker clean(backend, clock, "k", 1, /*ambiguous=*/false);
+        WriteResult result = op.replace("k", "w", seed, Retry::standard());
+        const auto * conflict = std::get_if<Conflict>(&result);
+        ASSERT_NE(conflict, nullptr);
+        EXPECT_FALSE(conflict->any_ambiguous);
+        EXPECT_EQ(conflict->attempts_sent, 1u);
+    }
+    {
+        RaceMaker faulty(backend, clock, "k", 1, /*ambiguous=*/true);
+        WriteResult result = op.replace("k", "w", seed, Retry::standard());
+        const auto * conflict = std::get_if<Conflict>(&result);
+        ASSERT_NE(conflict, nullptr);
+        EXPECT_TRUE(conflict->any_ambiguous);
+        EXPECT_EQ(conflict->attempts_sent, 1u);   /// one attempt, lost, settled as moved: `attempts_sent` cannot tell
+    }
+}
+
+TEST(CASRequests, OnPresenceUnderOnceKeepsTheFaultFlagOnTheRebuiltConflict)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    RaceMaker faulty(backend, clock, "k", 1, /*ambiguous=*/true);
+
+    WriteResult result = op.readModifyWriteOnPresence("k",
+        [](const std::optional<Meta> &) -> std::optional<String> { return String("w"); }, Retry::once());
+
+    const auto * conflict = std::get_if<Conflict>(&result);
+    ASSERT_NE(conflict, nullptr);
+    EXPECT_TRUE(conflict->any_ambiguous);
+    EXPECT_TRUE(std::holds_alternative<Meta>(conflict->seen));   /// presence-only, as before
+}
+
+TEST(CASRequests, CleanConflictsBeforeAFaultDoNotInflateTheFaultsFirstBackoff)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    constexpr int K = 3;
+    RaceMaker races(backend, clock, "k", K, /*ambiguous=*/false);
+    /// After the K clean races the next attempt is ambiguous with the precondition unchanged, so the
+    /// engine reissues it; that reissue's pause must be the schedule's first, not its (K+1)-th.
+    bool armed = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        /// The RaceMaker's hook is replaced by this one; it moves the key itself for the first K writes.
+        if (races.inside)
+            return;
+        if (races.made < K)
+        {
+            races.inside = true;
+            if (const auto current = races.rival.read("k", Retry::once()))
+                (void)races.rival.replace("k", current->bytes + "r", current->etag, Retry::once());
+            ++races.made;
+            races.inside = false;
+            return;
+        }
+        if (!armed)
+        {
+            armed = true;
+            backend->injectAmbiguousWrite("k");
+        }
+    });
+
+    WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K + 1));
+    EXPECT_LE(clock.sleeps[K], 200u) << "the first transport reissue sleeps within backoff(1)";
 }
 
 TEST(CASRequests, ADeterministicLocalFailureSurfacesUnchangedWithoutAReissue)

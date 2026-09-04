@@ -76,6 +76,8 @@ struct MountConfig
     RuntimeWorkerFactory worker_factory = {};
     /// Deterministic test interposition after the remount worker has confirmed renewal is parked,
     /// immediately before it releases `driver_mutex` and begins the real remount callback.
+    /// Runs with `driver_mutex` held: it must issue no backend request and never wait on the pool's
+    /// hot-key lane, whose holders sleep under that mutex, or the test deadlocks itself.
     std::function<void()> remount_parked_hook_for_test = {};
     /// Deterministic test interposition at the top of the renewal loop, before it acquires
     /// `driver_mutex` to inspect cadence or parking state.
@@ -88,6 +90,8 @@ struct MountConfig
     std::function<void()> renewal_terminal_deposited_hook_for_test = {};
     /// Deterministic test interposition after the parked renewal predicate has sampled terminal false,
     /// immediately before the condition-variable wait atomically releases `driver_mutex`.
+    /// Runs with `driver_mutex` held: it must issue no backend request and never wait on the pool's
+    /// hot-key lane, whose holders sleep under that mutex, or the test deadlocks itself.
     std::function<void()> renewal_parked_predicate_false_hook_for_test = {};
     /// Deterministic test interposition immediately before a terminal publisher attempts to acquire
     /// `driver_mutex`.
@@ -96,6 +100,8 @@ struct MountConfig
     /// contention, but before it blocks acquiring the mutex.
     std::function<void()> terminal_publication_driver_lock_contended_hook_for_test = {};
     /// Deterministic test interposition immediately after a terminal publisher acquires `driver_mutex`.
+    /// Runs with `driver_mutex` held: it must issue no backend request and never wait on the pool's
+    /// hot-key lane, whose holders sleep under that mutex, or the test deadlocks itself.
     std::function<void()> terminal_publication_driver_lock_acquired_hook_for_test = {};
     /// Deterministic failure injection at the vanished-reason preparation boundary.
     std::function<void()> vanished_reason_prepare_hook_for_test = {};
