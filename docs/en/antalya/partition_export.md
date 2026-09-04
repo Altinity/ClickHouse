@@ -40,16 +40,6 @@ Each MergeTree part will become a separate file with the following name conventi
 
 ## Plain (non-replicated) MergeTree
 
-`EXPORT PARTITION` is supported on plain `MergeTree` tables in addition to `Replicated*MergeTree`. Because a single node owns the whole export there is no cross-replica coordination and no ZooKeeper is involved:
-
-- The task descriptor (the list of parts, their per-part progress, the export settings and the task status) is persisted as a small JSON file on the table's disk under `<table_data_path>/partition_exports/<transaction_id>.json`, instead of in ZooKeeper.
-- A local background task drives the export: it schedules the part exports, records their completion, and performs the final commit (a commit file for plain object storage, or the Iceberg snapshot commit for Iceberg destinations).
-- The task is persistent — an in-flight export is reloaded from disk and resumed after a server restart.
-- Progress is observed through `system.partition_exports` (not `system.replicated_partition_exports`). It exposes the same core columns: `source_database`, `source_table`, `destination_database`, `destination_table`, `create_time`, `partition_id`, `transaction_id`, `query_id`, `parts`, `parts_count`, `parts_to_do`, `status`, `last_exception`, `last_exception_part`, `last_exception_time`, and `exception_count`. Replica-specific columns are omitted.
-- Duplicate protection, `export_merge_tree_partition_force_export`, `EXPORT PARTITION ALL`, and `KILL EXPORT PARTITION` all behave the same way as for `Replicated*MergeTree`. A single `KILL EXPORT PARTITION ... WHERE ...` matches tasks from both engines.
-
-All the object-storage and Iceberg output layouts, atomicity guarantees, and settings described in this document apply equally to plain `MergeTree`.
-
 ## Syntax
 
 ```sql
