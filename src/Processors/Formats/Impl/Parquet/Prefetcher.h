@@ -41,6 +41,11 @@ public:
     /// Called at most once, after all registerRange calls and before all enqueue/getRangeData calls.
     void finalizeRanges();
 
+    /// Keeps one read from covering parts of two row groups. `ranges` are the [start, end) byte
+    /// ranges of the row groups, sorted by start. Bytes outside every range (footer, page indexes,
+    /// bloom filters) belong to no row group and may be coalesced with either neighbour.
+    void setRowGroupRanges(std::vector<std::pair<size_t, size_t>> ranges);
+
     /// Replace a requested range with a set of disjoint smaller ranges contained within it.
     /// `subranges` must be sorted.
     std::vector<PrefetchHandle> splitRange(
@@ -144,6 +149,9 @@ private:
         };
         std::optional<CachedReadRegion> cached_region;
 
+        /// `decreaseTaskRefcount` is static but has to account for a task cancelled before it ran.
+        Prefetcher * owner = nullptr;
+
         std::atomic<State> state {State::Scheduled};
         /// How many RequestState-s in HasTask state point to this Task.
         std::atomic<size_t> refcount {};
@@ -179,6 +187,15 @@ private:
     size_t min_bytes_for_seek{};
     size_t bytes_per_read_task{};
 
+    /// See setRowGroupRanges. Empty until it is called.
+    std::vector<std::pair<size_t, size_t>> row_group_ranges;
+
+    /// Reads running or queued. Drives read-task size: smaller reads fill an idle pool faster, larger
+    /// ones amortize the round trip once it is busy.
+    std::atomic<size_t> tasks_in_flight {0};
+    size_t io_concurrency_target = 1;
+    size_t min_bytes_per_read_task{};
+
     std::shared_ptr<ShutdownHelper> shutdown = std::make_shared<ShutdownHelper>();
 
     /// Locked when creating a Task.
@@ -193,6 +210,11 @@ private:
 
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;
+
+    /// Index of the row group whose byte range contains `offset`, or nullopt if `offset` is outside
+    /// every row group (metadata) or the layout isn't known yet. Called with `mutex` held.
+    std::optional<size_t> rowGroupIndexFor(size_t offset) const;
+    size_t currentReadTaskBudget() const;
 
     void determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOptions & options);
     /// Creates and starts a Task covering this request and possibly other nearby ranges.

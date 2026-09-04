@@ -33,6 +33,12 @@ class ReadManager
 public:
     Reader reader;
 
+    /// See input_format_parquet_max_active_files. Progress never depends on holding a slot.
+    std::atomic<bool> holds_prefetch_slot {false};
+
+    /// Index of the first PREWHERE step (1), or 0 when there are no steps.
+    size_t firstStep() const;
+
     /// To initialize ReadManager:
     ///  1. call manager.reader.prefetcher.init
     ///  2. call manager.reader.init

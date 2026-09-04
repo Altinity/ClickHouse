@@ -19,6 +19,9 @@ namespace DB::ErrorCodes
 namespace ProfileEvents
 {
     extern const Event ParquetFetchWaitTimeMicroseconds;
+    extern const Event ParquetReadTasks;
+    extern const Event ParquetReadTaskBytes;
+    extern const Event ParquetPrefetchStarvation;
     extern const Event ParquetPrefetcherReadRandomRead;
     extern const Event ParquetPrefetcherReadSeekAndRead;
     extern const Event ParquetPrefetcherReadEntireFile;
@@ -31,9 +34,48 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
 {
     min_bytes_for_seek = options.min_bytes_for_seek;
     bytes_per_read_task = options.bytes_per_read_task;
+    /// Below `min_bytes_for_seek` a read stops amortizing its round trip.
+    min_bytes_per_read_task = std::max(min_bytes_for_seek, bytes_per_read_task / 4);
     parser_shared_resources = parser_shared_resources_;
+    if (parser_shared_resources)
+        io_concurrency_target = std::max(size_t(1), parser_shared_resources->max_io_threads);
     determineReadModeAndFileSize(reader_, options);
     range_sets.resize(1);
+}
+
+void Prefetcher::setRowGroupRanges(std::vector<std::pair<size_t, size_t>> ranges)
+{
+    chassert(std::is_sorted(ranges.begin(), ranges.end()));
+    std::lock_guard lock(mutex);
+    row_group_ranges = std::move(ranges);
+}
+
+std::optional<size_t> Prefetcher::rowGroupIndexFor(size_t offset) const
+{
+    if (row_group_ranges.empty())
+        return std::nullopt;
+    /// First range starting after `offset`; the candidate is the one before it.
+    auto hi = std::upper_bound(row_group_ranges.begin(), row_group_ranges.end(), offset,
+        [](size_t off, const std::pair<size_t, size_t> & range) { return off < range.first; });
+    if (hi == row_group_ranges.begin())
+        return std::nullopt;
+    const auto & range = *(hi - 1);
+    if (offset >= range.second)
+        return std::nullopt; // gap between row groups, or after the last one
+    return size_t(hi - 1 - row_group_ranges.begin());
+}
+
+size_t Prefetcher::currentReadTaskBudget() const
+{
+    if (min_bytes_per_read_task >= bytes_per_read_task)
+        return bytes_per_read_task;
+    /// Hysteresis, so the size doesn't flap around the threshold.
+    size_t in_flight = tasks_in_flight.load(std::memory_order_relaxed);
+    if (in_flight >= io_concurrency_target * 2)
+        return bytes_per_read_task;
+    if (in_flight < io_concurrency_target)
+        return min_bytes_per_read_task;
+    return (min_bytes_per_read_task + bytes_per_read_task) / 2;
 }
 
 Prefetcher::~Prefetcher()
@@ -307,13 +349,28 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     size_t end_idx = range_idx + 1;
     size_t total_length_of_covered_ranges = end_offset - start_offset;
 
+    /// Compared against the resulting span, not the distance from the seed range in each direction:
+    /// the latter let a task reach `seed length + 2 * bytes_per_read_task`.
+    const size_t task_budget = currentReadTaskBudget();
+
+    /// One read must not span two row groups: `getRangeData` waits for the whole task, so the
+    /// earlier row group would wait for the later one's bytes and delivery would serialize.
+    /// Bytes outside every row group (page indexes, bloom filters, footer) don't count: they may join
+    /// whichever row group the task already covers. `claimed_row_group` is the one it covers so far.
+    std::optional<size_t> claimed_row_group = rowGroupIndexFor(start_offset);
+    auto other_row_group = [&](size_t offset)
+    {
+        auto rg = rowGroupIndexFor(offset);
+        return rg.has_value() && claimed_row_group.has_value() && *rg != *claimed_row_group;
+    };
+
     /// Go left.
-    size_t initial_offset = start_offset;
     for (size_t idx = range_idx; idx > 0; --idx)
     {
         const RangeState & r = ranges[idx - 1];
         if (r.end + min_bytes_for_seek <= start_offset || // short gap
-            r.start + bytes_per_read_task <= initial_offset || // task not too big
+            other_row_group(r.start) || // would reach into another row group
+            end_offset - std::min(r.start, start_offset) > task_budget || // task not too big
             !r.request->allow_incidental_read.load(std::memory_order_relaxed)) // range wants to be coalesced
             break;
 
@@ -321,6 +378,8 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         if (s == RequestState::State::HasRange)
         {
             /// Include this range in the task.
+            if (!claimed_row_group.has_value())
+                claimed_row_group = rowGroupIndexFor(r.start);
             start_idx = idx - 1;
             total_length_of_covered_ranges += r.length();
             start_offset = std::min(start_offset, r.start);
@@ -343,18 +402,20 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     }
 
     /// Go right.
-    initial_offset = end_offset;
     for (size_t idx = range_idx + 1; idx < ranges.size(); ++idx)
     {
         const RangeState & r = ranges[end_idx];
         if (end_offset + min_bytes_for_seek <= r.start ||
-            initial_offset + bytes_per_read_task <= r.end ||
+            (r.end > r.start && other_row_group(r.end - 1)) || // would reach into another row group
+            std::max(r.end, end_offset) - start_offset > task_budget ||
             !r.request->allow_incidental_read.load(std::memory_order_relaxed))
             break;
 
         const auto s = r.request->state.load(std::memory_order_relaxed);
         if (s == RequestState::State::HasRange)
         {
+            if (!claimed_row_group.has_value() && r.end > r.start)
+                claimed_row_group = rowGroupIndexFor(r.end - 1);
             end_idx = idx + 1;
             total_length_of_covered_ranges += r.length();
             end_offset = std::max(end_offset, r.end);
@@ -370,8 +431,11 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
 
     /// Create task.
     Task & task = tasks.emplace_back();
+    task.owner = this;
     task.offset = start_offset;
     task.length = end_offset - task.offset;
+    ProfileEvents::increment(ProfileEvents::ParquetReadTasks);
+    ProfileEvents::increment(ProfileEvents::ParquetReadTaskBytes, task.length);
     task.memory_amplification = 1. * static_cast<double>(task.length) / static_cast<double>(total_length_of_covered_ranges);
     size_t initial_refcount = end_idx - start_idx + 1;
     task.refcount.store(initial_refcount);
@@ -406,15 +470,22 @@ void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount)
     if (c != amount)
         return;
 
-    if (task->state.exchange(Task::State::Deallocated) != Task::State::Running)
+    const auto prev = task->state.exchange(Task::State::Deallocated);
+    if (prev != Task::State::Running)
     {
         task->buf = {};
         task->cached_region.reset();
     }
+    /// Cancelled before any thread picked it up, so nothing else will account for it. Running is
+    /// accounted by whoever runs it; Done was accounted when it finished.
+    if (prev == Task::State::Scheduled && task->owner)
+        task->owner->tasks_in_flight.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void Prefetcher::scheduleTask(Task * task)
 {
+    /// Counted from queueing, not from when a thread picks it up: it is already committed work.
+    tasks_in_flight.fetch_add(1, std::memory_order_relaxed);
     if (parser_shared_resources && !parser_shared_resources->io_runner.isDisabled())
         parser_shared_resources->io_runner([this, task, _shutdown = shutdown]
             {
@@ -434,6 +505,10 @@ std::span<const char> Prefetcher::getRangeData(const PrefetchHandle & request)
     if (s == Task::State::Scheduled || s == Task::State::Running)
     {
         Stopwatch wait_time;
+
+        /// Read-ahead didn't stay in front of decoding: this thread either runs the read inline or
+        /// parks until it lands.
+        ProfileEvents::increment(ProfileEvents::ParquetPrefetchStarvation);
 
         if (s == Task::State::Scheduled)
         {
@@ -541,6 +616,8 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
         task->buf = {};
         task->cached_region.reset();
     }
+
+    tasks_in_flight.fetch_sub(1, std::memory_order_relaxed);
 
     task->completion.notify();
 

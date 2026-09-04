@@ -23,6 +23,7 @@ struct FormatParserSharedResources
     const size_t max_io_threads = 0;
 
     std::atomic<size_t> num_streams{0};
+    std::atomic<size_t> active_prefetch_readers{0};
     ThreadPoolCallbackRunnerFast parsing_runner;
     ThreadPoolCallbackRunnerFast io_runner;
 
@@ -34,6 +35,12 @@ struct FormatParserSharedResources
     static FormatParserSharedResourcesPtr singleThreaded(const Settings & settings);
 
     void finishStream();
+
+    /// See input_format_parquet_max_active_files. Spreading one IO pool across many files leaves
+    /// each with too few reads in flight to cover the storage's response time and none finishing
+    /// early. A reader without a slot still reads what it must deliver next, so this cannot stall.
+    bool tryAcquirePrefetchSlot(size_t max_active);
+    void releasePrefetchSlot();
 
     size_t getParsingThreadsPerReader() const;
     size_t getIOThreadsPerReader() const;

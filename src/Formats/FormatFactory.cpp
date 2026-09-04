@@ -219,6 +219,8 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.bloom_filter_push_down = settings[Setting::input_format_parquet_bloom_filter_push_down];
     format_settings.parquet.page_filter_push_down = settings[Setting::input_format_parquet_page_filter_push_down];
     format_settings.parquet.use_offset_index = settings[Setting::input_format_parquet_use_offset_index];
+    format_settings.parquet.use_constant_column_optimization = settings[Setting::input_format_parquet_use_constant_column_optimization];
+    format_settings.parquet.constant_column_sparse_ratio = settings[Setting::input_format_parquet_constant_column_sparse_ratio];
 
     format_settings.parquet.enable_json_parsing = settings[Setting::input_format_parquet_enable_json_parsing];
     format_settings.parquet.memory_low_watermark = settings[Setting::input_format_parquet_memory_low_watermark];
@@ -248,6 +250,11 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.bloom_filter_bits_per_value = settings[Setting::output_format_parquet_bloom_filter_bits_per_value];
     format_settings.parquet.bloom_filter_flush_threshold_bytes = settings[Setting::output_format_parquet_bloom_filter_flush_threshold_bytes];
     format_settings.parquet.local_read_min_bytes_for_seek = settings[Setting::input_format_parquet_local_file_min_bytes_for_seek];
+    format_settings.parquet.max_io_threads = settings[Setting::input_format_parquet_max_io_threads];
+    format_settings.parquet.bytes_per_read_task = settings[Setting::input_format_parquet_bytes_per_read_task];
+    format_settings.parquet.max_active_files = settings[Setting::input_format_parquet_max_active_files];
+    format_settings.parquet.read_ahead_subgroups = settings[Setting::input_format_parquet_read_ahead_subgroups];
+    format_settings.parquet.read_ahead_memory_fraction = settings[Setting::input_format_parquet_read_ahead_memory_fraction];
     format_settings.parquet.enable_row_group_prefetch = settings[Setting::input_format_parquet_enable_row_group_prefetch];
     format_settings.parquet.verify_checksums = settings[Setting::input_format_parquet_verify_checksums];
     format_settings.parquet.local_time_as_utc = settings[Setting::input_format_parquet_local_time_as_utc];

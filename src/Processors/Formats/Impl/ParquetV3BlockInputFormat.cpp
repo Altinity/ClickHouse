@@ -57,7 +57,11 @@ ParquetV3BlockInputFormat::ParquetV3BlockInputFormat(
     , object_with_metadata(object_with_metadata_)
 {
     read_options.min_bytes_for_seek = min_bytes_for_seek;
-    read_options.bytes_per_read_task = min_bytes_for_seek * 4;
+    /// min_bytes_for_seek says when reading across a gap beats another request; this says how big one
+    /// request should get, which is bounded by how many we want in flight.
+    read_options.bytes_per_read_task = format_settings.parquet.bytes_per_read_task != 0
+        ? format_settings.parquet.bytes_per_read_task
+        : min_bytes_for_seek * 4;
 
     if (!format_filter_info)
         format_filter_info = std::make_shared<FormatFilterInfo>();
@@ -70,9 +74,17 @@ void ParquetV3BlockInputFormat::initializeIfNeeded()
         format_filter_info->initKeyConditionOnce(getPort().getHeader());
         parser_shared_resources->initOnce([&]
             {
-                if (format_settings.parquet.enable_row_group_prefetch && parser_shared_resources->max_io_threads > 0)
+                /// `max_download_threads` defaults to 4, picked for the URL engine; on object storage
+                /// that rarely keeps the decoding threads fed.
+                size_t io_threads = format_settings.parquet.max_io_threads;
+                if (io_threads == 0)
+                    io_threads = std::max(
+                        parser_shared_resources->max_io_threads,
+                        std::min<size_t>(parser_shared_resources->max_parsing_threads, 16));
+                if (format_settings.parquet.enable_row_group_prefetch && io_threads > 0
+                    && parser_shared_resources->max_io_threads > 0)
                     parser_shared_resources->io_runner.initThreadPool(
-                        getFormatParsingThreadPool().get(), parser_shared_resources->max_io_threads, ThreadName::PARQUET_PREFETCH, CurrentThread::getGroup());
+                        getFormatParsingThreadPool().get(), io_threads, ThreadName::PARQUET_PREFETCH, CurrentThread::getGroup());
 
                 /// Unfortunately max_parsing_threads setting doesn't have a value for
                 /// "do parsing in the same thread as the rest of query processing

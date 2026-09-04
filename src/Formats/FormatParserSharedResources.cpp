@@ -27,6 +27,24 @@ FormatParserSharedResourcesPtr FormatParserSharedResources::singleThreaded(const
 }
 
 
+bool FormatParserSharedResources::tryAcquirePrefetchSlot(size_t max_active)
+{
+    if (max_active == 0)
+        return true; // unlimited
+    size_t cur = active_prefetch_readers.load(std::memory_order_relaxed);
+    while (cur < max_active)
+    {
+        if (active_prefetch_readers.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_relaxed))
+            return true;
+    }
+    return false;
+}
+
+void FormatParserSharedResources::releasePrefetchSlot()
+{
+    active_prefetch_readers.fetch_sub(1, std::memory_order_release);
+}
+
 void FormatParserSharedResources::finishStream()
 {
     num_streams.fetch_sub(1, std::memory_order_relaxed);

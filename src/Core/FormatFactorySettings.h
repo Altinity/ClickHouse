@@ -213,6 +213,12 @@ Skip pages using min/max values from column index.
     DECLARE(Bool, input_format_parquet_use_offset_index, true, R"(
 Minor tweak to how pages are read from parquet file when no page filtering is used.
 )", 0) \
+    DECLARE(Bool, input_format_parquet_use_constant_column_optimization, true, R"(
+When a Parquet column chunk provably holds a single value in every row (according to its min/max statistics), materialize that value directly instead of reading and decoding the column's data pages. Also covers chunks that are all null (materialized as a sparse column) and chunks holding a single value plus nulls (only the definition levels are decoded).
+)", 0) \
+    DECLARE(Float, input_format_parquet_constant_column_sparse_ratio, 0.9375, R"(
+For `input_format_parquet_use_constant_column_optimization`: a Parquet column chunk holding a single value plus nulls is materialized as a sparse column (memory proportional to the non-null rows) when the fraction of nulls is at least this ratio, and as a dense `Nullable` column otherwise. `1` disables sparse materialization for such chunks.
+)", 0) \
     DECLARE(Bool, input_format_parquet_verify_checksums, true, R"(
 Verify page checksums when reading parquet files.
 )", 0) \
@@ -250,6 +256,42 @@ Min bytes required for local read (file) to do seek, instead of read with ignore
 )", 0) \
     DECLARE(Bool, input_format_parquet_enable_row_group_prefetch, true, R"(
 Enable row group prefetching during parquet parsing. Currently, only single-threaded parsing can prefetch.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_max_io_threads, 0, R"(
+Size of the thread pool that issues reads for the Parquet reader, shared by all files read by the
+query. `0` derives it from `max_download_threads` and `max_parsing_threads`.
+
+With too few reads in flight to cover the storage's response time, decoding threads end up running
+the reads themselves or waiting for them.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_max_active_files, 0, R"(
+How many Parquet files may read ahead at the same time when a query reads many files. `0` means no
+limit, which is the previous behaviour.
+
+All files share one IO pool, so with many files each gets too few reads in flight and none finish
+early. Files that do not hold a slot still read the row group they must deliver next.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_read_ahead_subgroups, 0, R"(
+How many row subgroups ahead the Parquet reader may issue data-page reads for within a row group. `0`
+keeps the previous behaviour, where a subgroup's reads are issued only after its predecessor has been
+decoded, so the reader waits out the storage's response time on every subgroup. `1` issues the next
+subgroup's reads while the current one decodes. Subgroups are still decoded in order.
+
+Read-ahead is opportunistic: it stops when its memory budget
+(`input_format_parquet_read_ahead_memory_fraction`) is used up. Only helps for files whose row groups
+are split into several subgroups (see `input_format_parquet_max_block_size`) and that have an offset
+index; otherwise a row group's data is already read as one range.
+)", 0) \
+    DECLARE(Double, input_format_parquet_read_ahead_memory_fraction, 0.25, R"(
+Share of the Parquet reader's prefetch memory budget (`input_format_parquet_prefetch_memory_fraction`)
+reserved for data pages read ahead within a row group (`input_format_parquet_read_ahead_subgroups`).
+Range `[0, 1]`. The rest of the prefetch budget keeps other row groups reading ahead.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_bytes_per_read_task, 0, R"(
+Target size of a single read issued by the Parquet reader; nearby column chunks are coalesced up to
+this size. `0` derives it from the min-bytes-for-seek of the underlying storage.
+
+A read never spans two row groups regardless of this setting.
 )", 0) \
     DECLARE(Bool, input_format_arrow_allow_missing_columns, true, R"(
 Allow missing columns while reading Arrow input formats

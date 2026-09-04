@@ -1,0 +1,27 @@
+-- optimization on (sparse + dense kinds)
+13606684125528126333	0	10	10	10	990	10	499500
+-- optimization on, sparse disabled via ratio = 1 (dense kind only)
+13606684125528126333	0	10	10	10	990	10	499500
+-- optimization off (must be identical)
+13606684125528126333	0	10	10	10	990	10	499500
+-- filters and aggregation over sparse / all-null columns
+10
+990
+7	x	10
+\N	\N	990
+0	\N	7	\N	x
+1	\N	\N	7	\N
+100	\N	7	\N	x
+999	\N	\N	7	\N
+-- null_as_default with non-nullable output types
+0	70	990	6930	990	10
+-- DEFAULT expressions fill the null rows (AddingDefaultsTransform over sparse columns)
+5000	8980	7040	990	10
+-- INSERT ... FORMAT Parquet through the client: sparse columns travel over the Native protocol
+0	70	6930	990	10	1000
+-- LowCardinality output cannot be sparse: falls back to dense / normal decode with the same result
+0	10	10	10	10
+-- profile events: all-null chunks skip pages; single-value-plus-nulls chunks skip values; nothing when disabled
+10	30
+10	30
+0	0

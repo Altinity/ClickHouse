@@ -1471,7 +1471,11 @@ void IcebergMetadata::addDeleteTransformers(
                 Columns delete_columns = delete_chunk.detachColumns();
                 for (size_t i = 0; i < equality_indexes_delete_file.size(); i++)
                 {
-                    mutable_columns_for_set[i]->insertRangeFrom(*delete_columns[equality_indexes_delete_file[i]], 0, rows);
+                    /// The format may return ColumnConst / ColumnSparse for column chunks whose
+                    /// statistics prove a single value or all nulls; insertRangeFrom needs the
+                    /// concrete column type.
+                    auto full_column = delete_columns[equality_indexes_delete_file[i]]->convertToFullColumnIfConst()->convertToFullColumnIfSparse();
+                    mutable_columns_for_set[i]->insertRangeFrom(*full_column, 0, rows);
                 }
             }
             block_for_set.setColumns(std::move(mutable_columns_for_set));

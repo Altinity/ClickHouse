@@ -349,6 +349,8 @@ struct FormatSettings
         bool bloom_filter_push_down = true;
         bool page_filter_push_down = true;
         bool use_offset_index = true;
+        bool use_constant_column_optimization = true;
+        float constant_column_sparse_ratio = 0.9375f;
 
         bool enable_json_parsing = true;
         bool preserve_order = false;
@@ -359,6 +361,16 @@ struct FormatSettings
         UInt64 max_block_size = DEFAULT_BLOCK_SIZE;
         size_t prefer_block_bytes = DEFAULT_BLOCK_SIZE * 256;
         size_t local_read_min_bytes_for_seek = 8192;
+        /// 0 = derive from max_download_threads / max_parsing_threads.
+        size_t max_io_threads = 0;
+        /// 0 = derive from the storage's min-bytes-for-seek.
+        size_t bytes_per_read_task = 0;
+        /// 0 = no limit on how many files prefetch ahead concurrently.
+        size_t max_active_files = 0;
+        /// 0 = issue a subgroup's reads only after its predecessor finished.
+        size_t read_ahead_subgroups = 0;
+        /// Share of the prefetch memory budget reserved for read-ahead within a row group.
+        double read_ahead_memory_fraction = 0.25;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
         /// Reader scheduler knobs: share of the column-data memory budget given to compressed

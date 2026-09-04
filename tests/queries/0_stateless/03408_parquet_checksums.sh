@@ -24,9 +24,11 @@ ${CLICKHOUSE_LOCAL} -q "
     select * from file('$F');"
 
 corrupt_file
+# The single-row column chunk is provably constant from its statistics, so the reader would not read
+# (and therefore could not verify) its data page at all; disable that shortcut to exercise the checksum.
 
 ${CLICKHOUSE_LOCAL} -q "
-    select * from file('$F') settings input_format_parquet_verify_checksums=1
+    select * from file('$F') settings input_format_parquet_verify_checksums=1, input_format_parquet_use_constant_column_optimization=0
 " 2>&1 | grep -o 'CRC checksum verification failed' || echo 'got no checksum error, unexpected'
 
 ${CLICKHOUSE_LOCAL} -q "
@@ -42,5 +44,5 @@ ${CLICKHOUSE_LOCAL} -q "
 corrupt_file
 
 ${CLICKHOUSE_LOCAL} -q "
-    select * from file('$F') settings input_format_parquet_verify_checksums=1
+    select * from file('$F') settings input_format_parquet_verify_checksums=1, input_format_parquet_use_constant_column_optimization=0
 " 2>&1 | grep -o 'CRC checksum verification failed' || echo 'no checksum error, as expected'
