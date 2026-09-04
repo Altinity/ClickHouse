@@ -155,26 +155,57 @@ public:
     /// the round's own hot-scan catalog cut: `Gc::setPostHotScanCatalogReadHookForTest` (`CasGc.h`)
     /// fires the instant that cut is taken, before the round -- and later `authorityHolds` -- does
     /// anything else with it, so a move landed there is exactly "before the first chunk starts" and the
-    /// chunk's later fresh reads observe it. See `moveRefCleanupAuthorityBeforeFirstChunk` below.
+    /// chunk's later fresh reads observe it.
+    ///
+    /// `Authority::Catalog` moves the catalog's token directly, right there in the hook: the round's
+    /// own `round_commit` CAS (phase 13) never touches the catalog, so nothing downstream collides.
+    /// `Authority::GcFence` cannot do the same for `gc/state`: bumping its lease THERE lands strictly
+    /// BEFORE `round_commit`'s own `gc/state` replace (which still holds the etag from lease adoption,
+    /// phase 1), so that replace loses its own CAS and the round throws before `cleanupRefObjects`
+    /// (phase 17) ever runs -- the "nothing deleted" assertions would pass vacuously, not because
+    /// cleanup refused. Instead, the hook only ARMS `armGcFenceMoveOnAuthorityHoldsRevalidationForTest`: the
+    /// actual lease bump is deferred to a LATER read of `gc/state`. Not the next one -- namespace
+    /// janitor / orphan-sweep bookkeeping between `round_commit` and `cleanupRefObjects` also touches
+    /// the catalog and `gc/state`, just never the two BACK TO BACK the way `authorityHolds` does
+    /// (catalog, then `gc/state`, nothing in between): that adjacency is the one place in a round only
+    /// `authorityHolds`'s own revalidation produces, so gating on it -- rather than on the catalog key
+    /// alone -- is what actually lands the move inside that SAME call, well after `round_commit`.
     static void moveRefCleanupAuthorityBeforeFirstChunk(Authority authority_, CasOperation & op, const Layout & layout)
     {
-        if (authority_ == Authority::GcFence)
+        chassert(authority_ != Authority::GcFence);
+        /// Same-content rewrite: only the catalog's TOKEN moves (mints a fresh etag), never its
+        /// parsed content -- the pure "someone else touched this row" race `Authority::Catalog`
+        /// models, as opposed to `Authority::CatalogRebirth`'s actual incarnation bump.
+        const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
+        op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), *snap.etag, Retry::standard());
+    }
+
+    /// Arms the seam `read` below fires on: see the doc comment above.
+    void armGcFenceMoveOnAuthorityHoldsRevalidationForTest(const Layout & layout)
+    {
+        catalog_key = layout.refCatalogKey();
+        gc_state_key = layout.gcStateKey();
+        catalog_seam_armed = true;
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        const bool fires_here = catalog_seam_armed && key == gc_state_key && last_read_key == catalog_key;
+        if (fires_here)
         {
-            const auto state_object = op.read(layout.gcStateKey(), Retry::standard());
-            if (!state_object)
+            catalog_seam_armed = false;
+            const auto current = CountingBackend::read(key, access);
+            if (!current)
                 throw std::runtime_error("test-injected cleanup authority object is absent");
-            GcState moved = decodeGcState(state_object->bytes);
+            GcState moved = decodeGcState(current->bytes);
             ++moved.lease.seq;
-            op.replace(layout.gcStateKey(), encodeGcState(moved), state_object->etag, Retry::standard());
+            if (!write(key, encodeGcState(moved), current->value, access).has_value())
+                throw std::runtime_error("test-injected cleanup authority move lost its CAS");
+            last_read_key = key;
+            return CountingBackend::read(key, access);   /// the FRESH, post-move bytes, for THIS read
         }
-        else
-        {
-            /// Same-content rewrite: only the catalog's TOKEN moves (mints a fresh etag), never its
-            /// parsed content -- the pure "someone else touched this row" race `Authority::Catalog`
-            /// models, as opposed to `Authority::CatalogRebirth`'s actual incarnation bump.
-            const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
-            op.replace(layout.refCatalogKey(), encodeRefCatalog(snap.catalog), *snap.etag, Retry::standard());
-        }
+        last_read_key = key;
+        return CountingBackend::read(key, access);
     }
 
     /// The `AfterFirstDelete` seam moves the authority once the first chunk's batch delete has
@@ -203,6 +234,7 @@ private:
         gc_state_key = layout.gcStateKey();
         first_cleanup_key = first_cleanup_key_;
         reborn_ns = std::move(reborn_ns_);
+        layout_for_rebirth_seed = &layout;
         armed = true;
     }
 
@@ -225,16 +257,41 @@ private:
             ++moved.lease.seq;
             bytes = encodeGcState(moved);
         }
-        else if (authority == Authority::CatalogRebirth)
+        UInt128 reborn_incarnation = 0;
+        if (authority == Authority::CatalogRebirth)
         {
             RefCatalog catalog = decodeRefCatalog(bytes);
             for (CatalogEntry & entry : catalog.entries)
                 if (reborn_ns && entry.ns == *reborn_ns)
+                {
                     entry.incarnation = entry.incarnation + 1;
+                    reborn_incarnation = entry.incarnation;
+                }
             bytes = encodeRefCatalog(catalog);
         }
         if (!write(key, bytes, got->value, access).has_value())
             throw std::runtime_error("test-injected cleanup authority move lost its CAS");
+
+        /// Give the reborn life SOMETHING of its own, landed right after its catalog row exists (any
+        /// earlier and an "unknown incarnation" sweep elsewhere in the SAME round can claim it, since
+        /// no catalog entry yet names that incarnation) -- so the "reborn life untouched" assertions
+        /// below test something real instead of an empty listing.
+        if (authority == Authority::CatalogRebirth && reborn_ns && reborn_incarnation != 0 && layout_for_rebirth_seed)
+        {
+            const Layout & layout = *layout_for_rebirth_seed;
+            const NamespaceLifeId reborn_life = NamespaceLifeId::fromCatalogEntry(*reborn_ns, reborn_incarnation);
+            const RefTxnId reborn_log_id{1, 1};
+            const RefLogTxn reborn_birth{
+                .ns = reborn_ns->string(), .txn_id = reborn_log_id, .ops = {namespaceBirthOp()},
+                .prev_epoch_seal = std::nullopt};
+            if (!write(layout.refLogKey(reborn_life, reborn_log_id),
+                    sealObject(FormatId::RefLog, encodeRefLogTxn(reborn_birth)), std::nullopt, access).has_value())
+                throw std::runtime_error("test-injected reborn-life log seed lost its CAS");
+            const RefTableSnapshot reborn_snap = minimalLiveSnapshot(reborn_ns->string(), reborn_log_id);
+            if (!write(layout.refSnapshotKey(reborn_life, reborn_log_id),
+                    sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(reborn_snap)), std::nullopt, access).has_value())
+                throw std::runtime_error("test-injected reborn-life snapshot seed lost its CAS");
+        }
     }
 
     Authority authority = Authority::Catalog;
@@ -243,9 +300,13 @@ private:
     String gc_state_key;
     String first_cleanup_key;
     std::optional<RootNamespace> reborn_ns;
+    const Layout * layout_for_rebirth_seed = nullptr;
     bool armed = false;
-    /// The previous call's key, so `read` can recognize "this is the catalog-then-`gc/state` pair
-    /// `authorityHolds` reads back to back" without the production code exposing any seam of its own.
+    /// Independent of `armed`/`timing`/`authority` above: `armGcFenceMoveOnAuthorityHoldsRevalidationForTest`
+    /// arms this, and the `read` override consumes it once.
+    bool catalog_seam_armed = false;
+    /// The previous call's key, so `read` can recognize the catalog-then-`gc/state` ADJACENCY
+    /// `authorityHolds` alone produces -- see the doc comment above `moveRefCleanupAuthorityBeforeFirstChunk`.
     String last_read_key;
 };
 
@@ -631,7 +692,7 @@ TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
     EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(op, layout, *entry, checkpoint->ckpt));
 }
 
-TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
+TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstChunkRefusesEveryRefObjectDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -681,7 +742,7 @@ TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenChunksAllowsFirstAndRefuse
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
 
-TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
+TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstChunkRefusesEveryRefObjectDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -689,23 +750,20 @@ TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObject
     const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
 
     Gc gc(store, kGc);
-    /// The lease is already adopted by the time the hot-scan hook fires (PHASE 1 runs first), so the
-    /// extra bump here lands strictly AFTER the round's own adoption and strictly BEFORE the first
-    /// chunk's revalidation -- "the GC fence moved before the first chunk starts", spec §D's test (2).
-    OperationForTest race_op(*backend);
+    /// Bumping `gc/state`'s lease directly from the hot-scan hook (as `Authority::Catalog` bumps the
+    /// catalog above) would land BEFORE the round's own `round_commit` CAS (phase 13), which still
+    /// holds the etag from lease adoption (phase 1) -- that CAS would then lose and the round would
+    /// throw before `cleanupRefObjects` (phase 17) ever runs, so "nothing deleted" would hold
+    /// vacuously. Instead, only ARM the seam here: the actual bump happens on `authorityHolds`'s own
+    /// `gc/state` read (phase 17, long after `round_commit` landed) -- see the class doc comment above
+    /// `moveRefCleanupAuthorityBeforeFirstChunk`.
     bool hook_fired = false;
     gc.setPostHotScanCatalogReadHookForTest([&]
     {
         hook_fired = true;
-        RefCleanupAuthorityRaceBackend::moveRefCleanupAuthorityBeforeFirstChunk(
-            RefCleanupAuthorityRaceBackend::Authority::GcFence, *race_op, layout);
+        backend->armGcFenceMoveOnAuthorityHoldsRevalidationForTest(layout);
     });
-    /// A REAL `gc/state` move mid-round also loses the round's OWN `round_commit` CAS (Catalog authority
-    /// has no such collision: `round_commit` never touches the catalog) -- the round throws `ABORTED`
-    /// rather than returning cleanly. That is the genuine production shape of a competing leader
-    /// advancing the fence, and it entails "nothing deleted" even more strongly than a clean refusal
-    /// would: cleanup refuses first, and the round-level commit refuses again behind it.
-    EXPECT_THROW(runRegularRoundReclaiming(gc), DB::Exception);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_TRUE(hook_fired) << "the race hook never fired -- this test proves nothing about the race";
 
     OperationForTest raw_op(*backend);
@@ -774,15 +832,28 @@ TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
     EXPECT_FALSE((*raw_op).head(keys.first_log_key, Retry::once()).has_value());
     EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value());
     /// Whatever the reborn life owns is untouched: its keys carry a different life id and were never
-    /// in the cohort. Every key under the new life's stream prefix is still present.
+    /// in the cohort. Every key under the new life's stream prefix is still present -- `moveAuthority`'s
+    /// `CatalogRebirth` branch seeds the reborn life's own `_log` and `_snap` right after the catalog
+    /// rewrite lands (see its doc comment: any earlier and an "unknown incarnation" sweep elsewhere in
+    /// the SAME round could claim them, since no catalog entry names that incarnation yet).
     const CasRefCatalog::Snapshot cut = CasRefCatalog::read(*raw_op, layout);
     const auto entry = std::find_if(cut.catalog.entries.begin(), cut.catalog.entries.end(),
                                     [&](const CatalogEntry & e) { return e.ns == ns; });
     ASSERT_NE(entry, cut.catalog.entries.end());
     const NamespaceLifeId reborn = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
     ListPage page = (*raw_op).list(layout.namespaceStreamPrefix(reborn), "", 1000, Retry::once());
+    ASSERT_FALSE(page.keys.empty()) << "the seeded new-life objects must be listed, or this test proves nothing";
     for (const ListedKey & listed : page.keys)
+    {
         EXPECT_EQ(backend->deleteCount(listed.key), 0u) << listed.key;
+        EXPECT_TRUE((*raw_op).head(listed.key, Retry::once()).has_value()) << listed.key;
+    }
+
+    /// The next round revalidates against the NEW catalog row: the old (dead) life is no longer named
+    /// by any entry `cleanupRefObjects` walks, so the old cohort's untouched second key survives too.
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    EXPECT_TRUE((*raw_op).head(keys.second_log_key, Retry::once()).has_value())
+        << "the old cohort's second key must survive: the next round's plan is for the reborn life, not the dead one";
 }
 
 TEST(CASRefGc, RefObjectCleanupDeletesExactlyThePlannedSet)

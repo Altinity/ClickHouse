@@ -3551,14 +3551,9 @@ void Gc::cleanupRefObjects(
         const CatalogEntry & observed_entry = *entry_it;
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation);
 
-        /// Current-life ref cleanup is not the dead-life janitor: every irreversible key delete must
-        /// still be licensed by the SAME complete catalog observation and GC lease that adopted the
-        /// fold. Re-read both after the target observation and immediately before the removal. A moved
-        /// incarnation, changed row/life, missing or unreadable authority object, or changed
-        /// owner/sequence stops the whole cleanup pass. Continuing with another row/key would turn a
-        /// refusal into a fallback.
-        /// Every irreversible delete is still licensed by the SAME complete catalog observation and GC
-        /// lease that adopted the fold, re-read immediately before the deletes it licenses. The unit
+        /// Current-life ref cleanup is not the dead-life janitor: every irreversible delete is still
+        /// licensed by the SAME complete catalog observation and GC lease that adopted the fold,
+        /// re-read immediately before the deletes it licenses. The unit
         /// of licence is one chunk of write-once keys: a `_log` or `_snap` key is published once at a
         /// life-qualified key and never rewritten, so there is nothing to HEAD, and the plan below is
         /// derived from durable state a successor leader derives too. A moved incarnation, changed
