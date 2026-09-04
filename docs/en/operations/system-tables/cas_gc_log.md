@@ -44,7 +44,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `objects_absent` ([UInt64](/sql-reference/data-types/int-uint)) — Retire candidates found already absent.
 - `objects_replaced` ([UInt64](/sql-reference/data-types/int-uint)) — `412`-saves (a resurrection won the race against the delete).
 - `objects_spared` ([UInt64](/sql-reference/data-types/int-uint)) — Candidates spared because their in-degree was greater than zero at recheck.
-- `manifests_deleted` ([UInt64](/sql-reference/data-types/int-uint)) — Owner-removed manifest bodies physically deleted this round, counted separately from blob deletes.
+- `manifests_deleted` ([UInt64](/sql-reference/data-types/int-uint)) — Owner-removed manifest bodies deleted or found already absent this round (a batch delete of write-once keys cannot tell the two apart), counted separately from blob deletes.
 - `entries_condemned` ([UInt64](/sql-reference/data-types/int-uint)) — Retired entries newly condemned this round (retired-cursor pipeline stage 1).
 - `entries_graduated` ([UInt64](/sql-reference/data-types/int-uint)) — Retired entries newly floor-passed and republished `delete_pending` this round (pipeline stage 2; deleted the next round).
 - `entries_redeleted` ([UInt64](/sql-reference/data-types/int-uint)) — Pending exact-token blob deletes executed this round (pipeline stage 3).

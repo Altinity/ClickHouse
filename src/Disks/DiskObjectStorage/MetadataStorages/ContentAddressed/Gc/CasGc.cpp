@@ -1079,6 +1079,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// never re-derived by this pipeline, converting a bounded burst into a permanent leak. It drains
     /// the whole of `folded.mf_cleanup` every round it runs; only a crash (or the destructive-suppression
     /// gate below) leaves an entry for the orphan-manifest sweep to reclaim later.
+    /// The bodies go in batch requests of write-once keys; see the block.
     ///
     /// PHASE 15/18 `manifest_deletes`.
     {
@@ -1091,30 +1092,54 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         static const std::map<ManifestId, Etag> kNoManifestCleanup;
         const std::map<ManifestId, Etag> & mf_cleanup_now =
             suppress_destructive ? kNoManifestCleanup : folded.mf_cleanup;
+
+        /// Chunks of write-once keys, one request each, with no per-key precondition: a manifest key is
+        /// never written twice, so the body at it is the one the fold observed or nothing. The engine
+        /// reissues a failed chunk whole; a chunk that exhausts its policy throws here, and the chunks
+        /// before it are already recorded below. The etag the fold observed rides the event as
+        /// information only.
+        const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
         uint64_t attempted = 0;
-        for (const auto & [id, incarnation] : mf_cleanup_now)
+        uint64_t requests = 0;
+        std::vector<WriteOnceKey> chunk;
+        std::vector<const std::pair<const ManifestId, Etag> *> chunk_entries;
+        const auto flush = [&]
+        {
+            if (chunk.empty())
+                return;
+            op.removeManyWriteOnce(chunk, Retry::standard());
+            ++requests;
+            for (const auto * entry : chunk_entries)
+            {
+                ++report.manifests_deleted;
+                EventEmitter{*store}.emit([&](CasEvent & e)
+                {
+                    e.type = CasEventType::ManifestDelete;
+                    e.namespace_ = entry->first.root_namespace.string();
+                    e.object_kind = CasEventObjectKind::Manifest;
+                    e.object_hash = manifestRefDebugString(entry->first.ref);
+                    e.token = entry->second.render();
+                    e.round = new_round;
+                    e.gen = generation;
+                    e.outcome = "deleted_or_absent";
+                    e.reason = "owner-removed manifest body; batch delete of a write-once key after decrements adopted";
+                });
+            }
+            chunk.clear();
+            chunk_entries.clear();
+        };
+        for (const auto & entry : mf_cleanup_now)
         {
             ++attempted;
-            /// Gone and Mismatch are both tolerated: the body is already reclaimed, or a live
-            /// incarnation replaced the one this round's fold observed.
-            const Removal mdel = op.remove(layout.manifestKey(id), incarnation, Retry::standard());
-            if (mdel == Removal::Removed)
-                ++report.manifests_deleted;
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::ManifestDelete;
-                e.namespace_ = id.root_namespace.string();
-                e.object_kind = CasEventObjectKind::Manifest;
-                e.object_hash = manifestRefDebugString(id.ref);
-                e.token = incarnation.render();
-                e.round = new_round;
-                e.gen = generation;
-                e.outcome = String{removalName(mdel)};
-                e.reason = "owner-removed manifest body; exact-incarnation delete after decrements adopted";
-            });
+            chunk.push_back(layout.writeOnceManifestKey(entry.first));
+            chunk_entries.push_back(&entry);
+            if (chunk.size() >= chunk_keys)
+                flush();
         }
+        flush();
         t.metric("attempted", attempted);
-        t.metric("deleted", report.manifests_deleted - manifests_deleted_before);
+        t.metric("accepted", report.manifests_deleted - manifests_deleted_before);
+        t.metric("requests", requests);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
 
