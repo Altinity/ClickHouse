@@ -319,14 +319,15 @@ ManifestId publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const S
     return id;
 }
 
-/// The reads, heads, stream opens, writes and lists `CountingBackend` observes, summed. The zero-I/O
-/// contract is asserted against this total, so a confirm that quietly grew a HEAD or a GET fails the
-/// test rather than the review. `writeTotal` and not `putTotal`: a write that carried a precondition
-/// is still a write, and counting only the create-shaped ones left the replace path unwatched.
-/// Deletes are NOT in this sum.
+/// Every request `CountingBackend` observes, summed: reads, heads, stream opens, writes, lists,
+/// deletes and publications. The zero-I/O contract is asserted against this total, so a confirm that
+/// quietly grew any one of them fails the test rather than the review. `writeTotal` and not `putTotal`:
+/// a write that carried a precondition is still a write, and counting only the create-shaped ones left
+/// the replace path unwatched.
 uint64_t backendRequests(const CountingBackend & b)
 {
-    return b.headTotal() + b.getTotal() + b.getStreamTotal() + b.writeTotal() + b.listTotal();
+    return b.headTotal() + b.getTotal() + b.getStreamTotal() + b.writeTotal() + b.listTotal()
+        + b.deleteTotal() + b.publishTotal();
 }
 
 /// One refusal counter's current value. `confirmExactRef` attributes every `Unknown` to exactly one of
@@ -756,6 +757,9 @@ TEST(CASConfirmExactRef, WedgedTransactionRefusesEveryRef)
     budget.attempt_timeout_ms = 100;
     budget.lease_safety_margin_ms = 100;
     cfg.cas_request_budget = budget;
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     auto store = openPoolWithConfig(backend, cfg);
     auto clock = VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/confirm_real_wedge"};

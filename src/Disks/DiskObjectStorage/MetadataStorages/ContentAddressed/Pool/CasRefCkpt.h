@@ -89,7 +89,7 @@ enum class CkptPublishOutcome : uint8_t
 ///   - exhausting the policy under persistent conflict throws the retry-later class. No partial state
 ///     exists to clean up: every attempt either committed the complete merged body or changed nothing.
 CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
-                               const RefCkpt & contribution);
+                               const RefCkpt & contribution, const Retry & policy = Retry::standard());
 
 /// One observation of a namespace's `_ckpt`: the decoded body and the incarnation it was read at. The
 /// incarnation is what the missing-base revalidation adjudicates against, so a reader that keeps only

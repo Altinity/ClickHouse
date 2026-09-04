@@ -870,13 +870,13 @@ EpochCrossResult crossEpochFromSeal(CasOperation & op, const Layout & layout, co
         return result;
     }
 
-    /// `life`: REQUIRED, not resolved here (review NEW-3) -- an internal fallback resolve was tried
-    /// once already (review C3, `Gc::fold`) and once more here (fsck's own independent walk defaulted
-    /// to `nullopt` and re-resolved), and both times a caller that had already committed to one `life`
-    /// for the rest of its walk could silently diverge from this function's OWN resolution if the
-    /// namespace is dropped and recreated between the two reads. `CasFsck.cpp`'s stream walk resolves
-    /// `life` once, at the top of its own function, and must pass that SAME value here rather than let
-    /// this function re-derive it a second time.
+    /// `life`: REQUIRED, not resolved here -- an internal fallback resolve was tried once already
+    /// (in `Gc::fold`) and once more here (fsck's own independent walk defaulted to `nullopt` and
+    /// re-resolved), and both times a caller that had already committed to one `life` for the rest of
+    /// its walk could silently diverge from this function's OWN resolution if the namespace is dropped
+    /// and recreated between the two reads. `CasFsck.cpp`'s stream walk resolves `life` once, at the
+    /// top of its own function, and must pass that SAME value here rather than let this function
+    /// re-derive it a second time.
     uint64_t target_epoch = witness.writer_epoch;
     while (target_epoch > from_seal.writer_epoch)
     {

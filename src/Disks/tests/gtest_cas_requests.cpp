@@ -117,6 +117,50 @@ TEST(CASRetry, PoliciesAreShapedAsSpecified)
     EXPECT_EQ(Retry::within(1'000).bind(now).deadline_ms, now + 1'000);
 }
 
+/// A frozen policy is ONE absolute deadline: time passing does not buy a later one, freezing again
+/// cannot extend it, and the lease bound still wins when it is the smaller of the two -- which is what
+/// keeps `GaveUp::Source` able to say which bound refused.
+TEST(CASRetry, AFrozenPolicyIsOneDeadlineAndTheLeaseStillWins)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    const uint64_t start = clock.now;
+    const Retry frozen = op.freeze(Retry::standard());
+    ASSERT_TRUE(frozen.policy_deadline_ms.has_value());
+    EXPECT_EQ(frozen.bind(start).deadline_ms, start + 90'000);
+    EXPECT_EQ(frozen.bind(start + 50'000).deadline_ms, start + 90'000);
+    EXPECT_FALSE(frozen.bind(start + 50'000).lease_bound);
+    /// The single-attempt view of a frozen policy keeps the deadline rather than starting a window.
+    EXPECT_EQ(frozen.asSingleAttempt().policy_deadline_ms, frozen.policy_deadline_ms);
+    EXPECT_TRUE(frozen.asSingleAttempt().single_attempt);
+
+    clock.now += 50'000;
+    EXPECT_EQ(op.freeze(frozen).policy_deadline_ms, frozen.policy_deadline_ms);
+
+    const Retry::Bound leashed = op.freeze(Retry::untilLeaseSafe(start + 10'000, 2'000)).bind(clock.now);
+    EXPECT_EQ(leashed.deadline_ms, start + 8'000);
+    EXPECT_TRUE(leashed.lease_bound);
+}
+
+/// Freezing belongs to a loop. A single verb still gets a full window from where it is called, however
+/// long its caller has already been running.
+TEST(CASRequests, ALoneReadUnderTheStandardPolicyStillGetsItsFullWindow)
+{
+    FakeClock clock;
+    auto throttled = std::make_shared<ThrottlingBackend>(
+        std::make_shared<InMemoryBackend>(), ThrottlingBackend::Mode::EveryNth, 1, 429);
+    auto requests = makeRequests(throttled, clock);
+    auto op = requests.admit();
+
+    clock.now += 10 * 90'000;
+    const uint64_t start = clock.now;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)op.read("k", Retry::standard()); });
+    EXPECT_GE(clock.now - start, 85'000u);
+}
+
 TEST(CASWriteResult, OrThrowMapsEveryAlternative)
 {
     /// The two that are not failures: a commit hands back its incarnation, a decline hands back
@@ -229,11 +273,12 @@ TEST(CASBackendPrimitives, EveryBackendInstanceHasItsOwnId)
     EXPECT_EQ(a->dialect(), Dialect::Emulated);
 }
 
-/// `EveryLegacyVerbReachesAnOverrideOfThePrimitiveItForwardsTo` pinned the legacy verbs
-/// (`putIfAbsent`/`casPut`/`putOverwrite`) forwarding through the primitive `write`. Those verbs are
-/// gone -- `CasOperation` is the only caller of `Backend` now -- so the property is a type-level
-/// guarantee rather than a runtime check; every fault double in this file that overrides `write` (e.g.
-/// `EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite` below) is what proves a double sees every write.
+/// The legacy verbs (`putIfAbsent`/`casPut`/`putOverwrite`) that used to forward through the primitive
+/// `write` are gone -- `CasOperation` is the only caller of `Backend` now -- so that forwarding is a
+/// type-level guarantee rather than a runtime check. What remains to prove is that every fault double
+/// in this file that overrides `write` sees an ATTEMPT under either shape `CasOperation` can send:
+/// unconditional (`create`) and Etag-conditioned (`replace`).
+/// `EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite` below covers both.
 
 TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite)
 {
@@ -264,6 +309,19 @@ TEST(CASBackendPrimitives, EachWriteKnobIsKeyedAndOneShotOnThePrimitiveWrite)
     EXPECT_TRUE(std::holds_alternative<GaveUp>(op.create("k4", "v", Retry::once())));
     EXPECT_TRUE(std::holds_alternative<Conflict>(op.create("k4", "v", Retry::once())));
     EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k4", "v", Retry::once())));
+
+    /// The Etag-conditioned shape: every write above was unconditional (`create`), so none of them
+    /// could have caught a fault double that only intercepts `write` when it carries an
+    /// `expected_value` -- the shape `replace` alone sends.
+    const std::optional<Etag> k5_first = orThrow(op.create("k5", "v", Retry::once()), "create");
+    ASSERT_TRUE(k5_first);
+    b->refuseNextWrite("k5");
+    EXPECT_TRUE(std::holds_alternative<Conflict>(op.replace("k5", "v2", *k5_first, Retry::once())))
+        << "consumed here";
+    const std::optional<Etag> k5_second
+        = orThrow(op.replace("k5", "v2", *k5_first, Retry::once()), "replace");   /// and only once
+    ASSERT_TRUE(k5_second);
+    expectBytes(b, "k5", "v2");
 }
 
 TEST(CASBackendPrimitives, ReadRefusesAValueThatIsNotAnIncarnation)
@@ -1023,12 +1081,16 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
     /// A competitor takes the key while our own create is in flight, and that create's own fate is
     /// lost. The ambiguity is armed from inside the hook so the competitor's write cannot consume it.
     bool staged = false;
+    std::optional<Etag> rival_etag;
     backend->onBeforeWrite("k", [&]
     {
         if (staged)
             return;
         staged = true;
-        (void)rival.create("k", "theirs", Retry::once());
+        const WriteResult rival_result = rival.create("k", "theirs", Retry::once());
+        const auto * rival_committed = std::get_if<Committed>(&rival_result);
+        ASSERT_NE(rival_committed, nullptr);
+        rival_etag = rival_committed->etag;
         backend->injectAmbiguousWrite("k");
     });
 
@@ -1039,9 +1101,15 @@ TEST(CASRequests, OnPresenceReportsMetaEvenWhenItHadToFetchTheBody)
     const auto * conflict = std::get_if<Conflict>(&result);
     ASSERT_NE(conflict, nullptr);
     /// The ambiguity forced a body read, and the body stops at this boundary: a caller of the
-    /// presence loop can never come to depend on bytes the loop does not promise.
-    EXPECT_TRUE(std::holds_alternative<Meta>(conflict->seen));
-    EXPECT_FALSE(std::holds_alternative<Object>(conflict->seen));
+    /// presence loop can never come to depend on bytes the loop does not promise. `get_if<Meta>` plus
+    /// its field checks, not a bare `holds_alternative`: a variant that already proved it holds `Meta`
+    /// cannot also hold `Object`, so the field checks are what a regression could actually fail --
+    /// proving the observed Meta is the RIVAL's own committed incarnation, not some other object.
+    ASSERT_TRUE(rival_etag.has_value());
+    const auto * meta_seen = std::get_if<Meta>(&conflict->seen);
+    ASSERT_NE(meta_seen, nullptr);
+    EXPECT_EQ(meta_seen->etag, *rival_etag);
+    EXPECT_EQ(meta_seen->size, String("theirs").size());
     EXPECT_EQ(backend->getTotal(), 1u);
 }
 
@@ -1406,6 +1474,24 @@ std::exception_ptr s3Error(Aws::S3::S3Errors code, const String & name)
     return std::make_exception_ptr(DB::S3Exception("the store answered " + name, code, name));
 }
 
+/// Answers EVERY read with the same store error. A classification that terminates on an error is then
+/// visible as a single attempt, and one that keeps the error ambiguous as a policy spent to its
+/// deadline -- which a one-shot arming could never tell apart.
+class AlwaysFailingReadBackend final : public CountingBackend
+{
+public:
+    explicit AlwaysFailingReadBackend(std::exception_ptr error_) : error(std::move(error_)) {}
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        (void)CountingBackend::read(key, access);
+        std::rethrow_exception(error);
+    }
+
+private:
+    std::exception_ptr error;
+};
+
 }
 
 TEST(CASRequests, DeadlineIsTheOnlyBoundUnderZeroLatencyThrottling)
@@ -1648,6 +1734,39 @@ TEST(CASRequests, ReadModifyWriteWhoseResolveAndFreshObservationBothFailGivesUpU
     EXPECT_EQ(backend->writeTotal(), 1u);
     EXPECT_EQ(backend->getTotal(), 3u);
     EXPECT_EQ(clock.sleeps.size(), 1u);
+}
+
+/// A missing bucket is an ANSWER the store gave, but not an answer about the object: an S3-compatible
+/// store that transiently misroutes a bucket says exactly this, and a read that ended on it would turn
+/// an availability blip into a hard failure. It stays in the ambiguous class -- reissued until the
+/// policy's deadline -- like a throttle or a 5xx.
+TEST(CASRequests, AMissingBucketOnAReadIsReissuedToTheDeadline)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<AlwaysFailingReadBackend>(
+        s3Error(Aws::S3::S3Errors::NO_SUCH_BUCKET, "NoSuchBucket"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    const uint64_t start = clock.now;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)op.read("k", Retry::standard()); });
+    EXPECT_GT(backend->getTotal(), 1u) << "the read ended on its first attempt instead of reissuing";
+    EXPECT_GE(clock.now - start, 85'000u) << "the policy's own deadline is what must end this read";
+}
+
+/// The kept half of the same classification: a key miss IS an answer about the object, so reissuing it
+/// only replays the same authoritative absence until the deadline. One attempt, no pause.
+TEST(CASRequests, AnAuthoritativeKeyMissOnAReadEndsTheCallAtOnce)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<AlwaysFailingReadBackend>(
+        s3Error(Aws::S3::S3Errors::NO_SUCH_KEY, "NoSuchKey"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { (void)op.read("k", Retry::standard()); });
+    EXPECT_EQ(backend->getTotal(), 1u);
+    EXPECT_TRUE(clock.sleeps.empty());
 }
 
 TEST(CASRequests, AnUnmodeledStoreErrorOnAReadIsReissuedNotSurfaced)

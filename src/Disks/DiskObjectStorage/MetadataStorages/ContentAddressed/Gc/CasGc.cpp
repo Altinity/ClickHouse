@@ -727,7 +727,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             ++report.redeleted;
             ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
             /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
-            /// writer already resurrected a fresh incarnation at this hash (INV-1), and that writer's
+            /// writer already resurrected a fresh incarnation at this hash, and that writer's
             /// own republication path already flipped the meta back to Clean; blindly deleting here
             /// would race that legitimate Clean write for no reason (the meta is advisory, but there is
             /// no reason to touch it on that path at all).
@@ -844,11 +844,18 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         WriteResult written = op.create(key, body, Retry::standard());
         if (const auto * conflict = std::get_if<Conflict>(&written))
         {
-            /// The conflict's observation IS the read that used to follow the refused create.
+            /// The conflict's observation IS the read that used to follow the refused create. Only
+            /// something that read actually OBSERVED can support a verdict about the key; a resolve
+            /// read that settled nothing says nothing about whether the object is there.
+            if (std::holds_alternative<NotObserved>(conflict->seen))
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS gc: the create of the outcome log at {} was refused and its resolve read "
+                    "observed nothing, so what the key holds is unknown", key);
             const auto * existing = std::get_if<Object>(&conflict->seen);
             if (!existing)
                 throw Exception(ErrorCodes::ABORTED,
-                    "CAS gc: outcome log at {} vanished between the create and the read that settled it", key);
+                    "CAS gc: outcome log at {} refused the create and its resolve read observed {}",
+                    key, detail::renderObservation(conflict->seen));
             if (existing->bytes != body)
             {
                 try { log = decodeOutcomeLog(openObject(FormatId::GcOutcomes, existing->bytes)); }
@@ -948,9 +955,18 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
     WriteResult commit = op.replace(layout.gcStateKey(), encodeGcState(next), *state_etag,
                                     Retry::standard());
-    if (std::holds_alternative<Conflict>(commit))
+    if (const auto * conflict = std::get_if<Conflict>(&commit))
+    {
+        /// A refused precondition whose resolve read settled nothing proves only that this commit did
+        /// not apply -- naming a competing leader would assert something nobody observed.
+        if (std::holds_alternative<NotObserved>(conflict->seen))
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS gc round: the gc/state commit was refused and its resolve read observed nothing; "
+                "retry next round");
         throw Exception(ErrorCodes::ABORTED,
-            "CAS gc round: gc/state moved during the round (another leader advanced it); retry next round");
+            "CAS gc round: gc/state moved during the round (another leader advanced it, observed {}); "
+            "retry next round", detail::renderObservation(conflict->seen));
+    }
     state_etag = orThrow(std::move(commit), "CAS gc round commit");
     state = std::move(next);
     report.round = state.round;

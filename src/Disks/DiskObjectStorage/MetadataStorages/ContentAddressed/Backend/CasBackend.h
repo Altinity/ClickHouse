@@ -22,13 +22,14 @@
 namespace DB::Cas
 {
 
-/// Typed erasure evidence for one key or one prefix. `head`/
-/// `get` deliberately flatten every kind of miss (a clean absence, a missing bucket/container, a
-/// permission failure, a transport fault) into one "not found" result, which is exactly right for
-/// their callers (a plain read) but wrong for lifecycle recovery, which must never treat a
-/// transport/permission failure as proof that data is gone. `ProbeOutcome` keeps the four cases
-/// distinct: only a backend's OWN authoritative "not found" evidence earns `KeyAbsent` — a timeout,
-/// a 5xx, or an unclassifiable error is ALWAYS `Indeterminate`, never promoted to absence.
+/// Typed erasure evidence for one key or one prefix. Ordinary `head`/`read` answer only two things
+/// for a plain caller: the object, or nullopt for the store's own authoritative "key not found" (see
+/// `isObjectNotFound`) -- every other fault (a missing bucket/container, a permission failure, a
+/// transport fault) propagates as an exception instead of being flattened into absence. That
+/// present/absent/throw shape is exactly right for a plain read, but wrong for lifecycle recovery,
+/// which must never treat a fault it cannot classify as proof that data is gone. `ProbeOutcome` keeps
+/// the four cases distinct: only a backend's OWN authoritative "not found" evidence earns `KeyAbsent`
+/// -- a timeout, a 5xx, or an unclassifiable error is ALWAYS `Indeterminate`, never promoted to absence.
 enum class ProbeOutcome : uint8_t
 {
     Present,           /// the key (or, for a prefix probe, at least one object under it) exists
@@ -263,8 +264,9 @@ public:
     /// Fail-closed precondition: a Native-mode backend MUST have a
     /// working single-attempt conditional-write path before it coordinates a WRITABLE pool — silently
     /// running CAS conditional writes under the disk's default (~500-attempt) transparent retry policy
-    /// is exactly the hazard this seam forbids. Checked by the capability probe alongside
-    /// checkPoolPreconditions. Default: nothing to check (EmulatedSingleProcess and non-S3 backends
+    /// is exactly the hazard this seam forbids. Asked by `Pool::open` through
+    /// `backendForCapabilityPredicates()`, alongside `checkPoolPreconditions`, before the probe
+    /// operation is admitted. Default: nothing to check (EmulatedSingleProcess and non-S3 backends
     /// are not gated here — see ObjectStorageBackend's override for the one backend that is).
     virtual void checkConditionalWriteSingleAttemptSupport() {}
 

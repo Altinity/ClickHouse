@@ -60,11 +60,10 @@ TEST(CASProbe, PassesOnEmulatedLocal)
     EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe"));
 }
 
-/// B135: two servers mounting the SAME shared CA pool concurrently must not race on the probe keys.
+/// Two servers mounting the SAME shared CA pool concurrently must not race on the probe keys.
 /// We simulate "a concurrent mounter's probe is in flight" by PRE-SEEDING the fixed-name probe key
-/// `<pool>/_probe/token` over a shared backend, then opening the Pool. With the OLD fixed-key probe
-/// the open's `putIfAbsent("<pool>/_probe/token", …)` returns PreconditionFailed and `Pool::open`
-/// throws NOT_IMPLEMENTED ("putIfAbsent on a fresh key returned PreconditionFailed"). With the
+/// `<pool>/_probe/token` over a shared backend, then opening the Pool. A fixed-key probe would meet
+/// the seeded object as a refused precondition on its own `create` and fail the open; with the
 /// per-mount unique probe prefix `<pool>/_probe/<rand>/token`, the seeded key does not collide and
 /// the open succeeds — exactly the concurrent-shared-pool-mount behaviour we need.
 ///

@@ -77,9 +77,13 @@ using DB::Cas::tests::expectThrowsCode;
 namespace
 {
 
-PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
+template <typename BackendT>
+PoolPtr openPool(const std::shared_ptr<BackendT> & backend, CasRequestBudget budget = {})
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 

@@ -196,7 +196,7 @@ public:
         if (key == target_key && !fired)
         {
             fired = true;
-            /// GC's single content-delete site, landing in the HEAD->GET window.
+            /// Fires here: after the inner HEAD observation, before it is returned to the writer.
             inner->remove(target_key, condemned_value, access);
         }
         return observed;
@@ -2766,12 +2766,16 @@ TEST(CASPartWrite, EveryPhysicalPublicationMintsAFreshIncarnationTag)
         << "a repeated incarnation_tag is a repeated incarnation: GC's condemn would name the live body";
 }
 
-/// "One `Retry::standard()`" is one policy VALUE, not one shared deadline: each verb of the
-/// publication loop binds its own window from it, so a loop that has already spent far more than one
-/// window still publishes. Here each ambiguous publication burns forty seconds of the injected clock,
-/// so three of them exceed the standard ninety-second window; a loop that carried a single bound
-/// across its iterations would refuse the fourth iteration's HEAD instead of committing.
-TEST(CASPartWrite, EnsureBlobPresentSharesOneRetryAcrossItsLoop)
+/// The publication loop captures ONE bound before it starts, and every verb of every iteration shares
+/// it -- so eight iterations cannot spend eight ninety-second windows. Here each ambiguous
+/// publication burns forty seconds of the injected clock, so the third one carries the loop past the
+/// window it captured and the next iteration's HEAD refuses to start. The insert is refused as
+/// retry-later, which is what a caller can act on; the alternative is a single blob upload sitting on
+/// the request for twenty-five minutes. The eight-attempt cap stays as the secondary bound.
+///
+/// The throw and the publication count are what fail if the shared bound regresses: without it this
+/// same fixture publishes a fourth time and the call SUCCEEDS.
+TEST(CASPartWrite, EnsureBlobPresentIsBoundedByTheOneWindowItCaptured)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     auto s = openBlobFaultPool(b);
@@ -2788,11 +2792,15 @@ TEST(CASPartWrite, EnsureBlobPresentSharesOneRetryAcrossItsLoop)
 
     int payload_streams = 0;
     b->fault_count = 3;
-    const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
-    EXPECT_EQ(res.size, payload.size());
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        (void)build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+    });
 
-    EXPECT_EQ(b->publish_stream_attempts, 4) << "three ambiguous publications + the committing fourth";
-    EXPECT_GT(now->load(), 90'000u) << "the loop outlived one standard window, which is the point";
+    EXPECT_EQ(b->publish_stream_attempts, 3) << "the fourth iteration must not start a publication";
+    /// The clock is past the captured deadline when the loop stops, which is what stopped it -- the
+    /// third publication ends at 120 s of a window that closed at 90 s.
+    EXPECT_GT(now->load(), 90'000u);
 }
 
 namespace

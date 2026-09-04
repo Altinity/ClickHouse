@@ -54,6 +54,16 @@ public:
         return it == refusal_counts.end() ? 0 : it->second;
     }
 
+    /// Every key (or list prefix / publish destination) this backend has ever decided a request for, in
+    /// `FirstPerKey` mode every one of them by construction (`refused_keys` records the key whether or
+    /// not this particular call refused it), sorted. Lets a coverage test enumerate what it must check
+    /// without carrying its own duplicate list of keys.
+    std::vector<String> decidedKeys() const
+    {
+        std::lock_guard lock(mutex);
+        return std::vector<String>(refused_keys.begin(), refused_keys.end());
+    }
+
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         refuseOrPass(key);

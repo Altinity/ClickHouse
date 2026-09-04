@@ -36,18 +36,24 @@ PoolConfig singleAttemptConfig()
     return config;
 }
 
-PoolPtr openSingleAttemptPool(const BackendPtr & backend)
+template <typename BackendT>
+PoolPtr openSingleAttemptPool(const std::shared_ptr<BackendT> & backend)
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the fence math these single-attempt fixtures drive matches what admits.
+    backend->setAttemptTimeoutMs(singleAttemptConfig().cas_request_budget.attempt_timeout_ms);
     return Pool::open(backend, singleAttemptConfig());
 }
 
-PoolPtr openFrozenSingleAttemptPool(const BackendPtr & backend)
+template <typename BackendT>
+PoolPtr openFrozenSingleAttemptPool(const std::shared_ptr<BackendT> & backend)
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     PoolConfig config = singleAttemptConfig();
     config.boot_ms_fn = [] { return uint64_t{0}; };
     config.mount_renew_period = std::chrono::hours{1};
+    backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);
     return Pool::open(backend, config);
 }
 
@@ -88,53 +94,30 @@ uint64_t leaveRejectedCleanupDuty(const PoolPtr & store, const RootNamespace & n
     return rejected_seq;
 }
 
-/// `ChunkFaultBackend` counts its faults, and a count can no longer wedge one logical write: the write
-/// engine settles every ambiguity by an exact read and reissues, so a bounded fault is outlived and the
-/// call commits on a later attempt instead of exhausting its own retry window. Latching keeps the fault
-/// (and, for `LandedThenLost`, the paired lost resolve-read) armed on every reissue, so the duty tests
-/// below can drive a call all the way to a genuine give-up.
-class LatchedChunkFaultBackend : public DB::Cas::tests::ChunkFaultBackend
-{
-public:
-    bool latched = false;
-
-    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        if (latched && !fail_read_once_key.empty() && key == fail_read_once_key)
-            throw Poco::TimeoutException("LatchedChunkFaultBackend: the lost read stays lost");
-        return ChunkFaultBackend::read(key, access);
-    }
-
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value,
-                                             DB::Cas::TransportAccess & access) override
-    {
-        if (latched && mode != Mode::None && fault_skip == 0 && !expected_value && !fault_substr.empty()
-            && key.find(fault_substr) != String::npos)
-            fault_count = 1;
-        return ChunkFaultBackend::write(key, bytes, expected_value, access);
-    }
-
-    /// Disarms completely (not just unlatches): what a caller does right after driving a call to its
-    /// give-up is a further mutation that must reach the store normally.
-    void disarm()
-    {
-        latched = false;
-        mode = Mode::None;
-        fault_count = 0;
-        fault_skip = 0;
-        fail_read_once_key.clear();
-    }
-};
+using DB::Cas::tests::LatchedChunkFaultBackend;
 
 /// Latches `backend` and drives `f` to a NETWORK_ERROR give-up, then disarms the fault completely so a
 /// caller's next mutation reaches the store normally. The caller must have installed a
 /// `VirtualRetryClock` on the store first, or the give-up paces through a real sleep instead of a
 /// virtual one.
-void driveToNetworkErrorGiveUp(LatchedChunkFaultBackend & backend, const std::function<void()> & f)
+///
+/// A give-up is not by itself proof that the engine actually retried: a `once` policy reaches the same
+/// outcome by propagating its first failure. Asserting the fault double's own hit count and the
+/// clock's pause count is what tells the two apart -- both fire more than once only when reissues
+/// really happened, whether the fault re-arms on every write attempt (`Unresolved`) or the resolving
+/// read keeps retrying against a persistently lost response (`LandedThenLost`).
+void driveToNetworkErrorGiveUp(LatchedChunkFaultBackend & backend, DB::Cas::tests::VirtualRetryClock & clock,
+                               const std::function<void()> & f)
 {
     backend.latched = true;
+    const int fault_hits_before = backend.fault_hits;
+    const size_t pauses_before = clock.pauseCount();
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, f);
+    EXPECT_GE(backend.fault_hits - fault_hits_before, 1) << "the fault double must actually have fired";
+    EXPECT_GT(clock.pauseCount() - pauses_before, 1u)
+        << "a give-up after a single attempt cannot distinguish a retrying `standard` policy from one "
+        << "that never reissues at all";
+    EXPECT_GT(clock.longestPause(), 0u) << "at least one of the retry's pauses must be a real, nonzero backoff";
     backend.disarm();
 }
 
@@ -148,7 +131,7 @@ TEST(CASWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemove
 {
     auto backend = std::make_shared<LatchedChunkFaultBackend>();
     auto store = openSingleAttemptPool(backend);
-    DB::Cas::tests::VirtualRetryClock::installOn(store);
+    auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/writer_duty_adopt"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
@@ -160,7 +143,7 @@ TEST(CASWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemove
     backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
-    driveToNetworkErrorGiveUp(*backend, [&] { abandoned->precommitAdd(ns, "abandoned", abandoned_id); });
+    driveToNetworkErrorGiveUp(*backend, *clock, [&] { abandoned->precommitAdd(ns, "abandoned", abandoned_id); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_EQ(abandoned->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
 
@@ -200,6 +183,9 @@ TEST(CASWriterDuties, ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation)
     PoolConfig config = singleAttemptConfig();
     config.boot_ms_fn = [] { return uint64_t{0}; };
     config.mount_renew_period = std::chrono::hours{1};
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the fence math this single-attempt fixture drives matches what admits.
+    backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);
     auto store = Pool::open(backend, config);
     const RootNamespace ns{"srv1/writer_duty_reject"};
 
@@ -244,7 +230,7 @@ TEST(CASWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
 {
     auto backend = std::make_shared<LatchedChunkFaultBackend>();
     auto store = openSingleAttemptPool(backend);
-    DB::Cas::tests::VirtualRetryClock::installOn(store);
+    auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/writer_duty_wedge_reject"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
@@ -255,7 +241,7 @@ TEST(CASWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
     backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
-    driveToNetworkErrorGiveUp(*backend, [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
+    driveToNetworkErrorGiveUp(*backend, *clock, [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_EQ(rejected->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
 
@@ -377,6 +363,9 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
         .attempt_timeout_ms = 50,
         .lease_safety_margin_ms = 50,
     };
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     const RootNamespace ns{"srv1/writer_duty_crash"};
 
     auto predecessor = Pool::open(backend, PoolConfig{
@@ -452,6 +441,9 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
         .attempt_timeout_ms = 50,
         .lease_safety_margin_ms = 50,
     };
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     /// Rooted under the POOL's OWN `server_root_id` ("test", unlike this file's other fixtures, which
     /// stay under "srv1" precisely because they never drive the orphan sweep): `prefixEligible`'s
     /// watermark floor is looked up by walking the NAMESPACE's own prefix segments for a live mount
@@ -471,7 +463,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = budget,
     });
-    DB::Cas::tests::VirtualRetryClock::installOn(predecessor);
+    auto clock = DB::Cas::tests::VirtualRetryClock::installOn(predecessor);
 
     /// A real, fully-promoted ref through the ordinary production write path (no seeded catalog/ckpt)
     /// gives the namespace genuine epoch-1 content, so the successor's recovery below has something
@@ -496,7 +488,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     backend->fault_substr = predecessor->layout().namespaceStreamPrefix(predecessor->namespaceLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
-    driveToNetworkErrorGiveUp(*backend, [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
+    driveToNetworkErrorGiveUp(*backend, *clock, [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
     ASSERT_TRUE(predecessor->refLaneWedgedForTest(ns));
     ASSERT_EQ(rejected->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
     const uint64_t predecessor_epoch = predecessor->writerEpoch();
@@ -559,7 +551,7 @@ TEST(CASWriterDuties, DutySurvivesSettlementFailureForRetry)
 {
     auto backend = std::make_shared<LatchedChunkFaultBackend>();
     auto store = openFrozenSingleAttemptPool(backend);
-    DB::Cas::tests::VirtualRetryClock::installOn(store);
+    auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/writer_duty_settlement_retry"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
     publishEmptyRef(store, ns, "target");
@@ -577,7 +569,7 @@ TEST(CASWriterDuties, DutySurvivesSettlementFailureForRetry)
     backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
     backend->fault_count = 1;
-    driveToNetworkErrorGiveUp(*backend, [&] { store->dropRef(ns, "target"); });
+    driveToNetworkErrorGiveUp(*backend, *clock, [&] { store->dropRef(ns, "target"); });
 
     EXPECT_TRUE(store->writerCleanupDutiesPendingForTest())
         << "a settlement that throws must retain the duty for retry, never lose it";

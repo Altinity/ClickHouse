@@ -177,6 +177,9 @@ TEST(CASSentinelProbe, TransportErrorNeverClassifiesAsAbsent)
     const auto result = probeSentinel(op, "k", Retry::standard());
     EXPECT_EQ(result.outcome, ProbeOutcome::Indeterminate);
     EXPECT_FALSE(result.body.has_value());
+    EXPECT_GT(clock.sleeps.size(), 1u)
+        << "a single attempt would not distinguish this reissue loop from a non-retrying policy that "
+           "reaches the same Indeterminate give-up on its first try";
 }
 
 #if USE_AWS_S3
@@ -299,6 +302,9 @@ TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
     auto requests = makeRequests(backend, &clock);
     auto op = requests.admit();
     EXPECT_EQ(probeSentinel(op, nativeKeyUnder(storage, "some/key"), Retry::standard()).outcome, ProbeOutcome::Indeterminate);
+    EXPECT_GT(clock.sleeps.size(), 1u)
+        << "a single attempt would not distinguish this reissue loop from a non-retrying policy that "
+           "reaches the same Indeterminate give-up on its first try";
 }
 
 /// Production wiring (`Pool::open`) ALWAYS wraps the real backend in `InstrumentedBackend` before

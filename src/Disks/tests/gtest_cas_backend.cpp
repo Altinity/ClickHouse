@@ -334,10 +334,15 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
                 return std::make_unique<DB::ReadBufferFromOwnString>(String("payload"));
             }}};
 
-    auto publication = std::async(std::launch::async, [&] { op.publish(request, Retry::once()); });
+    /// `CasOperation` carries mutable per-call state and is single-threaded by design: the publish and
+    /// the concurrent read below each admit their OWN operation from the shared `requests` rather than
+    /// racing on `op`.
+    CasOperation publish_op = requests.admit();
+    auto publication = std::async(std::launch::async, [&] { publish_op.publish(request, Retry::once()); });
     source_opened.get_future().wait();
 
-    auto observation = std::async(std::launch::async, [&] { return op.read("blob", Retry::once()); });
+    CasOperation read_op = requests.admit();
+    auto observation = std::async(std::launch::async, [&] { return read_op.read("blob", Retry::once()); });
     const auto observation_status = observation.wait_for(2s);
     EXPECT_EQ(observation_status, std::future_status::ready)
         << "publication must not hold the visibility lock while draining its source";
@@ -672,31 +677,35 @@ TEST(CASCountingBackendShape, OneRequestIsCountedOnceWhicheverSurfaceIssuedIt)
     DB::Cas::CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     DB::Cas::CasOperation op = requests.admit();
 
-    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k", "v", Retry::standard())));
-    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k2", "v", Retry::standard())));
+    /// `Retry::once()` on every verb below, not `standard()`: this test pins ONE physical request per
+    /// call, and a healthy backend never distinguishes the two policies by outcome -- only `once()`
+    /// forbids a reissue by construction, so a regression that made the engine reissue speculatively
+    /// would still fail here instead of passing on a backend too healthy to ever need the second attempt.
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k", "v", Retry::once())));
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k2", "v", Retry::once())));
     EXPECT_EQ(backend->putCount("k"), 1u);
     EXPECT_EQ(backend->putCount("k2"), 1u);
     EXPECT_EQ(backend->writeTotal(), 2u);
     EXPECT_EQ(backend->putOverwriteTotal(), 0u) << "neither write carried a precondition";
 
-    const std::optional<Meta> k_meta = op.head("k", Retry::standard());
+    const std::optional<Meta> k_meta = op.head("k", Retry::once());
     ASSERT_TRUE(k_meta);
     EXPECT_EQ(backend->headCount("k"), 1u);
 
     expectBytes(*backend, "k", "v");
-    EXPECT_TRUE(op.read("k", Retry::standard()));
+    EXPECT_TRUE(op.read("k", Retry::once()));
     EXPECT_EQ(backend->getCount("k"), 2u);
 
-    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("k", "w", k_meta->etag, Retry::standard())));
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.replace("k", "w", k_meta->etag, Retry::once())));
     EXPECT_EQ(backend->putOverwriteCount("k"), 1u) << "a write with a precondition is the replace shape";
     EXPECT_EQ(backend->writeCount("k"), 2u);
 
-    const std::optional<Meta> k2_meta = op.head("k2", Retry::standard());
+    const std::optional<Meta> k2_meta = op.head("k2", Retry::once());
     ASSERT_TRUE(k2_meta);
-    EXPECT_EQ(op.remove("k2", k2_meta->etag, Retry::standard()), Removal::Removed);
-    const std::optional<Meta> k_meta_after = op.head("k", Retry::standard());
+    EXPECT_EQ(op.remove("k2", k2_meta->etag, Retry::once()), Removal::Removed);
+    const std::optional<Meta> k_meta_after = op.head("k", Retry::once());
     ASSERT_TRUE(k_meta_after);
-    EXPECT_EQ(op.remove("k", k_meta_after->etag, Retry::standard()), Removal::Removed);
+    EXPECT_EQ(op.remove("k", k_meta_after->etag, Retry::once()), Removal::Removed);
     EXPECT_EQ(backend->deleteCount("k"), 1u);
     EXPECT_EQ(backend->deleteCount("k2"), 1u);
     EXPECT_EQ(backend->deleteTotal(), 2u);
@@ -1094,6 +1103,26 @@ TEST(CASObjectStorageBackend, PublishBlobRefusesVerbatimCopyWithoutNativeTranspo
 
     EXPECT_EQ(storage->copy_calls, 0u);
     EXPECT_FALSE(storage->exists(DB::StoredObject(destination)));
+}
+
+/// Every Native conditional write selects the SingleAttempt object-storage retry profile (RFC
+/// cas-s3-timeout-retry-control §disable-transparent-conditional-write-retries): the CAS request
+/// engine, not the object-storage client, owns retry/backoff for a conditional PUT, so a client-level
+/// retry loop reissuing the identical request underneath it would double the reissue and could land a
+/// write the engine itself had already given up on. Two seams prove the property without a live/fake
+/// S3 endpoint: `IObjectStorage::supportsRetryProfile` is the fail-closed capability check
+/// `checkConditionalWriteSingleAttemptSupport` relies on at mount time, and
+/// `s3_max_unexpected_write_error_retries_override` is the SECOND retry-affecting layer above the S3
+/// client -- `WriteBufferFromS3`'s own makeSinglepartUpload/completeMultipartUpload loop, bounded
+/// independently of the client-level override.
+TEST(CASObjectStorageBackend, ConditionalWriteSelectsSingleAttemptAndLocalStorageDoesNotSupportIt)
+{
+    auto backend = std::make_shared<ObjectStorageBackend>(
+        tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    const auto ws = backend->conditionalWriteSettingsForTest();
+    EXPECT_EQ(ws.object_storage_retry_profile, DB::ObjectStorageRetryProfile::SingleAttempt);
+    EXPECT_EQ(ws.s3_max_unexpected_write_error_retries_override, 1u);
+    EXPECT_FALSE(tests::makeLocalObjectStorageForTest()->supportsRetryProfile(DB::ObjectStorageRetryProfile::SingleAttempt));
 }
 
 /// The Native conditional-PUT path discriminates a lost precondition by the canonical S3 error code
@@ -1637,7 +1666,9 @@ TEST(CASObjectStorageBackend, EmuTokenStateEventuallyPrunesDistinctShortLivedKey
 /// refuse to construct an `Etag` from a malformed value in the first place (`CORRUPTED_DATA`), so no
 /// caller reaching the primitives through `CasOperation` can ever hold one -- the grammar guard inside
 /// `ObjectStorageBackend::write`/`removeUnder` is unreachable from the public engine surface and stays
-/// as defense in depth only. The grammar predicate itself remains directly pinned by
+/// as defense in depth only. The empty/`*`/quoted-list token cases the deleted tests drove are covered
+/// at the `Etag::mint`/`tryMint` boundary by `CASIncarnation.GrammarRefusesTheNineWays`
+/// (`gtest_cas_requests.cpp`); the grammar predicate itself remains directly pinned by
 /// `CASBackendGrammar.GenerationDialectAcceptsOnlyCanonicalPositiveDecimal` above.
 
 #endif

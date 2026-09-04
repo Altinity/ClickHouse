@@ -43,9 +43,10 @@ namespace
     throw Exception(ErrorCodes::LOGICAL_ERROR, "{}: the write was declined, which this call cannot produce", what);
 }
 
-CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout & layout)
+CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout & layout,
+                                                const Retry & policy = Retry::standard())
 {
-    const std::optional<Object> got = op.read(layout.refCatalogKey(), Retry::standard());
+    const std::optional<Object> got = op.read(layout.refCatalogKey(), policy);
     if (!got)
     {
         RefCatalog empty;
@@ -59,9 +60,9 @@ CasRefCatalog::Snapshot readOptionalForBootstrap(CasOperation & op, const Layout
 
 }
 
-CasRefCatalog::Snapshot CasRefCatalog::read(CasOperation & op, const Layout & layout)
+CasRefCatalog::Snapshot CasRefCatalog::read(CasOperation & op, const Layout & layout, const Retry & policy)
 {
-    Snapshot snapshot = readOptionalForBootstrap(op, layout);
+    Snapshot snapshot = readOptionalForBootstrap(op, layout, policy);
     if (!snapshot.etag)
         throwMandatoryCatalogAbsent(layout.refCatalogKey());
     return snapshot;
@@ -139,11 +140,9 @@ struct CatalogCreatorStillLiveMarker : std::exception {};
 /// the catalog is a single object mutated by every lifecycle transition of every namespace in the
 /// pool, so persistent contention is a real, not theoretical, exit condition to plan for.
 ///
-/// It bounds ATTEMPTS, not time. Each iteration binds its own window per verb and pauses between
-/// iterations, so the aggregate wall clock of one call is this cap times a backoff plus two verb
-/// windows -- hours in the worst case. That is accepted because the only caller is the GC pre-fold
-/// drain: a background round that may take as long as it takes, and whose next round re-derives
-/// everything anyway. A foreground path must not adopt this loop without a wall-clock bound.
+/// It bounds ATTEMPTS, and is the SECONDARY bound: the loop freezes one `Retry` before it starts and
+/// every verb of every iteration shares that absolute deadline, so wall-clock time is already bounded
+/// by one standard window. This cap exists so a call that somehow converges on neither still ends.
 constexpr size_t kMaxCatalogCasAttempts = 100;
 
 /// Shared body of `casUpdate`/`casAdmitEntry`. `encode` turns a freshly `mutate`d candidate into the
@@ -153,7 +152,8 @@ constexpr size_t kMaxCatalogCasAttempts = 100;
 RefCatalog casUpdateImpl(
     CasOperation & op, const Layout & layout,
     const std::function<RefCatalog(const RefCatalog &)> & mutate,
-    const std::function<String(const RefCatalog &)> & encode)
+    const std::function<String(const RefCatalog &)> & encode,
+    const Retry & policy = Retry::standard())
 {
     const String key = layout.refCatalogKey();
     /// The candidate the LAST `decide` produced, which is the one the engine wrote: every earlier one
@@ -174,7 +174,7 @@ RefCatalog casUpdateImpl(
         return bytes;
     };
 
-    WriteResult result = op.readModifyWrite(key, decide, Retry::standard());
+    WriteResult result = op.readModifyWrite(key, decide, policy);
     /// The fence can be lost in two places and both mean the same to a lifecycle caller: inside
     /// `decide`, which throws the marker itself, and between two attempts, where the engine notices it
     /// first and no further `decide` runs. Normalising the second onto the first is what keeps "the
@@ -261,7 +261,8 @@ std::function<void()> create_namespace_step1_pre_read_hook_for_test;
 /// canonical-order/no-duplicate grammar check abort the process with `LOGICAL_ERROR` for what is, at
 /// this call site only, an ordinary race outcome.
 RefCatalog createNamespaceStep1(
-    CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
+    CasOperation & op, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry,
+    const Retry & policy)
 {
     /// Moved into a local before invoking, not called on the global directly: a hook that reassigns
     /// `create_namespace_step1_pre_read_hook_for_test` from inside its own body (a test driving a
@@ -289,7 +290,8 @@ RefCatalog createNamespaceStep1(
         [&entry, gc_shards, &layout](const RefCatalog & c)
         {
             return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
-        });
+        },
+        policy);
 }
 
 }
@@ -447,9 +449,13 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
             .catalog_snapshot = std::move(catalog_snapshot)};
     };
 
-    /// ONE policy value for every erase this loop sends. Each call binds its own window when it is
-    /// made; what is shared is the policy, not a deadline.
-    const Retry policy = Retry::standard();
+    /// ONE bound for the whole loop, frozen before the first iteration: every erase and every
+    /// resolution read below shares this deadline, so a permanently contended catalog gives up
+    /// retry-later within one standard window rather than spending a fresh window per verb per
+    /// iteration. The paced retry at the end of the loop is a bare sleep that does not consult the
+    /// deadline, so the loop can sleep one backoff (at most 5 s) past it before the next erase refuses
+    /// to start.
+    const Retry policy = op.freeze(Retry::standard());
 
     for (size_t attempt = 0; attempt < kMaxCatalogCasAttempts; ++attempt)
     {
@@ -484,7 +490,7 @@ CasRefCatalog::CompletedRemovingDeleteResult CasRefCatalog::deleteCompletedRemov
         /// The response to a conditional erase is not authority for what became durable. Resolve every
         /// attempted erase through one complete catalog read. This snapshot is also the next
         /// retry/selection cut, so no second read separates them.
-        catalog_snapshot = read(op, layout);
+        catalog_snapshot = read(op, layout, policy);
 
         const auto current_it = findEntry(catalog_snapshot.catalog, observed.ns);
         const bool old_life_still_cataloged = current_it != catalog_snapshot.catalog.entries.end()
@@ -557,7 +563,7 @@ CasRefCatalog::StalledCreatingCancelOutcome CasRefCatalog::cancelStalledCreating
 }
 
 CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
-    CasOperation & op, const Layout & layout, const CatalogEntry & observed)
+    CasOperation & op, const Layout & layout, const CatalogEntry & observed, const Retry & policy)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -573,7 +579,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
                                 .committed_through = std::nullopt,
                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     if (publishCkpt(op, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
-                     contribution) == CkptPublishOutcome::FencedOut)
+                     contribution, policy) == CkptPublishOutcome::FencedOut)
         return NamespaceCreationOutcome::FencedOut;
 
     /// Step 3. `mutate` is the fence re-check point `casUpdate`'s header doc names -- checked FIRST,
@@ -600,7 +606,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
     try
     {
         casUpdateImpl(op, layout, identityPreserving(mutate),
-                      [](const RefCatalog & c) { return encodeRefCatalog(c); });
+                      [](const RefCatalog & c) { return encodeRefCatalog(c); }, policy);
     }
     catch (const CatalogFenceMovedMarker &) { return NamespaceCreationOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return NamespaceCreationOutcome::Superseded; }
@@ -609,7 +615,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
 
 CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     CasOperation & op, const Layout & layout, uint64_t gc_shards,
-    const RootNamespace & ns, const CreatorFence & creator)
+    const RootNamespace & ns, const CreatorFence & creator, const Retry & policy)
 {
     /// Read-first, per the Task 2 review's own note on `casAdmitEntry`: a namespace that already
     /// carries an entry is THIS function's job to reject with a clear message, not `casAdmitEntry`'s
@@ -617,7 +623,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     /// -- true, but useless to a caller trying to understand why its create failed). A concurrent
     /// insert of the SAME namespace between this read and step 1 is still caught -- `casAdmitEntry`'s
     /// own grammar check is the backstop, not the only check.
-    const Snapshot snap = read(op, layout);
+    const Snapshot snap = read(op, layout, policy);
     const auto existing = findEntry(snap.catalog, ns);
     if (existing != snap.catalog.entries.end())
     {
@@ -652,13 +658,13 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     /// above) and reports the race as `Superseded` instead.
     try
     {
-        createNamespaceStep1(op, layout, gc_shards, entry);   /// step 1
+        createNamespaceStep1(op, layout, gc_shards, entry, policy);   /// step 1
     }
     catch (const CatalogEntryAlreadyPresentMarker &)
     {
         return NamespaceCreationOutcome::Superseded;
     }
-    return completeCreation(op, layout, entry);
+    return completeCreation(op, layout, entry, policy);
 }
 
 void CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest(std::function<void()> hook)
@@ -668,7 +674,7 @@ void CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest(std::function<void
 
 CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(
     CasOperation & op, const Layout & layout, const CatalogEntry & observed, const CreatorFence & new_creator,
-    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal)
+    const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal, const Retry & policy)
 {
     if (observed.state != NsState::Creating || !observed.creator)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -701,7 +707,7 @@ CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(
     try
     {
         casUpdateImpl(op, layout, identityPreserving(mutate),
-                      [](const RefCatalog & c) { return encodeRefCatalog(c); });
+                      [](const RefCatalog & c) { return encodeRefCatalog(c); }, policy);
     }
     catch (const CatalogFenceMovedMarker &) { return ReconcileCreatorOutcome::FencedOut; }
     catch (const CatalogEntryMismatchMarker &) { return ReconcileCreatorOutcome::EntryChanged; }

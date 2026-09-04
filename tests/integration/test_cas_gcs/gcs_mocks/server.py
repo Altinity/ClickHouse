@@ -38,6 +38,12 @@ Control surface, reserved under the bucket name ``_control``:
   - ``POST /_control/mode?if_match=reject|ignore&omit_generation=0|1`` — select the adversarial
     behaviours below. Global, not per bucket: the client reuses connections across buckets and a
     per-bucket switch would invite a test to believe it had isolated something it had not.
+  - ``POST /_control/first_per_key_throttle?enabled=0|1`` — while enabled, the FIRST request naming
+    any given ``(bucket, key)`` -- of any method, ``_control/*`` excluded -- answers ``429 SlowDown``
+    and touches nothing; every later request to that same key is served normally. Models a real
+    store's transient per-object throttling: the caller must resolve the refusal by reissuing, never
+    by treating it as a definite failure. ``enabled=0`` clears the seen-key set along with the flag, so
+    a later ``enabled=1`` throttles every key again from scratch.
 
 Adversarial behaviours, each off by default:
 
@@ -136,6 +142,11 @@ class Store:
         # a modelled rate cap — see the module docstring's `/_control/delay` bullet.
         self.delay_substr = ""
         self.delay_ms = 0
+        # `/_control/first_per_key_throttle`: while enabled, every key in `throttled_keys_seen` has
+        # already been refused once and is now served normally; a key not yet in the set gets added
+        # and refused with 429 instead of being dispatched.
+        self.first_per_key_throttle = False
+        self.throttled_keys_seen = set()
         self._next_generation = _GENERATION_SEED
         self._next_etag_ordinal = 1
         self._next_upload_ordinal = 1
@@ -209,6 +220,14 @@ def _unsupported(what):
 def _bad_request(message):
     return Reply(
         400, _error_xml("InvalidArgument", message), {"Content-Type": "application/xml"}
+    )
+
+
+def _slow_down(key):
+    return Reply(
+        429,
+        _error_xml("SlowDown", "throttled by /_control/first_per_key_throttle: " + key),
+        {"Content-Type": "application/xml"},
     )
 
 
@@ -817,11 +836,21 @@ def handle_control(path, method, query):
             json.dumps({"substr": STORE.delay_substr, "ms": STORE.delay_ms}).encode(),
             {"Content-Type": "application/json"},
         )
+    if path == "/_control/first_per_key_throttle" and method == "POST":
+        STORE.first_per_key_throttle = query.get("enabled", ["0"])[0] == "1"
+        STORE.throttled_keys_seen = set()
+        return Reply(
+            200,
+            json.dumps({"enabled": STORE.first_per_key_throttle}).encode(),
+            {"Content-Type": "application/json"},
+        )
     if path == "/_control/reset" and method == "POST":
         STORE.requests = []
         STORE.counters = {}
         STORE.delay_substr = ""
         STORE.delay_ms = 0
+        STORE.first_per_key_throttle = False
+        STORE.throttled_keys_seen = set()
         return Reply(200, b"OK")
     return Reply(404, _error_xml("NoSuchControl", "unknown control path " + path))
 
@@ -881,49 +910,71 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # sleep above actually ran.
             if delayed:
                 STORE.count("DelayedPut")
-            request_class = _request_class(bucket, key)
-            operation = _request_operation(bucket, request_class, method, query, headers)
-            if method == "PUT":
-                if "partNumber" in query:
-                    STORE.count("UploadPart")
-                reply = handle_put(bucket, key, query, headers, body)
-            elif method == "DELETE":
-                reply = handle_delete(bucket, key, query, headers)
-            elif method == "POST":
-                if "delete" in query:
-                    STORE.count("DeleteObjects")
-                    reply = handle_batch_delete(bucket, body)
+            throttled = STORE.first_per_key_throttle and (bucket, key) not in STORE.throttled_keys_seen
+            if throttled:
+                STORE.throttled_keys_seen.add((bucket, key))
+                STORE.count("FirstPerKeyThrottled")
+                reply = _slow_down(key)
+                STORE.requests.append(
+                    {
+                        "seq": len(STORE.requests),
+                        "method": method,
+                        "bucket": bucket,
+                        "key": key,
+                        "query": parsed.query,
+                        "headers": headers,
+                        "request_class": _request_class(bucket, key),
+                        "operation": "first_per_key_throttled",
+                        "request_body": "",
+                        "status": reply.status,
+                        "response_generation": None,
+                        "response_etag": None,
+                    }
+                )
+            if not throttled:
+                request_class = _request_class(bucket, key)
+                operation = _request_operation(bucket, request_class, method, query, headers)
+                if method == "PUT":
+                    if "partNumber" in query:
+                        STORE.count("UploadPart")
+                    reply = handle_put(bucket, key, query, headers, body)
+                elif method == "DELETE":
+                    reply = handle_delete(bucket, key, query, headers)
+                elif method == "POST":
+                    if "delete" in query:
+                        STORE.count("DeleteObjects")
+                        reply = handle_batch_delete(bucket, body)
+                    else:
+                        if "uploads" in query:
+                            STORE.count("CreateMultipartUpload")
+                        if "uploadId" in query:
+                            STORE.count("CompleteMultipartUpload")
+                        reply = handle_post(bucket, key, query, headers, body)
+                elif method in ("GET", "HEAD"):
+                    reply = handle_get_or_head(bucket, key, query, headers)
                 else:
-                    if "uploads" in query:
-                        STORE.count("CreateMultipartUpload")
-                    if "uploadId" in query:
-                        STORE.count("CompleteMultipartUpload")
-                    reply = handle_post(bucket, key, query, headers, body)
-            elif method in ("GET", "HEAD"):
-                reply = handle_get_or_head(bucket, key, query, headers)
-            else:
-                reply = _unsupported(method)
+                    reply = _unsupported(method)
 
-            STORE.requests.append(
-                {
-                    "seq": len(STORE.requests),
-                    "method": method,
-                    "bucket": bucket,
-                    "key": key,
-                    "query": parsed.query,
-                    "headers": headers,
-                    "request_class": request_class,
-                    "operation": operation,
-                    "request_body": (
-                        body.decode("utf-8", "replace")
-                        if request_class in ("blob_meta", "cas_control")
-                        else ""
-                    ),
-                    "status": reply.status,
-                    "response_generation": reply.headers.get("x-goog-generation"),
-                    "response_etag": reply.headers.get("ETag"),
-                }
-            )
+                STORE.requests.append(
+                    {
+                        "seq": len(STORE.requests),
+                        "method": method,
+                        "bucket": bucket,
+                        "key": key,
+                        "query": parsed.query,
+                        "headers": headers,
+                        "request_class": request_class,
+                        "operation": operation,
+                        "request_body": (
+                            body.decode("utf-8", "replace")
+                            if request_class in ("blob_meta", "cas_control")
+                            else ""
+                        ),
+                        "status": reply.status,
+                        "response_generation": reply.headers.get("x-goog-generation"),
+                        "response_etag": reply.headers.get("ETag"),
+                    }
+                )
 
         self._send(reply, want_body)
 

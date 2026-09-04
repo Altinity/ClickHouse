@@ -60,9 +60,21 @@ void fenceOutMount(Backend & backend, const String & mount_key)
     ASSERT_TRUE(std::holds_alternative<Committed>(put));
 }
 
-/// A Backend decorator whose reads, heads and lists throw an untyped transport error while `fail` is
-/// armed. Starts DISARMED so `Pool::open` succeeds; a test arms it only to make the identity probe
-/// inconclusive. Mirrors gtest_cas_sentinel_probe.cpp's `TransportFaultBackend`, but toggleable AFTER open.
+/// A Backend decorator whose reads, heads and lists throw a transport-classified error while `fail` is
+/// armed, counting every attempt so a test can prove the probe path was actually reached (and stopped
+/// where it should) rather than some other short-circuit. Starts DISARMED so `Pool::open` succeeds; a
+/// test arms it only to make the identity probe inconclusive. Mirrors
+/// gtest_cas_sentinel_probe.cpp's `TransportFaultBackend`, but toggleable AFTER open.
+///
+/// The fault is `Poco::TimeoutException`: `Backend::probeSentinelRaw`'s default implementation (the one
+/// `InMemoryBackend` uses) calls `head`/`read` directly and folds ANY exception from either into
+/// `Indeterminate` with its own `catch (...)` -- so the exception never reaches `CasOperation`'s
+/// transport-vs-local classification at all here. A `Poco::TimeoutException` is still the right class to
+/// inject: it is what a real backend's probe would actually throw, and the point of the counters below
+/// is to prove `head` was reached and actually failed, not skipped by some other short-circuit.
+/// `tryRemountOnce` retries its own whole chain internally (well past the single probe attempt), so
+/// the exact count per call is not pinned here -- only that a call growing it proves the fault path
+/// stayed live across it, rather than a stale verdict being served from a cache.
 class ToggleableTransportFaultBackend final : public InMemoryBackend
 {
 public:
@@ -70,32 +82,34 @@ public:
     using Backend::head;
     using Backend::list;
 
-    /// The faults sit on the TRANSPORT PRIMITIVES, because that is where every caller reaches the store:
-    /// the lifecycle gate probes `_pool_meta` through `probeSentinelRaw`, which speaks only these. A
-    /// legacy caller still reaches the fault, through the forwarder, so arming it here covers both
-    /// surfaces rather than only one.
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
+        ++head_attempts;
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::head(key, access);
     }
 
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
+        ++read_attempts;
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::read(key, access);
     }
 
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
     {
+        ++list_attempts;
         if (fail.load())
-            throw std::runtime_error("injected fault: transport error");
+            throw Poco::TimeoutException("injected fault: transport error");
         return InMemoryBackend::list(prefix, cursor, limit, access);
     }
 
     std::atomic<bool> fail{false};
+    std::atomic<uint64_t> head_attempts{0};
+    std::atomic<uint64_t> read_attempts{0};
+    std::atomic<uint64_t> list_attempts{0};
 };
 
 }
@@ -255,10 +269,18 @@ TEST(CASLifecycleCondition, ProbeTransportErrorStaysTransientAndRetries)
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::TransientNotLive);
     EXPECT_FALSE(store->isVanished());
     EXPECT_NO_THROW(store->throwIfLifecycleTerminal());
+    /// The `_pool_meta` probe was actually reached and actually failed at `head` -- proving the
+    /// TransientNotLive verdict above came from the probe's own `Indeterminate` classification, not
+    /// from some other short-circuit that never touched the fault at all.
+    const uint64_t first_head_attempts = backend->head_attempts.load();
+    EXPECT_GT(first_head_attempts, 0u);
 
-    /// A second attempt with the fault still armed remains transient (retries continue).
+    /// A second attempt with the fault still armed remains transient (retries continue) and probes
+    /// again -- proving each `tryRemountOnce` re-probes rather than caching the first call's
+    /// inconclusive verdict.
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::TransientNotLive);
+    EXPECT_GT(backend->head_attempts.load(), first_head_attempts);
 
     /// Disarm before teardown so `~Pool()`'s clean-farewell write is not fighting the injected fault.
     backend->fail.store(false);

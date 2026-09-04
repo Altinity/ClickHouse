@@ -219,6 +219,14 @@ public:
     /// than a request.
     bool admitted() const { return gate(0) == Gate::Ok; }
 
+    /// `policy` with its window turned into an absolute deadline on this operation's clock, taken NOW.
+    /// A hand-written loop freezes its policy once before it starts and passes the frozen value to
+    /// every call it makes, so the loop ends when the window it was given ends -- rather than granting
+    /// each verb of each iteration a fresh one, which is how a bounded document promise became hours
+    /// of paced retrying. A policy that already carries a deadline is returned unchanged, so freezing
+    /// twice cannot extend it.
+    Retry freeze(const Retry & policy) const;
+
     std::optional<Object> read(const String & key, const Retry & policy);
     std::optional<Meta>   head(const String & key, const Retry & policy);
     ListPage               list(const String & prefix, const String & cursor, size_t limit, const Retry & policy);

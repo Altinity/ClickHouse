@@ -908,9 +908,10 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// content key stays the pool's hash of `payload` and `blob_size` stays the payload size.
             std::string envelope_header = buildS3StagingBlobHeader(*r);
             /// The staged upload becomes durable in `sink->finalize()`, outside this request contract by
-            /// design, so its admission is re-checked there through the callback below. The generation
-            /// comes off the operation that admitted it, so the two can never name different
-            /// incarnations.
+            /// design, so its admission is re-checked there through the callback below, against the
+            /// generation captured HERE. `admit().generation()` reads a plain value off a temporary
+            /// `CasOperation` that does not outlive this statement -- it names the fence generation at
+            /// THIS instant, not a live operation the two calls share.
             const Cas::PoolPtr pool = metadata_storage.store();
             const uint64_t admitted_generation = pool->mountRequests().admit().generation();
             return std::make_unique<Cas::CaContentWriteBuffer>(

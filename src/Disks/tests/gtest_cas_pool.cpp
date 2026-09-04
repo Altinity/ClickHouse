@@ -1879,8 +1879,8 @@ CasRequestBudget runtimeRenewBudget();
 class RuntimeUnderTest
 {
 public:
-    template <typename... Args>
-    RuntimeUnderTest(DB::Cas::BackendPtr backend, Args &&... args)
+    template <typename BackendT, typename... Args>
+    RuntimeUnderTest(const std::shared_ptr<BackendT> & backend, Args &&... args)
         : mount(backend, DB::Cas::Fence{
               [this] { return runtime.fenceGeneration(); },
               [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
@@ -1888,6 +1888,10 @@ public:
         , farewell(backend, DB::Cas::Fence::open())
         , runtime(backend, mount, farewell, std::forward<Args>(args)...)
     {
+        /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
+        /// budget field alone; every construction of this holder pairs the two via `runtimeRenewBudget`,
+        /// the sole budget it is ever built with in this file.
+        backend->setAttemptTimeoutMs(runtimeRenewBudget().attempt_timeout_ms);
         /// The runtime arms its lease deadline on ITS boot clock, and the engine measures that deadline
         /// against the clock it reads. Production runs both on `CLOCK_BOOTTIME`, so they agree; a test
         /// that injects one MUST inject the other, or `Retry::untilLeaseSafe` compares a synthetic
@@ -2223,6 +2227,9 @@ TEST(CASPoolShutdown, UnresolvedWedgeSkipsFarewell)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     uint64_t fake_boot = 1'000'000;
     auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{
         .pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget,
@@ -2524,6 +2531,9 @@ TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     uint64_t fake_boot = 1'000'000;
     std::vector<uint64_t> waits;
     auto store = Pool::open(backend, PoolConfig{
@@ -2590,6 +2600,9 @@ TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     uint64_t fake_boot = 1'000'000;
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",

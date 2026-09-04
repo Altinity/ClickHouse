@@ -18,6 +18,7 @@
 
 #include <Poco/Exception.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <expected>
@@ -104,7 +105,7 @@ RefCkpt readCkptOrFail(CasOperation & op, const Layout & layout, const Namespace
     return sample->ckpt;
 }
 
-/// Stage B (Task 4-C): the incarnation `store`'s production birth wiring minted for `ns`, learned back
+/// Stage B: the incarnation `store`'s production birth wiring minted for `ns`, learned back
 /// from the catalog exactly as a real reader would (`NamespaceLifeId::fromCatalogEntry`) -- once a real
 /// `Pool`/`CasRefLedger` has opened the table, its ref-layer objects are no longer keyed at the
 /// Stage-A sentinel, so every test below that drives the REAL append lane must ask the catalog what
@@ -189,6 +190,9 @@ public:
     std::function<void()> after_write;
     std::function<void()> after_read;
     std::vector<String> journal;
+    /// How many reads `fail_reads_after_the_first` actually made throw, so a test can assert the fault
+    /// really fired rather than infer it from the journal's shape alone.
+    size_t read_fault_hits = 0;
 
     /// A test that must watch a namespace's `_ckpt` key cannot compute it before the pool exists --
     /// the real incarnation is minted only once the namespace's first open resolves it. So the watch
@@ -198,6 +202,7 @@ public:
         watched_key = std::move(key);
         watched_reads = 0;
         journal.clear();
+        read_fault_hits = 0;
     }
 
     void arm(const String & key, Fault fault_)
@@ -214,7 +219,10 @@ public:
         journal.push_back("READ");
         ++watched_reads;
         if (watched_reads >= 2 && fail_reads_after_the_first)
+        {
+            ++read_fault_hits;
             throw Poco::TimeoutException("CkptProbeBackend: read response lost");
+        }
         auto result = WriteCountingBackend::read(key, access);
         if (after_read)
             after_read();
@@ -876,10 +884,23 @@ TEST(CASRefCheckpoint, AFailedResolveReadNeverReportsACommitAndNeverSkipsTheRead
         publishCkpt(op, layout, life, RefCkpt{.life_epoch = std::nullopt, .committed_through = ID_1_2,
                     .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
     });
-    for (size_t i = 1; i < backend->journal.size(); ++i)
-        EXPECT_FALSE(backend->journal[i] == "WRITE" && backend->journal[i - 1] == "WRITE")
-            << "two attempts with no exact observation between them, at journal position " << i;
-    EXPECT_GE(std::count(backend->journal.begin(), backend->journal.end(), String{"WRITE"}), 1);
+    /// `{READ, WRITE}` alone would satisfy "no adjacent writes" and "at least one write" without the
+    /// resolving read ever having been attempted, let alone failed. Pin that at least one read follows
+    /// the write, that the fault double actually fired on every one of them (a resolving read is itself
+    /// retried against the policy deadline, so several follow, not just one), and that no reissue was
+    /// sent while every resolution read fails.
+    ASSERT_GE(backend->journal.size(), 3u);
+    EXPECT_EQ(backend->journal.front(), "READ") << "the baseline read of the current state";
+    EXPECT_EQ(backend->journal[1], "WRITE") << "the attempt that never committed";
+    const size_t resolve_reads = backend->journal.size() - 2;
+    EXPECT_TRUE(std::all_of(backend->journal.begin() + 2, backend->journal.end(),
+                            [](const String & verb) { return verb == "READ"; }))
+        << "no reissue can be sent while every resolution read fails, so nothing after the write is a WRITE";
+    EXPECT_EQ(backend->read_fault_hits, resolve_reads)
+        << "every read after the baseline failed -- the fault double actually fired on all of them, not just "
+        << "the first";
+    EXPECT_EQ(std::count(backend->journal.begin(), backend->journal.end(), String{"WRITE"}), 1)
+        << "no reissue can be sent while every resolution read fails";
     backend->watched_key.clear();
     backend->fail_reads_after_the_first = false;
     EXPECT_EQ(readCkptOrFail(reader, layout, life), base);
@@ -1075,7 +1096,7 @@ TEST(CASRefCheckpoint, NamespaceBirthCreatesTheCheckpointCarryingItsLifeEpoch)
     CasOperation op = requests.admit();
     const RootNamespace ns{"srv1/ckpt_birth"};
 
-    /// Stage B (Task 4-C): the catalog carries no entry for `ns` before its first open, and the
+    /// Stage B: the catalog carries no entry for `ns` before its first open, and the
     /// namespace's real incarnation does not exist to name a key with yet -- the pre-birth analog of
     /// "nothing exists" is "nothing is even NAMED", checked at the catalog rather than at a key this
     /// test cannot yet compute.
@@ -1317,7 +1338,7 @@ TEST(CASRefCheckpoint, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
 }
 
 /// ===================================================================================
-/// Equivalence fences for the `prepareRefChunk` extraction (Stage B `{#extract-prepare-ref-chunk}`)
+/// Equivalence fences for the `prepareRefChunk` extraction
 /// ===================================================================================
 ///
 /// An extraction is only safe to review if something pins what crosses its boundary. These three
@@ -1342,9 +1363,9 @@ TEST(CASRefCheckpoint, CommitRefChunkDurableBytesUnchangedByExtraction)
     ASSERT_EQ(id.writer_epoch, 1u);
     ASSERT_EQ(id.ref_sequence, 1u);
 
-    /// The KEY carries the namespace incarnation, so its life segment is rendered rather than pasted
-    /// (Task 1c re-keys it); every other segment is literal. Stage B (Task 4-C): the incarnation is now
-    /// a REAL, randomly minted catalog value rather than the Stage-A sentinel, so it is learned back
+    /// The KEY carries the namespace incarnation, so its life segment is rendered rather than pasted;
+    /// every other segment is literal. Stage B: the incarnation is now a REAL, randomly minted catalog
+    /// value rather than the Stage-A sentinel, so it is learned back
     /// from the catalog (`liveLifeOrFail`) rather than pasted as a literal -- the shape assertion below
     /// is unaffected, since it names every OTHER segment literally and renders this one dynamically.
     const NamespaceLifeId life = liveLifeOrFail(op, store->layout(), ns);
@@ -1398,7 +1419,7 @@ TEST(CASRefCheckpoint, AppendRequestCountUnchangedByExtraction)
     const String ckpt_key = store->layout().refCkptKey(life);
 
     EXPECT_EQ(backend->writes(log_key), 1u) << "exactly one write-once request per committed chunk";
-    /// ONE GET, not zero, since Stage B (Task 4-C): `resolveNamespaceLife`'s `completeCreation` call
+    /// ONE GET, not zero, since Stage B: `resolveNamespaceLife`'s `completeCreation` call
     /// publishes this life's `_ckpt.life_epoch` BEFORE the birth chunk is prepared, so this table's
     /// OWN recovery walk (also inside this `appendRefOps`, ahead of the commit) grounds itself at the
     /// genesis position `_ckpt` now names and confirms it absent by exact key -- which is `log_key`

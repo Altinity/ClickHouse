@@ -14,6 +14,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
+#include "config.h"
+
+namespace DB::ErrorCodes
+{
+extern const int ABORTED;
+}
 
 namespace ProfileEvents
 {
@@ -1385,3 +1391,78 @@ TEST(CASGCCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
     EXPECT_TRUE(e->marker_confirmed) << "a delete_pending row confirmed via loadMeta still carries the bit";
     EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
 }
+
+#if USE_AWS_S3
+/// The outcomes-log `create` meets the same shape as the round commit: a refused precondition whose
+/// resolve read was itself refused. Nothing observed the key, so the round may not report that the log
+/// vanished -- an absent key and an unreadable one are different answers.
+///
+/// The S3 gate is the fault's, not the site's: the definitive-refusal classification that makes a
+/// resolve read settle nothing rather than be reissued exists only for S3 errors.
+TEST(CASGCRetire, OutcomeLogUnobservedConflictDoesNotReportItVanished)
+{
+    class UnobservedOutcomesBackend : public InMemoryBackend
+    {
+    public:
+        std::expected<String, RawConflict> write(
+            const String & key, const String & bytes, const std::optional<String> & expected_value,
+            TransportAccess & access) override
+        {
+            if (arm && !expected_value && key.find("/outcomes/") != String::npos)
+            {
+                arm = false;
+                refused_key = key;
+                return std::unexpected(RawConflict{});
+            }
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        }
+
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
+        {
+            if (!refused_key.empty() && key == refused_key)
+            {
+                refused_key.clear();
+                throw DB::S3Exception("UnobservedOutcomesBackend: the settling read is definitively refused",
+                                      Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+            }
+            return InMemoryBackend::read(key, access);
+        }
+
+        bool arm = false;
+        String refused_key;
+    };
+
+    auto backend = std::make_shared<UnobservedOutcomesBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+
+    /// The condemn -> graduate -> delete pipeline needs several rounds before any round has an outcome
+    /// to log; the arm fires on the first one that does.
+    backend->arm = true;
+    bool refusal_reached = false;
+    for (int i = 0; i < 8 && !refusal_reached; ++i)
+    {
+        try
+        {
+            runRegularRoundReclaiming(gc);
+            store->renewWatermarkOnce();
+        }
+        catch (const DB::Exception & e)
+        {
+            refusal_reached = true;
+            EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+            EXPECT_NE(e.message().find("resolve read observed nothing"), String::npos) << e.message();
+            EXPECT_EQ(e.message().find("vanished"), String::npos)
+                << "nothing observed the key, so it may not be called vanished: " << e.message();
+        }
+    }
+    EXPECT_TRUE(refusal_reached) << "no round ever wrote an outcome log, so the arm was never reached";
+}
+#endif

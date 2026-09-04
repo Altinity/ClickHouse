@@ -47,18 +47,30 @@ void drainCompletedNamespaceRemovals(const std::shared_ptr<InMemoryBackend> & ba
 /// failure on one listed object must record a warning and let the rest of the sweep proceed, never
 /// abort the whole phase. Injects on the `remove` PRIMITIVE, not the legacy `deleteExact`, so it
 /// intercepts a caller on either surface.
+///
+/// The thrown fault is a `Poco::TimeoutException`, the class the request engine classifies as a
+/// transport failure and reissues (`Retry::standard()`); a `std::runtime_error` propagates immediately
+/// and never exercises the retry path this test's own name claims to drive. `latch` keeps it armed
+/// across every reissue of the SAME logical call, so the engine reaches its own retry deadline and
+/// gives up rather than recovering on a later attempt -- a one-shot throw would be outlived by the
+/// reissue and the delete would simply succeed.
 class FailingDeleteBackend : public InMemoryBackend
 {
 public:
     void failWithThrow(const String & key) { throw_key = key; }
     void failWithTokenMismatch(const String & key) { mismatch_key = key; }
+    void latch() { latched = true; }
     /// Clears every injected failure -- the resume half of a fail-then-retry test (Task 4).
-    void disarm() { throw_key.clear(); mismatch_key.clear(); }
+    void disarm() { throw_key.clear(); mismatch_key.clear(); latched = false; }
 
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
         if (key == throw_key)
-            throw std::runtime_error("injected transient delete failure for " + key);
+        {
+            if (!latched)
+                throw_key.clear();
+            throw Poco::TimeoutException("injected transient delete failure for " + key);
+        }
         if (key == mismatch_key)
             return RawRemoval::Mismatch;
         return InMemoryBackend::remove(key, expected_value, access);
@@ -67,6 +79,7 @@ public:
 private:
     String throw_key;
     String mismatch_key;
+    bool latched = false;
 };
 
 /// Replaces the durable catalog immediately after returning the first armed catalog read. This
@@ -907,10 +920,15 @@ TEST(CASDecommission, PerObjectFailureWarnsAndContinuesDrain)
         (*seed_op).create("p/roots/victim/clickhouse_access_check_abc", "x", Retry::once());
     }
     backend->failWithThrow("p/staging/victim/upload_throws.tmp");
+    backend->latch();
     backend->failWithTokenMismatch("p/roots/victim/clickhouse_access_check_abc");
 
+    /// The engine reissues an unresolved delete until its own retry window closes, measured on this
+    /// clock, so the latched fault reaches a genuine give-up with no real time passing.
+    DB::Cas::tests::FakeClock clock;
     const auto report = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim",
+        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
 
     EXPECT_EQ(report.staging_objects_removed, 1u)
         << "the OTHER staging object must still be deleted despite the injected failure on its sibling";
@@ -966,13 +984,18 @@ TEST(CASDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
         debris_key = victim->layout().manifestKey(debris_id);
     }
     backend->failWithThrow(debris_key);
+    backend->latch();
     {
         OperationForTest seed_op(*backend);
         (*seed_op).create("p/staging/victim/upload_ok.tmp", "x", Retry::once());
     }
 
+    /// The engine reissues an unresolved delete until its own retry window closes, measured on this
+    /// clock, so the latched fault reaches a genuine give-up with no real time passing.
+    DB::Cas::tests::FakeClock clock;
     const auto report = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim",
+        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
 
     EXPECT_EQ(report.namespaces_removed, 1u)
         << "victim/db/t1's namespace erasure (Task 2) is untouched by either injected failure";
@@ -1246,11 +1269,11 @@ public:
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
         if (armed && key.starts_with(fail_prefix))
-            /// A caller-bug-shaped exception (never `Poco::Exception`), so the engine surfaces it on
-            /// the first attempt instead of reissuing it for the whole policy window -- this fixture
-            /// models a single per-object failure the drain must warn on and move past, not a
-            /// transport fault the retry loop should absorb.
-            throw std::runtime_error("injected transient delete failure for " + key);
+            /// `Poco::TimeoutException`, the class the request engine classifies as a transport fault
+            /// and reissues (`Retry::standard()`): this fixture models a real backend transiently
+            /// failing, and `armed` stays set across every reissue of the same call, so the engine
+            /// reaches its own retry deadline and gives up rather than recovering on a later attempt.
+            throw Poco::TimeoutException("injected transient delete failure for " + key);
         return inner->remove(key, expected_value, access);
     }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
@@ -1283,8 +1306,13 @@ TEST(CASDecommission, FailedDrainKeepsSlotThenResumes)
     (*raw_op).create("p/roots/victim/loose_file", "x", Retry::once());
 
     auto failing = std::make_shared<FailDeletesUnderPrefixBackend>(inner, "p/roots/victim/");
+    /// The engine reissues an unresolved delete until its own retry window closes, measured on this
+    /// clock, so the fault (armed across every reissue) reaches a genuine give-up with no real time
+    /// passing.
+    DB::Cas::tests::FakeClock clock;
     const auto first = decommissionPoolMember(
-        failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
+        failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
+        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
     EXPECT_FALSE(first.warnings.empty());
     EXPECT_FALSE(first.slot_removed);
     EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
@@ -1320,9 +1348,14 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
         debris_key = victim->layout().manifestKey(debris_id);
     }
     backend->failWithThrow(debris_key);
+    backend->latch();
 
+    /// The engine reissues an unresolved delete until its own retry window closes, measured on this
+    /// clock, so the latched fault reaches a genuine give-up with no real time passing.
+    DB::Cas::tests::FakeClock clock;
     const auto first = decommissionPoolMember(
-        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
+        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
     EXPECT_FALSE(first.warnings.empty());
     EXPECT_FALSE(first.slot_removed);
     EXPECT_EQ(first.manifest_debris_removed, 0u);

@@ -160,24 +160,32 @@ private:
     std::vector<CasEvent> events;
 };
 
-PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
+template <typename BackendT>
+PoolPtr openPool(const std::shared_ptr<BackendT> & backend, CasRequestBudget budget = {})
 {
     /// Recovery tests seed ref-log/snapshot residue before opening; a pool with such residue always has a
     /// `_pool_meta` in production, so establish it first (Task 7's zero-write bootstrap check refuses to
     /// mint a fresh identity over residual data — see `seedPoolMetaForRestart`). Idempotent, and a no-op
     /// for the fresh-open tests that seed nothing (the subsequent open validates the just-created meta).
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 
 /// Task 11: like `openPool`, but the caller supplies (and owns) the rest of the config -- snapshot
 /// thresholds, grace age, a fake `boot_ms_fn`, etc. `pool_prefix`/`server_root_id` are pinned so every
 /// test in this file addresses the same pool shape.
-PoolPtr openPoolWithConfig(const BackendPtr & backend, PoolConfig config)
+template <typename BackendT>
+PoolPtr openPoolWithConfig(const std::shared_ptr<BackendT> & backend, PoolConfig config)
 {
     config.pool_prefix = "p";
     config.server_root_id = "test";
     DB::Cas::tests::seedPoolMetaForRestart(*backend);   /// see `openPool` above
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);
     return Pool::open(backend, std::move(config));
 }
 
@@ -3089,8 +3097,9 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
     auto store = openPoolWithConfig(backend, config);
     /// The boot clock above is frozen (it is what keeps the publish backoff armed), so the REQUEST
     /// engine needs its own advancing clock or a saturated publish never reaches its retry window and
-    /// reissues for ever.
-    VirtualRetryClock::installOn(store);
+    /// reissues for ever. Retained (not discarded) so the assertion below can tell that retry window
+    /// from a `once` policy that would give up on the very first attempt.
+    auto clock = VirtualRetryClock::installOn(store);
 
     /// Every `_snap` create is unresolved (backend saturated) and stays that way for the whole call, so
     /// the publish gives up at its own window -- which is one dispatch, which is what this test counts.
@@ -3099,6 +3108,11 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
 
     publishEmptyPart(store, ns, "a");   /// crosses the threshold -> one dispatch -> fails -> backoff armed
     store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the one dispatch above must itself have reissued more than once against the saturated "
+           "backend before giving up at its retry window -- a single attempt would not distinguish "
+           "this from a non-retrying policy";
+    EXPECT_GT(clock->longestPause(), 0u) << "at least one of those reissues must have paced with a real backoff";
 
     const auto dispatched_before = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
     for (int i = 0; i < 30; ++i)
@@ -3222,8 +3236,10 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.cas_request_budget = budget;
     auto store = openPoolWithConfig(backend, config);
-    /// As above: the frozen boot clock drives the backoff decisions, so the request engine gets its own.
-    VirtualRetryClock::installOn(store);
+    /// As above: the frozen boot clock drives the backoff decisions, so the request engine gets its
+    /// own. Retained (not discarded) so the assertion below can tell the retry window that arms the
+    /// backoff from a `once` policy that would give up on the very first attempt.
+    auto clock = VirtualRetryClock::installOn(store);
 
     /// Fail the FIRST dispatch's `_snap` create for the whole call, so it gives up at its own retry
     /// window and arms the backoff; the fault is cleared before the retry below.
@@ -3233,6 +3249,10 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     publishEmptyPart(store, ns, "a");   /// dispatch -> publish fails -> backoff armed
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+    EXPECT_GT(clock->pauseCount(), 1u)
+        << "the failing dispatch above must itself have reissued more than once before giving up and "
+           "arming the backoff -- a single attempt would not distinguish this from a non-retrying policy";
+    EXPECT_GT(clock->longestPause(), 0u) << "at least one of those reissues must have paced with a real backoff";
 
     /// A read within the backoff window (frozen clock) must not re-dispatch.
     const auto d1 = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();

@@ -15,8 +15,8 @@ namespace DB::Cas
 /// The `cas/ref_catalog` object (spec INV-3) as seen from the pool side: reading the current
 /// catalog, and the generic conditional-update primitive every lifecycle transition rides. This class
 /// builds ONLY that primitive -- the actual lifecycle steps (the three-conditional-write creation
-/// sequence, the removal terminal-record-then-entry-delete sequence) are later tasks' job, built ON
-/// TOP of `casUpdate`/`casAdmitEntry`.
+/// sequence, the removal terminal-record-then-entry-delete sequence) are built ON TOP of
+/// `casUpdate`/`casAdmitEntry`, further down in this same class.
 class CasRefCatalog
 {
 public:
@@ -32,7 +32,9 @@ public:
 
     /// Reads and decodes the mandatory current catalog. Absence is corruption, never an empty
     /// authority set: without the catalog, opaque life keys cannot prove ownership.
-    static Snapshot read(CasOperation & op, const Layout & layout);
+    /// `policy` lets a hand-written loop pass the bound it froze at entry, so its resolution reads end
+    /// with the rest of the loop instead of each starting a fresh window.
+    static Snapshot read(CasOperation & op, const Layout & layout, const Retry & policy = Retry::standard());
 
     /// Materializes the explicit empty catalog for a prefix already proven new by
     /// `probePoolBootstrapResidual`. This is the only absence-tolerant catalog operation: no
@@ -97,7 +99,7 @@ public:
     /// entry point that accepted a free-form candidate could be handed a REMOVAL by a future caller
     /// that reads as correct, silently reopening Constraint 13 (removal is never refused) behind a
     /// name that says "admitting". A namespace `entry.ns` already carries an entry is a bug in the
-    /// caller (Task 3's creation lifecycle owns checking that first) and surfaces as
+    /// caller (`createNamespace` below owns checking that first) and surfaces as
     /// `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
     /// `checkCatalogAdmission`.
     static RefCatalog casAdmitEntry(
@@ -184,7 +186,7 @@ public:
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
         const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
 
-    /// === Task 3: the §3 creation lifecycle, built on the two primitives above ===
+    /// === The creation lifecycle, built on the two primitives above ===
 
     /// Outcome of the two-step tail every creation attempt ends in (`_ckpt` publish + `Creating ->
     /// Live` CAS) -- shared by a fresh `createNamespace` and a reconciler that just adopted a stalled
@@ -232,10 +234,10 @@ public:
     /// nonzero incarnation (spec: "fresh_random_128"), runs step 1 (`casAdmitEntry` inserting `{ns,
     /// Creating, incarnation, creator}`), then steps 2+3 via `completeCreation` below.
     ///
-    /// Per the Task 2 review's own note on `casAdmitEntry` ("a namespace `entry.ns` already carries an
-    /// entry is a bug in the caller -- Task 3's creation lifecycle owns checking that first"): this
-    /// function reads the catalog FIRST rather than handing `casAdmitEntry` a doomed insert and letting
-    /// its own grammar check report a confusing duplicate-namespace message. A namespace already
+    /// This function reads the catalog FIRST rather than handing `casAdmitEntry` a doomed insert and
+    /// letting its own grammar check report a confusing duplicate-namespace message: a namespace
+    /// `entry.ns` already carries an entry is a bug in THIS caller, not in `casAdmitEntry`, which is
+    /// why it is checked here first. A namespace already
     /// `Creating` is not this function's problem to solve -- that is exactly what `reconcileStaleCreator`
     /// + `completeCreation` are for, so this reports `Superseded` (never `LOGICAL_ERROR`) and sends the
     /// caller back through its own resume loop: sibling openers of the same namespace that all observed
@@ -244,7 +246,8 @@ public:
     /// creation's) and still throws `LOGICAL_ERROR` naming the observed state.
     static NamespaceCreationOutcome createNamespace(
         CasOperation & op, const Layout & layout, uint64_t gc_shards,
-        const RootNamespace & ns, const CreatorFence & creator);
+        const RootNamespace & ns, const CreatorFence & creator,
+        const Retry & policy = Retry::standard());
 
     /// Fires once, synchronously, right after `createNamespace`'s own pre-check read observed no
     /// entry and right before its step 1 performs its own (first) catalog read -- the exact window a
@@ -278,11 +281,12 @@ public:
     /// `publishCkpt`); a caller that manages to make BOTH stale sees `FencedOut`, not `Superseded` --
     /// both are truthful refusals of a CAS that was never sent.
     static NamespaceCreationOutcome completeCreation(
-        CasOperation & op, const Layout & layout, const CatalogEntry & observed);
+        CasOperation & op, const Layout & layout, const CatalogEntry & observed,
+        const Retry & policy = Retry::standard());
 
     /// Stale-`Creating` reconciliation (spec INV-3: "stalled creators occupy entries until
-    /// fence-terminal reconciliation"; TLA Task 3 obligation 1: "the call-site is where
-    /// token-exactness is enforced"). `observed` must be a `Creating` entry this caller read a moment
+    /// fence-terminal reconciliation"; token-exactness is enforced right here, at this call site).
+    /// `observed` must be a `Creating` entry this caller read a moment
     /// ago (`LOGICAL_ERROR` otherwise -- a caller mistake, not a race). Refuses, WITHOUT writing
     /// anything, unless BOTH hold against a FRESH catalog read:
     ///   - `is_creator_fence_terminal(*observed.creator)` -- injected rather than reaching into
@@ -293,8 +297,8 @@ public:
     ///     `CreatorFence`, so the mount layer stays independent of the ref-catalog format), built from
     ///     `writer_epoch` plus the mount-terminality certificates
     ///     `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use -- NEVER from
-    ///     `CreatorFence::fence_generation`. That field IS persisted (Task 2 serializes it into the
-    ///     catalog entry), so it reaches the object store fine; what it is NOT is comparable across
+    ///     `CreatorFence::fence_generation`. That field IS persisted (the catalog entry's own encoding
+    ///     carries it), so it reaches the object store fine; what it is NOT is comparable across
     ///     actors: it mirrors `CasMountRuntime::fence_generation`, an in-process atomic that each mount
     ///     bumps from its OWN zero on every open, so a different actor's counter (or the SAME actor's
     ///     after a restart) starts over at the same values and answers a different question than "is
@@ -304,8 +308,8 @@ public:
     ///     invalidates this immediately).
     /// On success, CASes `creator` to `new_creator` -- `state` and `incarnation` are UNCHANGED, so the
     /// caller resumes with `completeCreation(op, layout, {..., .creator = new_creator})` over the SAME
-    /// incarnation, never a fresh one (rebirth under a fresh incarnation is Task 5/removal's business,
-    /// not a live reconciliation's).
+    /// incarnation, never a fresh one (rebirth under a fresh incarnation is removal's business, not a
+    /// live reconciliation's).
     ///
     /// `op.admitted()` is consulted FIRST on every fresh read this retries, exactly like
     /// `completeCreation`'s own placement -- a caller whose OWN mount fence has already moved must not
@@ -316,14 +320,16 @@ public:
     static ReconcileCreatorOutcome reconcileStaleCreator(
         CasOperation & op, const Layout & layout, const CatalogEntry & observed,
         const CreatorFence & new_creator,
-        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal);
+        const std::function<bool(const CreatorFence &)> & is_creator_fence_terminal,
+        const Retry & policy = Retry::standard());
 
     /// Spec §3: "`Creating` forbids publication -- no ref writes admitted while the entry is
     /// Creating." Throws `throwCasWriteRetryLater`'s class (transient: `Creating` resolves once the
     /// creator finishes or is reconciled away) if `catalog`'s entry for `ns` is `Creating`; a no-op for
     /// every other case -- no entry, `Live`, or `Removing` -- since this is ONLY the birth-lifecycle
     /// gate on the catalog's own `Creating` state, never a general existence/removal check (that role
-    /// moves onto the catalog in Task 4/Task 6). Takes an already-read `RefCatalog` rather than
+    /// belongs to the catalog-governed append path described just below). Takes an already-read
+    /// `RefCatalog` rather than
     /// `Backend`/`Layout`, so a caller that is about to append anyway (and so already holds a fresh
     /// read for its OWN purposes) pays no second GET here.
     ///

@@ -18,22 +18,22 @@ extern const int CORRUPTED_DATA;
 extern const int NETWORK_ERROR;
 }
 
-/// Stage B Task 4-C: production birth wiring. `CasRefLedger::resolveNamespaceLife`, called from
+/// Stage B: production birth wiring. `CasRefLedger::resolveNamespaceLife`, called from
 /// `ensureRefTableRecovered`, resolves a namespace's real catalog life ONCE per table-open --
 /// create-if-absent, adopt an existing `Live`/`Removing` entry, or reconcile a stale `Creating` one via
 /// `CasRefCatalog::reconcileStaleCreator` + `isCreatorFenceTerminal` -- so every ref-layer object a
 /// mounted writer produces is keyed at a real, catalog-proven incarnation (spec INV-3), never the
 /// Stage-A sentinel.
 ///
-/// OBLIGATION 3 (carried from Task 3's review, closed here): Task 3 could only enforce "`Creating`
-/// forbids publication" (`CasRefCatalog::checkPublicationAdmittedOrThrow`) AT THE CATALOG LEVEL, because
-/// nothing on the production ref-write path consulted the catalog at all. The refusal this suite pins
-/// below rests on CONSTRUCTION, not a check: there is no `if (state == Creating) throw` anywhere in
-/// `appendRefOps`'s path. `ensureRefTableRecovered` simply cannot make a table's runtime usable
-/// (`rt.recovered` never becomes `true`, `rt.life` never gets set) while the catalog entry is `Creating`
-/// under a fence that is not provably dead -- so no append can reach `commitRefChunk` for such a
-/// namespace, by construction, stronger than any per-write check could prove. Stated here so nobody
-/// later greps for a check and concludes the gap Task 3's review flagged is still open.
+/// OBLIGATION 3 (closed here): `CasRefCatalog::checkPublicationAdmittedOrThrow` can only enforce
+/// "`Creating` forbids publication" AT THE CATALOG LEVEL, because nothing on the production ref-write
+/// path consulted the catalog at all. The refusal this suite pins below rests on CONSTRUCTION, not a
+/// check: there is no `if (state == Creating) throw` anywhere in `appendRefOps`'s path.
+/// `ensureRefTableRecovered` simply cannot make a table's runtime usable (`rt.recovered` never becomes
+/// `true`, `rt.life` never gets set) while the catalog entry is `Creating` under a fence that is not
+/// provably dead -- so no append can reach `commitRefChunk` for such a namespace, by construction,
+/// stronger than any per-write check could prove. Stated here so nobody later greps for a check and
+/// concludes this gap is still open.
 ///
 /// The suite name is prefixed `Cas` so it is covered by the `Cas*` unit-test gate filter.
 
@@ -87,10 +87,14 @@ private:
 /// still be allowed to prove a new pool, and the failed first attempt must not have published
 /// `_pool_meta` without the catalog it makes mandatory.
 ///
-/// A plain `std::runtime_error`, not a `Poco::Exception`: the engine's write loop treats any
-/// `Poco`/transport exception as an ambiguity it settles itself with one resolve read, and a one-shot
-/// fault of that class is retried and silently succeeds within the SAME `Pool::open` call -- it never
-/// reaches the caller at all. A non-`Poco` `std::exception` is the engine's own signal for "this could
+/// A plain `std::runtime_error`, not a `Poco::Exception`, and deliberately so: a `Poco`/transport
+/// exception here would exercise the write loop's OWN ambiguity resolution rather than this suite's
+/// subject, which is what `FailedCatalogBootstrapDoesNotPublishPoolMetaAndRetryConverges` actually
+/// needs -- a fault that propagates out of the FIRST `Pool::open` call so a SEPARATE retry can be the
+/// one that converges. The engine's write loop treats any `Poco`/transport exception as an ambiguity it
+/// settles itself with one resolve read, and a one-shot fault of that class is retried and silently
+/// succeeds within the SAME `Pool::open` call -- it never reaches the caller at all. A non-`Poco`
+/// `std::exception` is the engine's own signal for "this could
 /// not have landed" and propagates unresolved, which is what "before it reaches durable storage" means.
 class CatalogBootstrapWriteFailsOnceBackend final : public WriteCountingBackend
 {
@@ -395,10 +399,10 @@ TEST(CASRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefu
     EXPECT_EQ(backend->writeTotal(), 0u);
 }
 
-/// The mirror image, and Task 3's own deferred obligation ("wire `reconcileStaleCreator` and pin it
-/// with a test that drives reconciliation through the discovery path rather than by calling the
-/// primitive directly"): a dead predecessor's `Creating` entry is reconciled onto THIS mount and
-/// completed to `Live`, over the SAME incarnation -- resumption, not rebirth.
+/// The mirror image, and the deferred obligation to wire `reconcileStaleCreator` and pin it with a
+/// test that drives reconciliation through the discovery path rather than by calling the primitive
+/// directly: a dead predecessor's `Creating` entry is reconciled onto THIS mount and completed to
+/// `Live`, over the SAME incarnation -- resumption, not rebirth.
 TEST(CASRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsReconciledThroughTheProductionPath)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -587,4 +591,86 @@ TEST(CASRefCatalogBirthWiring, ExactOldLifeCannotCancelReplacementTerminalCreati
     EXPECT_EQ(backend->writeTotal(), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{successor});
+}
+
+namespace
+{
+
+/// Leaves the catalog holding a body no previously observed entry equals: every read first bumps each
+/// entry's creator fence generation, so `reconcileStaleCreator`'s token-exactness check refuses on
+/// every attempt and `resolveNamespaceLife`'s state machine can never converge.
+class ChurningCatalogBackend final : public InMemoryBackend
+{
+public:
+    explicit ChurningCatalogBackend(String catalog_key_)
+        : catalog_key(std::move(catalog_key_))
+    {
+    }
+
+    bool churning = false;
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (churning && key == catalog_key)
+            bumpEveryCreatorFence(access);
+        return InMemoryBackend::read(key, access);
+    }
+
+private:
+    /// Qualified calls, never the virtual ones: this must not re-enter its own churn.
+    void bumpEveryCreatorFence(DB::Cas::TransportAccess & access)
+    {
+        const std::optional<Raw> got = InMemoryBackend::read(catalog_key, access);
+        if (!got)
+            return;
+        RefCatalog catalog = decodeRefCatalog(got->bytes);
+        for (CatalogEntry & entry : catalog.entries)
+            if (entry.creator)
+                ++entry.creator->fence_generation;
+        (void)InMemoryBackend::write(catalog_key, encodeRefCatalog(catalog), got->value, access);
+    }
+
+    const String catalog_key;
+};
+
+}
+
+/// A catalog entry that moves under every read drives `resolveNamespaceLife`'s state machine for ever.
+/// One `Retry` frozen before the loop bounds the WHOLE resolution to a single standard window, and
+/// every re-read a competing actor forces is paced by a jittered sleep -- so a permanently churning
+/// catalog costs one window, not one fresh window per verb per iteration hammered with no wait between
+/// them.
+///
+/// What the clock bound below does NOT check: it bounds this call's own wall time, not the number of
+/// requests the loop sent, and it says nothing about the paths that converge.
+TEST(CASRefCatalogBirthWiring, APerpetuallyChurningCatalogEntryIsPacedAndEndsWithinOneWindow)
+{
+    auto backend = std::make_shared<ChurningCatalogBackend>(Layout{"p"}.refCatalogKey());
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    auto store = openPoolForBirthTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"churning_creating"};
+
+    /// A FOREIGN creator, so the loop takes the reconciliation branch on every iteration.
+    const CatalogEntry creating{
+        .ns = ns,
+        .state = NsState::Creating,
+        .incarnation = UInt128{0xc001},
+        .creator = CreatorFence{.server_root_id = "foreign-creator", .writer_epoch = 7, .fence_generation = 1}};
+    CasRefCatalog::casAdmitEntry(op, layout, 1, creating);
+
+    auto clock = DB::Cas::tests::VirtualRetryClock::installOn(store);
+    backend->churning = true;
+    const size_t pauses_before = clock->pauseCount();
+    const uint64_t now_before = clock->nowMs();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->namespaceLife(ns); });
+
+    /// Sixteen jittered draws cannot exhaust a 90 s window even at their ceiling, so an unpaced loop
+    /// reaches its iteration cap having slept nothing at all.
+    EXPECT_GE(clock->pauseCount() - pauses_before, 16u) << "each forced re-read is paced";
+    /// The frozen window, plus at most one backoff draw the pace does not consult the deadline for,
+    /// plus the virtual clock's one extra millisecond per pause.
+    EXPECT_LE(clock->nowMs() - now_before, 95'100u) << "one standard window bounds the whole loop";
 }

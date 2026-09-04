@@ -148,12 +148,20 @@ bool isRefreshableCredentialError([[maybe_unused]] const std::exception & e)
 namespace
 {
 
-/// An answer from the store rather than a fault in reaching it: reissuing replays it unchanged.
-bool isDefiniteStoreRefusal([[maybe_unused]] const std::exception & e)
+/// The store's authoritative answer that there is nothing at the key -- a fact about the OBJECT, which
+/// reissuing only replays. Deliberately narrower than "not retryable": a missing bucket or an
+/// unmodeled name is an answer about reaching the store, which an S3-compatible store gives
+/// transiently when it misroutes a request, so it stays in the ambiguous class and is reissued until
+/// the deadline. The credential codes never reach here -- `refreshAndClassifyReadFault` consumes them
+/// first.
+bool isAuthoritativeAbsence([[maybe_unused]] const std::exception & e)
 {
 #if USE_AWS_S3
     if (const auto * s3 = dynamic_cast<const S3Exception *>(&e))
-        return !s3->isRetryableError();
+    {
+        const Aws::S3::S3Errors code = s3->getS3ErrorCode();
+        return code == Aws::S3::S3Errors::NO_SUCH_KEY || code == Aws::S3::S3Errors::NO_SUCH_UPLOAD;
+    }
 #endif
     return false;
 }
@@ -297,6 +305,15 @@ uint64_t CasOperation::reservedFor(uint64_t sleep_ms, uint32_t envelopes) const
     return total;
 }
 
+Retry CasOperation::freeze(const Retry & policy) const
+{
+    if (policy.policy_deadline_ms)
+        return policy;
+    Retry frozen = policy;
+    frozen.policy_deadline_ms = saturatingAdd(owner.now_ms(), policy.window_ms);
+    return frozen;
+}
+
 bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
 {
     /// Strict at the boundary. A backend with no attempt timeout reserves 0 and full jitter can draw a
@@ -328,10 +345,10 @@ bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & 
         refresh_attempted = true;
         return !owner.backend->refreshCredentials();
     }
-    /// The store's own answer decides. A definite refusal replays identically whether the store proved
-    /// the request never applied or merely named an error it will keep naming; everything else -- a
-    /// throttle, a 5xx, an unmodeled name an S3-compatible store reports -- may still be transient.
-    return isDefinitelyRefusedWrite(e) || isDefiniteStoreRefusal(e);
+    /// The store's own answer decides. A refusal it proved never applied, and an authoritative absence,
+    /// both replay identically; everything else -- a throttle, a 5xx, a missing bucket, an unmodeled
+    /// name an S3-compatible store reports -- may still be transient.
+    return isDefinitelyRefusedWrite(e) || isAuthoritativeAbsence(e);
 }
 
 void CasOperation::giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when)

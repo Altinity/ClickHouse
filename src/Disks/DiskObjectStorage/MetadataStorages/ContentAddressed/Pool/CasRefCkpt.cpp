@@ -193,7 +193,7 @@ std::optional<CkptSample> readCkpt(CasOperation & op, const Layout & layout, con
 }
 
 CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const NamespaceLifeId & life,
-                               const RefCkpt & contribution)
+                               const RefCkpt & contribution, const Retry & policy)
 {
     const String key = layout.refCkptKey(life);
 
@@ -256,7 +256,7 @@ CkptPublishOutcome publishCkpt(CasOperation & op, const Layout & layout, const N
         return encodeRefCkpt(merged);
     };
 
-    WriteResult result = op.readModifyWrite(key, decide, Retry::standard());
+    WriteResult result = op.readModifyWrite(key, decide, policy);
     if (std::holds_alternative<Committed>(result))
         return CkptPublishOutcome::Published;
     if (std::holds_alternative<Declined>(result))

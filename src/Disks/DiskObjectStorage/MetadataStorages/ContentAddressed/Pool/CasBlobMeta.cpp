@@ -12,19 +12,20 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
-std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, const BlobRef & ref)
+std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,
+                                   const Retry & policy)
 {
-    auto got = op.read(layout.blobMetaKey(ref), Retry::standard());
+    auto got = op.read(layout.blobMetaKey(ref), policy);
     if (!got)
         return std::nullopt;
     return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .etag = std::move(got->etag)};
 }
 
 WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const BlobRef & ref,
-                            const BlobMeta & meta)
+                            const BlobMeta & meta, const Retry & policy)
 {
     ProfileEvents::increment(ProfileEvents::CASMetaPut);
-    return op.create(layout.blobMetaKey(ref), encodeBlobMeta(meta), Retry::standard());
+    return op.create(layout.blobMetaKey(ref), encodeBlobMeta(meta), policy);
 }
 
 WriteResult casMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,

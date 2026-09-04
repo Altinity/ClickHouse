@@ -11,6 +11,7 @@
 #include <Core/UUID.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
+#include <IO/Expect404ResponseScope.h>
 #include <IO/ReadSettings.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
@@ -625,6 +626,10 @@ std::optional<Backend::Raw> ObjectStorageBackend::readUnder(
         /// incarnation, and it is the one place that can decide what a malformed one means.
         try
         {
+            /// An absent key is an ordinary answer here, exactly as for the HEAD helpers this GET
+            /// replaced: without the scope the HTTP client logs the 404 at Error, and a stateless
+            /// test whose stderr is checked fails on the log line alone.
+            Expect404ResponseScope scope;
             auto got = object_storage->readSmallObjectAndGetObjectMetadata(
                 StoredObject(key), readSettingsFor(profile, timeout_ms), casMaxStoredObjectBytes());
             return Raw{std::move(got.data), normalizeTokenValue(got.metadata.etag)};
@@ -677,6 +682,8 @@ std::unique_ptr<ReadBuffer> ObjectStorageBackend::stream(const String & key, Tra
     /// the request marked NativeConditional: a stream observes no incarnation to answer with.
     try
     {
+        /// Same reason as `readUnder`: a not-found is an ordinary answer, not an error to log.
+        Expect404ResponseScope scope;
         std::unique_ptr<ReadBufferFromFileBase> buf;
         if (mode == Mode::Native)
             buf = object_storage->readObject(StoredObject(key), getReadSettings(), /*read_hint=*/std::nullopt);
