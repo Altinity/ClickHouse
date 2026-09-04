@@ -1113,6 +1113,12 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     if (mount_runtime.isVanished())
         return;
 
+    /// This protocol deliberately does NOT arm the open plane. The GC join at (3+4) would be bounded
+    /// by it, but an already-latched self-remount completes its current step before the loop bails at
+    /// (5a), and that step's pool-identity probe is admitted on the open plane -- an arm here refuses
+    /// it, so the reclaim `finishTeardown` is written to override could never happen. Server shutdown
+    /// arms instead: it joins the same scheduler with no remount step to preserve.
+    ///
     /// (1) Publish the terminal-intent latch FIRST (spec §5). The runtime stops latching remounts and
     /// the remount loop bails at its next step boundary, so every join below is bounded to one step + one
     /// backend timeout.

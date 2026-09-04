@@ -57,6 +57,139 @@ PoolPtr openPlainPool(const std::shared_ptr<InMemoryBackend> & backend, PoolConf
     return Pool::open(backend, config);
 }
 
+/// A gate a test opens explicitly, so a thread can be held in flight without a sleep. Bounded, and it
+/// names what it waited on: an unbounded wait on a premise that stopped holding hangs the binary.
+struct Gate
+{
+    void wait(std::string_view name)
+    {
+        std::unique_lock lock(m);
+        if (!cv.wait_for(lock, std::chrono::seconds(60), [this] { return open_; }))
+            ADD_FAILURE() << "timed out waiting for '" << name << "'";
+    }
+    void open()
+    {
+        std::lock_guard lock(m);
+        open_ = true;
+        cv.notify_all();
+    }
+    std::mutex m;
+    std::condition_variable cv;
+    bool open_ = false;
+};
+
+/// Opens its gate on every exit from the scope, so a failing assertion cannot strand the thread
+/// parked behind it.
+struct GateOpenedOnExit
+{
+    explicit GateOpenedOnExit(Gate & gate_) : gate(gate_) {}
+    GateOpenedOnExit(const GateOpenedOnExit &) = delete;
+    GateOpenedOnExit & operator=(const GateOpenedOnExit &) = delete;
+    ~GateOpenedOnExit() { gate.open(); }
+    Gate & gate;
+};
+
+/// A real storage over a fresh local object storage, `context == nullptr`: no system log, no
+/// scheduler until the first GC entry point creates one.
+std::shared_ptr<DB::ContentAddressedMetadataStorage> openTestStorage()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto scratch = std::filesystem::temp_directory_path()
+        / ("cas_gc_teardown_stop_scratch_" + std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1)));
+    auto settings = DB::Cas::tests::makeSettingsForTest("test", scratch);
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    return storage;
+}
+
+/// Completes the first read of `key`, then withholds its return until released, so the round that
+/// issued it is parked with that request already accounted at the backend.
+class ParkFirstReadBackend : public CountingBackend
+{
+public:
+    void armParkFirstRead(String key_, std::shared_ptr<Gate> entered_, std::shared_ptr<Gate> release_)
+    {
+        key = std::move(key_);
+        entered = std::move(entered_);
+        release = std::move(release_);
+        armed.store(true);
+    }
+
+    std::optional<Raw> read(const String & read_key, TransportAccess & access) override
+    {
+        auto result = CountingBackend::read(read_key, access);
+        if (read_key == key && armed.exchange(false))
+        {
+            entered->open();
+            release->wait("release");
+        }
+        return result;
+    }
+
+    uint64_t requestsTotal() const { return getTotal() + headTotal() + listTotal() + writeTotal(); }
+
+private:
+    String key;
+    std::shared_ptr<Gate> entered;
+    std::shared_ptr<Gate> release;
+    std::atomic<bool> armed{false};
+};
+
+/// A thread-safe sink for the scheduler's rows, with a wait that never sleeps.
+class RoundLogSink
+{
+public:
+    GcRoundLogger logger()
+    {
+        return [this](const GcRoundLogRecord & r)
+        {
+            std::lock_guard lock(mutex);
+            records.push_back(r);
+            cv.notify_all();
+        };
+    }
+
+    std::vector<GcRoundLogRecord> all()
+    {
+        std::lock_guard lock(mutex);
+        return records;
+    }
+
+    /// The first Finish row at index >= `from`, waiting up to `timeout`; nullopt on timeout.
+    std::optional<GcRoundLogRecord> waitForFinish(size_t from, std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock(mutex);
+        const auto is_finish = [&]
+        {
+            for (size_t i = from; i < records.size(); ++i)
+                if (records[i].event_type == GcRoundLogRecord::EventType::Finish)
+                    return true;
+            return false;
+        };
+        if (!cv.wait_for(lock, timeout, is_finish))
+            return std::nullopt;
+        for (size_t i = from; i < records.size(); ++i)
+            if (records[i].event_type == GcRoundLogRecord::EventType::Finish)
+                return records[i];
+        return std::nullopt;
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<GcRoundLogRecord> records;
+};
+
+size_t countStarts(const std::vector<GcRoundLogRecord> & rows)
+{
+    size_t n = 0;
+    for (const auto & r : rows)
+        if (r.event_type == GcRoundLogRecord::EventType::Start)
+            ++n;
+    return n;
+}
+
 }
 
 /// The arm is idempotent, observable, and closes the door to new detached work; a drain after an
@@ -149,4 +282,173 @@ TEST(CASGCTeardownStop, ReadAheadWorkerIsRefusedAndTheTakeSiteSeesIt)
     reads.hintRead("p/k1");
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)reads.takeRead("p/k1"); });
     EXPECT_EQ(backend->getTotal(), 0u) << "the worker was refused before it reached the backend";
+}
+
+/// The defect itself: `shutdown` waits behind `gc_scheduler_mutex`, which a synchronous round holds
+/// for its whole duration. After the fix it arms the pool first, the parked round is refused at its
+/// next request, and `shutdown` returns. On the old code the arm never lands while the round is
+/// parked, which is the assertion that goes red.
+TEST(CASGCTeardownStop, ShutdownReturnsWhileASynchronousRoundIsParked)
+{
+    auto storage = openTestStorage();
+    auto pool = storage->poolForTest();
+    ASSERT_TRUE(pool);
+
+    auto parked = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    GateOpenedOnExit opener(*release);
+    std::mutex rows_mutex;
+    std::vector<GcRoundLogRecord> rows;
+    storage->setGcRoundRowHookForTest([&](const GcRoundLogRecord & r)
+    {
+        {
+            std::lock_guard lock(rows_mutex);
+            rows.push_back(r);
+        }
+        /// Park on the `lease` phase row: the round holds `gc_scheduler_mutex` and has more
+        /// requests ahead of it.
+        if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "lease")
+        {
+            parked->open();
+            release->wait("release");
+        }
+    });
+
+    auto round = std::async(std::launch::async, [&storage] { storage->runOneGcRoundForTest(); });
+    parked->wait("parked");
+
+    auto done = std::async(std::launch::async, [&storage] { storage->shutdown(); });
+
+    /// The state handshake: the arm must land while the round is still parked. Bounded, and its
+    /// expiry is the failure on the old code.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!pool->teardownBegun() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_TRUE(pool->teardownBegun()) << "shutdown waited for the round instead of arming the pool first";
+
+    release->open();
+    EXPECT_THROW(round.get(), DB::Exception) << "the released round must be refused at its next request";
+    EXPECT_EQ(done.wait_for(std::chrono::seconds(30)), std::future_status::ready);
+
+    std::optional<GcRoundLogRecord> finish;
+    {
+        std::lock_guard lock(rows_mutex);
+        for (const auto & r : rows)
+            if (r.event_type == GcRoundLogRecord::EventType::Finish)
+                finish = r;
+    }
+    ASSERT_TRUE(finish.has_value());
+    EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::Stopped);
+}
+
+/// A background round parked inside a request is refused at its NEXT request: nothing new reaches
+/// the backend after the arm, the Finish row is `Stopped`, and `stop` returns with nothing in flight.
+TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
+{
+    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto store = openPlainPool(backend);
+    RoundLogSink sink;
+    CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", sink.logger());
+
+    auto entered = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    GateOpenedOnExit opener(*release);
+    backend->armParkFirstRead(store->layout().gcStateKey(), entered, release);
+    sched.start();
+    entered->wait("entered");
+
+    store->beginTeardown();
+    const uint64_t requests_at_arm = backend->requestsTotal();
+    release->open();
+
+    const auto finish = sink.waitForFinish(/*from=*/0, std::chrono::seconds(30));
+    ASSERT_TRUE(finish.has_value()) << "the parked round never finished";
+    EXPECT_EQ(finish->outcome, GcRoundLogRecord::Outcome::Stopped);
+    sched.stop();
+    EXPECT_TRUE(sched.isQuiescent());
+    EXPECT_EQ(backend->requestsTotal(), requests_at_arm)
+        << "after the arm no request may reach the backend: the round unwinds at the next gate";
+    EXPECT_EQ(countStarts(sink.all()), 1u) << "no further round started after the arm";
+}
+
+/// The tick queued behind a manual round must not mint a Start row after the arm: it checks the
+/// flag once it holds the round mutex, before it logs anything.
+TEST(CASGCTeardownStop, AQueuedScheduledTickEmitsNoStartAfterTeardownBegan)
+{
+    auto backend = std::make_shared<ParkFirstReadBackend>();
+    auto store = openPlainPool(backend);
+    RoundLogSink sink;
+    /// An hour-long interval: the loop ticks only when asked.
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "test::gc", "ca", sink.logger());
+    sched.start();
+
+    auto entered = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    GateOpenedOnExit opener(*release);
+    backend->armParkFirstRead(store->layout().gcStateKey(), entered, release);
+    auto manual = std::async(std::launch::async,
+                             [&sched] { return sched.runOneRoundNow(GcRoundLogRecord::Trigger::Manual); });
+    entered->wait("entered");
+
+    /// The loop wakes and queues on the round mutex behind the parked manual round.
+    sched.requestRoundSoon();
+    store->beginTeardown();
+    release->open();
+
+    EXPECT_THROW((void)manual.get(), DB::Exception);
+    sched.stop();
+    const auto rows = sink.all();
+    EXPECT_EQ(countStarts(rows), 1u) << "the queued tick minted a Start row after teardown began";
+}
+
+namespace
+{
+
+/// Arms the pool's teardown the first time a chosen prefix is listed, so the stop lands inside the
+/// namespace janitor's page rather than in the round's own request chain.
+class ArmOnJanitorListBackend : public CountingBackend
+{
+public:
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        auto page = CountingBackend::list(prefix, cursor, limit, access);
+        if (!arm_prefix.empty() && prefix == arm_prefix && on_list)
+        {
+            on_list();
+            on_list = {};
+        }
+        return page;
+    }
+
+    String arm_prefix;
+    std::function<void()> on_list;
+};
+
+}
+
+/// A stop that lands inside advisory work the round swallows is not `Stopped`: the deferred path
+/// runs the namespace janitor's page and returns normally, and the janitor turns a refused request
+/// into an anomaly. The row is `Deferred`; the round did finish. Pinned so a later change to this
+/// behaviour is made on purpose.
+TEST(CASGCTeardownStop, AStopInsideTheJanitorPageIsSwallowedAsDeferred)
+{
+    auto backend = std::make_shared<ArmOnJanitorListBackend>();
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};
+    DB::Cas::tests::writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    DB::Cas::tests::writeManifestRaw(*backend, store->layout(), ns, r,
+                                     {DB::Cas::tests::blobEntryFor("a", DB::UInt128(1))});
+    DB::Cas::tests::publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, DB::UInt128(0xAB));
+    const RoundReport fold_rep = gc.runRegularRound();
+    ASSERT_FALSE(fold_rep.deferred) << "the first round folds";
+
+    backend->arm_prefix = store->layout().namespaceRootPrefix();
+    backend->on_list = [&store] { store->beginTeardown(); };
+    RoundReport rep;
+    EXPECT_NO_THROW(rep = gc.runRegularRound()) << "the janitor page swallows the refusal";
+    EXPECT_TRUE(store->teardownBegun()) << "sanity: the arm landed inside the round";
+    EXPECT_TRUE(rep.deferred) << "an idle second round defers; the stop inside its janitor page is advisory";
 }
