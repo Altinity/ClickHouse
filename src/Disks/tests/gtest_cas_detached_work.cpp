@@ -183,6 +183,10 @@ public:
               {},
               [](const RootNamespace &) {})
     {
+        /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
+        /// `oneAttemptBudget()` field alone; pair the two so the ledger's own admission arithmetic sees
+        /// what the budget claims.
+        backend->setAttemptTimeoutMs(oneAttemptBudget().attempt_timeout_ms);
         /// The engine's own retry pauses, on a clock the engine reads: one call reaches its retry
         /// deadline against a latched fault with no real time passing. `setCasRetrySleepForTest`
         /// installs the sleep on both `mount_requests` and the recovery retry loop.
@@ -286,6 +290,9 @@ PoolPtr openPublishingPool(const std::shared_ptr<DB::Cas::tests::OrderedFaultBac
     /// retry loop and no wall-clock wait -- the same budget the snapshot-ordering suite uses.
     config.cas_request_budget.attempt_timeout_ms = 100;
     config.cas_request_budget.lease_safety_margin_ms = 100;
+    /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
+    /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
+    backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);
     return Pool::open(backend, config);
 }
 
@@ -597,24 +604,59 @@ TEST(CASDetachedWork, FailedPublisherDispatchKeepsMutationAndClearsReservation)
 /// Settlement must survive a throwing error handler. Today it is a bare call after the handler, so a
 /// handler that throws skips it and strands the reservation for the life of the process.
 ///
-/// The publish is FAULTED deliberately: with a healthy backend it would succeed, the handler would
-/// never run, and this test would pass while exercising nothing.
+/// The dispatched attempt is made to throw deliberately, via `snapshot_after_capture_hook_for_test`
+/// (called inline, unguarded by any inner `catch`, so its throw reaches `dispatchSnapshotPublisher`'s
+/// outer `catch (...)` that invokes `publish_error_hook_for_test`): with a healthy backend and no
+/// injected throw the publish would succeed, the handler would never run, and this test would pass
+/// while exercising nothing. An ordinary FAULTED WRITE does not reach the handler at all --
+/// `tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl` treats every non-`Committed` `WriteResult`
+/// (including a genuine retry give-up) as an ordinary backoff-and-retry-later outcome, a plain return,
+/// never a throw -- so only an exception from OUTSIDE that write (this hook stands in for one) ever
+/// reaches the handler.
+///
+/// The hook fires (and throws) EXACTLY ONCE, then disarms itself before throwing. This exit -- an
+/// exception escaping before ANY of the write's own failure arms (each of which arms
+/// `advancePublishBackoff` before returning `false`) -- is the one path that never paces the redispatch
+/// `settleSnapshotPublish` re-admits: `admitSnapshotPublishUnderStateLock`'s only pacing gate is the
+/// backoff deadline, which nothing on this exit sets, so a fault that stayed armed here would make the
+/// ledger redispatch at full speed with no backoff -- measured at over a million redispatches in 30
+/// seconds pegging one core, stopped only by `tryRemountOnce`'s mount-lease check (real wall-clock, not
+/// the injectable boot clock) finally fencing the mount closed. Disarming after one throw keeps this
+/// test's own claim (settlement survives ONE throwing handler call) while never driving that busy loop.
 TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
 {
     auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
+    std::atomic<bool> handler_ran{false};
     PoolConfig config;
-    config.publish_error_hook_for_test
-        = [] { throw std::runtime_error("injected: the error handler itself throws"); };
+    /// No real backoff wait: the injected throw leaves the tail over-threshold, and a REAL backoff
+    /// sleep here would still be paid at teardown drain even though the test's own assertions never
+    /// wait on it directly.
+    config.snapshot_publish_backoff_initial_ms = 0;
+    config.snapshot_publish_backoff_max_ms = 0;
+    config.publish_error_hook_for_test = [&handler_ran]
+    {
+        handler_ran.store(true);
+        throw std::runtime_error("injected: the error handler itself throws");
+    };
     auto store = openPublishingPool(backend, config);
     const RootNamespace ns{"srv1/handler_throws"};
 
-    /// Arm the fault so the publisher's own PUT fails and its `catch` is entered. Use the same arming
-    /// call the snapshot-ordering suite uses against this backend.
-    backend->armWriteFailure("_snap/", 1);
+    std::atomic<bool> capture_hook_ran{false};
+    std::atomic<bool> capture_hook_armed{true};
+    store->setSnapshotAfterCaptureHookForTest([&capture_hook_ran, &capture_hook_armed]
+    {
+        capture_hook_ran.store(true);
+        if (capture_hook_armed.exchange(false))
+            throw std::runtime_error("injected: the dispatched attempt itself throws");
+    });
 
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
     store->waitForSnapshotPublishSettleForTest(ns);
+    ASSERT_TRUE(capture_hook_ran.load()) << "the dispatched attempt never reached the injected throw";
+    EXPECT_TRUE(handler_ran.load()) << "the injected throw must have reached the (throwing) error handler";
     EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 0);
+
+    store->setSnapshotAfterCaptureHookForTest(nullptr);
 }
 
 /// A publisher asleep in recovery backoff must be woken by the stop, not waited out. The injected
