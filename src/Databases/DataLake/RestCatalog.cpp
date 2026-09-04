@@ -1785,7 +1785,7 @@ bool RestCatalog::updateSchema(
     return true;
 }
 
-void RestCatalog::dropTable(const String & namespace_name, const String & table_name) const
+void RestCatalog::dropTable(const String & namespace_name, const String & table_name, bool /*delete_data*/) const
 {
     if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,

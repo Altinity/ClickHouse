@@ -33,6 +33,7 @@ namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int DATALAKE_DATABASE_ERROR;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace DB::Setting
@@ -157,13 +158,17 @@ bool S3TablesCatalog::tryGetTableMetadata(
     if (!RestCatalog::tryGetTableMetadata(namespace_name, table_name, context_, result))
         return false;
 
-    if (!result.requiresCredentials())
-        return true;
+    /// For S3 Tables the catalog and the underlying data live in AWS S3 under the same
+    /// AWS principal, so endpoint/metadata-location normalization and fallback IAM
+    /// credential injection must always run - even when the engine was created with
+    /// `vended_credentials=0` (which leaves `requiresCredentials()` == false). Otherwise
+    /// reads and inserts can lose the catalog endpoint/credentials and fail with auth
+    /// or routing errors.
 
     bool need_credentials = true;
-    if (const auto storage_credentials = result.getStorageCredentials())
+    if (result.hasStorageCredentials())
     {
-        auto creds = std::dynamic_pointer_cast<S3Credentials>(storage_credentials);
+        auto creds = std::dynamic_pointer_cast<S3Credentials>(result.getStorageCredentials());
         if (creds && !creds->isEmpty())
             need_credentials = false;
     }
@@ -178,6 +183,7 @@ bool S3TablesCatalog::tryGetTableMetadata(
                 "S3 Tables: catalog IAM credentials are empty for {}.{}, "
                 "check AWS credentials configuration",
                 namespace_name, table_name);
+        result.withStorageCredentials();
         result.setStorageCredentials(std::make_shared<S3Credentials>(
             aws_creds.GetAWSAccessKeyId(), aws_creds.GetAWSSecretKey(), aws_creds.GetSessionToken()));
     }
@@ -189,6 +195,20 @@ bool S3TablesCatalog::tryGetTableMetadata(
             : storage_endpoint;
         LOG_DEBUG(log, "S3 Tables: no endpoint for {}.{}, injecting: {}", namespace_name, table_name, endpoint);
         result.setEndpoint(endpoint);
+    }
+
+    if (auto props = result.getDataLakeSpecificProperties();
+        props && !props->iceberg_metadata_file_location.empty())
+    {
+        const String & loc = props->iceberg_metadata_file_location;
+        auto scheme_end = loc.find("://");
+        if (scheme_end != String::npos)
+        {
+            auto path_start = loc.find('/', scheme_end + 3);
+            if (path_start != String::npos)
+                props->iceberg_metadata_file_location = loc.substr(path_start + 1);
+        }
+        result.setDataLakeSpecificProperties(std::move(props));
     }
 
     return true;
@@ -214,8 +234,16 @@ ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfiguratio
     };
 }
 
-void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name) const
+void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, bool delete_data) const
 {
+    /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-delete.html
+    if (!delete_data)
+        throw DB::Exception(
+            DB::ErrorCodes::SUPPORT_IS_DISABLED,
+            "S3 Tables cannot drop table {}.{} without deleting its data, and `iceberg_delete_data_on_drop` is disabled. "
+            "Enable `iceberg_delete_data_on_drop` to drop the table together with its data",
+            namespace_name, table_name);
+
     const std::string endpoint
         = (base_url / config.prefix / "namespaces" / namespace_name / "tables" / table_name).string()
         + "?purgeRequested=True";
