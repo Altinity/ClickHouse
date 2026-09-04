@@ -118,11 +118,35 @@ CatalogEntry entryInState(const String & ns, NsState state, uint64_t inc)
 class WriteCountingBackend : public DB::Cas::tests::CountingBackend
 {
 public:
+    enum class Verb { Read, Write };
+
     uint64_t writes(const String & key) const
     {
         std::lock_guard lock(write_count_mutex);
         const auto it = write_counts.find(key);
         return it == write_counts.end() ? 0 : it->second;
+    }
+
+    /// The ordered READ/WRITE sequence issued against `key` since this backend was created. A count
+    /// alone cannot tell a settled-then-reissued attempt from a blind reissue that happened to read
+    /// more times; the order is what a caller actually needs to pin.
+    std::vector<Verb> journalFor(const String & key) const
+    {
+        std::lock_guard lock(write_count_mutex);
+        std::vector<Verb> filtered;
+        for (const auto & [journaled_key, verb] : journal)
+            if (journaled_key == key)
+                filtered.push_back(verb);
+        return filtered;
+    }
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(write_count_mutex);
+            journal.emplace_back(key, Verb::Read);
+        }
+        return CountingBackend::read(key, access);
     }
 
     std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
@@ -132,6 +156,7 @@ public:
         {
             std::lock_guard lock(write_count_mutex);
             ++write_counts[key];
+            journal.emplace_back(key, Verb::Write);
         }
         return CountingBackend::write(key, bytes, expected_value, access);
     }
@@ -139,7 +164,18 @@ public:
 private:
     mutable std::mutex write_count_mutex;
     std::map<String, uint64_t> write_counts;
+    std::vector<std::pair<String, Verb>> journal;
 };
+
+/// A compact 'R'/'W' rendering of `WriteCountingBackend::journalFor`, so a mismatch prints as one
+/// readable string rather than a wall of enum values.
+String renderJournal(const std::vector<WriteCountingBackend::Verb> & journal)
+{
+    String rendered;
+    for (const auto verb : journal)
+        rendered += verb == WriteCountingBackend::Verb::Read ? 'R' : 'W';
+    return rendered;
+}
 
 /// Lands a competing catalog body under the erase's own attempt and withdraws this actor's admission
 /// with it -- the concurrent winner an erase has to be resolved against, driven deterministically and
@@ -1386,17 +1422,30 @@ TEST(CASRefCatalogRemoval, ATransientEraseFailureIsResolvedByAReadAndReissued)
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
 
-    const uint64_t reads_before = backend->getCount(layout.refCatalogKey());
+    const size_t journal_before = backend->journalFor(layout.refCatalogKey()).size();
     backend->failNextWriteWith(layout.refCatalogKey(), std::make_exception_ptr(
         Poco::TimeoutException("injected erase failure whose outcome never reached the caller")));
 
     EXPECT_EQ(CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, noAuthorityRefresh),
         CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+
+    /// A blind reissue still performs a baseline read, a post-write read and a verification read,
+    /// satisfying a bare count. The ORDER pins what a count cannot: the lost attempt's outcome is
+    /// settled by a read (the engine's own ambiguity resolution) before it is ever reissued, and the
+    /// reissue that lands is settled by the loop's mandatory resolution read in turn. Captured before
+    /// the test's own verification read below, which is not part of the call under test.
+    const std::vector<WriteCountingBackend::Verb> full_journal = backend->journalFor(layout.refCatalogKey());
+    const std::vector<WriteCountingBackend::Verb> journal_since(
+        full_journal.begin() + static_cast<ptrdiff_t>(journal_before), full_journal.end());
+    using Verb = WriteCountingBackend::Verb;
+    EXPECT_EQ(journal_since, (std::vector<Verb>{Verb::Read, Verb::Write, Verb::Read, Verb::Write, Verb::Read}))
+        << "got " << renderJournal(journal_since) << "; a baseline read, the lost attempt settled by the "
+        << "engine's own resolution read BEFORE it is reissued, then the reissue settled by the loop's "
+        << "mandatory resolution read -- not a blind reissue that happens to read more times";
+
     EXPECT_TRUE(CasRefCatalog::read(op, layout).catalog.entries.empty());
     EXPECT_EQ(backend->writes(layout.refCatalogKey()), 3u)
         << "the seed, the attempt whose outcome was lost, and the reissue that landed";
-    EXPECT_GT(backend->getCount(layout.refCatalogKey()), reads_before + 1)
-        << "the lost attempt was settled by an exact read before anything was concluded from it";
 }
 
 /// A refused precondition is the only thing the erase loop retries, and it PACES that retry on the
@@ -1482,6 +1531,86 @@ TEST(CASRefCatalogRemoval, TheEraseLoopRefreshesItsLivenessBeforeEveryAttempt)
         << "the one refused erase; the paced retry was abandoned before it reached the store";
     EXPECT_EQ(CasRefCatalog::read(reader, layout).catalog.entries, std::vector<CatalogEntry>{removing})
         << "the row a deposed leader must not erase is still there";
+}
+
+/// The refresh hook can fail the same way the read it wraps can -- and a failure of it is not a
+/// negative liveness answer to fold into `FencedOut`; it is a fact this call cannot evaluate, so it
+/// must escape rather than be swallowed into any of the loop's own outcomes. This is the case where
+/// the hook fails before the loop has sent anything at all: no erase may reach the store on an
+/// authority this call could not even ask about.
+TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    requests.setSleepFnForTest(clock.sleepFn());
+    CasOperation op = requests.admit();
+    const Layout layout("erase-refresh-throws-before");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
+
+    EXPECT_THROW(
+        CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent,
+            [] { throw std::runtime_error("injected authority-refresh failure before the first attempt"); }),
+        std::runtime_error);
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()), writes_after_seed)
+        << "an authority this call could not even ask about must not send an erase";
+    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing})
+        << "nothing changed under an authority failure that reached no attempt";
+}
+
+/// The counterpart to the case above: the hook fails AFTER the loop has already sent one erase and
+/// resolved it (a refusal, so the row is provably unchanged), on the refresh that would gate the next
+/// attempt. The failure must still escape rather than be read as the fenced-out liveness answer this
+/// class's default `admitted()` would otherwise report, and -- exactly as when it fails up front -- no
+/// further erase may reach the store on an authority this call could not evaluate.
+TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolution)
+{
+    auto backend = std::make_shared<WriteCountingBackend>();
+    DB::Cas::tests::FakeClock clock;
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    requests.setNowFnForTest(clock.nowFn());
+    requests.setSleepFnForTest(clock.sleepFn());
+    CasOperation op = requests.admit();
+    const Layout layout("erase-refresh-throws-after");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    seedObject(op, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}));
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    backend->refuseNextWrite(layout.refCatalogKey());
+    const uint64_t writes_after_seed = backend->writes(layout.refCatalogKey());
+
+    size_t refreshes = 0;
+    EXPECT_THROW(
+        CasRefCatalog::deleteCompletedRemoving(op, layout, removing, ready_parent, [&]
+        {
+            ++refreshes;
+            if (refreshes > 1)
+                throw std::runtime_error("injected authority-refresh failure after the erase resolved");
+        }),
+        std::runtime_error);
+    EXPECT_EQ(refreshes, 2u) << "once before the refused attempt, once before the retry it never sent";
+    EXPECT_EQ(backend->writes(layout.refCatalogKey()) - writes_after_seed, 1u)
+        << "the one refused erase; the retry the resolution read would have paced never reached the store";
+    EXPECT_EQ(CasRefCatalog::read(op, layout).catalog.entries, std::vector<CatalogEntry>{removing})
+        << "the row a failed authority refresh must not let a later attempt erase is still there";
 }
 
 /// The loop iterates on ONE alternative and one only: a refused precondition. Every other non-committed
