@@ -67,12 +67,12 @@ public:
     String getClusterName(ContextPtr context) const override;
 
     /// Builds a standalone `<engine>Cluster('<cluster_name>', <args>, structure=..., format=...)` AST function
-    /// fragment for this storage -- the same shape updateQueryToSendIfNeeded() already produces for the
-    /// leftmost-table (q17) dispatch -- without mutating any existing query. Used by the whole-query
-    /// object-storage-cluster dispatch (findObjectStorageClusterWholeQueryDriver/buildQueryPlanForObjectStorageCluster
-    /// in findParallelReplicasQuery.cpp) to replace an exact QueryTree TableNode via cloneAndReplace(), instead
-    /// of searching an already-serialized AST for this storage's position. cluster_name is explicit (not read
-    /// from getClusterName()) because a driver nested below a CTE has an empty resolved cluster name of its own.
+    /// fragment for this storage, reusing the existing updateQueryToSendIfNeeded() rewrite, without mutating any
+    /// existing query. Used by buildQueryPlanForObjectStorageCluster() (findParallelReplicasQuery.cpp) -- shared
+    /// by both the leftmost-driver (PlannerJoinTree.cpp) and nested-driver (findQueryForParallelReplicas.h)
+    /// candidate-selection paths -- to replace an exact QueryTree TableNode via cloneAndReplace(), instead of
+    /// searching an already-serialized AST for this storage's position. cluster_name is explicit (not read from
+    /// getClusterName()) because a driver nested below a CTE has an empty resolved cluster name of its own.
     ASTPtr buildClusterTableFunctionAST(const String & cluster_name, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context);
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;

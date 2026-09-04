@@ -41,10 +41,12 @@ public:
         const QueryNode * parallel_replicas_node_,
         const TableNode * parallel_replicas_table_,
         const UnionNode * parallel_replicas_table_union_,
-        FiltersForTableExpressionMap filters_for_table_expressions_)
+        FiltersForTableExpressionMap filters_for_table_expressions_,
+        const TableNode * parallel_replicas_candidate_driver_ = nullptr)
         : parallel_replicas_node(parallel_replicas_node_)
         , parallel_replicas_table(parallel_replicas_table_)
         , parallel_replicas_table_union(parallel_replicas_table_union_)
+        , parallel_replicas_candidate_driver(parallel_replicas_candidate_driver_)
         , filters_for_table_expressions(std::move(filters_for_table_expressions_))
     {
     }
@@ -84,6 +86,14 @@ public:
     /// UNION node whose every child query reads from a table eligible for parallel replicas.
     /// When set, each branch retains parallel replicas reading instead of having it disabled.
     const UnionNode * const parallel_replicas_table_union = nullptr;
+    /// Driver TableNode associated with parallel_replicas_node, found via findParallelReplicasCandidateDriver()
+    /// (findQueryForParallelReplicas.h) -- an initiator-safe lookup derived directly from parallel_replicas_node
+    /// itself. Deliberately separate from parallel_replicas_table above: that field comes from the public,
+    /// follower-gated findTableForParallelReplicas() overload and is nullptr on a normal initiator by design
+    /// (it exists for PlannerJoinTree.cpp's unrelated View/MaterializedView follower-recursion-safety check).
+    /// Used by Planner::buildPlanForQueryNode() to pick the execution backend (MergeTree vs.
+    /// object-storage-cluster) for whatever table drives parallel_replicas_node's dispatch.
+    const TableNode * const parallel_replicas_candidate_driver = nullptr;
 
     const FiltersForTableExpressionMap filters_for_table_expressions;
 

@@ -38,7 +38,6 @@
 
 #include <Common/FieldVisitorToString.h>
 #include <Common/quoteString.h>
-#include <Common/logger_useful.h>
 #include <Core/Settings.h>
 
 #include <Parsers/ASTSelectQuery.h>
@@ -105,7 +104,6 @@ namespace Setting
     extern const SettingsString implicit_table_at_top_level;
     extern const SettingsBool parallel_replicas_for_cluster_engines;
     extern const SettingsBool enable_identifier_resolve_cache;
-    extern const SettingsBool object_storage_cluster_bypass_join_wrap;
 }
 
 
@@ -6214,33 +6212,7 @@ void QueryAnalyzer::resolveQuery(const QueryTreeNodePtr & query_node, Identifier
 
     TableFunctionsWithClusterAlternativesVisitor table_function_visitor;
     table_function_visitor.visit(query_node);
-
-    /// EXPERIMENTAL (see object_storage_cluster_bypass_join_wrap in PlannerJoinTree.cpp): root cause found for
-    /// the Iceberg-JOIN-pushdown experiment -- TableFunctionsWithClusterAlternativesVisitor unconditionally
-    /// excludes any query containing a JOIN (has_join) from being eligible for cluster alternatives, forcibly
-    /// resetting parallel_replicas_for_cluster_engines to false regardless of what the query's own SETTINGS
-    /// clause requested. That happens here, upstream of everything in PlannerJoinTree.cpp/IStorageCluster.cpp/
-    /// DatabaseDataLake.cpp.
-    ///
-    /// A blanket bypass of the whole check (ignoring subquery_count/table_count/table_function_count too, not
-    /// just has_join) regressed unrelated benchmark queries with CTEs (e.g. `Unknown table expression
-    /// identifier 'appinfo_d' in scope`) -- those other restrictions are protecting real things. So this only
-    /// lifts the has_join prohibition specifically, keeping every other restriction intact.
-    const bool experimental_allow_join = query_node_typed.getMutableContext()->getSettingsRef()[Setting::object_storage_cluster_bypass_join_wrap]
-        && table_function_visitor.shouldReplaceWithClusterAlternativesIgnoringJoin();
-
-    LOG_WARNING(
-        getLogger("QueryAnalyzer"),
-        "CLUSTER_ALT tables={} table_functions={} subqueries={} has_join={} normal={} ignoring_join={} experimental_allow_join={}",
-        table_function_visitor.getTableCount(),
-        table_function_visitor.getTableFunctionCount(),
-        table_function_visitor.getSubqueryCount(),
-        table_function_visitor.hasJoin(),
-        table_function_visitor.shouldReplaceWithClusterAlternatives(),
-        table_function_visitor.shouldReplaceWithClusterAlternativesIgnoringJoin(),
-        experimental_allow_join);
-
-    if (!table_function_visitor.shouldReplaceWithClusterAlternatives() && !experimental_allow_join)
+    if (!table_function_visitor.shouldReplaceWithClusterAlternatives())
         query_node_typed.getMutableContext()->setSetting("parallel_replicas_for_cluster_engines", false);
 
     /// Disable cache during join tree resolution - table expressions aren't fully initialized yet,

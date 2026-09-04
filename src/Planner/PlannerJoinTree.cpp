@@ -25,6 +25,7 @@
 #include <Storages/IStorage.h>
 #include <Storages/IStorageCluster.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <Storages/StorageDictionary.h>
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageDummy.h>
@@ -95,6 +96,7 @@
 #include <Planner/findQueryForParallelReplicas.h>
 #include <Interpreters/DirectJoinMergeTreeEntity.h>
 
+#include <functional>
 #include <ranges>
 
 namespace DB
@@ -119,7 +121,6 @@ namespace Setting
     extern const SettingsFloat max_streams_to_max_threads_ratio;
     extern const SettingsMaxThreads max_threads;
     extern const SettingsUInt64 max_threads_min_free_memory_per_thread;
-    extern const SettingsBool object_storage_cluster_bypass_join_wrap;
     extern const SettingsBool optimize_sorting_by_input_stream_properties;
     extern const SettingsBool optimize_trivial_count_query;
     extern const SettingsUInt64 parallel_replicas_count;
@@ -832,13 +833,22 @@ bool parallelReplicasEnabledForStorage(const StoragePtr & current_storage, const
     return true;
 }
 
+/// Pluggable storage-eligibility check for allowParallelReplicasForJoinTree() below. Two call sites bind two
+/// different policies: parallelReplicasEnabledForStorage() above for MergeTree (the existing, unmodified
+/// behavior), and isObjectStorageClusterDriverEligible() (findParallelReplicasQuery.h) for a StorageObjectStorageCluster
+/// driver that is the immediate leftmost/rightmost table of a JOIN (e.g. IcebergBench q17) -- the counterpart of
+/// findQueryForParallelReplicas()/findTableForParallelReplicas() picking up the same storage kind for a driver
+/// nested under a CTE/subquery (e.g. q21). Both paths dispatch to the same buildQueryPlanForObjectStorageCluster()
+/// execution backend once a driver is chosen.
+using ParallelReplicasStorageEligibility = std::function<bool(const StoragePtr &)>;
+
 /// Join-tree-level eligibility check: can the leftmost leaf of this join tree
 /// drive the parallel-replicas absorption of the entire join?  The contract is
 /// that a single leaf (the leftmost) takes the WithMergeableState path with the
 /// whole join query tree; the other leaves must take the plain `storage->read`
 /// path.  Callers should compute this once for the join tree and gate the
 /// per-leaf parallel-replicas activation accordingly.
-bool allowParallelReplicasForJoinTree(const QueryTreeNodePtr & join_tree_node, const ContextPtr & context, const Settings & query_settings)
+bool allowParallelReplicasForJoinTree(const QueryTreeNodePtr & join_tree_node, const ParallelReplicasStorageEligibility & storage_eligible)
 {
     if (!join_tree_node)
         return false;
@@ -861,11 +871,11 @@ bool allowParallelReplicasForJoinTree(const QueryTreeNodePtr & join_tree_node, c
     {
         // check that left table expression can be used for parallel replicas
         if (left_table)
-            return parallelReplicasEnabledForStorage(left_table->getStorage(), context, query_settings);
+            return storage_eligible(left_table->getStorage());
 
         const auto * left_table_function = left_table_expr->as<TableFunctionNode>();
         if (left_table_function)
-            return parallelReplicasEnabledForStorage(left_table_function->getStorage(), context, query_settings);
+            return storage_eligible(left_table_function->getStorage());
 
         // check if left one is not subquery
         return left_table_expr->getNodeType() != QueryTreeNodeType::QUERY
@@ -889,11 +899,11 @@ bool allowParallelReplicasForJoinTree(const QueryTreeNodePtr & join_tree_node, c
             return false;
 
         const auto right_storage = right_table ? right_table->getStorage() : right_table_function->getStorage();
-        if (parallelReplicasEnabledForStorage(right_storage, context, query_settings))
+        if (storage_eligible(right_storage))
         {
             const auto * left_table_function = left_table_expr->as<TableFunctionNode>();
             const auto left_storage = (left_table ? left_table->getStorage() : left_table_function->getStorage());
-            if (!parallelReplicasEnabledForStorage(left_storage, context, query_settings))
+            if (!storage_eligible(left_storage))
                 // TODO: support parallel replicas for (non_mt_table RIGHT JOIN mt_table) later
                 return false;
 
@@ -1326,7 +1336,8 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(QueryTreeNodePtr table_expres
                     }
                     else if (
                         ClusterProxy::canUseParallelReplicasOnInitiator(query_context)
-                        && allowParallelReplicasForJoinTree(parent_join_tree, query_context, settings))
+                        && allowParallelReplicasForJoinTree(parent_join_tree,
+                               [&](const StoragePtr & s) { return parallelReplicasEnabledForStorage(s, query_context, settings); }))
                     {
                         // (1) find read step
 
@@ -1971,39 +1982,6 @@ JoinTreeQueryPlan buildQueryPlanForArrayJoinNode(const QueryTreeNodePtr & array_
 
 }
 
-namespace
-{
-
-/// EXPERIMENTAL (see object_storage_cluster_bypass_join_wrap): capability check for the IStorageCluster
-/// leftmost-table wrap bypass below. The bypass hands the whole JOIN query to the leftmost IStorageCluster's
-/// own read() (see IStorageCluster.cpp), which forwards it to remote nodes using AST-level rewriting/qualified-
-/// name restoration. That machinery only works when every *other* table expression in the same flattened join
-/// scope needs no further recursive planning of its own -- i.e. rejects a QUERY/UNION node (a CTE or subquery,
-/// e.g. IcebergBench q2/q4/q13/q16's `appinfo_d`) wherever it appears in the scope, since that's a query
-/// boundary read()'s AST rewriting cannot safely serialize. Structural JOIN/CROSS_JOIN/ARRAY_JOIN nodes that
-/// buildTableExpressionsStack() also leaves in the flattened stack are allowed through (they're not table
-/// expressions, and getNodeType() already distinguishes them from QUERY/UNION, so no special-casing is needed
-/// for them here). Confirmed live: bypassing unconditionally for the QueryNode-RHS shape produces
-/// "Not found column __tableN.appinfo_app in block" instead of a clean error. Keyed purely on QueryTreeNodeType,
-/// not on query/table/CTE names, so it generalizes to any query with this shape.
-bool canBypassClusterJoinWrapForTableExpressions(const QueryTreeNodes & table_expressions_stack)
-{
-    /// table_expressions_stack[0] is always the leftmost table expression itself (buildTableExpressionsStack()
-    /// walks left-to-right, depth-first); every other entry is either another table expression in the same
-    /// scope or a structural JOIN/CROSS_JOIN/ARRAY_JOIN node (which getNodeType() distinguishes from QUERY/UNION
-    /// automatically, so no special-casing is needed here).
-    for (size_t i = 1; i < table_expressions_stack.size(); ++i)
-    {
-        auto node_type = table_expressions_stack[i]->getNodeType();
-        if (node_type == QueryTreeNodeType::QUERY || node_type == QueryTreeNodeType::UNION)
-            return false;
-    }
-
-    return true;
-}
-
-}
-
 JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     const SelectQueryInfo & select_query_info,
     SelectQueryOptions & select_query_options,
@@ -2128,61 +2106,103 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
       */
     auto left_table_expression = table_expressions_stack.front();
 
-    /** If the leftmost table uses IStorageCluster (e.g., s3Cluster, hdfsCluster)
-      * and there are multiple tables (indicating a JOIN), we must wrap it in a subquery.
-      * This prevents IStorageCluster from receiving the full JOIN query, which it cannot handle.
-      *
-      * IStorageCluster is a simple storage that just forwards queries to remote nodes.
-      * Unlike StorageDistributed, it cannot decompose and handle JOINs across multiple tables,
-      * because remote nodes don't have access to other tables in the JOIN.
-      *
-      * StorageDistributed has sophisticated query planning logic to handle JOINs and should
-      * NOT be wrapped (wrapping breaks tests like 03577_server_constant_folding).
-      */
     bool should_wrap_left_table = false;
     bool has_multiple_tables = table_expressions_stack.size() > 1;
 
     // Get the actual storage to check its type
     const IStorageCluster * left_storage_cluster = nullptr;
+    const TableNode * left_table_node = left_table_expression->as<TableNode>();
     if (has_multiple_tables)
     {
-        auto * table_node = left_table_expression->as<TableNode>();
         auto * table_function_node = left_table_expression->as<TableFunctionNode>();
 
-        if (table_node || table_function_node)
+        if (left_table_node || table_function_node)
         {
-            const auto & storage = table_node ? table_node->getStorage() : table_function_node->getStorage();
+            const auto & storage = left_table_node ? left_table_node->getStorage() : table_function_node->getStorage();
             // Only relevant if it's specifically IStorageCluster, not StorageDistributed or other remote storages
             left_storage_cluster = dynamic_cast<const IStorageCluster *>(storage.get());
         }
     }
 
-    /// EXPERIMENTAL A/B SETTING (not for production): bypasses the IStorageCluster wrapping guard
-    /// so object-storage-cluster sources (e.g. StorageObjectStorageCluster / Iceberg) can receive
-    /// the full JOIN query and execute JOIN + partial aggregation on the workers instead of the
-    /// initiator. See object_storage_cluster_join_mode in IStorageCluster.cpp for the remote-side
-    /// handling. Off by default; enable per-query with SETTINGS object_storage_cluster_bypass_join_wrap=1.
+    /// A StorageObjectStorageCluster driver that is the immediate leftmost table of this JOIN (e.g. IcebergBench
+    /// q17) reuses the exact same join-shape eligibility check (allowParallelReplicasForJoinTree(), see above)
+    /// MergeTree's own parallel-replicas dispatch already relies on -- just bound to a different storage-
+    /// eligibility policy (isObjectStorageClusterDriverEligible() instead of parallelReplicasEnabledForStorage()).
+    /// This is the counterpart of findQueryForParallelReplicas()/findTableForParallelReplicas() picking up the
+    /// same storage kind for a driver nested under a CTE/subquery (e.g. q21, dispatched from
+    /// Planner::buildPlanForQueryNode()); both end up calling the same buildQueryPlanForObjectStorageCluster()
+    /// execution backend. When eligible, this replaces the plain buildQueryPlanForTableExpression() call below
+    /// for the leftmost table entirely: storage->read() is never called for it directly, so the
+    /// ReadFromMergeTree-swap block inside buildQueryPlanForTableExpression() (gated on
+    /// parallelReplicasEnabledForStorage(), MergeTree-only) is never reached for this table.
     ///
-    /// Capability-gated (see canBypassClusterJoinWrapForTableExpressions() above): only bypasses when the
-    /// driver is directly an IStorageCluster AND every other table expression in this JOIN scope is a plain
-    /// TableNode/TableFunctionNode. A QueryNode/UnionNode RHS (a CTE/subquery) keeps the original wrapping
-    /// behavior instead of being (incorrectly) forwarded whole to IStorageCluster::read().
-    bool experimental_bypass_cluster_join_wrap =
-        left_storage_cluster != nullptr
-        && planner_context->getQueryContext()->getSettingsRef()[Setting::object_storage_cluster_bypass_join_wrap]
-        && canBypassClusterJoinWrapForTableExpressions(table_expressions_stack);
+    /// Scoped the same way the original IStorageCluster wrap guard always was: only the immediate leftmost table
+    /// of the JOIN. A driver on the right side of a RIGHT JOIN is out of scope here, same as before.
+    ///
+    /// !select_query_options.only_analyze is required, not optional: buildQueryPlanForObjectStorageCluster()
+    /// internally calls InterpreterSelectQueryAnalyzer::getSampleBlock()/getSampleBlockAndPlannerContext() on
+    /// query_node->clone() (still containing the *unmodified* driver TableNode, before cloneAndReplace()) purely
+    /// to compute headers, each spinning up its own only_analyze=true Planner that re-enters
+    /// buildJoinTreeQueryPlan() for this exact same query. Without this guard that recursive, analyze-only
+    /// invocation sees the identical eligible JOIN shape and calls buildQueryPlanForObjectStorageCluster() again,
+    /// which calls getSampleBlock() again, unbounded -- confirmed live as Code: 306 TOO_DEEP_RECURSION. Mechanism
+    /// A avoids this for free (findQueryForParallelReplicas()/findTableForParallelReplicas() both early-return
+    /// nullptr under only_analyze); this branch needs the equivalent guard explicitly, mirroring the analogous
+    /// `select_query_options.only_analyze ? nullptr : ...` guard the original leftmost-driver prototype used.
+    ///
+    /// !select_query_options.is_subquery: confirmed live (IcebergBench q16) that this branch dispatches
+    /// `query_node` as a standalone unit via buildQueryPlanForObjectStorageCluster() -> queryNodeToDistributedSelectQuery(),
+    /// which gets independently re-numbered (__table1/__table2 local to that scope) when re-analyzed on the
+    /// worker. That's fine when `query_node` is the query's true top level (q17), and mechanism A already
+    /// handles a driver nested under a *CTE* nested inside the top-level query (q21) by dispatching the whole
+    /// top-level query as one unit, keeping one global __tableN numbering throughout. But q16's JOIN
+    /// (`appev LEFT JOIN appinfo_d`) lives inside a *derived-table* subquery (`base`) that is itself nested
+    /// four levels under further derived-table wrapping (window-function pivot layers) -- `base` gets its own
+    /// nested `Planner subquery_planner` instance (this function's own `subquery_planner`, ~L1512), so
+    /// `select_query_options.is_subquery` is true for it. Dispatching `base` alone here produces a query whose
+    /// output columns don't line up with the __tableN qualified names the *outer* scope already resolved
+    /// against the original, single, whole-query analysis pass -- confirmed live as
+    /// `Not found column __table7.appinfo_ccl in block. There are only columns: __table2.appinfo_ccl, ...`.
+    /// Restricting this branch to the query's true top level is a conservative capability boundary, not a
+    /// q16-specific hack: nested mechanism-B dispatch is simply not validated/correct yet. A driver nested
+    /// under a derived-table subquery (as opposed to a CTE) still falls through to normal local planning below,
+    /// same as before this experiment. See ICEBERG_JOIN_EXPERIMENT.md §12.
+    JoinTreeQueryPlan left_table_expression_query_plan;
+    bool dispatched_as_object_storage_cluster = !select_query_options.only_analyze
+        && !select_query_options.is_subquery
+        && left_table_node && has_multiple_tables
+        && allowParallelReplicasForJoinTree(parent_join_tree_for_leftmost,
+               [&](const StoragePtr & s) { return isObjectStorageClusterDriverEligible(*s, planner_context->getQueryContext()); });
 
-    if (has_multiple_tables && !experimental_bypass_cluster_join_wrap)
+    if (dispatched_as_object_storage_cluster)
+    {
+        left_table_expression_query_plan
+            = buildQueryPlanForObjectStorageCluster(query_node, *left_table_node, select_query_info, planner_context);
+    }
+    else
+    {
+        /** If the leftmost table uses IStorageCluster (e.g., s3Cluster, hdfsCluster)
+          * and there are multiple tables (indicating a JOIN), we must wrap it in a subquery.
+          * This prevents IStorageCluster from receiving the full JOIN query, which it cannot handle.
+          *
+          * IStorageCluster is a simple storage that just forwards queries to remote nodes.
+          * Unlike StorageDistributed, it cannot decompose and handle JOINs across multiple tables,
+          * because remote nodes don't have access to other tables in the JOIN.
+          *
+          * StorageDistributed has sophisticated query planning logic to handle JOINs and should
+          * NOT be wrapped (wrapping breaks tests like 03577_server_constant_folding).
+          */
         should_wrap_left_table = (left_storage_cluster != nullptr);
 
-    auto left_table_expression_query_plan = buildQueryPlanForTableExpression(
-        left_table_expression,
-        parent_join_tree_for_leftmost,
-        select_query_info,
-        select_query_options,
-        planner_context,
-        is_single_table_expression,
-        should_wrap_left_table /*wrap_read_columns_in_subquery*/);
+        left_table_expression_query_plan = buildQueryPlanForTableExpression(
+            left_table_expression,
+            parent_join_tree_for_leftmost,
+            select_query_info,
+            select_query_options,
+            planner_context,
+            is_single_table_expression,
+            should_wrap_left_table /*wrap_read_columns_in_subquery*/);
+    }
     if (left_table_expression_query_plan.stage != QueryProcessingStage::FetchColumns)
         return left_table_expression_query_plan;
 

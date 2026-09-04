@@ -12,6 +12,7 @@
 #include <Core/Settings.h>
 #include <Interpreters/ClusterProxy/SelectStreamFactory.h>
 #include <Interpreters/ClusterProxy/executeQuery.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Planner/PlannerJoinTree.h>
 #include <Planner/Utils.h>
@@ -53,8 +54,47 @@ namespace ErrorCodes
     extern const int UNSUPPORTED_METHOD;
 }
 
+bool isObjectStorageClusterDriverEligible(const IStorage & storage, const ContextPtr & context)
+{
+    if (!dynamic_cast<const StorageObjectStorageCluster *>(&storage))
+        return false;
+
+    /// Deliberately does NOT check parallel_replicas_for_cluster_engines: stock
+    /// QueryAnalyzer::resolveQuery() (TableFunctionsWithClusterAlternativesVisitor's has_join check,
+    /// untouched by this redesign -- see ICEBERG_JOIN_EXPERIMENT.md §12) unconditionally forces that
+    /// setting to false on any query node containing a JOIN, before the Planner ever runs. Since q17/q21
+    /// both contain a JOIN, that flag would read false here regardless of what the query's own SETTINGS
+    /// requested, making it useless as an opt-in signal for this mechanism. object_storage_cluster_bypass_join_wrap
+    /// is untouched by any analyzer logic and is the sole, correctly-scoped opt-in gate.
+    ///
+    /// query_kind != SECONDARY_QUERY guards against recursive re-fanout: once the whole-query dispatch built
+    /// here reaches a worker (via ReadFromCluster), that worker's own analysis of the received query text
+    /// sees the same settings (object_storage_cluster_bypass_join_wrap, cluster_for_parallel_replicas
+    /// propagate like any other setting) and, without this guard, would find any other eligible
+    /// StorageObjectStorageCluster JOIN still embedded in that text (e.g. IcebergBench q21's alert_events:
+    /// event_alert LEFT JOIN policy_matches) and try to dispatch it *again* from within an already-distributed
+    /// execution. A worker executing a query it received this way always has query_kind==SECONDARY_QUERY, so
+    /// this confines whole-query dispatch to the initiator's own top-level analysis.
+    ///
+    /// Deliberately does NOT check context->isDistributed(): that flag does not mean "executing as a
+    /// distributed sub-query" in this codebase. QueryAnalyzer.cpp sets it, per query SCOPE, to
+    /// storage->isRemote() the moment that scope's own join tree resolves a remote-capable table --
+    /// IStorageCluster::isRemote() is unconditionally true, so q17's and q21's own top-level scopes get
+    /// isDistributed()=true purely because event_page/txnlog are IStorageCluster-derived, on the initiator,
+    /// during ordinary analysis, before this function is ever consulted. Checking it here made this predicate
+    /// always false for exactly the tables it needs to select -- confirmed live (q17 stopped distributing
+    /// entirely). query_kind is the correct, unrelated "am I a worker" signal; isDistributed() is not.
+    const auto & settings = context->getSettingsRef();
+    return settings[Setting::object_storage_cluster_bypass_join_wrap]
+        && !settings[Setting::cluster_for_parallel_replicas].value.empty()
+        && context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY;
+}
+
 bool isTableNodeEligibleForParallelReplicas(const TableNode & table_node, const StoragePtr & storage, const ContextPtr & context)
 {
+    if (isObjectStorageClusterDriverEligible(*storage, context))
+        return true;
+
     const auto & settings = context->getSettingsRef();
 
     if (!storage->isMergeTree() && !typeid_cast<const StorageDummy *>(storage.get()))
@@ -109,7 +149,17 @@ static bool canUseTableForParallelReplicas(const TableNode & table_node, const C
 /// subquery has only LEFT / RIGHT / ALL INNER JOIN (or none), and left / right part is MergeTree table or subquery candidate as well.
 ///
 /// Additional checks are required, so we return many candidates. The innermost subquery is on top.
-static std::vector<const QueryNode *> getSupportingParallelReplicasQueries(const IQueryTreeNode * query_tree_node, const ContextPtr & context)
+///
+/// `non_driver_branch_roots`, when non-null, collects the *other* side of every JOIN encountered along this
+/// walk -- exactly the child NOT followed toward the driver (see the JOIN case below). Used by
+/// findQueryForParallelReplicas() to let an object-storage-cluster driver's candidate widen past a JOIN
+/// whose non-driver branch needs its own finalization (e.g. GROUP BY) -- safe there because every worker can
+/// fully recompute that branch from the same shared catalog, unlike MergeTree's non-driver side. See
+/// ICEBERG_JOIN_EXPERIMENT.md §12.11.
+static std::vector<const QueryNode *> getSupportingParallelReplicasQueries(
+    const IQueryTreeNode * query_tree_node,
+    const ContextPtr & context,
+    std::vector<const IQueryTreeNode *> * non_driver_branch_roots = nullptr)
 {
     std::vector<const QueryNode *> res;
 
@@ -124,6 +174,23 @@ static std::vector<const QueryNode *> getSupportingParallelReplicasQueries(const
                 const auto & table_node = query_tree_node->as<TableNode &>();
                 if (canUseTableForParallelReplicas(table_node, context))
                     return res;
+
+                /// DIAGNOSTIC (temporary, see ICEBERG_JOIN_EXPERIMENT.md §12.12): pin down whether the
+                /// dummy-substituted driver (StorageDummy, not the real StorageObjectStorageCluster) fails
+                /// this eligibility check -- would explain PR_CANDIDATE_CLASSIFY's selected_is_null=true
+                /// despite non_driver_plan_roots being correctly populated.
+                if (context->getSettingsRef()[Setting::object_storage_cluster_bypass_join_wrap])
+                {
+                    const auto & storage = table_node.getStorage();
+                    LOG_WARNING(getLogger("ParallelReplicasClusterDiag"),
+                        "PR_TABLE_ELIGIBILITY_FAIL table={} is_storage_dummy={} is_merge_tree={} "
+                        "supports_replication={} parallel_replicas_for_non_replicated_merge_tree={}",
+                        table_node.getStorageID().getFullTableName(),
+                        typeid_cast<const StorageDummy *>(storage.get()) != nullptr,
+                        storage->isMergeTree(),
+                        storage->supportsReplication(),
+                        context->getSettingsRef()[Setting::parallel_replicas_for_non_replicated_merge_tree].value);
+                }
 
                 return {};
             }
@@ -170,10 +237,18 @@ static std::vector<const QueryNode *> getSupportingParallelReplicasQueries(const
                 std::unordered_set<QueryTreeNodeType> supported_table_expression_types = {QueryTreeNodeType::TABLE, QueryTreeNodeType::QUERY, QueryTreeNodeType::UNION};
 
                 if (join_kind == JoinKind::Left || (join_kind == JoinKind::Inner && join_strictness == JoinStrictness::All))
+                {
+                    if (non_driver_branch_roots)
+                        non_driver_branch_roots->push_back(join_node.getRightTableExpression().get());
                     query_tree_node = join_node.getLeftTableExpression().get();
+                }
                 else if (join_kind == JoinKind::Right && join_strictness != JoinStrictness::RightAny
                     && supported_table_expression_types.contains(join_node.getLeftTableExpression()->getNodeType()))
+                {
+                    if (non_driver_branch_roots)
+                        non_driver_branch_roots->push_back(join_node.getLeftTableExpression().get());
                     query_tree_node = join_node.getRightTableExpression().get();
+                }
                 else
                     return {};
 
@@ -208,12 +283,27 @@ public:
             const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
             const auto & storage = storage_snapshot->storage;
 
+            /// `StorageDummy` erases the original storage's type entirely -- isTableNodeEligibleForParallelReplicas()'s
+            /// own isObjectStorageClusterDriverEligible() check (a dynamic_cast<StorageObjectStorageCluster*>) can
+            /// never succeed against a StorageDummy, so an object-storage-cluster driver silently fails the later
+            /// (dummy-tree) eligibility re-check inside getSupportingParallelReplicasQueries() -- even though the
+            /// *same* driver was already confirmed eligible against its real storage earlier in
+            /// findQueryForParallelReplicas()'s public overload. StorageDummy's own MergeTree/replication fallback
+            /// then also fails for a DataLake table (StorageObjectStorage::supportsReplication() reports the
+            /// underlying catalog's replication semantics, not "is this a valid parallel-replicas candidate").
+            /// Confirmed live: q21's dummy-substituted `txnlog` reported `supports_replication=false`, making the
+            /// whole dummy-tree candidate stack come back empty, silently discarding a driver that was correctly
+            /// found eligible moments earlier. Fix: decide eligibility once, against the *real* storage, before it
+            /// is replaced, and fold it into the one signal the dummy can still carry forward. See
+            /// ICEBERG_JOIN_EXPERIMENT.md §12.13.
+            const bool dummy_supports_replication = storage.supportsReplication() || isObjectStorageClusterDriverEligible(storage, getContext());
+
             auto storage_dummy = std::make_shared<StorageDummy>(
                 storage.getStorageID(),
                 /// To preserve information about alias columns, column description must be extracted directly from storage metadata.
                 storage_snapshot->metadata->getColumns(),
                 storage_snapshot,
-                storage.supportsReplication());
+                dummy_supports_replication);
 
             auto dummy_table_node = std::make_shared<TableNode>(std::move(storage_dummy), getContext());
             if (table_node && table_node->hasTableExpressionModifiers())
@@ -249,10 +339,30 @@ static void dumpStack(const std::vector<const QueryNode *> & stack)
 /// Find the best candidate for parallel replicas execution by verifying query plan.
 /// If query plan has only Expression, Filter or Join steps, we can execute it fully remotely and check the next query.
 /// Otherwise we can execute current query up to WithMergableStage only.
+///
+/// `non_driver_plan_roots` / `relax_for_object_storage_driver`: when the eventual driver is an
+/// object-storage-cluster table, a step needing initiator finalization (e.g. GROUP BY) found *inside a
+/// JOIN's non-driver branch* -- one of the `non_driver_plan_roots` recorded by
+/// getSupportingParallelReplicasQueries(), or any of its descendants -- does not have to narrow the
+/// candidate the way it must for MergeTree (whose non-driver side cannot be assumed independently
+/// re-computable per replica); every worker can safely and fully recompute an object-storage JOIN's
+/// non-driver branch from the same shared catalog. `non_driver_plan_roots` is empty and
+/// `relax_for_object_storage_driver` is false for MergeTree, so this parameter has zero effect there --
+/// MergeTree's own decision still goes entirely through the untouched, last-write `currently_inside_join`
+/// exactly as before. Confirmed live: without this relaxation, IcebergBench q21's `alert_events` branch
+/// (itself a JOIN with its own GROUP BY) forced the outer q21 query to be rejected in favor of a narrower
+/// candidate, splitting the dispatch into two separate `ReadFromCluster` calls with mismatched internal
+/// column identifiers between them, instead of one whole-query dispatch. See ICEBERG_JOIN_EXPERIMENT.md §12.11.
+///
+/// This does not weaken the *other* rejection path just below (`if (!res) return nullptr;`), which still
+/// unconditionally excludes a driver directly wrapped by such a step with no enclosing JOIN at all (e.g.
+/// IcebergBench q2's `appinfo_d`, a window function over the driver table with no JOIN in its own scope).
 static const QueryNode * findQueryForParallelReplicas(
     std::vector<const QueryNode *> stack,
     const std::unordered_map<const QueryNode *, const QueryPlan::Node *> & mapping,
-    const Settings & settings)
+    const Settings & settings,
+    const std::unordered_set<const QueryPlan::Node *> & non_driver_plan_roots,
+    bool relax_for_object_storage_driver)
 {
 #ifdef DUMP_PARALLEL_REPLICAS_QUERY_CANDIDATES
     dumpStack(stack);
@@ -270,6 +380,12 @@ static const QueryNode * findQueryForParallelReplicas(
         /// of the JOIN needs to be finalized on the initiator.
         /// So this flag is used to track what subquery to return once we hit a step that needs finalization.
         bool inside_join = false;
+        /// Sticky, propagated to every descendant once set: true once this frame's `node` is, or descends
+        /// from (possibly through passthrough wrapper steps such as the "Pre Join Actions" Expression a JOIN
+        /// commonly inserts above a subquery's own recorded plan root -- see this function's own comment),
+        /// one of `non_driver_plan_roots`. Checked at *every* visited node (not just immediate JOIN children)
+        /// specifically to see through such wrapper steps without needing a separate subtree search.
+        bool on_non_driver_branch = false;
     };
 
     const QueryNode * res = nullptr;
@@ -285,15 +401,21 @@ static const QueryNode * findQueryForParallelReplicas(
             break;
 
         std::stack<Frame> nodes_to_check;
-        nodes_to_check.push({.node = it->second, .inside_join = false});
+        nodes_to_check.push({.node = it->second, .inside_join = false, .on_non_driver_branch = false});
         bool can_distribute_full_node = true;
         bool currently_inside_join = false;
+        /// Cumulative, unlike currently_inside_join above: the walk below does not stop at the first
+        /// non-passthrough step it finds, so a later, safe (non-driver-branch) failure must not erase an
+        /// earlier, unsafe one, or vice versa -- order must not matter. Only ever consulted when
+        /// relax_for_object_storage_driver is true; MergeTree's own decision never reads this.
+        bool saw_unsafe_join_branch_failure = false;
 
         while (!nodes_to_check.empty())
         {
             /// Copy to avoid container overflow (we call pop() in the next line).
-            const auto [next_node_to_check, inside_join] = nodes_to_check.top();
+            const auto [next_node_to_check, inside_join, inherited_on_non_driver_branch] = nodes_to_check.top();
             nodes_to_check.pop();
+            const bool on_non_driver_branch = inherited_on_non_driver_branch || non_driver_plan_roots.contains(next_node_to_check);
             const auto & children = next_node_to_check->children;
             auto * step = next_node_to_check->step.get();
 
@@ -317,9 +439,11 @@ static const QueryNode * findQueryForParallelReplicas(
                 {
                     can_distribute_full_node = false;
                     currently_inside_join = inside_join;
+                    if (inside_join && !on_non_driver_branch)
+                        saw_unsafe_join_branch_failure = true;
                 }
 
-                nodes_to_check.push({.node = children.front(), .inside_join = inside_join});
+                nodes_to_check.push({.node = children.front(), .inside_join = inside_join, .on_non_driver_branch = on_non_driver_branch});
             }
             else
             {
@@ -335,7 +459,7 @@ static const QueryNode * findQueryForParallelReplicas(
                     return res;
 
                 for (const auto & child : children)
-                    nodes_to_check.push({.node = child, .inside_join = true});
+                    nodes_to_check.push({.node = child, .inside_join = true, .on_non_driver_branch = on_non_driver_branch});
             }
         }
 
@@ -346,7 +470,8 @@ static const QueryNode * findQueryForParallelReplicas(
             if (!res)
                 return nullptr;
 
-            return currently_inside_join ? res : subquery_node;
+            const bool should_narrow = relax_for_object_storage_driver ? saw_unsafe_join_branch_failure : currently_inside_join;
+            return should_narrow ? res : subquery_node;
         }
 
         /// Query is simple enough to be fully distributed.
@@ -355,6 +480,10 @@ static const QueryNode * findQueryForParallelReplicas(
 
     return res;
 }
+
+/// Forward declaration: defined below, needed here (§ "Determine the eventual driver's storage kind" in
+/// findQueryForParallelReplicas() just below) to pick the finalization policy before the dummy-plan walk runs.
+static const TableNode * findTableForParallelReplicas(const IQueryTreeNode * query_tree_node, const ContextPtr & context);
 
 const QueryNode * findQueryForParallelReplicas(const QueryTreeNodePtr & query_tree_node, const SelectQueryOptions & select_query_options)
 {
@@ -383,6 +512,15 @@ const QueryNode * findQueryForParallelReplicas(const QueryTreeNodePtr & query_tr
     if (stack.back() == query_tree_node.get())
         return nullptr;
 
+    /// Determine the eventual driver's storage kind *before* running the dummy-plan walk below, purely
+    /// structurally (same traversal `stack` above already performed, just continued down to the TABLE
+    /// instead of stopping at the last eligible QUERY boundary) -- cheap, no dummy-table substitution or
+    /// nested Planner construction. Controls which finalization policy the walk uses; see
+    /// findQueryForParallelReplicas(stack, mapping, settings, ...)'s own comment.
+    const TableNode * driver_for_policy = findTableForParallelReplicas(query_tree_node.get(), context);
+    bool relax_for_object_storage_driver
+        = driver_for_policy && dynamic_cast<const StorageObjectStorageCluster *>(driver_for_policy->getStorage().get());
+
     /// This is needed to avoid infinite recursion.
     auto mutable_context = Context::createCopy(context);
     mutable_context->setSetting("allow_experimental_parallel_reading_from_replicas", Field(0));
@@ -399,9 +537,39 @@ const QueryNode * findQueryForParallelReplicas(const QueryTreeNodePtr & query_tr
     /// We updated a query_tree with dummy storages, and mapping is using updated_query_tree now.
     /// But QueryNode result should be taken from initial query tree.
     /// So that we build a list of candidates again, and call findQueryForParallelReplicas for it.
-    auto new_stack = getSupportingParallelReplicasQueries(updated_query_tree.get(), context);
+    /// Only object-storage-cluster drivers need non-driver-branch roots collected at all -- skip the
+    /// (harmless but pointless) extra bookkeeping for MergeTree.
+    std::vector<const IQueryTreeNode *> non_driver_branch_roots;
+    auto new_stack = getSupportingParallelReplicasQueries(
+        updated_query_tree.get(), context, relax_for_object_storage_driver ? &non_driver_branch_roots : nullptr);
     const auto & mapping = planner.getQueryNodeToPlanStepMapping();
-    const auto * res = findQueryForParallelReplicas(new_stack, mapping, context->getSettingsRef());
+
+    /// Translate the collected non-driver QueryTreeNode siblings into plan-node identity once, up front --
+    /// the vocabulary the walk below actually operates in. Only QUERY-type siblings matter: a bare TABLE
+    /// non-driver side (e.g. IcebergBench q17's geo_location_lookup) has no internal steps to protect.
+    std::unordered_set<const QueryPlan::Node *> non_driver_plan_roots;
+    for (const auto * sibling : non_driver_branch_roots)
+    {
+        if (const auto * sibling_query_node = sibling->as<QueryNode>())
+        {
+            if (auto mapping_it = mapping.find(sibling_query_node); mapping_it != mapping.end())
+                non_driver_plan_roots.insert(mapping_it->second);
+        }
+    }
+
+    const auto * res = findQueryForParallelReplicas(
+        new_stack, mapping, context->getSettingsRef(), non_driver_plan_roots, relax_for_object_storage_driver);
+
+    /// DIAGNOSTIC (temporary, see ICEBERG_JOIN_EXPERIMENT.md §12.11): confirm the classification q21 was
+    /// getting wrong before this fix. Removed once validated live.
+    if (relax_for_object_storage_driver)
+        LOG_WARNING(getLogger("ParallelReplicasClusterDiag"),
+            "PR_CANDIDATE_CLASSIFY stack_size={} new_stack_size={} non_driver_branch_roots={} non_driver_plan_roots={} "
+            "selected_is_outermost={} selected_is_innermost={} selected_is_null={}",
+            stack.size(), new_stack.size(), non_driver_branch_roots.size(), non_driver_plan_roots.size(),
+            !new_stack.empty() && res == new_stack.front(),
+            !new_stack.empty() && res == new_stack.back(),
+            res == nullptr);
 
     if (res)
     {
@@ -534,230 +702,30 @@ const TableNode * findTableForParallelReplicas(const QueryTreeNodePtr & query_tr
     return findTableForParallelReplicas(query_tree_node.get(), context);
 }
 
-namespace
+const TableNode * findParallelReplicasCandidateDriver(const QueryNode * candidate)
 {
+    if (!candidate)
+        return nullptr;
 
-/// DIAGNOSTIC ONLY (see object_storage_cluster_bypass_join_wrap in PlannerJoinTree.cpp / IStorageCluster.cpp):
-/// self-contained copies of getSupportingParallelReplicasQueries()/findTableForParallelReplicas() above, with
-/// eligibility relaxed from "MergeTree" to "StorageObjectStorageCluster" (Iceberg/DataLake specifically, not
-/// every IStorageCluster). Used purely to observe -- via logging -- whether the existing whole-query/leftmost-
-/// table candidate-finding traversal (which already sees through CTEs/subqueries, unlike PlannerJoinTree's
-/// buildJoinTreeQueryPlan) would identify a multi-CTE query like IcebergBench's q21 as a distributable
-/// candidate and its leftmost table as the driver, the way it already does for MergeTree. Deliberately NOT
-/// wired into GlobalPlannerContext / real execution -- buildQueryPlanForParallelReplicas() below is
-/// MergeTree/task-based-parallel-replicas machinery (ClusterProxy::executeQueryWithParallelReplicas) and would
-/// not be correct for an IStorageCluster driver.
-///
-/// Narrowed from "any IStorageCluster" to "StorageObjectStorageCluster" specifically: the real dispatch
-/// (buildQueryPlanForObjectStorageCluster) only knows how to drive a StorageObjectStorageCluster (it calls
-/// StorageObjectStorageCluster::buildClusterTableFunctionAST(), which no other IStorageCluster subtype has).
-/// A driver of some other IStorageCluster type (e.g. a plain s3Cluster/hdfsCluster table nested under a CTE)
-/// must not be picked here -- it should stay on its existing (unsupported-by-this-prototype) path rather than
-/// be selected and then hit the LOGICAL_ERROR throw in buildQueryPlanForObjectStorageCluster.
-bool isObjectStorageClusterTable(const IQueryTreeNode & table_node_untyped)
-{
-    const auto & table_node = table_node_untyped.as<const TableNode &>();
-    return dynamic_cast<const StorageObjectStorageCluster *>(table_node.getStorage().get()) != nullptr;
-}
-
-/// saw_join, when non-null, is set to true iff the walk passes through an actual JOIN node (not
-/// ARRAY_JOIN/CROSS_JOIN -- CROSS_JOIN is rejected outright above, and ARRAY_JOIN doesn't introduce a second,
-/// independently-planned source the way a two-sided JOIN does). Used by findObjectStorageClusterWholeQueryDriver()
-/// to reject a candidate that is merely a chain of derived-table subqueries wrapping one table with no JOIN
-/// anywhere -- see its own comment for why that shape must never be treated as a whole-query JOIN-bypass
-/// candidate (confirmed live: IcebergBench q2's `appinfo_d` CTE body -- SELECT * FROM (SELECT ... FROM appinfo
-/// WHERE ...) t WHERE rn = 1 -- has no JOIN at all, yet this traversal "succeeds" down to `appinfo` as if it
-/// were one, since it walks straight through QUERY nodes to the driver TABLE regardless of whether a JOIN was
-/// ever involved).
-std::vector<const QueryNode *> getSupportingObjectStorageClusterQueriesForDiagnostic(const IQueryTreeNode * query_tree_node, bool * saw_join = nullptr)
-{
-    std::vector<const QueryNode *> res;
-
-    while (query_tree_node)
-    {
-        switch (query_tree_node->getNodeType())
-        {
-            case QueryTreeNodeType::TABLE:
-            {
-                if (isObjectStorageClusterTable(*query_tree_node))
-                    return res;
-                return {};
-            }
-            case QueryTreeNodeType::TABLE_FUNCTION:
-            {
-                return {};
-            }
-            case QueryTreeNodeType::QUERY:
-            {
-                const auto & query_node_to_process = query_tree_node->as<QueryNode &>();
-                query_tree_node = query_node_to_process.getJoinTree().get();
-                res.push_back(&query_node_to_process);
-                break;
-            }
-            case QueryTreeNodeType::UNION:
-            {
-                const auto & union_node = query_tree_node->as<UnionNode &>();
-                const auto & union_queries = union_node.getQueries().getNodes();
-                if (union_queries.empty())
-                    return {};
-                query_tree_node = union_queries.front().get();
-                break;
-            }
-            case QueryTreeNodeType::ARRAY_JOIN:
-            {
-                const auto & array_join_node = query_tree_node->as<ArrayJoinNode &>();
-                query_tree_node = array_join_node.getTableExpression().get();
-                break;
-            }
-            case QueryTreeNodeType::CROSS_JOIN:
-            {
-                return {};
-            }
-            case QueryTreeNodeType::JOIN:
-            {
-                const auto & join_node = query_tree_node->as<JoinNode &>();
-                const auto join_kind = join_node.getKind();
-                const auto join_strictness = join_node.getStrictness();
-                std::unordered_set<QueryTreeNodeType> supported_table_expression_types
-                    = {QueryTreeNodeType::TABLE, QueryTreeNodeType::QUERY, QueryTreeNodeType::UNION};
-
-                if (join_kind == JoinKind::Left || (join_kind == JoinKind::Inner && join_strictness == JoinStrictness::All))
-                    query_tree_node = join_node.getLeftTableExpression().get();
-                else if (join_kind == JoinKind::Right && join_strictness != JoinStrictness::RightAny
-                    && supported_table_expression_types.contains(join_node.getLeftTableExpression()->getNodeType()))
-                    query_tree_node = join_node.getRightTableExpression().get();
-                else
-                    return {};
-                if (saw_join)
-                    *saw_join = true;
-                break;
-            }
-            default:
-                return {};
-        }
-    }
-
-    return res;
-}
-
-/// Same traversal as findObjectStorageClusterDriverTableForDiagnostic used to be, but carrying QueryTreeNodePtr
-/// (shared_ptr) instead of raw pointers, since the real dispatch (buildQueryPlanForObjectStorageCluster) needs
-/// the exact driver node as a QueryTreeNodePtr to key IQueryTreeNode::cloneAndReplace() -- analogous to how
-/// StorageDistributed::buildQueryTreeDistributed() uses query_info.table_expression as that key. No longer
-/// diagnostic-only; used for real by findObjectStorageClusterWholeQueryDriver() below.
-QueryTreeNodePtr findObjectStorageClusterDriverTableNode(QueryTreeNodePtr query_tree_node)
-{
-    std::stack<QueryTreeNodePtr> join_nodes;
-    while (query_tree_node || !join_nodes.empty())
-    {
-        if (!query_tree_node)
-        {
-            query_tree_node = join_nodes.top();
-            join_nodes.pop();
-        }
-
-        switch (query_tree_node->getNodeType())
-        {
-            case QueryTreeNodeType::TABLE:
-            {
-                if (isObjectStorageClusterTable(*query_tree_node))
-                    return query_tree_node;
-                query_tree_node = nullptr;
-                break;
-            }
-            case QueryTreeNodeType::TABLE_FUNCTION:
-            {
-                query_tree_node = nullptr;
-                break;
-            }
-            case QueryTreeNodeType::QUERY:
-            {
-                auto & query_node_to_process = query_tree_node->as<QueryNode &>();
-                query_tree_node = query_node_to_process.getJoinTree();
-                break;
-            }
-            case QueryTreeNodeType::UNION:
-            {
-                auto & union_node = query_tree_node->as<UnionNode &>();
-                const auto & union_queries = union_node.getQueries().getNodes();
-                query_tree_node = nullptr;
-                if (!union_queries.empty())
-                    query_tree_node = union_queries.front();
-                break;
-            }
-            case QueryTreeNodeType::ARRAY_JOIN:
-            {
-                auto & array_join_node = query_tree_node->as<ArrayJoinNode &>();
-                query_tree_node = array_join_node.getTableExpression();
-                break;
-            }
-            case QueryTreeNodeType::CROSS_JOIN:
-            {
-                return nullptr;
-            }
-            case QueryTreeNodeType::JOIN:
-            {
-                auto & join_node = query_tree_node->as<JoinNode &>();
-                const auto join_kind = join_node.getKind();
-
-                if (join_kind == JoinKind::Left || (join_kind == JoinKind::Inner && join_node.getStrictness() == JoinStrictness::All))
-                {
-                    auto right_table_expression = join_node.getRightTableExpression();
-                    query_tree_node = join_node.getLeftTableExpression();
-                    join_nodes.push(std::move(right_table_expression));
-                }
-                else if (join_kind == JoinKind::Right)
-                {
-                    auto left_table_expression = join_node.getLeftTableExpression();
-                    query_tree_node = join_node.getRightTableExpression();
-                    join_nodes.push(std::move(left_table_expression));
-                }
-                else
-                {
-                    return nullptr;
-                }
-                break;
-            }
-            default:
-                return nullptr;
-        }
-    }
-
-    return nullptr;
-}
-
-}
-
-void logObjectStorageClusterParallelReplicasCandidate(
-    const QueryTreeNodePtr & query_tree_node, const ContextPtr & context, const SelectQueryOptions & select_query_options)
-{
-    if (!context->getSettingsRef()[Setting::object_storage_cluster_bypass_join_wrap])
-        return;
-
-    /// This constructor also runs for the recursive per-subquery Planner instances that plan each table
-    /// expression independently (see buildJoinTreeQueryPlan()'s `Planner subquery_planner(...)`), not only for
-    /// the outermost query. Only the outermost query's traversal is meaningful for "does the whole query,
-    /// CTEs included, reach the driver table" -- a recursive subquery's own Planner only ever sees its own
-    /// already-flattened-out subtree, so it trivially reports candidates=1 for itself.
-    if (select_query_options.is_subquery)
-        return;
-
-    auto * query_node = query_tree_node->as<QueryNode>();
-    auto * union_node = query_tree_node->as<UnionNode>();
-    if (!query_node && !union_node)
-        return;
-
-    auto candidates = getSupportingObjectStorageClusterQueriesForDiagnostic(query_tree_node.get());
-    QueryTreeNodePtr driver_table = findObjectStorageClusterDriverTableNode(query_tree_node);
-
-    LOG_WARNING(
-        getLogger("ParallelReplicasClusterDiag"),
-        "PR_CLUSTER_DIAG depth={} is_subquery={} candidates={} outermost_candidate_is_top_query={} driver_table={}",
-        select_query_options.subquery_depth,
-        select_query_options.is_subquery,
-        candidates.size(),
-        (!candidates.empty() && candidates.front() == query_tree_node.get()),
-        driver_table ? driver_table->as<TableNode &>().getStorageID().getFullTableName() : "<none>");
+    /// Reuses the same private, unguarded findTableForParallelReplicas(IQueryTreeNode*, ContextPtr&)
+    /// traversal buildQueryPlanForParallelReplicas() itself already relies on internally for MergeTree
+    /// (`findTableForParallelReplicas(modified_query_tree.get(), context)`). Deliberately NOT the public
+    /// findTableForParallelReplicas(QueryTreeNodePtr, SelectQueryOptions&) overload above: that overload's
+    /// `serialize_query_plan || canUseParallelReplicasOnFollower()` gate exists specifically for
+    /// PlannerJoinTree.cpp's View/MaterializedView follower-recursion-safety check
+    /// (GlobalPlannerContext::parallel_replicas_table) and returns nullptr unconditionally on a normal
+    /// initiator by design -- using it here would make this lookup always fail exactly where it's needed.
+    ///
+    /// `candidate` must be the exact QueryNode findQueryForParallelReplicas() selected (GlobalPlannerContext::
+    /// parallel_replicas_node), not the original root query tree passed to it: getSupportingParallelReplicasQueries()'s
+    /// traversal is deterministic and structural, so walking from `candidate` finds the identical driver a
+    /// walk from the root would -- but deriving it directly from the actual selected candidate, rather than
+    /// independently re-deriving it from the root and relying on the two traversals agreeing, keeps the
+    /// relationship correct by construction. candidate->getContext() is used rather than threading a
+    /// separate context parameter through the Planner constructor, since findQueryForParallelReplicas()'s own
+    /// internal walk only ever produces genuine QueryNode entries (see its `res.push_back(&query_node_to_process)`),
+    /// so `candidate`, when non-null, always owns a valid context of its own.
+    return findTableForParallelReplicas(candidate, candidate->getContext());
 }
 
 /// Walk the query tree looking for a UNION node whose every child query
@@ -899,100 +867,31 @@ JoinTreeQueryPlan buildQueryPlanForParallelReplicas(
     return {std::move(query_plan), std::move(processed_stage), {}, {}, {}};
 }
 
-namespace
-{
-
-/// True when query_node's JOIN tree, walked leftmost-first through any number of JOINs, reaches a TABLE or
-/// TABLE_FUNCTION directly -- i.e. the driving table (if any) is exactly the shape PlannerJoinTree.cpp's
-/// existing should_wrap_left_table bypass (see IStorageCluster-JOIN-pushdown experiment, PlannerJoinTree.cpp
-/// §3.1) already handles. Used to make sure the whole-query dispatch below only takes over for the shape it
-/// doesn't handle -- the driver nested at least one CTE/subquery level down (e.g. q21) -- and never second-
-/// guesses the already-validated flat-JOIN case (e.g. q17).
-bool isObjectStorageClusterDriverImmediateLeftmostTableExpression(const QueryNode & query_node)
-{
-    const IQueryTreeNode * join_tree_node = query_node.getJoinTree().get();
-    if (!join_tree_node)
-        return false;
-
-    while (join_tree_node->getNodeType() == QueryTreeNodeType::JOIN)
-        join_tree_node = join_tree_node->as<const JoinNode &>().getLeftTableExpression().get();
-
-    auto node_type = join_tree_node->getNodeType();
-    return node_type == QueryTreeNodeType::TABLE || node_type == QueryTreeNodeType::TABLE_FUNCTION;
-}
-
-}
-
-/// EXPERIMENTAL PROTOTYPE (see object_storage_cluster_bypass_join_wrap): returns the driving IStorageCluster
-/// TableNode (as an exact QueryTreeNodePtr, suitable for cloneAndReplace()) for query_tree's whole-query
-/// dispatch (see buildQueryPlanForObjectStorageCluster below), or nullptr if this query isn't eligible. Reuses
-/// the exact structural traversal already proven live against IcebergBench q21 by
-/// logObjectStorageClusterParallelReplicasCandidate() (§3.4).
+/// Execution backend for an object-storage-cluster driver -- see findQueryForParallelReplicas.h for the full
+/// contract and the two candidate-selection call sites that share this. Unlike the MergeTree path, does NOT go
+/// through ClusterProxy::executeQueryWithParallelReplicas (task/part-range-based coordinator, MergeTree-
+/// specific); instead it hands the whole (CTE-inlined) candidate query straight to the driver storage's own
+/// IStorageCluster::readPreparedClusterQuery() / ReadFromCluster path.
 ///
-/// Deliberately NOT the full MergeTree dummy-plan eligibility walk (findQueryForParallelReplicas()'s
-/// StorageDummy-based step-by-step validation that every intermediate plan node between candidate and driver
-/// is Expression/Filter/Join/mergeable-Sorting) -- that walk is tuned for MergeTree's semantics, where the
-/// *other* side of a JOIN may not be independently readable on every replica, so it deliberately falls back to
-/// a narrower candidate once it sees e.g. an Aggregating step inside a JOIN branch. For a DataLake/object
-/// storage JOIN, the non-driver side (e.g. q21's alert_events, itself a JOIN+Aggregating tree) is backed by the
-/// same shared catalog and *is* safely re-computable in full by every worker -- recomputing it once per worker
-/// is the intended tradeoff (driver gets partitioned via the task iterator, everything else re-reads/re-
-/// aggregates locally). Porting the MergeTree walk here unmodified would very likely reject q21's outer query
-/// and fall back to a narrower (wrong-for-us) candidate; a DataLake-specific eligibility policy needs its own
-/// design, not a blind port. Tracked as an open item, not solved by this prototype.
-QueryTreeNodePtr findObjectStorageClusterWholeQueryDriver(const QueryTreeNodePtr & query_tree, const ContextPtr & context)
-{
-    if (!context->getSettingsRef()[Setting::object_storage_cluster_bypass_join_wrap])
-        return nullptr;
-
-    auto * query_node = query_tree->as<QueryNode>();
-    if (!query_node)
-        return nullptr;
-
-    if (isObjectStorageClusterDriverImmediateLeftmostTableExpression(*query_node))
-        return nullptr;
-
-    /// Require an actual JOIN somewhere between query_tree and the driver -- this whole mechanism exists to
-    /// bypass IStorageCluster's JOIN-wrap guard, so it must never fire for a candidate that is merely a chain
-    /// of derived-table subqueries wrapping one table with no JOIN at all (see saw_join's comment on
-    /// getSupportingObjectStorageClusterQueriesForDiagnostic() above -- confirmed live: without this check,
-    /// IcebergBench q2's `appinfo_d` CTE body, which has no JOIN, was wrongly picked up here with `appinfo` as
-    /// driver, dispatching it to the cluster independently and producing a column-identifier mismatch
-    /// ("Not found column __tableN.appinfo_app in block") once the outer q2 JOIN tried to read its result).
-    bool saw_join = false;
-    auto candidates = getSupportingObjectStorageClusterQueriesForDiagnostic(query_tree.get(), &saw_join);
-    if (candidates.empty() || candidates.front() != query_tree.get() || !saw_join)
-        return nullptr;
-
-    return findObjectStorageClusterDriverTableNode(query_tree);
-}
-
-/// EXPERIMENTAL PROTOTYPE (see object_storage_cluster_bypass_join_wrap): sibling of
-/// buildQueryPlanForParallelReplicas() above for an IStorageCluster driver (e.g. Iceberg
-/// StorageObjectStorageCluster) instead of MergeTree. Unlike the MergeTree path, does NOT go through
-/// ClusterProxy::executeQueryWithParallelReplicas (task/part-range-based coordinator, MergeTree-specific);
-/// instead it hands the whole (CTE-inlined) candidate query straight to the driver storage's own
-/// IStorageCluster::readPreparedClusterQuery() / ReadFromCluster path -- the same execution mechanism already
-/// proven correct for q17 (see §2), just invoked here with the driver possibly several CTE/subquery scopes
-/// below query_tree (q21's shape, see §3.4), rather than only when the driver is the immediate JOIN leftmost
-/// table (PlannerJoinTree.cpp's existing bypass, §3.1).
-///
-/// Follows StorageDistributed::buildQueryTreeDistributed()'s exact-node replacement pattern: build the
-/// driver's own *Cluster table-function form as a resolved TableFunctionNode, then
-/// query_tree->cloneAndReplace(driver_table_expression, table_function_node) -- one call, no AST-position or
-/// StorageID search, correct for self-joins by construction. cloneAndReplace() rebinds every ColumnNode's
-/// column_source weak pointer from the old TableNode to the new TableFunctionNode automatically, so the
-/// resulting query is already correctly qualified once serialized -- no RestoreQualifiedNamesVisitor needed.
+/// Follows StorageDistributed::buildQueryTreeDistributed()'s exact-node replacement pattern: build the driver's
+/// own *Cluster table-function form as a resolved TableFunctionNode, then replace `driver_table_node` inside
+/// `query_tree` via IQueryTreeNode::cloneAndReplace() -- one call, no AST-position or StorageID search, correct
+/// for self-joins by construction. The replacement is keyed by raw node identity (cloneAndReplace()'s
+/// ReplacementMap is `unordered_map<const IQueryTreeNode *, QueryTreeNodePtr>`), so `driver_table_node` need not
+/// be reached via a QueryTreeNodePtr owned by the caller -- both findTableForParallelReplicas() (returns a raw
+/// `const TableNode *`) and PlannerJoinTree.cpp's leftmost TableNode reference work directly. cloneAndReplace()
+/// rebinds every ColumnNode's column_source weak pointer from the old TableNode to the new TableFunctionNode
+/// automatically, so the resulting query is already correctly qualified once serialized -- no
+/// RestoreQualifiedNamesVisitor needed.
 JoinTreeQueryPlan buildQueryPlanForObjectStorageCluster(
     const QueryTreeNodePtr & query_tree,
-    const QueryTreeNodePtr & driver_table_expression,
+    const TableNode & driver_table_node,
     const SelectQueryInfo & select_query_info,
     const PlannerContextPtr & planner_context)
 {
     auto processed_stage = QueryProcessingStage::WithMergeableState;
     auto context = planner_context->getQueryContext();
 
-    auto & driver_table_node = driver_table_expression->as<TableNode &>();
     auto driver_storage = std::dynamic_pointer_cast<StorageObjectStorageCluster>(driver_table_node.getStorage());
     if (!driver_storage)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -1001,22 +900,19 @@ JoinTreeQueryPlan buildQueryPlanForObjectStorageCluster(
 
     auto driver_storage_snapshot = driver_table_node.getStorageSnapshot();
 
-    /// EXPERIMENTAL (see object_storage_cluster_bypass_join_wrap, §3.6 in ICEBERG_JOIN_EXPERIMENT.md):
-    /// driver_table_node's own getClusterName() may well be empty here -- parallel_replicas_for_cluster_engines
-    /// could already have been forced false for the driver's own resolution scope by an ancestor query's
-    /// analyzer decision (§3.2), long before this whole-query dispatch ever ran. Rather than relaxing that
-    /// analyzer decision for the whole scope (which would make every DataLake table under the query
-    /// cluster-aware, not just the chosen driver), read cluster_for_parallel_replicas explicitly and pass it
-    /// only into the driver's own *Cluster table-function arguments below -- every other table in the query
-    /// resolves normally, per-worker, from the query text itself.
+    /// driver_table_node's own getClusterName() may well be empty here -- e.g. for a driver nested under a
+    /// CTE, whose own resolution scope never independently resolved a cluster name. Read
+    /// cluster_for_parallel_replicas explicitly and pass it only into the driver's own *Cluster table-function
+    /// arguments below (as a literal in the query text, never as a propagated Context setting -- see
+    /// StorageObjectStorageCluster::buildClusterTableFunctionAST()) -- every other table in the query resolves
+    /// normally, per-worker, from the query text itself.
     const auto & cluster_name = context->getSettingsRef()[Setting::cluster_for_parallel_replicas].value;
     if (cluster_name.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "object_storage_cluster_bypass_join_wrap whole-query dispatch requires cluster_for_parallel_replicas to be set");
 
-    /// Build the driver's own *Cluster table-function form (e.g. icebergS3Cluster('vig-test', ...)), the same
-    /// shape already proven correct for the leftmost-table (q17) dispatch, as a standalone AST fragment, then
-    /// turn it into a resolved TableFunctionNode exactly the way
+    /// Build the driver's own *Cluster table-function form (e.g. icebergS3Cluster('vig-test', ...)) as a
+    /// standalone AST fragment, then turn it into a resolved TableFunctionNode exactly the way
     /// StorageDistributed::buildQueryTreeDistributed()'s `remote_table_function` branch does.
     ASTPtr cluster_function_ast = driver_storage->buildClusterTableFunctionAST(cluster_name, driver_storage_snapshot, context);
 
@@ -1033,14 +929,16 @@ JoinTreeQueryPlan buildQueryPlanForObjectStorageCluster(
         query_analysis_pass.run(node, context);
     }
 
-    table_function_node->setAlias(driver_table_expression->getAlias());
+    table_function_node->setAlias(driver_table_node.getAlias());
 
     auto initial_header = InterpreterSelectQueryAnalyzer::getSampleBlock(
         query_tree->clone(), context, SelectQueryOptions(processed_stage).analyze());
 
     /// Exact-node QueryTree replacement (StorageDistributed's pattern): clone the whole candidate tree and
     /// replace only this precise TableNode, however deeply it is nested under CTEs/subqueries.
-    QueryTreeNodePtr modified_query_tree = query_tree->cloneAndReplace(driver_table_expression, table_function_node);
+    IQueryTreeNode::ReplacementMap replacement_map;
+    replacement_map.emplace(&driver_table_node, table_function_node);
+    QueryTreeNodePtr modified_query_tree = query_tree->cloneAndReplace(replacement_map);
 
     auto [header, new_planner_context] = InterpreterSelectQueryAnalyzer::getSampleBlockAndPlannerContext(
         modified_query_tree, context, SelectQueryOptions(processed_stage).analyze());
@@ -1048,6 +946,12 @@ JoinTreeQueryPlan buildQueryPlanForObjectStorageCluster(
     auto modified_query_tree_for_ast = modified_query_tree->clone();
     removeGroupingFunctionSpecializations(modified_query_tree_for_ast);
     ASTPtr modified_query_ast = queryNodeToDistributedSelectQuery(modified_query_tree_for_ast);
+
+    /// DIAGNOSTIC (temporary, see ICEBERG_JOIN_EXPERIMENT.md §12.9): log the exact text dispatched to workers,
+    /// to pin down a NOT_FOUND_COLUMN_IN_BLOCK confirmed live on q21 -- a header/alias mismatch that survives
+    /// only the serialize (queryNodeToDistributedSelectQuery) -> wire -> re-parse-on-worker round trip, since
+    /// the identical query tree executes correctly in-process (undistributed) today. Removed once diagnosed.
+    LOG_WARNING(getLogger("ObjectStorageClusterDispatch"), "OSC_DISPATCH query={}", modified_query_ast->formatForLogging());
 
     /// Preserve the *real* enclosing SelectQueryInfo (storage limits, has_aggregates/has_window, etc.) instead
     /// of fabricating a near-empty one, mirroring PlannerJoinTree.cpp's buildQueryPlanForTableExpression() /
@@ -1057,7 +961,7 @@ JoinTreeQueryPlan buildQueryPlanForObjectStorageCluster(
     query_info.query_tree = modified_query_tree;
     /// table_expression must be a node actually present in query_info.query_tree, since
     /// new_planner_context's TableExpressionData is keyed by node identity within *this* (modified) tree --
-    /// driver_table_expression (the old txnlog TableNode) was replaced and no longer exists in it.
+    /// driver_table_node (the old TableNode) was replaced and no longer exists in it.
     /// table_function_node is the exact replacement registered here; ReadFromCluster's task-iterator generation
     /// still goes through driver_storage/driver_storage_snapshot below, passed separately -- this field is only
     /// planner bookkeeping (e.g. SourceStepWithFilter::applyFilters()'s buildNodeNameToInputNodeColumn()).

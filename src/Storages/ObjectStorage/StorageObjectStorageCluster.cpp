@@ -582,10 +582,11 @@ ASTPtr StorageObjectStorageCluster::buildClusterTableFunctionAST(
     ASTPtr synthetic_query_ast = synthetic_query;
 
     /// getClusterName()/getOriginalClusterName() may well be empty here (e.g. for a driver nested below a CTE,
-    /// whose own resolution scope never got parallel_replicas_for_cluster_engines -- see
-    /// findObjectStorageClusterWholeQueryDriver in findParallelReplicasQuery.cpp). Pin it to the explicit
-    /// cluster_name via a context copy scoped to just this call, so updateQueryToSendIfNeeded()'s internal
-    /// getClusterName(context) calls resolve to what the caller actually asked for.
+    /// whose own resolution scope never independently resolved a cluster name). Pin it to the explicit
+    /// cluster_name via a context copy scoped to just this call -- discarded once this function returns, never
+    /// passed to storage->read()/the remote query executor -- so updateQueryToSendIfNeeded()'s internal
+    /// getClusterName(context) calls resolve to what the caller actually asked for, without that setting ever
+    /// propagating to the query actually sent to workers.
     auto scoped_context = Context::createCopy(context);
     scoped_context->setSetting("object_storage_cluster", cluster_name);
 

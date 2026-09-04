@@ -1913,20 +1913,24 @@ Planner::Planner(const QueryTreeNodePtr & query_tree_,
     : query_tree(query_tree_)
     , select_query_options(select_query_options_)
     , planner_context(buildPlannerContext(query_tree, select_query_options,
-        std::make_shared<GlobalPlannerContext>(
-            findQueryForParallelReplicas(query_tree, select_query_options),
-            findTableForParallelReplicas(query_tree, select_query_options),
-            findTableUnionForParallelReplicas(query_tree, select_query_options),
-            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_))))
+        [&]
+        {
+            /// Computed once and reused below: GlobalPlannerContext::parallel_replicas_candidate_driver is
+            /// derived directly from this exact candidate (findParallelReplicasCandidateDriver()), not
+            /// independently re-derived from query_tree -- see that function's own comment for why. Must NOT
+            /// use GlobalPlannerContext::parallel_replicas_table for this: that field comes from the public
+            /// findTableForParallelReplicas() overload, whose follower-only gate makes it nullptr
+            /// unconditionally on a normal initiator (it exists for PlannerJoinTree.cpp's View/
+            /// MaterializedView follower-recursion-safety check, an unrelated purpose).
+            const QueryNode * parallel_replicas_node = findQueryForParallelReplicas(query_tree, select_query_options);
+            return std::make_shared<GlobalPlannerContext>(
+                parallel_replicas_node,
+                findTableForParallelReplicas(query_tree, select_query_options),
+                findTableUnionForParallelReplicas(query_tree, select_query_options),
+                collectFiltersForAnalysis(query_tree, select_query_options, post_filter_),
+                findParallelReplicasCandidateDriver(parallel_replicas_node));
+        }()))
 {
-    /// EXPERIMENTAL, DIAGNOSTIC ONLY (see object_storage_cluster_bypass_join_wrap): no-op unless that setting
-    /// is enabled; purely observes (via LOG_WARNING) whether the parallel-replicas candidate traversal above
-    /// -- run again here with eligibility relaxed to IStorageCluster -- would have found a distributable
-    /// whole-query candidate and driver table the same way it does for MergeTree. Does not affect
-    /// planner_context or query execution. Restricted to the outermost (non-subquery) Planner invocation
-    /// inside the function itself, since this constructor also runs for each recursively-planned subquery.
-    if (!select_query_options.only_analyze)
-        logObjectStorageClusterParallelReplicasCandidate(query_tree, planner_context->getQueryContext(), select_query_options);
 }
 
 Planner::Planner(const QueryTreeNodePtr & query_tree_,
@@ -2303,19 +2307,20 @@ void Planner::buildPlanForQueryNode()
     if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node)
     {
-        join_tree_query_plan = buildQueryPlanForParallelReplicas(query_node, planner_context, select_query_info.storage_limits);
-    }
-    else if (QueryTreeNodePtr object_storage_cluster_driver = select_query_options.only_analyze
-                 ? nullptr
-                 : findObjectStorageClusterWholeQueryDriver(query_tree, query_context))
-    {
-        /// EXPERIMENTAL PROTOTYPE (see object_storage_cluster_bypass_join_wrap, §3.4 in
-        /// ICEBERG_JOIN_EXPERIMENT.md): whole-query dispatch for an IStorageCluster driver nested below a
-        /// CTE/subquery (e.g. IcebergBench q21) that PlannerJoinTree.cpp's existing leftmost-table bypass
-        /// (§3.1) can't reach -- analogous to the MergeTree branch above, but routed through the driver's own
-        /// IStorageCluster::readPreparedClusterQuery()/ReadFromCluster path rather than
-        /// ClusterProxy::executeQueryWithParallelReplicas.
-        join_tree_query_plan = buildQueryPlanForObjectStorageCluster(query_tree, object_storage_cluster_driver, select_query_info, planner_context);
+        /// GlobalPlannerContext::parallel_replicas_candidate_driver was found by
+        /// findParallelReplicasCandidateDriver(parallel_replicas_node) -- an initiator-safe lookup derived
+        /// directly from parallel_replicas_node itself (see findQueryForParallelReplicas.h; NOT
+        /// parallel_replicas_table, which is nullptr on a normal initiator by design -- it exists for
+        /// PlannerJoinTree.cpp's unrelated follower-recursion-safety check). Dispatch to the matching
+        /// execution backend based on the driver's storage kind: MergeTree keeps its existing
+        /// task-based-coordinator path; an object-storage-cluster driver goes through the same
+        /// exact-QueryTree-replacement/ReadFromCluster backend PlannerJoinTree.cpp's leftmost-driver case uses
+        /// below, so ObjectStorage execution is identical regardless of where the driver sits in the tree.
+        const TableNode * driver_table = planner_context->getGlobalPlannerContext()->parallel_replicas_candidate_driver;
+        if (driver_table && dynamic_cast<const StorageObjectStorageCluster *>(driver_table->getStorage().get()))
+            join_tree_query_plan = buildQueryPlanForObjectStorageCluster(query_tree, *driver_table, select_query_info, planner_context);
+        else
+            join_tree_query_plan = buildQueryPlanForParallelReplicas(query_node, planner_context, select_query_info.storage_limits);
     }
     else
     {

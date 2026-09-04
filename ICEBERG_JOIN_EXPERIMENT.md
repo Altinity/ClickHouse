@@ -1925,3 +1925,742 @@ index 9eefd709aba..248cacfd879 100644
 | `iceberg-join-bypass-arm64-v10` | + first whole-query execution-dispatch prototype (§3.5): `findObjectStorageClusterWholeQueryDriver`/`buildQueryPlanForObjectStorageCluster` in `findParallelReplicasQuery.cpp`, wired into `Planner.cpp`'s dispatch; `IStorageCluster.cpp` qualified-names-restoration skip for a subquery-rooted first table expression | superseded — confirmed live that issue #4 (empty driver cluster name) reproduces, falls back to local |
 | **`iceberg-join-bypass-arm64-v11`** | + §3.6: explicit per-call `object_storage_cluster` context override in `buildQueryPlanForObjectStorageCluster()` (reads `cluster_for_parallel_replicas` directly, doesn't touch `QueryAnalyzer.cpp`); `StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded()` now finds its own table expression anywhere in the query (recursing into subqueries) instead of assuming position 0 | **current, fixes issue #4 (cluster resolution) and the deeper task-iterator-rewrite gap it uncovered, not yet run live** |
 | `bin-runner-amd64` / `bin-runner-arm64` | generic binary-URL-driven runner image, no baked binary | available, unused so far for actual testing |
+
+---
+
+## 12. Redesign: reuse the stock parallel-replicas candidate machinery (`v17` → `v18`)
+
+Review of `v17` (§3.7) found the design too ad hoc: three separate gates spread across
+`PlannerJoinTree.cpp`/`QueryAnalyzer.cpp`/`findParallelReplicasQuery.cpp`, each patched
+reactively per benchmark query shape (`should_wrap_left_table` bypass,
+`canBypassClusterJoinWrapForTableExpressions`, `saw_join`,
+`isObjectStorageClusterDriverImmediateLeftmostTableExpression`), plus a bespoke duplicate
+traversal (`getSupportingObjectStorageClusterQueriesForDiagnostic`/
+`findObjectStorageClusterDriverTableNode`) shadowing ClickHouse's own
+`getSupportingParallelReplicasQueries`/`findTableForParallelReplicas`. Root cause: ClickHouse
+already decides "should this table be a distributed parallel-replicas driver" in two places for
+`MergeTree`, and this experiment never reused either:
+
+1. **Planner-level, per-table, post-analysis** — `GlobalPlannerContext::parallel_replicas_node`/
+   `parallel_replicas_table`, populated once at `Planner::Planner()` construction time by
+   `findQueryForParallelReplicas()`/`findTableForParallelReplicas()`, both gated by the single
+   eligibility predicate `isTableNodeEligibleForParallelReplicas()`. Handles a driver reachable
+   only through a CTE/subquery boundary (q21's shape) — `findQueryForParallelReplicas()`
+   deliberately returns `nullptr` when the eligible table is already in the *current* query
+   scope (`stack.back() == query_tree_node.get()`), because that case is handled by mechanism 2.
+2. **`PlannerJoinTree.cpp`, per-JOIN-tree, join-shape-based** —
+   `parallelReplicasEnabledForStorage()` (storage eligibility) +
+   `allowParallelReplicasForJoinTree()` (join-kind/strictness shape check: LEFT/INNER-ALL follow
+   left, qualifying RIGHT follow right, reject CROSS JOIN and non-simple RIGHT JOIN shapes),
+   consumed inside `buildQueryPlanForTableExpression()` to swap a plain `ReadFromMergeTree` step
+   for `ClusterProxy::executeQueryWithParallelReplicas()`. Handles a driver that is the immediate
+   leftmost/rightmost table of the JOIN (q17's shape).
+
+Because `DatabaseDataLake`/`StorageObjectStorageCluster` instead decided cluster-dispatch
+*at table-resolution time* via a *query-scope-wide* analyzer flag
+(`TableFunctionsWithClusterAlternativesVisitor`'s `has_join` check forcing
+`parallel_replicas_for_cluster_engines` off), neither mechanism above ever got a chance to pick
+an object-storage-cluster driver on its own — every fix in §3 was a patch trying to stop *other*
+tables from being incidentally swept up by that scope-wide flag, not a way of picking the driver.
+This is the most likely cause of the still-open q2/q4/q13 hot-latency regression (§9): relaxing
+`has_join` lets `DatabaseDataLake`'s pre-existing `can_use_parallel_replicas` fallback bake a
+cluster name into *any* DataLake table under a JOIN scope, not just the one actually meant to be
+distributed — e.g. `event_app` in q2, which then fans out over the network for no benefit versus
+its already-fast single-node read, while `appinfo_d`'s window-function CTE is unrelated and never
+should have been touched at all.
+
+### 12.1 Finalized architecture
+
+**Candidate selection** (two entry points, both reusing/generalizing the exact stock
+`MergeTree` machinery via a shared, pluggable storage-eligibility predicate — no new traversal):
+
+```
+q17 (direct leftmost/rightmost driver)                q21 (driver nested under CTE/subquery)
+        PlannerJoinTree.cpp                              findParallelReplicasQuery.cpp
+ parallelReplicasEnabledForStorage()                 findQueryForParallelReplicas()
+ allowParallelReplicasForJoinTree()                   findTableForParallelReplicas()
+        (bound to isObjectStorageClusterDriverEligible)  (via isTableNodeEligibleForParallelReplicas())
+                       \                                        /
+                        \                                      /
+                         v                                    v
+                    buildQueryPlanForObjectStorageCluster()  (single execution backend)
+```
+
+- `isObjectStorageClusterDriverEligible(storage, context)` (new, `findParallelReplicasQuery.cpp`,
+  exported via `findQueryForParallelReplicas.h`): true iff `storage` is a
+  `StorageObjectStorageCluster` and the query's settings opt in
+  (`object_storage_cluster_bypass_join_wrap`, `parallel_replicas_for_cluster_engines`,
+  non-empty `cluster_for_parallel_replicas`). This is the *single* place the opt-in setting is
+  checked now (previously checked independently in three files).
+- `isTableNodeEligibleForParallelReplicas()` delegates to it first, before its existing
+  `MergeTree`-only checks — this alone makes `findQueryForParallelReplicas()`/
+  `findTableForParallelReplicas()` recognize an object-storage-cluster driver nested under a
+  CTE/subquery, with zero changes to either function's traversal logic.
+- `allowParallelReplicasForJoinTree()` is refactored to take the storage-eligibility check as a
+  parameter (`ParallelReplicasStorageEligibility`, a `std::function<bool(const StoragePtr&)>`)
+  instead of calling `parallelReplicasEnabledForStorage()` directly. The existing `MergeTree`
+  call site binds `parallelReplicasEnabledForStorage`, byte-for-byte unchanged behavior; a new
+  call site in `buildJoinTreeQueryPlan()` binds `isObjectStorageClusterDriverEligible`, replacing
+  `canBypassClusterJoinWrapForTableExpressions()`'s syntactic guard with the same join-shape
+  check MergeTree's own dispatch already trusts (rejects CROSS JOIN, non-simple RIGHT JOIN
+  shapes, a `VIEW` leftmost table, etc., for free).
+
+**Execution** (one shared backend, unchanged in essence from `v17`'s redesign, just
+re-parameterized): `buildQueryPlanForObjectStorageCluster(query_tree, driver_table_node,
+select_query_info, planner_context)` — takes the driver as `const TableNode &` rather than a
+`QueryTreeNodePtr`, since `IQueryTreeNode::cloneAndReplace()`'s `ReplacementMap` is keyed by raw
+pointer (`std::unordered_map<const IQueryTreeNode *, QueryTreeNodePtr>`) — no shared-ptr
+ownership of the driver node is actually needed, which is what let this same function be called
+directly from both `Planner::buildPlanForQueryNode()` (mechanism 1, with
+`GlobalPlannerContext::parallel_replicas_table`, a raw `const TableNode *`) and
+`buildJoinTreeQueryPlan()` (mechanism 2, with the leftmost `TableNode` reference) with no
+duplicated logic. Internally: `StorageObjectStorageCluster::buildClusterTableFunctionAST()` →
+`buildQueryTree()`/`QueryAnalysisPass` → `IQueryTreeNode::cloneAndReplace()` (mirroring
+`StorageDistributed::buildQueryTreeDistributed()`'s `remote_table_function` branch) →
+`queryNodeToDistributedSelectQuery()` → `IStorageCluster::readPreparedClusterQuery()` →
+`ReadFromCluster`. The cluster identity is embedded as a literal argument in the driver's own
+`icebergS3Cluster('vig-test', ...)` table-function AST — never as a propagated `Context`
+setting — so no other table in the same query text (on the initiator *or* a worker) can pick up
+cluster-dispatch behavior it wasn't explicitly selected for.
+
+For q17 specifically: `buildJoinTreeQueryPlan()`'s leftmost-table branch calls
+`buildQueryPlanForObjectStorageCluster()` directly in place of
+`buildQueryPlanForTableExpression()` when eligible — bypassing `storage->read()` entirely for
+that table expression, so `parallelReplicasEnabledForStorage()`'s `MergeTree`-only
+`ReadFromMergeTree`-swap block is never reached (not just gated false — genuinely not in the
+call path). The existing stock short-circuit
+`if (left_table_expression_query_plan.stage != QueryProcessingStage::FetchColumns) return
+left_table_expression_query_plan;` then makes the leftmost table's plan own the whole JOIN tree,
+exactly the way `Distributed`/`Merge`/parallel-replicas storages already do — no second RHS
+planning path needed.
+
+### 12.2 Removed entirely (not just reverted-and-reintroduced elsewhere)
+
+- `Analyzer/Resolve/QueryAnalyzer.cpp` / `TableFunctionsWithClusterAlternativesVisitor.h` — the
+  `has_join` relaxation and `CLUSTER_ALT` diagnostic. Reverted to stock byte-for-byte
+  (`git checkout 296cce3c390 -- <path>`). No longer needed: cluster dispatch is injected
+  explicitly, only for the one selected driver, at execution time — no table's storage object
+  needs a baked-in cluster name from this analyzer-level path anymore.
+- `PlannerJoinTree.cpp`'s `canBypassClusterJoinWrapForTableExpressions()` — superseded by
+  `allowParallelReplicasForJoinTree()` bound to `isObjectStorageClusterDriverEligible`.
+- `findParallelReplicasQuery.cpp`'s diagnostic-only duplicate traversal
+  (`isObjectStorageClusterTable`, `getSupportingObjectStorageClusterQueriesForDiagnostic`,
+  `findObjectStorageClusterDriverTableNode`, `logObjectStorageClusterParallelReplicasCandidate`),
+  `isObjectStorageClusterDriverImmediateLeftmostTableExpression`, and
+  `findObjectStorageClusterWholeQueryDriver` (including its `saw_join` guard) — all superseded by
+  reusing `getSupportingParallelReplicasQueries()`/`findQueryForParallelReplicas()`/
+  `findTableForParallelReplicas()` directly. The `saw_join` guard in particular is no longer
+  needed: it existed only because the old duplicate traversal ran unguarded against the
+  *recursive per-CTE* `Planner` instance for `appinfo_d`'s own body; the stock dummy-plan-walk
+  inside `findQueryForParallelReplicas()` already rejects a lone window-function-over-table
+  candidate on its own terms (a `WindowStep` isn't Expression/Filter/Join/mergeable-Sorting, and
+  with no enclosing JOIN `inside_join` stays false, so it returns `nullptr` outright) — this may
+  also be what naturally fixes the q2/q4/q13 regression, since it was never really about the JOIN
+  shape at all, see §12.1's root-cause paragraph.
+- `Planner.cpp`'s `logObjectStorageClusterParallelReplicasCandidate()` call in the constructor —
+  no longer needed once `GlobalPlannerContext::parallel_replicas_node`/`parallel_replicas_table`
+  genuinely reflect object-storage-cluster eligibility.
+- The considered-and-rejected approach of injecting `object_storage_cluster` on a
+  `Context::createCopy()` passed into `storage->read()` for the driver (an earlier draft of this
+  redesign, before implementation): that context is what gets serialized to the remote workers,
+  so the setting would travel with the query and let a worker's own resolution of an *unrelated*
+  DataLake table in the same JOIN (e.g. the RHS lookup table) pick up the same cluster name and
+  recursively fan out — reproducing the same scope-wide leakage this whole redesign exists to
+  eliminate, just via a different setting. `buildClusterTableFunctionAST()`'s `Context::createCopy`
+  is safe by contrast because it's used only to steer local AST construction and is discarded
+  before any query ever leaves the initiator.
+
+### 12.3 Kept unchanged
+
+- `IStorageCluster::read()`'s `queryNodeToDistributedSelectQuery()` CTE-serialization fix (§3.2b)
+  — genuinely orthogonal to everything above, still needed whenever a query dispatched through
+  this path has a CTE anywhere in it.
+- `StorageObjectStorageCluster::buildClusterTableFunctionAST()`,
+  `IStorageCluster::readPreparedClusterQuery()` — the execution backend from `v17`'s redesign,
+  unchanged in mechanism, just re-parameterized (`buildQueryPlanForObjectStorageCluster()` now
+  takes `const TableNode &` instead of `QueryTreeNodePtr`, see §12.1).
+- The RHS-wrap revert (§3.3) — still correct, untouched.
+- Diagnostics `DLPR` (`DatabaseDataLake.cpp`) and `OSC_STAGE` (`StorageObjectStorageCluster.cpp`)
+  — kept for one more live validation pass (confirm no cluster-name leakage to non-driver tables
+  now that `QueryAnalyzer.cpp` is reverted); `CLUSTER_ALT` and `PR_CLUSTER_DIAG` removed along
+  with the code they were observing.
+
+### 12.4 Known gap, unchanged from `v17`
+
+Neither candidate-selection mechanism evaluates the *cost* of redundantly recomputing the
+non-driver side of the JOIN on every worker — `allowParallelReplicasForJoinTree()`/
+`getSupportingParallelReplicasQueries()` check structural pushability (JOIN kind, whether a step
+needs initiator finalization), not cardinality or expense. This happens to exclude `appinfo_d`
+(a window function is structurally non-passthrough) but would not exclude a structurally-flat
+yet expensive non-driver branch. True cost-based gating remains an open follow-up, not attempted
+here — same status as the original review's issue #2 (the full MergeTree dummy-plan-walk was
+always structural, never cost-based, either).
+
+### 12.5 Build/validate plan
+
+Implemented directly against `fix/antalya-26.6/query-plan-aggregation-perf` (not yet committed —
+see git status once the arm64 build/image lands). Same validation loop as §7-§9: cross-compile
+for `arm64` via `build_arm64/`, package into a new `iceberg-join-bypass-arm64-v18` image, push to
+`docker.io/nerflongshotuv/clickhouse-test`, then re-run the full 23-query IcebergBench suite with
+`object_storage_cluster_bypass_join_wrap=1` — expect q17/q21 to reproduce `v17`'s speedups via the
+new shared path, and (the main open question) q2/q4/q13 to no longer regress now that
+`QueryAnalyzer.cpp` is untouched and no non-driver table can pick up a cluster name it wasn't
+explicitly given.
+
+### 12.6 Bug found before any live run: `isObjectStorageClusterDriverEligible()` checked a setting the
+kept stock analyzer code permanently zeroes for any JOIN query (`v18` → `v19`)
+
+`v18` (§12.1-12.5) was built and pushed, but never actually run live -- caught by re-reading the
+interaction with the *kept* stock `QueryAnalyzer.cpp` code before testing. `TableFunctionsWithClusterAlternativesVisitor`'s
+`has_join` check (untouched, deliberately kept stock -- §12.2) still does exactly what it always did:
+
+```cpp
+if (!table_function_visitor.shouldReplaceWithClusterAlternatives())
+    query_node_typed.getMutableContext()->setSetting("parallel_replicas_for_cluster_engines", false);
+```
+
+`shouldReplaceWithClusterAlternatives()` is `false` for any query with `has_join=true` -- i.e. for
+both q17 and q21, unconditionally, before the `Planner` ever runs. `v18`'s
+`isObjectStorageClusterDriverEligible()` (`findParallelReplicasQuery.cpp`) checked
+`settings[Setting::parallel_replicas_for_cluster_engines]` as part of its gate -- reading that same,
+now-forced-`false` setting off the same query-node context. Net effect: with `v18`'s code, **no
+`SETTINGS` clause could ever make the new mechanism fire** for a JOIN query -- the eligibility check
+always saw `parallel_replicas_for_cluster_engines=false`, regardless of what the query's own
+`SETTINGS` requested. This was caught by tracing the setting through before testing, not live.
+
+**Fix (`v19`)**: dropped the `parallel_replicas_for_cluster_engines` check from
+`isObjectStorageClusterDriverEligible()` entirely. It was never a meaningful signal for this
+mechanism to begin with -- `object_storage_cluster_bypass_join_wrap` (untouched by any analyzer
+logic, always reflects exactly what the query's own `SETTINGS` requested) is the correct, sole
+opt-in gate, together with a non-empty `cluster_for_parallel_replicas` (needed later to actually
+pick the cluster). Confirmed this doesn't weaken any other gate: `Planner.cpp`'s dispatch condition
+(`canUseTaskBasedParallelReplicas()`) and `findQueryForParallelReplicas()`'s own gate
+(`canUseParallelReplicasOnInitiator()`) check `allow_experimental_parallel_reading_from_replicas`/
+`parallel_replicas_mode`/`max_parallel_replicas`/`automatic_parallel_replicas_mode` -- none of which
+the `has_join` guard touches. `DatabaseDataLake`'s own pre-existing `parallel_replicas_for_cluster_engines`-driven
+fallback (for a plain, non-JOIN DataLake table) is untouched and still governed by that setting as
+before -- only the new mechanism's own eligibility check stopped depending on it.
+
+Compiled clean (native + `arm64` sanity checks), rebuilt `build_arm64/`, repackaged and pushed as
+`iceberg-join-bypass-arm64-v19`. **Not yet run live** -- this is the next actual test.
+
+**Settings to test with** (same shape as §5, `parallel_replicas_for_cluster_engines` no longer
+load-bearing for this mechanism specifically but left set since it still governs other DataLake
+tables' normal behavior):
+
+```sql
+SETTINGS
+    enable_parallel_replicas = 1,
+    cluster_for_parallel_replicas = 'vig-test',
+    object_storage_cluster_bypass_join_wrap = 1,
+    parallel_replicas_for_cluster_engines = 1,
+    filesystem_cache_name = 's3_disk_cache',
+    use_page_cache_for_object_storage = 1,
+    remote_read_min_bytes_for_seek = 1048576
+```
+
+### 12.7 First live run against `v19`: `Code: 306. TOO_DEEP_RECURSION` on q21, two more bugs found (`v19` → `v20`)
+
+q21 (run against `v19` with the §12.6 settings) failed immediately with:
+
+```
+Code: 306. DB::Exception: Stack size too large. Stack address: 0xffff4dd60000, frame address:
+0xffff4e25fd50, stack size: 5243568, maximum stack size: 10485760. (TOO_DEEP_RECURSION)
+```
+
+**Bug 1 (the actual cause): mechanism B's new dispatch branch in `buildJoinTreeQueryPlan()` never
+checked `select_query_options.only_analyze`.** `buildQueryPlanForObjectStorageCluster()` internally
+calls `InterpreterSelectQueryAnalyzer::getSampleBlock()`/`getSampleBlockAndPlannerContext()` on
+`query_tree->clone()` purely to compute output headers -- each spins up its own fresh, `only_analyze=true`
+`Planner` that re-enters `buildJoinTreeQueryPlan()` on the *same, still-unreplaced* tree (the driver
+TableNode hasn't been swapped for the cluster table function yet at the point `getSampleBlock()` is
+called). Without an `only_analyze` guard, that recursive analyze-only invocation sees the identical
+eligible JOIN shape and calls `buildQueryPlanForObjectStorageCluster()` again, which calls
+`getSampleBlock()` again -- unbounded recursion, confirmed as the `TOO_DEEP_RECURSION` above.
+Mechanism A got this guard *for free*, because `findQueryForParallelReplicas()`/
+`findTableForParallelReplicas()` both early-return `nullptr` under `only_analyze` (so
+`GlobalPlannerContext::parallel_replicas_node`/`parallel_replicas_table` are never populated during an
+analyze-only Planner construction); mechanism B's new branch had no equivalent check. This
+specifically hit q21 because `alert_events`'s own CTE body (`event_alert LEFT JOIN policy_matches`)
+is *itself* an eligible immediate-leftmost JOIN, and gets recursively (re-)analyzed while the outer
+q21 dispatch (mechanism A, driver `txnlog`) computes its own headers -- but the same bug would equally
+hit q17 on its own first analyze pass; it just hadn't been tested yet when this was found.
+
+**Fix**: added `!select_query_options.only_analyze &&` to the mechanism B dispatch condition in
+`buildJoinTreeQueryPlan()`, mirroring the `select_query_options.only_analyze ? nullptr : ...` guard
+the original (`v17`) leftmost-driver prototype used at its own call site.
+
+**Bug 2 (found while fixing bug 1, not yet observed live -- fixed proactively): `isObjectStorageClusterDriverEligible()`
+had no protection against firing on an already-distributed execution.** Once the outer query's driver
+is dispatched via `ReadFromCluster`, each worker receives and independently analyzes/executes the
+*whole* prepared query text (CTEs inlined by body via `queryNodeToDistributedSelectQuery()`). For
+q21 that text still contains `alert_events`'s own `event_alert LEFT JOIN policy_matches` -- a second,
+independently eligible JOIN. Settings (`object_storage_cluster_bypass_join_wrap`,
+`cluster_for_parallel_replicas`) propagate to the worker like any other setting, so without a guard
+the worker's own analysis of that embedded JOIN would find `event_alert` eligible too and try to
+dispatch *it* via `buildQueryPlanForObjectStorageCluster()` again -- recursive re-fanout from within
+an already-distributed execution, not just redundant work. `DatabaseDataLake::tryGetTableImpl()`
+already guards its own (unrelated) parallel-replicas fallback against exactly this with
+`!context_->isDistributed() && query_kind != SECONDARY_QUERY`; added the identical guard to
+`isObjectStorageClusterDriverEligible()`. A worker executing a query it received via `ReadFromCluster`
+is always `isDistributed()==true`/`query_kind==SECONDARY_QUERY`, so this confines whole-query dispatch
+to the initiator's own top-level analysis, matching the pre-existing pattern instead of inventing a
+new one.
+
+Both fixes compiled clean (native + full relink, `arm64` full rebuild), repackaged and pushed as
+`iceberg-join-bypass-arm64-v20`. **Not yet re-run live** -- q21 (and q17, not yet tested at all) are
+the next actual test, same settings as §12.6.
+
+### 12.8 Second live run against `v20`: crash gone, but wrong topology (q21) and no distribution at all
+(q17) -- two more bugs, both root-caused precisely, not guessed (`v20` → `v21`)
+
+q21 no longer crashed, but `EXPLAIN` showed `Aggregating → Join → [ReadFromCluster (txnlog),
+Aggregating → Join → [ReadFromObjectStorage, ReadFromObjectStorage]]` -- only `txnlog` distributed,
+`alert_events` still fully local, instead of the target `MergingAggregated → ReadFromCluster`. q17
+regressed further: **no** `ReadFromCluster` at all, fully local on both sides.
+
+**Bug 3 (q21's wrong topology): `Planner.cpp`'s dispatch used `GlobalPlannerContext::parallel_replicas_table`
+to pick the execution backend, but that field is `nullptr` on a normal initiator by design.** Diagnosed
+precisely by the reviewer (not guessed): the public `findTableForParallelReplicas()` overload is gated by
+`serialize_query_plan || context->canUseParallelReplicasOnFollower()` -- a gate meant for
+`PlannerJoinTree.cpp`'s View/MaterializedView follower-recursion-safety check
+(`no_tables_or_another_table_chosen_for_reading_with_parallel_replicas_mode`), which is only meaningful on a
+*follower*. `canUseParallelReplicasOnFollower()` is `canUseTaskBasedParallelReplicas() && collaborate_with_initiator`,
+always false on the initiator itself -- so `parallel_replicas_table` is always `nullptr` there, and
+`Planner.cpp`'s `if (driver_table && dynamic_cast<StorageObjectStorageCluster*>(...))` always fell through
+to the `else` branch (`buildQueryPlanForParallelReplicas()`, the MergeTree/`ClusterProxy::executeQueryWithParallelReplicas`
+backend). That backend didn't outright fail for `txnlog` because it re-derives its own driver internally via
+the *private*, ungated `findTableForParallelReplicas(modified_query_tree.get(), context)` overload (which
+now finds `txnlog` fine, since `isTableNodeEligibleForParallelReplicas()` accepts `StorageObjectStorageCluster`)
+-- but it dispatches through the wrong coordinator (MergeTree part-range assignment, not the object-storage
+task iterator) and runs `rewriteJoinToGlobalJoin()`/`buildQueryTreeForShard()` (MergeTree-shard-rewriting),
+which is why `alert_events` ended up wrapped as an ordinary local `GLOBAL JOIN` instead of being absorbed
+into the same dispatched query text.
+
+**Fix**: added a new, purpose-built initiator-safe lookup, `findParallelReplicasCandidateDriver(candidate)`
+(`findParallelReplicasQuery.cpp`/`.h`) -- explicitly *not* a modification of the public
+`findTableForParallelReplicas()` (its follower-only gate is correct and load-bearing for
+`PlannerJoinTree.cpp`'s existing use; touching it would have been exactly the kind of scope creep this
+redesign is trying to avoid). It reuses the same private, unguarded `findTableForParallelReplicas(IQueryTreeNode*,
+ContextPtr&)` overload `buildQueryPlanForParallelReplicas()` itself already relies on for MergeTree, called
+with `candidate` -- the *exact* `QueryNode` `findQueryForParallelReplicas()` selected
+(`GlobalPlannerContext::parallel_replicas_node`) -- rather than independently re-deriving from the whole root
+query tree. Since `getSupportingParallelReplicasQueries()`'s traversal is deterministic and structural, a
+walk from `candidate` reaches the identical driver a walk from the root would, but deriving it directly from
+the actual selected candidate keeps the relationship correct by construction rather than by two traversals
+happening to agree. `GlobalPlannerContext` gained a new field, `parallel_replicas_candidate_driver`
+(5th constructor parameter, defaulted to `nullptr` so none of the ~13 other call sites needed touching),
+computed once in `Planner::Planner()`'s constructor alongside `parallel_replicas_node` (both derived from a
+single `findQueryForParallelReplicas()` call, avoiding recomputation/evaluation-order hazards). `Planner.cpp`'s
+dispatch now reads `parallel_replicas_candidate_driver` instead of `parallel_replicas_table`.
+
+**Bug 4 (q17 stopped distributing entirely): the `!context->isDistributed()` guard added in §12.7 (bug 2) was
+based on a wrong assumption about what that flag means in this codebase.** Traced precisely via
+`QueryAnalyzer.cpp:5817-5827`:
+```cpp
+auto & mutable_context = query_node.getMutableContext();
+if (!mutable_context->isDistributed())
+{
+    bool is_distributed = false;
+    if (auto * table_node = join_tree_node->as<TableNode>())
+        is_distributed = table_node->getStorage()->isRemote();
+    ...
+    mutable_context->setDistributed(is_distributed);
+}
+```
+`IStorageCluster::isRemote()` is unconditionally `true`. So the moment *any* query scope's own join tree
+resolves a remote-capable table, that scope's *own* context gets `isDistributed()=true` -- purely
+structurally, during ordinary analysis, regardless of initiator vs. worker. q17's own top-level scope gets
+this set the instant `event_page` is resolved. This is not the "am I a worker executing an already-dispatched
+sub-query" signal `DatabaseDataLake.cpp`'s analogous check relies on -- that check works there only because
+of *when* it runs (during a table's own resolution, before the flag is set for it), a timing distinction
+that doesn't hold when read later, at Planner-construction time, after analysis has already flipped it for
+the whole scope. The actual "am I a worker" signal, `query_kind == SECONDARY_QUERY`, was already present
+alongside it and is unaffected by this bug.
+
+**Fix**: removed `!context->isDistributed()` from `isObjectStorageClusterDriverEligible()`, keeping only
+`query_kind != SECONDARY_QUERY` (the correct, narrower signal for the worker-side recursive-refanout concern
+§12.7 bug 2 was actually about).
+
+Both fixes compiled clean (native sanity + full relink in progress). Pushed as `iceberg-join-bypass-arm64-v21`
+once the `arm64` build completes. **Not yet re-run live.**
+
+**Success criteria for this build, per reviewer guidance** -- explicitly *not* "q17/q21 pass ⇒ done":
+1. q17 → `ReadFromCluster` / ~4s, q21 → `MergingAggregated → ReadFromCluster` / ~9s. This only proves the
+   plumbing (candidate selection + execution backend wiring) is now behavior-preserving relative to `v17`'s
+   validated shape -- it does **not** yet prove the general refactor is correct.
+2. Immediately after, re-check q2/q4/q13/q16. The direct-driver path
+   (`allowParallelReplicasForJoinTree()` bound to `isObjectStorageClusterDriverEligible()`) only checks that
+   the *left* storage is eligible for a `LEFT`/`INNER ALL` join -- it does not, and structurally cannot by
+   itself, distinguish q17's shape (`event_page LEFT JOIN` a 17-row lookup) from q2's shape (`event_app LEFT
+   JOIN appinfo_d`, an expensive window-function CTE) the same way `findQueryForParallelReplicas()`'s
+   dummy-plan-walk incidentally does for q21's driver-selection path (§12.2's `saw_join` removal note). If
+   q2/q4/q13 regress again here, that is not a plumbing bug to patch with another syntactic guard -- it is
+   the same open, genuinely unsolved cost/eligibility question flagged in §12.4, now confirmed to affect the
+   direct-driver path too, and the next step would be designing an actual cost signal, not another guard.
+
+### 12.9 Third live run against `v21`: q17 works, q2/q4/q13/q16 don't regress; q21 has a new,
+different bug (`v21` → `v22`, diagnostic-only)
+
+Confirmed live: q17 → `ReadFromCluster`, correct topology (§12.8 bugs 3 and 4 both fixed). q2/q4/q13/q16
+show no regression this round -- real validation that at least for these specific benchmark queries the
+direct-driver path's lack of a cost signal (§12.8's stated risk) has not (yet) bitten in practice.
+
+q21 now fails differently -- no crash, `ReadFromCluster` does appear in the plan (topology looks right), but
+execution fails:
+```
+Code: 10. DB::Exception: Not found column __table4.transaction_id in block. There are only columns:
+__table1.transaction_id, max(if(equals(__table1.alert_type, 'Malware'_String), coalesce(__table2.policy_action,
+__table1.action), __table1.action)): While executing Remote. (NOT_FOUND_COLUMN_IN_BLOCK)
+```
+
+Not guessed at: reproduced the *structural* shape locally first (`clickhouse local`, plain `Memory` tables,
+no cluster involved) to isolate whether this is a general AST/analyzer bug in
+`queryNodeToDistributedSelectQuery()`'s CTE-inlining for a "JOIN whose RHS is itself a JOIN against a CTE
+that re-references the same underlying table twice" shape (q21's actual structure: `alert_events` joins
+`event_alert AS a` against `policy_matches`, which itself independently reads `event_alert` again) --
+**both the original `WITH ... AS (...)` form and a manually flattened form (every CTE reference replaced by
+its own subquery body, mirroring `set_subquery_cte_name=false` serialization) execute correctly locally**,
+producing identical, correct results. This rules out a general AST-flattening/self-reference bug in the
+CTE-inlining logic itself -- the bug is specific to something in the actual distributed dispatch (serialize
+→ wire → re-parse-and-execute-on-worker), not reproducible with a pure in-process round trip.
+
+**Not yet fixed -- added a temporary diagnostic instead of guessing**: `buildQueryPlanForObjectStorageCluster()`
+now logs the exact dispatched query text (`LOG_WARNING`, tag `OSC_DISPATCH`) right after
+`queryNodeToDistributedSelectQuery()` produces it, so the next run can compare the *actual* serialized text
+against the locally-tested reproduction above and pin down where they diverge (most likely candidate,
+not yet confirmed: something specific to the driver being a genuine multi-node dispatching table function
+(`icebergS3Cluster(...)`) embedded as one operand of a JOIN whose *other* operand is itself another JOIN,
+executed by each of 3 initiator-selected workers independently -- an interaction between nested distributed
+dispatch and the alias/column-position matching `ReadFromCluster`/`RemoteQueryExecutor` do when reconciling
+returned blocks, not exercised by q17's simpler flat-RHS shape). Compiled clean, pushed as
+`iceberg-join-bypass-arm64-v22`. **Next action: re-run q21 against `v22` and capture the `OSC_DISPATCH` log
+line from `clickhouse-server.log`** (`grep OSC_DISPATCH`) before attempting any fix.
+
+### 12.10 Root cause found: `findQueryForParallelReplicas()`'s MergeTree-tuned candidate-narrowing policy
+is too conservative for an object-storage-cluster driver (`v22` → `v23`)
+
+The `OSC_DISPATCH` log plus the full `EXPLAIN` from `v21`/`v22` (reviewer's analysis, cross-checked against
+source, not taken on faith) showed the actual topology:
+```
+Join
+  Expression -> ReadFromCluster                                    (transaction_event, driver = txnlog)
+  Expression -> MergingAggregated -> Expression (Convert object storage
+                cluster whole-query names) -> ReadFromCluster       (alert_events, driver = event_alert)
+```
+i.e. `transaction_event` and `alert_events` were being dispatched as **two independent**
+`buildQueryPlanForObjectStorageCluster()` calls, joined locally on the initiator -- not the target `outer
+q21 query -> MergingAggregated -> ReadFromCluster` whole-query dispatch. That directly explains the
+`NOT_FOUND_COLUMN_IN_BLOCK __table4` error too: each independently-dispatched candidate gets its own,
+separately-numbered `__tableN` identifiers, and nothing reconciles the two once `alert_events`'s
+independently-computed result is joined against the outer scope's expectation of it.
+
+Traced precisely against `findQueryForParallelReplicas()`'s own dummy-plan walk (`findParallelReplicasQuery.cpp`,
+the internal 3-arg overload, unchanged in this repository until this fix) for q21's exact shape:
+- `getSupportingParallelReplicasQueries()` from the outer q21 query walks `outer -> JOIN(left) -> transaction_event
+  -> txnlog`, giving `stack = [outer_query, transaction_event]`.
+- The dummy-plan walk processes innermost-first: `transaction_event`'s own scope (`SELECT transaction_id FROM
+  txnlog WHERE ...`) is a clean Expression/Filter chain -> `res = transaction_event`.
+- Processing the outer query next: its own plan is `Aggregating -> ... -> Join(txnlog-side, alert_events-side)`.
+  Walking this hits the outer `Aggregating` (needs finalization, `inside_join=false` at that point, so the
+  walk *keeps going* rather than stopping), then the `Join` step (pushes both children with `inside_join=true`),
+  then reaches `alert_events`'s own `Aggregating` (its `GROUP BY a.transaction_id`) with `inside_join=true`.
+  `can_distribute_full_node` ends up `false`, `currently_inside_join` ends up `true`.
+- The function's own return logic: `if (!res) return nullptr; return currently_inside_join ? res : subquery_node;`
+  -- since `currently_inside_join=true` and `res=transaction_event`, it returns the **narrower**
+  `transaction_event`, not the outer query. The function's own comment on this exact branch says why:
+  *"If we were inside JOIN we cannot offload the whole subquery to replicas because at least one side of the
+  JOIN needs to be finalized on the initiator."*
+
+That assumption -- a JOIN's non-driver branch needing its own finalization means the branch can't be
+delegated to a replica -- is specifically true for MergeTree (a shard cannot assume it independently holds
+the data needed to correctly finalize the non-driver side) and specifically **false** for a DataLake/
+object-storage JOIN, where every worker has full access to the same shared catalog and can safely,
+redundantly recompute the non-driver branch (`alert_events`, GROUP BY included) in full. This exact
+distinction was already flagged, deliberately unresolved, in the original `v17` prototype notes (review
+issue #2: *"a DataLake-specific eligibility policy needs its own design, not a blind port"*) and in this
+redesign's own §12.4 -- reusing `findQueryForParallelReplicas()` wholesale (rather than just its structural
+half) fixed the `appinfo_d` false-positive (§12.2) but reintroduced this false-negative for q21, a genuine,
+previously-anticipated tension between MergeTree's and DataLake's semantics, not a plumbing bug.
+
+**Fix**: added a 4th parameter, `narrow_candidate_on_non_passthrough_join_branch`, to the internal 3-arg
+`findQueryForParallelReplicas(stack, mapping, settings, ...)` walk, controlling exactly the
+`currently_inside_join ? res : subquery_node` decision above -- `true` (MergeTree's call site, unchanged
+behavior) keeps falling back to the narrower candidate; `false` (used when the eventual driver is a
+`StorageObjectStorageCluster`) instead accepts the wider candidate regardless. The *other*, unconditional
+rejection path just above it (`if (!res) return nullptr;`, which is what correctly excludes q2's `appinfo_d`
+-- a window function with no enclosing JOIN at all, rejected before this parameter is ever consulted) is
+untouched by this change, so the q2/q4/q13/q16 protection is unaffected. The public `findQueryForParallelReplicas()`
+overload determines which policy to use by finding the eventual driver's storage *before* running the dummy-plan
+walk -- a second, cheap, side-effect-free call to the same private, structural `findTableForParallelReplicas()`
+traversal already used elsewhere in this redesign (no dummy-table substitution, no nested `Planner`
+construction) -- and passes the corresponding boolean through.
+
+**Known, deliberately out of scope for this fix**: the relaxation applies uniformly to *any* non-passthrough
+step found inside a JOIN once the driver is object-storage-cluster-kind, not specifically to the *non-driver*
+side. A (currently hypothetical, not exercised by q17/q21) shape where the *driver's own* path additionally
+passed through a JOIN with an unabsorbed step before reaching the actual table could be wrongly accepted
+under this policy. Neither test query has this shape; distinguishing "which side of the join" would need
+the dummy-plan walk to track branch identity, not just an `inside_join` boolean -- left as a follow-up, not
+attempted here, matching this document's established practice of flagging known gaps rather than
+guessing at unexercised cases.
+
+Compiled clean (native + `arm64` full rebuilds). Pushed as `iceberg-join-bypass-arm64-v23` once the `arm64`
+build completes. **Not yet re-run live.** Expected: q21 -> `outer query MergingAggregated -> ReadFromCluster`,
+single dispatch, matching `v17`'s validated `~9s` shape; q17/q2/q4/q13/q16 unaffected (this change only
+alters the policy consulted when the eventual driver is object-storage-cluster-kind *and* the outer query
+was already being considered as a mechanism-A candidate at all -- q17's mechanism-B path and q2/q4/q13/q16's
+rejection-before-policy-matters path are both untouched). The `OSC_DISPATCH` diagnostic (§12.9) is left in
+place for this next validation pass, to directly confirm the dispatched text is now the single, whole outer
+query rather than two independent candidates.
+
+### 12.11 `v23` rejected before testing: too broad, fixed by carrying branch-role through the traversal
+(`v22`/`v23` → `v24`)
+
+§12.10's fix (`v23`) was rejected on review *before* being adopted, for a correctness reason its own
+"known, deliberately out of scope" paragraph had already flagged but underestimated: it relaxed narrowing
+for *any* non-passthrough step found inside a JOIN once the driver is object-storage-cluster-kind, not
+specifically the non-driver side. Counter-example: `(SELECT k, sum(v) FROM object_storage_driver GROUP BY
+k) LEFT JOIN rhs` -- here the `GROUP BY` sits on the *driver's own* (partitioned) path, and blindly widening
+the candidate would let each worker aggregate only its own file-range slice before the JOIN, which is not
+generally equivalent to aggregating first. `v23` was pushed before this was caught, but should not be used
+-- the actual property needed is "the finalization-requiring step is on a JOIN branch proven to be the
+*non-driver* side, not merely the driver's own storage kind."
+
+**Two further gaps found in the first sketch of the branch-aware fix**, before any of it was written, by
+tracing the exact code (not assumption):
+
+1. **Order-dependence.** The existing `currently_inside_join = inside_join;` assignment inside the walk is
+   overwritten on *every* non-passthrough step found, and the walk does not stop at the first one -- q21's
+   own candidate check visits at least three (outer `Aggregating`, `alert_events`'s own `GROUP BY`,
+   `policy_matches`'s own `GROUP BY`). A branch-role bit tracked the same overwriting way would let whichever
+   failure is visited *last* silently override an earlier, differently-classified one. Fixed by keeping
+   `currently_inside_join`'s existing last-write semantics **completely untouched** (so MergeTree's decision
+   is provably byte-identical to before) and adding a **separate, purely cumulative** flag,
+   `saw_unsafe_join_branch_failure` (set once, on any inside-join failure *not* on a recognized non-driver
+   branch, never reset), consulted only when the driver is object-storage-cluster-kind.
+2. **Plan-node identity mismatch.** `Planner.cpp:2753` (`query_node_to_plan_step_mapping[&query_node] =
+   query_plan.getRootNode();`) confirms `mapping[alert_events]` records the root of `alert_events`'s own,
+   independently-built plan (e.g. its `Aggregating` step) -- captured *before* the outer query wraps it with
+   its own "Pre Join Actions" `Expression` step(s) when integrating it as a JOIN operand (the same shape
+   visible in the real initiator `EXPLAIN`: `Join → Expression (Right Pre Join Actions) → ... →
+   MergingAggregated`). So a JOIN's *immediate* child in the walk is that wrapper, not the mapped node one
+   or more levels down -- pointer-equality against immediate JOIN children alone would miss it. Rather than a
+   per-JOIN subtree search, the walk already visits every one of those intermediate wrapper steps one at a
+   time via its existing single-child traversal (and `ExpressionStep` is already classified as passthrough,
+   so it doesn't itself trigger a failure) -- so checking set membership at *every* visited node, not just
+   immediate JOIN children, finds the mapped root correctly at whatever depth it sits, in O(1) per node
+   instead of O(subtree) per JOIN.
+
+**Fix, replacing `v23`'s single boolean:**
+- `getSupportingParallelReplicasQueries()` gained an optional out-parameter,
+  `std::vector<const IQueryTreeNode *> * non_driver_branch_roots`, populated at the exact point the function
+  already decides which JOIN child to follow toward the driver -- pushing the *other* child (previously
+  discarded) when non-null. Zero behavior change for existing callers (parameter defaults to `nullptr`).
+- The public `findQueryForParallelReplicas()` overload calls this (only when the driver is
+  object-storage-cluster-kind, via the same early `findTableForParallelReplicas()` lookup from `v23`) on
+  `updated_query_tree` specifically -- not the original tree -- so the collected pointers share identity
+  with `mapping` (both built from the same dummy-substituted clone). QUERY-type siblings are then resolved
+  through `mapping` once, up front, into `non_driver_plan_roots` (`std::unordered_set<const QueryPlan::Node
+  *>`); a bare-table non-driver side (q17's `geo_location_lookup`) is skipped, having no internal steps to
+  protect.
+- The internal 3-arg walk's `Frame` gained one sticky bit, `on_non_driver_branch`, checked and propagated at
+  *every* visited node (inherited from the parent frame, or newly set on a `non_driver_plan_roots` match) --
+  addressing gap 2. The failure site now also sets `saw_unsafe_join_branch_failure` cumulatively when
+  `inside_join && !on_non_driver_branch` -- addressing gap 1. The final decision:
+  `relax_for_object_storage_driver ? saw_unsafe_join_branch_failure : currently_inside_join` -- for
+  MergeTree (`relax_for_object_storage_driver=false`, `non_driver_plan_roots` never populated), this reads
+  `currently_inside_join` exactly as stock code always has; only the object-storage path uses the new,
+  order-independent, branch-aware signal.
+
+Verified against the counter-example from the rejected `v23`: `GROUP BY` on the driver's own (LEFT/followed)
+side means the *right* side gets recorded as the non-driver sibling, not the aggregating branch --
+`on_non_driver_branch` stays false at that `Aggregating` step, `saw_unsafe_join_branch_failure` still gets
+set, narrowing still applies, exactly as required.
+
+Added a temporary diagnostic (`LOG_WARNING`, tag `PR_CANDIDATE_CLASSIFY`, object-storage-driver candidates
+only) logging candidate-stack size, how many non-driver branch roots were found/resolved, and whether the
+final selection is the outermost/innermost/null candidate -- to directly confirm q21's classification
+without needing to infer it from `EXPLAIN` alone. Compiled clean (native + `arm64` full rebuilds). Pushed as
+`iceberg-join-bypass-arm64-v24`.
+
+### 12.12 `v24` live: `selected_is_null=true` -- a third, unrelated bug in the dummy-substitution mechanism
+itself (`v24` → `v25`, diagnostic-only)
+
+`PR_CANDIDATE_CLASSIFY` from the actual `v24` run: `stack_size=2 non_driver_branch_roots=1
+non_driver_plan_roots=1 selected_is_outermost=false selected_is_innermost=false selected_is_null=true`.
+`res` is **null**, not narrow (`transaction_event`) and not wide (outer query) -- §12.11's fix for gaps 1
+and 2 both worked exactly as designed (`non_driver_branch_roots`/`non_driver_plan_roots` both correctly
+populated), but the *result itself* regressed to nothing at all, and the `OSC_DISPATCH` text (`alert_events`
+alone, `icebergS3Cluster(event_alert) LEFT JOIN policy_matches`) confirms mechanism A found no candidate,
+letting `buildJoinTreeQueryPlan()` run normally for the outer query and mechanism B independently pick up
+`alert_events`'s own `event_alert` as an unrelated immediate-leftmost driver -- a different code path than
+anything touched in §12.10/§12.11.
+
+Traced (not yet confirmed live) to a third, structurally separate bug in the pre-existing dummy-substitution
+mechanism itself, unrelated to branch-role tracking: `getSupportingParallelReplicasQueries()`, called on
+`updated_query_tree` (dummy-substituted), reaches `transaction_event`'s own driving table -- now a
+`StorageDummy` standing in for the real `StorageObjectStorageCluster` `txnlog` -- and if
+`canUseTableForParallelReplicas()` (→ `isTableNodeEligibleForParallelReplicas()`) rejects that `StorageDummy`,
+the function returns `{}` (discarding everything accumulated, including `outer_query`/`transaction_event`)
+regardless of anything already recorded via the `non_driver_branch_roots` out-parameter (a side effect,
+independent of the return value) -- exactly matching `new_stack` ending up empty, the internal walker's
+`while (!stack.empty())` loop never running, and `res` staying `nullptr`.
+
+Whether `isObjectStorageClusterDriverEligible()`'s `StorageObjectStorageCluster`-only `dynamic_cast` (which a
+generic `StorageDummy` can never satisfy) is *actually* what rejects it, or whether the existing MergeTree/
+`StorageDummy` fallback path (`storage->isMergeTree() || typeid_cast<StorageDummy*>`, then
+`supportsReplication()`) still saves it as it apparently did before this session's changes (`ReadFromCluster`
+did appear for `txnlog` in every prior test), is not yet certain from static reading alone --
+`StorageObjectStorage::supportsReplication()` returns `configuration->isDataLakeConfiguration()` (true for
+Iceberg) and `ReplaceTableNodeToDummyVisitor` passes the real storage's `supportsReplication()` into the
+`StorageDummy` constructor, which by that reasoning *should* still pass the stock MergeTree/StorageDummy
+check -- but that reasoning contradicts the observed `new_stack` failure, so something in it is wrong.
+Rather than guess further, added a second temporary diagnostic, `PR_TABLE_ELIGIBILITY_FAIL` (fires from
+`getSupportingParallelReplicasQueries()`'s own `TABLE` case whenever `canUseTableForParallelReplicas()`
+rejects a table, logging `is_storage_dummy`, `is_merge_tree`, `supports_replication`, and the
+`parallel_replicas_for_non_replicated_merge_tree` setting), plus `new_stack_size` added directly to
+`PR_CANDIDATE_CLASSIFY` (previously only `stack.size()`, the *original*-tree stack, was logged -- not
+`new_stack.size()`, the dummy-tree one actually driving the walk). Compiled clean (native + `arm64` full
+rebuilds). Pushed as `iceberg-join-bypass-arm64-v25`. **Not yet re-run live** -- next action is to capture
+both new log lines from a fresh q21 run before writing any further fix.
+
+### 12.13 Root cause confirmed with certainty: `StorageDummy` erases the type `isObjectStorageClusterDriverEligible()` depends on (`v25` → `v26`)
+
+`v25` live: `PR_TABLE_ELIGIBILITY_FAIL table=ice.\`billion-rows_t17175.txnlog\` is_storage_dummy=true
+is_merge_tree=false supports_replication=false parallel_replicas_for_non_replicated_merge_tree=false`,
+immediately followed by `PR_CANDIDATE_CLASSIFY ... new_stack_size=0 ... selected_is_null=true`. No more
+ambiguity: the dummy-substituted `txnlog` fails the eligibility check inside
+`getSupportingParallelReplicasQueries()`, which discards the *entire* candidate stack (`{}`), including
+everything already accumulated (`outer_query`, `transaction_event`) -- independent of §12.11's
+`non_driver_branch_roots`/`non_driver_plan_roots` bookkeeping, which had already succeeded (both `=1`) by
+that point. With `new_stack` empty, the internal walker's `while (!stack.empty())` loop never runs and `res`
+stays `nullptr` -- `parallel_replicas_node` ends up unset entirely, `buildJoinTreeQueryPlan()` runs normally
+for the outer query, and `alert_events` gets independently picked up by mechanism B -- a different code path
+than anything §12.10/§12.11 touched, which is why those fixes, though individually correct (confirmed by
+the same log line), could never have been observed taking effect.
+
+**Root cause, structural, not tunable**: `ReplaceTableNodeToDummyVisitor` (used only for the disposable
+plan built to walk plan-step *shapes*, never executed) replaces every table with a generic `StorageDummy` --
+by design, since the dummy-tree analysis only needs each table's columns/`StorageID`, not its real storage
+class. But `isObjectStorageClusterDriverEligible()`'s `dynamic_cast<StorageObjectStorageCluster *>` can
+never succeed against a `StorageDummy`, no matter what the original storage was -- the type information the
+whole ObjectStorage eligibility path depends on is erased by the very substitution mechanism eligibility is
+later re-checked against. `StorageDummy`'s own MergeTree/replication fallback doesn't save it either,
+because `StorageObjectStorage::supportsReplication()` (`return configuration->isDataLakeConfiguration();`)
+reports the underlying catalog's own replication semantics -- for this Iceberg source, `false` -- not "is
+this a valid parallel-replicas candidate," a question `StorageDummy`'s constructor has no other way to be
+told the answer to. Static reasoning about whether this fallback would or wouldn't save it (§12.12) was
+inconclusive precisely because the property being checked (`isDataLakeConfiguration()`) has nothing to do
+with the property actually needed -- confirmed empirically rather than resolved by further reading.
+
+**Fix**: `isObjectStorageClusterDriverEligible()`'s signature changed from `(const StoragePtr &, const
+ContextPtr &)` to `(const IStorage &, const ContextPtr &)` -- a pure widening, no behavior change at either
+existing call site (`isTableNodeEligibleForParallelReplicas()`, `PlannerJoinTree.cpp`'s
+`allowParallelReplicasForJoinTree()` predicate), both updated to dereference their `StoragePtr` instead.
+This lets `ReplaceTableNodeToDummyVisitor::enterImpl()` -- which already holds `const IStorage & storage`,
+the *real* storage, at the exact point before it gets replaced -- call it directly, with no `shared_ptr`
+needed. The dummy's `supportsReplication()` constructor argument (previously just
+`storage.supportsReplication()`) becomes `storage.supportsReplication() ||
+isObjectStorageClusterDriverEligible(storage, getContext())`: eligibility is decided once, against the real
+storage, before replacement, and folded into the one signal `StorageDummy` can still carry forward --
+`isTableNodeEligibleForParallelReplicas()`'s existing MergeTree/`StorageDummy` fallback branch (`if
+(!storage->isMergeTree() && !typeid_cast<StorageDummy*>(storage.get())) return false;` then the
+`supportsReplication()` check) then passes for exactly the tables that were already proven eligible, without
+touching that branch's logic or its behavior for genuine MergeTree/`StorageDummy` cases at all.
+
+This is a **fourth**, entirely independent bug from the three already fixed in this document (§12.8's
+`only_analyze` recursion and `isDistributed()` misunderstanding; §12.10/§12.11's candidate-narrowing policy
+and its two tracking gaps) -- all of which turned out, in retrospect, to have been correctly implemented but
+untestable, because this one silently zeroed out mechanism A's candidate stack before any of that logic
+ever got exercised for an object-storage-cluster driver reachable through a CTE. Compiled clean (native +
+`arm64` full rebuilds). Pushed as `iceberg-join-bypass-arm64-v26`.
+
+**Confirmed live: q21 works.** This closes out the redesign's core correctness goal -- both q17 (direct
+leftmost driver, mechanism B) and q21 (driver nested under a CTE, mechanism A) now dispatch through the same
+shared `buildQueryPlanForObjectStorageCluster()` execution backend, matching the architecture agreed in §12.1,
+via the stock parallel-replicas candidate-selection machinery generalized with a pluggable storage-eligibility
+policy rather than a duplicated traversal.
+
+### 12.14 Next steps, not yet done
+
+- [ ] Re-check q2/q4/q13/q16 against `v26` specifically (they showed no regression against `v20`/`v21`,
+      before §12.10-§12.13's candidate-selection changes landed -- those changes only affect
+      `findQueryForParallelReplicas()`'s internal walk for an object-storage-cluster driver, gated the same
+      way, so no reason to expect a new regression, but not yet re-confirmed against this exact binary).
+
+### 12.15 `v26`'s re-check (§12.14's own open item) found a fifth bug: mechanism B has no boundary against a
+JOIN nested under a *derived-table* subquery, not just a CTE (`v26` → `v27`)
+
+Running the actual re-check flagged as still outstanding in §12.14 (not a fresh regression -- the first time
+this exact binary shape had been exercised against the full 23-query suite) surfaced a new failure, q16 only:
+
+```
+Code: 10. DB::Exception: Not found column __table7.appinfo_ccl in block. There are only columns:
+__table2.appinfo_ccl, __table1.event_timestamp...
+```
+
+q2/q4/q13/q21/q17 all still correct against `v26` -- confirming §12.14's own prediction that §12.10-§12.13
+didn't regress them. q16 is structurally different from q2/q4/q13 despite sharing the same `appinfo_d` CTE
+(comment in `q16_looker_pivot.sql`: "base is q4's bytes-by-day-x-CCL"): q16 wraps that same `base` JOIN (`{appev}
+e LEFT JOIN appinfo_d a`) in **four more levels of derived-table subqueries** (`ww`/`xx`/`yy`/`zz`, Looker's
+pivot machinery -- stacked `DENSE_RANK`/`RANK`/`MIN() OVER` window functions), where q2/q4/q13 select from
+`base` directly with no extra wrapping.
+
+**Root-caused precisely, not by pattern-matching against q21's earlier bug**: traced which mechanism actually
+fires. Mechanism A (`findQueryForParallelReplicas()`) does **not** engage for q16 at all -- `base` gets its own
+recursive `Planner subquery_planner` (`PlannerJoinTree.cpp:1512`, one per derived-table `FROM`-clause subquery),
+and from that nested Planner's own candidate search, `base` is both the outermost *and* innermost stack entry
+(`getSupportingParallelReplicasQueries()` on `base`'s own scope returns just `[base]`). It's popped first,
+`mapping[base]` is `base`'s own `Aggregating` (its `GROUP BY`) step, which needs finalization, and since `res`
+is still `nullptr` on this very first iteration, `findParallelReplicasQuery.cpp`'s `if (!res) return nullptr;`
+fires immediately -- mechanism A is a dead end for this shape, never even reaching the "narrow vs wide candidate"
+question §12.10-§12.13 fixed for q21.
+
+**Mechanism B** (`PlannerJoinTree.cpp`'s `dispatched_as_object_storage_cluster`, §12.1) is what actually fires,
+and it has no check on whether the JOIN's owning `query_node` (`base`) is the query's true top level or merely
+nested under further wrapping. It dispatches `base` as a **standalone unit** via
+`buildQueryPlanForObjectStorageCluster()` -> `queryNodeToDistributedSelectQuery()`, which gets independently
+re-numbered when the worker re-analyzes it from scratch -- `__table1`(`appev`)/`__table2`(`appinfo_d`), scoped
+only to `base`'s own two tables. That's exactly the observed "There are only columns: `__table2.appinfo_ccl`,
+`__table1.event_timestamp`". Something in the *already-built* outer plan -- from the single, original,
+whole-query analysis pass that ran once before any nested `subquery_planner` instances existed -- still expects
+`appinfo_d`'s column at its original position in that global numbering, `__table7`. Same bug *family* as q21's
+original double-dispatch (§12.9: two independently-renumbered candidates never reconciled), different trigger:
+there it was two independent whole-scope dispatches; here it's one dispatch whose scope is narrower than a
+reference that survives around it. q17 never exposed this because its JOIN sits at the query's true top level --
+no enclosing subquery scope to go stale against.
+
+**Fix**: added `!select_query_options.is_subquery` to `dispatched_as_object_storage_cluster`'s condition
+(`PlannerJoinTree.cpp`, ~L2153). `select_query_options.is_subquery` is set at exactly the point (`subquery()`,
+`PlannerJoinTree.cpp:1511`) where a derived-table subquery gets its own nested `Planner subquery_planner` --
+already available as a parameter at this call site, no new plumbing needed. This is a conservative capability
+boundary, not a q16-specific patch: whole-query object-storage-cluster dispatch via mechanism B is validated
+only for a JOIN at the query's actual top level (q17); a driver nested under a *CTE* (not a derived-table
+subquery) inside the top-level query is mechanism A's territory and unaffected (q21). A driver nested under a
+plain derived-table subquery now falls through to ordinary local planning, exactly as it did before this
+session's changes -- narrower than the general goal, but honest about what's actually been proven correct.
+Nested mechanism-B pushdown (reconciling `__tableN` identity across the nested-Planner serialization boundary)
+remains a real, deliberately out-of-scope follow-up, not attempted here.
+
+Compiled clean, no new warnings (native + `arm64`, incremental -- only `PlannerJoinTree.cpp` recompiled).
+Packaged (`llvm-strip-21`, ~5.2 GB → ~615 MB, same as every prior build) and pushed as
+`iceberg-join-bypass-arm64-v27`. **Not yet re-run live** -- next action is the full suite (q16 correctness,
+q2/q4/q13 still correct, q17 ~4s, q21 ~9-10s) against this exact image.
+
+### 12.16 Next steps, not yet done
+
+- [ ] Run the full 23-query suite against `v27` live; confirm q16 now succeeds and q2/q4/q13/q17/q21 are
+      unaffected (success criteria above).
+- [ ] Multiple hot-run timing samples for q17 and q21 (median, not one run) to confirm the speedups still
+      match `v17`'s validated shape (q17 ~3.8s, q21 ~9s) now that the mechanism is unified.
+- [ ] Remove the temporary diagnostics once the above is confirmed: `OSC_DISPATCH`, `PR_CANDIDATE_CLASSIFY`,
+      `PR_TABLE_ELIGIBILITY_FAIL` (all added this session), plus the older `DLPR`/`OSC_STAGE` (kept from the
+      `v17` redesign for this validation pass, §12.2).
+- [ ] Commit the working tree (currently uncommitted since the `v17` redesign began -- §12) once the above
+      validation is complete, if requested.
+- [ ] The known, deliberately-unsolved gaps remain open, unchanged by this session's fixes: no cost-based
+      eligibility signal (§12.4/§12.8's stated risk for q2/q4/q13-shaped regressions in general, not just
+      the two tested this session), and `buildQueryPlanForObjectStorageCluster()`'s `column_names`/
+      `filter_actions_dag` still use `AllPhysical`/unset rather than the driver's exact required columns
+      (§3.7's original "known gap", carried forward unchanged through this redesign).

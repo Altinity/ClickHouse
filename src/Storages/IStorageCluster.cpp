@@ -376,11 +376,12 @@ void IStorageCluster::read(
     const auto & settings = context->getSettingsRef();
     ASTPtr query_to_send = query_info.query;
 
-    /// EXPERIMENTAL (see object_storage_cluster_bypass_join_wrap in PlannerJoinTree.cpp): when the JOIN
-    /// leftmost-table wrap is bypassed, query_info.query (built via queryNodeToSelectQuery() with
-    /// set_subquery_cte_name=true) may reference a CTE like `appinfo_d` by name only -- CTEs are only defined at
-    /// the top-level query and are not sent to the remote node, causing "Unknown table expression identifier"
-    /// errors there. queryNodeToDistributedSelectQuery() (already used below by
+    /// EXPERIMENTAL (see object_storage_cluster_bypass_join_wrap, findParallelReplicasQuery.h): when a
+    /// StorageObjectStorageCluster leftmost-JOIN driver is dispatched whole (see PlannerJoinTree.cpp's
+    /// allowParallelReplicasForJoinTree()-gated branch), query_info.query (built via queryNodeToSelectQuery()
+    /// with set_subquery_cte_name=true) may reference a CTE elsewhere in the same query by name only -- CTEs are
+    /// only defined at the top-level query and are not sent to the remote node, causing "Unknown table
+    /// expression identifier" errors there. queryNodeToDistributedSelectQuery() (already used below by
     /// updateQueryWithJoinToSendIfNeeded() for the LOCAL/GLOBAL join modes) forces every CTE subquery to be
     /// serialized by its body instead of by name, which is what the remote node needs.
     if (settings[Setting::object_storage_cluster_bypass_join_wrap] && query_info.query_tree)
