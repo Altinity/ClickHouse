@@ -6,10 +6,16 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/ProfileEvents.h>
 
 #include "config.h"
 
 #if USE_AWS_S3
+
+namespace ProfileEvents
+{
+extern const Event CASRequestResolveRead;
+}
 
 using namespace DB::Cas;
 using DB::Cas::tests::CountingBackend;
@@ -60,6 +66,8 @@ TEST(CASThrottlingGate, EveryUserVisibleStatementSucceedsUnderFirstPerKeyThrottl
     /// mount claim and the epoch allocation under this same throttled backend.
     auto store = DB::Cas::tests::openPoolForTest(throttled);
 
+    const auto resolve_reads_before = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load();
+
     const RootNamespace ns{"test/throttle_gate"};
 
     /// CREATE-shaped: the namespace's first part write births it.
@@ -87,11 +95,16 @@ TEST(CASThrottlingGate, EveryUserVisibleStatementSucceedsUnderFirstPerKeyThrottl
     /// `refusals(key) == 1` for every key is a class invariant of `FirstPerKey` mode itself
     /// (`refuseOrPass` refuses a key at most once, ever, by construction of `refused_keys.insert`), so
     /// asserting it here would prove nothing about THIS run's engine behavior -- it cannot fail. What
-    /// can fail, and is the actual content of the gate: every key was requested again afterwards (an
-    /// inner post-refusal count of zero means the caller never retried at all, which the statements
-    /// above already ruled out by succeeding), and at least one of them needed MORE than a single
-    /// post-refusal request to land -- proof the engine actually resolved a refused write's ambiguity
-    /// by reading rather than every refusal landing on a trivially-retried read/list/head.
+    /// can fail, and is the actual content of the gate: every key the gate decided was requested again
+    /// afterwards (an inner post-refusal count of zero means the caller never retried at all, which the
+    /// statements above already ruled out by succeeding), and at least one of them took more than one
+    /// post-refusal request.
+    ///
+    /// That count alone does NOT prove a resolve read happened: a key that is read and then written
+    /// reaches two requests through two different verbs. The counter delta below is what pins the
+    /// engine's own ambiguity resolution -- it is incremented at exactly one site, the write loop's
+    /// settle-by-reading step. It does not attribute the reads to any particular key, and it counts a
+    /// refused precondition the same as a throttled ambiguity.
     size_t keys_needing_more_than_one_request = 0;
     for (const String & key : throttled->decidedKeys())
     {
@@ -103,8 +116,14 @@ TEST(CASThrottlingGate, EveryUserVisibleStatementSucceedsUnderFirstPerKeyThrottl
     }
     EXPECT_FALSE(throttled->decidedKeys().empty()) << "the gate must have actually decided some keys";
     EXPECT_GT(keys_needing_more_than_one_request, 0u)
-        << "no throttled key needed more than one post-refusal request -- the gate never actually "
-           "exercised the engine's own ambiguity-resolution path, only trivially-retried reads";
+        << "no throttled key needed more than one post-refusal request -- every refusal landed on a "
+           "trivially-retried read/list/head";
+    /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
+    /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
+#if !WITH_COVERAGE
+    EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load() - resolve_reads_before, 0u)
+        << "no throttled write was settled by a read -- the engine's ambiguity-resolution path never ran";
+#endif
 }
 
 #endif
