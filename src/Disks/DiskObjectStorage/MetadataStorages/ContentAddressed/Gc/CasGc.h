@@ -507,10 +507,42 @@ private:
     /// renewing our own are unaffected.
     bool acquireOrRenewLease(GcState & state, Token & state_token, bool allow_steal);
 
+    struct LeaseContext
+    {
+        GcState state;
+        Token state_token;
+        uint64_t next_round = 0;
+    };
+
+    std::optional<LeaseContext> runLeasePhase(RoundReport & report, bool allow_steal);
+
     /// Catalog-only helping barrier run immediately after lease acquisition. It validates the adopted
     /// parent and delegates deterministic `Removing`-row settlement to `CatalogLifecycleReconciler`.
     /// It performs no physical LIST or delete.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
+
+    void runPreFoldRefDrainPhase(const GcState & leased_state);
+
+    void runHeartbeatFloorPhase(const GcState & leased_state, uint64_t new_round, RoundReport & report);
+
+    enum class RoundKind : uint8_t
+    {
+        Fold,
+        Defer,
+    };
+
+    struct DeferDecisionPhaseResult
+    {
+        RoundKind round_kind;
+        std::optional<RefPlan> walk_plan;
+        size_t changed_shards = 0;
+    };
+
+    DeferDecisionPhaseResult runDeferDecisionPhase(const GcState & gc_state, uint64_t new_round);
+
+    std::vector<RunRef> runParentSealReadPhase(const GcState & gc_state);
+
+    GcRoundWorkBudget buildRoundWorkBudget() const;
 
     /// Run exactly one independently paced physical namespace-maintenance page. The caller supplies
     /// the one round-wide destructive verdict when it exists; DEFER passes suppression because it has
