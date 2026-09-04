@@ -42,7 +42,7 @@ uint64_t totalRequestsFor(const CountingBackend & inner, const String & key)
 
 }
 
-/// The `ThrottlingBackend` gate (plan Task 21): every user-visible statement -- table creation, an
+/// The `ThrottlingBackend` gate: every user-visible statement -- table creation, an
 /// insert, a rename, a drop, the writable mount `Pool::open` itself performs, and one GC round -- must
 /// still SUCCEED when every key it touches is refused exactly once (`FirstPerKey`, HTTP 429) before it
 /// is honored. `refusals(key) == 1` for every key the gate recorded, and every one of them was requested
@@ -84,17 +84,27 @@ TEST(CASThrottlingGate, EveryUserVisibleStatementSucceedsUnderFirstPerKeyThrottl
     /// DROP-shaped: the whole namespace goes last, so the statements above still have something to act on.
     ASSERT_NO_THROW(store->dropNamespace(ns));
 
-    /// Every key the gate ever decided must have been refused EXACTLY once and requested again
-    /// afterwards -- a refusal count above one means the same key was throttled more than the
-    /// `FirstPerKey` contract promises; an inner (post-refusal) request count of zero means the caller
-    /// never retried at all, which the statements above already ruled out by succeeding.
+    /// `refusals(key) == 1` for every key is a class invariant of `FirstPerKey` mode itself
+    /// (`refuseOrPass` refuses a key at most once, ever, by construction of `refused_keys.insert`), so
+    /// asserting it here would prove nothing about THIS run's engine behavior -- it cannot fail. What
+    /// can fail, and is the actual content of the gate: every key was requested again afterwards (an
+    /// inner post-refusal count of zero means the caller never retried at all, which the statements
+    /// above already ruled out by succeeding), and at least one of them needed MORE than a single
+    /// post-refusal request to land -- proof the engine actually resolved a refused write's ambiguity
+    /// by reading rather than every refusal landing on a trivially-retried read/list/head.
+    size_t keys_needing_more_than_one_request = 0;
     for (const String & key : throttled->decidedKeys())
     {
-        EXPECT_EQ(throttled->refusals(key), 1u) << "key: " << key;
-        EXPECT_GE(totalRequestsFor(*inner, key), 1u)
+        const uint64_t total = totalRequestsFor(*inner, key);
+        EXPECT_GE(total, 1u)
             << "key: " << key << " -- one refusal plus at least one later success is 'requested at least twice'";
+        if (total >= 2)
+            ++keys_needing_more_than_one_request;
     }
     EXPECT_FALSE(throttled->decidedKeys().empty()) << "the gate must have actually decided some keys";
+    EXPECT_GT(keys_needing_more_than_one_request, 0u)
+        << "no throttled key needed more than one post-refusal request -- the gate never actually "
+           "exercised the engine's own ambiguity-resolution path, only trivially-retried reads";
 }
 
 #endif
