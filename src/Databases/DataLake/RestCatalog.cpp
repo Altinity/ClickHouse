@@ -92,6 +92,10 @@ namespace ProfileEvents
     extern const Event DataLakeRestCatalogGetTableMetadataMicroseconds;
     extern const Event DataLakeRestCatalogGetCredentials;
     extern const Event DataLakeRestCatalogGetCredentialsMicroseconds;
+    extern const Event DataLakeRestCatalogAuthTokenCachedValid;
+    extern const Event DataLakeRestCatalogAuthTokenRetrieve;
+    extern const Event DataLakeRestCatalogAuthTokenRefreshedMicroseconds;
+    extern const Event DataLakeRestCatalogUnauthorized;
     extern const Event DataLakeRestCatalogCreateNamespace;
     extern const Event DataLakeRestCatalogCreateNamespaceMicroseconds;
     extern const Event DataLakeRestCatalogCreateTable;
@@ -319,12 +323,25 @@ void RestCatalog::validateAuthHeaders(const DB::HTTPHeaderEntry & header) const
     getContext()->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(header_to_check);
 }
 
+<<<<<<< HEAD
 DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const CatalogState & catalog_state, bool update_token) const
+=======
+DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
+    bool update_token,
+    const String & /*method*/,
+    const Poco::URI & /*url*/,
+    const DB::HTTPHeaderEntries & /*extra_headers*/,
+    const String & /*body*/,
+    bool * used_cached_oauth_token) const
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 {
     fiu_do_on(DB::FailPoints::check_database_datalake_negative,
     {
         throw DB::Exception(DB::ErrorCodes::FAULT_INJECTED, "Injecting fault when checking database");
     });
+
+    if (used_cached_oauth_token)
+        *used_cached_oauth_token = false;
 
     /// Option 1: user specified auth header manually.
     /// Header has format: 'Authorization: <scheme> <token>'.
@@ -343,10 +360,14 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const CatalogState & catalog_s
         /// request fails with 401/403 and is retried with `update_token = true`, fetching
         /// a token with the snapshot's credentials.
         auto current = access_token.get();
-        if (!current || update_token)
+        if (!current || update_token || current->isExpired())
         {
             access_token.set(std::make_unique<AccessToken>(retrieveAccessToken(catalog_state.client_id, catalog_state.client_secret)));
             current = access_token.get();
+        }
+        else if (used_cached_oauth_token)
+        {
+            *used_cached_oauth_token = true;
         }
 
         DB::HTTPHeaderEntries headers;
@@ -767,6 +788,9 @@ namespace
 
 AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const
 {
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
 
     /// TODO:
@@ -1021,7 +1045,17 @@ BigLakeCatalog::BigLakeCatalog(
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
 
+<<<<<<< HEAD
 DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const CatalogState & catalog_state, bool update_token) const
+=======
+DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
+    bool update_token,
+    const String & method,
+    const Poco::URI & url,
+    const DB::HTTPHeaderEntries & extra_headers,
+    const String & body,
+    bool * used_cached_oauth_token) const
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 {
     /// Google Cloud OAuth2 for BigLake.
     /// Uses GCP metadata service or Application Default Credentials to get access token.
@@ -1029,11 +1063,18 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const CatalogState & catalo
     /// https://developers.google.com/identity/protocols/oauth2
     if (!google_project_id.empty() || !google_adc_client_id.empty())
     {
+        if (used_cached_oauth_token)
+            *used_cached_oauth_token = false;
+
         auto current = access_token.get();
         if (!current || update_token || current->isExpired())
         {
             access_token.set(std::make_unique<AccessToken>(retrieveGoogleCloudAccessToken()));
             current = access_token.get();
+        }
+        else if (used_cached_oauth_token)
+        {
+            *used_cached_oauth_token = true;
         }
 
         DB::HTTPHeaderEntries headers;
@@ -1053,7 +1094,11 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const CatalogState & catalo
         return headers;
     }
 
+<<<<<<< HEAD
     return RestCatalog::getAuthHeaders(catalog_state, update_token);
+=======
+    return RestCatalog::getAuthHeaders(update_token, method, url, extra_headers, body, used_cached_oauth_token);
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 }
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
@@ -1075,7 +1120,24 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() con
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 {
+<<<<<<< HEAD
     const auto & context = getContext();
+=======
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
+    if (!google_adc_client_id.empty() && !google_adc_client_secret.empty() && !google_adc_refresh_token.empty())
+    {
+        try
+        {
+            return retrieveGoogleCloudAccessTokenFromRefreshToken();
+        }
+        catch (const DB::Exception & e)
+        {
+            LOG_DEBUG(log, "Failed to use ADC credentials, falling back to metadata service: {}", e.what());
+        }
+    }
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 
     /// An explicit Application Default Credentials triple is a user-supplied credential, so it is honored.
     /// Fail closed if it does not work: do not fall back to the server's GCP metadata service, which would
@@ -1206,9 +1268,13 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
     if (!params.empty())
         url.setQueryParameters(params);
 
-    auto create_buffer = [&](bool update_token)
+    auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
+<<<<<<< HEAD
         auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(catalog_state, update_token);
+=======
+        auto result_headers = getAuthHeaders(update_token, Poco::Net::HTTPRequest::HTTP_GET, url, headers, {}, &used_cached_oauth_token);
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
 
         return DB::BuilderRWBufferFromHTTP(url)
@@ -1226,7 +1292,11 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
 
     try
     {
-        return create_buffer(false);
+        bool used_cached_oauth_token = false;
+        auto buf = create_buffer(false, used_cached_oauth_token);
+        if (used_cached_oauth_token)
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCachedValid);
+        return buf;
     }
     catch (const DB::HTTPException & e)
     {
@@ -1235,7 +1305,9 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
             (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
              || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
         {
-            return create_buffer(true);
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUnauthorized);
+            bool used_cached_oauth_token_on_retry = false;
+            return create_buffer(true, used_cached_oauth_token_on_retry);
         }
         throw;
     }
@@ -1815,6 +1887,7 @@ void RestCatalog::sendRequest(const CatalogState & catalog_state, const String &
     /// enable_url_encoding=false to allow using tables with encoded sequences in names like 'foo%2Fbar'
     Poco::URI url(endpoint, /* enable_url_encoding */ false);
 
+<<<<<<< HEAD
     auto wb = DB::BuilderRWBufferFromHTTP(url)
         .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
         .withMethod(method)
@@ -1828,12 +1901,63 @@ void RestCatalog::sendRequest(const CatalogState & catalog_state, const String &
         .withOutCallbackFixedContentLength(body_str.size())
         .withSkipNotFound(false)
         .create(credentials);
+=======
+    DB::HTTPHeaderEntries extra_headers;
+    extra_headers.emplace_back("Content-Type", "application/json");
 
-    String response_str;
-    if (!ignore_result)
-        readJSONObjectPossiblyInvalid(response_str, *wb);
-    else
-        wb->ignoreAll();
+    auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
+    {
+        DB::HTTPHeaderEntries headers = getAuthHeaders(update_token, method, url, extra_headers, body_str, &used_cached_oauth_token);
+        headers.emplace_back("Content-Type", "application/json");
+        return DB::BuilderRWBufferFromHTTP(url)
+            .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
+            .withMethod(method)
+            .withSettings(context->getReadSettings())
+            .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
+            .withHostFilter(&context->getRemoteHostFilter())
+            .withHeaders(headers)
+            .withOutCallback(out_stream_callback)
+            .withSkipNotFound(false)
+            .create(credentials);
+    };
+>>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
+
+    try
+    {
+        bool used_cached_oauth_token = false;
+        auto wb = create_buffer(false, used_cached_oauth_token);
+
+        String response_str;
+        if (!ignore_result)
+            readJSONObjectPossiblyInvalid(response_str, *wb);
+        else
+            wb->ignoreAll();
+
+        if (used_cached_oauth_token)
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCachedValid);
+    }
+    catch (const DB::HTTPException & e)
+    {
+        const auto status = e.getHTTPStatus();
+        if (update_token_if_expired &&
+            (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
+             || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUnauthorized);
+            bool used_cached_oauth_token_on_retry = false;
+            auto wb = create_buffer(true, used_cached_oauth_token_on_retry);
+
+            String response_str;
+            if (!ignore_result)
+                readJSONObjectPossiblyInvalid(response_str, *wb);
+            else
+                wb->ignoreAll();
+        }
+        else
+        {
+            throw;
+        }
+    }
 }
 
 void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, const String & location) const
