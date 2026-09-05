@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <vector>
@@ -1401,6 +1402,8 @@ TEST(CASGCCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
 /// resolve read settle nothing rather than be reissued exists only for S3 errors.
 TEST(CASGCRetire, OutcomeLogUnobservedConflictDoesNotReportItVanished)
 {
+    /// The fault's state is shared between the round (writes, on the test thread) and the meta
+    /// writer's pool (reads), so it lives under its own mutex.
     class UnobservedOutcomesBackend : public InMemoryBackend
     {
     public:
@@ -1408,28 +1411,42 @@ TEST(CASGCRetire, OutcomeLogUnobservedConflictDoesNotReportItVanished)
             const String & key, const String & bytes, const std::optional<String> & expected_value,
             TransportAccess & access) override
         {
-            if (arm && !expected_value && key.find("/outcomes/") != String::npos)
             {
-                arm = false;
-                refused_key = key;
-                return std::unexpected(RawConflict{});
+                std::lock_guard lock(fault_mutex);
+                if (arm && !expected_value && key.find("/outcomes/") != String::npos)
+                {
+                    arm = false;
+                    refused_key = key;
+                    return std::unexpected(RawConflict{});
+                }
             }
             return InMemoryBackend::write(key, bytes, expected_value, access);
         }
 
         std::optional<Raw> read(const String & key, TransportAccess & access) override
         {
-            if (!refused_key.empty() && key == refused_key)
             {
-                refused_key.clear();
-                throw DB::S3Exception("UnobservedOutcomesBackend: the settling read is definitively refused",
-                                      Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+                std::lock_guard lock(fault_mutex);
+                if (!refused_key.empty() && key == refused_key)
+                {
+                    refused_key.clear();
+                    throw DB::S3Exception("UnobservedOutcomesBackend: the settling read is definitively refused",
+                                          Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+                }
             }
             return InMemoryBackend::read(key, access);
         }
 
-        bool arm = false;
-        String refused_key;
+        void armOnce()
+        {
+            std::lock_guard lock(fault_mutex);
+            arm = true;
+        }
+
+    private:
+        std::mutex fault_mutex;
+        bool arm TSA_GUARDED_BY(fault_mutex) = false;
+        String refused_key TSA_GUARDED_BY(fault_mutex);
     };
 
     auto backend = std::make_shared<UnobservedOutcomesBackend>();
@@ -1445,7 +1462,7 @@ TEST(CASGCRetire, OutcomeLogUnobservedConflictDoesNotReportItVanished)
 
     /// The condemn -> graduate -> delete pipeline needs several rounds before any round has an outcome
     /// to log; the arm fires on the first one that does.
-    backend->arm = true;
+    backend->armOnce();
     bool refusal_reached = false;
     for (int i = 0; i < 8 && !refusal_reached; ++i)
     {
