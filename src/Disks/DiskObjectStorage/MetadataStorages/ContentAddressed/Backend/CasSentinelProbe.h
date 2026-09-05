@@ -48,8 +48,10 @@ enum class BootstrapResidual : uint8_t
     Indeterminate,
 };
 
-/// Zero-write authoritative classification of a pool prefix for the startup bootstrap decision. A single
-/// paginated LIST of `layout.poolPrefix()`; each listed object is classified as the `_pool_meta`
+/// Zero-write authoritative classification of a pool prefix for the startup bootstrap decision. One exact
+/// read of `_pool_meta` first: present is decisive, and it costs no enumeration, so an existing pool
+/// reopens without a LIST at all. Only when the key is absent (or the read could not settle it) does a
+/// single paginated LIST of `layout.poolPrefix()` run; each listed object is classified as the `_pool_meta`
 /// sentinel, capability-battery debris under the reserved `<prefix>/_probe/` subtree (a crash-mid-battery
 /// leftover OR a concurrent fresh opener's in-flight battery — [D2]), or genuine residual CAS state. It
 /// NEVER writes, and it IGNORES probe debris exactly so a normal restart after a crash-mid-battery still

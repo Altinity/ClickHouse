@@ -11,6 +11,7 @@
 #include "cas_test_helpers.h"
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -260,6 +261,19 @@ TEST(CASListLiarEndToEnd, RecoveryUnderTheSameLieReconstructsExactlyTheTruth)
     auto lying = openRecoveryPool(lying_backend);
     const std::map<String, String> recovered = refsOf(lying, ns);
 
+    /// Recovery reads every record by exact key and asks no listing what to read next, and an existing
+    /// pool reopens on the exact read of `_pool_meta` alone -- so nothing above ever LISTed the stream.
+    /// That is the point, but it also means the lie has to be PROVEN in effect here, or the comparison
+    /// below would pass against a store that hid nothing.
+    {
+        DB::Cas::tests::OperationForTest op(*lying_backend);
+        std::set<String> listed;
+        (*op).forEachListedKey(layout.namespaceStreamPrefix(fixture::fixtureLife(ns)),
+                               [&](const ListedKey & key) { listed.insert(key.key); return true; },
+                               Retry::standard());
+        for (const String & hidden : hiddenMiddleOf(layout, ns))
+            ASSERT_FALSE(listed.contains(hidden)) << "the store was told to hide " << hidden << " and did not";
+    }
     ASSERT_GT(lying_backend->holesServed(), 0u)
         << "the omission was never actually served -- the test would pass vacuously";
     EXPECT_EQ(truth.size(), 5u) << "the oracle itself must see all five published refs";

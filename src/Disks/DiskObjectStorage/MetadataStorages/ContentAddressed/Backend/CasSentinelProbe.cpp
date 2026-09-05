@@ -36,10 +36,31 @@ BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & l
     const String prefix = layout.poolPrefix() + "/";
     const String probe_root = layout.poolPrefix() + "/_probe/";
 
+    /// `_pool_meta` present is decisive on its own, and one exact read of that key answers it without
+    /// enumerating anything: a LIST page over a large pool is the most expensive request a store
+    /// answers (it must enumerate and sort the prefix), and a store that is merely slow to LIST would
+    /// otherwise refuse to reopen a pool it can read perfectly well. So the existing-pool case is
+    /// settled by the read, and the LIST below runs only when the key is absent -- which is exactly
+    /// the case that needs the absence-of-residue proof. A read that could not settle presence (a
+    /// refusal, a deadline) is not a verdict; it falls through to the LIST, which may still see the
+    /// key.
+    try
+    {
+        if (op.read(pool_meta_key, Retry::standard()))
+            return BootstrapResidual::PoolMetaPresent;
+    }
+    catch (...)
+    {
+        LOG_WARNING(getLogger("CasBootstrap"),
+            "Pool prefix '{}': the exact read of '{}' could not settle whether the pool exists; "
+            "falling back to the residual LIST: {}",
+            prefix, pool_meta_key, getCurrentExceptionMessage(/*with_stacktrace=*/false));
+    }
+
     /// Classification is order-independent for correctness: every listed key is examined, and finding
     /// `_pool_meta` anywhere is decisive. It relies on lexicographic LIST order only for COST — `_pool_meta`
-    /// sorts first under `<prefix>/`, so a healthy pool short-circuits on the first page rather than
-    /// enumerating its whole content on every open.
+    /// sorts first under `<prefix>/`, so a pool whose exact read above was refused still short-circuits
+    /// on the first page rather than enumerating its whole content.
     bool has_pool_meta = false;
     bool has_residual = false;
     bool has_catalog = false;

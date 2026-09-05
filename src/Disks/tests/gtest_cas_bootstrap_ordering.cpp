@@ -7,6 +7,7 @@
 #include "cas_test_helpers.h"
 #include <Common/Exception.h>
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -24,6 +25,7 @@
 namespace DB::ErrorCodes
 {
 extern const int INVALID_STATE;
+extern const int NOT_IMPLEMENTED;
 }
 
 using namespace DB::Cas;
@@ -44,7 +46,7 @@ const String kProbeUid2 = "fedcba9876543210fedcba9876543210";
 ///
 /// The `write` primitive covers create, replace and conditional-put alike, so the log distinguishes
 /// only writes from removals -- which is all the ordering assertions ask.
-class RecordingBackend final : public InMemoryBackend
+class RecordingBackend : public InMemoryBackend
 {
 public:
     /// Unhide the legacy `list` overloads the primitive override below would otherwise hide: the tests
@@ -353,6 +355,49 @@ TEST(CASBootstrapOrdering, HealthyPoolReopenPreservesIdentity)
     EXPECT_EQ(store2->lifecycle(), PoolLifecycle::Live);
     EXPECT_EQ(store2->poolMeta().pool_id, pool_id_first)
         << "a healthy reopen must NOT re-mint _pool_meta — the pool identity must be preserved";
+}
+
+/// (d') An existing pool whose prefix the store cannot LIST at the moment (a large prefix on a store
+/// that enumerates slowly, a LIST budget that expires) still reopens: `_pool_meta` present is proven by
+/// ONE exact read, and the residual LIST is only the absent-key path. Before this, a pool that could be
+/// read perfectly well refused to start because the enumeration that would have found the same key
+/// did not return in time.
+TEST(CASBootstrapOrdering, HealthyPoolReopensWhenThePrefixCannotBeListed)
+{
+    /// Refuses every LIST of the pool root once armed; everything else is the ordinary store.
+    class UnlistableRootBackend final : public RecordingBackend
+    {
+    public:
+        using RecordingBackend::list;
+        RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+        {
+            if (refuse_root_list && prefix == kPrefix + "/")
+                throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
+                                    "UnlistableRootBackend: the pool root cannot be enumerated right now");
+            return RecordingBackend::list(prefix, cursor, limit, access);
+        }
+        std::atomic<bool> refuse_root_list{false};
+    };
+
+    auto backend = std::make_shared<UnlistableRootBackend>();
+
+    UInt128 pool_id_first;
+    {
+        PoolPtr store = Pool::open(backend, makeConfig());
+        pool_id_first = store->poolMeta().pool_id;
+    }   /// clean teardown: drained farewell, so the reopen reclaims immediately
+
+    backend->refuse_root_list = true;
+    backend->clearLog();
+    PoolPtr store2;
+    ASSERT_NO_THROW(store2 = Pool::open(backend, makeConfig()))
+        << "an existing pool must reopen on the exact read of _pool_meta alone";
+    EXPECT_EQ(store2->lifecycle(), PoolLifecycle::Live);
+    EXPECT_EQ(store2->poolMeta().pool_id, pool_id_first);
+    const auto log = backend->snapshot();
+    EXPECT_FALSE(firstIndex(log, [](const RecordingBackend::Entry & e)
+        { return e.op == RecordingBackend::Op::List && e.key == kPrefix + "/"; }).has_value())
+        << "a pool whose _pool_meta was read must not be enumerated to prove it exists";
 }
 
 /// (e) [D2] concurrent-opener case: debris from a SECOND concurrent fresh opener's in-flight battery (a
