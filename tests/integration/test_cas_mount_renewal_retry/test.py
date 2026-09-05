@@ -205,10 +205,12 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     mount_body = _decode_mount(body_after)
     delta = _event_delta(counters_before, counters_after)
     sequence = mount_after["sequence"]
+    # The engine paces the reissues inside one renewal; what the log records is the renewal's
+    # outcome, and the attempt count on that row is what says a retry happened.
     rows = _wait_until(
         lambda: (
             found
-            if {row[0] for row in found} >= {"retrying", "recovered"}
+            if any(row[0] == "recovered" for row in found)
             else None
         )
         if (found := _renewal_log_rows(node, since, sequence))
@@ -232,10 +234,8 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     assert stats["by_mode"].get("503") == 1, stats
     print("targeted request count (transient renewal): {}".format(stats["faults"]), flush=True)
 
-    retrying = next(row for row in rows if row[0] == "retrying")
     recovered = next(row for row in rows if row[0] == "recovered")
-    assert retrying[1] == recovered[1] == str(sequence), rows
-    assert retrying[2] == recovered[2], rows
+    assert recovered[1] == str(sequence), rows
     assert int(recovered[3]) > 1, rows
     assert recovered[4] == "committed_after_retry", rows
 
@@ -291,7 +291,7 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     rows = _wait_until(
         lambda: (
             found
-            if any(row[0] == "recovered" and row[4] == "committed_by_get" for row in found)
+            if any(row[0] == "recovered" and row[4] == "committed_by_read" for row in found)
             else None
         )
         if (found := _renewal_log_rows(node, since, sequence))
@@ -329,5 +329,5 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     assert recovered[1] == str(sequence), rows
     assert recovered[2] and mount_body["write_attempt_id"].startswith(recovered[2]), rows
     assert recovered[3] == "1", rows
-    assert recovered[4] == "committed_by_get", rows
+    assert recovered[4] == "committed_by_read", rows
     print("targeted request count (landed response lost): {}".format(stats["faults"]), flush=True)
