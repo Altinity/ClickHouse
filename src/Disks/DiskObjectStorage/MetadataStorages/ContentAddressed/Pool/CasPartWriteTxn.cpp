@@ -330,10 +330,12 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     /// Bring the freshness marker to `Clean`. A publication that followed an ABSENT observation has
     /// nothing at the marker key to decide from, so its create IS the whole reconciliation; routing it
     /// through a read-decide-write would spend a GET on every insert to learn what the create settles
-    /// for itself. Only a create that loses -- a racing writer's marker, or the stale `Condemned` one a
-    /// resurrect always finds -- needs the read, and there the engine's own loop is what bounds the
+    /// for itself. A resurrect already READ the stale `Condemned` marker before it published, and the
+    /// incarnation that read observed is the precondition its compare-swap needs -- so it spends no
+    /// second GET either. Only a write that loses -- a racing writer's marker, a marker that moved
+    /// under the resurrect -- needs the read, and there the engine's own loop is what bounds the
     /// retries at the policy's deadline instead of a fixed count of unpaced attempts.
-    auto reconcileMetaClean = [&](BlobPublicationReason reason)
+    auto reconcileMetaClean = [&](const std::optional<LoadedMeta> & loaded, BlobPublicationReason reason)
     {
         if (reason == BlobPublicationReason::Absent)
             ProfileEvents::increment(ProfileEvents::CASMetaCreateClean);
@@ -345,17 +347,23 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             "PartWriteTxn::ensureBlobPresent: reconciling the freshness metadata of '{}' to `Clean` "
             "after blob publication", key);
 
+        std::optional<WriteResult> first;
         if (reason == BlobPublicationReason::Absent)
         {
             ProfileEvents::increment(ProfileEvents::CASMetaPut);
-            WriteResult created = op.create(meta_key, encodeBlobMeta(clean), policy);
-            /// Anything but a lost race is this call's answer, and `orThrow` maps it exactly as it maps
-            /// the read-decide-write's own result.
-            if (!std::holds_alternative<Conflict>(created))
-            {
-                orThrow(std::move(created), what);
-                return;
-            }
+            first = op.create(meta_key, encodeBlobMeta(clean), policy);
+        }
+        else if (loaded)
+        {
+            ProfileEvents::increment(ProfileEvents::CASMetaCompareSwap);
+            first = op.replace(meta_key, encodeBlobMeta(clean), loaded->etag, policy);
+        }
+        /// Anything but a lost race is this call's answer, and `orThrow` maps it exactly as it maps
+        /// the read-decide-write's own result.
+        if (first && !std::holds_alternative<Conflict>(*first))
+        {
+            orThrow(std::move(*first), what);
+            return;
         }
 
         orThrow(
@@ -393,6 +401,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             op.pause(Retry::backoff(attempt));
         const std::optional<Meta> present = op.head(key, policy);
         BlobPublicationReason reason = BlobPublicationReason::Absent;
+        std::optional<LoadedMeta> loaded;
 
         if (present)
         {
@@ -412,7 +421,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     logical_size,
                     source.size);
 
-            const std::optional<LoadedMeta> loaded = loadMeta(op, store->layout(), ref, policy);
+            loaded = loadMeta(op, store->layout(), ref, policy);
             if (loaded)
                 validateMetaSize(loaded->meta);
 
@@ -511,7 +520,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             continue;
         }
 
-        reconcileMetaClean(reason);
+        reconcileMetaClean(loaded, reason);
         /// A publication may land just as this mount loses its fence. The bytes are harmless debris,
         /// but they cannot become dependency proof for the fenced transaction.
         requireAdmitted("before the publication is recorded");
