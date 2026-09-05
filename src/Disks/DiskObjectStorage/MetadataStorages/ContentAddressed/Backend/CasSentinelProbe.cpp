@@ -57,10 +57,17 @@ BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & l
             prefix, pool_meta_key, getCurrentExceptionMessage(/*with_stacktrace=*/false));
     }
 
-    /// Classification is order-independent for correctness: every listed key is examined, and finding
-    /// `_pool_meta` anywhere is decisive. It relies on lexicographic LIST order only for COST — `_pool_meta`
-    /// sorts first under `<prefix>/`, so a pool whose exact read above was refused still short-circuits
-    /// on the first page rather than enumerating its whole content.
+    /// The LIST answers one question: is there anything under the prefix besides the ignorable
+    /// battery debris (and, as the one retryable exception, the canonical empty catalog)? The first
+    /// residual key settles it, so the walk stops there. A probe-only or catalog-only prefix is walked
+    /// to completion -- debris is normally a few keys but every interrupted open leaves one more, so
+    /// it may span pages -- and the page is kept small because the enumeration cost of a large prefix
+    /// is what a slow store cannot deliver within an attempt. `_pool_meta` is still recognised if the
+    /// walk meets it (the exact read above may have been refused): it sorts before every key family
+    /// CAS itself writes under `<prefix>/`, so on a lexicographic listing it is met before anything
+    /// that could have stopped the walk. Foreign residue that sorts earlier, or a listing that is not
+    /// lexicographic, can only make this refuse an existing pool, never bootstrap over one.
+    constexpr size_t page_limit = 32;
     bool has_pool_meta = false;
     bool has_residual = false;
     bool has_catalog = false;
@@ -80,9 +87,9 @@ BootstrapResidual probePoolBootstrapResidual(CasOperation & op, const Layout & l
                 has_catalog = true;
                 return true;
             }
-            has_residual = true;   /// a non-`_probe` object, and no `_pool_meta` seen (so far)
-            return true;
-        }, Retry::standard());
+            has_residual = true;   /// a non-`_probe` object, and no `_pool_meta` seen — decisive too
+            return false;
+        }, Retry::standard(), page_limit);
     }
     catch (...)
     {

@@ -265,6 +265,28 @@ TEST(CASBootstrapOrdering, ResidualWithoutMetaFailsTypedWithZeroWrites)
     EXPECT_FALSE(readPresent(*backend, kPoolMetaKey)) << "a fresh _pool_meta must NOT have been minted";
 }
 
+/// (b') The residual verdict is decided by the first residual key, not by an enumeration of the whole
+/// prefix: forty residue keys and a 32-key page must cost exactly ONE list request. Enumerating a
+/// large prefix is the one request a slow store cannot answer within an attempt, and a refusal
+/// needs none of it.
+TEST(CASBootstrapOrdering, ResidualWithoutMetaIsDecidedByTheFirstPage)
+{
+    auto backend = std::make_shared<RecordingBackend>();
+    for (uint64_t i = 1; i <= 40; ++i)
+        seedObject(*backend, Layout{"p"}.refLogKey(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"test%2Fabcd"}), RefTxnId{1, i}), "x");
+    backend->clearLog();
+
+    expectThrowsCodeContaining(DB::ErrorCodes::INVALID_STATE, "refusing to bootstrap over residual data",
+                               [&] { Pool::open(backend, makeConfig()); });
+
+    size_t root_lists = 0;
+    for (const auto & e : backend->snapshot())
+        if (e.op == RecordingBackend::Op::List && e.key == kPrefix + "/")
+            ++root_lists;
+    EXPECT_EQ(root_lists, 1u) << "the first residual key settles the verdict; nothing past it may be enumerated";
+    EXPECT_EQ(backend->writeCount(), 0u);
+}
+
 /// (c) A prefix containing ONLY stale, structurally-valid `_probe/<hex>/…` debris (a crash-mid-battery
 /// leftover) → treated as empty → open succeeds and bootstraps a fresh pool. The debris-skip is what makes
 /// a normal restart-after-crash recover instead of wedging.

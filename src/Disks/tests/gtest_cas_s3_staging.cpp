@@ -1296,6 +1296,27 @@ std::shared_ptr<FakeGenerationObjectStorage> makeFakeGenerationObjectStorageForT
 
 }
 
+/// A store whose iterator does not page (the fallback `IObjectStorage::iterate` lists `max_keys` keys
+/// once and ends) must still let a page-sized list report that more keys follow. A page that ended
+/// exactly at the limit with an empty cursor would read as the end of the prefix, and the startup
+/// residual check would then take a prefix of debris plus residue for an empty one.
+TEST(CASS3Staging, ListPageOverANonPagingStoreStillReportsMoreKeys)
+{
+    auto object_storage = makeFakeGenerationObjectStorageForTest();
+    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(object_storage, DB::Cas::ObjectStorageBackend::Mode::Native);
+    for (int i = 0; i < 40; ++i)
+        createAt(*backend, fmt::format("p/list/{:03}", i), "x");
+
+    DB::Cas::tests::OperationForTest op(*backend);
+    const DB::Cas::ListPage first = (*op).list("p/list/", "", 32, DB::Cas::Retry::once());
+    EXPECT_EQ(first.keys.size(), 32u);
+    ASSERT_FALSE(first.next_cursor.empty()) << "a full page over a non-paging store must still say there is more";
+
+    const DB::Cas::ListPage rest = (*op).list("p/list/", first.next_cursor, 32, DB::Cas::Retry::once());
+    EXPECT_EQ(rest.keys.size(), 8u);
+    EXPECT_TRUE(rest.next_cursor.empty());
+}
+
 TEST(CASS3Staging, GenerationBackendMayUseNativeOnlyCopy)
 {
     auto object_storage = makeFakeGenerationObjectStorageForTest();

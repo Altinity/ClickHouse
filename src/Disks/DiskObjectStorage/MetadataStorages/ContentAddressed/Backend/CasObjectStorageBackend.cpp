@@ -1086,8 +1086,20 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
         ? std::nullopt
         : std::optional<String>(cursor);
 
+    /// The FIRST page the caller asked for is the page the store is asked for: a request that
+    /// enumerates the storage's default page (a thousand keys) to answer a caller that wanted a
+    /// handful spends the caller's whole attempt on keys it will never read -- and on a large prefix
+    /// that enumeration is exactly what a slow store cannot deliver within an attempt. One key MORE
+    /// than the page, because not every storage pages: the fallback iterator lists `max_keys` keys
+    /// once and ends, and a page that ends exactly at the limit would then be indistinguishable from
+    /// the end of the prefix -- the extra key is what proves there is more, whichever iterator
+    /// answers. A RESUMED page is not bounded: a storage that ignores `start_after` would answer it
+    /// with the first keys of the prefix again, and a bound there would drop every key past it. The
+    /// first page is the one the emptiness probe needs; a walk keeps the storage's own page size.
+    static constexpr size_t max_store_page = 1'000'000;
+    const size_t store_page = cursor.empty() ? std::min(limit, max_store_page) + 1 : 0;
     RawListPage page;
-    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/0, /*with_tags=*/false, start_after, profile, timeout_ms);
+    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, profile, timeout_ms);
     for (; it->isValid(); it->next())
     {
         const auto child = it->current();
