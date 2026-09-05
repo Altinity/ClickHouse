@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1
+#
+# ClickHouse server on an Ubuntu 22.04 FIPS base.
+#
+# Derived from Dockerfile.ubuntu. Everything below the `docker-official-library` marker is
+# identical.
+#
+# You need an Ubuntu Pro subscription to build this. The FIPS and ESM packages live in the
+# entitlement-gated esm.ubuntu.com archive. Pass the token as a BuildKit secret, NEVER as a build
+# arg because build args are recorded in `docker history`.
+#
+#   docker buildx build docker/server -f docker/server/Dockerfile.ubuntu-fips \
+#       --secret id=pro-attach-config,src=pro-attach-config.yaml \
+#       --build-arg DIRECT_DOWNLOAD_URLS="<deb urls>" \
+#       --load -t altinity/clickhouse-server:<version>-fips
+
+FROM ubuntu:22.04
+
+# see https://github.com/moby/moby/issues/4032#issuecomment-192327844
+# It could be removed after we move on a version 23:04+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ARG for quick switch to a given ubuntu mirror
+ARG apt_archive="http://archive.ubuntu.com"
+
+# user/group precreated explicitly with fixed uid/gid on purpose.
+# It is especially important for rootless containers: in that case entrypoint
+# can't do chown and owners of mounted volumes should be configured externally.
+# We do that in advance at the begining of Dockerfile before any packages will be
+# installed to prevent picking those uid / gid by some unrelated software.
+# The same uid / gid (101) is used both for alpine and ubuntu.
+#
+# `pro detach` removes the token, the ESM apt sources, the archive keyrings and the FIPS apt pin.
+# The FIPS packages stay installed, so the image ships FIPS out of the box with no credentials.
+#
+# ubuntu-pro-client stays installed on purpose. Run `pro attach` in the container and it restores
+# the sources, keyrings, credentials and pin itself; the result is a normal Ubuntu FIPS system that
+# can take updates.
+RUN --mount=type=secret,id=pro-attach-config,required=true \
+    set -eux; \
+    sed -i "s|http://archive.ubuntu.com|${apt_archive}|g" /etc/apt/sources.list; \
+    groupadd -r clickhouse --gid=101; \
+    useradd -r -g clickhouse --uid=101 --home-dir=/var/lib/clickhouse --shell=/bin/bash clickhouse; \
+    apt-get update; \
+    apt-get install --yes --no-install-recommends ubuntu-pro-client ca-certificates; \
+    pro attach --attach-config /run/secrets/pro-attach-config; \
+    apt-get upgrade --yes; \
+    apt-get install --yes --no-install-recommends \
+        openssl \
+        libssl3 \
+        libgcrypt20 \
+        libgcrypt20-hmac \
+        openssl-fips-module-3 \
+        locales \
+        tzdata \
+        wget; \
+    pro detach --assume-yes; \
+    rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
+
+#docker-official-library:off
+# The part between `docker-official-library` tags is related to our builds
+
+# NOTE (strtgbb): Removed install methods other than direct URL install to tidy the Dockerfile
+
+ARG DIRECT_DOWNLOAD_URLS=""
+
+ARG TARGETARCH
+
+# install from direct URL
+RUN if [ -n "${DIRECT_DOWNLOAD_URLS}" ]; then \
+        echo "installing from custom predefined urls with deb packages: ${DIRECT_DOWNLOAD_URLS}" \
+        && rm -rf /tmp/clickhouse_debs \
+        && mkdir -p /tmp/clickhouse_debs \
+        && for url in $DIRECT_DOWNLOAD_URLS; do \
+            wget --progress=bar:force:noscroll "$url" -P /tmp/clickhouse_debs || exit 1 \
+        ; done \
+        && dpkg -i /tmp/clickhouse_debs/*.deb \
+        && rm -rf /tmp/* ; \
+    fi
+
+# NOTE (strtgbb): Removed install methods other than direct URL install to tidy the Dockerfile
+
+# post install
+# we need to allow "others" access to clickhouse folder, because docker container
+# can be started with arbitrary uid (openshift usecase)
+RUN clickhouse-local -q 'SELECT * FROM system.build_options' \
+    && mkdir -p /var/lib/clickhouse /var/log/clickhouse-server /etc/clickhouse-server /etc/clickhouse-client \
+    && chmod ugo+Xrw -R /var/lib/clickhouse /var/log/clickhouse-server /etc/clickhouse-server /etc/clickhouse-client
+
+RUN locale-gen en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV TZ=UTC
+
+RUN mkdir /docker-entrypoint-initdb.d
+
+COPY docker_related_config.xml /etc/clickhouse-server/config.d/
+COPY entrypoint.sh /entrypoint.sh
+
+EXPOSE 9000 8123 9009
+VOLUME /var/lib/clickhouse
+
+ENV CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml
+
+ENTRYPOINT ["/entrypoint.sh"]
