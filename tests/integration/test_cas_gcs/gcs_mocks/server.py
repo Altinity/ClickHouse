@@ -53,8 +53,9 @@ Adversarial behaviours, each off by default:
     if it did, and therefore how much of the fixture's safety depends on the service being strict.
   - ``omit_generation=1`` — a successful object-write ``PUT`` answers without ``x-goog-generation``.
     A real GCS always sends one; this models the response a proxy or a future API version might
-    return, which is the only input that can reach the "write succeeded but carried no valid
-    generation" refusal in the CAS write path.
+    return, which is the only input that leaves a successful conditional write UNATTRIBUTED to an
+    incarnation. The CAS request engine settles such a write with an exact GET of the key (see
+    ``CasOperation::writeLoop``) rather than refusing it or adopting whatever a HEAD reports.
 
 Usage: ``python3 server.py <port>``. Started by ``helpers.mock_servers.start_mock_servers``, which
 probes ``GET /`` and expects the body ``OK``.
