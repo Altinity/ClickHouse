@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_set>
 #include <config.h>
+#include <fmt/ranges.h>
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
@@ -1422,6 +1423,16 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
         for (UInt32 field_index = 0; field_index < fields->size(); ++field_index)
         {
             auto field = fields->getObject(field_index);
+
+            /// Iceberg V3: multi-argument transforms use `source-ids` instead of `source-id`.
+            /// We cannot evaluate multi-arg transforms, so skip these sort fields — this disables
+            /// the read-in-order optimization for such columns (safe: data is still correct).
+            if (field->has(f_source_ids))
+                continue;
+
+            if (!field->has(f_source_id))
+                continue;
+
             auto source_id = field->getValue<Int64>(f_source_id);
             auto column_name = source_id_to_column_name[source_id];
             int direction = field->getValue<String>(f_direction) == "asc" ? 1 : -1;
@@ -1459,6 +1470,28 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
         return KeyDescription{};
     order_by_str.pop_back();
     return KeyDescription::parse(order_by_str, column_description, {}, local_context, true);
+}
+
+/// Format a multi-argument partition field for display in Iceberg/Spark style, e.g. "bucket(16, a, b)".
+static String formatPartitionFieldDisplayMultiArg(const String & iceberg_transform_name, const std::vector<String> & column_names)
+{
+    std::string name = Poco::toLower(iceberg_transform_name);
+    String columns_joined = fmt::format("{}", fmt::join(column_names, ", "));
+
+    if (name.starts_with("bucket") && name.back() == ']')
+    {
+        auto p = name.find('[');
+        if (p != std::string::npos)
+            return "bucket(" + name.substr(p + 1, name.size() - p - 2) + ", " + columns_joined + ")";
+    }
+    if (name.starts_with("truncate") && name.back() == ']')
+    {
+        auto p = name.find('[');
+        if (p != std::string::npos)
+            return "truncate(" + name.substr(p + 1, name.size() - p - 2) + ", " + columns_joined + ")";
+    }
+    /// Fallback for unknown multi-arg transforms: show as transform(col1, col2, ...)
+    return name + "(" + columns_joined + ")";
 }
 
 /// Format one partition field for display in Iceberg/Spark style, e.g. "day(ts)" or "bucket(16, id)".
@@ -1522,12 +1555,32 @@ std::optional<String> getPartitionKeyStringFromMetadata(Poco::JSON::Object::Ptr 
     for (UInt32 i = 0; i < fields->size(); ++i)
     {
         auto field = fields->getObject(i);
+        auto iceberg_transform_name = field->getValue<String>(f_transform);
+
+        /// Iceberg V3 multi-argument transform: `source-ids` is an array of column IDs.
+        if (field->has(f_source_ids))
+        {
+            auto source_ids_array = field->getArray(f_source_ids);
+            std::vector<String> column_names;
+            for (UInt32 idx = 0; idx < source_ids_array->size(); ++idx)
+            {
+                auto sid = source_ids_array->getElement<Int64>(idx);
+                auto it = source_id_to_column_name.find(sid);
+                if (it == source_id_to_column_name.end())
+                    return std::nullopt;
+                column_names.push_back(it->second);
+            }
+            part_exprs.push_back(formatPartitionFieldDisplayMultiArg(iceberg_transform_name, column_names));
+            continue;
+        }
+
+        if (!field->has(f_source_id))
+            return std::nullopt;
         auto source_id = field->getValue<Int64>(f_source_id);
         auto it = source_id_to_column_name.find(source_id);
         if (it == source_id_to_column_name.end())
             return std::nullopt;
         String column_name = it->second;
-        auto iceberg_transform_name = field->getValue<String>(f_transform);
         part_exprs.push_back(formatPartitionFieldDisplay(iceberg_transform_name, column_name));
     }
     String result;
@@ -1562,14 +1615,38 @@ std::optional<String> getSortingKeyDisplayStringFromMetadata(Poco::JSON::Object:
         for (UInt32 j = 0; j < sort_fields->size(); ++j)
         {
             auto field = sort_fields->getObject(j);
-            auto source_id = field->getValue<Int64>(f_source_id);
-            auto it = source_id_to_column_name.find(source_id);
-            if (it == source_id_to_column_name.end())
-                return std::nullopt;
-            String column_name = it->second;
-            String direction = field->getValue<String>(f_direction) == "asc" ? " asc" : " desc";
             auto iceberg_transform_name = field->getValue<String>(f_transform);
-            String expr = formatPartitionFieldDisplay(iceberg_transform_name, column_name);
+            String direction = field->getValue<String>(f_direction) == "asc" ? " asc" : " desc";
+            String expr;
+
+            /// Iceberg V3 multi-argument transform
+            if (field->has(f_source_ids))
+            {
+                auto source_ids_array = field->getArray(f_source_ids);
+                std::vector<String> column_names;
+                for (UInt32 idx = 0; idx < source_ids_array->size(); ++idx)
+                {
+                    auto sid = source_ids_array->getElement<Int64>(idx);
+                    auto it = source_id_to_column_name.find(sid);
+                    if (it == source_id_to_column_name.end())
+                        return std::nullopt;
+                    column_names.push_back(it->second);
+                }
+                expr = formatPartitionFieldDisplayMultiArg(iceberg_transform_name, column_names);
+            }
+            else if (field->has(f_source_id))
+            {
+                auto source_id = field->getValue<Int64>(f_source_id);
+                auto it = source_id_to_column_name.find(source_id);
+                if (it == source_id_to_column_name.end())
+                    return std::nullopt;
+                expr = formatPartitionFieldDisplay(iceberg_transform_name, it->second);
+            }
+            else
+            {
+                return std::nullopt;
+            }
+
             if (!result.empty())
                 result += ", ";
             result += expr + direction;
