@@ -560,7 +560,13 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
 {
     if (!configuration->isDataLakeConfiguration())
+    {
+        /// Called before query analysis, so the hive partition columns are visible to the
+        /// triggering query. The deferred resolution lives in `pure_storage`, from which the
+        /// metadata of this storage is read, so resolving it there is enough.
+        pure_storage->updateExternalDynamicMetadataIfExists(query_context);
         return;
+    }
 
     /// Always force an update to pick up the latest snapshot version.
     /// Using if_not_updated_before=true would leave latest_snapshot_version
