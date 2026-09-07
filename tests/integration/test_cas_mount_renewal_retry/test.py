@@ -43,14 +43,14 @@ def _control(base_url, path, patch=None):
         return json.loads(response.read().decode())
 
 
-def _wait_until(probe, timeout=40):
+def _wait_until(probe, timeout=40, interval=0.2):
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
         last = probe()
         if last:
             return last
-        time.sleep(0.2)
+        time.sleep(interval)
     raise AssertionError("condition did not become true within {}s; last={!r}".format(timeout, last))
 
 
@@ -363,7 +363,10 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
             return mount, counters
         return None
 
-    mount_after, counters_after = _wait_until(resolved_snapshot)
+    # Polling at the renewal's own 200 ms period (the default `interval`) can alias with it under a
+    # sanitizer build's slowdown -- a resolved renewal can land and be superseded by the next one
+    # between two polls. Poll faster than the cadence it observes, with a longer timeout to match.
+    mount_after, counters_after = _wait_until(resolved_snapshot, timeout=120, interval=0.05)
     _control(control_url, "/config", {"rate": 0.0})
     delta = _event_delta(counters_before, counters_after)
     # Look the recovered row up by outcome/classification rather than by a snapshot-derived sequence
