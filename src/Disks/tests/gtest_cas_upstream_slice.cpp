@@ -89,23 +89,26 @@ TEST(CASUpstreamSlice, HeadListRemoveOverloadsRefuseSingleAttemptOnTheBaseStorag
 {
     auto local = makeLocalObjectStorageForRetryProfileTest();
 
+    const DB::ObjectStorageControlRequest single_attempt{.profile = DB::ObjectStorageRetryProfile::SingleAttempt};
+    const DB::ObjectStorageControlRequest default_profile{.profile = DB::ObjectStorageRetryProfile::Default};
+
     expectThrowsNotImplementedSaying(
         "single-attempt metadata requests",
-        [&] { local->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::SingleAttempt, 0); });
+        [&] { local->tryGetObjectMetadataWithNativeToken("k", false, single_attempt); });
     expectThrowsNotImplementedSaying(
         "single-attempt listing requests",
-        [&] { local->iterate("", 1, false, {}, DB::ObjectStorageRetryProfile::SingleAttempt, 0); });
+        [&] { local->iterate("", 1, false, {}, single_attempt); });
     expectThrowsNotImplementedSaying(
         "single-attempt removal requests",
-        [&] { local->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::SingleAttempt, 0); });
+        [&] { local->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", single_attempt); });
 
     /// `Default` must keep reaching the ordinary implementation. For removal that is still a refusal,
     /// but the pre-existing one — matching its wording proves the profile overload forwarded.
-    EXPECT_NO_THROW(local->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::Default, 0));
-    EXPECT_NO_THROW(local->iterate("", 1, false, {}, DB::ObjectStorageRetryProfile::Default, 0));
+    EXPECT_NO_THROW(local->tryGetObjectMetadataWithNativeToken("k", false, default_profile));
+    EXPECT_NO_THROW(local->iterate("", 1, false, {}, default_profile));
     expectThrowsNotImplementedSaying(
         "Conditional (token-exact) object removal",
-        [&] { local->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::Default, 0); });
+        [&] { local->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", default_profile); });
 }
 
 #if USE_AWS_S3
@@ -640,7 +643,7 @@ TEST(CASUpstreamSlice, NativeTokenHeadRecoversFromAnExpiredTokenAndInstallsTheRe
     expired->scriptHead({controlExpiredToken()});
 
     const auto metadata = storage->tryGetObjectMetadataWithNativeToken(
-        "k", /*with_tags=*/false, DB::ObjectStorageRetryProfile::Default, /*request_timeout_ms=*/0);
+        "k", /*with_tags=*/false, DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::Default});
 
     ASSERT_TRUE(metadata.has_value());
     ASSERT_NE(refreshed, nullptr);
@@ -664,7 +667,7 @@ TEST(CASUpstreamSlice, ConditionalRemoveRecoversFromAnExpiredTokenAndInstallsThe
     expired->scriptDelete({controlExpiredToken()});
 
     const auto result = storage->removeObjectIfTokenMatches(
-        DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::Default, /*request_timeout_ms=*/0);
+        DB::StoredObject("k"), "e", DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::Default});
 
     EXPECT_EQ(result.outcome, DB::ConditionalRemoveOutcome::Removed);
     ASSERT_NE(refreshed, nullptr);
@@ -689,7 +692,7 @@ TEST(CASUpstreamSlice, SingleAttemptConditionalRemoveIssuesExactlyOneRequestOnTh
     retrying->scriptDelete({controlThrottle()});
 
     EXPECT_ANY_THROW(retrying_storage->removeObjectIfTokenMatches(
-        DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::Default, 0));
+        DB::StoredObject("k"), "e", DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::Default}));
     EXPECT_EQ(retrying->deleteRequestTimeouts().size(), 3u);   /// max_retries = 2, so three attempts
 
     ScriptedGetObjectClient * client = nullptr;
@@ -697,7 +700,7 @@ TEST(CASUpstreamSlice, SingleAttemptConditionalRemoveIssuesExactlyOneRequestOnTh
     client->scriptDelete({controlThrottle()});
 
     EXPECT_ANY_THROW(storage->removeObjectIfTokenMatches(
-        DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::SingleAttempt, 0));
+        DB::StoredObject("k"), "e", DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::SingleAttempt}));
     EXPECT_EQ(client->deleteRequestTimeouts().size(), 1u);
 }
 
@@ -711,18 +714,21 @@ TEST(CASUpstreamSlice, HeadAndRemoveUnderSingleAttemptRideTheClientBoundToTheReq
     ScriptedGetObjectClient * client = nullptr;
     auto storage = makeScriptedS3ObjectStorage(client);
 
-    storage->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::SingleAttempt, 4321);
+    storage->tryGetObjectMetadataWithNativeToken(
+        "k", false, DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::SingleAttempt, .attempt_timeout_ms = 4321});
     ASSERT_EQ(client->headRequestTimeouts().size(), 1u);
     EXPECT_EQ(client->headRequestTimeouts().at(0), 4321);
 
-    storage->removeObjectIfTokenMatches(DB::StoredObject("k"), "e", DB::ObjectStorageRetryProfile::SingleAttempt, 8765);
+    storage->removeObjectIfTokenMatches(DB::StoredObject("k"), "e",
+        DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::SingleAttempt, .attempt_timeout_ms = 8765});
     ASSERT_EQ(client->deleteRequestTimeouts().size(), 1u);
     EXPECT_EQ(client->deleteRequestTimeouts().at(0), 8765);
 
     EXPECT_EQ(client->cloneRequestTimeouts(), (std::vector<long>{4321, 8765}));
 
     /// Asking again for a bound already built must reuse that clone rather than evict the other one.
-    storage->tryGetObjectMetadataWithNativeToken("k", false, DB::ObjectStorageRetryProfile::SingleAttempt, 4321);
+    storage->tryGetObjectMetadataWithNativeToken(
+        "k", false, DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::SingleAttempt, .attempt_timeout_ms = 4321});
     EXPECT_EQ(client->cloneRequestTimeouts(), (std::vector<long>{4321, 8765}));
     EXPECT_EQ(client->headRequestTimeouts().at(1), 4321);
 }
@@ -736,10 +742,11 @@ TEST(CASUpstreamSlice, IterateUnderSingleAttemptSelectsTheClientBoundToTheReques
     ScriptedGetObjectClient * client = nullptr;
     auto storage = makeScriptedS3ObjectStorage(client);
 
-    (void)storage->iterate("p", 1, false, {}, DB::ObjectStorageRetryProfile::Default, 0);
+    (void)storage->iterate("p", 1, false, {}, DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::Default});
     EXPECT_TRUE(client->cloneRequestTimeouts().empty());
 
-    (void)storage->iterate("p", 1, false, {}, DB::ObjectStorageRetryProfile::SingleAttempt, 4321);
+    (void)storage->iterate("p", 1, false, {},
+        DB::ObjectStorageControlRequest{.profile = DB::ObjectStorageRetryProfile::SingleAttempt, .attempt_timeout_ms = 4321});
     EXPECT_EQ(client->cloneRequestTimeouts(), (std::vector<long>{4321}));
 }
 

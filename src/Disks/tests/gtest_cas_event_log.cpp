@@ -126,6 +126,7 @@ CasRequestBudget renewalEventBudget()
     return CasRequestBudget{
         .attempt_timeout_ms = 10,
         .lease_safety_margin_ms = 20,
+        .connect_timeout_cap_ms = std::nullopt,
     };
 }
 

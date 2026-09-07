@@ -272,8 +272,14 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openTestStorage(bool tiny_b
     storage->startup();
     if (tiny_budget)
     {
-        storage->poolForTest()->setDetachedDrainDeadlineBudgetForTest(
-            /*attempt_timeout_ms=*/10, /*lease_safety_margin_ms=*/10);
+        /// `connect_timeout_cap_ms` is set explicitly (not left at whatever the pool froze at open)
+        /// so the drain deadline -- `attemptEnvelopeMs() + lease_safety_margin_ms` -- is really the
+        /// tiny 20 ms this test wants, not 10 ms of attempt timeout plus a hidden connect-cap tax.
+        CasRequestBudget budget;
+        budget.attempt_timeout_ms = 10;
+        budget.lease_safety_margin_ms = 10;
+        budget.connect_timeout_cap_ms = 0;
+        storage->poolForTest()->setDetachedDrainDeadlineBudgetForTest(budget);
     }
     return storage;
 }
@@ -290,6 +296,9 @@ PoolPtr openPublishingPool(const std::shared_ptr<DB::Cas::tests::OrderedFaultBac
     /// retry loop and no wall-clock wait -- the same budget the snapshot-ordering suite uses.
     config.cas_request_budget.attempt_timeout_ms = 100;
     config.cas_request_budget.lease_safety_margin_ms = 100;
+    /// No connect cap: the in-memory backend has no connect notion (`attemptTimeoutMs()` alone answers
+    /// its budget), so the envelope must equal the bare attempt timeout for the pairing below to hold.
+    config.cas_request_budget.connect_timeout_cap_ms = 0;
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
     backend->setAttemptTimeoutMs(config.cas_request_budget.attempt_timeout_ms);

@@ -88,21 +88,7 @@ void validateWritableMountTiming(const PoolConfig & config)
             "CAS mount timing rejected: lease TTL must be positive and renewal period non-negative");
     const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
     const uint64_t period_ms = static_cast<uint64_t>(config.mount_renew_period.count());
-    validateCasRequestBudget(config.cas_request_budget, ttl_ms, period_ms);
-    if (!config.background_watermark)
-        return;
-
-    const uint64_t safety_ms = config.cas_request_budget.lease_safety_margin_ms;
-    const uint64_t attempt_ms = config.cas_request_budget.attempt_timeout_ms;
-    const bool cadence_fits = safety_ms <= ttl_ms
-        && period_ms <= ttl_ms - safety_ms
-        && attempt_ms <= ttl_ms - safety_ms - period_ms;
-    if (!cadence_fits)
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "CAS mount renewal cadence rejected: period ({} ms) + attempt timeout ({} ms) must be "
-            "at most TTL ({} ms) - safety margin ({} ms) when background renewal is enabled",
-            period_ms, attempt_ms, ttl_ms, safety_ms);
+    validateCasRequestBudget(config.cas_request_budget, ttl_ms, period_ms, config.background_watermark);
 }
 
 /// The verdict of the pool-lifecycle identity gate (step 0 of `tryRemountOnce`, spec §2). Exactly one
@@ -838,14 +824,20 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         : claim_anchor_boot_ms + ttl_ms_u - safety_ms;
     const uint64_t now_boot_ms = store->bootMsNow();
     const uint64_t period_ms = static_cast<uint64_t>(store->config.mount_renew_period.count());
+    const uint64_t envelope_ms = store->config.cas_request_budget.attemptEnvelopeMs();
+    const uint64_t two_envelopes_ms = envelope_ms > std::numeric_limits<uint64_t>::max() / 2
+        ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
     const uint64_t renewal_window_ms = store->config.background_watermark
-        ? period_ms + store->config.cas_request_budget.attempt_timeout_ms
-        : store->config.cas_request_budget.attempt_timeout_ms;
-    /// Preserve one ordinary cadence followed by one physical renewal attempt inside the safe lease
-    /// window. If that publication horizon was consumed, re-anchor synchronously before opening the
-    /// fence; the renewer independently retains its per-request deadline checks.
+        ? (two_envelopes_ms > std::numeric_limits<uint64_t>::max() - period_ms
+              ? std::numeric_limits<uint64_t>::max() : period_ms + two_envelopes_ms)
+        : two_envelopes_ms;
+    /// Preserve one ordinary cadence followed by one physical renewal attempt (a write and its
+    /// settlement read: two envelopes) inside the safe lease window. If that publication horizon was
+    /// consumed, re-anchor synchronously before opening the fence; the renewer independently retains
+    /// its per-request deadline checks. STRICT, like `CasMountRuntime::admit`: a horizon that fits
+    /// exactly still starts a renewal the fence would then refuse.
     const bool renewal_window_fits = now_boot_ms <= safe_deadline
-        && renewal_window_ms <= safe_deadline - now_boot_ms;
+        && renewal_window_ms < safe_deadline - now_boot_ms;
     if (!renewal_window_fits)
     {
         /// The claim path outlived the lease TTL: its anchor can no longer authorize an armed fence (a
@@ -1001,7 +993,7 @@ Pool::~Pool()
         if (config.teardown_phase2_throw_for_test)
             config.teardown_phase2_throw_for_test();
         const bool ref_lanes_drained = ref_ledger.drainRefLanesForShutdown(
-            config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
+            config.cas_request_budget.attemptEnvelopeMs() + config.cas_request_budget.lease_safety_margin_ms);
         drained = ref_lanes_drained && !writerCleanupDutiesPending();
     }, "CAS pool teardown: draining ref lanes");
 
@@ -1094,10 +1086,9 @@ bool Pool::detachedWorkStoppingForTest() const
     return teardownBegun();
 }
 
-void Pool::setDetachedDrainDeadlineBudgetForTest(uint64_t attempt_timeout_ms, uint64_t lease_safety_margin_ms)
+void Pool::setDetachedDrainDeadlineBudgetForTest(const CasRequestBudget & budget)
 {
-    config.cas_request_budget.attempt_timeout_ms = attempt_timeout_ms;
-    config.cas_request_budget.lease_safety_margin_ms = lease_safety_margin_ms;
+    config.cas_request_budget = budget;
 }
 
 void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason)
@@ -1157,7 +1148,7 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     /// (5b) Drain the ref lanes (bounded by one attempt's budget + safety margin) to learn whether a clean
     /// farewell is EARNED — exactly the `~Pool` rule.
     const bool ref_lanes_drained = ref_ledger.drainRefLanesForShutdown(
-        config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
+        config.cas_request_budget.attemptEnvelopeMs() + config.cas_request_budget.lease_safety_margin_ms);
     const bool drained = ref_lanes_drained && !writerCleanupDutiesPending();
 
     /// (3+5c) Retire the merged heartbeat: a clean-release farewell ONLY if the lanes provably drained,
@@ -1503,11 +1494,17 @@ bool Pool::tryRemountOnce()
             : remount_anchor_boot_ms + ttl_ms - safety_ms;
         const uint64_t now_boot_ms = mount_runtime.bootMsNow();
         const uint64_t period_ms = static_cast<uint64_t>(config.mount_renew_period.count());
+        const uint64_t envelope_ms = config.cas_request_budget.attemptEnvelopeMs();
+        const uint64_t two_envelopes_ms = envelope_ms > std::numeric_limits<uint64_t>::max() / 2
+            ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
         const uint64_t renewal_window_ms = config.background_watermark
-            ? period_ms + config.cas_request_budget.attempt_timeout_ms
-            : config.cas_request_budget.attempt_timeout_ms;
+            ? (two_envelopes_ms > std::numeric_limits<uint64_t>::max() - period_ms
+                  ? std::numeric_limits<uint64_t>::max() : period_ms + two_envelopes_ms)
+            : two_envelopes_ms;
+        /// STRICT, like the open path and `CasMountRuntime::admit`: a horizon that fits exactly still
+        /// starts a renewal the fence would then refuse.
         const bool renewal_window_fits = now_boot_ms <= safe_deadline
-            && renewal_window_ms <= safe_deadline - now_boot_ms;
+            && renewal_window_ms < safe_deadline - now_boot_ms;
         if (!renewal_window_fits)
         {
             step = "renewer_redo";

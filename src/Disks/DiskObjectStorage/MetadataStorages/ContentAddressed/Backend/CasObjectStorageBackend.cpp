@@ -125,11 +125,13 @@ void recordConditionalWriteOutcome(CasWriteOutcome outcome)
 }
 
 ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_,
-                                           bool single_attempt_control_plane_, uint64_t attempt_timeout_ms_)
+                                           bool single_attempt_control_plane_, uint64_t attempt_timeout_ms_,
+                                           uint64_t connect_timeout_cap_ms_)
     : object_storage(std::move(object_storage_))
     , mode(mode_)
     , single_attempt_control_plane(single_attempt_control_plane_)
     , attempt_timeout_ms(attempt_timeout_ms_)
+    , connect_timeout_cap_ms(connect_timeout_cap_ms_)
     , emu_root(object_storage->getCommonKeyPrefix())
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
@@ -221,10 +223,9 @@ bool ObjectStorageBackend::isValidTokenValue(Dialect type, const String & value)
     return isIncarnationValue(type, value);
 }
 
-std::optional<Backend::RawMeta> ObjectStorageBackend::nativeHead(
-    const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms)
+std::optional<Backend::RawMeta> ObjectStorageBackend::nativeHead(const String & key, const ObjectStorageControlRequest & request)
 {
-    auto metadata = object_storage->tryGetObjectMetadataWithNativeToken(key, /*with_tags=*/false, profile, timeout_ms);
+    auto metadata = object_storage->tryGetObjectMetadataWithNativeToken(key, /*with_tags=*/false, request);
     if (!metadata)
         return std::nullopt;
 
@@ -599,24 +600,25 @@ String ObjectStorageBackend::emuMintToken(const String & key, const String & eta
 /// Backend interface
 /// =========================================================================================
 
-ReadSettings ObjectStorageBackend::readSettingsFor(ObjectStorageRetryProfile profile, uint64_t timeout_ms) const
+ReadSettings ObjectStorageBackend::readSettingsFor(const ObjectStorageControlRequest & request) const
 {
     ReadSettings rs = getReadSettings();
     /// Mark the request for the store's native conditional dialect, so a GCS read is answered with a
     /// generation rather than an MD5-shaped ETag.
     rs.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
-    rs.object_storage_retry_profile = profile;
-    rs.object_storage_attempt_timeout_ms = timeout_ms;
+    rs.object_storage_retry_profile = request.profile;
+    rs.object_storage_attempt_timeout_ms = request.attempt_timeout_ms;
+    rs.object_storage_connect_timeout_cap_ms = request.connect_timeout_cap_ms;
+    rs.object_storage_attempt_number = request.attempt_number;
     return rs;
 }
 
-std::optional<Backend::Raw> ObjectStorageBackend::read(const String & key, TransportAccess &)
+std::optional<Backend::Raw> ObjectStorageBackend::read(const String & key, TransportAccess & access)
 {
-    return readUnder(key, controlPlaneProfile(), attempt_timeout_ms);
+    return readUnder(key, controlRequest(access.attemptNo()));
 }
 
-std::optional<Backend::Raw> ObjectStorageBackend::readUnder(
-    const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms)
+std::optional<Backend::Raw> ObjectStorageBackend::readUnder(const String & key, const ObjectStorageControlRequest & request)
 {
     if (mode == Mode::Native)
     {
@@ -631,7 +633,7 @@ std::optional<Backend::Raw> ObjectStorageBackend::readUnder(
             /// test whose stderr is checked fails on the log line alone.
             Expect404ResponseScope scope;
             auto got = object_storage->readSmallObjectAndGetObjectMetadata(
-                StoredObject(key), readSettingsFor(profile, timeout_ms), casMaxStoredObjectBytes());
+                StoredObject(key), readSettingsFor(request), casMaxStoredObjectBytes());
             return Raw{std::move(got.data), normalizeTokenValue(got.metadata.etag)};
         }
         catch (const std::exception & e)
@@ -705,16 +707,15 @@ std::unique_ptr<ReadBuffer> ObjectStorageBackend::stream(const String & key, Tra
     }
 }
 
-std::optional<Backend::RawMeta> ObjectStorageBackend::head(const String & key, TransportAccess &)
+std::optional<Backend::RawMeta> ObjectStorageBackend::head(const String & key, TransportAccess & access)
 {
-    return headUnder(key, controlPlaneProfile(), attempt_timeout_ms);
+    return headUnder(key, controlRequest(access.attemptNo()));
 }
 
-std::optional<Backend::RawMeta> ObjectStorageBackend::headUnder(
-    const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms)
+std::optional<Backend::RawMeta> ObjectStorageBackend::headUnder(const String & key, const ObjectStorageControlRequest & request)
 {
     if (mode == Mode::Native)
-        return nativeHead(key, profile, timeout_ms);
+        return nativeHead(key, request);
 
     std::lock_guard lock(emu_mutex);
     if (!emuExists(key))
@@ -731,13 +732,12 @@ std::optional<Backend::RawMeta> ObjectStorageBackend::headUnder(
 }
 
 /// See Backend::probeSentinelRaw / CasBackend.h's ProbeOutcome for the semantics this classifies.
-SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key, TransportAccess &)
+SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key, TransportAccess & access)
 {
-    return probeSentinelUnder(key, controlPlaneProfile(), attempt_timeout_ms);
+    return probeSentinelUnder(key, controlRequest(access.attemptNo()));
 }
 
-SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(
-    const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms)
+SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key, const ObjectStorageControlRequest & request)
 {
     if (mode == Mode::Native)
     {
@@ -746,7 +746,7 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(
             /// One `read`: unlike a bodyless HEAD 404, a GET 404 carries a response body, so the
             /// SDK can parse its `<Code>` and a missing key and a missing bucket arrive as different
             /// errors -- which is the whole distinction this probe exists to make.
-            auto raw = readUnder(key, profile, timeout_ms);
+            auto raw = readUnder(key, request);
             if (!raw)
                 return {ProbeOutcome::KeyAbsent, std::nullopt};
             return {ProbeOutcome::Present, std::move(raw->bytes)};
@@ -785,7 +785,7 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(
         if (!object_storage->existsOrHasAnyChild(emu_root))
             return {ProbeOutcome::ContainerAbsent, std::nullopt};
 
-        auto raw = readUnder(key, profile, timeout_ms);
+        auto raw = readUnder(key, request);
         if (!raw)
             return {ProbeOutcome::KeyAbsent, std::nullopt};
         return {ProbeOutcome::Present, std::move(raw->bytes)};
@@ -802,7 +802,7 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(
 /// unconditional multipart-capable write. CAS-mutable keys (shard manifests, gc/state, the registry)
 /// also skip the racy post-upload existence/size check; a publish's manifest CAS was observed racing
 /// the GC fence there.
-WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
+WriteSettings ObjectStorageBackend::conditionalWriteSettings(size_t attempt_no) const
 {
     WriteSettings ws;
     ws.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
@@ -821,11 +821,15 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
     /// And that attempt is bounded by the same budget the caller reserved for it. Without this the
     /// write would run under the storage's own timeout while its caller waited on a shorter one.
     ws.object_storage_attempt_timeout_ms = attempt_timeout_ms;
+    /// And that attempt's connect is bounded by the same frozen cap every other control request carries.
+    ws.object_storage_connect_timeout_cap_ms = connect_timeout_cap_ms;
+    /// The caller's own physical-attempt count, so the HTTP client sees a reissue as attempt >= 2.
+    ws.object_storage_attempt_number = attempt_no;
     return ws;
 }
 
 std::expected<String, Backend::RawConflict> ObjectStorageBackend::write(
-    const String & key, const String & bytes, const std::optional<String> & expected_value, TransportAccess &)
+    const String & key, const String & bytes, const std::optional<String> & expected_value, TransportAccess & access)
 {
     /// An empty, wildcard or list value would turn the precondition into an unconditional write --
     /// refuse it as a caller bug before anything else runs.
@@ -837,7 +841,7 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::write(
 
     if (mode == Mode::Native)
     {
-        WriteSettings ws = conditionalWriteSettings();
+        WriteSettings ws = conditionalWriteSettings(access.attemptNo());
         if (expected_value)
             ws.object_storage_write_if_match = *expected_value;
         else
@@ -937,13 +941,13 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
         write_settings);
 }
 
-Backend::RawRemoval ObjectStorageBackend::remove(const String & key, const String & expected_value, TransportAccess &)
+Backend::RawRemoval ObjectStorageBackend::remove(const String & key, const String & expected_value, TransportAccess & access)
 {
-    return removeUnder(key, expected_value, controlPlaneProfile(), attempt_timeout_ms);
+    return removeUnder(key, expected_value, controlRequest(access.attemptNo()));
 }
 
 Backend::RawRemoval ObjectStorageBackend::removeUnder(
-    const String & key, const String & expected_value, ObjectStorageRetryProfile profile, uint64_t timeout_ms)
+    const String & key, const String & expected_value, const ObjectStorageControlRequest & request)
 {
     /// Same grammar guard as `write`, and for the same reason: an empty, wildcard or list value would
     /// turn the condition into an unconditional delete.
@@ -957,7 +961,7 @@ Backend::RawRemoval ObjectStorageBackend::removeUnder(
     {
         /// `NOT_IMPLEMENTED` from a storage that does not enforce conditional removal propagates —
         /// fail-closed by construction.
-        auto result = object_storage->removeObjectIfTokenMatches(StoredObject(key), expected_value, profile, timeout_ms);
+        auto result = object_storage->removeObjectIfTokenMatches(StoredObject(key), expected_value, request);
         switch (result.outcome)
         {
             case ConditionalRemoveOutcome::Removed:
@@ -999,7 +1003,7 @@ void ObjectStorageBackend::emuForgetDeletedToken(const String & key)
     }
 }
 
-void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &)
+void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access)
 {
     if (keys.empty())
         return;
@@ -1010,7 +1014,7 @@ void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> &
         for (const WriteOnceKey & key : keys)
             objects.emplace_back(key.str());
         /// `NOT_IMPLEMENTED` from a storage without a batch delete propagates -- fail-closed by construction.
-        object_storage->removeObjectsIfExistUnderProfile(objects, controlPlaneProfile(), attempt_timeout_ms);
+        object_storage->removeObjectsIfExistUnderProfile(objects, controlRequest(access.attemptNo()));
         return;
     }
 
@@ -1024,13 +1028,13 @@ void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> &
     }
 }
 
-Backend::RawListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit, TransportAccess &)
+Backend::RawListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access)
 {
-    return listUnder(prefix, cursor, limit, controlPlaneProfile(), attempt_timeout_ms);
+    return listUnder(prefix, cursor, limit, controlRequest(access.attemptNo()));
 }
 
 Backend::RawListPage ObjectStorageBackend::listUnder(
-    const String & prefix, const String & cursor, size_t limit, ObjectStorageRetryProfile profile, uint64_t timeout_ms)
+    const String & prefix, const String & cursor, size_t limit, const ObjectStorageControlRequest & request)
 {
     /// Use the lazy object-storage iterator instead of `listObjects(..., max_keys=0)`: the latter
     /// materialized the whole prefix, then sliced client-side, so a paginated walk re-fetched the full
@@ -1099,7 +1103,7 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
     static constexpr size_t max_store_page = 1'000'000;
     const size_t store_page = cursor.empty() ? std::min(limit, max_store_page) + 1 : 0;
     RawListPage page;
-    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, profile, timeout_ms);
+    auto it = object_storage->iterate(physical_prefix, /*max_keys=*/store_page, /*with_tags=*/false, start_after, request);
     for (; it->isValid(); it->next())
     {
         const auto child = it->current();
@@ -1131,5 +1135,21 @@ Backend::RawListPage ObjectStorageBackend::listUnder(
     return page;
 }
 
+void ensureBackendMatchesBudget(const ObjectStorageBackend & backend, const CasRequestBudget & budget)
+{
+    const uint64_t budget_connect_cap = budget.connect_timeout_cap_ms.value_or(0);
+    if (backend.connectTimeoutCapMs() != budget_connect_cap)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS: backend connect timeout cap ({} ms) does not match the pool's request budget ({} ms); "
+            "the mount's lease arithmetic was validated against the budget alone, so a backend built with "
+            "another cap could silently outlive it",
+            backend.connectTimeoutCapMs(), budget_connect_cap);
+    if (backend.attemptTimeoutMs() != budget.attempt_timeout_ms)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS: backend attempt timeout ({} ms) does not match the pool's request budget ({} ms); "
+            "the mount's lease arithmetic was validated against the budget alone, so a backend built with "
+            "another timeout could silently outlive it",
+            backend.attemptTimeoutMs(), budget.attempt_timeout_ms);
+}
 
 }

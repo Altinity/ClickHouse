@@ -367,7 +367,7 @@ constexpr int kFaultsBeyondTheRetryWindow = 100'000;
 CasRequestBudget tinyBudget()
 {
     return CasRequestBudget{
-        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
 }
 
 PoolConfig walkTestConfig()

@@ -52,6 +52,14 @@ PLAIN_BUCKET = "plainbucket"
 PLAIN_HMAC_DISK = "plain_gcs_hmac"
 PLAIN_HMAC_BUCKET = "plainhmacbucket"
 
+# A CAS disk dedicated to the first-attempt-fuse proof: same fake bucket as `cas_gcs_hmac` but its
+# own physical prefix (so it shares no keys with it) and a tightened `attempt_timeout_ms`, so a
+# deliberate fake-server delay is a genuine transport timeout instead of sailing through the 5000 ms
+# default. Deliberately excluded from `CAS_DISKS`, so no parametrized test or run-wide assertion
+# picks it up.
+FUSE_DISK = "cas_gcs_hmac_fuse"
+FUSE_BUCKET = "hmacbucket"
+
 NUM_ROWS = 200
 
 # Where the fixture installs the disk configuration, so a test can rewrite it and reload.
@@ -133,6 +141,26 @@ def start_cluster():
             "</policies>",
             "<plain_gcs_hmac><volumes><main><disk>plain_gcs_hmac</disk></main></volumes>"
             "</plain_gcs_hmac></policies>",
+        )
+        # `FUSE_DISK`: same bucket as `cas_gcs_hmac`, its own physical prefix and `cas_server_root_id`
+        # (so it owns a disjoint key space), with `attempt_timeout_ms` tightened to 200 -- see
+        # `test_a_first_attempt_timeout_is_reissued_as_attempt_two` for why this needs its own disk
+        # rather than a reload of `cas_gcs_hmac`'s setting.
+        node.replace_in_config(
+            CONFIG_IN_CONTAINER,
+            "</disks>",
+            "<cas_gcs_hmac_fuse><type>object_storage</type><object_storage_type>s3</object_storage_type>"
+            "<metadata_type>cas</metadata_type><cas_server_root_id>itest-cas-gcs-hmac-fuse</cas_server_root_id>"
+            "<endpoint>http://fakegcs:8080/hmacbucket/cas-fuse/</endpoint>"
+            "<http_client>gcs_hmac</http_client><access_key_id>GOOG1EFAKEACCESSKEYID</access_key_id>"
+            "<secret_access_key>fake-goog4-hmac-secret</secret_access_key>"
+            "<cas_attempt_timeout_ms>200</cas_attempt_timeout_ms></cas_gcs_hmac_fuse></disks>",
+        )
+        node.replace_in_config(
+            CONFIG_IN_CONTAINER,
+            "</policies>",
+            "<cas_gcs_hmac_fuse><volumes><main><disk>cas_gcs_hmac_fuse</disk></main></volumes>"
+            "</cas_gcs_hmac_fuse></policies>",
         )
         node.replace_in_config(
             CONFIG_IN_CONTAINER,
@@ -1469,6 +1497,104 @@ def test_first_per_key_throttling_is_transparently_absorbed(disk):
     finally:
         assert _control_post("/_control/first_per_key_throttle?enabled=0")["enabled"] is False
         node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+
+
+def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
+    """A first-attempt fuse timeout is reissued at once, on the wire, as attempt 2.
+
+    The fake's `/_control/delay` knob delays the first matching request past the first-attempt
+    fuse; the engine's zero-pause reissue must show up as a second request carrying
+    `clickhouse-request: ...attempt=2` — for a LIST issued directly by a GC round, and for a
+    conditional PUT of an INSERT's `.meta` marker, which settles with a `GET` before its own
+    attempt 2 and counts as a `CASRequestResolveRead`.
+
+    The fuse only trips on a real transport timeout, and `content_addressed`'s
+    `attempt_timeout_ms` defaults to 5000 -- a 300 ms fake delay would sail through that budget on
+    the ordinary `cas_gcs_hmac` disk and never throw at all. `FUSE_DISK` is a second CAS disk
+    the fixture mounts alongside it (own `cas_server_root_id`, own physical prefix under the same
+    bucket, so it shares no keys with `cas_gcs_hmac`'s traffic) with `attempt_timeout_ms` tightened
+    to 200 -- the only way to make a 300 ms delay a genuine transport timeout without touching the
+    engine's C++ default. `attempt_timeout_ms` is frozen at pool-open time (mount-time), not
+    reloadable, hence a dedicated disk rather than a temporary `SYSTEM RELOAD CONFIG` on the
+    existing one.
+    """
+    node = cluster.instances["node"]
+    disk = FUSE_DISK
+    # No `/_control/reset` here: it would wipe the fake's cumulative capture log, which the
+    # run-wide fence at the end of this file depends on seeing from the very start of the run.
+    # No earlier test in this file arms the delay knob, so there is nothing stale to clear.
+    node.query("DROP TABLE IF EXISTS fuse_probe SYNC")
+    node.query(
+        "CREATE TABLE fuse_probe (id UInt64) ENGINE = MergeTree ORDER BY id "
+        "SETTINGS storage_policy = '{}'".format(disk)
+    )
+    node.query("INSERT INTO fuse_probe VALUES (1)")
+    _quiesce_merges(node, "fuse_probe")
+    node.query("SYSTEM CAS GC STOP '{}'".format(disk))  # only the explicit round below may LIST
+    try:
+        # LIST: a GC round's first LIST lists the `gc/server-roots/` family; the first matching
+        # LIST is delayed past the fuse and must be reissued at once as attempt 2.
+        seq = _next_seq()
+        delayed_before = _counters().get("DelayedRequest", 0)
+        assert _control_post("/_control/delay?substr=gc&ms=300&method=LIST&once=1")["method"] == "LIST"
+        node.query("SYSTEM CAS GC RUN '{}'".format(disk))
+        assert _counters().get("DelayedRequest", 0) - delayed_before == 1, "the LIST delay must fire exactly once"
+        lists = [
+            r
+            for r in _captured_since(seq, FUSE_BUCKET)
+            if r["method"] == "GET" and not r["key"] and "prefix=" in r["query"]
+        ]
+        # The fake appends a request's capture record's `seq` when ITS OWN handler finishes, not
+        # when the client issued it: the delayed LIST's handler is still sleeping out its 300 ms
+        # when the reissue (a fresh connection, unaffected by the knob once `once=1` cleared it)
+        # completes and gets a lower `seq`. So the pair is identified by sharing one `query` (the
+        # same prefix, reissued), and ordered by `arrival_seq` -- assigned when a request arrives,
+        # before any delay is applied, so it reflects issue order rather than completion order.
+        by_query = {}
+        for r in lists:
+            by_query.setdefault(r["query"], []).append(r)
+        retried = [group for group in by_query.values() if len(group) >= 2]
+        assert len(retried) == 1, (lists, by_query)
+        pair = retried[0]
+        assert len(pair) == 2, pair
+        list2 = [r for r in pair if r["headers"].get("clickhouse-request", "").endswith("attempt=2")]
+        list1 = [r for r in pair if r not in list2]
+        assert len(list1) == 1 and len(list2) == 1, pair
+        list1, list2 = list1[0], list2[0]
+        assert list1["headers"].get("clickhouse-request", "").endswith("attempt=1") or not list1["headers"].get(
+            "clickhouse-request", ""
+        ), pair
+        assert list1["arrival_seq"] < list2["arrival_seq"], (list1, list2)
+
+        # Conditional PUT: delay the first `.meta` PUT of the next insert; expect a settlement GET
+        # arriving strictly between PUT(1) and its reissue PUT(2), and one settlement read counted.
+        seq = _next_seq()
+        resolve_reads_before = _resolve_reads(node)
+        delayed_before = _counters().get("DelayedRequest", 0)
+        assert _control_post("/_control/delay?substr=.meta&ms=300&method=PUT&once=1")["method"] == "PUT"
+        node.query("INSERT INTO fuse_probe VALUES (2)")
+        assert _counters().get("DelayedRequest", 0) - delayed_before == 1, "the PUT delay must fire exactly once"
+        rows = [r for r in _captured_since(seq, FUSE_BUCKET) if r["key"].endswith(".meta")]
+        assert rows, "no `.meta` PUT reached the fake, so this test would be vacuous"
+        meta_key = rows[0]["key"]
+        same_key = [r for r in rows if r["key"] == meta_key]
+        puts = [r for r in same_key if r["method"] == "PUT"]
+        gets = [r for r in same_key if r["method"] == "GET"]
+        assert len(puts) >= 2, same_key
+        assert gets, "no settlement GET reached the fake between PUT(1) and its reissue"
+        put2 = [r for r in puts if r["headers"].get("clickhouse-request", "").endswith("attempt=2")]
+        put1 = [r for r in puts if r not in put2]
+        assert len(put1) == 1 and len(put2) == 1, puts
+        put1, put2 = put1[0], put2[0]
+        assert put1["headers"].get("clickhouse-request", "").endswith("attempt=1") or not put1["headers"].get(
+            "clickhouse-request", ""
+        ), puts
+        settle_get = min(gets, key=lambda r: r["arrival_seq"])
+        assert put1["arrival_seq"] < settle_get["arrival_seq"] < put2["arrival_seq"], (put1, settle_get, put2)
+        assert _resolve_reads(node) - resolve_reads_before >= 1
+    finally:
+        node.query("SYSTEM CAS GC START '{}'".format(disk))
+        node.query("DROP TABLE IF EXISTS fuse_probe SYNC")
 
 
 # MUST STAY LAST IN THIS FILE. The fake's capture log is global and cumulative and nothing in this

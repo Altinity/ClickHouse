@@ -82,7 +82,10 @@ void seedOwnClaim(CasOperation & op, const Layout & l, const String & srid, UInt
     ASSERT_EQ(claimMount(op, l, srid, uuid, epoch, now_ms, ttl_ms).kind, MountClaimResult::Claimed);
 }
 
-class RenewalScriptBackend final : public InMemoryBackend
+/// Not `final`: `EnvelopeEatingBackend` (the envelope-cutoff test below) derives from it to
+/// reuse its `Attempt`/`attempts` bookkeeping while overriding `write`/`read` with its own always-fail
+/// behavior instead of the scripted-action queue.
+class RenewalScriptBackend : public InMemoryBackend
 {
 public:
     enum class Action : uint8_t
@@ -290,6 +293,201 @@ TEST(CASHeartbeat, StopStampsExpiredAndFarewellSentinel)
     /// AND folds the watermark farewell into it (min_active_build_sequence = UINT64_MAX).
     EXPECT_LE(m.expires_at_ms, now_ms);
     EXPECT_EQ(m.min_active_build_sequence, std::numeric_limits<uint64_t>::max());
+}
+
+namespace
+{
+/// Reports the SHIPPED PRODUCTION defaults (`attempt_timeout_ms=5000`, two `connect_timeout_cap_ms=1000`
+/// caps -> `attemptEnvelopeMs()=7000`, `CasRequestBudget.cpp`'s own defaults) while landing every attempt
+/// immediately: the write's own success is not what is under test here, only whether the farewell's
+/// policy window is wide enough to admit one attempt in the first place.
+struct DefaultEnvelopeBackend : InMemoryBackend
+{
+    uint64_t attemptTimeoutMs() const override { return 5000; }
+    uint64_t attemptEnvelopeMs() const override { return 7000; }
+};
+
+/// A DIFFERENT envelope from `DefaultEnvelopeBackend`'s, for
+/// `FarewellIsAdmittedUnderADifferentEnvelope` below: that test exists to pin the window's
+/// ARITHMETIC, not just that some window admits the write, so it needs a reservation the
+/// shipped-default window (16000 ms) could not have admitted by coincidence.
+struct WiderEnvelopeBackend : InMemoryBackend
+{
+    uint64_t attemptTimeoutMs() const override { return 5000; }
+    uint64_t attemptEnvelopeMs() const override { return 9000; }
+};
+}
+
+/// A write reserves two attempt envelopes before it starts (`CasOperation::writeLoop`'s
+/// `reservedFor(0, 2)`), so at the shipped defaults the farewell needs a policy window that admits
+/// 2 * 7000 = 14000 ms. A fixed window that predates that reservation (`kFarewellBudgetMs` alone is
+/// 10000 ms) refuses the write before its first attempt on every graceful shutdown: no farewell is
+/// published, and the next start pays a full incarnation-stability observation instead of reclaiming
+/// the slot instantly.
+TEST(CASHeartbeat, FarewellIsAdmittedUnderTheDefaultBudget)
+{
+    auto backend = std::make_shared<DefaultEnvelopeBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    uint64_t boot_ms = 100;
+    Ops ops(backend, &boot_ms);
+    seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/30000);
+
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, srid, uuid, /*writer_epoch=*/9,
+                            std::chrono::milliseconds(30000), [&] { return now_ms; },
+                            [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
+                            [&] { return boot_ms; });
+    renewer.start();
+
+    now_ms = 2000;
+    EXPECT_NO_THROW(renewer.release())
+        << "the farewell's policy window must admit the write's own two-envelope reservation "
+           "(2 * 7000 ms with the shipped defaults) -- otherwise a clean shutdown never hands the "
+           "mount slot back and every restart pays a full incarnation-stability observation";
+
+    auto m = decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes);
+    EXPECT_LE(m.expires_at_ms, now_ms);
+    EXPECT_EQ(m.min_active_build_sequence, std::numeric_limits<uint64_t>::max());
+}
+
+/// Pins the window's ARITHMETIC, not just that some fixed window happens to be wide enough: a
+/// regression that hardcoded the shipped-default window (16000 ms) instead of deriving it from
+/// `attemptReservationMs()` would still pass `FarewellIsAdmittedUnderTheDefaultBudget` above (16000
+/// happens to equal what a 7000 ms envelope needs) but would refuse THIS write, whose reservation is
+/// 2 * 9000 = 18000 ms -- strictly more than the shipped-default window.
+TEST(CASHeartbeat, FarewellIsAdmittedUnderADifferentEnvelope)
+{
+    auto backend = std::make_shared<WiderEnvelopeBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    uint64_t boot_ms = 100;
+    Ops ops(backend, &boot_ms);
+    seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/40000);
+
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, srid, uuid, /*writer_epoch=*/9,
+                            std::chrono::milliseconds(40000), [&] { return now_ms; },
+                            [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
+                            [&] { return boot_ms; });
+    renewer.start();
+
+    now_ms = 2000;
+    EXPECT_NO_THROW(renewer.release())
+        << "the farewell's policy window must be DERIVED from this backend's own envelope "
+           "(2 * 9000 ms), not hardcoded to the shipped-default window -- a window fixed at "
+           "16000 ms would refuse this write's 18000 ms reservation";
+
+    auto m = decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes);
+    EXPECT_LE(m.expires_at_ms, now_ms);
+    EXPECT_EQ(m.min_active_build_sequence, std::numeric_limits<uint64_t>::max());
+}
+
+/// The derived window alone is not the whole story: mount-control activity must also never run past
+/// the point this node's own fence may already be gone. A 5000 ms TTL with a 2000 ms safety margin
+/// leaves only 3000 ms of lease-safe remaining time at release -- far short of the 7000 ms envelope's
+/// own 16000 ms derived window (2 * 7000 + 2000 slack) -- so the LEASE bound, not the derived window,
+/// must be what refuses this write, and it must refuse it before any physical attempt: a write that
+/// cannot land inside the lease-safe remainder gains nothing by being sent anyway.
+TEST(CASHeartbeat, FarewellIsRefusedWhenTheLeaseExpiresBeforeItsDerivedWindow)
+{
+    auto backend = std::make_shared<DefaultEnvelopeBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    uint64_t boot_ms = 100;
+    Ops ops(backend, &boot_ms);
+    seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/5000);
+
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, srid, uuid, /*writer_epoch=*/9,
+                            std::chrono::milliseconds(5000), [&] { return now_ms; },
+                            [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
+                            [&] { return boot_ms; });
+    renewer.start();
+
+    now_ms = 2000;
+    String message;
+    int code = 0;
+    bool threw = false;
+    try
+    {
+        renewer.release();
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        message = e.message();
+        code = e.code();
+    }
+    EXPECT_TRUE(threw) << "a farewell whose reservation cannot fit inside the lease-safe remaining "
+                           "time must be refused, not admitted past the point this node's fence may "
+                           "already be gone";
+    EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR) << message;
+    EXPECT_NE(message.find("gave up at the lease deadline after zero attempt(s)"), String::npos) << message;
+
+    auto m = decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes);
+    EXPECT_NE(m.min_active_build_sequence, std::numeric_limits<uint64_t>::max())
+        << "the refused write must not have landed";
+}
+
+/// The lease bound added above must not change what an ordinary Conflict outcome does: a successor
+/// that took the slot (a different, unfenced incarnation) before this node's own shutdown could
+/// publish its farewell must be left untouched, and the release must report the conflict rather than
+/// silently succeeding or overwriting the successor's incarnation.
+TEST(CASHeartbeat, ForeignIncarnationDuringFarewellLeavesTheSuccessorUntouchedAndReportsTheConflict)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    uint64_t boot_ms = 100;
+    Ops ops(backend, &boot_ms);
+    seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
+
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, srid, uuid, /*writer_epoch=*/9,
+                            std::chrono::milliseconds(100), [&] { return now_ms; },
+                            [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(0),
+                            [&] { return boot_ms; });
+    renewer.start();
+
+    /// A successor (a different uuid/epoch, NOT gc_fenced) took the slot before this node's own
+    /// clean shutdown could publish its farewell -- the exact shape a live double-start reclaim
+    /// leaves behind.
+    const auto observed = ops.op.read(layout.mountKey(srid), Retry::standard());
+    ASSERT_TRUE(observed.has_value());
+    MountLease successor;
+    successor.server_uuid = UInt128(0x9999);
+    successor.writer_epoch = 1;
+    successor.seq = 1;
+    successor.write_attempt_id = UInt128{1};
+    mustCommit(ops.op.replace(layout.mountKey(srid), encodeMountLease(successor), observed->etag,
+                              Retry::standard()), "successor slot");
+
+    now_ms = 2000;
+    String message;
+    int code = 0;
+    try
+    {
+        renewer.release();
+        FAIL() << "a farewell that finds a foreign, unfenced incarnation must report the conflict, "
+                  "not silently succeed or clobber the successor";
+    }
+    catch (const DB::Exception & e)
+    {
+        message = e.message();
+        code = e.code();
+    }
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED) << message;
+    EXPECT_NE(message.find("found a foreign incarnation"), String::npos) << message;
+
+    auto m = decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes);
+    EXPECT_EQ(m.server_uuid, successor.server_uuid)
+        << "the successor's own incarnation must be untouched by the refused farewell";
+    EXPECT_EQ(m.writer_epoch, successor.writer_epoch);
 }
 
 /// Phase A (spec rev.4 2026-07-24): a confirmed renewal mismatch whose re-read shows OUR OWN
@@ -1086,4 +1284,64 @@ TEST(CASHeartbeat, WallClockStepsAndBootSuspendCannotExtendAuthority)
     const DB::Exception failure = terminalException(suspended);
     EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR);
     EXPECT_TRUE(backend->attempts.empty()) << "suspend-sized BOOTTIME overshoot must close admission";
+}
+
+/// Every attempt costs the whole envelope (attempt 100 + 2 * cap 50 = 200 ms) and fails ambiguously.
+/// Under a 1000 ms lease with a 100 ms margin the renewal must stop issuing before the cutoff rather
+/// than start an attempt that cannot finish inside it.
+namespace
+{
+/// Bypasses `RenewalScriptBackend`'s scripted-action queue for a guarded mount write and instead
+/// always fails it (and every read) once armed, each failure costing the whole envelope on the
+/// injected boot clock. Left unarmed during `seedOwnClaim` (an unconditional read then an unguarded
+/// create -- neither is a guarded mount write, but the read would still hit the always-throwing
+/// override below) and during `renewer.start()`'s adopt read, so the fixture itself can land.
+struct EnvelopeEatingBackend : RenewalScriptBackend
+{
+    uint64_t * boot_ms = nullptr;
+    bool armed = false;
+    uint64_t attemptTimeoutMs() const override { return 100; }
+    uint64_t attemptEnvelopeMs() const override { return 200; }
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (armed && expected_value && key.ends_with("/mount"))
+        {
+            attempts.push_back({key, bytes, expected_value});
+            *boot_ms += 200;
+            throw Poco::TimeoutException("the whole envelope, gone");
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (armed)
+        {
+            *boot_ms += 200;
+            throw Poco::TimeoutException("the read too");
+        }
+        return InMemoryBackend::read(key, access);
+    }
+};
+}
+
+TEST(CASHeartbeat, RenewalStopsBeforeTheCutoffWhenEveryAttemptConsumesTheEnvelope)
+{
+    auto backend = std::make_shared<EnvelopeEatingBackend>();
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    backend->boot_ms = &boot_ms;
+    Layout layout("pool");
+    Ops ops(backend, &boot_ms);
+    seedOwnClaim(ops.op, layout, "test", UInt128{0x1234}, 9, wall_ms, 1000);
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, "test", UInt128{0x1234}, 9, std::chrono::milliseconds(1000),
+                              [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(100),
+                              [&] { return boot_ms; });
+    renewer.start();
+    const uint64_t cutoff = renewer.lastCommittedAttemptStartBootMs() + 1000 - 100;
+    backend->attempts.clear();
+    backend->armed = true;
+    const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
+    EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
+    EXPECT_LE(boot_ms, cutoff) << "the last attempt started inside the cutoff and the engine did not start one that could not finish";
 }

@@ -2213,6 +2213,9 @@ CasRequestBudget runtimeRenewBudget()
     return CasRequestBudget{
         .attempt_timeout_ms = 10,
         .lease_safety_margin_ms = 20,
+        /// The default cap (1000 ms) would make the envelope (10 + 2*1000 = 2010) blow every tiny TTL
+        /// this budget is used against; no connect notion is exercised by these tests.
+        .connect_timeout_cap_ms = std::nullopt,
     };
 }
 }
@@ -2315,7 +2318,7 @@ TEST(CASMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
     /// cas-s3-timeout-retry-control §required-timeout-model requires attempt_timeout + safety_margin <
     /// lease TTL), so scale the budget down to fit -- mirrors `CasMountStartup::StaleSelfMountReclaimedAfterWait`.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
 
     uint64_t fake_boot = 0;
     std::vector<uint64_t> waits;
@@ -2367,6 +2370,53 @@ TEST(CASMountOpenWaits, CleanOpenSkipsAllWaits)
         << "a clean farewell (Task 5) needs no observation window";
 }
 
+namespace
+{
+/// Reports the SHIPPED PRODUCTION default envelope (`CasRequestBudget{}`'s own defaults --
+/// `attempt_timeout_ms=5000`, `connect_timeout_cap_ms=1000` -> `attemptEnvelopeMs()=7000`), so the
+/// teardown below pays the SAME two-envelope reservation (14000 ms) production pays, not the
+/// near-zero envelope a bare `InMemoryBackend` reports by default.
+struct DefaultBudgetEnvelopeBackend : InMemoryBackend
+{
+    uint64_t attemptTimeoutMs() const override { return 5000; }
+    uint64_t attemptEnvelopeMs() const override { return 7000; }
+};
+}
+
+/// `CleanOpenSkipsAllWaits` above proves a clean farewell skips the observation window, but its bare
+/// `InMemoryBackend` reports a zero attempt envelope, so its teardown never exercises the farewell's
+/// own policy window against a write's real cost. Pin the shipped default budget specifically: a
+/// window that cannot admit the write's `2 * attemptEnvelopeMs()` reservation refuses the farewell
+/// before its first attempt, and the successor below then pays a full incarnation-stability
+/// observation instead of reclaiming instantly.
+TEST(CASMountOpenWaits, CleanTeardownUnderDefaultBudgetLeavesAFarewell)
+{
+    auto b = std::make_shared<DefaultBudgetEnvelopeBackend>();
+    auto predecessor = Pool::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test"});
+    predecessor.reset();   /// drives ~Pool(): with nothing in flight, this is the graceful-shutdown farewell.
+
+    const Layout layout{"p"};
+    const auto got = readObj(*b, layout.mountKey("test"));
+    ASSERT_TRUE(got.has_value());
+    const MountLease lease = decodeMountLease(got->bytes);
+    EXPECT_EQ(lease.min_active_build_sequence, std::numeric_limits<uint64_t>::max())
+        << "the farewell's policy window must admit the write's own two-envelope reservation at the "
+           "shipped default budget (2 * 7000 ms) -- otherwise a clean teardown never hands the mount "
+           "slot back";
+
+    std::vector<uint64_t> waits;
+    PoolPtr successor;
+    ASSERT_NO_THROW(
+        successor = Pool::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+            .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
+        }));
+    ASSERT_TRUE(successor);
+    EXPECT_TRUE(waits.empty())
+        << "a clean farewell needs no observation window on reopen, even at the shipped default budget";
+}
+
 TEST(CASMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -2384,7 +2434,7 @@ TEST(CASMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
 
     /// See UncleanOpenPaysOnlyTheObservationWindow above: a 500ms TTL needs a scaled-down budget too.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
 
     std::vector<uint64_t> waits;
     PoolPtr store;
@@ -2402,6 +2452,109 @@ TEST(CASMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
     /// paid the materialization grace; nothing is owed now, so this open blocks on nothing at all.
     EXPECT_TRUE(waits.empty())
         << "a certified-dead predecessor needs neither the observation window nor any grace period";
+}
+
+/// The open-time publication horizon must reserve TWO attempt envelopes (connect cap included), not
+/// two bare attempt timeouts -- a slow connect could otherwise overrun the reservation the horizon
+/// check was guarding. `background_watermark` defaults false (not set below), so `CasPool.cpp`'s
+/// `renewal_window_ms` ternary takes its no-period branch: `2 * attemptEnvelopeMs()`. The check is also
+/// STRICT (refuses equality), matching `CasMountRuntime::admit`.
+TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
+{
+    /// Opens with a boot clock costing `per_call_ms` per read (models a faster or slower claim) and
+    /// returns how many times the mount key was written. attempt 100, cap 100: envelope =
+    /// 100 + 2*100 = 300, so 2*envelope = 600; the old code reserved 2*attempt = 200. Empirically the
+    /// claim path's own anchor read and the horizon check's own `now_boot_ms` read are five reads apart,
+    /// so `remaining = safe_deadline(TTL 1000 - margin 50 = 950) - now = 950 - 5 * per_call_ms`.
+    const auto mountWriteCount = [](uint64_t per_call_ms) -> uint64_t
+    {
+        auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
+        Layout l{"p"};
+        DB::Cas::tests::seedPoolMetaForRestart(*b);
+        uint64_t fake_boot = 0;
+        PoolPtr store;
+        store = Pool::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
+            .boot_ms_fn = [&] { const uint64_t now = fake_boot; fake_boot += per_call_ms; return now; },
+            .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; },
+        });
+        if (!store)
+            return 0;
+        return b->putOverwriteCount(l.mountKey("test")) + b->putCount(l.mountKey("test"));
+    };
+
+    /// remaining = 945 (per_call_ms=1): both 2*attempt(200) and 2*envelope(600) fit -- two writes (the
+    /// claim's own reclaim, then the renewer's adopt) and no re-anchor.
+    EXPECT_EQ(mountWriteCount(1), 2u) << "a horizon that fits both windows must not re-anchor";
+    /// remaining = 450 (per_call_ms=100): 2*attempt(200) fits, 2*envelope(600) does not -- the
+    /// re-anchor costs one extra write. This is the discriminator: reverting the reservation to
+    /// 2*attempt would make this case behave like the one above (two writes).
+    EXPECT_EQ(mountWriteCount(100), 3u) << "the old 2*attempt window fit here; only the envelope window must redo";
+    /// remaining = 600 (per_call_ms=70) exactly equals 2*envelope: STRICT ("<", not "<=") refuses
+    /// equality too, so this must also redo -- reverting the strict comparison to "<=" would make this
+    /// case behave like the fits-both case (two writes).
+    EXPECT_EQ(mountWriteCount(70), 3u) << "an exact boundary (renewal_window_ms == remaining) must be refused, not accepted";
+}
+
+/// Same reservation change as `PublicationHorizonUsesTheEnvelope` above, exercised through the remount
+/// path's own `renewer_redo` step (`CasPool.cpp` ~1503). Modelled directly on
+/// `CASPoolRemount.TheRenewerRedoRenewsOnTheOpenPlane` above: the step's admission refuses a driver that
+/// was never parked by a persistent renewal worker, so `background_watermark` must be true and the
+/// remount must be driven through `scheduleRemountForTest` (which parks the worker before running it),
+/// never through a bare `tryRemountOnce` with no workers -- the direct-driven attempt deadlocks in
+/// exactly the way that test's own comment describes.
+TEST(CASPoolRemount, RemountRenewerRedoUsesTheEnvelope)
+{
+    /// One successful self-remount whose quiescence costs `quiesce_ms`; returns the conditional
+    /// mount-slot writes it issued, counted while the remount worker is still held inside the event
+    /// sink that reported the result (so the renewal worker it un-parks cannot add one).
+    const auto remountConditionalMountWrites = [](uint64_t quiesce_ms) -> uint64_t
+    {
+        auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+        uint64_t fake_boot = 1'000'000;
+        DB::Cas::tests::ManualBarrier committed;
+        auto store = Pool::open(backend, PoolConfig{
+            .pool_prefix = "remount-renewer-redo-envelope",
+            .server_root_id = "test",
+            .background_watermark = true,
+            .event_sink = [&committed](const CasEvent & event)
+            {
+                if (event.type == CasEventType::MountRemount && event.outcome == "ok")
+                    committed.arriveAndWait();
+            },
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_renew_period = std::chrono::milliseconds(100),
+            .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
+            .boot_ms_fn = [&fake_boot] { return fake_boot; },
+            .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; },
+            .remount_quiesce_hook_for_test = [&fake_boot, quiesce_ms] { fake_boot += quiesce_ms; },
+        });
+        const String mount_key = store->layout().mountKey("test");
+
+        fenceOutMount(*backend, mount_key);
+        const uint64_t before = backend->putOverwriteCount(mount_key);
+        EXPECT_TRUE(store->scheduleRemountForTest())
+            << "the remount must be latched with quiesce_ms=" << quiesce_ms;
+        committed.waitUntilArrived();
+        const uint64_t writes = backend->putOverwriteCount(mount_key) - before;
+        committed.release();
+        return writes;
+    };
+
+    /// attempt 100, cap 100: envelope = 100 + 2*100 = 300, so period(100) + 2*envelope(600) = 700. A
+    /// 450 ms quiescence leaves remaining = TTL(1000) - margin(50) - 450 = 500: the old
+    /// period + 2*attempt (300) window fit that, but the new period + 2*envelope (700) window does not
+    /// -- so only the envelope-based check must redo (validation: 100 + 600 + 50 = 750 < 1000).
+    const uint64_t control = remountConditionalMountWrites(0);
+    EXPECT_GT(remountConditionalMountWrites(450), control)
+        << "a quiescence that fits the old attempt-only window but not the envelope window must still cost the redo";
+    /// A 250 ms quiescence leaves remaining = 950 - 250 = 700, exactly equal to
+    /// period + 2*envelope (700): STRICT ("<", not "<=") refuses equality too, so this must also
+    /// redo -- reverting the strict comparison to "<=" would make this case behave like the control.
+    EXPECT_GT(remountConditionalMountWrites(250), control)
+        << "an exact boundary (renewal_window_ms == remaining) must be refused, not accepted";
 }
 
 namespace

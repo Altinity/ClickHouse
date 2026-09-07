@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <IO/S3/S3Capabilities.h>
 #include <IO/S3Settings.h>
 #include <Common/MultiVersion.h>
@@ -23,7 +24,6 @@ namespace S3RequestSetting
 {
     extern const S3RequestSettingsBool read_only;
 }
-
 
 class S3ObjectStorage : public IObjectStorage
 {
@@ -110,8 +110,7 @@ public:
         size_t max_keys,
         bool with_tags,
         const std::optional<std::string> & start_after,
-        ObjectStorageRetryProfile profile,
-        uint64_t request_timeout_ms) const override;
+        const ObjectStorageControlRequest & request) const override;
 
     /// Uses `DeleteObjectRequest`.
     void removeObjectIfExists(const StoredObject & object) override;
@@ -124,11 +123,11 @@ public:
     ConditionalRemoveResult removeObjectIfTokenMatches(const StoredObject & object, const std::string & etag) override;
 
     ConditionalRemoveResult removeObjectIfTokenMatches(
-        const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) override;
+        const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request) override;
 
     /// One `DeleteObjects` for the given objects (the caller chunks to at most 1000); absence is success.
     void removeObjectsIfExistUnderProfile(
-        const StoredObjects & objects, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) override;
+        const StoredObjects & objects, const ObjectStorageControlRequest & request) override;
 
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
@@ -141,7 +140,7 @@ public:
     std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override;
 
     std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(
-        const std::string & path, bool with_tags, ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) const override;
+        const std::string & path, bool with_tags, const ObjectStorageControlRequest & request) const override;
 
     void copyObject( /// NOLINT
         const StoredObject & object_from,
@@ -201,7 +200,10 @@ public:
     /// disk client rotates (applyNewSettings/credentials refresh) — the cached clone is keyed by the
     /// base client's identity, so a stale clone can never outlive a rotation.
     /// `request_timeout_ms` overrides the clone's send/receive inactivity bound; 0 keeps the disk's.
-    std::shared_ptr<const S3::Client> getSingleAttemptClient(uint64_t request_timeout_ms) const;
+    /// `connect_timeout_cap_ms` caps the clone's connect timeout (0 = no cap); the cache key is the
+    /// pair, so two callers asking for the same request timeout but different caps get distinct clones.
+    std::shared_ptr<const S3::Client> getSingleAttemptClient(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms = 0) const;
+
 private:
     void removeObjectImpl(const StoredObject & object, bool if_exists);
     void removeObjectsImpl(const StoredObjects & objects, bool if_exists);
@@ -212,14 +214,17 @@ private:
         const std::string & path,
         bool with_tags,
         ObjectStorageRequestMode request_mode,
-        const std::shared_ptr<const S3::Client> & used_client) const;
+        const std::shared_ptr<const S3::Client> & used_client,
+        size_t attempt_seed = 0) const;
 
     ConditionalRemoveResult removeObjectIfTokenMatchesImpl(
-        const StoredObject & object, const std::string & etag, const std::shared_ptr<const S3::Client> & used_client);
+        const StoredObject & object, const std::string & etag, const std::shared_ptr<const S3::Client> & used_client,
+        size_t attempt_seed);
 
-    void removeObjectsIfExistImpl(const StoredObjects & objects, const std::shared_ptr<const S3::Client> & used_client);
+    void removeObjectsIfExistImpl(
+        const StoredObjects & objects, const std::shared_ptr<const S3::Client> & used_client, size_t attempt_seed);
 
-    std::shared_ptr<const S3::Client> clientForRetryProfile(ObjectStorageRetryProfile profile, uint64_t request_timeout_ms) const;
+    std::shared_ptr<const S3::Client> clientForRetryProfile(const ObjectStorageControlRequest & request) const;
 
     /// Runs `fn` and, if it failed because the vended credentials expired, refreshes this disk's
     /// client and runs it once more. `fn` must re-read the client itself, so the second run signs
@@ -252,10 +257,10 @@ private:
     std::atomic<int8_t> pinned_generation_dialect{-1};   /// -1 unpinned, 0 pinned ETag, 1 pinned generation
 
     mutable std::mutex single_attempt_client_mutex;
-    /// One clone per requested timeout: the verbs of one operation ask for different bounds, and a
-    /// single slot would rebuild a whole S3 client (and lose its connection pool) on every
-    /// alternation between them.
-    mutable std::map<uint64_t, std::shared_ptr<const S3::Client>> single_attempt_clients;
+    /// One clone per (requested timeout, connect cap) pair: the verbs of one operation ask for
+    /// different bounds, and a single slot would rebuild a whole S3 client (and lose its connection
+    /// pool) on every alternation between them.
+    mutable std::map<std::pair<uint64_t, uint64_t>, std::shared_ptr<const S3::Client>> single_attempt_clients;
     /// The base client the cached clones above were built from. Deliberately held as a shared_ptr (not
     /// a raw pointer): a raw pointer would be compared for identity AFTER the object it once pointed
     /// to could have been freed and a new client reallocated at the same address by an unrelated

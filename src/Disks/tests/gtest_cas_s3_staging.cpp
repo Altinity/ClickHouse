@@ -1110,20 +1110,20 @@ public:
     /// vary, so the profile-aware overloads simply forward. A storage that claimed the capability
     /// without implementing them would refuse every control-plane request of a writable mount.
     std::optional<DB::ObjectMetadata> tryGetObjectMetadataWithNativeToken(
-        const std::string & path, bool with_tags, DB::ObjectStorageRetryProfile, uint64_t) const override
+        const std::string & path, bool with_tags, const DB::ObjectStorageControlRequest &) const override
     {
         return tryGetObjectMetadata(path, with_tags);
     }
 
     DB::ObjectStorageIteratorPtr iterate(
         const std::string & path_prefix, size_t max_keys, bool with_tags, const std::optional<std::string> & start_after,
-        DB::ObjectStorageRetryProfile, uint64_t) const override
+        const DB::ObjectStorageControlRequest &) const override
     {
         return DB::LocalObjectStorage::iterate(path_prefix, max_keys, with_tags, start_after);
     }
 
     DB::ConditionalRemoveResult removeObjectIfTokenMatches(
-        const DB::StoredObject & object, const std::string & etag, DB::ObjectStorageRetryProfile, uint64_t) override
+        const DB::StoredObject & object, const std::string & etag, const DB::ObjectStorageControlRequest &) override
     {
         return removeObjectIfTokenMatches(object, etag);
     }

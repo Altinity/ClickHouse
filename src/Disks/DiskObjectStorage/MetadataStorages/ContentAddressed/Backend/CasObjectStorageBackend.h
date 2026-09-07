@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <deque>
 #include <map>
@@ -65,10 +66,12 @@ public:
     /// requests below: a writable Native mount owns its own retry policy and a transparently retried
     /// request would outlive the caller's deadline, while a read-only mount has no such deadline and
     /// keeps the storage's default. `attempt_timeout_ms` bounds ONE attempt of those requests; 0
-    /// leaves the storage's own timeout in place. Both are supplied by the mount that opens the pool;
-    /// the defaults are what a narrow unit test constructing a bare backend gets.
+    /// leaves the storage's own timeout in place. `connect_timeout_cap_ms` caps the connect portion of
+    /// that same attempt (0 = no cap), frozen by the mount at open. All three are supplied by the mount
+    /// that opens the pool; the defaults are what a narrow unit test constructing a bare backend gets.
     ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_,
-                         bool single_attempt_control_plane_ = false, uint64_t attempt_timeout_ms_ = 0);
+                         bool single_attempt_control_plane_ = false, uint64_t attempt_timeout_ms_ = 0,
+                         uint64_t connect_timeout_cap_ms_ = 0);
 
     /// Read the whole object, or return `nullopt` if it is absent. Native mode reads the incarnation
     /// value out of the GET response itself, so no HEAD precedes it; a not-found race is reported as
@@ -103,6 +106,16 @@ public:
     Dialect dialect() const override { return mode == Mode::Native ? native_token_type : Dialect::Emulated; }
     /// The budget for one attempt of a read-class request, as configured by the mount.
     uint64_t attemptTimeoutMs() const override { return attempt_timeout_ms; }
+    /// What one attempt may cost end to end, connect included: the attempt timeout plus two connect
+    /// caps (TCP, then TLS), saturating. Delegates to `CasRequestBudget::attemptEnvelopeMs` (the single
+    /// definition of this formula) rather than re-deriving it here.
+    uint64_t attemptEnvelopeMs() const override
+    {
+        return CasRequestBudget{.attempt_timeout_ms = attempt_timeout_ms, .connect_timeout_cap_ms = connect_timeout_cap_ms}
+            .attemptEnvelopeMs();
+    }
+    /// The frozen connect cap this backend was constructed with; see the constructor.
+    uint64_t connectTimeoutCapMs() const { return connect_timeout_cap_ms; }
     /// Ask the storage to re-acquire credentials through its refresh callback.
     bool refreshCredentials() override { return object_storage->tryRefreshCredentialsViaCallback(); }
 
@@ -184,9 +197,11 @@ public:
     /// Settings for a Native COMPARE/CREATE write (create-if-absent, compare-and-set): mark the request
     /// conditional, make exactly one attempt at every retry layer, skip the racy post-upload
     /// existence/size check, and force a single PUT on generation stores because GCS does not
-    /// enforce the condition on multipart completion.
-    WriteSettings conditionalWriteSettings() const;
-    WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(); }
+    /// enforce the condition on multipart completion. `attempt_no` is the engine's own 1-based
+    /// physical-attempt count (see `TransportAccess::attemptNo`), carried into
+    /// `object_storage_attempt_number` so the HTTP client sees a reissue as attempt >= 2.
+    WriteSettings conditionalWriteSettings(size_t attempt_no) const;
+    WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(/*attempt_no=*/1); }
     /// Override the emulated backend's wall clock for deterministic expiry tests.
     void setEmuNowNsForTest(uint64_t now_ns);
     /// Return the guarded per-key token-state size for expiry tests.
@@ -199,24 +214,34 @@ private:
     /// See the constructor: what the READ-class requests (read, head, list, remove) carry.
     const bool single_attempt_control_plane;
     const uint64_t attempt_timeout_ms;
+    const uint64_t connect_timeout_cap_ms;
     ObjectStorageRetryProfile controlPlaneProfile() const
     {
         return single_attempt_control_plane ? ObjectStorageRetryProfile::SingleAttempt : ObjectStorageRetryProfile::Default;
     }
-    /// The read settings a request carries: the native conditional dialect, plus the retry profile and
-    /// per-attempt bound its caller is entitled to.
-    ReadSettings readSettingsFor(ObjectStorageRetryProfile profile, uint64_t timeout_ms) const;
+    /// The control-request context every read-class primitive builds from `access.attemptNo()`: this
+    /// backend's own retry profile, attempt timeout and frozen connect cap, plus the caller's attempt
+    /// number -- see `ObjectStorageControlRequest`.
+    ObjectStorageControlRequest controlRequest(size_t attempt_no) const
+    {
+        return ObjectStorageControlRequest{
+            .profile = controlPlaneProfile(),
+            .attempt_timeout_ms = attempt_timeout_ms,
+            .connect_timeout_cap_ms = connect_timeout_cap_ms,
+            .attempt_number = attempt_no};
+    }
+    /// The read settings a request carries: the native conditional dialect, plus the control-request
+    /// context (retry profile, per-attempt bound and connect cap, attempt number) its caller built.
+    ReadSettings readSettingsFor(const ObjectStorageControlRequest & request) const;
 
-    /// The bodies a keyed primitive and its legacy override share. They differ in one thing: the
-    /// keyed call passes `controlPlaneProfile(), attempt_timeout_ms`, the legacy one the storage's
-    /// defaults. The legacy arguments disappear with the legacy methods.
-    std::optional<Raw> readUnder(const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms);
-    std::optional<RawMeta> headUnder(const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms);
+    /// The keyed primitive's body, taking the control-request context its caller built
+    /// (`controlRequest(access.attemptNo())`) rather than deriving it again here.
+    std::optional<Raw> readUnder(const String & key, const ObjectStorageControlRequest & request);
+    std::optional<RawMeta> headUnder(const String & key, const ObjectStorageControlRequest & request);
     RawListPage listUnder(const String & prefix, const String & cursor, size_t limit,
-                          ObjectStorageRetryProfile profile, uint64_t timeout_ms);
-    RawRemoval removeUnder(const String & key, const String & expected_value,
-                           ObjectStorageRetryProfile profile, uint64_t timeout_ms);
-    SentinelProbeResult probeSentinelUnder(const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms);
+                          const ObjectStorageControlRequest & request);
+    RawRemoval removeUnder(const String & key, const String & expected_value, const ObjectStorageControlRequest & request);
+    SentinelProbeResult probeSentinelUnder(const String & key, const ObjectStorageControlRequest & request);
     /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. A successfully
     /// deleted entry is retained only while its etag is recent enough that an immediate recreate could
     /// land in the same mtime quantum. `deleteExact` erases already-old entries immediately and queues
@@ -237,7 +262,7 @@ private:
     /// Look up Native metadata and normalize the storage ETag or generation into an incarnation
     /// value. The value is returned as the store gave it: whether it IS an incarnation is judged by
     /// whoever can act on the answer, never here.
-    std::optional<RawMeta> nativeHead(const String & key, ObjectStorageRetryProfile profile, uint64_t timeout_ms);
+    std::optional<RawMeta> nativeHead(const String & key, const ObjectStorageControlRequest & request);
 
     /// Write a body with the condition already encoded in `ws`, finalize it, map a lost precondition
     /// onto `RawConflict`, and return the write response's own value on success -- normalized, and
@@ -284,5 +309,13 @@ private:
     /// (`CAS_WRITE_UNATTRIBUTED`) and an observation has no incarnation to report (`CORRUPTED_DATA`).
     String emuMintToken(const String & key, const String & etag, bool just_wrote);
 };
+
+/// Fail-closed programmer-error guard: a mount opens exactly one backend and one `CasRequestBudget`
+/// together (`ContentAddressedMetadataStorage::openPoolView`), and the pool's lease arithmetic
+/// (`validateCasRequestBudget`, `CasMountRuntime::admit`) is validated against the budget alone --
+/// never against the backend it hands to the request layer. If the two ever disagree, the backend
+/// would silently outlive (or underlive) the envelope the lease math was checked against. Throws
+/// `LOGICAL_ERROR` naming both values; called once at open, before `Pool::open`.
+void ensureBackendMatchesBudget(const ObjectStorageBackend & backend, const CasRequestBudget & budget);
 
 }

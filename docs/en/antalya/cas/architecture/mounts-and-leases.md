@@ -84,7 +84,7 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
 - **Absolute deadline.** Renewal uses `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed from
   suspend correctly observes itself expired. Its absolute deadline is the minimum of the existing
   request-operation budget and the last confirmed lease deadline minus the safety margin. The
-  controller checks that one configured attempt still fits before each backend `PUT` or resolving
+  controller checks that one attempt envelope still fits before each backend `PUT` or resolving
   `GET`, after each interruptible backoff, and before accepting success. A retry, `GET`, response
   timestamp, or wall-clock step never extends authority.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
@@ -96,8 +96,8 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   and rechecks it immediately before the object-store call and on every conditional retry. Reads
   are not gated.
 - **Request-budget admission.** `refAppendFenceOk` refuses to *start* a ref-log attempt unless
-  `attempt_timeout + safety_margin` fits inside the remaining lease, rejecting with
-  `BAD_ARGUMENTS` at request-admission time rather than mid-flight.
+  `2 × envelope + safety_margin` fits inside the remaining lease (a write and its settlement read),
+  rejecting with `BAD_ARGUMENTS` at request-admission time rather than mid-flight.
 
 **Losing the lease is neither read-only mode nor a process abort.** `MountLeaseRenewer` is a
 synchronous durable-slot state machine. A committed result advances its token, sequence, confirmed

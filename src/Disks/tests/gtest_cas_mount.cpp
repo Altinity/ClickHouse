@@ -291,6 +291,7 @@ CasRequestBudget renewalLogBudget()
     return CasRequestBudget{
         .attempt_timeout_ms = 10,
         .lease_safety_margin_ms = 20,
+        .connect_timeout_cap_ms = std::nullopt,
     };
 }
 
@@ -1268,14 +1269,14 @@ TEST(CASMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
 TEST(CASRequestBudget, ValidateAcceptsDefaultsAndRejectsAnOverflowingSumWithoutWrapping)
 {
     EXPECT_NO_THROW(validateCasRequestBudget(
-        CasRequestBudget{}, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000));
+        CasRequestBudget{}, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000, /*background_renewal=*/false));
 
     const CasRequestBudget overflowing{
         .attempt_timeout_ms = std::numeric_limits<uint64_t>::max() - 100,
         .lease_safety_margin_ms = std::numeric_limits<uint64_t>::max() - 100};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
-        validateCasRequestBudget(overflowing, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);
+        validateCasRequestBudget(overflowing, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000, /*background_renewal=*/false);
     });
 }
 
@@ -1312,7 +1313,7 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
     /// lease TTL), so it also scales down cas_request_budget to fit — the budget itself is not
     /// exercised here, only Pool::open's validateCasRequestBudget startup gate.
     const CasRequestBudget tiny_budget{
-        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
     auto a = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
         .mount_lease_ttl_ms = std::chrono::milliseconds(300),

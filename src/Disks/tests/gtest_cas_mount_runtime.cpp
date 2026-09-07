@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 
 #include <limits>
+#include <optional>
 
 using namespace DB::Cas;
 
@@ -17,7 +18,8 @@ namespace
 class RuntimeFixture
 {
 public:
-    explicit RuntimeFixture(uint64_t lease_safety_margin_ms, uint64_t attempt_timeout_ms = 10)
+    explicit RuntimeFixture(uint64_t lease_safety_margin_ms, uint64_t attempt_timeout_ms = 10,
+                            std::optional<uint64_t> connect_timeout_cap_ms = std::nullopt)
         : backend(std::make_shared<InMemoryBackend>())
         , mount(backend, Fence{
               [this] { return runtime.fenceGeneration(); },
@@ -29,7 +31,8 @@ public:
               MountConfig{.boot_ms_fn = [this] { return boot_ms; }},
               "test", sink,
               CasRequestBudget{.attempt_timeout_ms = attempt_timeout_ms,
-                               .lease_safety_margin_ms = lease_safety_margin_ms},
+                               .lease_safety_margin_ms = lease_safety_margin_ms,
+                               .connect_timeout_cap_ms = connect_timeout_cap_ms},
               [] { return false; })
     {
     }
@@ -142,15 +145,32 @@ TEST(CASMountRuntime, AdmitAllowsAnUnarmedFence)
 }
 
 /// `refAppendFenceOk` is `admit` at one attempt's worth of budget under the live generation.
-TEST(CASMountRuntime, RefAppendFenceOkIsAdmitAtTheAttemptTimeout)
+TEST(CASMountRuntime, RefAppendFenceOkIsAdmitAtTwoEnvelopes)
 {
+    /// connect_timeout_cap_ms is nullopt (see RuntimeFixture), so the envelope equals the bare attempt
+    /// timeout (10 ms); refAppendFenceOk asks for TWO of them (a write and its settlement read).
     RuntimeFixture f(/*lease_safety_margin_ms=*/20, /*attempt_timeout_ms=*/10);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'031);   /// 31 ms left: one more than 10 + 20
+    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'041);   /// 41 ms left: one more than 2*10 + 20
     EXPECT_TRUE(f->refAppendFenceOk());
-    EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 10)), "Ok");
+    EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 20)), "Ok");
 
-    f->setMountDeadline(1'030);   /// exactly 10 + 20 left
+    f->setMountDeadline(1'040);   /// exactly 2*10 + 20 left
     EXPECT_FALSE(f->refAppendFenceOk());
-    EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 10)), "NoBudget");
+    EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 20)), "NoBudget");
+}
+
+/// Same boundary, with a nonzero connect cap so the envelope's connect contribution (not just the
+/// doubling) is pinned: attempt 100, cap 50 -> envelope 200, refAppendFenceOk asks for 2*200 = 400.
+TEST(CASMountRuntime, RefAppendFenceOkIsAdmitAtTwoEnvelopesWithANonzeroCap)
+{
+    RuntimeFixture f(/*lease_safety_margin_ms=*/20, /*attempt_timeout_ms=*/100, /*connect_timeout_cap_ms=*/50);
+    f.boot_ms = 1'000;
+    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'421);   /// 421 ms left: one more than 2*200 + 20
+    EXPECT_TRUE(f->refAppendFenceOk());
+    EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 400)), "Ok");
+
+    f->setMountDeadline(1'420);   /// exactly 2*200 + 20 left
+    EXPECT_FALSE(f->refAppendFenceOk());
+    EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 400)), "NoBudget");
 }

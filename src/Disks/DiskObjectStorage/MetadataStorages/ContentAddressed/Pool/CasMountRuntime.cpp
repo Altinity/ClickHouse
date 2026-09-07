@@ -153,9 +153,13 @@ Fence::Admit CasMountRuntime::admit(uint64_t admitted_generation, uint64_t neede
 
 bool CasMountRuntime::refAppendFenceOk() const
 {
-    /// One attempt's worth of room under the live generation: a ref-log attempt is not started when it
-    /// cannot plausibly finish, safety margin included, before the lease expires.
-    return admit(fenceGeneration(), cas_request_budget.attempt_timeout_ms) == Fence::Admit::Ok;
+    /// Two envelopes' worth of room under the live generation -- a write and its settlement read, which
+    /// is what `writeLoop` reserves -- so a ref-log attempt is not started when it cannot plausibly
+    /// finish, safety margin included, before the lease expires.
+    const uint64_t envelope_ms = cas_request_budget.attemptEnvelopeMs();
+    const uint64_t needed_ms = envelope_ms > std::numeric_limits<uint64_t>::max() / 2
+        ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
+    return admit(fenceGeneration(), needed_ms) == Fence::Admit::Ok;
 }
 
 void CasMountRuntime::setMountDeadline(uint64_t deadline_boot_ms)

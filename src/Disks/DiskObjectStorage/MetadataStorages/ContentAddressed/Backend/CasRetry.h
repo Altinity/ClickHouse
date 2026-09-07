@@ -39,12 +39,15 @@ struct Retry
     static Retry within(uint64_t ms) { return {.window_ms = ms, .lease_deadline_ms = std::nullopt, .single_attempt = false}; }
     /// `within(90'000)` -- the default write policy.
     static Retry standard() { return within(90'000); }
-    /// The standard policy, additionally bound by the mount lease: `lease_deadline_ms` minus
-    /// `margin`, clamped at 0 -- never risk a write landing after this node's fence may already be
-    /// gone.
-    static Retry untilLeaseSafe(uint64_t lease_deadline_ms, uint64_t margin)
+    /// A policy bound by the mount lease: `lease_deadline_ms` minus `margin`, clamped at 0 -- never
+    /// risk a write landing after this node's fence may already be gone. `window_ms` defaults to the
+    /// standard 90 s write budget; a caller whose own budget is deliberately much smaller (the
+    /// graceful-shutdown farewell, whose window is derived from what ONE write costs, not from the
+    /// standard policy) passes its own window explicitly, and `bind` still takes whichever of the two
+    /// bounds is smaller.
+    static Retry untilLeaseSafe(uint64_t lease_deadline_ms, uint64_t margin, uint64_t window_ms = 90'000)
     {
-        return {.window_ms = 90'000,
+        return {.window_ms = window_ms,
                 .lease_deadline_ms = lease_deadline_ms > margin ? lease_deadline_ms - margin : 0,
                 .single_attempt = false};
     }

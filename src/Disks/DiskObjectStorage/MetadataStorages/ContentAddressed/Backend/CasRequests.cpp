@@ -33,6 +33,7 @@ namespace ProfileEvents
     extern const Event CASRequestRefused;
     extern const Event CASRequestFenceLostPostWrite;
     extern const Event CASRequestConnectFailureHint;
+    extern const Event CASRequestFirstAttemptFuse;
 }
 
 namespace DB::ErrorCodes
@@ -64,6 +65,11 @@ void recordReissue()
 void recordConflictPause()
 {
     ProfileEvents::increment(ProfileEvents::CASRequestConflictPause);
+}
+
+void recordFirstAttemptFuse()
+{
+    ProfileEvents::increment(ProfileEvents::CASRequestFirstAttemptFuse);
 }
 
 }
@@ -255,6 +261,23 @@ bool isConnectFailureHint([[maybe_unused]] const std::exception & e)
     return false;
 }
 
+bool isFirstAttemptFuseTimeout([[maybe_unused]] const std::exception & e, [[maybe_unused]] size_t attempt_no)
+{
+#if USE_AWS_S3
+    /// The connect-failure hint is checked FIRST: `connect timed out` belongs to that classifier, and
+    /// an attempt whose text matches both stays a hint, reissued without a preceding settle read.
+    if (attempt_no != 1 || isConnectFailureHint(e))
+        return false;
+    const auto * s3 = dynamic_cast<const S3Exception *>(&e);
+    if (!s3 || s3->getS3ErrorCode() != Aws::S3::S3Errors::NETWORK_CONNECTION)
+        return false;
+    const std::string_view message = s3->message();
+    return message.find("Timeout") != std::string_view::npos;
+#else
+    return false;
+#endif
+}
+
 CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
                          std::function<uint64_t()> now_ms_, std::function<void(uint64_t)> sleep_ms_,
                          CasHotKeys * hot_keys_)
@@ -262,7 +285,7 @@ CasRequests::CasRequests(BackendPtr backend_, Fence fence_,
     , fence(std::move(fence_))
     , now_ms(now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(bootClockMs))
     , sleep_ms(sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(sleepForMilliseconds))
-    , attempt_reservation_ms(backend->attemptTimeoutMs())
+    , attempt_reservation_ms(backend->attemptEnvelopeMs())
     , own_hot_keys(hot_keys_ ? nullptr : std::make_unique<CasHotKeys>(0))
     , hot_keys(hot_keys_ ? hot_keys_ : own_hot_keys.get())
 {
@@ -430,7 +453,7 @@ bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
     return needed_ms <= bound.deadline_ms - now;
 }
 
-bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted)
+bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted, bool & refreshed)
 {
     if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
         return true;
@@ -448,7 +471,8 @@ bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & 
         if (refresh_attempted)
             return true;
         refresh_attempted = true;
-        return !owner.backend->refreshCredentials();
+        refreshed = owner.backend->refreshCredentials();
+        return !refreshed;
     }
     /// The store's own answer decides. A refusal it proved never applied, and an authoritative absence,
     /// both replay identically; everything else -- a throttle, a 5xx, a missing bucket, an unmodeled
@@ -652,14 +676,17 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
         SentinelProbeResult result{ProbeOutcome::Indeterminate, std::nullopt};
         try
         {
-            result = owner.withTransportAccess([&](auto & access)
+            result = owner.withTransportAccess(attempt, [&](auto & access)
             {
                 return owner.backend->probeSentinelRaw(key, access);
             });
         }
         catch (const std::exception & e)
         {
-            if (refreshAndClassifyReadFault(e, refresh_attempted))
+            /// The probe never counts a fuse, so whether this fault was a credential reissue is not
+            /// interesting here -- only the write and read loops guard a counter with it.
+            bool refreshed = false;
+            if (refreshAndClassifyReadFault(e, refresh_attempted, refreshed))
                 throw;
             /// The probe reports every transport failure as `Indeterminate` rather than by throwing, so
             /// a decorator that does throw is folded onto the same inconclusive outcome.
@@ -815,10 +842,10 @@ WriteResult CasOperation::postCommit(Etag inc, bool resolved_by_read, WriteState
     return Committed{std::move(inc), state.attempts_sent, resolved_by_read};
 }
 
-std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, const Retry::Bound & bound)
+std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
+                                                    const Retry::Bound & bound, void (*record)(), bool should_sleep)
 {
-    const uint64_t pause_ms = Retry::backoff(++state.reissues);
-    const uint64_t needed = reservedFor(pause_ms, 2);
+    const uint64_t needed = reservedFor(pause_ms, envelopes);
     switch (gate(needed))
     {
         case Gate::FenceLost: return gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), state);
@@ -827,26 +854,25 @@ std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, con
     }
     if (!fits(needed, bound))
         return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
-    detail::recordReissue();
-    owner.sleep_ms(pause_ms);
+    record();
+    /// `should_sleep` is false ONLY for the fuse's zero-pause reissue: that pause is not "zero
+    /// milliseconds", it is NO PAUSE AT ALL, so it must not call `sleep_ms` even with a zero argument.
+    /// The three ordinary callers always sleep, even when a drawn jitter happens to be exactly zero --
+    /// `Retry::backoff`'s full jitter includes zero -- so their call to `sleep_ms(0)` is kept
+    /// unconditional here to leave their observable behaviour exactly as it was before this collapse.
+    if (should_sleep)
+        owner.sleep_ms(pause_ms);
     return std::nullopt;
+}
+
+std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, const Retry::Bound & bound)
+{
+    return gatedPause(Retry::backoff(++state.reissues), 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
 std::optional<WriteResult> CasOperation::pauseForConflict(WriteState & state, const Retry::Bound & bound)
 {
-    const uint64_t pause_ms = Retry::conflictBackoff();
-    const uint64_t needed = reservedFor(pause_ms, 2);
-    switch (gate(needed))
-    {
-        case Gate::FenceLost: return gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), state);
-        case Gate::NoBudget:  return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
-        case Gate::Ok: break;
-    }
-    if (!fits(needed, bound))
-        return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
-    detail::recordConflictPause();
-    owner.sleep_ms(pause_ms);
-    return std::nullopt;
+    return gatedPause(Retry::conflictBackoff(), 2, state, bound, detail::recordConflictPause, /*should_sleep=*/true);
 }
 
 /// A flat pause before reissuing an attempt whose failure text named a failed connection.
@@ -854,18 +880,12 @@ static constexpr uint64_t kConnectHintPauseMs = 50;
 
 std::optional<WriteResult> CasOperation::pauseFlat(WriteState & state, const Retry::Bound & bound)
 {
-    const uint64_t needed = reservedFor(kConnectHintPauseMs, 2);
-    switch (gate(needed))
-    {
-        case Gate::FenceLost: return gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), state);
-        case Gate::NoBudget:  return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
-        case Gate::Ok: break;
-    }
-    if (!fits(needed, bound))
-        return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
-    detail::recordReissue();
-    owner.sleep_ms(kConnectHintPauseMs);
-    return std::nullopt;
+    return gatedPause(kConnectHintPauseMs, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
+}
+
+std::optional<WriteResult> CasOperation::reissueAtOnce(WriteState & state, const Retry::Bound & bound)
+{
+    return gatedPause(0, 2, state, bound, detail::recordReissue, /*should_sleep=*/false);
 }
 
 WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
@@ -907,10 +927,17 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// instead of resolved by a read and reissued to the deadline.
         bool credential_answer = false;
         bool refreshed = false;
+        /// Set once `refreshed` is known: true only when the credential-owned reissue below (the one
+        /// guarded by this exact expression) is what will actually resend this attempt. An earlier
+        /// ambiguity of this inner write routes the reissue through the ordinary hint/fuse/backoff
+        /// mechanisms instead -- the credential answer never gets to skip their read or their pacing --
+        /// so a hint or fuse counter must still count in that case even though credentials were refreshed.
+        bool refresh_owns_reissue = false;
         bool connect_hint = false;
+        bool fuse = false;
         try
         {
-            outcome = owner.withTransportAccess([&](auto & access)
+            outcome = owner.withTransportAccess(state.attempts_sent, [&](auto & access)
             {
                 return owner.backend->write(key, bytes, expected_value, access);
             });
@@ -931,6 +958,14 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
                 state.refresh_attempted = true;
                 refreshed = owner.backend->refreshCredentials();
             }
+            /// Mirrors the condition guarding the credential-owned reissue below exactly, so the two
+            /// can never drift: `state.any_ambiguous` here is still this attempt's INCOMING value,
+            /// because the update below only fires when `!credential_answer`, which `refreshed` implies
+            /// false for. `!policy.single_attempt` is redundant today -- `refreshed` can only be set
+            /// above under `!policy.single_attempt` already -- but it is kept so this stays an exact
+            /// copy of the reissue branch's condition rather than a hand-simplified one that could
+            /// silently stop matching it.
+            refresh_owns_reissue = refreshed && !policy.single_attempt && !state.any_ambiguous;
             /// A refusal that FOLLOWS an ambiguous attempt of this inner write proves nothing about that
             /// attempt, so it is settled by the read below instead of ending the call here.
             const bool definitely_refused = !refreshed && isDefinitelyRefusedWrite(e);
@@ -941,10 +976,22 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             }
             /// A refusal-class exception is never a hint, even when an earlier ambiguity of this inner
             /// write kept it from ending the call above: that earlier attempt's fate is what the read
-            /// below must settle, and a hint reissue would skip it.
+            /// below must settle, and a hint reissue would skip it. Both counters below are recorded
+            /// here, at classification, regardless of `policy.single_attempt` (`Retry::once` never acts
+            /// on either, but the attempt's transport error still named what it named) -- except when
+            /// the credential answer OWNS the reissue: a credential answer whose text happens to also
+            /// match a hint or fuse text is a credential reissue, not a hint or fuse one, and must not
+            /// inflate these counts. When an earlier ambiguity of this inner write keeps the credential
+            /// answer from owning the reissue, the hint/fuse mechanism reissues it instead, exactly as
+            /// if credentials had never been refreshed, so the counter must still count it.
             connect_hint = !definitely_refused && isConnectFailureHint(e);
-            if (connect_hint)
+            if (connect_hint && !refresh_owns_reissue)
                 ProfileEvents::increment(ProfileEvents::CASRequestConnectFailureHint);
+            /// Checked AFTER the hint, so a hinted attempt stays hinted (reissued before its read); a
+            /// fuse timeout is reissued after the settle read runs below.
+            fuse = isFirstAttemptFuseTimeout(e, state.attempts_sent);
+            if (fuse && !refresh_owns_reissue)
+                ProfileEvents::increment(ProfileEvents::CASRequestFirstAttemptFuse);
         }
         catch (const std::exception & e)
         {
@@ -970,7 +1017,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
 
         /// Nothing for a read to settle: this attempt did not apply, and no EARLIER attempt of this
         /// inner write is unresolved either. Re-send it under the credentials the refresh installed.
-        if (refreshed && !policy.single_attempt && !state.any_ambiguous)
+        if (refresh_owns_reissue)
         {
             if (auto given_up = pauseAndReissue(state, bound))
                 return *given_up;
@@ -1030,6 +1077,16 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// the store's own answer. A policy with no reissue has to say it settled nothing.
         if (policy.single_attempt)
             return gaveUp(GaveUp::Why::Unresolved, sourceFor(bound), state);
+        /// The first attempt met the adaptive first-attempt timeout: a connection-quality answer, not a
+        /// store fault. The read above settled nothing new about it, so re-send at once as attempt 2
+        /// under the full attempt budget; the backoff index is untouched because no store fault was
+        /// seen yet.
+        if (fuse)
+        {
+            if (auto given_up = reissueAtOnce(state, bound))
+                return *given_up;
+            continue;
+        }
         if (auto given_up = pauseAndReissue(state, bound))
             return *given_up;
     }

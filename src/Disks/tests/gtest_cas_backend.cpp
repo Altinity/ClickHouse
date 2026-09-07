@@ -1648,6 +1648,40 @@ TEST(CASObjectStorageBackend, EmuTokenStateEventuallyPrunesDistinctShortLivedKey
         << "token state should track only the bounded recent-key window, not all " << key_count << " deleted keys";
 }
 
+TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetAcceptsAMatchingHandoff)
+{
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = 4000;
+    budget.connect_timeout_cap_ms = 900;
+    auto backend = std::make_shared<ObjectStorageBackend>(
+        tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess,
+        /*single_attempt_control_plane_=*/false, budget.attempt_timeout_ms, *budget.connect_timeout_cap_ms);
+    EXPECT_NO_THROW(ensureBackendMatchesBudget(*backend, budget));
+}
+
+TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedConnectCap)
+{
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = 4000;
+    budget.connect_timeout_cap_ms = 900;
+    /// The backend is built with a DIFFERENT connect cap than the budget it will be paired with --
+    /// exactly the handoff mistake the production check at `openPoolView` guards against.
+    auto backend = std::make_shared<ObjectStorageBackend>(
+        tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess,
+        /*single_attempt_control_plane_=*/false, budget.attempt_timeout_ms, /*connect_timeout_cap_ms_=*/1500);
+    EXPECT_THROW(ensureBackendMatchesBudget(*backend, budget), DB::Exception);
+}
+
+TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedAttemptTimeout)
+{
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = 4000;
+    budget.connect_timeout_cap_ms = 900;
+    auto backend = std::make_shared<ObjectStorageBackend>(
+        tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess,
+        /*single_attempt_control_plane_=*/false, /*attempt_timeout_ms_=*/6000, *budget.connect_timeout_cap_ms);
+    EXPECT_THROW(ensureBackendMatchesBudget(*backend, budget), DB::Exception);
+}
 
 /// `NativeRejectsWrongDialectTokenBeforeTouchingTheWire` is deleted here: it built a `Token{value,
 /// Dialect::Emulated}` holding a NATIVE backend's live wire value under the WRONG dialect tag, to prove

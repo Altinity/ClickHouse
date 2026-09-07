@@ -2,6 +2,8 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasTransportAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
@@ -10,8 +12,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
 #include "cas_test_helpers.h"
 #include <Common/ProfileEvents.h>
+#include <Common/RemoteHostFilter.h>
 
 #include <IO/ReadHelpers.h>
+#include <IO/S3/Client.h>
+#include <IO/WriteBufferFromS3.h>
 
 #include "config.h"
 
@@ -19,6 +24,11 @@
 #include <Poco/Net/NetException.h>
 #include <Poco/Net/SocketImpl.h>
 #include <base/defines.h>
+
+#include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/core/client/AWSError.h>
+#include <aws/core/client/CoreErrors.h>
+#include <aws/s3/model/PutObjectRequest.h>
 
 #include <gmock/gmock.h>
 
@@ -39,6 +49,7 @@
 namespace DB::ErrorCodes
 {
 extern const int ABORTED;
+extern const int BAD_ARGUMENTS;
 extern const int CAS_DELETE_MARKER;
 extern const int CORRUPTED_DATA;
 extern const int LOGICAL_ERROR;
@@ -51,6 +62,7 @@ namespace ProfileEvents
     extern const Event CASRequestReissue;
     extern const Event CASRequestConflictPause;
     extern const Event CASRequestConnectFailureHint;
+    extern const Event CASRequestFirstAttemptFuse;
 }
 
 using namespace DB::Cas;
@@ -678,6 +690,46 @@ TEST(CASRequests, AmbiguousCreateThatNeverLandedIsReissued)
     EXPECT_EQ(committed->attempts_sent, 2u);
     EXPECT_EQ(backend->getTotal(), 1u);     /// the resolve proved absence, and only then did a reissue follow
     EXPECT_EQ(clock.sleeps.size(), 1u);
+}
+
+/// The engine's own attempt number reaches the transport through `TransportAccess::attemptNo()`, for
+/// every primitive -- write, read (the resolve read is its own call, with its own attempt count) and
+/// list.
+TEST(CASRequests, TheTransportSeesTheEngineAttemptNumber)
+{
+    struct AttemptRecordingBackend : CountingBackend
+    {
+        std::vector<size_t> write_attempts, read_attempts, list_attempts;
+        std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                                 const std::optional<String> & expected, TransportAccess & access) override
+        {
+            write_attempts.push_back(access.attemptNo());
+            return CountingBackend::write(key, bytes, expected, access);
+        }
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
+        {
+            read_attempts.push_back(access.attemptNo());
+            return CountingBackend::read(key, access);
+        }
+        RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+        {
+            list_attempts.push_back(access.attemptNo());
+            return CountingBackend::list(prefix, cursor, limit, access);
+        }
+    };
+    FakeClock clock;
+    auto backend = std::make_shared<AttemptRecordingBackend>();
+    backend->injectAmbiguousWrite("k");
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("read timed out")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.create("k", "v", Retry::standard())));
+    /// Attempt 1 ambiguous, attempt 2 commits. The settle read is its OWN read call: attempt 1 failed, 2 answered.
+    EXPECT_EQ(backend->write_attempts, (std::vector<size_t>{1, 2}));
+    EXPECT_EQ(backend->read_attempts, (std::vector<size_t>{1, 2}));
+    backend->list_attempts.clear();
+    (void)op.list("p/", "", 10, Retry::standard());
+    EXPECT_EQ(backend->list_attempts, (std::vector<size_t>{1}));
 }
 
 TEST(CASRequests, OnceSendsOneWriteAndAtMostOneResolveRead)
@@ -2186,6 +2238,87 @@ TEST(CASRequestsConnectHint, ClassifierGuards)
 
 namespace
 {
+
+DB::S3::PocoHTTPClientConfiguration networkFailureClientConfiguration()
+{
+    DB::RemoteHostFilter remote_host_filter;
+    return DB::S3::ClientFactory::instance().createClientConfiguration(
+        "some-region",
+        remote_host_filter,
+        /* s3_max_redirects = */ 100,
+        DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 0},
+        /* s3_slow_all_threads_after_network_error = */ true,
+        /* s3_slow_all_threads_after_retryable_error = */ true,
+        /* enable_s3_requests_logging = */ false,
+        /* for_disk_s3 = */ false,
+        /* opt_disk_name = */ {},
+        /* request_throttler = */ {});
+}
+
+/// A client whose `PutObject` always fails with a `NETWORK_CONNECTION` `AWSError` carrying `text`
+/// verbatim -- shaped exactly as `PocoHTTPClient` shapes a real connection failure (empty exception
+/// name, the Poco text as the message) -- so a test built on it proves `WriteBufferFromS3`'s rethrow,
+/// not a hand-built exception, is what `isConnectFailureHint` above actually has to classify.
+struct NetworkFailurePutClient : DB::S3::Client
+{
+    explicit NetworkFailurePutClient(std::string text_)
+        : DB::S3::Client(
+            /*max_retries=*/100,
+            DB::S3::ServerSideEncryptionKMSConfig(),
+            std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>("", ""),
+            networkFailureClientConfiguration(),
+            Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+            DB::S3::ClientSettings{
+                .use_virtual_addressing = true,
+                .disable_checksum = false,
+                .gcs_issue_compose_request = false,
+                .is_s3express_bucket = false,
+            })
+        , text(std::move(text_))
+    {
+    }
+
+    Aws::S3::Model::PutObjectOutcome PutObject(const Aws::S3::Model::PutObjectRequest &) const override
+    {
+        return Aws::Client::AWSError<Aws::Client::CoreErrors>(Aws::Client::CoreErrors::NETWORK_CONNECTION, "", text, /*retryable=*/false);
+    }
+
+    std::string text;
+};
+
+}
+
+/// The classifier above reads the Poco text a connection failure carries off an `S3Exception`; this
+/// pins that the REAL `WriteBufferFromS3` rethrow every CAS conditional write goes through -- not a
+/// hand-built exception -- hands the caller that text unchanged, under `NETWORK_CONNECTION`.
+TEST(CASRequestsConnectHint, WriteBufferFromS3SurfacesTheConnectFailureTextUnchanged)
+{
+    for (const char * text : {"Cannot assign requested address", "Connection refused", "No route to host",
+                              "Network is unreachable", "connect timed out"})
+    {
+        auto client = std::make_shared<NetworkFailurePutClient>(text);
+        DB::WriteSettings write_settings;
+        write_settings.object_storage_retry_profile = DB::ObjectStorageRetryProfile::SingleAttempt;
+        DB::S3::S3RequestSettings request_settings;
+        DB::WriteBufferFromS3 buffer(
+            client, "bucket", "network_text", DB::DBMS_DEFAULT_BUFFER_SIZE, request_settings,
+            /*blob_log_=*/nullptr, /*object_metadata_=*/std::nullopt, /*schedule_=*/{}, write_settings);
+        buffer.write('A');
+        try
+        {
+            buffer.finalize();
+            FAIL() << "the injected failure must surface";
+        }
+        catch (const DB::S3Exception & e)
+        {
+            EXPECT_EQ(e.getS3ErrorCode(), Aws::S3::S3Errors::NETWORK_CONNECTION) << text;
+            EXPECT_THAT(e.message(), testing::HasSubstr(text));
+        }
+    }
+}
+
+namespace
+{
 std::exception_ptr connectHint()
 {
     return std::make_exception_ptr(DB::S3Exception(
@@ -2410,6 +2543,78 @@ TEST(CASRequestsConnectHint, RefusalAfterAnEarlierAmbiguitySettlesByRead)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 0u);
 }
 
+/// A single exception can ALSO be both refreshable-credential-class (`isRefreshableCredentialError`
+/// matches on the exception NAME, independent of the S3 error code) and hint-text
+/// (`isConnectFailureHint` matches on the code and the message). The credential refresh drives the
+/// reissue here, not the hint, so the hint counter must stay put.
+TEST(CASRequestsConnectHint, RefreshedCredentialTextDoesNotDoubleCountTheHint)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->setRefreshCredentialsResult(true);
+    backend->failNextWriteWith("k", std::make_exception_ptr(DB::S3Exception(
+        "Poco::Exception. Code: 1000, e.code() = 99, Connection refused: 10.0.0.1:9000",
+        Aws::S3::S3Errors::NETWORK_CONNECTION, "ExpiredToken")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_FALSE(committed->resolved_by_read);
+    EXPECT_EQ(backend->getTotal(), 0u);
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+    /// The refresh -- not the hint's flat pause -- drove the reissue, so the hint counter must not move
+    /// even though the exception's code and text also match `isConnectFailureHint`.
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 0u);
+}
+
+/// The counter's ambiguity-precedence twin: the credential-owned reissue above requires
+/// `!state.any_ambiguous`, so an earlier ambiguity of this inner write keeps it from applying even
+/// though attempt 2's exception matches the refreshable-credential class. Attempt 2 is then reissued
+/// by the ordinary hint mechanism instead -- flat-paused, and after the resolve read attempt 1 still
+/// owes -- so the hint counter must count it.
+TEST(CASRequestsConnectHint, CredentialRefreshAfterAnEarlierAmbiguityStillCountsTheHint)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->setRefreshCredentialsResult(true);
+    backend->injectAmbiguousWrite("k");           /// attempt 1: ordinary ambiguity -> read, backoff
+    bool hint_fired_on_second_attempt = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (backend->writeTotal() == 2)
+        {
+            EXPECT_EQ(backend->getTotal(), 1u) << "attempt 1's ambiguity read must already have run";
+            hint_fired_on_second_attempt = true;
+            throw DB::S3Exception(
+                "Poco::Exception. Code: 1000, e.code() = 99, Cannot assign requested address: 10.0.0.1:9000",
+                Aws::S3::S3Errors::NETWORK_CONNECTION, "ExpiredToken");   /// hint AND credential-refreshable
+        }
+    });
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 3u);
+    /// One read (attempt 1's) settles the earlier ambiguity; attempt 2's hint reissue skips its own
+    /// read, exactly as `EarlierAmbiguityStillSettlesByRead` pins for a non-credential hint.
+    EXPECT_EQ(backend->getTotal(), 1u);
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+    ASSERT_EQ(clock.sleeps.size(), 2u);
+    EXPECT_LE(clock.sleeps[0], 200u);     /// the backoff after attempt 1's ambiguity read
+    EXPECT_EQ(clock.sleeps[1], 50u);      /// the flat pause after attempt 2's hint, not a credential backoff
+    EXPECT_TRUE(hint_fired_on_second_attempt);
+    /// The hint mechanism, not a credential-owned reissue, actually resent this attempt, so the counter
+    /// counts it even though the exception's name also matches the refreshable-credential class.
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 1u);
+}
+
 TEST(CASRequestsConnectHint, GatesRefuseTheReissue)
 {
     /// Deadline: hints until the window closes.
@@ -2483,4 +2688,346 @@ TEST(CASRequestsConnectHint, AmbiguityAfterHintsStartsAtFirstBackoff)
     EXPECT_LE(clock.sleeps[2], 200u);
 }
 
+TEST(CASRequestsFuse, MatcherPrecedence)
+{
+    using Aws::S3::S3Errors;
+    /// The generic transport-timeout text is Poco's exception name, pinned here.
+    EXPECT_THAT(Poco::TimeoutException("the socket").displayText(), testing::StartsWith("Timeout"));
+    const DB::S3Exception fuse("Poco::Exception. Code: 1000, e.code() = 0, Timeout: the socket", S3Errors::NETWORK_CONNECTION);
+    EXPECT_TRUE(isFirstAttemptFuseTimeout(fuse, 1));
+    EXPECT_FALSE(isFirstAttemptFuseTimeout(fuse, 2));
+    const DB::S3Exception hint("Poco::Exception. Code: 1000, e.code() = 0, Timeout: connect timed out: 10.0.0.1:9", S3Errors::NETWORK_CONNECTION);
+    EXPECT_FALSE(isFirstAttemptFuseTimeout(hint, 1));     /// the connect-failure hint owns it
+    EXPECT_TRUE(isConnectFailureHint(hint));
+    EXPECT_FALSE(isFirstAttemptFuseTimeout(DB::S3Exception("Connection reset by peer", S3Errors::NETWORK_CONNECTION), 1));
+    EXPECT_FALSE(isFirstAttemptFuseTimeout(DB::S3Exception("Timeout", S3Errors::INTERNAL_FAILURE), 1));
+}
+
+namespace
+{
+std::exception_ptr fuseTimeout()
+{
+    return std::make_exception_ptr(DB::S3Exception("Poco::Exception. Code: 1000, e.code() = 0, Timeout: the socket",
+                                                   Aws::S3::S3Errors::NETWORK_CONNECTION));
+}
+}
+
+TEST(CASRequestsFuse, FirstAttemptTimeoutReissuesWithoutSleep)
+{
+    /// Write: the settle read still runs (the request may have been sent), then a no-sleep reissue.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        backend->failNextWriteWith("k", fuseTimeout());
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        WriteResult result = op.create("k", "v", Retry::standard());
+        const auto * committed = std::get_if<Committed>(&result);
+        ASSERT_NE(committed, nullptr);
+        EXPECT_EQ(committed->attempts_sent, 2u);
+        EXPECT_EQ(backend->getTotal(), 1u);
+        EXPECT_TRUE(clock.sleeps.empty());
+    }
+    /// Read: no settle read, no sleep.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        orThrow(op.create("k", "v", Retry::standard()), "seed");
+        backend->resetCounts();
+        backend->failNextReadWith("k", fuseTimeout());
+        EXPECT_TRUE(op.read("k", Retry::standard()).has_value());
+        EXPECT_EQ(backend->getTotal(), 2u);
+        EXPECT_TRUE(clock.sleeps.empty());
+    }
+    /// LIST: no sleep either. LIST has no `failNextWith`-style armed queue (only write/read/head do),
+    /// so a small backend that throws the fuse on its first LIST and records the physical attempt
+    /// number stands in.
+    {
+        struct ListFuseOnceBackend : CountingBackend
+        {
+            bool armed = true;
+            std::vector<size_t> list_attempts;
+            RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+            {
+                list_attempts.push_back(access.attemptNo());
+                if (armed)
+                {
+                    armed = false;
+                    std::rethrow_exception(fuseTimeout());
+                }
+                return CountingBackend::list(prefix, cursor, limit, access);
+            }
+        };
+        FakeClock clock;
+        auto backend = std::make_shared<ListFuseOnceBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        (void)op.list("p/", "", 10, Retry::standard());
+        EXPECT_EQ(backend->list_attempts, (std::vector<size_t>{1, 2}));
+        EXPECT_TRUE(clock.sleeps.empty());
+    }
+    /// Attempts 1 and 2 failing: attempt 2 is not a first attempt, so exactly one sleep, after it.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        backend->failNextWriteWith("k", fuseTimeout());
+        backend->failNextWriteWith("k", fuseTimeout());
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        WriteResult result = op.create("k", "v", Retry::standard());
+        ASSERT_TRUE(std::holds_alternative<Committed>(result));
+        EXPECT_EQ(std::get<Committed>(result).attempts_sent, 3u);
+        EXPECT_EQ(clock.sleeps.size(), 1u);
+    }
+}
+
+TEST(CASRequestsFuse, GatesRefuseTheZeroPauseReissue)
+{
+    /// `setAttemptReservationForTest(1'000)`: the write's own admission reserves two envelopes
+    /// (`reservedFor(0, 2) == 2000`), which matches a 2000 ms window exactly -- `fits` is `needed <=
+    /// remaining`, so the boundary admits. The settle read that follows the fuse reserves only one
+    /// envelope (`reservedFor(0, 1) == 1000`), which still fits even after the clock below has moved.
+    /// What must NOT fit is the zero-pause reissue's own `reservedFor(0, 2) == 2000`. `FakeClock` never
+    /// moves on its own -- only a sleep advances it, and this path sleeps none -- so a naive `now()`
+    /// would see the SAME instant at every one of the four calls this operation makes (the initial
+    /// `bind`, the write's own admission, the settle read's admission, the reissue's admission) and
+    /// wrongly admit the reissue too. A real failing attempt spends wall time even though it never
+    /// lands, so this fixture's clock counts its own calls and adds 1 ms starting from the THIRD one
+    /// (the settle read's admission) onward: late enough that the write's own admission still sees the
+    /// pristine window, early enough that the reissue's admission sees one fewer millisecond than it
+    /// needs.
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextWriteWith("k", fuseTimeout());
+    int now_calls = 0;
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(1'000);
+    requests.setNowFnForTest([&clock, &now_calls]() -> uint64_t
+    {
+        ++now_calls;
+        return clock.now + (now_calls <= 2 ? 0 : 1);
+    });
+    auto op = requests.admit();
+    WriteResult result = op.create("k", "v", Retry::within(2'000));
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_TRUE(clock.sleeps.empty()) << "the zero-pause reissue never sleeps, even when refused";
+    /// The fence, not the deadline, refuses the zero-pause reissue: three `Fence::admit` calls happen
+    /// in this scenario -- the write's own admission, the settle read's admission, and the reissue's
+    /// admission -- in that order, so tripping the fence on the THIRD call refuses only the reissue,
+    /// after the write attempt and its settle read both already went through.
+    {
+        FakeClock fence_clock;
+        auto fence_backend = std::make_shared<CountingBackend>();
+        fence_backend->failNextWriteWith("k", fuseTimeout());
+        int admit_calls = 0;
+        Fence fence{
+            [] { return uint64_t{1}; },
+            [&](uint64_t, uint64_t) { return ++admit_calls >= 3 ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
+            [](uint64_t) {}};
+        auto fence_requests = makeRequests(fence_backend, fence_clock, fence);
+        auto fence_op = fence_requests.admit();
+        WriteResult fence_result = fence_op.create("k", "v", Retry::standard());
+        const auto * fence_gave_up = std::get_if<GaveUp>(&fence_result);
+        ASSERT_NE(fence_gave_up, nullptr);
+        EXPECT_EQ(fence_gave_up->why, GaveUp::Why::FenceLost);
+        EXPECT_TRUE(fence_gave_up->sent_any);
+        EXPECT_EQ(fence_backend->writeTotal(), 1u) << "the fence refuses before a second write is ever sent";
+    }
+    /// `Retry::once()` never performs a second attempt.
+    auto once_backend = std::make_shared<CountingBackend>();
+    once_backend->failNextWriteWith("k", fuseTimeout());
+    auto once_requests = makeRequests(once_backend, clock);
+    auto once_op = once_requests.admit();
+    (void)once_op.create("k", "v", Retry::once());
+    EXPECT_EQ(once_backend->writeTotal(), 1u);
+}
+
+TEST(CASRequestsFuse, ReadLoopZeroPauseKeepsTheBackoffIndex)
+{
+    struct ReadAttemptRecordingBackend : CountingBackend
+    {
+        std::vector<size_t> read_attempts;
+        std::optional<Raw> read(const String & key, TransportAccess & access) override
+        {
+            read_attempts.push_back(access.attemptNo());
+            return CountingBackend::read(key, access);
+        }
+    };
+    FakeClock clock;
+    auto backend = std::make_shared<ReadAttemptRecordingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "v", Retry::standard()), "seed");
+    backend->read_attempts.clear();
+    backend->failNextReadWith("k", fuseTimeout());
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("attempt 2: an ordinary fault")));
+    EXPECT_TRUE(op.read("k", Retry::standard()).has_value());
+    ASSERT_EQ(clock.sleeps.size(), 1u);
+    /// The one sleep is `backoff(1)`: the zero-pause reissue did not advance the index.
+    EXPECT_LE(clock.sleeps[0], 200u);   /// `backoff(1)` is full jitter over [0, 200] ms
+    /// The transport still sees every physical attempt: the zero-pause reissue (attempt 2) advances
+    /// `attempt_no` alone, so attempt 3 -- reached only after the one ordinary backoff -- follows it,
+    /// not a second attempt 1.
+    EXPECT_EQ(backend->read_attempts, (std::vector<size_t>{1, 2, 3}));
+}
+
+/// `Retry::once` forbids the REISSUE, not the observation: a fuse a single-attempt read hits still
+/// counts (the write path already counts at classification, before its own single-attempt check), it
+/// just throws unchanged instead of re-sending.
+TEST(CASRequestsFuse, ReadUnderOnceCountsTheFuseWithoutReissuing)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextReadWith("k", fuseTimeout());
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load();
+    expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { (void)op.read("k", Retry::once()); });
+    EXPECT_EQ(backend->getTotal(), 1u) << "Retry::once performs no second attempt";
+    EXPECT_TRUE(clock.sleeps.empty());
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load() - fuses_before, 1u);
+}
+
+/// The fuse counter's credential-refresh twin of `CASRequestsConnectHint.RefreshedCredentialTextDoesNotDoubleCountTheHint`:
+/// a first attempt whose exception is both fuse-text and refreshable-credential-name must be counted
+/// as the credential reissue it actually is, not also as a fuse.
+TEST(CASRequestsFuse, RefreshedCredentialTextDoesNotDoubleCountTheFuse)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->setRefreshCredentialsResult(true);
+    backend->failNextWriteWith("k", std::make_exception_ptr(DB::S3Exception(
+        "Poco::Exception. Code: 1000, e.code() = 0, Timeout: the socket",
+        Aws::S3::S3Errors::NETWORK_CONNECTION, "ExpiredToken")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load();
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_FALSE(committed->resolved_by_read);
+    EXPECT_EQ(backend->getTotal(), 0u);
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+    /// The refresh -- not the fuse's immediate reissue -- drove the resend, so the fuse counter must not
+    /// move even though the exception's code and text also match `isFirstAttemptFuseTimeout`.
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load() - fuses_before, 0u);
+}
+
+/// The read loop's own twin of `RefreshedCredentialTextDoesNotDoubleCountTheFuse`: a first read attempt
+/// whose exception is both fuse-text and refreshable-credential-name is a credential reissue, not a
+/// fuse, so the counter must not move even though the reissue itself is immediate, exactly like a fuse.
+TEST(CASRequestsFuse, ReadRefreshedCredentialTextDoesNotDoubleCountTheFuse)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    orThrow(op.create("k", "v", Retry::standard()), "seed");
+    backend->resetCounts();
+    backend->setRefreshCredentialsResult(true);
+    backend->failNextReadWith("k", std::make_exception_ptr(DB::S3Exception(
+        "Poco::Exception. Code: 1000, e.code() = 0, Timeout: the socket",
+        Aws::S3::S3Errors::NETWORK_CONNECTION, "ExpiredToken")));
+    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load();
+
+    const auto seen = op.read("k", Retry::standard());
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->bytes, "v");
+    EXPECT_EQ(backend->getTotal(), 2u) << "the failed attempt and its immediate reissue both reached the store";
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+    EXPECT_TRUE(clock.sleeps.empty());
+    /// The refresh -- not the fuse's immediate reissue -- drove the resend, so the fuse counter must not
+    /// move even though the exception's code and text also match `isFirstAttemptFuseTimeout`.
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load() - fuses_before, 0u);
+}
+
 #endif
+
+TEST(CASRequestBudget, EnvelopeIsValidatedNotTheBareAttempt)
+{
+    CasRequestBudget budget{.attempt_timeout_ms = 5000, .lease_safety_margin_ms = 2000, .connect_timeout_cap_ms = 1000};
+    EXPECT_EQ(budget.attemptEnvelopeMs(), 7000u);
+    EXPECT_EQ((CasRequestBudget{.attempt_timeout_ms = 5000, .lease_safety_margin_ms = 2000, .connect_timeout_cap_ms = std::nullopt}.attemptEnvelopeMs()), 5000u);
+    /// Defaults with the default TTL / period are accepted.
+    EXPECT_NO_THROW(validateCasRequestBudget(budget, 30000, 10000, /*background_renewal=*/true));
+    /// A zero attempt timeout would reserve nothing while the request keeps the disk's own timeout.
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        validateCasRequestBudget(CasRequestBudget{.attempt_timeout_ms = 0, .lease_safety_margin_ms = 2000,
+                                                   .connect_timeout_cap_ms = std::nullopt}, 30000, 10000, true);
+    });
+    /// The old inequality (attempt <= TTL - margin - period: 5000 <= 13000) accepted this; two envelopes
+    /// of 15 s do not fit a 25 s lease behind a 10 s period and a 2 s margin.
+    const CasRequestBudget wide{.attempt_timeout_ms = 5000, .lease_safety_margin_ms = 2000, .connect_timeout_cap_ms = 5000};
+    try
+    {
+        validateCasRequestBudget(wide, 25000, 10000, true);
+        FAIL() << "must refuse";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_THAT(e.message(), testing::HasSubstr("envelope"));
+        EXPECT_THAT(e.message(), testing::HasSubstr("15000"));
+    }
+    /// Without background renewal only `envelope + margin < TTL` applies (15000 + 2000 < 25000).
+    EXPECT_NO_THROW(validateCasRequestBudget(wide, 25000, 10000, /*background_renewal=*/false));
+    /// Saturation: absurd values fail closed rather than wrap.
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        validateCasRequestBudget(CasRequestBudget{.attempt_timeout_ms = std::numeric_limits<uint64_t>::max(),
+                                                   .lease_safety_margin_ms = 1, .connect_timeout_cap_ms = 1},
+                                  30000, 10000, true);
+    });
+}
+
+TEST(CASRequests, ReservationIsTheEnvelope)
+{
+    struct EnvelopeBackend : InMemoryBackend
+    {
+        uint64_t attemptTimeoutMs() const override { return 5000; }
+        uint64_t attemptEnvelopeMs() const override { return 7000; }
+    };
+    FakeClock clock;
+    auto backend = std::make_shared<EnvelopeBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    /// A write reserves two envelopes: 14 s fits a 14 s window, 13.999 s does not.
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k", "v", Retry::within(14'000))));
+    const WriteResult refused = op.create("k2", "v", Retry::within(13'999));
+    const auto * gave_up = std::get_if<GaveUp>(&refused);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_FALSE(gave_up->sent_any);
+}
+
+/// Every `Backend` decorator that forwards `attemptTimeoutMs` to an inner backend must forward
+/// `attemptEnvelopeMs` too, or the default (`attemptEnvelopeMs() { return attemptTimeoutMs(); }`)
+/// silently drops the inner backend's connect contribution -- exactly the gap `Pool::open`'s
+/// `InstrumentedBackend` wrapper had. Pin the forwarding through the same engine construction
+/// production uses.
+TEST(CASRequests, ReservationIsTheEnvelopeThroughInstrumentedBackend)
+{
+    struct EnvelopeBackend : InMemoryBackend
+    {
+        uint64_t attemptTimeoutMs() const override { return 5000; }
+        uint64_t attemptEnvelopeMs() const override { return 7000; }
+    };
+    FakeClock clock;
+    auto inner = std::make_shared<EnvelopeBackend>();
+    auto wrapped = std::make_shared<InstrumentedBackend>(inner);
+    ASSERT_EQ(wrapped->attemptTimeoutMs(), 5000u);
+    ASSERT_EQ(wrapped->attemptEnvelopeMs(), 7000u) << "InstrumentedBackend must forward the envelope, not fall back to the bare attempt timeout";
+    auto requests = makeRequests(wrapped, clock);
+    auto op = requests.admit();
+    /// Same boundary as ReservationIsTheEnvelope, now through the wrapper `Pool::open` actually uses.
+    EXPECT_TRUE(std::holds_alternative<Committed>(op.create("k", "v", Retry::within(14'000))));
+    const WriteResult refused = op.create("k2", "v", Retry::within(13'999));
+    const auto * gave_up = std::get_if<GaveUp>(&refused);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_FALSE(gave_up->sent_any);
+}

@@ -93,7 +93,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
 | `cas_mount_lease_ttl_ms` | `30000` | Milliseconds for which a mount lease remains valid after a successful claim or renewal (≥ 1). Lower values shorten stale-mount recovery but reduce tolerance for object-storage and scheduling delays |
-| `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for one request attempt and the lease safety margin before the TTL expires |
+| `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for two attempt envelopes (a renewal write and its settlement read) and the lease safety margin before the TTL expires: `period + 2 × envelope + margin < TTL` |
 | `cas_gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
 | `cas_gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `gcs_max_conditional_put_bytes` | 1 GiB | Largest conditional non-blob `PUT` on a generation-token store, including create-if-absent metadata/control artifacts and conditional replacements. Blob publication is unconditional, uses ordinary multipart, and is not subject to this cap |
@@ -103,9 +103,18 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_manifest_decode_cache_bytes` | 128 MiB | Manifest decode cache byte budget (`0` disables) |
 | `cas_gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
 | `cas_gc_read_concurrency` | `16` | Bounded pool size for the GC fold's read-ahead of checkpoints, ref logs, manifests and zero-candidate HEADs; `1` disables |
-| `cas_attempt_timeout_ms` | `5000` | Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove) |
-| `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: `cas_attempt_timeout_ms + cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, or the disk refuses to open writable |
+| `cas_attempt_timeout_ms` | `5000` | Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write), at least 1. Together with the connect cap it forms the attempt envelope (`cas_attempt_timeout_ms + 2 × cap`; the cap is `cas_attempt_timeout_ms` itself when the disk's `connect_timeout_ms` is `0`, else `min(connect_timeout_ms, cas_attempt_timeout_ms)`) that the lease arithmetic reserves: one TCP connect and one TLS handshake under the cap each, send/receive bounded per socket operation by `cas_attempt_timeout_ms`. With background renewal the cadence check requires `cas_mount_renew_period_ms + 2 × envelope + cas_lease_safety_margin_ms < cas_mount_lease_ttl_ms`, which puts an effective ceiling on the frozen connect cap: under the defaults (TTL 30000, period 10000, margin 2000) the envelope must stay under 9000, so a disk `connect_timeout_ms` of 2000 ms or more refuses to open writable — lower the connect timeout or raise the TTL if you hit this |
+| `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: the attempt envelope + `cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, and `cas_mount_renew_period_ms` + 2 × envelope + `cas_lease_safety_margin_ms` too, or the disk refuses to open writable |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
+
+A shorter TTL reduces the tolerance for object-storage delays; a shorter renewal period increases it
+(renewal starts earlier) at the cost of more background traffic. With the defaults,
+`cas_mount_lease_ttl_ms − cas_lease_safety_margin_ms − cas_mount_renew_period_ms − 2 × envelope =
+4000` ms is the scheduling-lateness budget before the first renewal attempt of a period can begin,
+where `envelope = cas_attempt_timeout_ms + 2 × cap` (7000 ms with defaults) and `cap` is
+`cas_attempt_timeout_ms` when the disk's `connect_timeout_ms` is `0`, else
+`min(connect_timeout_ms, cas_attempt_timeout_ms)` (1000 ms with defaults); the renewal then keeps
+retrying until `confirmed deadline − cas_lease_safety_margin_ms`.
 
 ## Advanced GC pacing settings {#advanced-gc-pacing-settings}
 

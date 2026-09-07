@@ -21,6 +21,17 @@ enum class ObjectStorageRetryProfile : uint8_t
     SingleAttempt,
 };
 
+/// What a CAS control request carries into the object storage: the retry profile, the per-attempt
+/// budget and connect cap the storage's single-attempt client must honour, and the caller's own
+/// attempt number (0 = unset) so the HTTP client sees a reissue as attempt ≥ 2.
+struct ObjectStorageControlRequest
+{
+    ObjectStorageRetryProfile profile = ObjectStorageRetryProfile::Default;
+    uint64_t attempt_timeout_ms = 0;
+    uint64_t connect_timeout_cap_ms = 0;
+    size_t attempt_number = 0;
+};
+
 /// Per-copy transport requirement, resolved by the object storage that executes the copy.
 /// `NativeOnly` requires a provider-native same-store copy and forbids a client-side fallback.
 enum class ObjectStorageCopyMode : uint8_t
@@ -84,6 +95,14 @@ struct WriteSettings
     /// Request timeout (send/receive inactivity bound) for the single-attempt client selected by
     /// `object_storage_retry_profile == SingleAttempt`. 0 = the storage's configured timeout.
     uint64_t object_storage_attempt_timeout_ms = 0;
+
+    /// The cap the single-attempt client's clone puts on one TCP connect and again on one TLS
+    /// handshake, frozen by the mount at open; see `CasRequestBudget::attemptEnvelopeMs`. 0 = no cap.
+    uint64_t object_storage_connect_timeout_cap_ms = 0;
+
+    /// The caller's own attempt number for the request built from these settings, 1-based; 0 leaves the
+    /// buffer's own numbering. A CAS reissue passes its count so the HTTP client sees attempt ≥ 2.
+    size_t object_storage_attempt_number = 0;
 
     /// Selects the transport requirement for an object storage copy; see `ObjectStorageCopyMode`.
     ObjectStorageCopyMode object_storage_copy_mode = ObjectStorageCopyMode::Default;

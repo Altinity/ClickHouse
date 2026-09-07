@@ -80,8 +80,8 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, gc_meta_pool_size, 16, "Bounded pool size for GC per-hash freshness-meta writes", 0) \
     DECLARE(UInt64, gc_read_concurrency, 16, "Bounded pool size for the GC fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate HEADs; 1 disables read-ahead", 0) \
     DECLARE(UInt64, gc_bulk_delete_chunk_keys, 1000, "Keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots); 1 to 1000", 0) \
-    DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a writable Native mount's control-plane requests", 0) \
-    DECLARE(UInt64, lease_safety_margin_ms, 2000, "Startup-only margin validated against the mount lease TTL (attempt_timeout_ms + this must be strictly less than the lease TTL)", 0) \
+    DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write), at least 1. With the connect cap it forms the attempt envelope the lease arithmetic reserves", 0) \
+    DECLARE(UInt64, lease_safety_margin_ms, 2000, "Startup-only margin validated against the mount lease TTL: attempt envelope + this must be strictly less than the TTL, and renew period + 2 × envelope + this too", 0) \
     DECLARE(String, staging_backend, "local", "Blob staging backend (local | s3); s3 is opt-in", 0) \
 
 DECLARE_SETTINGS_TRAITS(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, CONTENT_ADDRESSED_SETTINGS_SUPPORTED_TYPES)
@@ -240,6 +240,11 @@ void ContentAddressedSettings::validate()
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "content_addressed disk: gc_bulk_delete_chunk_keys must be between 1 and 1000 (got {})",
             settings[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value);
+
+    if (settings[ContentAddressedSetting::attempt_timeout_ms] == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: cas_attempt_timeout_ms must be >= 1 (got {})",
+            settings[ContentAddressedSetting::attempt_timeout_ms].value);
 
     if (settings[ContentAddressedSetting::mount_lease_ttl_ms] == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,

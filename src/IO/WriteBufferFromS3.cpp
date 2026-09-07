@@ -749,6 +749,9 @@ S3::PutObjectRequest WriteBufferFromS3::getPutRequest(PartData & data)
     /// If we don't do it, AWS SDK can mistakenly set it to application/xml, see https://github.com/aws/aws-sdk-cpp/issues/1840
     req.SetContentType("binary/octet-stream");
 
+    if (write_settings.object_storage_attempt_number != 0)
+        S3::setClickhouseAttemptNumber(req, write_settings.object_storage_attempt_number);
+
     client_ptr->setKMSHeaders(req);
 
     /// The actual PUT that produces a CAS incarnation token: eligible for the typed NativeConditional

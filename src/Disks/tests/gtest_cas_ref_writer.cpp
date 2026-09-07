@@ -5309,7 +5309,7 @@ void seedUncleanPredecessorMount(const BackendPtr & backend, const Layout & layo
 /// lease TTL) -- mirrors `CASMountOpenWaits.FencedPriorReclaimsWithoutAnyWait` exactly.
 CasRequestBudget sealTestTinyBudget()
 {
-    return CasRequestBudget{.attempt_timeout_ms = 50, .lease_safety_margin_ms = 50};
+    return CasRequestBudget{.attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
 }
 
 }

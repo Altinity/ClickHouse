@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 #include <Common/Exception.h>
+#include <Poco/Exception.h>
 
 #include <atomic>
 #include <mutex>
@@ -263,6 +264,40 @@ TEST(CASBootstrapOrdering, ResidualWithoutMetaFailsTypedWithZeroWrites)
 
     EXPECT_EQ(backend->writeCount(), 0u) << "the fail path must perform zero writes (battery never ran)";
     EXPECT_FALSE(readPresent(*backend, kPoolMetaKey)) << "a fresh _pool_meta must NOT have been minted";
+}
+
+/// The engine's attempt number reaches the transport even through the bootstrap's own residual LIST.
+/// A backend that fails only the FIRST attempt of every LIST
+/// (as the adaptive-timeout fuse would) must still let the residual check succeed on attempt 2 -- if
+/// propagation were broken every attempt would look like attempt 1 and the LIST would never succeed,
+/// which the bootstrap reports as `BootstrapResidual::Indeterminate` ("could not authoritatively list"),
+/// a DIFFERENT message from the one asserted below. Reuses `ResidualWithoutMetaFailsTypedWithZeroWrites`'s
+/// exact seeding helper and expected error code so the assertion distinguishes "refused because listed"
+/// from "refused because the LIST failed".
+TEST(CASBootstrapOrdering, ResidualListSucceedsOnTheSecondAttempt)
+{
+    /// Every LIST whose attempt number is 1 fails as the first-attempt fuse would; attempt 2 answers.
+    struct FuseOnFirstList : RecordingBackend
+    {
+        RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+        {
+            if (access.attemptNo() == 1)
+                throw Poco::TimeoutException("Timeout");
+            return RecordingBackend::list(prefix, cursor, limit, access);
+        }
+    };
+    auto backend = std::make_shared<FuseOnFirstList>();
+    /// A healthy pool without `_pool_meta` is the shape that needs the LIST: seed one residual key.
+    seedObject(*backend, residualRefLogKey(), "x");
+    backend->clearLog();
+
+    expectThrowsCodeContaining(DB::ErrorCodes::INVALID_STATE, "refusing to bootstrap over residual data",
+                               [&] { Pool::open(backend, makeConfig()); });
+
+    bool listed_on_second = false;
+    for (const auto & e : backend->snapshot())
+        listed_on_second |= (e.op == RecordingBackend::Op::List);
+    EXPECT_TRUE(listed_on_second) << "the residual LIST must have been answered (on attempt 2), not merely failed forever";
 }
 
 /// (b') The residual verdict is decided by the first residual key, not by an enumeration of the whole

@@ -183,6 +183,17 @@ public:
     /// observe the detached-work stop latch without going through the lifecycle gate.
     Cas::PoolPtr poolForTest() const;
 
+    /// What `openPoolView` freezes into `pool_config.cas_request_budget.connect_timeout_cap_ms`: the
+    /// connect cap every control request and every single-attempt clone will carry for the life of
+    /// this mount. `nullopt` when `object_storage` has no S3 client (the envelope is then the attempt
+    /// alone); otherwise `min(disk connect_timeout_ms, cas_attempt_timeout_ms)`, with a configured zero
+    /// (Poco's "unbounded") normalized to `cas_attempt_timeout_ms` rather than treated as no limit.
+    /// Exposed here (not test-only) because it is a pure read of already-public state -- freezing it in
+    /// one place, unit-testable without opening a pool, is what keeps a later client reload from
+    /// widening the envelope the lease arithmetic was validated against.
+    static std::optional<uint64_t> freezeConnectTimeoutCapMs(
+        const ObjectStoragePtr & object_storage, uint64_t cas_attempt_timeout_ms);
+
     /// Runs one synchronous GC round on the caller's thread and emits Start and Finish rows to
     /// `system.cas_gc_log`. Throws `BAD_ARGUMENTS` when GC is disabled
     /// by read-only mode or configuration.

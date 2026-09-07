@@ -36,6 +36,14 @@ bool isDefinitelyRefusedWrite(const std::exception & e);
 /// ambiguous one; what the hint changes is only that the engine reissues before spending a read.
 bool isConnectFailureHint(const std::exception & e);
 
+/// TRUE when a FIRST physical attempt (`attempt_no == 1`) failed with the adaptive first-attempt
+/// timeout: an `S3Exception` naming `NETWORK_CONNECTION` whose text is the generic transport-timeout
+/// one, not a connect-failure hint (checked first, so a hinted attempt stays hinted -- the failed
+/// connection it names is a different condition from the fuse, and must not be claimed by it). A
+/// connection-quality answer about a fresh connection, not a store fault -- attempt 2 runs under the
+/// full attempt budget, so the right response is to re-send at once rather than pace it like a fault.
+bool isFirstAttemptFuseTimeout(const std::exception & e, size_t attempt_no);
+
 /// Deterministic caller/local bugs, surfaced unchanged by every loop here: reissuing only replays the
 /// same failure and buries the root cause behind a retryable exception. The set is `LOGICAL_ERROR`,
 /// `NOT_IMPLEMENTED`, `BAD_ARGUMENTS` and `CORRUPTED_DATA`.
@@ -130,6 +138,7 @@ namespace detail
 void recordAttempt();
 void recordReissue();
 void recordConflictPause();
+void recordFirstAttemptFuse();
 }
 
 class CasOperation;
@@ -148,7 +157,8 @@ public:
     /// `now_ms` defaults to `CLOCK_BOOTTIME` milliseconds -- the same clock a mount lease deadline is
     /// expressed on, so `Retry::untilLeaseSafe` and this engine compare like with like. `sleep_ms`
     /// defaults to a real sleep. `attempt_reservation_ms` is taken from the backend's own attempt
-    /// timeout: it is what the engine reserves before it starts anything. `hot_keys` is the pool's
+    /// envelope (attempt timeout plus its connect caps): it is what the engine reserves before it
+    /// starts anything. `hot_keys` is the pool's
     /// write lane, shared by its planes; without one this object owns a private lane with no cache,
     /// so a write through it costs today's read and write.
     CasRequests(BackendPtr backend_, Fence fence_,
@@ -177,6 +187,11 @@ public:
     void setSleepFnForTest(std::function<void(uint64_t)> sleep_ms_);
     void setAttemptReservationForTest(uint64_t ms) { attempt_reservation_ms = ms; }
 
+    /// What every write on this plane reserves before it starts an attempt (the backend's own attempt
+    /// envelope). A caller that derives its OWN policy window from a write's cost -- rather than from a
+    /// constant that predates this reservation -- reads it here instead of duplicating the backend call.
+    uint64_t attemptReservationMs() const { return attempt_reservation_ms; }
+
 private:
     friend class CasOperation;
     /// `CasOperation::owner` is a `CasRequests &`: `CasOperation`'s own friendship with `CasHotKeys`
@@ -186,10 +201,12 @@ private:
 
     /// The one place a transport key is created. Every verb reaches the store through this, so no
     /// engine code -- and nothing outside it -- can name the key's type, let alone construct one.
+    /// `attempt_no` is the caller's own 1-based physical-attempt count, threaded to the transport
+    /// through `TransportAccess::attemptNo()` so a reissue is seen as attempt >= 2.
     template <typename Fn>
-    auto withTransportAccess(Fn && fn)
+    auto withTransportAccess(size_t attempt_no, Fn && fn)
     {
-        TransportAccess access;
+        TransportAccess access(attempt_no);
         return std::forward<Fn>(fn)(access);
     }
 
@@ -380,6 +397,13 @@ private:
     /// state the read never saw, which is how a lease refusal used to be reported as a policy deadline.
     WriteResult gaveUpAfterFailedObservation(std::optional<ReadStop> stop, WriteState & state,
                                              const Retry::Bound & bound) const;
+    /// The shared shape behind every gated pause below: admission for `envelopes` attempt reservations
+    /// plus `pause_ms`, the deadline check, the counter this pause records itself under, then the sleep
+    /// -- called even with a zero `pause_ms` UNLESS `should_sleep` is false, which is reserved for the
+    /// fuse's zero-pause reissue (a pace of "no pause", not "a zero-length one"). A value means the call
+    /// ended during it; nullopt means the caller may send another attempt.
+    std::optional<WriteResult> gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
+                                         const Retry::Bound & bound, void (*record)(), bool should_sleep);
     /// Admission, then the jittered sleep. A value means the call ended during it; nullopt means the
     /// caller may send another attempt.
     std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry::Bound & bound);
@@ -390,6 +414,10 @@ private:
     /// The sibling for a failure text that named a failed connection. The same admission and the same
     /// reservation, a flat `kConnectHintPauseMs` sleep, and `state.reissues` untouched.
     std::optional<WriteResult> pauseFlat(WriteState & state, const Retry::Bound & bound);
+    /// The sibling for a first-attempt fuse timeout: the same admission and the same reservation, NO
+    /// sleep at all, and `state.reissues` untouched -- the fuse is a connection-quality answer about a
+    /// fresh connection, not a store fault, so nothing here is paced against it.
+    std::optional<WriteResult> reissueAtOnce(WriteState & state, const Retry::Bound & bound);
 
     /// `sleep_ms` plus `envelopes` attempt reservations, saturating.
     uint64_t reservedFor(uint64_t sleep_ms, uint32_t envelopes) const;
@@ -400,8 +428,10 @@ private:
     /// One failed read-class attempt, classified. A credential failure is refreshed HERE so the reissue
     /// signs with the new client, at most once per call -- `refresh_attempted` is the caller's, and a
     /// second credential failure under the same call is classified as if no refresh were available.
-    /// TRUE means the failure must surface unchanged.
-    bool refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted);
+    /// `refreshed` is set true only when THIS call installed new credentials, mirroring the write
+    /// loop's own local of the same name, so the caller can keep a credential reissue from also
+    /// inflating a counter whose text it happens to match. TRUE means the failure must surface unchanged.
+    bool refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted, bool & refreshed);
 
     /// Each records its cause in `last_read_stop` before throwing, so the resolve read can report it.
     [[noreturn]] void giveUpReadFenceLost(std::string_view verb, const String & subject, std::string_view when);
@@ -422,7 +452,12 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
                             const Retry::Bound & bound, Fn && once)
 {
     bool refresh_attempted = false;
-    for (uint32_t attempt = 1;; ++attempt)
+    /// Two counters, deliberately kept separate: `attempt_no` is the PHYSICAL attempt count handed to
+    /// the transport (so a reissue is seen as attempt >= 2); `ordinary_reissues` is the
+    /// exponential-backoff index. They advance together on an ordinary failure, but the first-attempt
+    /// fuse below advances `attempt_no` alone (via `continue`, skipping the backoff pause) so a
+    /// following ordinary failure's backoff still starts from `backoff(1)`, undisturbed.
+    for (uint32_t attempt_no = 1, ordinary_reissues = 0;; ++attempt_no)
     {
         const uint64_t reservation = reservedFor(0, 1);
         switch (gate(reservation))
@@ -432,20 +467,49 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
             case Gate::Ok: break;
         }
         if (!fits(reservation, bound))
-            giveUpReadDeadline(verb, subject, bound, attempt - 1);
+            giveUpReadDeadline(verb, subject, bound, attempt_no - 1);
 
         detail::recordAttempt();
         try
         {
-            return owner.withTransportAccess([&](auto & access) { return once(access); });
+            return owner.withTransportAccess(attempt_no, [&](auto & access) { return once(access); });
         }
         catch (const std::exception & e)
         {
-            if (refreshAndClassifyReadFault(e, refresh_attempted) || policy.single_attempt)
+            bool refreshed = false;
+            if (refreshAndClassifyReadFault(e, refresh_attempted, refreshed))
                 throw;
+            /// Classified -- and counted -- before the single-attempt check below: `Retry::once` forbids
+            /// the REISSUE, not the observation that this attempt hit the fuse, and the write path
+            /// already counts at classification the same way -- except when `refreshed` is also true: a
+            /// credential answer whose text happens to also match the fuse text is a credential reissue,
+            /// not a fuse one, and must not inflate this count.
+            const bool fuse = isFirstAttemptFuseTimeout(e, attempt_no);
+            if (fuse && !refreshed)
+                detail::recordFirstAttemptFuse();
+            if (policy.single_attempt)
+                throw;
+            /// A first-attempt fuse is a connection-quality answer, not a store fault: re-check
+            /// admission for the reissue alone and send it at once. `ordinary_reissues` stays put, so a
+            /// following ordinary failure's backoff starts at `backoff(1)`, exactly as if this attempt
+            /// had never happened.
+            if (fuse)
+            {
+                const uint64_t needed = reservedFor(0, 1);
+                switch (gate(needed))
+                {
+                    case Gate::FenceLost: giveUpReadFenceLost(verb, subject, "before the reissue");
+                    case Gate::NoBudget:  giveUpReadNoBudget(verb, subject, "for the reissue");
+                    case Gate::Ok: break;
+                }
+                if (!fits(needed, bound))
+                    giveUpReadDeadline(verb, subject, bound, attempt_no);
+                detail::recordReissue();
+                continue;
+            }
         }
 
-        const uint64_t pause_ms = Retry::backoff(attempt);
+        const uint64_t pause_ms = Retry::backoff(++ordinary_reissues);
         const uint64_t needed = reservedFor(pause_ms, 1);
         switch (gate(needed))
         {
@@ -454,7 +518,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
             case Gate::Ok: break;
         }
         if (!fits(needed, bound))
-            giveUpReadDeadline(verb, subject, bound, attempt);
+            giveUpReadDeadline(verb, subject, bound, attempt_no);
         detail::recordReissue();
         owner.sleep_ms(pause_ms);
     }

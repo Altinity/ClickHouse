@@ -84,6 +84,30 @@ public:
 
 }
 
+/// The probe loop's own attempt counter reaches the transport too -- propagation only, the probe
+/// keeps its ordinary backoff.
+TEST(CASSentinelProbe, AttemptNumberPropagates)
+{
+    struct ProbeRecording : InMemoryBackend
+    {
+        std::vector<size_t> attempts;
+        SentinelProbeResult probeSentinelRaw(const String & key, TransportAccess & access) override
+        {
+            attempts.push_back(access.attemptNo());
+            if (attempts.size() == 1)
+                return {ProbeOutcome::Indeterminate, std::nullopt};
+            return InMemoryBackend::probeSentinelRaw(key, access);
+        }
+    };
+    DB::Cas::tests::FakeClock clock;
+    auto backend = std::make_shared<ProbeRecording>();
+    CasRequests requests(backend, Fence::open(), clock.nowFn(), clock.sleepFn());
+    auto op = requests.admit();
+    (void)op.probeSentinel("probe", Retry::standard());
+    EXPECT_EQ(backend->attempts, (std::vector<size_t>{1, 2}));
+    EXPECT_EQ(clock.sleeps.size(), 1u);   /// propagation only: the probe keeps its ordinary backoff
+}
+
 /// (a) A present key probes Present and carries the materialized body.
 TEST(CASSentinelProbe, PresentKeyReturnsPresentWithBody)
 {

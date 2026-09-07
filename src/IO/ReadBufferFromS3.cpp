@@ -565,7 +565,7 @@ Aws::S3::Model::GetObjectResult ReadBufferFromS3::sendRequest(size_t attempt, si
     if (!version_id.empty())
         req.SetVersionId(version_id);
 
-    S3::setClickhouseAttemptNumber(req, attempt);
+    S3::setClickhouseAttemptNumber(req, S3::seededAttemptNumber(read_settings.object_storage_attempt_number, attempt));
 
     if (read_settings.object_storage_request_mode == ObjectStorageRequestMode::NativeConditional)
         req.setNativeConditional();

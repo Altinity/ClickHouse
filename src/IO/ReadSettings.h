@@ -169,6 +169,14 @@ struct ReadSettings
     ObjectStorageRetryProfile object_storage_retry_profile = ObjectStorageRetryProfile::Default;
     uint64_t object_storage_attempt_timeout_ms = 0;
 
+    /// The cap the single-attempt client's clone puts on one TCP connect and again on one TLS
+    /// handshake, frozen by the mount at open; see `CasRequestBudget::attemptEnvelopeMs`. 0 = no cap.
+    uint64_t object_storage_connect_timeout_cap_ms = 0;
+
+    /// The caller's own attempt number for the request built from these settings, 1-based; 0 leaves the
+    /// buffer's own numbering. A CAS reissue passes its count so the HTTP client sees attempt ≥ 2.
+    size_t object_storage_attempt_number = 0;
+
     ReadSettings adjustBufferSize(size_t file_size) const;
 
     /// Verification/metadata-read mode: disable every read-side cache (and the

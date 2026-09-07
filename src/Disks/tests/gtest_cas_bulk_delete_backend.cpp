@@ -190,7 +190,8 @@ TEST(CASBulkDeleteBackend, LocalObjectStorageRefusesTheProfileOverload)
     DB::StoredObjects objects{DB::StoredObject("p/anything")};
     expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]
     {
-        storage->removeObjectsIfExistUnderProfile(objects, DB::ObjectStorageRetryProfile::SingleAttempt, 1000);
+        storage->removeObjectsIfExistUnderProfile(objects, DB::ObjectStorageControlRequest{
+            .profile = DB::ObjectStorageRetryProfile::SingleAttempt, .attempt_timeout_ms = 1000});
     });
 }
 #endif

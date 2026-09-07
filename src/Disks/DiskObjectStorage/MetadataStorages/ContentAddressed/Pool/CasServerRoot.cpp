@@ -1283,9 +1283,22 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
     return terminal;
 }
 
-/// The farewell's whole budget. It is deliberately short: a departing mount is holding shutdown open,
-/// and a slot it fails to hand back is fenced out by the next GC round anyway.
+/// The farewell's FLOOR, not its whole budget: a departing mount is holding shutdown open, so the
+/// window still wants to be short, but it can never be shorter than what the farewell's own write
+/// needs to send even one attempt. `terminate` below takes the larger of this and that requirement.
+/// A window below the requirement is strictly worse than a slightly longer shutdown: the write is
+/// refused before it tries the wire, the slot is left holding the departing incarnation, and the next
+/// start pays a full incarnation-stability observation (up to the mount lease TTL) instead of
+/// reclaiming instantly off a clean farewell.
 constexpr uint64_t kFarewellBudgetMs = 10'000;
+
+/// Slack added on top of the write's bare two-envelope reservation (see `terminate`). `fits` admits a
+/// write whose reservation exactly equals the remaining window, but only at the instant it is checked;
+/// with zero slack the farewell would be admitted only to immediately re-fail its own deadline check
+/// once the clock advances by even one millisecond. This mirrors `lease_safety_margin_ms`'s default
+/// (`CasRequestBudget.h`) -- the same order of magnitude already trusted elsewhere on this path for
+/// "admission-time arithmetic needs room to actually run, not just to pass at t=0".
+constexpr uint64_t kFarewellSlackMs = 2'000;
 
 MountLeaseRenewer::MountLeaseRenewer(
     CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
@@ -1712,7 +1725,33 @@ void MountLeaseRenewer::terminate(CasOperation & op)
         .min_active_build_sequence = std::numeric_limits<uint64_t>::max(),
         .write_attempt_id = newMountWriteAttemptId(),
     });
-    WriteResult written = op.replace(key, body, precondition(), Retry::within(kFarewellBudgetMs));
+    /// The farewell is admitted on `open_requests` (see `release`, which calls this via `open_requests.admit()`),
+    /// so its own reservation -- attempt plus the read that settles it, `reservedFor(0, 2)` in
+    /// `CasOperation::writeLoop` -- is exactly `2 * open_requests.attemptReservationMs()`. A window
+    /// below that value refuses the write before its first attempt, deterministically, on every call:
+    /// `kFarewellBudgetMs` alone predates the attempt-envelope reservation and can no longer be trusted
+    /// to admit it. Saturating, like every other deadline computation on this path (see the
+    /// `expires_at_ms`/`confirmed_deadline_boot_ms` arithmetic above): an operator-configured envelope
+    /// is not bounds-checked against this doubling, and wrapping past `UINT64_MAX` would turn a too-long
+    /// window into a too-SHORT one -- the exact failure mode this fix exists to remove.
+    const uint64_t reservation_ms = open_requests.attemptReservationMs();
+    const uint64_t doubled_reservation_ms = reservation_ms > std::numeric_limits<uint64_t>::max() / 2
+        ? std::numeric_limits<uint64_t>::max()
+        : reservation_ms * 2;
+    const uint64_t two_envelope_reservation_plus_slack_ms = doubled_reservation_ms > std::numeric_limits<uint64_t>::max() - kFarewellSlackMs
+        ? std::numeric_limits<uint64_t>::max()
+        : doubled_reservation_ms + kFarewellSlackMs;
+    const uint64_t farewell_window_ms = std::max<uint64_t>(kFarewellBudgetMs, two_envelope_reservation_plus_slack_ms);
+    /// The derived window alone is not enough: mount-control activity must also never run past the
+    /// point this node's own fence may already be gone (the same rule `renew` enforces via
+    /// `Retry::untilLeaseSafe` above). The precondition on this write already stops it from clobbering
+    /// a successor if it DOES land late, but a shutdown holding the process open to retry a write past
+    /// its own lease-safe deadline serves no one -- the successor's own reclaim does not wait for it.
+    /// `confirmed_deadline_boot_ms` is set at `start()` and kept current by every successful `renew`,
+    /// so it is valid here whenever `terminate` runs (only reachable from `release`, which requires
+    /// `Active`, which `start` alone establishes).
+    WriteResult written = op.replace(key, body, precondition(),
+        Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()), farewell_window_ms));
 
     if (Committed * committed = std::get_if<Committed>(&written))
     {

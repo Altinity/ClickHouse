@@ -72,31 +72,30 @@ ObjectStorageIteratorPtr IObjectStorage::iterate(
     size_t max_keys,
     bool with_tags,
     const std::optional<std::string> & start_after,
-    ObjectStorageRetryProfile profile,
-    uint64_t /*request_timeout_ms*/) const
+    const ObjectStorageControlRequest & request) const
 {
-    if (profile == ObjectStorageRetryProfile::SingleAttempt)
+    if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt listing requests", getName());
     return iterate(path_prefix, max_keys, with_tags, start_after);
 }
 
 std::optional<ObjectMetadata> IObjectStorage::tryGetObjectMetadataWithNativeToken(
-    const std::string & path, bool with_tags, ObjectStorageRetryProfile profile, uint64_t /*request_timeout_ms*/) const
+    const std::string & path, bool with_tags, const ObjectStorageControlRequest & request) const
 {
-    if (profile == ObjectStorageRetryProfile::SingleAttempt)
+    if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt metadata requests", getName());
     return tryGetObjectMetadataWithNativeToken(path, with_tags);
 }
 
 ConditionalRemoveResult IObjectStorage::removeObjectIfTokenMatches(
-    const StoredObject & object, const std::string & etag, ObjectStorageRetryProfile profile, uint64_t /*request_timeout_ms*/)
+    const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request)
 {
-    if (profile == ObjectStorageRetryProfile::SingleAttempt)
+    if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt removal requests", getName());
     return removeObjectIfTokenMatches(object, etag);
 }
 
-void IObjectStorage::removeObjectsIfExistUnderProfile(const StoredObjects &, ObjectStorageRetryProfile, uint64_t)
+void IObjectStorage::removeObjectsIfExistUnderProfile(const StoredObjects &, const ObjectStorageControlRequest &)
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support batch removal under a retry profile", getName());
 }

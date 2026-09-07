@@ -368,6 +368,7 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
     const CasRequestBudget budget{
         .attempt_timeout_ms = 50,
         .lease_safety_margin_ms = 50,
+        .connect_timeout_cap_ms = std::nullopt,
     };
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
@@ -446,6 +447,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     const CasRequestBudget budget{
         .attempt_timeout_ms = 50,
         .lease_safety_margin_ms = 50,
+        .connect_timeout_cap_ms = std::nullopt,
     };
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
