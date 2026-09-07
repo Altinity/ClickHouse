@@ -1116,8 +1116,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// Chunks of write-once keys, one request each, with no per-key precondition: a manifest key is
         /// never written twice, so the body at it is the one the fold observed or nothing. The engine
         /// reissues a failed chunk whole; a chunk that exhausts its policy throws here, and the chunks
-        /// before it are already recorded below. The etag the fold observed rides the event as
-        /// information only.
+        /// before it are already recorded below. A key that one of the exhausted chunk's own attempts
+        /// did delete is not recorded either: deletion and recording are all-or-nothing per request,
+        /// never per key, so the next round's fold sees that key as already gone. The etag the fold
+        /// observed rides the event as information only.
         const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
         uint64_t attempted = 0;
         uint64_t requests = 0;
