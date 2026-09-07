@@ -146,12 +146,13 @@ TEST(CASNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncar
 }
 
 /// ---------------------------------------------------------------------------------------------
-/// `createNamespace` refuses a namespace that already has an entry (Task 2 review's own note: this
-/// is Task 3's job, not `casAdmitEntry`'s duplicate-namespace grammar refusal).
+/// `createNamespace`'s pre-check reports `Superseded` for a namespace that already has an entry, in
+/// EVERY state -- not a caller bug, but a sibling opener of the same namespace (CI PR#2300 run 3,
+/// `tiered_storage_cas`: seven concurrent `MergeTreeBackgroundExecutor` movers) that landed somewhere in
+/// its own three-step sequence between the caller's "no entry" read and this pre-check's read.
 /// ---------------------------------------------------------------------------------------------
 
-#ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CASNsCreationLifecycle, CreateNamespaceRejectsAnAlreadyExistingEntry)
+TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsLiveEntryReportsSupersededNotAbort)
 {
     auto backend = initializedCatalogBackend();
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
@@ -162,15 +163,18 @@ TEST(CASNsCreationLifecycle, CreateNamespaceRejectsAnAlreadyExistingEntry)
     ASSERT_EQ(CasRefCatalog::createNamespace(op, layout, 1, ns, creator),
                CasRefCatalog::NamespaceCreationOutcome::Live);
 
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
-    {
-        CasRefCatalog::createNamespace(op, layout, 1, ns, creatorFence("srv2", 2));
-    });
-}
-#endif
+    EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, 1, ns, creatorFence("srv2", 2)),
+              CasRefCatalog::NamespaceCreationOutcome::Superseded);
 
-#if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CASNsCreationLifecycleDeathTest, CreateNamespaceRejectsAnAlreadyExistingEntryAborts)
+    /// The refused call left the winner's `Live` entry exactly as it was.
+    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
+    const CatalogEntry * entry = findEntryForTest(snap.catalog, ns);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->state, NsState::Live);
+    EXPECT_EQ(entry->creator, std::nullopt);
+}
+
+TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsRemovingEntryReportsSupersededNotAbort)
 {
     auto backend = initializedCatalogBackend();
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
@@ -180,14 +184,19 @@ TEST(CASNsCreationLifecycleDeathTest, CreateNamespaceRejectsAnAlreadyExistingEnt
     const CreatorFence creator = creatorFence("srv1", 1);
     ASSERT_EQ(CasRefCatalog::createNamespace(op, layout, 1, ns, creator),
                CasRefCatalog::NamespaceCreationOutcome::Live);
+    ASSERT_EQ(CasRefCatalog::beginRemoving(op, layout, *findEntryForTest(CasRefCatalog::read(op, layout).catalog, ns),
+                                          /*removal_started_round=*/1),
+              CasRefCatalog::BeginRemovingOutcome::Transitioned);
 
-    EXPECT_DEATH(
-        {
-            CasRefCatalog::createNamespace(op, layout, 1, ns, creatorFence("srv2", 2));
-        },
-        "already carries a catalog entry");
+    EXPECT_EQ(CasRefCatalog::createNamespace(op, layout, 1, ns, creatorFence("srv2", 2)),
+              CasRefCatalog::NamespaceCreationOutcome::Superseded);
+
+    /// The refused call left the concurrent drop's `Removing` entry exactly as it was.
+    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, layout);
+    const CatalogEntry * entry = findEntryForTest(snap.catalog, ns);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->state, NsState::Removing);
 }
-#endif
 
 /// ---------------------------------------------------------------------------------------------
 /// `Creating` forbids publication

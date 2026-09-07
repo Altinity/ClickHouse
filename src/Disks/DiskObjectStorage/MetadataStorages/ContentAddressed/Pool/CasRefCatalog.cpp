@@ -270,6 +270,13 @@ struct CatalogEntryAlreadyPresentMarker : std::exception {};
 /// Empty (no-op) in production, mirroring every other `*_hook_for_test` in this tree.
 std::function<void()> create_namespace_step1_pre_read_hook_for_test;
 
+/// Fires once, synchronously, right before `createNamespace`'s own pre-check read -- the window in
+/// which a sibling opener of the SAME namespace can complete an entire birth (or begin a removal) that
+/// this call's pre-check then observes. Lets a test land that interleaving deterministically instead of
+/// relying on real thread scheduling. Empty (no-op) in production, mirroring every other
+/// `*_hook_for_test` in this tree.
+std::function<void()> create_namespace_pre_check_hook_for_test;
+
 /// Step 1 of `createNamespace`, split out so it can recheck presence on EVERY catalog read this loop
 /// performs (the first one, and any `Conflict` retry's re-read), not only the snapshot-in-time read
 /// `createNamespace` itself already did before calling in. That single upfront read cannot see a
@@ -646,33 +653,35 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     const RootNamespace & ns, const CreatorFence & creator, const Retry & policy)
 {
     /// Read-first, per the Task 2 review's own note on `casAdmitEntry`: a namespace that already
-    /// carries an entry is THIS function's job to reject with a clear message, not `casAdmitEntry`'s
-    /// duplicate-namespace grammar refusal (which would report a `LOGICAL_ERROR` about canonical order
-    /// -- true, but useless to a caller trying to understand why its create failed). A concurrent
+    /// carries an entry is THIS function's job to notice and report `Superseded` for, not
+    /// `casAdmitEntry`'s duplicate-namespace grammar refusal (which would report a `LOGICAL_ERROR` about
+    /// canonical order -- true, but useless to a caller whose create merely lost a race). A concurrent
     /// insert of the SAME namespace between this read and step 1 is still caught -- `casAdmitEntry`'s
     /// own grammar check is the backstop, not the only check.
+    if (create_namespace_pre_check_hook_for_test)
+    {
+        std::function<void()> hook_to_run;
+        std::swap(hook_to_run, create_namespace_pre_check_hook_for_test);
+        hook_to_run();
+    }
     const Snapshot snap = read(op, layout, policy);
     const auto existing = findEntry(snap.catalog, ns);
     if (existing != snap.catalog.entries.end())
     {
-        /// `Creating` is not this function's problem to solve (the class-level doc above says so) --
-        /// it is exactly the race `resolveNamespaceLife`'s own loop is built to absorb: sibling openers
-        /// of the SAME namespace (e.g. concurrent per-part freeze threads of one query, which share one
-        /// mount's fence) can all observe "no entry" before any of them lands step 1, then race into
-        /// this call. Reporting `Superseded` sends the loser back through the loop, where it re-reads
-        /// and takes the documented resume path (its own fence: `completeCreation`; a foreign one:
-        /// `reconcileStaleCreator`) instead of aborting the server for an outcome the design already
-        /// names and handles. `Live`/`Removing` stay a `LOGICAL_ERROR`: `namespaceLife`'s caller filters
-        /// `Live` before ever reaching here and refuses `Removing` outright, so seeing either here means
-        /// a caller bypassed that dispatch, not a race.
-        if (existing->state == NsState::Creating)
-            return NamespaceCreationOutcome::Superseded;
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CasRefCatalog::createNamespace: namespace '{}' already carries a catalog entry (state "
-            "'{}') -- a stalled Creating entry is resumed through reconcileStaleCreator + "
-            "completeCreation, never a fresh createNamespace call; an existing Live or Removing "
-            "namespace must complete its current lifecycle before a fresh creation can be admitted",
-            ns.string(), nsStateToWord(existing->state));
+        /// This read is a snapshot taken AFTER the caller's own "no entry" read (`resolveNamespaceLife`'s
+        /// loop, or any other dispatcher that only reaches `createNamespace` once it has seen nothing to
+        /// adopt). A sibling opener of the SAME namespace -- concurrent threads of one server: parallel
+        /// background movers, inserts, or per-part `FREEZE` -- can land anywhere in its own three-step
+        /// sequence in the gap between those two reads, so EVERY state observed here is a race outcome,
+        /// never a caller bug: `Creating` (a sibling landed step 1 only), `Live` (a sibling completed all
+        /// three steps and already won birth), and `Removing` (a concurrent drop) are all reported
+        /// `Superseded`, sending the loser back through its own resume loop rather than aborting the
+        /// server for an outcome the design already names and handles. There the loop's fresh re-read
+        /// tells the loser what actually happened: `Live` is adopted directly, `Removing` is refused by
+        /// the loop's own `Removing` branch, and a still-`Creating` entry resumes through
+        /// `reconcileStaleCreator` + `completeCreation` (or, if it is this caller's own fence, straight
+        /// through `completeCreation`).
+        return NamespaceCreationOutcome::Superseded;
     }
 
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating,
@@ -704,6 +713,11 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
 void CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest(std::function<void()> hook)
 {
     create_namespace_step1_pre_read_hook_for_test = std::move(hook);
+}
+
+void CasRefCatalog::setCreateNamespacePreCheckHookForTest(std::function<void()> hook)
+{
+    create_namespace_pre_check_hook_for_test = std::move(hook);
 }
 
 CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(

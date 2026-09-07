@@ -235,15 +235,14 @@ public:
     /// Creating, incarnation, creator}`), then steps 2+3 via `completeCreation` below.
     ///
     /// This function reads the catalog FIRST rather than handing `casAdmitEntry` a doomed insert and
-    /// letting its own grammar check report a confusing duplicate-namespace message: a namespace
-    /// `entry.ns` already carries an entry is a bug in THIS caller, not in `casAdmitEntry`, which is
-    /// why it is checked here first. A namespace already
-    /// `Creating` is not this function's problem to solve -- that is exactly what `reconcileStaleCreator`
-    /// + `completeCreation` are for, so this reports `Superseded` (never `LOGICAL_ERROR`) and sends the
-    /// caller back through its own resume loop: sibling openers of the same namespace that all observed
-    /// "no entry" before any of them landed step 1 race in here exactly this way. A namespace already
-    /// `Live`/`Removing` IS a caller bug (recreating an existing name is removal's business, not
-    /// creation's) and still throws `LOGICAL_ERROR` naming the observed state.
+    /// letting its own grammar check report a confusing duplicate-namespace message. That read is a
+    /// snapshot taken AFTER the caller's own "no entry" read, so a sibling opener of the SAME namespace
+    /// (concurrent threads of one server: parallel background movers, inserts, `FREEZE`) can have landed
+    /// anywhere in its own three-step sequence in between -- ANY state observed here (`Creating`, `Live`,
+    /// `Removing`) is that race, never a caller bug, and is reported `Superseded` uniformly, sending the
+    /// caller back through its own resume loop (`resolveNamespaceLife`'s loop re-reads and dispatches:
+    /// `Live` is adopted, `Removing` is refused there, a still-`Creating` entry resumes through
+    /// `reconcileStaleCreator` + `completeCreation`).
     static NamespaceCreationOutcome createNamespace(
         CasOperation & op, const Layout & layout, uint64_t gc_shards,
         const RootNamespace & ns, const CreatorFence & creator,
@@ -256,6 +255,13 @@ public:
     /// in production; a stateless class-scope hook (rather than an instance member) because
     /// `CasRefCatalog` itself carries no state.
     static void setCreateNamespaceStep1PreReadHookForTest(std::function<void()> hook);
+
+    /// Fires once, synchronously, right before `createNamespace`'s own pre-check read -- the exact
+    /// window a sibling opener of the same namespace can complete an entire birth (or begin a removal)
+    /// in, for a test to drive that interleaving deterministically instead of relying on real thread
+    /// scheduling. Empty (no-op) hook in production; a stateless class-scope hook (rather than an
+    /// instance member) because `CasRefCatalog` itself carries no state.
+    static void setCreateNamespacePreCheckHookForTest(std::function<void()> hook);
 
     /// Steps 2 (`_ckpt` publish) + 3 (`Creating -> Live` CAS) alone, given an entry the caller already
     /// owns as `observed` -- either the entry `createNamespace`'s own step 1 just inserted, or one a

@@ -366,6 +366,50 @@ TEST(CASRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
     EXPECT_TRUE(op.head(layout.refLogKey(life, id), Retry::standard()).has_value());
 }
 
+/// Regression (CI PR#2073, `tiered_storage_cas`, part `all_1_1_0` of a fresh table): seven concurrent
+/// `MergeTreeBackgroundExecutor` movers all reached `resolveNamespaceLife`'s "no entry" read for the
+/// SAME namespace before any of them landed a row. The winner's `createNamespace` ran its full three
+/// steps to `Live` inside the WINDOW between the loop's own "no entry" read and the loser's own
+/// `createNamespace` pre-check read -- so the loser's pre-check itself observed `Live`, not "no entry".
+/// That must be adopted through the loop's normal re-read, never abort the server.
+TEST(CASRefCatalogBirthWiring, ASiblingsFullCreateInsideCreateNamespacesOwnPreCheckWindowIsAdoptedNotAbort)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation sibling_op = requests.admit();
+    auto store = openPoolForBirthTest(backend, "loser-server");
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/precheck_race"};
+    const CreatorFence sibling_fence{.server_root_id = "sibling-server", .writer_epoch = 1, .fence_generation = 1};
+
+    /// Fires once, inside the LOSER's own `store->namespaceLife` -> `resolveNamespaceLife` ->
+    /// `createNamespace` call, right before that call's pre-check read -- i.e. AFTER
+    /// `resolveNamespaceLife`'s own loop already observed no entry. Runs a sibling's entire
+    /// `createNamespace` to completion in that window, so the loser's own pre-check read is the one
+    /// that observes the sibling's `Live` row.
+    CasRefCatalog::setCreateNamespacePreCheckHookForTest([&]
+    {
+        const auto sibling_outcome = CasRefCatalog::createNamespace(sibling_op, layout, 1, ns, sibling_fence);
+        ASSERT_EQ(sibling_outcome, CasRefCatalog::NamespaceCreationOutcome::Live);
+    });
+
+    std::optional<NamespaceLifeId> life;
+    EXPECT_NO_THROW(life = store->namespaceLife(ns));
+
+    /// The read result must outlive the returned pointer -- findEntry points into its entries.
+    const auto snap = CasRefCatalog::read(sibling_op, layout);
+    size_t rows_for_ns = 0;
+    for (const CatalogEntry & e : snap.catalog.entries)
+        if (e.ns.string() == ns.string())
+            ++rows_for_ns;
+    EXPECT_EQ(rows_for_ns, 1u) << "the loser's refused pre-check left no trace of its own";
+    const CatalogEntry * entry = findEntry(snap.catalog, ns);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->state, NsState::Live);
+    ASSERT_TRUE(life.has_value());
+    EXPECT_EQ(*life, NamespaceLifeId::fromCatalogEntry(ns, entry->incarnation)) << "the sibling's incarnation, adopted";
+}
+
 /// OBLIGATION 3, pinned through the PRODUCTION path: a `Creating` entry left by a DIFFERENT, still-live
 /// (or at least not provably dead) actor refuses every append -- no test-only seam, no direct call to
 /// `resolveNamespaceLife`/`reconcileStaleCreator`, just an ordinary `appendRefOps`.
