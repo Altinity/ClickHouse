@@ -214,6 +214,19 @@ namespace
         return false;
     }
 
+    size_t calculatePartsToDo(
+        size_t number_of_parts,
+        const std::map<String, std::vector<String>> & destination_file_paths_per_part)
+    {
+        /// A failed listing publishes the marker as a key and says nothing about progress, while a
+        /// marker as a value only means that leaf's paths were unreadable - the leaf exists, so
+        /// that part is done and still counts.
+        if (destination_file_paths_per_part.contains(String(zk_sync_failed_marker)))
+            return number_of_parts;
+
+        return number_of_parts - destination_file_paths_per_part.size();
+    }
+
     bool skipReadingDestinationFilePaths(
         ExportReplicatedMergeTreePartitionTaskEntry::Status status,
         const std::map<String, std::vector<String>> & cached_paths,
@@ -415,7 +428,7 @@ std::vector<PartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartiti
         info.create_time = manifest.create_time;
         info.source_replica = manifest.source_replica;
         info.parts_count = manifest.number_of_parts;
-        info.parts_to_do = manifest.parts.size();
+        info.parts_to_do = calculatePartsToDo(manifest.number_of_parts, entry.destination_file_paths_per_part);
         info.parts = manifest.parts;
         info.status = magic_enum::enum_name(entry.status);
 

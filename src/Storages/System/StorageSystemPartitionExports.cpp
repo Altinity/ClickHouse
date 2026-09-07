@@ -49,7 +49,7 @@ ColumnsDescription StorageSystemPartitionExports::getColumnsDescription()
             "Name of the replica that received the export command. Empty for plain (non-replicated) MergeTree, which exports on a single node."},
         {"parts", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "List of part names to be exported."},
         {"parts_count", std::make_shared<DataTypeUInt64>(), "Number of parts in the export."},
-        {"parts_to_do", std::make_shared<DataTypeUInt64>(), "Number of parts pending to be exported. Only a plain (non-replicated) MergeTree decrements it as parts finish; for a Replicated*MergeTree it currently stays equal to parts_count."},
+        {"parts_to_do", std::make_shared<DataTypeUInt64>(), "Number of parts pending to be exported."},
         {"status", std::make_shared<DataTypeString>(), "Status of the export."},
         {"last_exception_per_replica", std::make_shared<DataTypeArray>(last_exception_tuple),
             "Per-replica last exception entries. Each tuple records the most recent exception observed by that replica plus a best-effort within-replica count. Empty array if no replica has reported an exception for this task. A plain (non-replicated) MergeTree reports at most one entry, with an empty replica name."},
