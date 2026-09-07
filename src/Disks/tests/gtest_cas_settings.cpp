@@ -27,6 +27,7 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsString scratch_path;
+    extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
 }
 
 namespace
@@ -576,4 +577,20 @@ TEST(CASContentAddressedSettings, AbsentScratchPathUsesDefaultVerbatim)
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/data", "/data/disks/x/cas_scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/disks/x/cas_scratch");
+}
+
+TEST(CASContentAddressedSettings, UnsafeRemountNoDelayIsOffByDefault)
+{
+    {
+        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
+        ContentAddressedSettings s;
+        s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+        EXPECT_FALSE(s[ContentAddressedSetting::unsafe_remount_no_delay].value);
+    }
+    {
+        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_unsafe_remount_no_delay>1</cas_unsafe_remount_no_delay>");
+        ContentAddressedSettings s;
+        s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+        EXPECT_TRUE(s[ContentAddressedSetting::unsafe_remount_no_delay].value);
+    }
 }

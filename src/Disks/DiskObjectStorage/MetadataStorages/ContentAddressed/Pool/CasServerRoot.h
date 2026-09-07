@@ -184,7 +184,8 @@ uint64_t allocateWriterEpoch(CasOperation & op, const Layout & l, const String &
                              EpochMintPolicy policy, uint64_t now_ms,
                              const ObserveRefCatalog & observe_catalog);
 
-/// Which certificate of death justified a same-uuid, different-epoch mount reclaim. `None` when no
+/// Which certificate of death, or the operator's explicit unsafe authorization, justified a
+/// same-uuid, different-epoch mount reclaim. `None` when no
 /// reclaim of that kind happened (a fresh claim, a
 /// same-epoch refresh, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
 enum class MountPriorState
@@ -193,6 +194,7 @@ enum class MountPriorState
     Clean,             /// the predecessor's own graceful farewell (`min_active_build_sequence == UINT64_MAX`)
     Fenced,            /// the GC leader's own (already threshold-gated) fence-out (`gc_fenced`)
     UncleanObserved,   /// OUR observation watched the incarnation hold stable for the full threshold
+    UncleanUnsafe,     /// the operator's explicit `cas_unsafe_remount_no_delay` authorization carried the slot's exact token
 };
 
 /// Startup decision for the mount lease (`gc/server-roots/<srid>/mount`), run AFTER the owner gate
@@ -205,7 +207,8 @@ enum class MountPriorState
 ///       - `gc_fenced` → terminal for THIS (uuid, epoch) — a fence costs an epoch, so refreshing it
 ///         in place would reactivate a fenced incarnation → `FencedSelf` (no write);
 ///       - otherwise → refresh (`replace` to bump seq + fresh `expires_at_ms`) → `Claimed`;
-///   - same `server_uuid`, DIFFERENT `writer_epoch` → reclaimed ONLY on a certificate of death that
+///   - same `server_uuid`, DIFFERENT `writer_epoch` → reclaimed ONLY on a certificate of death, or the
+///     operator's explicit unsafe authorization, that
 ///     needs no fresh wall-clock trust (see
 ///     `claimMountAwaitingExpiry` below for how a plain "looks expired" reading is turned into one):
 ///       - `gc_fenced` (the GC leader already, itself, threshold-gated this incarnation dead; a fence
@@ -215,6 +218,9 @@ enum class MountPriorState
 ///       - `proven_dead_incarnation` matches the CURRENTLY OBSERVED incarnation (the caller itself
 ///         watched that exact incarnation hold stable for the full observation threshold) → reclaim, `prior =
 ///         UncleanObserved`;
+///       - `unsafe_reclaim_authorization` matches the CURRENTLY OBSERVED incarnation (the operator's
+///         explicit `cas_unsafe_remount_no_delay` authorization, carrying the exact token read, with NO
+///         observation at all) → reclaim, `prior = UncleanUnsafe`;
 ///       - none of the above → `LiveDoubleStart` (do NOT write). In particular `expires_at_ms <=
 ///         now_ms` ALONE is never sufficient — comparing a predecessor's stamp against OUR wall clock
 ///         is unsafe because a clock-skewed or merely late-observing
@@ -241,7 +247,8 @@ struct MountClaimResult
     /// message may name a holder, and the lease this server merely PROPOSED is not one. An optional
     /// rather than the proposal, because a caller cannot check a convention it cannot see.
     std::optional<MountLease> body;
-    /// Which certificate of death justified a same-uuid, different-epoch `Claimed` reclaim (`None` for
+    /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
+    /// same-uuid, different-epoch `Claimed` reclaim (`None` for
     /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).
     MountPriorState prior = MountPriorState::None;
     /// The incarnation of the body this result observed, for
@@ -271,10 +278,14 @@ public:
 /// CURRENTLY observed incarnation is the ONLY way (besides `gc_fenced` / the clean marker) a
 /// same-uuid different-epoch lease is ever reclaimed. Absent (`{}`, the default) for a bare claim
 /// attempt with no such proof.
+/// `unsafe_reclaim_authorization`: the exact token the operator's `cas_unsafe_remount_no_delay` read
+/// off a same-uuid, different-epoch slot before authorizing this reclaim, with no observation at all.
+/// Never reused from `proven_dead_incarnation`: that one says the token was OBSERVED dead, this one
+/// says the operator accepted the risk. Absent (`{}`, the default) when the knob is off.
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation = {},
-    const CasEventSink & sink = {});
+    const CasEventSink & sink = {}, const std::optional<Etag> & unsafe_reclaim_authorization = {});
 
 /// Format the operator-actionable startup error shown when the mount lease is held by a genuinely
 /// live second server (the same `server_root_id` is mounted twice). Produced only AFTER this server
@@ -308,11 +319,21 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 /// tests drive fake clocks with no real sleeping. `on_wait_start` (default no-op) fires once per
 /// observation-window start (including restarts), with the currently-observed lease and the
 /// threshold, for an operator-visible startup log.
-/// All callers use this shared formula so a future adjustment cannot silently leave the startup
-/// observation path and either GC heartbeat path with different thresholds. `cadence_ms` is the
-/// caller's own poll or heartbeat interval; the additional interval accounts for observation
-/// discreteness, while `ttl_ms / 20` allows for a five-percent clock-rate difference.
+/// All callers share this one formula, not duplicated arithmetic, so a future fix or an added term
+/// applies everywhere at once -- but the callers deliberately pass DIFFERENT `cadence_ms` values, so
+/// the resulting thresholds are close, not identical: the startup reopen wait below passes half the
+/// renewal period (`max(1, floor(mount_renew_period_ms / 2))`), while GC's heartbeat fence-out
+/// (`Gc/CasGc.cpp`) passes the full renewal period. `cadence_ms` is the caller's own poll or
+/// heartbeat interval; the additional interval accounts for observation discreteness, while
+/// `ttl_ms / 20` allows for a five-percent clock-rate difference.
 uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms);
+
+/// Bounded number of observation restarts `claimMountAwaitingExpiry` allows before giving up on a
+/// same-uuid slot whose write-token keeps changing (see the function comment above): each restart
+/// means the token changed DURING the observation window, i.e. something is actively renewing it.
+/// Exposed here (rather than kept file-local in the `.cpp`) so tests can size a fixture's poll count
+/// against the exact bound the engine enforces.
+constexpr size_t kMaxObservationRestarts = 3;
 
 MountClaimResult claimMountAwaitingExpiry(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,

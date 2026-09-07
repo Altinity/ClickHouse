@@ -1799,6 +1799,127 @@ TEST(CASPoolRemount, RemountArmAnchorsAtClaimAttemptNotResponseTime)
            "response-time reading taken after renewerStart/quiesceRefTablesForRemount";
 }
 
+/// ==== self-remount vs. a live successor carrying the same uuid under the unsafe-reclaim knob ====
+///
+/// `cas_unsafe_remount_no_delay` is consulted at exactly one site: the writable `Pool::open` claim.
+/// `Pool::tryRemountOnce` (self-remount after a fence loss) does NOT consult it -- an incarnation
+/// superseded by a duplicate-uuid process must still OBSERVE the slot's write-token before it may
+/// reclaim, or two processes sharing a uuid (a copied uuid file, a stalled predecessor restarted under
+/// the knob) would alternate authority indefinitely.
+
+TEST(CASMountRemount, SupersededIncarnationDoesNotReclaimALiveSuccessor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    uint64_t boot_a = 0;
+    uint64_t boot_b = 0;
+    /// Mirrors `UncleanOpenPaysOnlyTheObservationWindow`'s tiny budget: the 1s lease TTL below is far
+    /// under the default `cas_request_budget`, so it must be scaled down to fit the required-timeout
+    /// inequality (attempt_timeout + safety_margin < lease TTL).
+    const CasRequestBudget tiny_budget{
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
+    auto config_for = [&](uint64_t * boot, bool unsafe)
+    {
+        return PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_renew_period = std::chrono::milliseconds(200),
+            .unsafe_remount_no_delay = unsafe,
+            .cas_request_budget = tiny_budget,
+            .boot_ms_fn = [boot] { return *boot; },
+            .wait_sleep_fn = [boot](uint64_t ms) { *boot += ms; },
+        };
+    };
+
+    PoolPtr pool_a = Pool::open(backend, config_for(&boot_a, /*unsafe=*/false));
+    ASSERT_TRUE(pool_a);
+    /// B carries the SAME (server_root_id, server_id) as A -- a copied uuid file -- and opens over A's
+    /// still-live slot under the operator's unsafe knob, reclaiming it at once (no observation).
+    PoolPtr pool_b = Pool::open(backend, config_for(&boot_b, /*unsafe=*/true));
+    ASSERT_TRUE(pool_b);
+    EXPECT_NE(pool_a->liveWriterEpoch(), pool_b->liveWriterEpoch())
+        << "the unsafe reclaim must have minted B a fresh epoch over A's slot";
+
+    /// A's next renewal meets the token guard: same uuid, a newer epoch now sits on the slot. Pin the
+    /// terminal classification directly (the "superseded" branch of `throwRenewConflict`, the one
+    /// that maps to `MountRenewOutcome::Terminal`) rather than accepting any exception -- no accessor
+    /// exposes the renewer's outcome/state today, so the error code and the classification's own
+    /// wording are what distinguish this from every other terminal reason (foreign owner, GC fence,
+    /// vanished slot, an unresolved write).
+    try
+    {
+        pool_a->renewWatermarkOnce();
+        FAIL() << "A's renewal must be refused once B's reclaim superseded its epoch";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+        EXPECT_NE(e.message().find("superseded by a newer incarnation"), std::string::npos)
+            << "actual message: " << e.message();
+    }
+    EXPECT_FALSE(pool_a->mayMutate()) << "the superseded classification must trip A's local write fence closed";
+
+    /// A's self-remount now observes the slot's write-token. Drive B's renewal from INSIDE every one
+    /// of A's observation polls, so the token never stabilizes across the whole bounded observation --
+    /// the knob is not consulted by `tryRemountOnce` (only by `Pool::open`), so nothing else could let
+    /// A reclaim a slot a live successor keeps renewing. This cannot deadlock: A and B are distinct
+    /// `Pool` objects, so B's `renewWatermarkOnce` takes none of A's locks (each `Pool` owns its own
+    /// `remount_mutex`), and the wait fires between `claimMountAwaitingExpiry`'s polls -- with no
+    /// backend request of A's own in flight -- so B's call is the only one touching the shared
+    /// in-memory backend at that instant.
+    size_t polls = 0;
+    pool_a->setWaitSleepForTest([&](uint64_t ms)
+    {
+        boot_a += ms;
+        ++polls;
+        boot_b += ms;
+        EXPECT_NO_THROW(pool_b->renewWatermarkOnce());
+    });
+    EXPECT_FALSE(pool_a->tryRemountOnce())
+        << "a superseded incarnation must never reclaim a live successor's slot";
+    /// Bounded, not merely nonzero: B renews on every poll, so the observed token changes every
+    /// iteration and the FIRST (non-restart) observation start plus `kMaxObservationRestarts` further
+    /// restarts is exactly the number of polls before `claimMountAwaitingExpiry` gives up -- one
+    /// `sleep_ms_fn` call per iteration that does not itself exceed the bound, and none on the
+    /// terminal iteration that does. A widened or removed restart bound would make this hang instead
+    /// of failing, so pin the exact count rather than only asserting it ran.
+    EXPECT_EQ(polls, DB::Cas::kMaxObservationRestarts + 1)
+        << "the observation must give up after exactly kMaxObservationRestarts restarts, not wait "
+           "indefinitely for a live twin to go quiet";
+
+    const MountLease final_lease = decodeMountLease(readObj(*backend, pool_a->layout().mountKey("test"))->bytes);
+    EXPECT_EQ(final_lease.writer_epoch, pool_b->liveWriterEpoch())
+        << "the mount slot must still belong to B's incarnation -- A never reclaimed it";
+}
+
+/// Cutoff-only fencing: with no renewals and no competing incarnation at all, crossing the armed
+/// deadline on the local BOOTTIME clock alone must fence a mount closed -- the mechanism
+/// `SupersededIncarnationDoesNotReclaimALiveSuccessor` above relies on is not special-cased to a
+/// renewal conflict; the plain boot-clock cutoff fences unconditionally.
+TEST(CASMountRemount, CutoffFencesWithoutRenewals)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    uint64_t boot = 0;
+    const CasRequestBudget tiny_budget{
+        .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
+    PoolPtr store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+        .mount_renew_period = std::chrono::milliseconds(200),
+        .cas_request_budget = tiny_budget,
+        .boot_ms_fn = [&] { return boot; },
+        .wait_sleep_fn = [&](uint64_t ms) { boot += ms; },
+    });
+    ASSERT_TRUE(store);
+    EXPECT_TRUE(store->mayMutate()) << "freshly armed at open, well within the ttl";
+
+    /// No renewals at all -- advance the boot clock past the armed deadline (open's claim anchor plus
+    /// the lease ttl) on this incarnation's own clock alone.
+    boot += 1001;
+    EXPECT_FALSE(store->mayMutate())
+        << "crossing the armed deadline must fence closed on the boot clock alone, with no renewal "
+           "conflict needed to trip it";
+}
+
 /// ==== rev.6 Task 5: clean-release drain gates the farewell marker ====
 
 namespace
@@ -2334,18 +2455,68 @@ TEST(CASMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
         }));
     ASSERT_TRUE(store);
 
-    /// The token-stability observation window (>= the 500ms ttl) is paid, because this predecessor's
-    /// death was never certified -- only observed.
+    /// The token-stability observation window is paid in full, pinned to the exact configured
+    /// formula (`mountObservationThresholdMs`): threshold_ms = ttl_ms + ttl_ms/20 + poll_interval_ms
+    /// = 500 + 25 + 50 = 575 ms, where poll_interval_ms = max(1, mount_renew_period/2) = 50 ms. The
+    /// loop only re-checks the threshold between polls, so the observed wait rounds UP to the next
+    /// whole poll: ceil(575 / 50) * 50 = 600 ms, i.e. exactly 12 polls of 50 ms each -- because this
+    /// predecessor's death was never certified, only observed.
     uint64_t total = 0;
     for (uint64_t w : waits)
         total += w;
-    EXPECT_GE(total, 500u) << "the observation window must have been paid";
-    /// And NOTHING is paid on top of it. Every recorded wait is a poll of that window, bounded by the
-    /// lease TTL; a wait longer than the whole window can only be a reintroduced grace period.
+    EXPECT_EQ(total, 600u) << "the observation window must be paid in full, poll-rounded to the "
+                              "configured threshold -- neither less (a shortened wait) nor more "
+                              "(a reintroduced grace period)";
+    /// And every one of those polls is exactly one poll interval -- no wait beyond the observation
+    /// poll (the straggler it used to wait out is fenced by the recovery seal instead).
     for (uint64_t w : waits)
-        EXPECT_LE(w, 500u)
+        EXPECT_EQ(w, 50u)
             << "an unclean reclaim must not block on any wait beyond the observation poll -- the "
                "straggler it used to wait out is fenced by the recovery seal instead";
+}
+
+TEST(CASMountOpenWaits, UnsafeNoDelayOpensWithoutTheObservationWindow)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l{"p"};
+    DB::Cas::tests::seedPoolMetaForRestart(*b);
+    /// Same predecessor shape as UncleanOpenPaysOnlyTheObservationWindow above: a bare `claimMount`
+    /// plants the lease directly, with no clean-farewell marker and no `gc_fenced`, so this slot has no
+    /// certificate of death -- only `cas_unsafe_remount_no_delay` below will let the successor skip
+    /// observing it.
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(b), l, "test", UInt128(1), 7, 1000, 500).kind, MountClaimResult::Claimed);
+    /// A real predecessor at epoch 7 durably minted this first; seed it here too, or the successor's
+    /// own `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
+    createObj(*b, l.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+    std::vector<CasEvent> events;
+    uint64_t fake_boot = 0;
+    std::vector<uint64_t> waits;
+    PoolPtr store;
+    /// Same server_id (uuid) as the seeded predecessor and a different epoch -- exactly the shape
+    /// `unsafe_remount_no_delay` is for. Unlike the neighbour test, no wait is expected: the bare
+    /// `claimMount` reclaims at once under the operator's authorization.
+    ASSERT_NO_THROW(store = Pool::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+        .event_sink = [&](CasEvent e) { events.push_back(std::move(e)); },
+        .mount_lease_ttl_ms = std::chrono::milliseconds(500), .mount_renew_period = std::chrono::milliseconds(100),
+        .unsafe_remount_no_delay = true,
+        .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt},
+        .boot_ms_fn = [&] { return fake_boot; },
+        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+    }));
+    ASSERT_TRUE(store);
+    EXPECT_TRUE(waits.empty()) << "no observation window under the unsafe setting";
+    /// `Pool` has no test accessor for the adopted `MountPriorState`, so the `UncleanUnsafe`
+    /// classification is asserted through the mount audit event instead: `claimMount`'s unsafe-reclaim
+    /// branch (`CasServerRoot.cpp`) emits exactly one `MountClaim`/"reclaim" event whose reason names
+    /// the setting, and `CASMountClaim.UnsafeAuthorizationIsTokenExact` already pins the classification
+    /// itself at the `claimMount` level.
+    const auto reclaim_event = std::ranges::find_if(events,
+        [](const CasEvent & e) { return e.reason.find("cas_unsafe_remount_no_delay") != String::npos; });
+    ASSERT_NE(reclaim_event, events.end());
+    EXPECT_EQ(reclaim_event->type, CasEventType::MountClaim);
+    EXPECT_EQ(reclaim_event->outcome, "reclaim");
+    EXPECT_EQ(decodeMountLease((*DB::Cas::tests::OperationForTest(b)).read(l.mountKey("test"), Retry::standard())->bytes).writer_epoch, 8u);
 }
 
 TEST(CASMountOpenWaits, CleanOpenSkipsAllWaits)

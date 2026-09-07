@@ -699,10 +699,32 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         if (policy == MountClaimPolicy::WaitForExpiry)
         {
             CasOperation claim_op = store->gc_requests.admit();
-            claim = claimMountAwaitingExpiry(
-                claim_op, store->pool_layout, srid, our_uuid, writer_epoch,
-                [&now_ms]() { return now_ms(); }, [raw] { return raw->bootMsNow(); },
-                ttl_ms, poll_interval_ms, sleep_ms, on_wait_start, emit_mount_event);
+            const bool unsafe = store->config.unsafe_remount_no_delay;
+            if (unsafe)
+            {
+                /// One bare attempt first: a slot held by OUR uuid under another epoch is reclaimed at
+                /// once under the operator's authorization, carrying the exact token this read saw so a
+                /// slot that moves in between is refused. Every outcome but a claim (an absent slot
+                /// freshly minted, or a same-epoch refresh) falls through to the ordinary observed path
+                /// below.
+                claim = claimMount(claim_op, store->pool_layout, srid, our_uuid, writer_epoch, now_ms(), ttl_ms,
+                                   /*proven_dead_incarnation=*/{}, emit_mount_event);
+                if (claim.kind == MountClaimResult::LiveDoubleStart && claim.etag
+                    && claim.body && claim.body->server_uuid == our_uuid)
+                    claim = claimMount(claim_op, store->pool_layout, srid, our_uuid, writer_epoch, now_ms(), ttl_ms,
+                                       {}, emit_mount_event, /*unsafe_reclaim_authorization=*/claim.etag);
+            }
+            /// A `FencedSelf`, a foreign-uuid `LiveDoubleStart`/`ForeignOwner`, or a raced
+            /// `LiveDoubleStart` the authorization above did not cover falls through here and re-runs
+            /// the bare `claimMount` a second time inside `claimMountAwaitingExpiry`'s own loop; under
+            /// the knob that means the same conflict is recorded twice in the mount audit stream for
+            /// one open. The outcome this open ends in is unaffected -- only the audit stream gains a
+            /// duplicate row, and only when the knob is set.
+            if (!unsafe || claim.kind != MountClaimResult::Claimed)
+                claim = claimMountAwaitingExpiry(
+                    claim_op, store->pool_layout, srid, our_uuid, writer_epoch,
+                    [&now_ms]() { return now_ms(); }, [raw] { return raw->bootMsNow(); },
+                    ttl_ms, poll_interval_ms, sleep_ms, on_wait_start, emit_mount_event);
         }
         else
         {
@@ -778,9 +800,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     }
 
     /// A reclaim over a predecessor whose death was NOT proven clean may still have a conditional PUT
-    /// from that predecessor in flight -- `Fenced` and `UncleanObserved` are exactly the two
-    /// `MountPriorState`s with no such proof (`Clean`, drained farewell, and `None`, a fresh mount /
-    /// same-epoch refresh with nothing to hand over, are the proven ones).
+    /// from that predecessor in flight -- `Fenced`, `UncleanObserved`, and `UncleanUnsafe` are exactly
+    /// the three `MountPriorState`s with no such proof (`UncleanUnsafe` has no proof at all, not merely
+    /// no proof of a CLEAN death: it is the operator's explicit `cas_unsafe_remount_no_delay`
+    /// acceptance of that risk, with no observation behind it). `Clean`, drained farewell, and `None`, a
+    /// fresh mount / same-epoch refresh with nothing to hand over, are the proven ones.
     /// An EXHAUSTIVE switch, not a positive allowlist -- a future `MountPriorState`
     /// enumerator with no proof of clean death must fail the BUILD (a missing `-Wswitch` case), never
     /// silently fall through to "clean".
@@ -802,6 +826,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             break;
         case MountPriorState::Fenced:
         case MountPriorState::UncleanObserved:
+        case MountPriorState::UncleanUnsafe:
             unclean_reclaim = true;
             break;
     }
@@ -810,7 +835,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         LOG_INFO(getLogger("CasPool"),
             "Content-addressed mount {} follows a predecessor whose death was not proven clean "
             "(writer_epoch {}). Opening without a grace period: a still-in-flight conditional PUT from "
-            "that predecessor is fenced by the recovery seal, whenever it arrives.", srid, writer_epoch);
+            "that predecessor is fenced by the recovery seal, whenever it arrives.{}", srid, writer_epoch,
+            claimed_prior == MountPriorState::UncleanUnsafe
+                ? " (reclaimed without observation under cas_unsafe_remount_no_delay)"
+                : "");
     }
 
     /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline at the claim
@@ -1413,7 +1441,11 @@ bool Pool::tryRemountOnce()
         /// unlike the initial `open`, every event fired below reaches the real sink immediately.
         const auto emit_mount_event = [this](CasEvent e) { emitEvent(std::move(e)); };
 
-        const auto sleep_ms = [](uint64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        /// Routes through `mount_runtime.waitSleep` (which itself routes through `config.wait_sleep_fn`
+        /// when a test injected one) rather than a bare `sleep_for` directly, so a test intercepting
+        /// `wait_sleep_fn` observes every wait a self-remount can block on, exactly like `Pool::open`'s
+        /// own observation poll above.
+        const auto sleep_ms = [this](uint64_t ms) { mount_runtime.waitSleep(ms); };
         step = "mount_claim";
         CasOperation claim_op = gc_requests.admit();
         const MountClaimResult claim = claimMountAwaitingExpiry(

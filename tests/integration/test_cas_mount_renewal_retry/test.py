@@ -238,8 +238,13 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     )
 
     def recovered_snapshot():
-        mount = _mount_snapshot(node)
+        # Read the counter before the mount row: `CASMountRenewalRecovered` is incremented as soon as
+        # the renewal decides its outcome, strictly before the mount row's `renewal_sequence` (and the
+        # matching cas_log row) is updated to the new sequence. With the shortened renewal period a
+        # background (fault-free) renewal can land between the two reads; reading counters first makes
+        # the subsequent mount read very unlikely to still observe the pre-recovery sequence.
         counters = _profile_events(node)
+        mount = _mount_snapshot(node)
         if (
             mount["sequence"] > mount_before["sequence"]
             and counters["CASMountRenewalRecovered"]
@@ -254,19 +259,23 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     body_after, token_after = _read_mount_object()
     mount_body = _decode_mount(body_after)
     delta = _event_delta(counters_before, counters_after)
-    sequence = mount_after["sequence"]
     # The engine paces the reissues inside one renewal; what the log records is the renewal's
-    # outcome, and the attempt count on that row is what says a retry happened.
+    # outcome, and the attempt count on that row is what says a retry happened. Look the row up by
+    # outcome rather than by a snapshot-derived sequence (see _renewal_log_rows): with the shortened
+    # renewal period, background renewals can advance `system.cas_mounts` past the exact sequence this
+    # recovery landed on before either of these two reads gets to it.
     rows = _wait_until(
         lambda: (
             found
             if any(row[0] == "recovered" for row in found)
             else None
         )
-        if (found := _renewal_log_rows(node, since, sequence))
+        if (found := _renewal_log_rows(node, since))
         else None,
         timeout=20,
     )
+    recovered = next(row for row in rows if row[0] == "recovered")
+    sequence = int(recovered[1])
 
     assert delta["CASMountRenewalAttempts"] > 1, delta
     assert delta["CASMountRenewalRetries"] > 0, delta
@@ -278,14 +287,14 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     assert mount_after["state"] == "live", mount_after
     assert mount_after["lifecycle"] == "live", mount_after
     assert mount_after["gc_fenced"] == 0, mount_after
-    assert int(mount_body["seq"]) == sequence
+    # >= rather than == : body_after may reflect a later, unrelated background renewal that landed
+    # after the one this test is verifying.
+    assert int(mount_body["seq"]) >= sequence
     assert token_after != token_before
     assert stats["faults"] == 1, stats
     assert stats["by_mode"].get("503") == 1, stats
     print("targeted request count (transient renewal): {}".format(stats["faults"]), flush=True)
 
-    recovered = next(row for row in rows if row[0] == "recovered")
-    assert recovered[1] == str(sequence), rows
     assert int(recovered[3]) > 1, rows
     assert recovered[4] == "committed_after_retry", rows
 
@@ -318,9 +327,32 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
         },
     )
 
+    # The proxy records the dropped-after-forward request (and the upstream_etag the real PUT landed
+    # under) as soon as it happens -- the physical write itself already reached the object store; only
+    # the response back to ClickHouse was dropped. That is well before ClickHouse's own request notices
+    # the lost response and resolves it by re-reading. With the renewal period this short, a plain
+    # "read the object once resolution is confirmed" can just as easily observe a LATER, unrelated
+    # background renewal that started immediately after this one resolved (see the mount_before/after
+    # sequence race this replaced). Wait for the proxy's own record first, then poll the object for
+    # its exact upstream_etag, so body_after is unambiguously the write this test is about.
+    def dropped_record():
+        found_stats = _control(control_url, "/stats")
+        found_records = found_stats["drop_after_forward"]
+        return (found_stats, found_records[0]) if len(found_records) == 1 else None
+
+    stats, record = _wait_until(dropped_record)
+    target_etag = record["upstream_etag"].strip('"')
+
+    def matching_object():
+        body, token = _read_mount_object()
+        return (body, token) if token == target_etag else None
+
+    body_after, token_after = _wait_until(matching_object)
+    mount_body = _decode_mount(body_after)
+
     def resolved_snapshot():
-        mount = _mount_snapshot(node)
         counters = _profile_events(node)
+        mount = _mount_snapshot(node)
         if (
             mount["sequence"] > mount_before["sequence"]
             and counters["CASMountRenewalResolved"]
@@ -333,37 +365,40 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
 
     mount_after, counters_after = _wait_until(resolved_snapshot)
     _control(control_url, "/config", {"rate": 0.0})
-    stats = _control(control_url, "/stats")
-    body_after, token_after = _read_mount_object()
-    mount_body = _decode_mount(body_after)
     delta = _event_delta(counters_before, counters_after)
-    sequence = mount_after["sequence"]
+    # Look the recovered row up by outcome/classification rather than by a snapshot-derived sequence
+    # (see _renewal_log_rows): background renewals can advance `system.cas_mounts` past the exact
+    # sequence this recovery landed on before either of these reads gets to it.
     rows = _wait_until(
         lambda: (
             found
             if any(row[0] == "recovered" and row[4] == "committed_by_read" for row in found)
             else None
         )
-        if (found := _renewal_log_rows(node, since, sequence))
+        if (found := _renewal_log_rows(node, since))
         else None,
         timeout=20,
     )
+    recovered = next(row for row in rows if row[0] == "recovered" and row[4] == "committed_by_read")
+    sequence = int(recovered[1])
 
-    records = stats["drop_after_forward"]
     assert stats["faults"] == 1, stats
     assert stats["by_mode"].get("drop_after_forward") == 1, stats
-    assert len(records) == 1, records
-    record = records[0]
     assert record["method"] == "PUT", record
     assert record["path"].split("?", 1)[0] == MOUNT_REQUEST_PATH, record
     assert 200 <= record["upstream_status"] < 300, record
     assert record["request_body_sha256"] == hashlib.sha256(body_after).hexdigest(), record
-    assert record["upstream_etag"].strip('"') == token_after, record
     assert body_after != body_before
     assert token_after != token_before
-    assert int(mount_body["seq"]) == sequence
+    # >= rather than == : a later, unrelated background renewal may have advanced the mount object
+    # again between the capture above and this read of the confirmed sequence from the log.
+    assert int(mount_body["seq"]) >= sequence
 
-    assert delta["CASMountRenewalAttempts"] == 1, delta
+    # >= rather than == : with the shortened renewal period, an unrelated fault-free background
+    # renewal can complete (and count its own single attempt) right before or after this one, in the
+    # gap between configuring the fault and observing this specific renewal's resolution. Resolved and
+    # Recovered stay exact -- only a lost-response renewal like this one increments them.
+    assert delta["CASMountRenewalAttempts"] >= 1, delta
     assert delta["CASMountRenewalRetries"] == 0, delta
     assert delta["CASMountRenewalResolved"] == 1, delta
     assert delta["CASMountRenewalRecovered"] == 1, delta
@@ -375,8 +410,6 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     assert mount_after["lifecycle"] == "live", mount_after
     assert mount_after["gc_fenced"] == 0, mount_after
 
-    recovered = next(row for row in rows if row[0] == "recovered")
-    assert recovered[1] == str(sequence), rows
     assert recovered[2] and mount_body["write_attempt_id"].startswith(recovered[2]), rows
     assert recovered[3] == "1", rows
     assert recovered[4] == "committed_by_read", rows

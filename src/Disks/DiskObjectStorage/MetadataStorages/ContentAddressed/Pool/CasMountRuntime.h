@@ -111,10 +111,12 @@ struct MountConfig
 };
 
 /// Local, in-memory write fence. It is deliberately not checked by reading the object store for every
-/// write: the `MountLeaseRenewer` is the sole lease reader/renewer. A successful renewal translates the
-/// durable `expires_at_ms` into `deadline_boot_ms`; a foreign owner, newer `writer_epoch`, or failed
-/// renewal latches `lost`. Mutable operations are allowed only while the latch is clear and the local
-/// deadline has not passed. The `writer_epoch` is the durable fencing token.
+/// write: the `MountLeaseRenewer` is the sole lease reader/renewer. A successful renewal computes
+/// `deadline_boot_ms` from its own confirmed request's pre-I/O `CLOCK_BOOTTIME` anchor plus the lease
+/// TTL, never from the durable `expires_at_ms` stamp, which is a writer-stamped diagnostic only; a
+/// foreign owner, newer `writer_epoch`, or failed renewal latches `lost`. Mutable operations are
+/// allowed only while the latch is clear and the local deadline has not passed. The `writer_epoch` is
+/// the durable fencing token.
 ///
 /// The fence uses `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`: monotonic time does not advance while a VM is
 /// suspended, so a resumed sleeper would compute the same "not yet expired" verdict it had before the nap
@@ -389,6 +391,13 @@ public:
     /// Sleep through the injected test hook when present; otherwise use the production thread sleep.
     /// `Pool` claim observation and materialization grace waits share this seam so tests control both.
     void waitSleep(uint64_t ms) const;
+    /// Swap the wait hook after construction -- a test that must change what a wait DOES partway
+    /// through a scenario (e.g. driving a second incarnation's renewal from inside the observed
+    /// incarnation's own poll) cannot express that through `PoolConfig::wait_sleep_fn` alone, since
+    /// that value is fixed at open time. Unsynchronized against `waitSleep`'s `const` read of the same
+    /// field: safe only called from the test's own thread before any worker is running (no persistent
+    /// renewal/remount worker reads `config.wait_sleep_fn` concurrently with this write).
+    void setWaitSleepForTest(std::function<void(uint64_t)> fn) { config.wait_sleep_fn = std::move(fn); }
 
     /// Forward renewer events to the injected sink. The sink is held by reference so it observes the
     /// owning pool's current event routing for the runtime's entire lifetime.

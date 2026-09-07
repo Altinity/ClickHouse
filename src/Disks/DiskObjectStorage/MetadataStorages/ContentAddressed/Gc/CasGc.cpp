@@ -465,8 +465,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// rounds via `new_round`, not on heartbeat acks). Fencing no longer trusts a predecessor's stamped
     /// `expires_at_ms` against our wall clock — it
     /// fences ONLY once `mount_obs` has watched the mount's write-token hold unchanged for the full
-    /// threshold on THIS leader's own monotonic clock (mirrors `claimMountAwaitingExpiry`'s identical
-    /// `TTL + Drift` threshold for a mount's own reopen).
+    /// threshold on THIS leader's own monotonic clock (shares `claimMountAwaitingExpiry`'s
+    /// `TTL + Drift` formula for a mount's own reopen wait, but with the full renewal period as the
+    /// cadence term below instead of half of it, so the two thresholds are close, not identical).
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
     /// The formula is shared with `claimMountAwaitingExpiry` via
     /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).

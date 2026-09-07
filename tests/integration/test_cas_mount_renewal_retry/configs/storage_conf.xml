@@ -19,6 +19,15 @@
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
                 <cas_gc_enabled>false</cas_gc_enabled>
+                <!-- Shortened so a hard-restart test observes the token-stability wait within a
+                     bounded test timeout: TTL 1000ms, renew period 200ms, attempt timeout 50ms, safety
+                     margin 50ms. The frozen attempt-timeout cap is min(connect_timeout_ms=1000, 50) = 50,
+                     so the retry envelope (attempt + 2 * cap = 150) stays well under the shortened TTL:
+                     150 + 50 < 1000 and 200 + 300 + 50 < 1000. -->
+                <cas_mount_lease_ttl_ms>1000</cas_mount_lease_ttl_ms>
+                <cas_mount_renew_period_ms>200</cas_mount_renew_period_ms>
+                <cas_attempt_timeout_ms>50</cas_attempt_timeout_ms>
+                <cas_lease_safety_margin_ms>50</cas_lease_safety_margin_ms>
             </disk_cas_renewal>
         </disks>
         <policies>

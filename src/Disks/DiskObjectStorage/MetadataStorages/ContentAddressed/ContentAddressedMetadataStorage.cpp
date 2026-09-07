@@ -79,6 +79,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_round_outcome_entry_budget;
     extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
     extern const ContentAddressedSettingsUInt64 mount_renew_period_ms;
+    extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
@@ -302,6 +303,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_round_outcome_entry_budget(settings_[ContentAddressedSetting::gc_round_outcome_entry_budget].value)
     , mount_lease_ttl(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_lease_ttl_ms].value))
     , mount_renew_period(std::chrono::milliseconds(settings_[ContentAddressedSetting::mount_renew_period_ms].value))
+    , cas_unsafe_remount_no_delay(settings_[ContentAddressedSetting::unsafe_remount_no_delay].value)
     , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
     , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
@@ -807,6 +809,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.cas_request_budget.connect_timeout_cap_ms = freezeConnectTimeoutCapMs(object_storage, cas_attempt_timeout_ms);
     pool_config.mount_lease_ttl_ms = mount_lease_ttl;
     pool_config.mount_renew_period = mount_renew_period;
+    pool_config.unsafe_remount_no_delay = cas_unsafe_remount_no_delay;
     pool_config.event_sink = makeCasEventSink();
 
     /// Built here rather than above so it carries the budget the pool was configured with. Only a

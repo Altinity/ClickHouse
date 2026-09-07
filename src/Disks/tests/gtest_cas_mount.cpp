@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
@@ -14,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace DB::ErrorCodes
 {
@@ -890,11 +892,13 @@ TEST(CASMountMessage, DoubleStartTextHasIdentityAndRemediation)
     EXPECT_NE(msg.find("unique"), std::string::npos);
     EXPECT_NE(msg.find("reclaim the mount on restart"), std::string::npos);
     EXPECT_NE(msg.find("uuid file"), std::string::npos);
-    /// Clock-skew caveat + manual mount-object delete escape hatch.
-    EXPECT_NE(msg.find("CLOCK SKEW"), std::string::npos);
-    EXPECT_NE(msg.find("NTP"), std::string::npos);
+    /// Token-stability liveness statement (replaces the old wall-clock CLOCK SKEW caveat) + manual
+    /// mount-object delete escape hatch + the unsafe-knob escape hatch.
+    EXPECT_NE(msg.find("own clock"), std::string::npos);
+    EXPECT_NE(msg.find("diagnostic"), std::string::npos);
     EXPECT_NE(msg.find("manually delete the mount"), std::string::npos);
     EXPECT_NE(msg.find("gc/server-roots/replica-a/mount"), std::string::npos);
+    EXPECT_NE(msg.find("cas_unsafe_remount_no_delay"), std::string::npos);
 }
 
 /// rev.6: a stamped `expires_at_ms` that already looks past-due on our wall clock must NOT shortcut
@@ -1092,6 +1096,46 @@ TEST(CASMountAwaitExpiry, SkewedFarFutureExpiryHasNoEffectOnObservationThreshold
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
     EXPECT_LE(mono, 100u + 100u / 20 + 20u + 20u);      // bounded by OUR threshold, not the predecessor's stamp
     EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 8u);   // reclaimed
+}
+
+TEST(CASMountClaim, UnsafeAuthorizationIsTokenExact)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 30000).kind, MountClaimResult::Claimed);
+    const Etag stale = ops.op.read(l.mountKey("r"), Retry::standard())->etag;
+
+    /// `Etag` equality compares (key, value), and it is minted only through the request planes -- there
+    /// is no cross-key comparison to exercise here. Build the stale token by refreshing the SAME slot a
+    /// second time (same uuid, same epoch): `stale`, read before this refresh, is then a genuinely stale
+    /// token for the slot's CURRENT value, without touching an unrelated key.
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 30000).kind, MountClaimResult::Claimed);
+    const Etag current = ops.op.read(l.mountKey("r"), Retry::standard())->etag;
+
+    /// A stale token is refused: nothing authorizes a reclaim over a slot that moved.
+    const MountClaimResult refused = claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 30000, /*proven_dead=*/{},
+                                                /*sink=*/{}, /*unsafe_reclaim_authorization=*/stale);
+    EXPECT_EQ(refused.kind, MountClaimResult::LiveDoubleStart);
+
+    /// A foreign uuid is refused before the authorization is consulted.
+    const MountClaimResult foreign = claimMount(ops.op, l, "r", UInt128(2), 8, 1000, 30000, {}, {}, current);
+    EXPECT_EQ(foreign.kind, MountClaimResult::ForeignOwner);
+
+    /// The exact token reclaims, with the prior state and the audit reason naming the setting.
+    std::vector<CasEvent> events;
+    const MountClaimResult reclaimed = claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 30000, {},
+                                                  [&](CasEvent e) { events.push_back(std::move(e)); }, current);
+    ASSERT_EQ(reclaimed.kind, MountClaimResult::Claimed);
+    EXPECT_EQ(reclaimed.prior, MountPriorState::UncleanUnsafe);
+    ASSERT_FALSE(events.empty());
+    EXPECT_THAT(events.back().reason, testing::HasSubstr("cas_unsafe_remount_no_delay"));
+    /// Pin the fields `system.cas_log` consumers actually key on, not just the free-form reason: the
+    /// unsafe reclaim shares the same event type and outcome as every other reclaim (`emitMountEvent`'s
+    /// "reclaim" branch argument), so nothing about this path is a separate, unaudited channel.
+    EXPECT_EQ(events.back().type, CasEventType::MountClaim);
+    EXPECT_EQ(events.back().outcome, "reclaim");
+    EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 8u);
 }
 
 TEST(CASMountLease, RenewerStartAdoptsOurOwnClaimNotDoubleStart)

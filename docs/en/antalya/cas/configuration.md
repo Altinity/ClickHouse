@@ -105,7 +105,20 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_gc_read_concurrency` | `16` | Bounded pool size for the GC fold's read-ahead of checkpoints, ref logs, manifests and zero-candidate HEADs; `1` disables |
 | `cas_attempt_timeout_ms` | `5000` | Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write), at least 1. Together with the connect cap it forms the attempt envelope (`cas_attempt_timeout_ms + 2 × cap`; the cap is `cas_attempt_timeout_ms` itself when the disk's `connect_timeout_ms` is `0`, else `min(connect_timeout_ms, cas_attempt_timeout_ms)`) that the lease arithmetic reserves: one TCP connect and one TLS handshake under the cap each, send/receive bounded per socket operation by `cas_attempt_timeout_ms`. With background renewal the cadence check requires `cas_mount_renew_period_ms + 2 × envelope + cas_lease_safety_margin_ms < cas_mount_lease_ttl_ms`, which puts an effective ceiling on the frozen connect cap: under the defaults (TTL 30000, period 10000, margin 2000) the envelope must stay under 9000, so a disk `connect_timeout_ms` of 2000 ms or more refuses to open writable — lower the connect timeout or raise the TTL if you hit this |
 | `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: the attempt envelope + `cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, and `cas_mount_renew_period_ms` + 2 × envelope + `cas_lease_safety_margin_ms` too, or the disk refuses to open writable |
+| `cas_unsafe_remount_no_delay` | `0` | Reclaim a mount slot that carries this server's own uuid at once after a hard restart, without observing the slot's token for the lease TTL. Unsafe whenever two processes can hold the same `server_uuid` (a copied uuid file, a stalled predecessor). After such a reclaim the predecessor can still start conditional writes until its own cutoff (`confirmed deadline − cas_lease_safety_margin_ms − 2 × envelope`) or until its next renewal meets the token guard, and a request it already sent may still materialize later. That is not a data hazard: ref-log keys carry `(writer_epoch, sequence)` and creates are conditional, so two writers can never commit different bodies to one key, and recovery's epoch seal settles any straggler (recovery fails closed after 64 successive seal-create attempts displaced by newly materializing old-epoch transactions). The exposure is availability, not data. Intended for test stands and deployments that guarantee one process per uuid |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
+
+All servers sharing a pool must run the same `cas_mount_lease_ttl_ms` and `cas_mount_renew_period_ms`.
+Startup reclaim and GC's fence-out both judge liveness by the mount slot's write token holding stable
+on the observer's own `CLOCK_BOOTTIME`, using the observer's own threshold — nothing about a writer's
+timing travels on the wire. Startup observes `cas_mount_lease_ttl_ms + floor(cas_mount_lease_ttl_ms /
+20) + max(1, floor(cas_mount_renew_period_ms / 2))`; GC observes `cas_mount_lease_ttl_ms +
+floor(cas_mount_lease_ttl_ms / 20) + cas_mount_renew_period_ms`. A pool member or GC leader
+configured with a shorter threshold than its peers can therefore fence out a healthy peer whose
+token-update gap exceeds that shorter threshold — a peer renewing frequently stays live, one that
+missed a renewal does not. Change these values only with every member of the pool stopped: a
+graceful restart removes only that member's own startup observation and does not make mixed
+thresholds safe.
 
 A shorter TTL reduces the tolerance for object-storage delays; a shorter renewal period increases it
 (renewal starts earlier) at the cost of more background traffic. With the defaults,
@@ -115,6 +128,11 @@ where `envelope = cas_attempt_timeout_ms + 2 × cap` (7000 ms with defaults) and
 `cas_attempt_timeout_ms` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, cas_attempt_timeout_ms)` (1000 ms with defaults); the renewal then keeps
 retrying until `confirmed deadline − cas_lease_safety_margin_ms`.
+
+The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic used by
+`system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck; it never
+authorizes a reclaim or a GC fence-out. Local fencing is derived instead from the confirmed
+request's pre-I/O `CLOCK_BOOTTIME` anchor plus the TTL.
 
 ## Advanced GC pacing settings {#advanced-gc-pacing-settings}
 

@@ -891,6 +891,17 @@ TEST(CASGCAckFloor, PublishBeforeGraduationSpares)
     EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
 }
 
+namespace
+{
+
+/// Shared body for the fence-out timing invariant: opens a pool from `config`, then drives the exact
+/// two-round scenario described below. Parameterized only by `config` so the same scenario can be run
+/// against the default `PoolConfig` (`ExpiredMountFencedOutAndExcluded`) and against
+/// `unsafe_remount_no_delay = true` (`CASGcFenceOut.ThresholdUnchangedByUnsafeKnob`), proving the knob
+/// changes nothing about the fence-out threshold or its round count. `backend` and `events` are declared
+/// BEFORE the Pool inside this same function so they outlive the background syncer's emits (ASan
+/// 2026-07-09) -- the Pool must never outlive the function that opened it.
+///
 /// A dead mount is fenced out by the round's heartbeat step: gc_fenced is set on its body (a
 /// token-guarded rewrite that bumps seq). The fence is pure liveness (re-arms the write fence so a
 /// resumed sleeper can never mutate again); reclaim itself no longer depends on any mount's heartbeat —
@@ -901,14 +912,15 @@ TEST(CASGCAckFloor, PublishBeforeGraduationSpares)
 /// (`expires_at_ms`) against the GC's own clock — it fences ONLY once GC has watched a mount's write
 /// token hold unchanged for the full threshold on its OWN monotonic clock. That takes (at least) two
 /// `computeHeartbeatFloor` calls spanning the threshold, so this test drives the GC leader's own
-/// (persistent) `mono_ms_fn` across two rounds: round 1 seeds the observation for both mounts; the
-/// STORE's own mount is then renewed (as a live leader would) before round 2 crosses the threshold —
-/// srid2, never renewed again after its one-shot claim, is the one that gets fenced.
-TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
+/// (persistent) `mono_ms_fn` across three rounds: round 1 seeds the observation for both mounts; the
+/// STORE's own mount is then renewed (as a live leader would); round 2, one millisecond short of the
+/// threshold, discriminates the threshold's exact value (must NOT fence yet); round 3, exactly at the
+/// threshold, is where srid2 — never renewed again after its one-shot claim — gets fenced.
+void runExpiredMountFenceOutScenario(const PoolConfig & config)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     std::vector<CasEvent> events;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto store = openPoolForTest(backend);
+    auto store = Pool::open(backend, config);
     const Layout & layout = store->layout();
 
     // srid2's renewer claims ONE lease via `start` and is never renewed again — tests never enable
@@ -950,9 +962,19 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
 
     // The store's OWN mount renews between rounds (as a live leader would); srid2 never does.
     store->renewWatermarkOnce();
+    gc_mono = threshold_ms - 1;
+
+    // Round 2 (mono == threshold - 1): a discriminator for the threshold's EXACT value, not just its
+    // existence — one millisecond short of the full threshold, srid2's original token must NOT be fenced
+    // yet. Without this round, any knob-shortened positive threshold would also satisfy the fence-out
+    // assertion taken only at the full threshold below.
+    const RoundReport rep_before_threshold = gc.runRegularRound();
+    EXPECT_EQ(rep_before_threshold.fence_outs, 0u);
+    EXPECT_FALSE(decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes).gc_fenced);
+
     gc_mono = threshold_ms;
 
-    // Round 2 (mono == threshold): srid2's original token has held stable for the full threshold —
+    // Round 3 (mono == threshold): srid2's original token has held stable for the full threshold —
     // fenced. The store's own (just-renewed) mount restarts its observation and stays live.
     const RoundReport rep = gc.runRegularRound();
 
@@ -986,6 +1008,25 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     // regardless of srid2's fate — fencing one stale mount must never wedge the reclaim pipeline.
     dropRefTransition(*backend, layout, ns, "tbl", r);
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, layout, blob));
+}
+
+}
+
+TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
+{
+    runExpiredMountFenceOutScenario(PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+}
+
+/// GC's fence-out threshold (`ttl + 5% drift allowance + one round's worth of renewal slack`, computed in
+/// `Gc::runRegularRound`) never reads `PoolConfig::unsafe_remount_no_delay` -- that knob is consulted only
+/// by `Pool::mountWritable`'s own reclaim decision, never by GC's heartbeat-floor observation. Runs the
+/// IDENTICAL three-round scenario as `ExpiredMountFencedOutAndExcluded` with the knob turned on, and
+/// asserts the SAME round-by-round fence-out counts -- including the one-millisecond-short discriminator
+/// round -- proving the threshold's exact value and its timing are unaffected.
+TEST(CASGcFenceOut, ThresholdUnchangedByUnsafeKnob)
+{
+    runExpiredMountFenceOutScenario(
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .unsafe_remount_no_delay = true});
 }
 
 /// fix-round F6 (author-review: `Gc`'s own `mono_ms_fn` used to default to the RAW static `Pool::

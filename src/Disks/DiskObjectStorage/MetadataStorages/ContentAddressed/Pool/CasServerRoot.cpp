@@ -787,7 +787,7 @@ void emitMountEvent(const CasEventSink & sink, CasEventType type, const String &
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation,
-    const CasEventSink & sink)
+    const CasEventSink & sink, const std::optional<Etag> & unsafe_reclaim_authorization)
 {
     const String key = l.mountKey(srid);
     const auto got = op.read(key, Retry::standard());
@@ -856,12 +856,17 @@ MountClaimResult claimMount(
     ///     observation threshold on its own clock; re-deriving that here from a bare wall-clock
     ///     comparison is exactly the cross-node trust that makes a clock-skewed or delayed observer
     ///     unsafe.
+    ///   - `unsafe_reclaim_authorization` matches the one we just read → the operator's
+    ///     `cas_unsafe_remount_no_delay` setting explicitly authorized this reclaim with NO
+    ///     observation at all; the caller read this exact token and accepted the availability risk.
     /// Anything else → `LiveDoubleStart` (do NOT write): a same-uuid, different-epoch, not fenced, not
-    /// clean-marked, not (yet) proven-dead lease may simply be a live twin, and `expires_at_ms` alone
-    /// can never distinguish that from a dead predecessor across two different clocks.
+    /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
+    /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
+    /// clocks.
     const bool clean_marker = existing.min_active_build_sequence == std::numeric_limits<uint64_t>::max();
     const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
-    if (existing.gc_fenced || clean_marker || proven_dead)
+    const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
+    if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
     {
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
         if (const std::optional<Observation> raced
@@ -873,18 +878,22 @@ MountClaimResult claimMount(
             return racedDoubleStart(*raced);
         const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
                                      : clean_marker       ? MountPriorState::Clean
-                                                           : MountPriorState::UncleanObserved;
+                                     : proven_dead        ? MountPriorState::UncleanObserved
+                                                           : MountPriorState::UncleanUnsafe;
         emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
             existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
             : clean_marker     ? "same server_uuid, different writer_epoch, clean farewell — reclaimed"
-                               : "same server_uuid, different writer_epoch, observed dead by "
-                                 "incarnation stability — reclaimed");
+            : proven_dead      ? "same server_uuid, different writer_epoch, observed dead by "
+                                 "token-stability observation — reclaimed"
+                               : "same server_uuid, different writer_epoch, reclaimed at once under "
+                                 "cas_unsafe_remount_no_delay — the operator accepted that a live "
+                                 "predecessor with this uuid may still be writing");
         return {.kind = MountClaimResult::Claimed, .body = body, .prior = prior, .etag = std::nullopt};
     }
 
     emitMountEvent(sink, CasEventType::MountConflict, srid, "live_double_start", &existing,
         "same server_uuid, different writer_epoch, not fenced/clean/proven-dead — no wall-clock trust; "
-        "the caller must run the incarnation-stability observation wait before reclaiming");
+        "the caller must run the token-stability observation wait before reclaiming");
     /// No write was attempted on this path -- `got->etag` is exactly the CURRENT body's
     /// etag (what we just read is what's still there), so it is safe to hand back for the
     /// caller's observation loop to compare across polls without a redundant re-read.
@@ -906,26 +915,21 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         "server is holding the same CAS namespace. This prevents two ClickHouse servers from writing it.\n"
         " - If the other server is running intentionally, configure a unique <cas_server_root_id> for this disk.\n"
         " - If the other server is a stale/zombie process, stop it; this server will then reclaim the mount on restart.\n"
-        " - CLOCK SKEW CAVEAT: liveness is judged by comparing the lease's wall-clock expires_at_ms against\n"
-        "   THIS server's clock, so a large clock skew between the two servers can misjudge it (a healthy holder\n"
-        "   may look mounted here, or a dead one may look live). Verify both servers' clocks are in sync (NTP).\n"
+        " - LIVENESS: this wait judges the holder alive by its write token holding stable on THIS server's\n"
+        "   own clock for the full observation threshold; the stamped expires_at_ms above never enters that\n"
+        "   judgment on its own -- it is a writer-stamped diagnostic (also shown in system.cas_mounts), not\n"
+        "   an authorization. Every server sharing this pool must run the SAME cas_mount_lease_ttl_ms and\n"
+        "   cas_mount_renew_period_ms: a server configured with a shorter threshold than its peers can fence\n"
+        "   out a healthy one.\n"
         " - If the local ClickHouse uuid file was regenerated, restore the old uuid file, or remove the stale\n"
         "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.\n"
         " - As a LAST RESORT, after verifying that NO server is writing this root, manually delete the mount\n"
-        "   object gc/server-roots/{}/mount and restart; this server will then re-claim it.",
+        "   object gc/server-roots/{}/mount and restart; this server will then re-claim it.\n"
+        " - For a test stand or a deployment that guarantees one process per server_uuid,\n"
+        "   cas_unsafe_remount_no_delay reclaims a slot carrying this server's own uuid at once instead of\n"
+        "   waiting -- but a live predecessor sharing this uuid may still be writing, so enable it only\n"
+        "   under that guarantee.",
         srid, identity, srid, srid);
-}
-
-namespace
-{
-/// Bounded number of observation restarts before giving up on a same-uuid slot whose write-token keeps
-/// changing: each restart means the token changed DURING our observation window — i.e. something is
-/// actively renewing it. A genuinely dead predecessor's token never changes again after its last
-/// renewal, so it is observed stable well within one window; only a truly LIVE writer (a real second
-/// incarnation, or the predecessor's own background renewer racing our first few polls) keeps resetting
-/// the clock. Bounding this converts "wait forever for a live twin" into the same bounded-then-report
-/// shape the old wall-clock wait had, without ever trusting a wall-clock deadline to get there.
-constexpr size_t kMaxObservationRestarts = 3;
 }
 
 uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms)
@@ -948,8 +952,9 @@ MountClaimResult claimMountAwaitingExpiry(
     /// Rate-bound observation threshold: the full lease TTL, plus a 5% allowance for clock-rate
     /// mismatch between the holder's and our own local clock, plus one poll interval for observation
     /// discreteness. It is measured only with OUR OWN clock (`mono_ms_fn`); no cross-node wall-clock
-    /// comparison participates in this loop. The shared helper keeps the startup and GC thresholds
-    /// identical.
+    /// comparison participates in this loop. `poll` here is half the renewal period (the caller's own
+    /// poll cadence), so this threshold is close to, but not identical to, GC's heartbeat fence-out
+    /// threshold, which passes the full renewal period into the same shared helper.
     const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
 
     std::optional<Etag> observed;
@@ -960,7 +965,7 @@ MountClaimResult claimMountAwaitingExpiry(
     {
         const bool threshold_met = observed && mono_ms_fn() - observed_since >= threshold_ms;
         MountClaimResult r = claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms,
-            threshold_met ? observed : std::nullopt, sink);
+            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{});
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
 
@@ -1004,7 +1009,7 @@ MountClaimResult claimMountAwaitingExpiry(
                 on_wait_start(*r.body, threshold_ms);
             LOG_INFO(getLogger("CasMountLease"),
                 "Attempting to mount content-addressed server root {} after node change or hard "
-                "restart; waiting ~{} ms (incarnation-stability observation) to confirm the previous "
+                "restart; waiting ~{} ms (token-stability observation) to confirm the previous "
                 "incarnation's operations are all finalized", srid, threshold_ms);
         }
 
@@ -1105,7 +1110,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
             LOG_INFO(getLogger("CasHeartbeatFloor"),
                 "CAS GC fenced out mount lease for content-addressed server root {} at "
                 "wall-clock ms {}: its write incarnation held unchanged for >= {} ms on the GC "
-                "leader's own monotonic clock (incarnation-stability observation)",
+                "leader's own monotonic clock (token-stability observation)",
                 srid, now_ms, stable_threshold_ms);
             return true;
         }

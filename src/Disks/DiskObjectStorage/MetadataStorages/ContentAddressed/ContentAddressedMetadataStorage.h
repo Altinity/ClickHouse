@@ -624,6 +624,9 @@ private:
     const uint64_t gc_round_outcome_entry_budget;
     const std::chrono::milliseconds mount_lease_ttl;
     const std::chrono::milliseconds mount_renew_period;
+    /// See `PoolConfig::unsafe_remount_no_delay` -- the operator's explicit acceptance of an
+    /// unobserved same-uuid reclaim.
+    const bool cas_unsafe_remount_no_delay;
     /// Part-folder view cache settings. `cas_part_folder_cache_bytes == 0` disables retention.
     const uint64_t cas_part_folder_cache_bytes;
     const uint64_t cas_part_folder_cache_max_entries;
