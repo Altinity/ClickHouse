@@ -7,6 +7,9 @@
 #include <Common/Exception.h>
 #include <base/scope_guard.h>
 
+#include "config.h"
+#include <IO/S3Common.h>
+
 #include <atomic>
 #include <deque>
 #include <limits>
@@ -89,6 +92,7 @@ public:
         LandThenThrow,
         ReturnThenCancel,
         ThrowBeforeThenLandAfterResolve,
+        ThrowConnectHint,
     };
 
     struct Attempt
@@ -116,6 +120,16 @@ public:
         const Action action = actions.empty() ? Action::Delegate : actions.front();
         if (!actions.empty())
             actions.pop_front();
+
+        if (action == Action::ThrowConnectHint)
+        {
+#if USE_AWS_S3
+            throw DB::S3Exception("Poco::Exception. Code: 1000, e.code() = 99, Cannot assign requested address: 10.0.0.1:9000",
+                                  Aws::S3::S3Errors::NETWORK_CONNECTION);
+#else
+            throw Poco::TimeoutException("connect timed out");
+#endif
+        }
 
         if (action == Action::ThrowBefore || action == Action::ThrowBeforeThenLandAfterResolve)
         {
@@ -735,6 +749,40 @@ TEST(CASHeartbeat, RenewalRetriesOneImmutableBodyAndAdoptsLostResponse)
     EXPECT_EQ(decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes).write_attempt_id,
               decodeMountLease(backend->attempts.front().bytes).write_attempt_id);
 }
+
+#if USE_AWS_S3
+TEST(CASHeartbeat, RenewalOverConnectFailuresRecoversWithoutASettleRead)
+{
+    auto backend = std::make_shared<RenewalScriptBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid{0x1234};
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    Ops ops(backend, &boot_ms);
+    seedOwnClaim(ops.op, layout, srid, uuid, 9, wall_ms, 30000);
+    MountLeaseRenewer renewer(
+        ops.mount, ops.farewell, layout, srid, uuid, 9, std::chrono::milliseconds(30000),
+        [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(2000),
+        [&] { return boot_ms; });
+    renewer.start();
+
+    backend->attempts.clear();
+    backend->read_calls = 0;
+    /// Three seconds of "no free port" at 50 ms per hint, then the store answers.
+    for (int i = 0; i < 60; ++i)
+        backend->actions.push_back(RenewalScriptBackend::Action::ThrowConnectHint);
+    backend->actions.push_back(RenewalScriptBackend::Action::Delegate);
+    const MountRenewResult renewed = renewer.renew(renewalEnvironment(boot_ms));
+    ASSERT_EQ(renewed.outcome, MountRenewOutcome::Committed);
+    EXPECT_GT(renewed.attempts_sent, 1u);
+    EXPECT_FALSE(renewed.resolved_by_read);            /// classification `committed_after_retry`
+    EXPECT_EQ(backend->read_calls, 0u);
+    EXPECT_EQ(backend->attempts.size(), 61u);
+    for (const auto & attempt : backend->attempts)
+        EXPECT_EQ(attempt.bytes, backend->attempts.front().bytes);
+}
+#endif
 
 TEST(CASHeartbeat, DeadlineBeforeSendTerminalizesWithTypedFailure)
 {

@@ -564,6 +564,18 @@ struct PutObjectPreconditionFailedIngection: InjectionModel
     }
 };
 
+/// A transport failure shaped as `PocoHTTPClient` shapes one: the S3 error is `NETWORK_CONNECTION`
+/// and the message is the Poco text, exception name empty.
+struct PutObjectNetworkTextIngection: InjectionModel
+{
+    explicit PutObjectNetworkTextIngection(std::string text_) : text(std::move(text_)) {}
+    std::optional<Aws::S3::Model::PutObjectOutcome> call(const Aws::S3::Model::PutObjectRequest & /*request*/) override
+    {
+        return Aws::Client::AWSError<Aws::Client::CoreErrors>(Aws::Client::CoreErrors::NETWORK_CONNECTION, "", text, false);
+    }
+    std::string text;
+};
+
 struct HeadObjectFailIngection: InjectionModel
 {
     std::optional<Aws::S3::Model::HeadObjectOutcome> call(const Aws::S3::Model::HeadObjectRequest & /*request*/) override
@@ -1019,6 +1031,35 @@ TEST_P(SyncAsync, PreconditionFailedNeverLogsAtError)
     }, DB::S3Exception);
 
     EXPECT_THAT(log_capture.captured(), testing::Not(testing::HasSubstr("S3Exception name")));
+}
+
+/// The classifier a later change adds to the CAS request engine (`isConnectFailureHint`) reads the
+/// Poco text a connection failure carries. This pins that the fake S3 client -- and, through it, the
+/// same `WriteBufferFromS3` rethrow every real disk uses -- hands the caller that text unchanged,
+/// under `NETWORK_CONNECTION`.
+TEST_F(WBS3Test, NetworkConnectionTextSurvives)
+{
+    for (const char * text : {"Cannot assign requested address", "Connection refused", "No route to host",
+                              "Network is unreachable", "connect timed out"})
+    {
+        setInjectionModel(std::make_shared<MockS3::PutObjectNetworkTextIngection>(text));
+        WriteSettings write_settings;
+        write_settings.object_storage_retry_profile = ObjectStorageRetryProfile::SingleAttempt;
+        write_settings.s3_max_unexpected_write_error_retries_override = 1;
+        try
+        {
+            auto buffer = getWriteBuffer("network_text", write_settings);
+            buffer->write('A');
+            getAsyncPolicy().setAutoExecute(true);
+            buffer->finalize();
+            FAIL() << "the injected failure must surface";
+        }
+        catch (const DB::S3Exception & e)
+        {
+            EXPECT_EQ(e.getS3ErrorCode(), Aws::S3::S3Errors::NETWORK_CONNECTION) << text;
+            EXPECT_THAT(e.message(), testing::HasSubstr(text));
+        }
+    }
 }
 
 TEST_P(SyncAsync, ExceptionOnCreateMPU) {

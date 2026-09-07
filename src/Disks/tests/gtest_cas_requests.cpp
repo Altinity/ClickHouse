@@ -16,9 +16,16 @@
 #include "config.h"
 
 #include <Poco/Exception.h>
+#include <Poco/Net/NetException.h>
+#include <Poco/Net/SocketImpl.h>
 #include <base/defines.h>
 
+#include <gmock/gmock.h>
+
+#include <fmt/format.h>
+
 #include <atomic>
+#include <cerrno>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -43,6 +50,7 @@ namespace ProfileEvents
 {
     extern const Event CASRequestReissue;
     extern const Event CASRequestConflictPause;
+    extern const Event CASRequestConnectFailureHint;
 }
 
 using namespace DB::Cas;
@@ -2129,3 +2137,350 @@ TEST(CASRequests, StreamBodyServesTheAdoptedWindowEvenWhenAdmissionIsAlreadyRefu
     char c;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { body->readStrict(&c, 1); });
 }
+
+/// The hint is a text match on this repository's Poco. These pins fail the build's own tests the day
+/// `SocketImpl::error` changes a word, which is the only way a text match stays honest.
+TEST(CASRequestsConnectHint, PocoTextsArePinned)
+{
+    const auto text_of = [](int err)
+    {
+        try
+        {
+            Poco::Net::SocketImpl::error(err);
+        }
+        catch (const Poco::Exception & e)
+        {
+            return e.displayText();
+        }
+        return std::string("did not throw");
+    };
+    EXPECT_THAT(text_of(EADDRNOTAVAIL), testing::HasSubstr("Cannot assign requested address"));
+    EXPECT_THAT(text_of(ECONNREFUSED), testing::HasSubstr("Connection refused"));
+    EXPECT_THAT(text_of(EHOSTUNREACH), testing::HasSubstr("No route to host"));
+    EXPECT_THAT(text_of(ENETUNREACH), testing::HasSubstr("Network is unreachable"));
+    /// The fifth text is the connect poll's own: `SocketImpl::connect` throws
+    /// `Poco::TimeoutException("connect timed out", ...)` (SocketImpl.cpp ~138).
+    EXPECT_THAT(Poco::TimeoutException("connect timed out", "10.255.255.1:9").displayText(),
+                testing::HasSubstr("connect timed out"));
+}
+
+#if USE_AWS_S3
+TEST(CASRequestsConnectHint, ClassifierGuards)
+{
+    using Aws::S3::S3Errors;
+    for (const char * text : {"Cannot assign requested address", "Connection refused", "No route to host",
+                              "Network is unreachable", "connect timed out"})
+    {
+        const DB::S3Exception hinted(fmt::format("Poco::Exception. Code: 1000, e.code() = 99, {}: 10.0.0.1:9000", text),
+                                     S3Errors::NETWORK_CONNECTION);
+        EXPECT_TRUE(isConnectFailureHint(hinted)) << text;
+        /// The same text under another S3 error is not a transport verdict.
+        const DB::S3Exception other(String(text), S3Errors::INTERNAL_FAILURE);
+        EXPECT_FALSE(isConnectFailureHint(other)) << text;
+    }
+    EXPECT_FALSE(isConnectFailureHint(DB::S3Exception("Timeout", S3Errors::NETWORK_CONNECTION)));
+    EXPECT_FALSE(isConnectFailureHint(DB::S3Exception("Connection reset by peer", S3Errors::NETWORK_CONNECTION)));
+    EXPECT_FALSE(isConnectFailureHint(Poco::TimeoutException("connect timed out")));
+    EXPECT_FALSE(isConnectFailureHint(std::runtime_error("Connection refused")));
+}
+
+namespace
+{
+std::exception_ptr connectHint()
+{
+    return std::make_exception_ptr(DB::S3Exception(
+        "Poco::Exception. Code: 1000, e.code() = 99, Cannot assign requested address: 10.0.0.1:9000",
+        Aws::S3::S3Errors::NETWORK_CONNECTION));
+}
+}
+
+TEST(CASRequestsConnectHint, HintedFailuresReissueWithoutARead)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextWriteWith("k", connectHint());
+    backend->failNextWriteWith("k", connectHint());
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load();
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 3u);
+    EXPECT_FALSE(committed->resolved_by_read);
+    EXPECT_EQ(backend->writeTotal(), 3u);
+    EXPECT_EQ(backend->getTotal(), 0u);                 /// no settle read before the commit
+    ASSERT_EQ(clock.sleeps.size(), 2u);
+    EXPECT_EQ(clock.sleeps[0], 50u);                    /// the flat pause, twice
+    EXPECT_EQ(clock.sleeps[1], 50u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 2u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load() - reissues_before, 2u);
+}
+
+TEST(CASRequestsConnectHint, ReissueMeetsPreconditionAndAdoptsOwnBytes)
+{
+    /// The hint was false: the write landed, its response was lost as a connect-failure text. The
+    /// reissue meets 412 (the store now holds our OWN new incarnation, minted by the attempt whose
+    /// response never arrived), one read follows and proves the bytes are ours.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+        backend->resetCounts();
+        bool thrown = false;
+        /// Runs after the write lands and before the caller ever sees a value, with no lock held --
+        /// `InMemoryBackend::applyWrite` (CasInMemoryBackend.cpp) calls it right there.
+        backend->onWriteCommitted("k", [&]
+        {
+            if (!thrown)
+            {
+                thrown = true;
+                throw DB::S3Exception(
+                    "Poco::Exception. Code: 1000, e.code() = 99, Cannot assign requested address: 10.0.0.1:9000",
+                    Aws::S3::S3Errors::NETWORK_CONNECTION);
+            }
+        });
+        WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+        const auto * committed = std::get_if<Committed>(&result);
+        ASSERT_NE(committed, nullptr);
+        EXPECT_TRUE(committed->resolved_by_read);
+        EXPECT_EQ(committed->attempts_sent, 2u);
+        EXPECT_EQ(backend->writeTotal(), 2u);
+        EXPECT_EQ(backend->getTotal(), 1u);
+        ASSERT_EQ(clock.sleeps.size(), 1u);
+        EXPECT_EQ(clock.sleeps[0], 50u);
+    }
+    /// Different ETag, other bytes: a conflict, as today.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+        backend->failNextWriteWith("k", connectHint());
+        /// A competitor lands during the flat pause: the engine's own sleep is the seam.
+        bool competitor_landed = false;
+        requests.setSleepFnForTest([&](uint64_t ms)
+        {
+            clock.sleepFn()(ms);
+            if (!competitor_landed)
+            {
+                competitor_landed = true;
+                auto other = requests.admit();
+                orThrow(other.replace("k", "theirs", seen, Retry::standard()), "competitor");
+            }
+        });
+        WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+        EXPECT_TRUE(std::holds_alternative<Conflict>(result));
+        EXPECT_EQ(backend->getTotal(), 1u);
+    }
+    /// The ORIGINAL ETag is still current after the hinted attempt: the reissue meets a CLEAN 412 (the
+    /// store untouched, unlike sub-block 1's landed write), the settle read observes the original bytes
+    /// still there under the original ETag, and a further reissue is what actually commits.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        auto requests = makeRequests(backend, clock);
+        auto op = requests.admit();
+        const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "create");
+        backend->resetCounts();
+        backend->failNextWriteWith("k", connectHint());   /// attempt 1: hint, flat pause, no read
+        backend->refuseNextWrite("k");                    /// attempt 2: clean 412, store unchanged
+        WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+        const auto * committed = std::get_if<Committed>(&result);
+        ASSERT_NE(committed, nullptr);
+        EXPECT_FALSE(committed->resolved_by_read);
+        EXPECT_EQ(committed->attempts_sent, 3u);
+        EXPECT_EQ(backend->writeTotal(), 3u);
+        /// The read after attempt 2's 412 saw the precondition still satisfiable (the original ETag,
+        /// untouched), so the loop reissued instead of adopting -- exactly one read, not zero.
+        EXPECT_EQ(backend->getTotal(), 1u);
+        ASSERT_EQ(clock.sleeps.size(), 2u);
+        EXPECT_EQ(clock.sleeps[0], 50u);       /// the flat pause after attempt 1's hint
+        EXPECT_LE(clock.sleeps[1], 200u);      /// the backoff after attempt 2's settle read
+    }
+}
+
+TEST(CASRequestsConnectHint, OnceKeepsOneWriteAndOneRead)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextWriteWith("k", connectHint());
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+    WriteResult result = op.create("k", "v", Retry::once());
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Unresolved);
+    EXPECT_EQ(backend->writeTotal(), 1u);
+    EXPECT_EQ(backend->getTotal(), 1u);
+    EXPECT_TRUE(clock.sleeps.empty());
+    /// The counter is "hint seen", recorded at classification: `Retry::once` never acts on it, but the
+    /// attempt's transport error still named a failed connection.
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 1u);
+}
+
+TEST(CASRequestsConnectHint, EarlierAmbiguityStillSettlesByRead)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->injectAmbiguousWrite("k");           /// attempt 1: ordinary ambiguity -> read, backoff
+    /// Attempt 2's hint has to come from the hook, not a second `failNextWriteWith`: the armed-failure
+    /// queue is checked BEFORE the ambiguous-key injection on every call, so a queued failure would win
+    /// attempt 1 regardless of install order. `writeTotal()` ticks before the request is served, so it
+    /// reads 2 while attempt 2 is in flight.
+    bool hint_fired_on_second_attempt = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (backend->writeTotal() == 2)
+        {
+            /// The ordering claim in full: attempt 1's ambiguity must already have been settled by its
+            /// read before attempt 2 -- the one place `sleeps[1] == 50u` alone could be fooled by a
+            /// same-range jittered draw (`backoff(1)` is `uniform(0, 200)`, so a reversed order would
+            /// false-green about once in 200 runs).
+            EXPECT_EQ(backend->getTotal(), 1u) << "attempt 1's ambiguity read must already have run";
+            hint_fired_on_second_attempt = true;
+            throw DB::S3Exception(
+                "Poco::Exception. Code: 1000, e.code() = 99, Cannot assign requested address: 10.0.0.1:9000",
+                Aws::S3::S3Errors::NETWORK_CONNECTION);
+        }
+    });
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 3u);
+    EXPECT_EQ(backend->getTotal(), 1u);
+    ASSERT_EQ(clock.sleeps.size(), 2u);
+    EXPECT_LE(clock.sleeps[0], 200u);     /// the backoff after attempt 1's ambiguity read
+    EXPECT_EQ(clock.sleeps[1], 50u);      /// the flat pause after attempt 2's hint
+    EXPECT_TRUE(hint_fired_on_second_attempt);
+}
+
+/// A single exception can be BOTH refusal-class (`isDefinitelyRefusedWrite` matches on the exception
+/// NAME, independent of the S3 error code) and hint-text (`isConnectFailureHint` matches on the code
+/// and the message): the classifier order, not the exception's shape, must decide which wins. An
+/// earlier ambiguity of this inner write keeps the refusal from ending the call, but that must never
+/// let the hint skip the read the earlier attempt still needs.
+TEST(CASRequestsConnectHint, RefusalAfterAnEarlierAmbiguitySettlesByRead)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->injectAmbiguousWrite("k");           /// attempt 1: ordinary ambiguity -> read, backoff
+    /// Attempt 2's refusal-and-hint exception has to come from the hook, not a second
+    /// `failNextWriteWith`: the armed-failure queue is checked BEFORE the ambiguous-key injection on
+    /// every call, so a queued failure would win attempt 1 regardless of install order (see the sibling
+    /// `EarlierAmbiguityStillSettlesByRead` above). `writeTotal()` ticks before the request is served,
+    /// so it reads 2 while attempt 2 is in flight.
+    bool refusal_fired_on_second_attempt = false;
+    backend->onBeforeWrite("k", [&]
+    {
+        if (backend->writeTotal() == 2)
+        {
+            EXPECT_EQ(backend->getTotal(), 1u) << "attempt 1's ambiguity read must already have run";
+            refusal_fired_on_second_attempt = true;
+            throw DB::S3Exception(
+                "Poco::Exception. Code: 1000, e.code() = 99, Cannot assign requested address: 10.0.0.1:9000",
+                Aws::S3::S3Errors::NETWORK_CONNECTION, "MalformedXML");   /// refusal AND hint text
+        }
+    });
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+    WriteResult result = op.create("k", "v", Retry::standard());
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 3u);
+    /// Two reads, one per settled attempt: a hint reissue for attempt 2 would have skipped its own
+    /// read and left this at 1.
+    EXPECT_EQ(backend->getTotal(), 2u);
+    ASSERT_EQ(clock.sleeps.size(), 2u);
+    EXPECT_LE(clock.sleeps[0], 200u);      /// backoff(1) after attempt 1's read
+    EXPECT_LE(clock.sleeps[1], 400u);      /// backoff(2) after attempt 2's read -- today's verdict,
+                                           /// never the flat 50 ms hint pause
+    EXPECT_TRUE(refusal_fired_on_second_attempt);
+    /// The refusal classification wins outright: a definite refusal is never a hint, so the counter
+    /// must not move even though the exception's code and text also match `isConnectFailureHint`.
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 0u);
+}
+
+TEST(CASRequestsConnectHint, GatesRefuseTheReissue)
+{
+    /// Deadline: hints until the window closes.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        for (int i = 0; i < 100; ++i)
+            backend->failNextWriteWith("k", connectHint());
+        auto requests = makeRequests(backend, clock);
+        requests.setAttemptReservationForTest(1'000);
+        auto op = requests.admit();
+        WriteResult result = op.create("k", "v", Retry::within(3'000));
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_NE(gave_up, nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+        EXPECT_TRUE(gave_up->sent_any);
+        EXPECT_EQ(backend->getTotal(), 0u);
+    }
+    /// Fence: the fence trips during the pause.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        backend->failNextWriteWith("k", connectHint());
+        bool lost = false;
+        Fence fence{
+            [] { return uint64_t{1}; },
+            [&](uint64_t, uint64_t) { return lost ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
+            [](uint64_t) {}};
+        auto requests = makeRequests(backend, clock, fence);
+        requests.setSleepFnForTest([&](uint64_t ms) { clock.sleepFn()(ms); lost = true; });
+        auto op = requests.admit();
+        WriteResult result = op.create("k", "v", Retry::standard());
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_NE(gave_up, nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
+    }
+    /// Two envelopes exactly for the attempt; today's ambiguous path would still have its read
+    /// envelope (2000 >= 1000), the hint path gives up instead -- the documented deadline-edge
+    /// difference.
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<CountingBackend>();
+        backend->failNextWriteWith("k", connectHint());
+        auto requests = makeRequests(backend, clock);
+        requests.setAttemptReservationForTest(1'000);
+        auto op = requests.admit();
+        WriteResult result = op.create("k", "v", Retry::within(2'000));
+        const auto * gave_up = std::get_if<GaveUp>(&result);
+        ASSERT_NE(gave_up, nullptr);
+        EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+        EXPECT_TRUE(gave_up->sent_any);
+        EXPECT_EQ(backend->getTotal(), 0u);
+    }
+}
+
+TEST(CASRequestsConnectHint, AmbiguityAfterHintsStartsAtFirstBackoff)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextWriteWith("k", connectHint());
+    backend->failNextWriteWith("k", connectHint());
+    backend->failNextWriteWith("k", std::make_exception_ptr(Poco::TimeoutException("the write timed out")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    WriteResult result = op.create("k", "v", Retry::standard());
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    ASSERT_EQ(clock.sleeps.size(), 3u);
+    EXPECT_EQ(clock.sleeps[0], 50u);
+    EXPECT_EQ(clock.sleeps[1], 50u);
+    /// `backoff(1)` is full jitter over [0, 200] ms (`CasRetry.h`): the hints did not advance the index.
+    EXPECT_LE(clock.sleeps[2], 200u);
+}
+
+#endif

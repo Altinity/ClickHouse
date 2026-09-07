@@ -75,7 +75,9 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   write_attempt_id)` tuple before I/O. Every physical retry repeats it byte-for-byte; a later GC
   fence preserves the observed ID, while reclaim and successor bodies mint new IDs.
 - **Resolve before retry.** A transient or ambiguous conditional `PUT` is followed by one exact
-  `GET`. The renewer adopts the result only when the complete body, including `write_attempt_id`,
+  `GET`, except that an attempt whose transport error names a failed connection is reissued first
+  after a flat pause and settled by the reissue's own answer (a 2xx) or by the exact `GET` that
+  follows its `412`. The renewer adopts the result only when the complete body, including `write_attempt_id`,
   equals its immutable request. If the predecessor token is still current, another identical `PUT`
   may follow bounded backoff. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
   body is never treated as this renewal.

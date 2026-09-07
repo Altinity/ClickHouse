@@ -30,6 +30,12 @@ namespace DB::Cas
 /// refusal: an unmodeled error may have landed.
 bool isDefinitelyRefusedWrite(const std::exception & e);
 
+/// TRUE when a transport failure's text says the CONNECTION itself failed: no free local port, a
+/// refused or unreachable peer, or the connect poll's own timeout. A hint, not a verdict: the same
+/// errno can be reported after `send` or `recv`, so a hinted attempt keeps every property of an
+/// ambiguous one; what the hint changes is only that the engine reissues before spending a read.
+bool isConnectFailureHint(const std::exception & e);
+
 /// Deterministic caller/local bugs, surfaced unchanged by every loop here: reissuing only replays the
 /// same failure and buries the root cause behind a retryable exception. The set is `LOGICAL_ERROR`,
 /// `NOT_IMPLEMENTED`, `BAD_ARGUMENTS` and `CORRUPTED_DATA`.
@@ -353,8 +359,10 @@ private:
     /// the attempt landed.
     enum class ResolveWith : uint8_t { Body, Presence };
 
-    /// The write engine: one call, any policy. Settles every refused precondition and every ambiguity
-    /// by an exact read before it reports anything.
+    /// The write engine: one call, any policy. `Committed` and `Conflict` are proven by an exact read
+    /// or by the reissue's own 2xx before they are reported; an attempt whose transport error named a
+    /// failed connection is reissued before its read. `Refused`, `Declined` and `GaveUp` report what
+    /// the store or the bounds said.
     WriteResult writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
                           const Retry & policy, const Retry::Bound & bound, WriteState & state,
                           ResolveWith resolve_refusal_with);
@@ -379,6 +387,9 @@ private:
     /// `Retry::conflictBackoff` sleep, and `state.reissues` untouched, so a transport fault that follows
     /// starts its own schedule at the beginning.
     std::optional<WriteResult> pauseForConflict(WriteState & state, const Retry::Bound & bound);
+    /// The sibling for a failure text that named a failed connection. The same admission and the same
+    /// reservation, a flat `kConnectHintPauseMs` sleep, and `state.reissues` untouched.
+    std::optional<WriteResult> pauseFlat(WriteState & state, const Retry::Bound & bound);
 
     /// `sleep_ms` plus `envelopes` attempt reservations, saturating.
     uint64_t reservedFor(uint64_t sleep_ms, uint32_t envelopes) const;

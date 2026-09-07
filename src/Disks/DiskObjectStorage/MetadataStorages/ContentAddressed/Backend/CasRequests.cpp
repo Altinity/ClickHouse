@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 
+#include <array>
 #include <ctime>
 #include <limits>
 #include <utility>
@@ -31,6 +32,7 @@ namespace ProfileEvents
     extern const Event CASRequestGaveUp;
     extern const Event CASRequestRefused;
     extern const Event CASRequestFenceLostPostWrite;
+    extern const Event CASRequestConnectFailureHint;
 }
 
 namespace DB::ErrorCodes
@@ -231,6 +233,24 @@ bool isDefinitelyRefusedWrite([[maybe_unused]] const std::exception & e)
         /// available -- which is every CAS disk today.
         return S3::isMalformedRequestError(*s3) || S3::isEntityTooLargeError(*s3)
             || S3::isAccessDeniedError(*s3) || isRefreshableCredentialError(e);
+#endif
+    return false;
+}
+
+bool isConnectFailureHint([[maybe_unused]] const std::exception & e)
+{
+#if USE_AWS_S3
+    const auto * s3 = dynamic_cast<const S3Exception *>(&e);
+    if (!s3 || s3->getS3ErrorCode() != Aws::S3::S3Errors::NETWORK_CONNECTION)
+        return false;
+    /// This repository's Poco (`SocketImpl::error`, `SocketImpl::connect`) is the source of every text.
+    static constexpr std::array<std::string_view, 5> texts{
+        "Cannot assign requested address", "Connection refused", "No route to host",
+        "Network is unreachable", "connect timed out"};
+    const std::string_view message = s3->message();
+    for (std::string_view text : texts)
+        if (message.find(text) != std::string_view::npos)
+            return true;
 #endif
     return false;
 }
@@ -829,6 +849,25 @@ std::optional<WriteResult> CasOperation::pauseForConflict(WriteState & state, co
     return std::nullopt;
 }
 
+/// A flat pause before reissuing an attempt whose failure text named a failed connection.
+static constexpr uint64_t kConnectHintPauseMs = 50;
+
+std::optional<WriteResult> CasOperation::pauseFlat(WriteState & state, const Retry::Bound & bound)
+{
+    const uint64_t needed = reservedFor(kConnectHintPauseMs, 2);
+    switch (gate(needed))
+    {
+        case Gate::FenceLost: return gaveUp(GaveUp::Why::FenceLost, sourceFor(bound), state);
+        case Gate::NoBudget:  return gaveUp(GaveUp::Why::Deadline, GaveUp::Source::Lease, state);
+        case Gate::Ok: break;
+    }
+    if (!fits(needed, bound))
+        return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
+    detail::recordReissue();
+    owner.sleep_ms(kConnectHintPauseMs);
+    return std::nullopt;
+}
+
 WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
                                     const Retry & policy, const Retry::Bound & bound, WriteState & state,
                                     ResolveWith resolve_refusal_with)
@@ -868,6 +907,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// instead of resolved by a read and reissued to the deadline.
         bool credential_answer = false;
         bool refreshed = false;
+        bool connect_hint = false;
         try
         {
             outcome = owner.withTransportAccess([&](auto & access)
@@ -893,11 +933,18 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             }
             /// A refusal that FOLLOWS an ambiguous attempt of this inner write proves nothing about that
             /// attempt, so it is settled by the read below instead of ending the call here.
-            if (!refreshed && isDefinitelyRefusedWrite(e) && !state.any_ambiguous)
+            const bool definitely_refused = !refreshed && isDefinitelyRefusedWrite(e);
+            if (definitely_refused && !state.any_ambiguous)
             {
                 ProfileEvents::increment(ProfileEvents::CASRequestRefused);
                 return Refused{e.code(), e.message(), state.attempts_sent};
             }
+            /// A refusal-class exception is never a hint, even when an earlier ambiguity of this inner
+            /// write kept it from ending the call above: that earlier attempt's fate is what the read
+            /// below must settle, and a hint reissue would skip it.
+            connect_hint = !definitely_refused && isConnectFailureHint(e);
+            if (connect_hint)
+                ProfileEvents::increment(ProfileEvents::CASRequestConnectFailureHint);
         }
         catch (const std::exception & e)
         {
@@ -930,11 +977,25 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
             continue;
         }
 
-        /// Every refused precondition and every ambiguous attempt is settled by ONE exact read, under
-        /// every policy: a refused precondition does not say WHO holds the key, and a 404 and a 412
-        /// reach here as the same answer. A refused precondition needs only to know WHAT is there, so a
-        /// presence-only caller settles it with a HEAD; proving an ambiguous attempt landed needs the
-        /// bytes, and there the body read is unavoidable.
+        /// The failure text named a failed CONNECTION -- counted above, at classification, whether or
+        /// not this policy or the deadline/fence gates below let the reissue actually happen. A read now
+        /// would meet the same broken condition, so the reissue itself is the cheaper probe: the attempt
+        /// stays ambiguous (`any_ambiguous` is set above), and if the reissue meets a refused precondition
+        /// the read below settles it.
+        if (connect_hint && !policy.single_attempt)
+        {
+            if (auto given_up = pauseFlat(state, bound))
+                return *given_up;
+            continue;
+        }
+
+        /// Every refused precondition, and every ambiguous attempt that was not reissued on a
+        /// connect-failure hint, is settled by ONE exact read, under every policy: a refused
+        /// precondition does not say WHO holds the key, and a 404 and a 412 reach here as the same
+        /// answer. A hinted attempt reaches this read only when its reissue meets a refused
+        /// precondition. A refused precondition needs only to know WHAT is there, so a presence-only
+        /// caller settles it with a HEAD; proving an ambiguous attempt landed needs the bytes, and there
+        /// the body read is unavoidable.
         ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
         const Resolved resolved = resolve_refusal_with == ResolveWith::Presence && !state.any_ambiguous
             ? observePresence(key, policy, bound)
