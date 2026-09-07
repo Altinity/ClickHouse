@@ -1669,7 +1669,13 @@ TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedConnec
     auto backend = std::make_shared<ObjectStorageBackend>(
         tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess,
         /*single_attempt_control_plane_=*/false, budget.attempt_timeout_ms, /*connect_timeout_cap_ms_=*/1500);
+    /// The mismatch is a programmer error (LOGICAL_ERROR): under DEBUG_OR_SANITIZER_BUILD it aborts the
+    /// process before it can be caught, so that arm pins the refusal via EXPECT_DEATH.
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+    EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
+#else
     EXPECT_THROW(ensureBackendMatchesBudget(*backend, budget), DB::Exception);
+#endif
 }
 
 TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedAttemptTimeout)
@@ -1680,7 +1686,12 @@ TEST(CASObjectStorageBackend, EnsureBackendMatchesBudgetRejectsAMismatchedAttemp
     auto backend = std::make_shared<ObjectStorageBackend>(
         tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess,
         /*single_attempt_control_plane_=*/false, /*attempt_timeout_ms_=*/6000, *budget.connect_timeout_cap_ms);
+    /// Same split as the connect-cap twin above: a LOGICAL_ERROR aborts under DEBUG_OR_SANITIZER_BUILD.
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+    EXPECT_DEATH({ ensureBackendMatchesBudget(*backend, budget); }, "does not match the pool's request budget");
+#else
     EXPECT_THROW(ensureBackendMatchesBudget(*backend, budget), DB::Exception);
+#endif
 }
 
 /// `NativeRejectsWrongDialectTokenBeforeTouchingTheWire` is deleted here: it built a `Token{value,
