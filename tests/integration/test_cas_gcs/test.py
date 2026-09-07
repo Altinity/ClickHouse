@@ -154,7 +154,7 @@ def start_cluster():
             "<endpoint>http://fakegcs:8080/hmacbucket/cas-fuse/</endpoint>"
             "<http_client>gcs_hmac</http_client><access_key_id>GOOG1EFAKEACCESSKEYID</access_key_id>"
             "<secret_access_key>fake-goog4-hmac-secret</secret_access_key>"
-            "<cas_attempt_timeout_ms>200</cas_attempt_timeout_ms>"
+            "<cas_attempt_timeout_ms>1000</cas_attempt_timeout_ms>"
             "<http_keep_alive_timeout>30</http_keep_alive_timeout>"
             "<http_keep_alive_max_requests>10000</http_keep_alive_max_requests>"
             "</cas_gcs_hmac_fuse></disks>",
@@ -1502,6 +1502,20 @@ def test_first_per_key_throttling_is_transparently_absorbed(disk):
         node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
 
 
+def _wait_for_delayed_request_count(delayed_before, timeout=10):
+    # The fake counts a delayed request only once its own sleep finishes, in the handler thread that
+    # received it -- a thread the client's fuse timeout does not cancel. `SYSTEM CAS GC RUN`/the
+    # `INSERT` below already return once the fast attempt 2 lands, which can be well before that
+    # thread's own delay elapses, so the counter needs a moment to catch up rather than an immediate
+    # read.
+    deadline = time.monotonic() + timeout
+    count = _counters().get("DelayedRequest", 0)
+    while count - delayed_before < 1 and time.monotonic() < deadline:
+        time.sleep(0.05)
+        count = _counters().get("DelayedRequest", 0)
+    return count
+
+
 def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
     """A first-attempt fuse timeout is reissued at once, on the wire, as attempt 2.
 
@@ -1512,14 +1526,15 @@ def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
     attempt 2 and counts as a `CASRequestResolveRead`.
 
     The fuse only trips on a real transport timeout, and `content_addressed`'s
-    `attempt_timeout_ms` defaults to 5000 -- a 300 ms fake delay would sail through that budget on
+    `attempt_timeout_ms` defaults to 5000 -- a 3000 ms fake delay would sail through that budget on
     the ordinary `cas_gcs_hmac` disk and never throw at all. `FUSE_DISK` is a second CAS disk
     the fixture mounts alongside it (own `cas_server_root_id`, own physical prefix under the same
     bucket, so it shares no keys with `cas_gcs_hmac`'s traffic) with `attempt_timeout_ms` tightened
-    to 200 -- the only way to make a 300 ms delay a genuine transport timeout without touching the
-    engine's C++ default. `attempt_timeout_ms` is frozen at pool-open time (mount-time), not
-    reloadable, hence a dedicated disk rather than a temporary `SYSTEM RELOAD CONFIG` on the
-    existing one.
+    to 1000 -- the only way to make a 3000 ms delay a genuine transport timeout without touching the
+    engine's C++ default. The margin between the two (rather than the earlier 200 ms / 300 ms pair)
+    is what keeps the reissue observable under a sanitizer build's own slowdown of the request path.
+    `attempt_timeout_ms` is frozen at pool-open time (mount-time), not reloadable, hence a dedicated
+    disk rather than a temporary `SYSTEM RELOAD CONFIG` on the existing one.
     """
     node = cluster.instances["node"]
     disk = FUSE_DISK
@@ -1539,16 +1554,18 @@ def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
         # LIST is delayed past the fuse and must be reissued at once as attempt 2.
         seq = _next_seq()
         delayed_before = _counters().get("DelayedRequest", 0)
-        assert _control_post("/_control/delay?substr=gc&ms=300&method=LIST&once=1")["method"] == "LIST"
+        assert _control_post("/_control/delay?substr=gc&ms=3000&method=LIST&once=1")["method"] == "LIST"
         node.query("SYSTEM CAS GC RUN '{}'".format(disk))
-        assert _counters().get("DelayedRequest", 0) - delayed_before == 1, "the LIST delay must fire exactly once"
+        assert _wait_for_delayed_request_count(delayed_before) - delayed_before == 1, (
+            "the LIST delay must fire exactly once"
+        )
         lists = [
             r
             for r in _captured_since(seq, FUSE_BUCKET)
             if r["method"] == "GET" and not r["key"] and "prefix=" in r["query"]
         ]
         # The fake appends a request's capture record's `seq` when ITS OWN handler finishes, not
-        # when the client issued it: the delayed LIST's handler is still sleeping out its 300 ms
+        # when the client issued it: the delayed LIST's handler is still sleeping out its 3000 ms
         # when the reissue (a fresh connection, unaffected by the knob once `once=1` cleared it)
         # completes and gets a lower `seq`. So the pair is identified by sharing one `query` (the
         # same prefix, reissued), and ordered by `arrival_seq` -- assigned when a request arrives,
@@ -1574,9 +1591,11 @@ def test_a_first_attempt_timeout_is_reissued_as_attempt_two():
         seq = _next_seq()
         resolve_reads_before = _resolve_reads(node)
         delayed_before = _counters().get("DelayedRequest", 0)
-        assert _control_post("/_control/delay?substr=.meta&ms=300&method=PUT&once=1")["method"] == "PUT"
+        assert _control_post("/_control/delay?substr=.meta&ms=3000&method=PUT&once=1")["method"] == "PUT"
         node.query("INSERT INTO fuse_probe VALUES (2)")
-        assert _counters().get("DelayedRequest", 0) - delayed_before == 1, "the PUT delay must fire exactly once"
+        assert _wait_for_delayed_request_count(delayed_before) - delayed_before == 1, (
+            "the PUT delay must fire exactly once"
+        )
         rows = [r for r in _captured_since(seq, FUSE_BUCKET) if r["key"].endswith(".meta")]
         assert rows, "no `.meta` PUT reached the fake, so this test would be vacuous"
         meta_key = rows[0]["key"]
