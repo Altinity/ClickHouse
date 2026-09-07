@@ -187,10 +187,20 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         validateSupportedColumns(columns, *configuration);
     configuration->check(context_);
 
+    const bool need_resolve_sample_path = context_->getSettingsRef()[Setting::use_hive_partitioning]
+        && !configuration->isDataLakeConfiguration()
+        && !configuration->getPartitionStrategy();
+
+    /// Mirror StorageObjectStorage: when the schema and format are already known, defer resolving
+    /// the hive partitioning sample path (which lists the object storage) to the first use of the
+    /// table, so that CREATE, ATTACH and server startup do not depend on the endpoint. The inner
+    /// pure_storage carries the same deferral and resolves it lazily on read.
+    const bool hive_partitioning_sample_path_deferred =
+        !is_table_function && need_resolve_sample_path && !need_resolve_columns_or_format;
+
     if (updated_configuration && sample_path.empty()
-            && context_->getSettingsRef()[Setting::use_hive_partitioning]
-            && !configuration->isDataLakeConfiguration()
-            && !configuration->getPartitionStrategy())
+            && need_resolve_sample_path
+            && !hive_partitioning_sample_path_deferred)
     {
         sample_path = getPathSample(context_);
     }
