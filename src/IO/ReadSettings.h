@@ -4,8 +4,8 @@
 #include <Core/Defines.h>
 #include <IO/DistributedCacheSettings.h>
 #include <IO/ObjectStorageRequestMode.h>
+#include <IO/ObjectStorageRequestProfile.h>
 #include <IO/ReadMethod.h>
-#include <IO/WriteSettings.h>
 #include <Interpreters/FileCache/FileCache_fwd.h>
 #include <Common/Priority.h>
 #include <Common/Scheduler/ResourceLink.h>

@@ -13,6 +13,7 @@
 #include <IO/ReadSettings.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
+#include <IO/WriteSettings.h>
 #include <base/defines.h>
 
 #include <chrono>
