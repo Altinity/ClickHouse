@@ -18,10 +18,9 @@
                 <secret_access_key>clickhouse</secret_access_key>
                 <!-- Real server-local scratch dir for the write-buffer spill. -->
                 <cas_scratch_path>cas_s3_scratch/</cas_scratch_path>
-                <!-- Background GC pacing: the incarnation protocol's fence/recheck handshake
-                     replaces the old grace window (M-W D-W5); a short interval so reclamation
-                     happens during the run. -->
-                <cas_gc_enabled>1</cas_gc_enabled>
+                <!-- DO NOT MERGE. Experiment: GC disabled to isolate GC cost on ASan CAS-S3
+                     stateless shards. Interval left at the test-lane 5s override. -->
+                <cas_gc_enabled>0</cas_gc_enabled>
                 <cas_gc_interval_sec>5</cas_gc_interval_sec>
             </cas_s3>
             <!-- Optional local filesystem cache in front of the cacheless CA-S3 disk (mirrors how plain-s3
