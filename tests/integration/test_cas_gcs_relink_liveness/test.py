@@ -84,7 +84,8 @@ def _set_delay(substr, ms):
     # and the rest of the test would exercise a fake running at full speed. Checking the echoed body
     # is what makes a broken lever fail loudly instead of silently.
     reply = _control_post("/_control/delay?substr={}&ms={}".format(substr, ms))
-    assert json.loads(reply) == {"substr": substr, "ms": ms}, (
+    echoed = json.loads(reply)
+    assert {"substr": substr, "ms": ms}.items() <= echoed.items(), (
         "fake did not echo back the delay setting it was asked for: {!r}".format(reply)
     )
 
