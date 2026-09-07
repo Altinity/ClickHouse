@@ -50,3 +50,9 @@ WHERE disk LIKE '%05010_cas_mounts_gc_health%';
 DROP TABLE t_cas_mounts_gc_health;
 SELECT 'ok';
 """
+
+# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+# stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '05010_cas_mounts_gc_health'" || {
+    echo "FORGET failed"; exit 1; }

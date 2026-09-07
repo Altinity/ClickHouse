@@ -60,3 +60,9 @@ ${CLICKHOUSE_CLIENT} --query "SYSTEM UNFREEZE WITH NAME 'backup_05003';" \
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze;"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'dropped_ok';"
+
+# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+# stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '05003_cas_freeze'" || {
+    echo "FORGET failed"; exit 1; }

@@ -50,3 +50,10 @@ DROP TABLE IF EXISTS t_cas_restored;
 DROP TABLE t_cas_backup;
 SELECT 'dropped_ok';
 EOF
+
+# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+# stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+# RESTORE re-created t_cas_restored on the same named pool ('04284_cas_backup'), so one FORGET covers it.
+${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '04284_cas_backup'" || {
+    echo "FORGET failed"; exit 1; }

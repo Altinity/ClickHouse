@@ -56,3 +56,9 @@ SELECT 'data_readback', key, s FROM t_cas_fetch_dst ORDER BY key;
 DROP TABLE t_cas_fetch_src;
 DROP TABLE t_cas_fetch_dst;
 SELECT 'dropped_ok';
+
+-- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+-- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+-- Both tables share the one named pool ('05002_cas_fetch'), so a single FORGET covers it.
+SET send_logs_level = 'fatal';
+SYSTEM CAS FORGET '05002_cas_fetch';

@@ -112,3 +112,9 @@ SELECT 'final_data_match',
 
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_ca    SYNC"
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_plain SYNC"
+
+# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+# stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+$CLICKHOUSE_CLIENT --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '04292_cas_mut'" || {
+    echo "FORGET failed"; exit 1; }

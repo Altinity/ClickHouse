@@ -140,3 +140,12 @@ ${CLICKHOUSE_CLIENT} --query "DROP TABLE dst_cas_same_pool;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE src_plain_repl SYNC;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE dst_cas_repl SYNC;"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'dropped_ok';"
+
+# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+# stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET calls.
+# Four independent content-addressed disks were created across the three legs; each needs its own FORGET.
+for disk in 05025_cas_dst 05025_cas_shared_a 05025_cas_shared_b 05025_cas_dst_repl; do
+    ${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+        --query "SYSTEM CAS FORGET '${disk}'" || {
+        echo "FORGET failed for ${disk}"; exit 1; }
+done

@@ -48,3 +48,11 @@ ${CLICKHOUSE_CLIENT} --query "SELECT 'projection', k, count() FROM t_cas_br_rest
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_br;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_br_restored;"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'done';"
+
+# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+# stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+# RESTORE re-created t_cas_br_restored on the same named pool ('05005_cas_backup_restore'), so one FORGET
+# covers it.
+${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '05005_cas_backup_restore'" || {
+    echo "FORGET failed"; exit 1; }

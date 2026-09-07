@@ -41,4 +41,9 @@ FROM system.cas_log
 WHERE disk_name = '05009_cas_event_log' AND event_type = 'blob_put';
 
 DROP TABLE t_cas_event_log;
+
+-- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+-- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+SET send_logs_level = 'fatal';
+SYSTEM CAS FORGET '05009_cas_event_log';
 SELECT 'ok';

@@ -38,3 +38,8 @@ ORDER BY name;
 
 DROP TABLE t_cas_detach_mtime;
 SELECT 'dropped_ok';
+
+-- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+-- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+SET send_logs_level = 'fatal';
+SYSTEM CAS FORGET '04288_cas_detach_mtime';

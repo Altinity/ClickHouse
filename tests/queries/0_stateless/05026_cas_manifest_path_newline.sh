@@ -52,3 +52,9 @@ ${CLICKHOUSE_CLIENT} --query "SYSTEM CAS FSCK '${DISK_NAME}'" --format TSVWithNa
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE ${TABLE};"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'dropped_ok';"
+
+# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+# stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '${DISK_NAME}'" || {
+    echo "FORGET failed"; exit 1; }

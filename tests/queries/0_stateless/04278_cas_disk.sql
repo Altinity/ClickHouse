@@ -47,3 +47,9 @@ SELECT 'slice', a, s, count() FROM t_cas WHERE a IN (0, 500, 999) GROUP BY a, s 
 DROP TABLE t_cas;
 DROP TABLE t_ref;
 SELECT 'dropped_ok';
+
+-- FORGET logs an operator WARNING (the decommission is deliberately prominent in the server log); the
+-- clickhouse-test harness runs the client at --send_logs_level=warning, which would stream that expected
+-- warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+SET send_logs_level = 'fatal';
+SYSTEM CAS FORGET '04278_cas';

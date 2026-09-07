@@ -122,4 +122,11 @@ SELECT 'after_reload_by_b', b, count() FROM t_proj_cas_alter GROUP BY b ORDER BY
 SELECT 'after_reload_sum_b', b, sum(a) FROM t_proj_cas_alter GROUP BY b ORDER BY b;
 
 DROP TABLE t_proj_cas_alter;
+
+-- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+-- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+-- Only the first table's inline disk is forgotten here: t_proj_cas_alter uses the lane's own default
+-- storage policy, not a disk this test created.
+SET send_logs_level = 'fatal';
+SYSTEM CAS FORGET '04299_cas_projection';
 SELECT 'dropped_ok';

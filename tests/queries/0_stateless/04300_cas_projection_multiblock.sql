@@ -51,3 +51,8 @@ SELECT 'after_reload_by_b_top', b, sum(a) AS s FROM t_pmb GROUP BY b ORDER BY s 
 
 DROP TABLE t_pmb;
 SELECT 'dropped_ok';
+
+-- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+-- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+SET send_logs_level = 'fatal';
+SYSTEM CAS FORGET '04300_pmb';

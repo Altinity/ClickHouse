@@ -60,3 +60,9 @@ ${CLICKHOUSE_CLIENT} --query "SELECT 'rolled_back_absent', count() FROM t_cas_tx
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_txn;"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'done';"
+
+# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+# stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
+    --query "SYSTEM CAS FORGET '05004_cas_transactions'" || {
+    echo "FORGET failed"; exit 1; }

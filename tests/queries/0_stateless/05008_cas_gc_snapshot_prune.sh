@@ -75,3 +75,7 @@ FROM system.cas_gc_log
 WHERE disk_name LIKE '%${DISK}%' AND event_type = 'Finish'"
 
 $CLIENT -q "DROP TABLE t_ca_p9"
+
+# FORGET logs an operator WARNING; $CLIENT already runs at --send_logs_level=error, which excludes it.
+$CLIENT -q "SYSTEM CAS FORGET '${DISK}'" || {
+    echo "FORGET failed"; exit 1; }

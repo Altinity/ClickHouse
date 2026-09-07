@@ -55,3 +55,8 @@ WHERE database = currentDatabase() AND table = 't_ref_mut' AND active;
 DROP TABLE t_cas_mut;
 DROP TABLE t_ref_mut;
 SELECT 'dropped_ok';
+
+-- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
+-- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
+SET send_logs_level = 'fatal';
+SYSTEM CAS FORGET '04282_cas';
