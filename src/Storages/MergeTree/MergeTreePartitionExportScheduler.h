@@ -9,32 +9,13 @@
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
 #include <Storages/MergeTree/MergeTreePartitionExportTask.h>
+#include <Storages/MergeTree/PartitionExportInfo.h>
 
 namespace DB
 {
 
 class StorageMergeTree;
 
-
-struct PartitionExportInfo
-{
-    String source_database;
-    String source_table;
-    String destination_database;
-    String destination_table;
-    time_t create_time = 0;
-    String partition_id;
-    String transaction_id;
-    String query_id;
-    std::vector<String> parts;
-    size_t parts_count = 0;
-    size_t parts_to_do = 0;
-    String status;
-    String last_exception_message;
-    String last_exception_part;
-    time_t last_exception_time = 0;
-    size_t exception_count = 0;
-};
 
 class MergeTreePartitionExportScheduler
 {

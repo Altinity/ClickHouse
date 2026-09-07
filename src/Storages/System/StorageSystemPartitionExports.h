@@ -7,10 +7,13 @@ namespace DB
 
 class Context;
 
-/// system.partition_exports: progress of EXPORT PARTITION tasks on plain (non-replicated) MergeTree
-/// tables. Backed by each table's on-disk task descriptors mirrored in memory; querying it does not
-/// touch disk. Each export task is represented by a single row. (ReplicatedMergeTree tasks live in
-/// system.replicated_partition_exports instead.)
+/// system.partition_exports: progress of EXPORT PARTITION tasks of every MergeTree-family table,
+/// both plain `MergeTree` (backed by on-disk task descriptors) and `Replicated*MergeTree` (backed
+/// by the ZooKeeper manifest mirror). Both are read from memory, so querying it touches neither
+/// disk nor ZooKeeper. Each export task is represented by a single row.
+///
+/// Also attached as `system.replicated_partition_exports`, a backwards-compatible alias from when
+/// the two engines had separate tables.
 class StorageSystemPartitionExports final : public IStorageSystemOneBlock
 {
 public:

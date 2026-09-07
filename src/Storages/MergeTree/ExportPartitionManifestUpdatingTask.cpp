@@ -389,7 +389,7 @@ ExportPartitionManifestUpdatingTask::ExportPartitionManifestUpdatingTask(Storage
 {
 }
 
-std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartitionExportsInfo() const
+std::vector<PartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartitionExportsInfo() const
 {
     const auto model = storage.export_partition_manifests.get();
 
@@ -398,14 +398,14 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
 
     const auto backoff = storage.export_merge_tree_partition_task_scheduler->getLocalBackoffSnapshot();
 
-    std::vector<ReplicatedPartitionExportInfo> infos;
+    std::vector<PartitionExportInfo> infos;
     infos.reserve(model->size());
 
     for (const auto & entry : model->get<ExportPartitionTaskEntryTagByCompositeKey>())
     {
         const auto & manifest = entry.manifest;
 
-        ReplicatedPartitionExportInfo info;
+        PartitionExportInfo info;
 
         info.destination_database = manifest.destination_database;
         info.destination_table = manifest.destination_table;
@@ -424,7 +424,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         for (const auto & [_, ex] : entry.last_exception_per_replica)
         {
             total_exception_count += ex.count;
-            info.last_exception_per_replica.push_back(ex);
+            info.last_exception_per_replica.push_back({ex.replica, ex.message, ex.part, ex.time, ex.count});
         }
         info.exception_count = total_exception_count;
 

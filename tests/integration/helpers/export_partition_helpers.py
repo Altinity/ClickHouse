@@ -21,12 +21,9 @@ def wait_for_export_status(
     expected_status="COMPLETED",
     timeout=60,
     poll_interval=0.5,
-    system_table="replicated_partition_exports",
+    system_table="partition_exports",
 ):
     """Poll a partition-exports system table until status matches.
-
-    *system_table* selects the source table: ``replicated_partition_exports`` for
-    ReplicatedMergeTree (default) or ``partition_exports`` for plain MergeTree.
 
     *dest_table* may be ``None`` to skip filtering by destination table
     (useful for catalog-based tests where the destination is a database-qualified path).
@@ -63,7 +60,7 @@ def wait_for_export_to_start(
     partition_id,
     timeout=10,
     poll_interval=0.2,
-    system_table="replicated_partition_exports",
+    system_table="partition_exports",
 ):
     """Poll until at least one row exists in the given partition-exports system table."""
     start_time = time.time()
@@ -93,18 +90,18 @@ def wait_for_exception_count(
     min_exception_count=1,
     timeout=60,
     poll_interval=0.5,
-    system_table="replicated_partition_exports",
+    system_table="partition_exports",
 ):
     """Wait for exception_count to reach at least *min_exception_count*.
 
     The default timeout is intentionally larger than one manifest-updater poll
     cycle (~30s, see StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask).
-    system.replicated_partition_exports is served from the in-memory mirror, which
-    is refreshed on (a) the periodic poll tick and (b) status changes. While the
-    task is still PENDING (e.g. transient part-export failures with a generous
-    max_retries), no status watch fires, so newly written per-replica exception
-    leaves only become visible on the next poll. Allow at least one full cycle
-    plus headroom so the test is not racing the cadence.
+    For a ReplicatedMergeTree source, system.partition_exports is served from the
+    in-memory mirror, which is refreshed on (a) the periodic poll tick and (b)
+    status changes. While the task is still PENDING (e.g. transient part-export
+    failures with a generous max_retries), no status watch fires, so newly written
+    per-replica exception leaves only become visible on the next poll. Allow at
+    least one full cycle plus headroom so the test is not racing the cadence.
     """
     start_time = time.time()
     last_exception_count = None

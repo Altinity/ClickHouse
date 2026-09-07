@@ -79,7 +79,6 @@
 #include <Poco/JSON/Stringifier.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageReplicatedMergeTree.h>
-#include <Storages/System/StorageSystemReplicatedPartitionExports.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeSinkPatch.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsLock.h>
@@ -4825,7 +4824,7 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
     }
 }
 
-std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
+std::vector<PartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
 {
     return export_merge_tree_partition_manifest_updater->getPartitionExportsInfo();
 }

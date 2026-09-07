@@ -182,8 +182,6 @@ std::vector<PartitionExportInfo> MergeTreePartitionExportScheduler::getInfo() co
     {
         const auto & descriptor = entry.getDescriptor();
         PartitionExportInfo info;
-        info.source_database = descriptor.source_database;
-        info.source_table = descriptor.source_table;
         info.destination_database = descriptor.destination_database;
         info.destination_table = descriptor.destination_table;
         info.create_time = descriptor.create_time;
@@ -194,10 +192,25 @@ std::vector<PartitionExportInfo> MergeTreePartitionExportScheduler::getInfo() co
         info.parts_count = descriptor.partsCount();
         info.parts_to_do = descriptor.partsToDo();
         info.status = String(magic_enum::enum_name(descriptor.status));
-        info.last_exception_message = descriptor.last_exception.message;
-        info.last_exception_part = descriptor.last_exception.part;
-        info.last_exception_time = descriptor.last_exception.time;
+
+        /// A single node exports on its own, so there is at most one "per-replica" entry and it
+        /// carries an empty replica name.
+        if (descriptor.last_exception.count > 0)
+        {
+            info.last_exception_per_replica.push_back(
+                {/*replica*/ "", descriptor.last_exception.message, descriptor.last_exception.part,
+                 descriptor.last_exception.time, descriptor.last_exception.count});
+        }
         info.exception_count = descriptor.last_exception.count;
+
+        for (const auto & part : descriptor.parts)
+            if (!part.paths_in_destination.empty())
+                info.destination_file_paths_per_part.emplace(part.part_name, part.paths_in_destination);
+
+        info.backoff_per_part.reserve(entry.part_backoff.size());
+        for (const auto & [part_name, backoff] : entry.part_backoff)
+            info.backoff_per_part.push_back({part_name, backoff.attempts, backoff.next_retry_time});
+
         result.push_back(std::move(info));
     }
     return result;

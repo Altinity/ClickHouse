@@ -135,7 +135,7 @@ public:
     CancellationCode killExportPartition(const String & transaction_id) override;
 
     /// Snapshot of local partition-export tasks for `system.partition_exports`. No disk I/O.
-    std::vector<PartitionExportInfo> getPartitionExportsInfo() const;
+    std::vector<PartitionExportInfo> getPartitionExportsInfo() const override;
 
 private:
     friend class MergeTreePartitionExportScheduler;

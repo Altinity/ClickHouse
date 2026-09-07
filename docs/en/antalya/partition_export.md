@@ -9,11 +9,13 @@ The `ALTER TABLE EXPORT PARTITION` command exports entire partitions from `Merge
 
 The set of parts that are exported is based on the list of parts the replica that received the export command sees. On `Replicated*MergeTree`, the other replicas will assist in the export process if they have those parts locally. Otherwise they will ignore it.
 
-The partition export tasks can be observed through `system.replicated_partition_exports` (for `Replicated*MergeTree`) or `system.partition_exports` (for plain `MergeTree`). Both tables are served from an in-memory mirror, so queries do not contact ZooKeeper or disk and are cheap to run. The `system.replicated_partition_exports` mirror is refreshed on the manifest-updater poll cycle and on every status change, so a freshly written exception or terminal state may take up to one poll interval to appear. Individual part export progress can be observed as usual through `system.exports`.
+The partition export tasks of both engines can be observed through `system.partition_exports`. The table is served from an in-memory mirror, so queries do not contact ZooKeeper or disk and are cheap to run. For a `Replicated*MergeTree` source the mirror is refreshed on the manifest-updater poll cycle and on every status change, so a freshly written exception or terminal state may take up to one poll interval to appear; for a plain `MergeTree` source it is updated synchronously with every state change. Individual part export progress can be observed as usual through `system.exports`.
+
+`system.replicated_partition_exports` is kept as an alias of `system.partition_exports` for backwards compatibility. It returns exactly the same rows, including exports of plain `MergeTree` tables. Filter on `source_table` (or join against `system.tables`) if you need only one engine.
 
 The same partition can not be exported to the same destination more than once. There are two ways to override this behavior: either by setting the `export_merge_tree_partition_force_export` setting or waiting for the task to expire.
 
-The export task can be killed by issuing the kill command: `KILL EXPORT PARTITION <where predicate for system.replicated_partition_exports>`.
+The export task can be killed by issuing the kill command: `KILL EXPORT PARTITION <where predicate for system.partition_exports>`.
 
 The task is persistent - it should be resumed after crashes, failures and etc.
 
@@ -188,19 +190,19 @@ WHERE partition_id = '2020'
   AND destination_table = 's3_table'
 ```
 
-The `WHERE` clause filters exports from the `system.replicated_partition_exports` table (for `Replicated*MergeTree`) and the `system.partition_exports` table (for plain `MergeTree`); a single `KILL EXPORT PARTITION` consults both. You can use any columns common to those tables in the filter (for example `partition_id`, `source_table`, `destination_table`).
+The `WHERE` clause filters exports from the `system.partition_exports` table, which covers both `Replicated*MergeTree` and plain `MergeTree` sources, so a single `KILL EXPORT PARTITION` targets either engine. You can use any column of that table in the filter (for example `partition_id`, `source_table`, `destination_table`).
 
 ## Monitoring
 
 ### Active and Completed Exports
 
-Monitor partition exports using the `system.replicated_partition_exports` table:
+Monitor partition exports using the `system.partition_exports` table:
 
 ```sql
-arthur :) select * from system.replicated_partition_exports Format Vertical;
+arthur :) select * from system.partition_exports Format Vertical;
 
 SELECT *
-FROM system.replicated_partition_exports
+FROM system.partition_exports
 FORMAT Vertical
 
 Query id: 9efc271a-a501-44d1-834f-bc4d20156164
@@ -262,30 +264,42 @@ Status values include:
 - `FAILED` - Export failed
 - `KILLED` - Export was cancelled
 
+The `parts` column lists every part the task exports, including the ones already finished, and `parts_count` is its size. `parts_to_do` is only meaningful for a plain `MergeTree` source, where it decreases as parts finish; for a `Replicated*MergeTree` source it currently stays equal to `parts_count` for the whole lifetime of the task.
+
 ### Exception columns
 
-- `last_exception_per_replica` is an `Array(Tuple(replica String, message String, part String, time DateTime, count UInt64))`. Each tuple is the most recent exception observed by a single replica plus a best-effort within-replica `count`. Replicas that have never reported an exception are omitted.
+- `last_exception_per_replica` is an `Array(Tuple(replica String, message String, part String, time DateTime, count UInt64))`. Each tuple is the most recent exception observed by a single replica plus a best-effort within-replica `count`. Replicas that have never reported an exception are omitted. A plain `MergeTree` export runs on a single node, so it contributes at most one tuple and its `replica` is empty.
 - `exception_count` is the sum of every `count` in `last_exception_per_replica`. Each replica owns its own counter, so cross-replica updates do not race; the sum is exact w.r.t. the snapshot returned. Within a single replica concurrent failing writers may under-count by one.
 
 ### Per-part destination file paths
 
-- `destination_file_paths` is a `Map(String, Array(String))` keyed by source part name. Each value is the list of file paths written to the destination object storage when that part was exported (a single part can produce multiple files depending on `max_bytes` / `max_rows`). If a refresh cannot read a processed entry from ZooKeeper, the affected key holds the sentinel `<failed to read from zk>` instead of silently under-counting.
+- `destination_file_paths` is a `Map(String, Array(String))` keyed by source part name. Each value is the list of file paths written to the destination object storage when that part was exported (a single part can produce multiple files depending on `max_bytes` / `max_rows`). On a `Replicated*MergeTree` source, if a refresh cannot read a processed entry from ZooKeeper, the affected key holds the sentinel `<failed to read from zk>` instead of silently under-counting.
 
 ### Commit info columns
 
-These columns surface paths produced by the destination storage during commit, so it is possible to inspect what was written without consulting the destination directly:
+These columns surface paths produced by the destination storage during commit, so it is possible to inspect what was written without consulting the destination directly. They are populated for `Replicated*MergeTree` sources only; a plain `MergeTree` does not persist the commit paths, so they stay empty there even after a successful commit.
 
 - `committed_metadata_file` — for Iceberg destinations: path of the new `vN.metadata.json` written by the commit. Empty for non-Iceberg destinations and before the commit lands. If the commit was already finished by a previous run (detected via the transaction id stored in the snapshot summary), this column carries a human-readable sentinel string instead of a path because the original committer's paths are not recoverable from inside the impl.
 - `committed_manifest_list` — for Iceberg destinations: path of the manifest list file (`snap-*.avro`) referenced by the new snapshot. Empty under the same conditions as `committed_metadata_file`.
 - `committed_manifest_file` — for Iceberg destinations: path of the manifest file referenced by `committed_manifest_list`. Empty under the same conditions as `committed_metadata_file`.
 - `committed_marker_file` — for plain object storage destinations: path of the per-transaction commit marker file written by the destination. Empty for Iceberg destinations and for tasks that have not committed yet.
 
+### Columns that depend on the source engine
+
+Rows for plain `MergeTree` sources share the schema with replicated ones, and leave the columns that only make sense with cross-replica coordination empty:
+
+- `source_replica` — empty, since there is a single node.
+- `last_exception_per_replica` — at most one tuple, with an empty `replica`.
+- `committed_metadata_file`, `committed_manifest_list`, `committed_manifest_file`, `committed_marker_file` — always empty.
+
+`local_backoff_per_part` is local to the node answering the query for both engines.
+
 To pick the latest exception across replicas:
 
 ```sql
 SELECT
     arraySort(x -> -x.time, last_exception_per_replica)[1] AS latest_exception
-FROM system.replicated_partition_exports
+FROM system.partition_exports
 WHERE source_table = 'rmt_table' AND destination_table = 's3_table';
 ```
 
