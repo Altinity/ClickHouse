@@ -1,6 +1,7 @@
 import csv
 import logging
 import os
+import shutil
 import socket
 import sys
 from pathlib import Path
@@ -312,6 +313,14 @@ def run_stress_test(upgrade_check: bool = False) -> None:
     exit_code = Shell.run(run_command)
 
     Utils.fix_ownership_after_docker(temp_path, docker_image)
+
+    # ci/tmp is not uploaded. Copying here rather than from stress_runner.sh runs
+    # whatever the container's exit code, so a job that aborts early still publishes
+    # rustfs.log -- the only record of what the pool side did behind a CAS disk.
+    for helper_log in ("rustfs.log", "minio.log", "azurite.log", "kafka.log"):
+        src = temp_path / helper_log
+        if src.is_file():
+            shutil.copy(src, result_path / helper_log)
 
     core_files = ClickHouseService.collect_cores(cores_path)
 

@@ -323,11 +323,8 @@ start_server 10 || { echo "Failed to start server"; exit 1; }
 
 check_server_start
 
-# clickhouse-local cannot claim a CAS server-root (its uuid is all-zero), so
-# dump system logs via the still-running server that owns the root.
-if [[ "$USE_CAS_S3_STORAGE_FOR_MERGE_TREE" == "1" || "$USE_CAS_STORAGE_FOR_MERGE_TREE" == "1" ]]; then
-    collect_query_and_trace_logs --client
-fi
+# The server may be killed rather than shut down, so don't rely on the shutdown flush.
+clickhouse-client --receive_timeout 30 -q "SYSTEM FLUSH LOGS" ||:
 
 stop_server
 
@@ -341,14 +338,6 @@ check_logs_for_critical_errors
 
 tar -chf /test_output/coordination.tar /var/lib/clickhouse/coordination ||:
 
-if [[ "$USE_CAS_S3_STORAGE_FOR_MERGE_TREE" != "1" && "$USE_CAS_STORAGE_FOR_MERGE_TREE" != "1" ]]; then
-    collect_query_and_trace_logs
-fi
+collect_query_and_trace_logs
 
 mv /var/log/clickhouse-server/stderr.log /test_output/
-
-# The job uploads /test_output only, and rustfs.log is the sole record of
-# pool-side S3 failures (412 mismatches, 503 saturation) behind a CAS disk.
-if [[ -f /repo/ci/tmp/rustfs.log ]]; then
-    zstd --threads=0 -o /test_output/rustfs.log.zst /repo/ci/tmp/rustfs.log ||:
-fi

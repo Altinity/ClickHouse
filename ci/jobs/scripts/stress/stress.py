@@ -133,8 +133,6 @@ def get_options(i: int, upgrade_check: bool, encrypted_storage: bool) -> str:
     # this flag those tests still run and fail against a CAS disk.
     if os.environ.get("USE_CAS_S3_STORAGE_FOR_MERGE_TREE") == "1":
         options.append("--cas-s3-storage")
-    elif os.environ.get("USE_CAS_STORAGE_FOR_MERGE_TREE") == "1":
-        options.append("--cas-storage")
 
     if upgrade_check:
         # Disable settings randomization for upgrade checks to prevent test failures caused by missing settings in old version
