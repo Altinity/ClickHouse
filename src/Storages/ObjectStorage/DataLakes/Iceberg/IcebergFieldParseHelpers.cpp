@@ -107,6 +107,14 @@ std::optional<Field> deserializeFieldFromBinaryRepr(const std::string & str, Dat
     auto column = non_nullable_type->createColumn();
     if (WhichDataType(non_nullable_type).isDecimal())
     {
+        /// The unscaled value is accumulated in an `Int64` below, so only `Decimal32` and `Decimal64`
+        /// bounds can be represented. Bail out before doing any arithmetic for the wider decimals:
+        /// their scale can exceed 18 and computing `scaler` for it overflows `Int64`.
+        const auto * decimal32_type = checkDecimal<Decimal32>(*non_nullable_type);
+        const auto * decimal64_type = checkDecimal<Decimal64>(*non_nullable_type);
+        if (!decimal32_type && !decimal64_type)
+            return std::nullopt;
+
         /// Iceberg store decimal values as unscaled value with two's-complement big-endian binary
         /// using the minimum number of bytes for the value
         /// Our decimal binary representation is little endian
@@ -149,18 +157,14 @@ std::optional<Field> deserializeFieldFromBinaryRepr(const std::string & str, Dat
             unscaled_value += scaler;
         }
 
-        if (const auto * decimal_type = checkDecimal<Decimal32>(*non_nullable_type))
+        if (decimal32_type)
         {
-            DecimalField<Decimal32> result(static_cast<Int32>(unscaled_value), decimal_type->getScale());
-            return result;
-        }
-        if (const auto * decimal_type = checkDecimal<Decimal64>(*non_nullable_type))
-        {
-            DecimalField<Decimal64> result(unscaled_value, decimal_type->getScale());
+            DecimalField<Decimal32> result(static_cast<Int32>(unscaled_value), decimal32_type->getScale());
             return result;
         }
 
-        return std::nullopt;
+        DecimalField<Decimal64> result(unscaled_value, decimal64_type->getScale());
+        return result;
     }
 
     if (non_nullable_type->getTypeId() == TypeIndex::Variant)
