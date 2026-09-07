@@ -418,11 +418,11 @@ def get_credentials_profile_events(node, query_id):
 def get_auth_token_profile_events(node, query_id):
     node.query("SYSTEM FLUSH LOGS")
     refreshed = int(node.query(
-        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenRefreshed'] "
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenRetrieve'] "
         f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
     ))
     cache_hits = int(node.query(
-        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenCacheHits'] "
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenCachedValid'] "
         f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
     ))
     return refreshed, cache_hits
@@ -450,24 +450,35 @@ def test_auth_token_profile_events(started_cluster):
         properties={"write.metadata.compression-codec": "none"},
     )
 
-    # The catalog client is initialized lazily on the first database access,
-    # not during CREATE DATABASE. OAuth credentials must use client_id:client_secret
-    # format; oauth_server_uri points to a mock token endpoint in docker compose.
-    create_clickhouse_iceberg_database(
-        started_cluster,
-        node,
-        db_name,
-        additional_settings={
-            "catalog_credential": "test:secret",
-            "oauth_server_uri": MOCK_OAUTH_URL,
-        },
+    # CREATE DATABASE eagerly builds the RestCatalog (lazy init is only for ATTACH),
+    # so the OAuth token is retrieved during CREATE, not during the first SHOW TABLES.
+    # OAuth credentials must use client_id:client_secret format; oauth_server_uri points
+    # to a mock token endpoint in docker compose.
+    settings = {
+        "catalog_type": "rest",
+        "warehouse": "demo",
+        "storage_endpoint": "http://minio1:9001/warehouse-rest",
+        "catalog_credential": "test:secret",
+        "oauth_server_uri": MOCK_OAUTH_URL,
+    }
+    node.query("SET allow_experimental_database_iceberg=true")
+    node.query(f"DROP DATABASE IF EXISTS {db_name}")
+    create_qid = f"{test_ref}-create-{uuid.uuid4()}"
+    node.query(
+        f"""
+CREATE DATABASE {db_name} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
+SETTINGS {",".join((k + "=" + repr(v) for k, v in settings.items()))}
+        """,
+        query_id=create_qid,
     )
+    refreshed, _ = get_auth_token_profile_events(node, create_qid)
+    assert refreshed >= 1
 
     qid1 = f"{test_ref}-show-1-{uuid.uuid4()}"
     node.query(f"SHOW TABLES FROM {db_name}", query_id=qid1)
     assert table_name in node.query(f"SHOW TABLES FROM {db_name}")
     refreshed, cache_hits = get_auth_token_profile_events(node, qid1)
-    assert refreshed >= 1
+    assert refreshed == 0 and cache_hits >= 1
 
     qid2 = f"{test_ref}-show-2-{uuid.uuid4()}"
     node.query(f"SHOW TABLES FROM {db_name}", query_id=qid2)
