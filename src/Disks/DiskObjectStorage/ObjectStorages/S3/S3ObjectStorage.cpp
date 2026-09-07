@@ -336,9 +336,12 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
         request_settings[S3RequestSetting::max_single_read_retries] = 1;
         if (credentials_refresh_callback)
         {
-            /// Captures the client SLOT and a copy of the callback, never `this`: the buffer this
-            /// returns can outlive the storage, and a credential expiry firing afterwards would
-            /// otherwise install a fresh client into a destroyed object.
+            /// Captures the client SLOT and a copy of the caller's refresh callback, never this
+            /// storage's `this`: the buffer this returns can outlive the storage, and a credential
+            /// expiry firing afterwards would otherwise install a fresh client into a destroyed
+            /// object. The copied callback can itself capture a shorter-lived object --
+            /// `StorageS3Configuration::createObjectStorage`'s refresher captures the configuration
+            /// it was built from -- so the caller must keep that object alive as long as the buffer.
             refresh_callback = [client_slot = client, refresh = credentials_refresh_callback]()
                 -> std::unique_ptr<const S3::Client>
             {
