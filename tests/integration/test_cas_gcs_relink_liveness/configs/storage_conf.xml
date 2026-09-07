@@ -5,6 +5,8 @@
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
                 <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
                 <!-- Both replicas mount ONE pool in the fake's `hmacbucket`; each owns its own server-root
                      subtree. The placeholder is replaced per node by the fixture before the restart. -->
                 <cas_server_root_id>__SERVER_ROOT_ID__</cas_server_root_id>

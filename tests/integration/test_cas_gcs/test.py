@@ -154,7 +154,10 @@ def start_cluster():
             "<endpoint>http://fakegcs:8080/hmacbucket/cas-fuse/</endpoint>"
             "<http_client>gcs_hmac</http_client><access_key_id>GOOG1EFAKEACCESSKEYID</access_key_id>"
             "<secret_access_key>fake-goog4-hmac-secret</secret_access_key>"
-            "<cas_attempt_timeout_ms>200</cas_attempt_timeout_ms></cas_gcs_hmac_fuse></disks>",
+            "<cas_attempt_timeout_ms>200</cas_attempt_timeout_ms>"
+            "<http_keep_alive_timeout>30</http_keep_alive_timeout>"
+            "<http_keep_alive_max_requests>10000</http_keep_alive_max_requests>"
+            "</cas_gcs_hmac_fuse></disks>",
         )
         node.replace_in_config(
             CONFIG_IN_CONTAINER,

@@ -15,7 +15,9 @@ A `CAS` disk is an `object_storage` disk with `metadata_type` set to `cas` and a
 `cas_server_root_id`. The recommended shape layers a `type=cache` disk in front of it — the local
 filesystem cache absorbs repeated reads of the same blob, while the `CAS` disk underneath stays the
 single source of truth the pool's other members and GC also read from. The storage policy references
-the **cached** disk, not the raw `CAS` disk directly:
+the **cached** disk, not the raw `CAS` disk directly. `http_keep_alive_timeout` and
+`http_keep_alive_max_requests` are set here for the reason explained under
+[recommended keep-alive settings](#recommended-keep-alive-settings):
 
 ```xml
 <clickhouse>
@@ -29,6 +31,8 @@ the **cached** disk, not the raw `CAS` disk directly:
                 <endpoint>https://bucket.s3.amazonaws.com/cas/</endpoint>
                 <access_key_id>...</access_key_id>
                 <secret_access_key>...</secret_access_key>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
             </cas>
             <cas_cache>
                 <type>cache</type>
@@ -133,6 +137,38 @@ The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic
 `system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck; it never
 authorizes a reclaim or a GC fence-out. Local fencing is derived instead from the confirmed
 request's pre-I/O `CLOCK_BOOTTIME` anchor plus the TTL.
+
+## Recommended keep-alive settings {#recommended-keep-alive-settings}
+
+On a `CAS` disk, set `http_keep_alive_timeout` to `30` and `http_keep_alive_max_requests` to `10000`,
+alongside the disk's other settings:
+
+```xml
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <cas_server_root_id>{replica}</cas_server_root_id>
+                <endpoint>https://example-bucket.s3.amazonaws.com/cas/</endpoint>
+                <access_key_id>...</access_key_id>
+                <secret_access_key>...</secret_access_key>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+            </ca>
+        </disks>
+    </storage_configuration>
+</clickhouse>
+```
+
+The generic S3 default, `http_keep_alive_max_requests = 100`, is the whole lifetime of a
+connection under `CAS`'s control-plane request rate rather than a headroom margin: every ~100
+requests, a connection is torn down and recreated, and its local port then cycles through
+`TIME_WAIT`. Under sustained load this churn exhausts the ephemeral port range
+(`EADDRNOTAVAIL`) and starves the mount-lease renewal request. Raising the two settings above
+removes that churn, with no measured cost.
 
 ## Advanced GC pacing settings {#advanced-gc-pacing-settings}
 

@@ -263,6 +263,8 @@ def _disk_xml(
             "                <cas_gc_interval_sec>3600</cas_gc_interval_sec>",
             "                <gcs_max_conditional_put_bytes>{}</gcs_max_conditional_put_bytes>".format(FORMER_CONDITIONAL_PUT_CAP),
             "                <cas_staging_backend>{}</cas_staging_backend>".format(staging_backend),
+            "                <http_keep_alive_timeout>30</http_keep_alive_timeout>",
+            "                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>",
         ]
     lines += [
         "                <endpoint>{}/{}/{}/{}/</endpoint>".format(GCS_ENDPOINT, _xml(bucket or BUCKET), _xml(PREFIX), _xml(subprefix)),

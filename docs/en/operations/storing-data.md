@@ -467,7 +467,9 @@ and the [`system.cas_gc_log`](/operations/system-tables/cas_gc_log),
 [content-addressed storage documentation](/antalya/cas) for the architecture, operations
 runbooks, and a live-validated quick start.
 
-Configuration:
+Configuration: `http_keep_alive_timeout` and `http_keep_alive_max_requests` are set here for the
+reason explained under
+[recommended keep-alive settings](/antalya/cas/configuration#recommended-keep-alive-settings).
 
 ```xml
 <s3_cas>
@@ -476,6 +478,8 @@ Configuration:
     <metadata_type>cas</metadata_type>
     <endpoint>https://s3.eu-west-1.amazonaws.com/clickhouse-eu-west-1.clickhouse.com/data/</endpoint>
     <use_environment_credentials>1</use_environment_credentials>
+    <http_keep_alive_timeout>30</http_keep_alive_timeout>
+    <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
 
     <cas_server_root_id>server-{replica}</cas_server_root_id>
     <cas_scratch_path>disks/s3_cas/cas_scratch/</cas_scratch_path>
