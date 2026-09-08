@@ -71,6 +71,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -377,6 +378,24 @@ void Gc::runNamespaceJanitorPage(
     t.metric("janitor_keys", janitor_result.keys);
     t.metric("janitor_deleted", janitor_result.deleted);
     t.metric("leaked", janitor_result.leaked);
+}
+
+uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<WriteOnceKey> & chunk, const Retry & policy)
+{
+    try
+    {
+        op.removeManyWriteOnce(chunk, policy);
+        return 1;
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::NOT_IMPLEMENTED)
+            throw;
+        for (const WriteOnceKey & key : chunk)
+            op.removeManyWriteOnce({key}, policy);
+        /// +1: the failed bulk attempt above is itself a call this helper made.
+        return 1 + chunk.size();
+    }
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy,
@@ -1108,8 +1127,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         {
             if (chunk.empty())
                 return;
-            op.removeManyWriteOnce(chunk, Retry::standard());
-            ++requests;
+            /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here;
+            /// `chunk_entries`' per-key bookkeeping below is unaffected either way -- it counts objects
+            /// that are gone after this call returns, not how many requests it took to get them there.
+            requests += removeChunkWriteOnceOrOneByOne(op, chunk, Retry::standard());
             for (const auto * entry : chunk_entries)
             {
                 ++report.manifests_deleted;
@@ -3666,7 +3687,10 @@ void Gc::cleanupRefObjects(
             std::vector<WriteOnceKey> chunk(cohort.begin() + begin, cohort.begin() + end);
             if (!authorityHolds(chunk.front().str()))
                 return;
-            op.removeManyWriteOnce(chunk, Retry::standard());
+            /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here.
+            /// The budget and the profile event below count OBJECTS in `chunk`, which is the same
+            /// `chunk.size()` whichever way `removeChunkWriteOnceOrOneByOne` actually sent them.
+            removeChunkWriteOnceOrOneByOne(op, chunk, Retry::standard());
             work_budget.ref_cleanup_objects_used += chunk.size();
             ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted, chunk.size());   /// cleanup object deletion
             /// Advance by what was actually sent, not the nominal chunk size: the budget cap above can

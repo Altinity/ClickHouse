@@ -25,6 +25,7 @@ using namespace DB::Cas::tests;
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int NOT_IMPLEMENTED;
 }
 
 namespace ProfileEvents
@@ -998,6 +999,69 @@ TEST(CASRefGc, RefObjectCleanupDeletesExactlyThePlannedSet)
         if (!deleted_snapshots.contains(id))
             EXPECT_TRUE((*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value())
                 << "snapshot " << renderRefTxnId(id) << " not in the plan must survive";
+}
+
+/// The same planned set as above, but the object storage rejects the cohort's one bulk
+/// `removeManyWriteOnce` as NOT_IMPLEMENTED (a GCS-backed pool): `cleanupRefObjects`' call site falls
+/// back to one admitted request per key (`removeChunkWriteOnceOrOneByOne`, CasGc.h), and the outcome --
+/// which keys are gone, and the budget/profile-event accounting -- must be identical to the plain
+/// bulk-request path above.
+TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    fixture::admitLive(*backend, store->layout(), ns);
+
+    const ManifestRef r1 = mref(1);
+    const ManifestRef r2 = mref(2);
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    const uint64_t v1 = publishCommittedTransition(*backend, layout, ns, "t1", std::nullopt, r1);
+    const uint64_t v2 = publishCommittedTransition(*backend, layout, ns, "t2", std::nullopt, r2);
+
+    RefTableSnapshot old_snap = minimalLiveSnapshot(ns.string(), RefTxnId{1, v1},
+        {committedRow("t1", r1)});
+    RefTableSnapshot new_snap = minimalLiveSnapshot(ns.string(), RefTxnId{1, v2},
+        {committedRow("t1", r1), committedRow("t2", r2)});
+    writeRefSnapshotRaw(*backend, layout, old_snap);
+    writeRefSnapshotRaw(*backend, layout, new_snap);
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, v2},
+        .checkpoint_snapshot_id = RefTxnId{1, v2},
+        .last_epoch_seal = std::nullopt,
+    });
+
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    const RefTableListing listing{
+        .logs = {RefTxnId{1, v1}, RefTxnId{1, v2}},
+        .snapshots = {RefTxnId{1, v1}, RefTxnId{1, v2}}};
+    const RefTxnId durable_cursor{1, v2};
+    const RefTxnId checkpoint_snapshot_id{1, v2};
+    const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint_snapshot_id, std::nullopt);
+    const uint64_t cohort_size = plan.deletable_logs.size() + plan.deletable_snapshots.size();
+    ASSERT_GT(cohort_size, 0u) << "the fixture must actually have something to delete for this test to prove anything";
+
+    /// One armed failure: the cohort's own bulk `removeManyWriteOnce` call fails as "batch delete not
+    /// supported"; the fallback's per-key calls that follow are not armed and succeed.
+    backend->failNextBulkRemoveWith(std::make_exception_ptr(
+        DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete")));
+    const auto cleaned_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+
+    OperationForTest op(*backend);
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    for (const RefTxnId & id : plan.deletable_logs)
+        EXPECT_FALSE((*op).head(layout.refLogKey(life, id), Retry::once()).has_value());
+    for (const RefTxnId & id : plan.deletable_snapshots)
+        EXPECT_FALSE((*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value());
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load() - cleaned_before, cohort_size)
+        << "the budget/profile-event accounting counts objects, unaffected by the fallback";
+    /// 1 failed bulk attempt + one request per key in the cohort.
+    EXPECT_EQ(backend->bulkRemoveCalls(), 1 + cohort_size);
 }
 
 /// Task 13 (spec §implementation-impact / §GC Budget): one fold+clean round increments every ref-intake

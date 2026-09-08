@@ -126,6 +126,12 @@ public:
         const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request) override;
 
     /// One `DeleteObjects` for the given objects (the caller chunks to at most 1000); absence is success.
+    /// Exactly one object is always a plain `DeleteObject` instead (never gated on `s3_capabilities`: a
+    /// single physical request per call, so there is nothing here for that capability to say no to).
+    /// For more than one object, throws `NOT_IMPLEMENTED` without sending anything once `DeleteObjects`
+    /// is known unsupported (a configured or a just-learned `S3Capabilities::isBatchDeleteSupported() ==
+    /// false`) -- this storage never substitutes a per-key loop of its own, since the caller is the one
+    /// that can admit each physical delete as its own request.
     void removeObjectsIfExistUnderProfile(
         const StoredObjects & objects, const ObjectStorageControlRequest & request) override;
 

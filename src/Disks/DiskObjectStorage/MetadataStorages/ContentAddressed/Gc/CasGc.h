@@ -71,6 +71,28 @@ enum class UniversePolicy : uint8_t
 /// decision ever reads them.
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len);
 
+/// Deletes `chunk` as one bulk `removeManyWriteOnce` request, falling back to one admitted request per
+/// key when the object storage answers with `NOT_IMPLEMENTED` -- the signal
+/// `S3ObjectStorage::removeObjectsIfExistImpl` gives (without sending anything else itself) once
+/// `DeleteObjects` is known unsupported (a configured GCS backend, or one that just failed a batch
+/// attempt this same call). The fallback is not merely "the same deletes issued more slowly": each
+/// `op.removeManyWriteOnce({key}, policy)` is its OWN admission (fence, budget, deadline checked
+/// afresh), which one bulk call covering up to `kBulkDeleteMaxKeys` physical deletes under a SINGLE
+/// admission cannot be -- exactly the gap a storage-side per-key loop would have left open. Every other
+/// failure propagates unchanged: retry/reissue for it is the engine's own policy, applied to each
+/// admitted attempt -- bulk or single -- the same way it always was.
+///
+/// Returns the number of `op.removeManyWriteOnce` calls THIS HELPER issued: 1 for the bulk path, or
+/// 1 + `chunk.size()` for the fallback -- the failed bulk attempt counted alongside the one call per key
+/// that followed it, since that attempt is a call this helper made whether or not it reached the network
+/// (there is no signal available here to tell "sent and rejected" apart from "refused locally, unsent";
+/// `S3ObjectStorage::removeObjectsIfExistImpl` reports both as the same NOT_IMPLEMENTED). This is call
+/// COUNT, not a distinct network-request count -- the same granularity `CountingBackend::bulkRemoveCalls`
+/// and the `CASBulkDeleteRequests` profile event already use elsewhere for "request".
+/// Declared here (not file-local) so a unit test can drive it directly against a scripted backend,
+/// rather than only through a full GC round.
+uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<WriteOnceKey> & chunk, const Retry & policy);
+
 /// Pure skip-unchanged decision. Returns true iff the current round may be
 /// DEFERRED (re-adopt the sealed generation, no fold/delete). A round MUST fold when: enough shards
 /// changed (>= fold_threshold), OR a destructive decision is due (graduation_due), OR the defer bound

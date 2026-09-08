@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 
 /// The manifest_deletes phase sends owner-removed manifest bodies to the store in chunks of
@@ -13,6 +14,11 @@
 namespace ProfileEvents
 {
     extern const Event CASBulkDeleteRequests;
+}
+
+namespace DB::ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
 }
 
 using namespace DB::Cas;
@@ -84,6 +90,33 @@ TEST(CASGCManifestBulkDelete, FiveBodiesInChunksOfTwoAreThreeRequests)
     EXPECT_EQ(deleted, 5u);
     EXPECT_EQ(backend->bulkRemoveCalls(), 3u) << "2 + 2 + 1";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests].load() - requests_before, 3u);
+    OperationForTest op(*backend);
+    for (const ManifestId & id : ids)
+        EXPECT_FALSE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());
+}
+
+/// The object storage rejects the chunk's one bulk `removeManyWriteOnce` as NOT_IMPLEMENTED (a
+/// GCS-backed pool): the phase's `flush()` falls back to one admitted request per key
+/// (`removeChunkWriteOnceOrOneByOne`, CasGc.h), and every manifest in the chunk is still recorded
+/// deleted -- the per-key event emission this phase does is unaffected by how the deletes were sent.
+TEST(CASGCManifestBulkDelete, NotImplementedFallsBackToOneRequestPerKeyAndStillRecordsAllOfThem)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                .gc_fold_max_defer_rounds = 0});
+    const auto ids = seedDroppedManifests(*backend, store->layout(), 5);
+
+    /// One armed failure: the chunk's own bulk attempt (all 5 land in one chunk under the default
+    /// chunk size) fails as "batch delete not supported"; the 5 single-key fallback calls that follow
+    /// are not armed and succeed.
+    backend->failNextBulkRemoveWith(std::make_exception_ptr(
+        DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete")));
+
+    Gc gc(store, kGc);
+    const uint64_t deleted = reclaim(gc, store, *backend, ids, 16);
+
+    EXPECT_EQ(deleted, 5u) << "the per-key fallback must still record every manifest as deleted";
+    EXPECT_EQ(backend->bulkRemoveCalls(), 6u) << "1 failed bulk attempt + 5 single-key fallback requests";
     OperationForTest op(*backend);
     for (const ManifestId & id : ids)
         EXPECT_FALSE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());
