@@ -200,22 +200,6 @@ A deposed leader may keep running, but correctness does not rely on exclusive ex
 
 The lease is therefore **work de-duplication, not mutual exclusion**.
 
-### 1.7 Phase costs {#phase-1-costs}
-
-Without token conflicts, phase 1 sends:
-
-| Result | `<pool_prefix>/gc/state` `GET` | `<pool_prefix>/gc/hb` `GET` | `<pool_prefix>/gc/state` conditional `PUT` (`CAS`) | Total |
-|---|---:|---:|---:|---:|
-| `Acquire` | 1 | 0 | 1 | 2 |
-| `Renew` | 1 | 0 | 1 | 2 |
-| `Follower` | 1 | 1 | 0 | 2 |
-| `Steal` | 1 | 1 | 1 | 3 |
-
-Each acquire or renew token conflict (the conditional `PUT` loses because the `gc/state` token
-changed) adds two requests. A lost `Steal` adds one final `gc/state` `GET`, raising its total to four
-requests. A heartbeat pulse runs outside this phase and costs one `gc/hb` `GET` and one conditional
-`PUT`.
-
 ## Phase 2: pre-fold ref drain {#phase-2-pre-fold-ref-drain}
 
 Phase 2 completes namespace removals that were proved safe by the last committed folding round. It
@@ -325,11 +309,11 @@ catalog entries:
    remains; after the eligible set empties, re-read `<pool_prefix>/gc/state` a final time before
    declaring the drain complete.
 
-The two `<pool_prefix>/gc/state` re-reads around every write are why phase 2 issues `2N + 1` state
-`GET`s for `N` removed rows (see the [phase costs](#phase-2-costs) below). The catalog row is
-removed by replacing the whole catalog with `CAS`; this is not a backend `DELETE`. The mandatory
-catalog re-read distinguishes a completed removal, replacement by a new incarnation, and a token
-conflict that still left the old entry present.
+Every write is bracketed by two `<pool_prefix>/gc/state` re-reads (see
+[per-phase backend cost](#per-phase-cost)). The catalog row is removed by replacing the whole
+catalog with `CAS`; this is not a backend `DELETE`. The mandatory catalog re-read distinguishes a
+completed removal, replacement by a new incarnation, and a token conflict that still left the old
+entry present.
 
 ### 2.5 Result {#phase-2-result}
 
@@ -345,23 +329,6 @@ Phase 2 does not change `<pool_prefix>/gc/state` or the parent fold seal, create
 read ref-log bodies, or physically delete namespace data, manifests, or blobs. Its result is a
 barrier: phase 3 starts only after all catalog removals already authorized by the parent have been
 resolved.
-
-### 2.6 Phase costs {#phase-2-costs}
-
-If `snap_generation` is `0`, phase 2 sends no requests to the storage backend.
-
-Otherwise, let `N` be the number of eligible catalog rows removed without conflicts. Phase 2 sends:
-
-| Key | Operation | Requests |
-|---|---|---:|
-| `<pool_prefix>/gc/gen/<generation>/attempt/<attempt>/fold_seal` | `GET` | 1 |
-| `<pool_prefix>/cas/ref_catalog` | `GET` | `N + 1` |
-| `<pool_prefix>/gc/state` | `GET` | `2N + 1` |
-| `<pool_prefix>/cas/ref_catalog` | conditional `PUT` (`CAS`) | `N` |
-
-The total is `4N + 3` backend requests: `3N + 3` reads and `N` writes. Each catalog token conflict
-(the conditional `PUT` loses because the catalog token changed, but the old row remains) adds four
-requests.
 
 ## Phase 3: heartbeat floor {#phase-3-heartbeat-floor}
 
@@ -470,24 +437,6 @@ events; phase 4 receives no direct input from them.
 Phase 3 does not delete mount objects or user data. It may write `gc_fenced = true` even when the
 round later returns as `Deferred` or destructive GC work is suppressed.
 
-### 3.6 Phase costs {#phase-3-costs}
-
-The phase enumerates the subtree to find the `/mount` object of every known `server_root_id`. Let
-`P` be the number of backend `LIST` requests used by this enumeration, `M` the number of `/mount`
-keys found, `F` the number of successful fence-outs, and `C` the number of fence-out token
-conflicts. Each `LIST` response contains up to 1000 keys. A normal server root has three keys
-(`owner`, `epoch`, and `mount`), so with `R` complete server roots, `P` is usually
-`ceil(3R / 1000)`, while `M = R`. A completed phase sends:
-
-| Key | Operation | Requests |
-|---|---|---:|
-| `<pool_prefix>/gc/server-roots/` | paginated `LIST` | `P` |
-| `<pool_prefix>/gc/server-roots/<server_root_id>/mount` | `GET` | `M + C` |
-| `<pool_prefix>/gc/server-roots/<server_root_id>/mount` | conditional `PUT` | `F + C` |
-
-The total is `P + M + F + 2C` backend requests. Each token conflict (the writer changes the mount
-token before the fence-out `PUT`) adds one `PUT` and one re-read.
-
 ## Phase 4: defer decision {#phase-4-defer-decision}
 
 Phase 4 builds one in-memory plan of ref-stream work and decides whether this execution needs a
@@ -584,21 +533,6 @@ failure after this decision does not restore the local counter.
 Phase 4 does not recheck the GC lease. If leadership changed, a stale plan remains local and a
 later round commit is rejected by the `gc/state` token.
 
-### 4.5 Phase costs {#phase-4-costs}
-
-Let `P` be the number of backend `LIST` requests needed to enumerate
-`<pool_prefix>/cas/ns/stream/`. Each response contains up to 1000 keys.
-
-| Key | Operation | Requests |
-|---|---|---:|
-| `<pool_prefix>/cas/ns/stream/` | paginated `LIST` | `P` |
-| `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
-| Adopted `fold_seal` | `GET` | 2 with an adopted generation; otherwise 1 |
-
-The total is `P + 3` backend requests with an adopted generation and `P + 2` on a fresh pool. The
-plan builder still probes the generation-zero `fold_seal` key on a fresh pool and accepts its
-absence; the separate graduation check skips that read. The phase sends no backend writes.
-
 ## Phase 5: parent seal read {#phase-5-parent-seal-read}
 
 Phase 5 reads the fold seal adopted before the current fold and copies its `blob_target_runs` into
@@ -669,15 +603,6 @@ phase 4, phase 5 gets an empty list; phase 7 checks the adopted seal again and r
 Phase 5 does not recheck the GC lease. A stale leader can keep the list in memory, but its later
 commit is still guarded by the phase 1 `gc/state` token.
 
-### 5.5 Phase costs {#phase-5-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| `<pool_prefix>/gc/gen/<snap_generation>/attempt/<snap_attempt>/fold_seal` | `GET` | 1 |
-
-The phase sends exactly one backend read and no writes. It does not send a `GET` for any
-`blob_target_runs[].key`.
-
 ## Phase 6: fold ref group {#phase-6-fold-ref-group}
 
 Phases 6 through 10 build the new generation. They run inside `Gc::fold` and only on the folding
@@ -722,10 +647,6 @@ The outputs are `ref_tables`, `root_shards` (one per admitted namespace), the st
 `catalog_cut_proved_empty`, and `ref_folding_aborted`. Metrics: `ref_keys_listed`,
 `namespaces_seen`, `ref_folding_aborted`.
 
-### 6.5 Phase costs {#phase-6-costs}
-
-The phase sends no backend requests. The keys are already in memory from phase 4.
-
 ## Phase 7: fold seal read {#phase-7-fold-seal-read}
 
 Phase 7 reads the adopted fold seal that anchors this fold's coverage and prepares the fold's base
@@ -743,9 +664,7 @@ The first read anchors coverage. If the object is absent while `snap_generation 
 reports `CORRUPTED_DATA`: `gc/state` points at a missing adopted artifact, and the fix is
 `SYSTEM CAS GC REBUILD`. The second read loads the parent run references. It returns the same
 generation, the same attempt, and the same bytes; nothing between the two reads touches the backend.
-On a folding round this is the fourth and fifth `GET` of this one key — phase 4 reads it twice and
-phase 5 once. When orphan-sweep planning runs in phase 9, it reads the same key a sixth time. The
-redundancy is measured, not yet removed.
+The full per-round count of adopted-seal reads is in [per-phase backend cost](#per-phase-cost).
 
 ### 7.2 Base inputs {#phase-7-base-inputs}
 
@@ -767,15 +686,6 @@ side-effect-free `HEAD` peek, and the graduation-gate marker check.
 
 Metrics: `seal_reads` (2), `redundant_reads` (1), `parent_ref_lives`, `dropped_parent_ref_lives`,
 `parent_runs`, `parent_cleanup_evidence`.
-
-### 7.4 Phase costs {#phase-7-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| Adopted `fold_seal` | `GET` | 2 |
-
-The phase sends no writes. On a fresh pool both reads return nothing and the fold starts from an
-empty baseline.
 
 ## Phase 8: fold ref intake {#phase-8-fold-ref-intake}
 
@@ -894,18 +804,6 @@ The phase records many metrics. The load-bearing ones are `frontier_namespaces` 
 `logs_accounted` / `logs_applied` — a control-flow identity that fails the round closed on a
 mismatch.
 
-### 8.7 Phase costs {#phase-8-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| `<pool_prefix>/cas/ns/state/<life_id>/_ckpt` | `GET` | one per namespace life in the universe, budget or not |
-| `_log` record from the first position up to `committed_through` | `GET` | one per record read; none for a namespace whose cursor already equals the ceiling |
-| `_log` record at an epoch start | `GET` | at least two per crossing (chain validation, then the ordinary fold read), plus one per epoch stepped back and one on a failed crossing |
-| Manifest body | `GET` | one per folded owner edge |
-
-An absent read (`absent_probes`) is a hold, not a routine per-namespace probe. The phase sends no
-writes.
-
 ## Phase 9: fold reduce {#phase-9-fold-reduce}
 
 Phase 9 recomputes the in-degree snapshot per shard and computes the round's single destructive
@@ -988,19 +886,6 @@ and `graduated` for phase 11), `suppress_destructive`, `frontier_complete`, and 
 `runs_written`, `condemned`, `graduated`, `spared`, `redelete_pending`, `unmatched_removes`,
 `suppress_destructive`, `frontier_complete`, `transactions_unapplied`.
 
-### 9.7 Phase costs {#phase-9-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| Referenced parent run segments | streaming `GET` | one per referenced run |
-| `<pool_prefix>/blobs/...` | `HEAD` | one per zero-in-degree candidate, plus one peek per carried entry that reached zero again |
-| Blob `.meta` | `GET` | one per graduation candidate with no in-process marker confirmation |
-| New run segments | `PUT` | one per written run |
-| `<pool_prefix>/cas/manifests/` | `LIST` | one bounded page, only when orphan planning runs |
-| Manifest candidate body | `GET` | one per candidate on the page, up to `manifest_sweep_delete_budget_keys` |
-| `gc/state`, adopted `fold_seal`, catalog | `GET` | one each, only when orphan planning runs |
-| `_ckpt` and committed-tail `_log` records | `GET` | per namespace on the page, only when orphan planning runs |
-
 The phase also schedules the round's async `.meta` condemn-marker writes — one per new condemn,
 and one retry per graduation candidate whose marker is not confirmed; phase 12 drains them.
 
@@ -1025,14 +910,6 @@ phase timer ends, `snap_generation` and `snap_attempt` are set in memory to `new
 ### 10.1 Result {#phase-10-result}
 
 Metrics: `seal_bytes`, `seal_runs`, `seal_ref_lives`, `seal_cleanup_evidence`.
-
-### 10.2 Phase costs {#phase-10-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| New `fold_seal` | `PUT` | 1, or one byte-compare `GET` on a deterministic replay |
-
-The phase sends no `CAS`.
 
 ## Phase 11: pending deletes {#phase-11-pending-deletes}
 
@@ -1082,16 +959,6 @@ commit `CAS` does not matter to the delete's safety.
 Metrics: `redeleted`, `graduated`, `deleted`, `absent`, `replaced`, `spared`,
 `outcome_logs_written`.
 
-### 11.6 Phase costs {#phase-11-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| Blob body | `DELETE` | one per `redelete` entry, plus one `HEAD` on the token-mismatch quirk path |
-| Per-shard outcome log | `PUT` | one per shard with settled entries, plus one `GET` on a write-once conflict |
-
-Under `suppress_destructive`, `redelete` is empty by construction and the phase deletes nothing; the
-bookkeeping and outcome logs still run.
-
 ## Phase 12: meta pool wait {#phase-12-meta-pool-wait}
 
 Phase 12 is a durability barrier. It drains the round's batch of async per-hash `.meta` writes
@@ -1114,11 +981,6 @@ framework failure propagates here and prevents the round commit.
 On an exception path that skips this barrier, a non-throwing drain in `runRegularRound`'s
 `SCOPE_EXIT` still waits for the same pool, so a throwing round never leaves its jobs running into
 the next round, where their confirmations would reach a graduation gate that never scheduled them.
-
-### 12.3 Phase costs {#phase-12-costs}
-
-The phase sends no backend request on the GC thread. It waits on the bounded `meta_pool`
-(`cas_gc_meta_pool_size`, default 16).
 
 ## Phase 13: round commit {#phase-13-round-commit}
 
@@ -1162,13 +1024,6 @@ un-commit it. See [the one-pass commit](#gc-state) for the fold seal's role as t
 
 Metrics: `generations_visited`, `pruned_through`, `generations_referenced`, `round`, `generation`.
 
-### 13.5 Phase costs {#phase-13-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| Pruned generation prefixes | `LIST` + wholesale `DELETE` | bounded per round |
-| `<pool_prefix>/gc/state` | `CAS` | exactly 1 |
-
 ## Phase 14: handoff reclaim {#phase-14-handoff-reclaim}
 
 Phases 14 through 18 are the post-`CAS` tail. They run only after a successful commit `CAS`.
@@ -1202,11 +1057,6 @@ the prefix is left to `fsck`.
 
 Metrics: `generations_reclaimed`, `objects_reclaimed`, `suppressed`.
 
-### 14.4 Phase costs {#phase-14-costs}
-
-One `LIST` plus a wholesale `DELETE` per handed-off generation prefix, bounded by the hand-off's own
-budget.
-
 ## Phase 15: manifest deletes {#phase-15-manifest-deletes}
 
 Phase 15 deletes owner-removed manifest bodies, now that phase 13's `CAS` adopted their minus-one
@@ -1233,10 +1083,6 @@ it runs; only a crash or `suppress_destructive` leaves an entry for the orphan-m
 ### 15.3 Result {#phase-15-result}
 
 Metrics: `attempted`, `deleted`, `suppressed`.
-
-### 15.4 Phase costs {#phase-15-costs}
-
-One `DELETE` per `mf_cleanup` entry. No writes under `suppress_destructive`.
 
 ## Phase 16: namespace cleanup {#phase-16-namespace-cleanup}
 
@@ -1267,17 +1113,6 @@ catch-all: any exception is logged as "namespace janitor skipped this round" and
 ### 16.4 Result {#phase-16-result}
 
 Metrics: `evidence_rows`, `janitor_pages`, `janitor_keys`, `janitor_deleted`, `leaked`.
-
-### 16.5 Phase costs {#phase-16-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| `<pool_prefix>/gc/maintenance_state` | `GET` | 1, for the durable `janitor_cursor` |
-| `<pool_prefix>/cas/ns/` | `LIST` | one page (up to 1000 keys) |
-| `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
-| `<pool_prefix>/gc/state` | `GET` | one per fence check |
-| Dead-life object | `DELETE` | one per object |
-| `<pool_prefix>/gc/maintenance_state` | `CAS` | 1 when the page is decided, plus 1 to reset a corrupt state |
 
 ## Phase 17: ref object cleanup {#phase-17-ref-object-cleanup}
 
@@ -1314,14 +1149,6 @@ the same remaining candidates next round.
 
 Metrics: `suppressed`, `trim_enabled`, `namespaces_planned`.
 
-### 17.5 Phase costs {#phase-17-costs}
-
-| Key | Operation | Requests |
-|---|---|---:|
-| `_log` / `_snap` candidate | `HEAD` | one per candidate |
-| `<pool_prefix>/cas/ref_catalog` and `<pool_prefix>/gc/state` | `GET` | one each per delete (authority re-validation) |
-| `_log` / `_snap` key | `DELETE` | one per planned key |
-
 ## Phase 18: orphan sweep {#phase-18-orphan-sweep}
 
 Phase 18 is the last phase. It executes the orphan-manifest sweep planned in phase 9 and adopted by
@@ -1352,10 +1179,6 @@ nomination list is empty and the cursor did not move.
 Metrics: `cursor_advanced`, `list_budget_keys`, `suppressed`, `listed`, `deleted`, `skipped`,
 `undecodable`, `retained_no_coverage`, `retained_hold`, `retained_unconsumed_seal`,
 `retained_tail_removal`.
-
-### 18.5 Phase costs {#phase-18-costs}
-
-One `DELETE` per nomination. The planning `LIST` and `GET` cost was paid in phase 9.
 
 ## The one-pass commit {#gc-state}
 
@@ -1451,7 +1274,7 @@ logs:
 |---|---|
 | `LIST cas/ns/stream/` | 1 full enumeration |
 | `LIST gc/server-roots/` | 1, plus 1 `GET` per mount |
-| `GET` the adopted fold seal | 5, explicitly instrumented |
+| `GET` the adopted fold seal | 5 on the fold path (phases 4, 5, 7); phase 9 orphan planning adds one more. See [per-phase backend cost](#per-phase-cost) |
 | `GET` ref logs | 1 per new log |
 | `GET` manifests | 1 per emitted edge — no manifest-body cache within a round |
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
@@ -1472,6 +1295,164 @@ the user-facing configuration surface.
 | Setting | Default | Bounds |
 |---|---|---|
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes |
+
+## Per-phase backend cost {#per-phase-cost}
+
+Backend requests each phase issues, by key and operation. These tables track the current
+implementation and are the expansion of [what a round costs](#round-cost); the request *shapes* are
+stable, exact per-round *counts* and any token-conflict retries are not. `N` is the number of items
+the phase acts on without conflicts; `P` is the number of paginated `LIST` requests (up to 1000
+keys each).
+
+### Phase 1 — lease {#cost-phase-1}
+
+| Result | `gc/state` `GET` | `gc/hb` `GET` | `gc/state` `CAS` |
+|---|---:|---:|---:|
+| `Acquire` | 1 | 0 | 1 |
+| `Renew` | 1 | 0 | 1 |
+| `Follower` | 1 | 1 | 0 |
+| `Steal` | 1 | 1 | 1 |
+
+A heartbeat pulse runs outside this phase: one `gc/hb` `GET` and one `CAS`.
+
+### Phase 2 — pre-fold ref drain {#cost-phase-2}
+
+No requests when `snap_generation` is `0`. Otherwise, for `N` removed catalog rows:
+
+| Key | Operation | Requests |
+|---|---|---:|
+| adopted `fold_seal` | `GET` | 1 |
+| `<pool_prefix>/cas/ref_catalog` | `GET` | `N + 1` |
+| `<pool_prefix>/gc/state` | `GET` | `2N + 1` (two re-reads bracket every write) |
+| `<pool_prefix>/cas/ref_catalog` | `CAS` | `N` |
+
+### Phase 3 — heartbeat floor {#cost-phase-3}
+
+`F` successful fence-outs over `M` mounts found by `P` `LIST` requests:
+
+| Key | Operation | Requests |
+|---|---|---:|
+| `<pool_prefix>/gc/server-roots/` | paginated `LIST` | `P` |
+| `<server_root_id>/mount` | `GET` | `M` |
+| `<server_root_id>/mount` | `CAS` | `F` |
+
+### Phase 4 — defer decision {#cost-phase-4}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| `<pool_prefix>/cas/ns/stream/` | paginated `LIST` | `P` |
+| `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
+| adopted `fold_seal` | `GET` | 2 with an adopted generation, otherwise 1 |
+
+No writes.
+
+### Phase 5 — parent seal read {#cost-phase-5}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| adopted `fold_seal` | `GET` | 1 |
+
+No writes. The `blob_target_runs[].key` run objects are not read here.
+
+### Phase 6 — fold ref group {#cost-phase-6}
+
+No requests. The keys are already in memory from phase 4.
+
+### Phase 7 — fold seal read {#cost-phase-7}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| adopted `fold_seal` | `GET` | 2 |
+
+No writes. On the fold path phases 4, 5 and 7 read the adopted seal 5 times in total; when phase 9
+runs orphan planning it reads the same key once more.
+
+### Phase 8 — fold ref intake {#cost-phase-8}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| `<life_id>/_ckpt` | `GET` | one per namespace life in the universe |
+| `_log` record up to `committed_through` | `GET` | one per record read; none when the cursor already equals the ceiling |
+| `_log` record at an epoch start | `GET` | at least two per crossing, plus one per epoch stepped back and one on a failed crossing |
+| manifest body | `GET` | one per folded owner edge |
+
+No writes.
+
+### Phase 9 — fold reduce {#cost-phase-9}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| referenced parent run segments | streaming `GET` | one per referenced run |
+| `<pool_prefix>/blobs/...` | `HEAD` | one per zero-in-degree candidate, plus one peek per carried entry that reached zero again |
+| blob `.meta` | `GET` | one per graduation candidate with no in-process marker confirmation |
+| new run segments | `PUT` | one per written run |
+| `<pool_prefix>/cas/manifests/` | `LIST` | one bounded page, only when orphan planning runs |
+| manifest candidate body | `GET` | one per candidate on the page (≤ `manifest_sweep_delete_budget_keys`), only when orphan planning runs |
+| `gc/state`, adopted `fold_seal`, catalog | `GET` | one each, only when orphan planning runs |
+| `_ckpt` and committed-tail `_log` | `GET` | per namespace on the page, only when orphan planning runs |
+
+Also schedules the async `.meta` condemn-marker writes drained by phase 12.
+
+### Phase 10 — fold seal write {#cost-phase-10}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| new `fold_seal` | `PUT` | 1, or one byte-compare `GET` on a deterministic replay |
+
+No `CAS`.
+
+### Phase 11 — pending deletes {#cost-phase-11}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| blob body | `DELETE` | one per `redelete` entry |
+| per-shard outcome log | `PUT` | one per shard with settled entries |
+
+Under `suppress_destructive`, `redelete` is empty and nothing is deleted; the outcome logs still run.
+
+### Phase 12 — meta pool wait {#cost-phase-12}
+
+No backend request on the GC thread. Waits on the bounded `meta_pool` (`cas_gc_meta_pool_size`,
+default 16).
+
+### Phase 13 — round commit {#cost-phase-13}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| pruned generation prefixes | `LIST` + wholesale `DELETE` | bounded per round |
+| `<pool_prefix>/gc/state` | `CAS` | exactly 1 |
+
+### Phase 14 — handoff reclaim {#cost-phase-14}
+
+One `LIST` plus a wholesale `DELETE` per handed-off generation prefix, within the hand-off's own
+budget.
+
+### Phase 15 — manifest deletes {#cost-phase-15}
+
+One `DELETE` per `mf_cleanup` entry. No writes under `suppress_destructive`.
+
+### Phase 16 — namespace cleanup {#cost-phase-16}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| `<pool_prefix>/gc/maintenance_state` | `GET` | 1 (durable `janitor_cursor`) |
+| `<pool_prefix>/cas/ns/` | `LIST` | one page |
+| `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
+| `<pool_prefix>/gc/state` | `GET` | one per fence check |
+| dead-life object | `DELETE` | one per object |
+| `<pool_prefix>/gc/maintenance_state` | `CAS` | 1 when the page is decided |
+
+### Phase 17 — ref object cleanup {#cost-phase-17}
+
+| Key | Operation | Requests |
+|---|---|---:|
+| `_log` / `_snap` candidate | `HEAD` | one per candidate |
+| `<pool_prefix>/cas/ref_catalog` and `<pool_prefix>/gc/state` | `GET` | one each per delete (authority re-validation) |
+| `_log` / `_snap` key | `DELETE` | one per planned key |
+
+### Phase 18 — orphan sweep {#cost-phase-18}
+
+One `DELETE` per nomination. The planning `LIST` and `GET` cost is paid in phase 9.
 
 ## Observability {#observability}
 
