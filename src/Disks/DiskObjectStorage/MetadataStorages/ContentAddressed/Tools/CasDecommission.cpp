@@ -149,11 +149,33 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(preflight_op, catalog_layout);
     catalog_cut.life_index.throwIfAmbiguous("CAS decommission");
 
+    /// `drain_now_fn`/`drain_sleep_fn` below replace the clock and sleep the STANDALONE `requests`
+    /// engine (opened further down) paces its own retries on, but `config.boot_ms_fn`/
+    /// `config.retry_sleep_fn` -- the seams `Pool::openForDecommission` itself constructs its
+    /// mount/farewell/GC planes with -- are distinct. Left unset, those planes retry on the real boot
+    /// clock and a real sleep, and a caller that fakes only the standalone engine's clock ends up
+    /// comparing it against an unrelated one at the mount lease's farewell bound (or, worse, against a
+    /// clock that only the standalone engine's sleep advances: a retry loop on `mount_requests`/
+    /// `gc_requests` bound to that frozen clock while actually sleeping for real would never see its
+    /// own deadline elapse). Fold BOTH into `config` here, together, unless the caller already asked
+    /// for a specific clock or sleep of its own -- installing only one of the two is exactly the
+    /// half-fix that leaves the other seam retrying forever.
+    if (drain_now_fn && drain_sleep_fn)
+    {
+        if (!config.boot_ms_fn)
+            config.boot_ms_fn = drain_now_fn;
+        if (!config.retry_sleep_fn)
+            config.retry_sleep_fn = drain_sleep_fn;
+    }
+
     config.event_sink = sink;
     PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
     if (drain_now_fn && drain_sleep_fn)
     {
-        /// `sweepNamespace` below issues its deletes on `admin`'s own GC plane.
+        /// Re-affirms the same values `config` above already installed on `mount_requests`/
+        /// `farewell_requests`/`gc_requests` at construction, and additionally wires `ref_ledger`'s own
+        /// retry sleep, which has no construction-time seam of its own. `sweepNamespace` below issues
+        /// its deletes on `admin`'s own GC plane.
         admin->setCasRequestNowFnForTest(drain_now_fn);
         admin->setCasRetrySleepForTest(drain_sleep_fn);
     }

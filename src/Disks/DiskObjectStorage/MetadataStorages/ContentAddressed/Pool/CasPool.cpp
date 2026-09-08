@@ -181,9 +181,9 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this](uint64_t g, uint64_t needed) { return mount_runtime.admit(g, needed); },
           [this](uint64_t g) { mount_runtime.checkFenceOrThrow(g); }},
           config.boot_ms_fn,
-          mountPlaneSleepFn(),
+          config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
           &hot_keys)
-    , farewell_requests(pool_backend, Fence::open(), config.boot_ms_fn, {}, &hot_keys)
+    , farewell_requests(pool_backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn, &hot_keys)
     /// The open plane's fence is the pool's teardown flag: generation 0 forever, exactly like
     /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
     /// flight is then refused at its next request instead of running to completion under a disk that
@@ -199,7 +199,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this](uint64_t, uint64_t) { return teardownBegun() ? Fence::Admit::LostOrRearmed : Fence::Admit::Ok; },
           [](uint64_t) {}},
           config.boot_ms_fn,
-          openPlaneSleepFn(),
+          config.retry_sleep_fn ? config.retry_sleep_fn : openPlaneSleepFn(),
           &hot_keys)
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
     /// established (fresh create, steady-state member, or a just-completed admission union) --
@@ -928,8 +928,11 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// observation wait -- see `mountWritable`). Owner anchor absent + mount absent = nothing to
     /// decommission.
     /// The open plane: this factory impersonates the victim to take its mount, so there is no lease of
-    /// ours to be gated on until the claim below establishes one.
-    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn);
+    /// ours to be gated on until the claim below establishes one. `config.retry_sleep_fn` must travel
+    /// with `config.boot_ms_fn`: a retry loop bound to a frozen test clock that only a fake sleep
+    /// advances would otherwise retry forever against this engine's default REAL sleep, which never
+    /// calls it -- the deadline it measures against would never appear to elapse.
+    CasRequests bootstrap_requests(backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn);
     CasOperation owner_op = bootstrap_requests.admit();
     std::optional<UInt128> victim_uuid = readOwnerUuid(owner_op, layout, victim_srid);
     if (!victim_uuid)

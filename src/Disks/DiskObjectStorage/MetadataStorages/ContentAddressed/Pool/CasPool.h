@@ -250,6 +250,15 @@ struct PoolConfig
     /// boot clock (`Pool::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
 
+    /// The inter-attempt sleep for the mount, farewell and GC request planes (`mount_requests`,
+    /// `farewell_requests`, `gc_requests`), installed at their CONSTRUCTION -- before this `Pool` has
+    /// claimed or read anything. Empty = each plane's own production default (an interruptible real
+    /// sleep for the mount and GC planes, `CasRequests`'s own real sleep for the farewell plane). A test
+    /// that also freezes `boot_ms_fn` must supply a matching sleep here: a retry loop bound to a clock
+    /// that only moves when this function is called would otherwise retry forever against a REAL sleep
+    /// that never calls it, because the deadline it measures against never appears to elapse.
+    std::function<void(uint64_t)> retry_sleep_fn = {};
+
     /// Test hook for open/remount waits: `Pool::waitSleep` -- the mount-claim observation loop's poll --
     /// routes through this function when set instead of a real `std::this_thread::sleep_for`, so a test
     /// observes every wait without actually blocking. Empty (the production default) sleeps for real.

@@ -82,6 +82,32 @@ private:
     bool latched = false;
 };
 
+/// Fails a read of one designated key a fixed number of times with a transient `Poco::TimeoutException`
+/// -- the class the request engine classifies as a transport failure and reissues -- before delegating
+/// to the base `InMemoryBackend`. Drives the owner-object read `Pool::openForDecommission` itself issues
+/// on the OPEN plane (`claimOwnerOrThrow` -> `readOwnerObject`, CasServerRoot.cpp) through a bounded
+/// number of paced retries DURING opening, before `decommissionPoolMember` gets a chance to install
+/// anything on the already-open `Pool`.
+class FlakyReadBackend : public InMemoryBackend
+{
+public:
+    void failReadNTimes(const String & key, int times) { flaky_key = key; remaining = times; }
+
+    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (key == flaky_key && remaining > 0)
+        {
+            --remaining;
+            throw Poco::TimeoutException("injected transient read failure for " + key);
+        }
+        return InMemoryBackend::read(key, access);
+    }
+
+private:
+    String flaky_key;
+    int remaining = 0;
+};
+
 /// Replaces the durable catalog immediately after returning the first armed catalog read. This
 /// distinguishes the immutable cut validated before decommission impersonation from a later mount
 /// safety observation without assuming those two decisions share one GET.
@@ -1309,11 +1335,17 @@ TEST(CASDecommission, FailedDrainKeepsSlotThenResumes)
     auto failing = std::make_shared<FailDeletesUnderPrefixBackend>(inner, "p/roots/victim/");
     /// The engine reissues an unresolved delete until its own retry window closes, measured on this
     /// clock, so the fault (armed across every reissue) reaches a genuine give-up with no real time
-    /// passing.
+    /// passing -- `clock` fast-forwards through the whole 90 s `Retry::standard()` window in one call.
+    /// `drain_now_fn` is also this session's boot clock (decommissionPoolMember unifies the two), so the
+    /// admin's own mount lease needs a TTL well past that fast-forward or the farewell it attempts on
+    /// the way out would refuse against a deadline the retry exhaustion already ran past -- a real
+    /// decommission's background renewer would have kept the deadline current over 90 real seconds, but
+    /// nothing here advances real time to let it.
     DB::Cas::tests::FakeClock clock;
     const auto first = decommissionPoolMember(
-        failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
-        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+        failing,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "a1", .mount_lease_ttl_ms = std::chrono::milliseconds(300'000)},
+        "victim", /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
     EXPECT_FALSE(first.warnings.empty());
     EXPECT_FALSE(first.slot_removed);
     EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
@@ -1382,6 +1414,73 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
     EXPECT_TRUE((*raw_op).head(debris_key, Retry::once()).has_value());
     EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
         << "the slot is still the resume anchor -- nothing was retired against unreclaimed debris";
+}
+
+/// CI run 7 (PR #2300): `drain_now_fn` fakes the drain's own request clock, but the mount lease's
+/// farewell deadline is bound to `PoolConfig::boot_ms_fn`, a distinct clock that -- before this test's
+/// fix -- stayed on the real boot clock regardless. On a freshly booted CI host (real boot time below
+/// `FakeClock`'s starting instant) the two clocks disagreed enough that the farewell's own bound looked
+/// already-expired, so `admin.reset()` released nothing and the slot was never retired -- passing locally
+/// only because a long-lived dev box's real uptime dwarfs the fake clock. Pin the fake clock far beyond
+/// ANY real host's boot time (rather than relying on the host actually being fresh) so the mismatch --
+/// and the fix -- are exercised deterministically on every machine.
+TEST(CASDecommission, DrainClockUnifiesWithTheFarewellBootClockRegardlessOfHostUptime)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = openVictim(backend); }   /// identity only -- no namespace, so retirement runs straight
+                                              /// to the farewell instead of stopping on an unrelated warning
+
+    DB::Cas::tests::FakeClock clock;
+    clock.now = 1'000'000'000'000'000ULL;   /// dwarfs any real CLOCK_BOOTTIME on any host
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
+        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_TRUE(report.slot_removed);
+    OperationForTest raw_op(*backend);
+    EXPECT_FALSE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
+        << "one clock for both the request engine and the mount lease -- the farewell must commit and the "
+           "slot must retire in a single call, with no leftover mount to resume against";
+}
+
+/// Review round 9r2: folding `drain_now_fn` into `config.boot_ms_fn` alone left `Pool::openForDecommission`'s
+/// own mount/farewell/GC planes -- constructed and used DURING opening, before `decommissionPoolMember`
+/// gets a chance to call `setCasRequestNowFnForTest`/`setCasRetrySleepForTest` on the already-open `Pool`
+/// -- retrying on a clock that only a fake SLEEP advances, while those planes still slept for REAL between
+/// attempts. A transient failure during opening (the owner-object read on the open plane) would then never
+/// see its own `Retry::standard()` deadline elapse, because the bound is measured against a clock frozen
+/// at the value it had when the retry loop started: nothing calls the fake clock's `sleepFn` from a path
+/// that still sleeps for real. `PoolConfig::retry_sleep_fn` closes this by installing the matching fake
+/// sleep on those same planes AT CONSTRUCTION, together with `boot_ms_fn`.
+///
+/// Failing-first without risking an actual hang: this fixture flakes the owner read 5 times, so a correct
+/// fix paces exactly 5 retries on the fake clock and returns in well under a second of real time; the
+/// pre-fix code either never returns (the bound never elapses) or, if it did return, would show an empty
+/// `clock.sleeps` (nothing ever called the fake sleep) and real wall time consumed by 5 real backoffs.
+TEST(CASDecommission, OpeningRetriesPaceOnTheSameFakeClockAndSleepAsTheDrain)
+{
+    auto backend = std::make_shared<FlakyReadBackend>();
+    { auto victim = openVictim(backend); }   /// identity only
+
+    const Layout layout("p");
+    backend->failReadNTimes(layout.ownerKey("victim"), /*times=*/5);
+
+    DB::Cas::tests::FakeClock clock;
+    clock.now = 1'000'000'000'000'000ULL;
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
+        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+    const auto wall_elapsed = std::chrono::steady_clock::now() - started;
+
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_TRUE(report.slot_removed);
+    EXPECT_FALSE(clock.sleeps.empty())
+        << "the opening retries must have been paced on the injected clock, not a real sleep";
+    EXPECT_LT(wall_elapsed, std::chrono::seconds(5))
+        << "paced on the fake clock, five retries during opening should cost no real wall time at all";
 }
 
 /// Task 5 (Task-1 carry-forward, escalated by review): preserve recovery from the legacy partial

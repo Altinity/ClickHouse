@@ -190,22 +190,32 @@ inline DB::ContentAddressedSettings makeSettingsForTest(const std::string & serv
 /// A clock that only ever moves when something sleeps on it, plus the record of every sleep it
 /// served. Injected into `CasRequests` so a policy's whole 90-second deadline is exercised in a test
 /// that takes no wall-clock time, and so the schedule itself -- how many pauses, how long -- becomes
-/// an assertion rather than a wait. Single-threaded by construction: two threads sharing one would
-/// race on both fields, so a concurrency test uses the real clock instead.
+/// an assertion rather than a wait. `now` is atomic and `sleeps` is mutex-guarded because a
+/// decommission session's background mount-lease renewer reads this same clock (via
+/// `PoolConfig::boot_ms_fn`) from its own thread while the caller's thread drives it forward through
+/// `sleepFn` -- relaxed ordering is enough since nothing here needs a happens-before relationship
+/// beyond the value eventually becoming visible; direct field reads from a single thread after the
+/// clock stops moving (the common case in this file's other users) are unaffected.
 struct FakeClock
 {
-    uint64_t now = 1'000'000;
+    std::atomic<uint64_t> now{1'000'000};
     std::vector<uint64_t> sleeps;
 
-    std::function<uint64_t()> nowFn() { return [this] { return now; }; }
+    std::function<uint64_t()> nowFn() { return [this] { return now.load(std::memory_order_relaxed); }; }
     std::function<void(uint64_t)> sleepFn()
     {
         return [this](uint64_t ms)
         {
-            sleeps.push_back(ms);
-            now += ms;
+            {
+                std::lock_guard lock(sleeps_mutex);
+                sleeps.push_back(ms);
+            }
+            now.fetch_add(ms, std::memory_order_relaxed);
         };
     }
+
+private:
+    std::mutex sleeps_mutex;
 };
 
 /// Run `fn`, expect a DB::Exception with EXACTLY `expected_code` (CORRUPTED_DATA-vs-NOT_IMPLEMENTED
