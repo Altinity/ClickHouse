@@ -17,9 +17,9 @@ enum class ObjectStorageRetryProfile : uint8_t
     SingleAttempt,
 };
 
-/// What a CAS control request carries into the object storage: the retry profile, the per-attempt
-/// budget and connect cap the storage's single-attempt client must honour, and the caller's own
-/// attempt number (0 = unset) so the HTTP client sees a reissue as attempt ≥ 2.
+/// A per-request override of retry behavior for an object storage call: which retry profile to use,
+/// the per-attempt budget and connect cap the storage's single-attempt client must honour, and the
+/// caller's own attempt number (0 = unset) so the HTTP client sees a reissue as attempt ≥ 2.
 struct ObjectStorageControlRequest
 {
     ObjectStorageRetryProfile profile = ObjectStorageRetryProfile::Default;

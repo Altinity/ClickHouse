@@ -36,10 +36,10 @@ struct WriteSettings
 
     bool s3_allow_parallel_part_upload = true;
     /// Overrides S3RequestSetting::check_objects_after_upload for this write (nullopt = no
-    /// override). Writers of CAS-MUTABLE keys (content-addressed shard manifests) set `false`:
-    /// such a key is legitimately replaced by a concurrent conditional PUT between this upload and
-    /// the check's HEAD, so the size comparison false-positives ("it's a bug in S3") under normal
-    /// contention. Integrity for those keys is the conditional PUT outcome + token, not a recheck.
+    /// override). A writer whose key can legitimately be replaced by a concurrent conditional PUT
+    /// between this upload and the check's HEAD sets `false`: otherwise the size comparison
+    /// false-positives ("it's a bug in S3") under normal contention. Integrity for such a key comes
+    /// from the conditional PUT outcome and token, not a recheck.
     std::optional<bool> s3_check_objects_after_upload_override;
     bool azure_allow_parallel_part_upload = true;
 
@@ -62,9 +62,9 @@ struct WriteSettings
     /// Overrides S3RequestSetting::max_unexpected_write_error_retries (default 4) for this write.
     /// WriteBufferFromS3::makeSinglepartUpload/completeMultipartUpload run their OWN retry loop above
     /// the S3 client that reissues the identical request (WITH its If-None-Match/If-Match condition)
-    /// on a NO_SUCH_KEY response — a second retry-affecting layer a client-level override
-    /// (a client-level profile override) does not reach. A CAS conditional write sets this to 1 for
-    /// exactly one attempt at this layer too (RFC cas-s3-timeout-retry-control). 0 = no override.
+    /// on a NO_SUCH_KEY response — a second retry-affecting layer a client-level profile override does
+    /// not reach. A conditional write that must not retry at that layer either sets this to 1 for
+    /// exactly one attempt. 0 = no override.
     size_t s3_max_unexpected_write_error_retries_override = 0;
 
     /// Selects the retry profile the object storage should execute this write under; see
@@ -80,7 +80,8 @@ struct WriteSettings
     uint64_t object_storage_connect_timeout_cap_ms = 0;
 
     /// The caller's own attempt number for the request built from these settings, 1-based; 0 leaves the
-    /// buffer's own numbering. A CAS reissue passes its count so the HTTP client sees attempt ≥ 2.
+    /// buffer's own numbering. A caller reissuing this write passes its count so the HTTP client sees
+    /// attempt ≥ 2.
     size_t object_storage_attempt_number = 0;
 
     /// Selects the transport requirement for an object storage copy; see `ObjectStorageCopyMode`.
