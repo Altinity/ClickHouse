@@ -534,10 +534,56 @@ jobs:
     secrets: inherit
 
   # CAS (content-addressed storage) is only available in Antalya builds >= 26.6.
-  # These jobs run the suites that support the `--cas` or `--cas-s3-cache` flag with
-  # a content-addressed disk as the default MergeTree storage. Gated on the Antalya
-  # version so they are never scheduled on upstream release builds where the `cas`
-  # metadata type does not exist.
+  # The dedicated `cas` suite, plus other suites run with `--cas` or `--cas-s3-cache`.
+  # Gated on the Antalya version so they are never scheduled on upstream release
+  # builds where the `cas` metadata type does not exist.
+  CASSuite:
+    if: |
+      contains(fromJson(inputs.workflow_config).workflow_config.custom_data.version.string, 'antalya') &&
+      (
+        fromJson(inputs.workflow_config).workflow_config.custom_data.ci_regression_jobs[0] == null ||
+        contains(fromJson(inputs.workflow_config).workflow_config.custom_data.ci_regression_jobs, 'cas')
+      )
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      workflow_config: ${{ inputs.workflow_config }}
+      suite_name: cas
+      suite_executable: regression.py
+      output_format: new-fails
+      flags: --with-analyzer
+      timeout_minutes: 180
+      runner_arch: ${{ inputs.arch }}
+      runner_type: ${{ inputs.runner_type }}
+      build_sha: ${{ inputs.build_sha }}
+      set_commit_status: true
+      job_name: cas
+    secrets: inherit
+
+  CASS3CacheSuite:
+    if: |
+      contains(fromJson(inputs.workflow_config).workflow_config.custom_data.version.string, 'antalya') &&
+      (
+        fromJson(inputs.workflow_config).workflow_config.custom_data.ci_regression_jobs[0] == null ||
+        contains(fromJson(inputs.workflow_config).workflow_config.custom_data.ci_regression_jobs, 'cas')
+      )
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      workflow_config: ${{ inputs.workflow_config }}
+      suite_name: cas
+      suite_executable: regression.py
+      output_format: new-fails
+      flags: --with-analyzer
+      timeout_minutes: 180
+      runner_arch: ${{ inputs.arch }}
+      runner_type: ${{ inputs.runner_type }}
+      build_sha: ${{ inputs.build_sha }}
+      set_commit_status: true
+      job_name: cas_s3_cache
+      regression_args: --cas-s3-cache
+    secrets: inherit
+
   CAS:
     if: |
       contains(fromJson(inputs.workflow_config).workflow_config.custom_data.version.string, 'antalya') &&
