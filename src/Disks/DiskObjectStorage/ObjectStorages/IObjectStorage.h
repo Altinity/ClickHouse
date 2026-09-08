@@ -374,7 +374,9 @@ public:
     /// Removes every object in ONE request with no per-key precondition; an absent object is success.
     /// Content-addressed callers use it for write-once keys only, at most 1000 per call. Throws on a
     /// request-level failure and on any per-key error other than "not found", naming the failed keys.
-    /// Same context note as `iterate`. Backends without a batch delete keep the default, which refuses.
+    /// Same context note as `iterate`: the default forwards a Default-profile request to
+    /// `removeObjectsIfExist` and refuses a SingleAttempt one, so a backend without a real batch
+    /// delete still needs to override this for SingleAttempt to behave correctly under that profile.
     virtual void removeObjectsIfExistUnderProfile(
         const StoredObjects & objects, const ObjectStorageControlRequest & request);
 

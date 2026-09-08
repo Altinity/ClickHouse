@@ -95,9 +95,11 @@ ConditionalRemoveResult IObjectStorage::removeObjectIfTokenMatches(
     return removeObjectIfTokenMatches(object, etag);
 }
 
-void IObjectStorage::removeObjectsIfExistUnderProfile(const StoredObjects &, const ObjectStorageControlRequest &)
+void IObjectStorage::removeObjectsIfExistUnderProfile(const StoredObjects & objects, const ObjectStorageControlRequest & request)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support batch removal under a retry profile", getName());
+    if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support batch removal under a retry profile", getName());
+    removeObjectsIfExist(objects);
 }
 
 ThreadPool & IObjectStorage::getThreadPoolWriter()
