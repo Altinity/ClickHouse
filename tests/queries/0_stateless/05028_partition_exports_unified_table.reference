@@ -1,9 +1,0 @@
-Both names expose the same schema
-OK
-Both engines are tracked in system.partition_exports
-mt_table_{db}	COMPLETED	1	1	0	1
-rmt_table_{db}	COMPLETED	1	1	0	0
-The alias returns the same rows
-0
-Replicated-only columns of the plain MergeTree row
-1	[]		0
