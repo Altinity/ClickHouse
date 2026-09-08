@@ -1725,6 +1725,13 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogCreateNamespaceMicroseconds);
         sendRequest(endpoint, request_body);
     }
+    catch (const DB::HTTPException & e)
+    {
+        if (e.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_CONFLICT)
+            LOG_DEBUG(log, "Namespace {} already exists", namespace_name);
+        else
+            DB::tryLogCurrentException(log);
+    }
     catch (...)
     {
         DB::tryLogCurrentException(log);
