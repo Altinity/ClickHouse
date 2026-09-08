@@ -264,8 +264,6 @@ Status values include:
 - `FAILED` - Export failed
 - `KILLED` - Export was cancelled
 
-The `parts` column lists every part the task exports, including the ones already finished, and `parts_count` is its size. `parts_to_do` is only meaningful for a plain `MergeTree` source, where it decreases as parts finish; for a `Replicated*MergeTree` source it currently stays equal to `parts_count` for the whole lifetime of the task.
-
 ### Exception columns
 
 - `last_exception_per_replica` is an `Array(Tuple(replica String, message String, part String, time DateTime, count UInt64))`. Each tuple is the most recent exception observed by a single replica plus a best-effort within-replica `count`. Replicas that have never reported an exception are omitted. A plain `MergeTree` export runs on a single node, so it contributes at most one tuple and its `replica` is empty.

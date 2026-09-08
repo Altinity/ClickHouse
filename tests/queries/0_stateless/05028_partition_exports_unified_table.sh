@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-shared-merge-tree
+# Tags: no-fasttest, no-shared-merge-tree, no-cas-storage
 # no-fasttest: requires S3 / MinIO.
 # no-shared-merge-tree: asserts that a plain MergeTree and a ReplicatedMergeTree export share one system table.
 
@@ -53,15 +53,13 @@ query "ALTER TABLE $rmt_table EXPORT PARTITION ID '2020' TO TABLE $s3_table"
 wait_for_status "$rmt_table" "COMPLETED"
 
 echo "Both engines are tracked in system.partition_exports"
-query "SELECT replaceOne(source_table, '$CLICKHOUSE_DATABASE', '{db}'), status, parts_count, length(parts), empty(source_replica) FROM system.partition_exports WHERE source_table IN ('$mt_table', '$rmt_table') ORDER BY 1"
+query "SELECT replaceOne(source_table, '$CLICKHOUSE_DATABASE', '{db}'), status, parts_count, length(parts), parts_to_do, empty(source_replica) FROM system.partition_exports WHERE source_table IN ('$mt_table', '$rmt_table') ORDER BY 1"
 
 echo "The alias returns the same rows"
 query "SELECT count() FROM (SELECT * FROM system.partition_exports WHERE source_table IN ('$mt_table', '$rmt_table') EXCEPT SELECT * FROM system.replicated_partition_exports WHERE source_table IN ('$mt_table', '$rmt_table'))"
 
-# parts_to_do is only asserted for the plain MergeTree row: a Replicated*MergeTree task never
-# decrements it, because the manifest znode holding the part list is written once at schedule time.
 echo "Replicated-only columns of the plain MergeTree row"
-query "SELECT parts_to_do, length(destination_file_paths), last_exception_per_replica, committed_metadata_file, committed_marker_file != '' FROM system.partition_exports WHERE source_table = '$mt_table'"
+query "SELECT length(destination_file_paths), last_exception_per_replica, committed_metadata_file, committed_marker_file != '' FROM system.partition_exports WHERE source_table = '$mt_table'"
 
 query "DROP TABLE IF EXISTS $mt_table"
 query "DROP TABLE IF EXISTS $rmt_table"

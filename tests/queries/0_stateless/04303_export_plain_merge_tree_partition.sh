@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-shared-merge-tree
+# Tags: no-fasttest, no-shared-merge-tree, no-cas-storage
 # no-fasttest: requires S3 / MinIO.
 # no-shared-merge-tree: this test exercises EXPORT PARTITION on a plain (non-replicated) MergeTree.
 
