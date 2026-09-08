@@ -1,6 +1,3 @@
--- Tags: no-fasttest
--- Tag no-fasttest: requires remote() table function
-
 SET allow_experimental_hybrid_table = 1;
 
 -- The EXPLAIN-based assertions below print plan shapes that some randomized session
