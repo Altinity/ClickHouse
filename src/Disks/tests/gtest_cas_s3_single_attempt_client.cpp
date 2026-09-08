@@ -16,6 +16,7 @@
 #include <Common/RemoteHostFilter.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
+#include <base/defines.h>
 
 #include <atomic>
 #include <chrono>
@@ -699,7 +700,18 @@ TEST(CASEnvelopeWiring, ProductionDispatchAppliesTheFrozenConnectCapAtConnectTim
                     .attempt_timeout_ms = single_attempt_timeout_ms,
                     .connect_timeout_cap_ms = single_attempt_connect_cap_ms});
         });
+        EXPECT_LT(capped_elapsed.count(), default_elapsed.count())
+            << "the cap must remove SOME of the connect budget, unconditionally";
+        /// A sanitizer build adds a roughly constant addend to both measurements, so the PRIMARY fence
+        /// is the DIFFERENCE the cap made, not an absolute bound: at least half of the connect budget it
+        /// removed.
+        EXPECT_GE(default_elapsed.count() - capped_elapsed.count(),
+                  (base_connect_timeout_ms - static_cast<long>(single_attempt_connect_cap_ms)) / 2);
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
+        /// Release builds keep the original tighter absolute bound too: sanitizer instrumentation
+        /// overhead is the only reason it was loosened to a difference above.
         EXPECT_LT(capped_elapsed.count(), 1000);
+#endif
     }
 
     /// Conditional DELETE: removeObjectIfTokenMatches's ObjectStorageControlRequest-taking overload.
@@ -722,7 +734,18 @@ TEST(CASEnvelopeWiring, ProductionDispatchAppliesTheFrozenConnectCapAtConnectTim
                     .attempt_timeout_ms = single_attempt_timeout_ms,
                     .connect_timeout_cap_ms = single_attempt_connect_cap_ms});
         });
+        EXPECT_LT(capped_elapsed.count(), default_elapsed.count())
+            << "the cap must remove SOME of the connect budget, unconditionally";
+        /// A sanitizer build adds a roughly constant addend to both measurements, so the PRIMARY fence
+        /// is the DIFFERENCE the cap made, not an absolute bound: at least half of the connect budget it
+        /// removed.
+        EXPECT_GE(default_elapsed.count() - capped_elapsed.count(),
+                  (base_connect_timeout_ms - static_cast<long>(single_attempt_connect_cap_ms)) / 2);
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
+        /// Release builds keep the original tighter absolute bound too: sanitizer instrumentation
+        /// overhead is the only reason it was loosened to a difference above.
         EXPECT_LT(capped_elapsed.count(), 1000);
+#endif
     }
 }
 
@@ -767,11 +790,12 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
     auto uncapped_backend = std::make_shared<DB::Cas::ObjectStorageBackend>(
         storage, DB::Cas::ObjectStorageBackend::Mode::Native,
         /*single_attempt_control_plane_=*/false, /*attempt_timeout_ms_=*/0, /*connect_timeout_cap_ms_=*/0);
+    std::chrono::milliseconds uncapped_elapsed{};
     {
         DB::Cas::CasRequests requests(DB::Cas::BackendPtr(uncapped_backend), DB::Cas::Fence::open());
         auto op = requests.admit();
-        const auto elapsed = expectConnectFailureAndMeasure([&] { (void)op.head("k", DB::Cas::Retry::once()); });
-        EXPECT_GE(elapsed.count(), 1500);
+        uncapped_elapsed = expectConnectFailureAndMeasure([&] { (void)op.head("k", DB::Cas::Retry::once()); });
+        EXPECT_GE(uncapped_elapsed.count(), 1500);
     }
 
     /// The derived cap, handed to the backend exactly as `openPoolView` constructs it (:812-822) for a
@@ -779,11 +803,26 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
     auto capped_backend = std::make_shared<DB::Cas::ObjectStorageBackend>(
         storage, DB::Cas::ObjectStorageBackend::Mode::Native,
         /*single_attempt_control_plane_=*/true, cas_attempt_timeout_ms, *cap);
+    /// Deterministic, non-timing corroboration alongside the timing assertions below: cheap because
+    /// `ObjectStorageBackend` already exposes its own budget, though it only proves the constructor
+    /// argument the line above passed was stored -- not that it reached the S3 client's actual connect
+    /// timeout, which only the timing assertions below can show.
+    EXPECT_EQ(capped_backend->connectTimeoutCapMs(), *cap);
     {
         DB::Cas::CasRequests requests(DB::Cas::BackendPtr(capped_backend), DB::Cas::Fence::open());
         auto op = requests.admit();
         const auto elapsed = expectConnectFailureAndMeasure([&] { (void)op.head("k", DB::Cas::Retry::once()); });
+        EXPECT_LT(elapsed.count(), uncapped_elapsed.count())
+            << "the cap must remove SOME of the connect budget, unconditionally";
+        /// A sanitizer build adds a roughly constant addend to both measurements, so the PRIMARY fence
+        /// is the DIFFERENCE the cap made, not an absolute bound: at least half of the connect budget it
+        /// removed.
+        EXPECT_GE(uncapped_elapsed.count() - elapsed.count(), (base_connect_timeout_ms - static_cast<long>(*cap)) / 2);
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
+        /// Release builds keep the original tighter absolute bound too: sanitizer instrumentation
+        /// overhead is the only reason it was loosened to a difference above.
         EXPECT_LT(elapsed.count(), 1000);
+#endif
     }
 }
 
