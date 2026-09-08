@@ -533,11 +533,6 @@ profiles:
             os.environ["LLVM_PROFILE_FILE"] = "ft-server-%m.profraw"
 
         env = os.environ.copy()
-        # Leave ASAN_OPTIONS at the sanitizer defaults here. Under ASan, a stateless run's resident set is
-        # proportional to the number of live server threads (each gets a fake stack via
-        # `detect_stack_use_after_return`), so when an ASan lane hits the memory ceiling, check the thread
-        # count first (`system.metrics` GlobalThread / LocalThread, `system.stack_trace` grouped by
-        # thread_name) rather than tuning ASan away from its defaults.
         env["TSAN_OPTIONS"] = " ".join(
             filter(
                 lambda x: x is not None,
@@ -844,9 +839,7 @@ fi
         command = bootstrap_vars + command
         if with_s3_storage:
             command = "USE_S3_STORAGE_FOR_MERGE_TREE=1\n" + command
-        # verbose: this step loads the stateful datasets and it is the only place in the job
-        # that can fail without printing anything at all, which is exactly what happened.
-        return Shell.check(command, verbose=True)
+        return Shell.check(command)
 
     def insert_system_zookeeper_config(self):
         for _ in range(10):
