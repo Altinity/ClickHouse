@@ -576,7 +576,16 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         case TypeIndex::Decimal64:
         case TypeIndex::Decimal128:
         case TypeIndex::Decimal256:
-            return {fmt::format("decimal({}, {})", getDecimalPrecision(*type), getDecimalScale(*type)), true};
+        {
+            /// The Iceberg spec caps `decimal(P, S)` at precision 38, while ClickHouse `Decimal256` goes up to 76.
+            /// A wider precision has no Iceberg representation, so refuse it instead of writing metadata that
+            /// other engines reject.
+            const UInt32 precision = getDecimalPrecision(*type);
+            if (precision > 38)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Iceberg decimal type supports precision up to 38, got {}", precision);
+            return {fmt::format("decimal({}, {})", precision, getDecimalScale(*type)), true};
+        }
         case TypeIndex::Tuple:
         {
             auto type_tuple = std::static_pointer_cast<const DataTypeTuple>(type);
