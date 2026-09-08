@@ -294,6 +294,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
         case FileContentType::POSITION_DELETE: {
             /// reference_file_path can be absent in schema for some reason, though it is present in specification: https://iceberg.apache.org/spec/#manifests
             const bool is_puffin = Poco::toLower(file_format) == "puffin";
+            const bool has_dv_offsets = content_offset.has_value() && content_size_in_bytes.has_value();
             std::optional<Iceberg::IcebergPathFromMetadata> lower_reference_data_file_path;
             std::optional<Iceberg::IcebergPathFromMetadata> upper_reference_data_file_path;
             bool bounds_set_by_referenced_data_file = false;
@@ -309,9 +310,9 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                     bounds_set_by_referenced_data_file = true;
                 }
             }
-            /// Parquet position deletes may fall back to file-path column bounds. Puffin deletion
+            /// Parquet position deletes may fall back to file-path column bounds. Deletion
             /// vectors must use the dedicated referenced_data_file field only.
-            if (!bounds_set_by_referenced_data_file && !is_puffin)
+            if (!bounds_set_by_referenced_data_file && !is_puffin && !has_dv_offsets)
             {
                 if (auto it = value_for_bounds.find(IcebergPositionDeleteTransform::data_file_path_column_field_id);
                     it != value_for_bounds.end())
@@ -326,13 +327,17 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
 
             if (is_puffin)
             {
-                if (!content_offset.has_value() || !content_size_in_bytes.has_value())
+                if (!has_dv_offsets)
                 {
                     throw Exception(
                         DB::ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                         "Puffin deletion vector entry in manifest file '{}' is missing content_offset or content_size_in_bytes",
                         manifest_file_path);
                 }
+            }
+
+            if (is_puffin || has_dv_offsets)
+            {
                 requireDirectReferencedDataFileForPuffinDeletionVector(
                     bounds_set_by_referenced_data_file, lower_reference_data_file_path, manifest_file_path);
             }
