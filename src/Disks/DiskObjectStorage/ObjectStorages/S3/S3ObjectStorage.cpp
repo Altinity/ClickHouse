@@ -1109,23 +1109,17 @@ void S3ObjectStorage::shutdown()
     /// This should significantly speed up shutdown process if S3 is unhealthy.
     const_cast<S3::Client &>(*client.get()).DisableRequestProcessing();
 
-    /// Parity with the main client above, not a stronger guarantee. `DisableRequestProcessing` cannot
-    /// prevent a request's INITIAL dispatch, and cannot interrupt an attempt already in flight: contrib/aws's
-    /// AWSClient checks it only after an attempt has already failed and returned, right before deciding
-    /// whether to retry (AWSClient.cpp, between `ShouldRetry` and the backoff sleep). Every cached clone
-    /// here runs `SingleAttemptRetryStrategy` (max_retries=0), whose `ShouldRetry` already always says no
-    /// -- so the flag is still consulted on a clone's failed attempt, it just changes nothing observable
-    /// there, since no retry was ever going to happen regardless of the flag's value.
-    ///
-    /// What actually stops a NEW request on the OPEN plane -- GC, FSCK, the probe; the plane the write-once
-    /// bulk-delete verb this storage serves runs on -- from being dispatched at all is admission, refused
-    /// earlier and on a different plane: `DiskObjectStorage::shutdown()` calls `metadata_storage->shutdown()`
-    /// (which arms `Pool::beginTeardown()`, tripping the open-plane fence `CasPool.cpp` wires to
-    /// `teardownBegun()`) BEFORE it calls this object storage's `shutdown()`, and `CasOperation::readLoop`
-    /// (CasRequests.h) checks that fence before every attempt, including the first -- so an open-plane
-    /// request issued after the disk's shutdown began throws at admission and never reaches a clone at
-    /// all. The mount and farewell planes are NOT covered by this: they intentionally stay admitting
-    /// through this same window, since teardown's own drain and farewell I/O run on them.
+    /// The SDK checks this flag only after an attempt has failed, right before deciding whether to
+    /// retry -- it neither blocks a request's initial dispatch nor interrupts one already in flight.
+    /// Every cached clone below runs `SingleAttemptRetryStrategy` (max_retries=0), so its retry strategy
+    /// never asks for a reissue; the one reissue the SDK makes on its own regardless of the strategy --
+    /// an `AWS_GLOBAL` client re-signing for the region a 301/307/400/403 reply names -- is what the
+    /// disabled flag stops on a clone, since that check runs before the region redirect is considered.
+    /// What actually blocks a NEW request on the CAS engine's open plane (GC, FSCK, the probe) after
+    /// shutdown began is admission, refused at `Pool::teardownBegun()` (`CasPool.cpp`), which
+    /// `CasOperation::readLoop` (`CasRequests.h`) checks before every attempt, including the first.
+    /// The mount and farewell planes stay admitting through this window, since teardown's own drain
+    /// and farewell I/O run on them.
     std::lock_guard lock(single_attempt_client_mutex);
     single_attempt_clients_disabled = true;
     for (const auto & [_, clone] : single_attempt_clients)
@@ -1279,11 +1273,9 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(uint64
 
     const auto & clone = single_attempt_clients.emplace(cache_key, base->cloneWithConfigurationOverride(cfg)).first->second;
 
-    /// A fresh clone's own `Aws::Http::HttpClient` starts with request processing enabled regardless of
-    /// the main client's state; kept in parity with `shutdown()` for the same reason that flag is set
-    /// there in the first place (see the comment on `shutdown()`) -- this does not, by itself, stop a
-    /// request already dispatched on this clone, which a single-attempt clone never reaches anyway once
-    /// admission is refused (see `shutdown()`).
+    /// A fresh clone starts with request processing enabled regardless of the main client's state, so
+    /// one built after shutdown() must be disabled to match it (see the comment on shutdown() for what
+    /// that flag does and does not do).
     if (single_attempt_clients_disabled)
         const_cast<S3::Client &>(*clone).DisableRequestProcessing();
 

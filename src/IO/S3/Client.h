@@ -236,9 +236,10 @@ public:
 
     using Aws::S3::S3Client::EnableRequestProcessing;
     using Aws::S3::S3Client::DisableRequestProcessing;
-    /// Lets a caller (a shutdown-state test, in particular) observe whether Enable/DisableRequestProcessing
-    /// last took effect on this client's own `Aws::Http::HttpClient`, without exposing the rest of the
-    /// privately-inherited `Aws::S3::S3Client` surface.
+    /// Test-only: lets a gtest observe whether Enable/DisableRequestProcessing last took effect on this
+    /// client's own `Aws::Http::HttpClient`, without exposing the rest of the privately-inherited
+    /// `Aws::S3::S3Client` surface. Production code reaches `GetHttpClient` directly (private
+    /// inheritance already permits that from this class's own methods) and has no need of this `using`.
     using Aws::S3::S3Client::GetHttpClient;
 
     void BuildHttpRequest(const Aws::AmazonWebServiceRequest& request,
