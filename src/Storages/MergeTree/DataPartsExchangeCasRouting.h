@@ -2,8 +2,23 @@
 
 #include <Core/Types_fwd.h>
 
+#include <memory>
 #include <optional>
 #include <vector>
+
+namespace DB
+{
+class IDisk;
+using DiskPtr = std::shared_ptr<IDisk>;
+using Disks = std::vector<DiskPtr>;
+}
+
+namespace Poco
+{
+class Logger;
+using LoggerPtr = std::shared_ptr<Logger>;
+}
+using LoggerPtr = Poco::LoggerPtr;
 
 namespace DB::DataPartsExchange
 {
@@ -45,6 +60,29 @@ std::optional<size_t> resolveForcedCaCandidate(
     const std::vector<CasRelinkCandidate> & candidates,
     const Strings & advertised_pools,
     const String & offered_pool_cookie);
+
+/// The outcome of resolving a relink offer against this receiver's candidates: the pool the offer is
+/// for (needed even when no disk is forced, to check a caller-supplied disk against it later), and the
+/// disk to force the fetch onto — null when the caller already supplied a disk, or no live-policy
+/// candidate matches the offered pool.
+struct ForcedCaDiskChoice
+{
+    String offered_pool;
+    DiskPtr disk;
+};
+
+/// Resolve a relink offer's pool, and — only when the caller left disk selection to the fetch itself —
+/// pick the forced candidate (`resolveForcedCaCandidate`) to place it on, ahead of the storage policy's
+/// own placement. `part_name` and `log` are for the log lines only; the `cas_relink_receiver_drop_forced_disk`
+/// failpoint (test-only) lives here so it can stand in for an offer this policy has no disk for.
+ForcedCaDiskChoice chooseForcedCaDisk(
+    bool caller_supplied_disk,
+    const std::vector<CasRelinkCandidate> & candidates,
+    const Disks & candidate_disks,
+    const Strings & advertised_pools,
+    const String & offered_pool_cookie,
+    const String & part_name,
+    LoggerPtr log);
 
 /// One content-addressed disk of the SENDING table's storage policy, as the confirm routing sees it.
 struct CasConfirmRoutingCandidate

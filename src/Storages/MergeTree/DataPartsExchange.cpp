@@ -58,9 +58,6 @@ namespace FailPoints
     /// Stands in for a sender that predates the `cas_pool_uuid` response cookie: the offer is made
     /// without naming the pool, and the receiver has to fall back on "the single advertised pool".
     extern const char cas_relink_sender_omit_pool_cookie[];
-    /// Stands in for an offer this policy has no disk for: the receiver forgets the forced disk it
-    /// resolved and must take the ordinary placement and a byte fetch.
-    extern const char cas_relink_receiver_drop_forced_disk[];
 }
 
 namespace MergeTreeSetting
@@ -840,24 +837,12 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     if (!ca_relink.empty())
     {
         const String offered_pool_cookie = parse<String>(in->getResponseCookie(CA_POOL_UUID_PARAM, ""));
-        offered_pool = resolveOfferedCasPool(advertised_pools, offered_pool_cookie);
-        if (!disk)
-        {
-            auto chosen = resolveForcedCaCandidate(ca_candidates, advertised_pools, offered_pool_cookie);
-            fiu_do_on(FailPoints::cas_relink_receiver_drop_forced_disk,
-            {
-                LOG_INFO(log, "Failpoint cas_relink_receiver_drop_forced_disk: forgetting the forced disk for part {}", part_name);
-                chosen.reset();
-            });
-            if (chosen)
-            {
-                forced_ca_disk = ca_candidate_disks[*chosen];
-                LOG_DEBUG(log, "Part {} is offered by relink for content-addressed pool {}; placing it on disk {} "
-                    "ahead of the storage policy's volume order and TTL rules", part_name, offered_pool, ca_candidates[*chosen].disk_name);
-                /// From here on the target is decided: every `!disk` reservation branch below is skipped.
-                disk = forced_ca_disk;
-            }
-        }
+        auto choice = chooseForcedCaDisk(
+            static_cast<bool>(disk), ca_candidates, ca_candidate_disks, advertised_pools, offered_pool_cookie, part_name, log);
+        offered_pool = std::move(choice.offered_pool);
+        /// From here on the target is decided: every `!disk` reservation branch below is skipped.
+        if (choice.disk)
+            disk = forced_ca_disk = choice.disk;
     }
 
     DiskPtr preffered_disk = disk;
