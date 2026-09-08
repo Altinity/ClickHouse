@@ -812,15 +812,12 @@ void WriteBufferFromS3::makeSinglepartUpload(WriteBufferFromS3::PartData && data
             }
             else
             {
-                /// PreconditionFailed is an expected response for conditional writes (e.g. If-None-Match: *),
-                /// not a genuine error — the caller handles it (see `S3::isPreconditionFailedError`), and it
-                /// says nothing to the operator.
-                if (S3::isPreconditionFailedError(outcome.GetError()))
-                    LOG_DEBUG(log, "S3Exception name {}, Message: {}, bucket {}, key {}, object size {}",
-                              outcome.GetError().GetExceptionName(), outcome.GetError().GetMessage(), bucket, key, content_length);
-                /// A SingleAttempt write is owned by an outer retry loop that resolves the outcome and
-                /// reissues; its one failed attempt is not terminal, so it is not an error.
-                else if (write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt)
+                /// Neither says anything to the operator: PreconditionFailed is an expected response for
+                /// conditional writes (e.g. If-None-Match: *), handled by the caller (see
+                /// `S3::isPreconditionFailedError`); a SingleAttempt write is owned by an outer retry loop
+                /// that resolves the outcome and reissues, so its one failed attempt is not terminal either.
+                if (S3::isPreconditionFailedError(outcome.GetError())
+                    || write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt)
                     LOG_DEBUG(log, "S3Exception name {}, Message: {}, bucket {}, key {}, object size {}",
                               outcome.GetError().GetExceptionName(), outcome.GetError().GetMessage(), bucket, key, content_length);
                 else
