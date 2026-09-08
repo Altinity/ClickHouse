@@ -667,13 +667,10 @@ jobs:
         include:
           - PART: 1
             FILTER: --only "/lightweight delete/disk space/*"
-            TIMEOUT: 360
           - PART: 2
             FILTER: --only "/lightweight delete/hard restart/*"
-            TIMEOUT: 240
           - PART: 3
             FILTER: --skip "/lightweight delete/disk space/*" "/lightweight delete/hard restart/*"
-            TIMEOUT: 360
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -682,7 +679,7 @@ jobs:
       suite_executable: regression.py
       output_format: new-fails
       flags: --with-analyzer
-      timeout_minutes: ${{ matrix.TIMEOUT }}
+      timeout_minutes: 240
       runner_arch: ${{ inputs.arch }}
       runner_type: ${{ inputs.runner_type }}
       part: ${{ matrix.PART }}
@@ -706,13 +703,10 @@ jobs:
         include:
           - PART: 1
             FILTER: --only "/lightweight delete/disk space/*"
-            TIMEOUT: 360
           - PART: 2
             FILTER: --only "/lightweight delete/hard restart/*"
-            TIMEOUT: 240
           - PART: 3
             FILTER: --skip "/lightweight delete/disk space/*" "/lightweight delete/hard restart/*"
-            TIMEOUT: 360
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -721,7 +715,7 @@ jobs:
       suite_executable: regression.py
       output_format: new-fails
       flags: --with-analyzer
-      timeout_minutes: ${{ matrix.TIMEOUT }}
+      timeout_minutes: 240
       runner_arch: ${{ inputs.arch }}
       runner_type: ${{ inputs.runner_type }}
       part: ${{ matrix.PART }}
