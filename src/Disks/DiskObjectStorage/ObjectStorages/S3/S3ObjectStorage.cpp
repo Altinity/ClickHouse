@@ -674,44 +674,17 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
     if (objects.empty())
         return;
 
-    /// A batch of exactly one object is always a plain `DeleteObject`, never `DeleteObjects` -- mirroring
-    /// `deleteFilesFromS3`'s own `keys.size() == 1` rule (IO/S3/deleteFileFromS3.cpp), which skips the
-    /// batch request for the same single key for the same reason: there is no need for it. This is what
-    /// makes the CAS-side per-key fallback actually delete anything on a backend with no `DeleteObjects`
-    /// at all (GCS): that backend rejects the VERB outright, not by key count, so a "batch" of one
-    /// object sent as `DeleteObjects` would fail there identically to a bigger one. A single physical
-    /// request is never a loop, so this does not reintroduce what the capability check below exists to
-    /// rule out.
+    /// A batch of exactly one object is a plain `DeleteObject`, never `DeleteObjects` -- the same rule
+    /// `deleteFilesFromS3` applies to a single key. This is what makes the CAS-side per-key fallback
+    /// work on a backend with no `DeleteObjects` at all (GCS): that backend rejects the verb itself, not
+    /// a key count, so a "batch" of one object sent as `DeleteObjects` would fail there too.
     if (objects.size() == 1)
     {
         const StoredObject & object = objects.front();
-        S3::DeleteObjectRequest request;
-        request.SetBucket(uri.bucket);
-        request.SetKey(object.remote_path);
-        if (attempt_seed != 0)
-            S3::setClickhouseAttemptNumber(request, attempt_seed);
-
-        ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
-        Stopwatch watch;
-        auto outcome = used_client->DeleteObject(request);
-        auto elapsed = watch.elapsedMicroseconds();
-
-        if (auto blob_storage_log = BlobStorageLogWriter::create(disk_name))
-            blob_storage_log->addEvent(BlobStorageLogElement::EventType::Delete,
-                                       uri.bucket, object.remote_path,
-                                       object.local_path, object.bytes_size, elapsed,
-                                       outcome.IsSuccess() ? 0 : static_cast<Int32>(outcome.GetError().GetErrorType()),
-                                       outcome.IsSuccess() ? "" : outcome.GetError().GetMessage());
-
-        if (outcome.IsSuccess())
-            return;
-
-        const auto & err = outcome.GetError();
-        if (S3::isNotFoundError(err.GetErrorType()))
-            return;
-
-        throw S3Exception(err.GetErrorType(), "{} (Code: {}) while removing object with path {} from S3",
-                          err.GetMessage(), static_cast<size_t>(err.GetErrorType()), object.remote_path);
+        deleteFileFromS3(used_client, uri.bucket, object.remote_path, /*if_exists=*/ true,
+                         BlobStorageLogWriter::create(disk_name), object.local_path, object.bytes_size,
+                         ProfileEvents::DiskS3DeleteObjects, attempt_seed);
+        return;
     }
 
     /// GCS has no `DeleteObjects`: a capability the config declared false, or that an earlier batch
