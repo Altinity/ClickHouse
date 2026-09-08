@@ -524,8 +524,13 @@ TEST(CASUpstreamSlice, NativeConditionalReadSettingMarksTheGetRequest)
     EXPECT_FALSE(plain_client->nativeConditionalMarks().at(0));
 }
 
-/// The buffer's own retry loop can straddle a replacement of the object: the first response is the old
-/// incarnation, the reissue the new one. The bytes handed back are then from neither one alone.
+/// The buffer's own retry loop can straddle a replacement of the object: the first response delivers
+/// some of the old incarnation's bytes to the consumer before its stream breaks mid-body, and the
+/// reissue answers with a different ETag. The bytes handed back are then from neither incarnation
+/// alone. `buffer_size` is pinned to 2 so the first fill (of "AAAA"'s 4 bytes) completes and is
+/// exposed to the consumer before the second fill hits the scripted mid-body failure - with the
+/// default (much larger) buffer, that failure happens inside the very first fill, before any byte of
+/// "e1" ever reaches the consumer, which is the "nothing to mix with" case covered below instead.
 TEST(CASUpstreamSlice, ReadSmallObjectThrowsWhenAReissueAnswersWithADifferentETag)
 {
     (void)getContext();
@@ -536,12 +541,31 @@ TEST(CASUpstreamSlice, ReadSmallObjectThrowsWhenAReissueAnswersWithADifferentETa
 
     DB::ReadSettings read_settings;
     read_settings.object_storage_request_mode = DB::ObjectStorageRequestMode::NativeConditional;
+    read_settings.remote_fs_settings.buffer_size = 2;
     /// Default profile here: the buffer's own multi-attempt loop is what straddles the replacement.
     expectThrowsCodeSaying(
         DB::ErrorCodes::CANNOT_READ_ALL_DATA,
         "response identity changed",
         [&] { storage->readSmallObjectAndGetObjectMetadata(DB::StoredObject("k"), read_settings, 1 << 20); });
 
+    EXPECT_EQ(client->getObjectCalls(), 2u);
+}
+
+/// Scoped to an identity change that actually mixed bytes: with the default (large) buffer, "e1"'s
+/// mid-body failure happens inside its very first fill attempt, before any byte crosses into the
+/// consumer's buffer - so the reissue under a different ETag is an ordinary retry of a request that
+/// never delivered anything, not a coherence problem, even though the ETag changed.
+TEST(CASUpstreamSlice, ReadSmallObjectAcceptsAReissueThatDeliveredNoBytesEvenWithADifferentETag)
+{
+    (void)getContext();
+
+    ScriptedGetObjectClient * client = nullptr;
+    auto storage = makeScriptedS3ObjectStorage(client);
+    client->script({okStep("\"e1\"", "AAAA", /*fail_mid_body=*/true), okStep("\"e2\"", "BBBB")});
+
+    const auto result = storage->readSmallObjectAndGetObjectMetadata(DB::StoredObject("k"), DB::ReadSettings{}, 1 << 20);
+    EXPECT_EQ(result.data, "BBBB");
+    EXPECT_EQ(result.metadata.etag, "\"e2\"");
     EXPECT_EQ(client->getObjectCalls(), 2u);
 }
 
