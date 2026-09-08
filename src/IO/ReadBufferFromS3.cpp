@@ -217,15 +217,9 @@ bool ReadBufferFromS3::nextImpl()
                 /// reaches this point (fails before delivering anything) never touches the baseline,
                 /// so any number of empty failed attempts in between are transparent to the check.
                 ///
-                /// Nothing here may throw: `last_delivering_response_etag = pending_response_etag`
-                /// used to be a copy, which can allocate and throw for a non-SSO ETag; if that throw
-                /// happened after `next_result` was already set to true, the catch block below resets
-                /// `impl` (since `processException` retries), but the loop's `!next_result` condition
-                /// is already false, so it exits with `impl` null while the code past the loop still
-                /// dereferences it. A `std::string` move is noexcept, so this block cannot throw; as a
-                /// second line of defense, `next_result` itself is set only once this block is done, so
-                /// even a future throwing addition here would leave the loop's retry invariant intact
-                /// instead of exiting with a dangling `impl`.
+                /// Must run before `next_result = delivered_more_data` below exits the loop via
+                /// `break`: a throw after that point would leave the loop exiting with `impl` null
+                /// (reset by the catch handler) while the code past the loop still dereferences it.
                 if (last_delivering_response_etag && *last_delivering_response_etag != pending_response_etag)
                     response_identity_changed = true;
                 last_delivering_response_etag = std::move(pending_response_etag);
