@@ -236,6 +236,10 @@ public:
 
     using Aws::S3::S3Client::EnableRequestProcessing;
     using Aws::S3::S3Client::DisableRequestProcessing;
+    /// Lets a caller (a shutdown-state test, in particular) observe whether Enable/DisableRequestProcessing
+    /// last took effect on this client's own `Aws::Http::HttpClient`, without exposing the rest of the
+    /// privately-inherited `Aws::S3::S3Client` surface.
+    using Aws::S3::S3Client::GetHttpClient;
 
     void BuildHttpRequest(const Aws::AmazonWebServiceRequest& request,
                           const std::shared_ptr<Aws::Http::HttpRequest>& httpRequest) const override;

@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcReadAhead.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
@@ -236,6 +237,35 @@ TEST(CASGCTeardownStop, OpenPlaneRefusesAfterTeardownBeganAndTheMountPlaneDoesNo
     ASSERT_TRUE(mount.read("p/probe", Retry::once()).has_value())
         << "the mount plane is not the open plane: teardown's own drain and farewell run on it";
     EXPECT_EQ(backend->getTotal(), 1u);
+}
+
+/// `removeManyWriteOnce` -- the verb the CAS GC bulk-delete phases call, and the one an
+/// `S3ObjectStorage`-backed pool ultimately dispatches to `removeObjectsIfExistUnderProfile` -- runs on
+/// the same open plane as `read` above, so a control-plane bulk delete issued after the disk's shutdown
+/// (which arms teardown on this plane before the object storage's own `shutdown()` even runs, see
+/// `DiskObjectStorage::shutdown()`) is refused at admission and never reaches the backend at all.
+TEST(CASGCTeardownStop, RemoveManyWriteOnceIsRefusedAfterTeardownBeganAndNeverReachesTheBackend)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPlainPool(backend);
+    {
+        CasOperation op = store->openRequests().admit();
+        orThrow(op.create("p/probe", "v", Retry::once()), "create");
+    }
+    backend->resetCounts();
+
+    store->beginTeardown();
+
+    const Layout layout{"p"};
+    const ManifestId manifest_id{RootNamespace{"probe/ns@cas@"},
+        ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1}};
+
+    CasOperation refused = store->openRequests().admit();
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        refused.removeManyWriteOnce({layout.writeOnceManifestKey(manifest_id)}, Retry::standard());
+    });
+    EXPECT_EQ(backend->deleteTotal(), 0u) << "a refused admission never reaches the backend, not even for one key";
 }
 
 /// The open plane's sleep is the interruptible one, in production wiring and after the test seam is
