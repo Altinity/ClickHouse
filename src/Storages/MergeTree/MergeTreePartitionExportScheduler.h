@@ -40,8 +40,6 @@ public:
 
     void loadFromDisk();
 
-    static String compositeKey(const String & partition_id, const String & destination_database, const String & destination_table);
-
 private:
     StorageMergeTree & storage;
 

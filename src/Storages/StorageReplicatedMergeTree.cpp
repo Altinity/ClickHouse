@@ -83,6 +83,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeSinkPatch.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsLock.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
+#include <Storages/MergeTree/ExportPartitionKey.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Interpreters/ActionsDAG.h>
 
@@ -8651,7 +8652,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     
     const auto exports_path = fs::path(zookeeper_path) / "exports";
 
-    const auto export_key = partition_id + "_" + dest_storage_id.getQualifiedName().getFullName();
+    const auto export_key = ExportPartitionUtils::compositeKey(
+        partition_id, dest_storage_id.getDatabaseName(), dest_storage_id.getTableName());
 
     const auto partition_exports_path = fs::path(exports_path) / export_key;
 

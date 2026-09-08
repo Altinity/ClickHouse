@@ -3,8 +3,8 @@
 #include <map>
 #include <optional>
 #include <Storages/ExportReplicatedMergeTreePartitionManifest.h>
+#include <Storages/MergeTree/ExportPartitionKey.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
-#include "Core/QualifiedTableName.h"
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/ordered_index.hpp>
@@ -60,8 +60,8 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
 
     std::string getCompositeKey() const
     {
-        const auto qualified_table_name = QualifiedTableName {manifest.destination_database, manifest.destination_table};
-        return manifest.partition_id + "_" + qualified_table_name.getFullName();
+        return ExportPartitionUtils::compositeKey(
+            manifest.partition_id, manifest.destination_database, manifest.destination_table);
     }
 
     std::string getTransactionId() const

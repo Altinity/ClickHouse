@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/MergeTreePartitionExportScheduler.h>
 #include <Storages/StorageMergeTree.h>
+#include <Storages/MergeTree/ExportPartitionKey.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -7,7 +8,6 @@
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
 #include <Common/SipHash.h>
-#include <Common/escapeForFileName.h>
 #include <Common/logger_useful.h>
 #include <Common/quoteString.h>
 #include <Disks/IDisk.h>
@@ -43,17 +43,6 @@ MergeTreePartitionExportScheduler::MergeTreePartitionExportScheduler(StorageMerg
 {
 }
 
-String MergeTreePartitionExportScheduler::compositeKey(
-    const String & partition_id, const String & destination_database, const String & destination_table)
-{
-    /// `escapeForFileName` percent-encodes every character that is not alphanumeric or `_`, so an
-    /// escaped component can never contain the `.` used here as a separator. Note that `_` survives
-    /// escaping and therefore cannot be used as a separator.
-    return escapeForFileName(partition_id) + "."
-        + escapeForFileName(destination_database) + "."
-        + escapeForFileName(destination_table);
-}
-
 String MergeTreePartitionExportScheduler::describeKey(const MergeTreePartitionExportTask & descriptor)
 {
     return fmt::format(
@@ -85,7 +74,7 @@ MergeTreePartitionExportScheduler::findByTransactionId(const String & transactio
 void MergeTreePartitionExportScheduler::addTask(
     MergeTreePartitionExportTask descriptor, std::vector<DataPartPtr> part_references, bool force)
 {
-    const auto composite_key = compositeKey(descriptor.partition_id, descriptor.destination_database, descriptor.destination_table);
+    const auto composite_key = ExportPartitionUtils::compositeKey(descriptor.partition_id, descriptor.destination_database, descriptor.destination_table);
     /// Rendered before `descriptor` is moved into the entry below.
     const auto key_description = describeKey(descriptor);
     const auto transaction_id = descriptor.transaction_id;
@@ -699,7 +688,7 @@ void MergeTreePartitionExportScheduler::loadFromDisk()
             readStringUntilEOF(content, *buf);
 
             auto descriptor = MergeTreePartitionExportTask::fromJsonString(content);
-            const auto composite_key = compositeKey(descriptor.partition_id, descriptor.destination_database, descriptor.destination_table);
+            const auto composite_key = ExportPartitionUtils::compositeKey(descriptor.partition_id, descriptor.destination_database, descriptor.destination_table);
             /// Rendered before `descriptor` is moved into the entry below.
             const auto key_description = describeKey(descriptor);
 
