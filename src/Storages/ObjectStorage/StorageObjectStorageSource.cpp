@@ -116,29 +116,29 @@ namespace ErrorCodes
 
 namespace
 {
-DataTypePtr rowLineageColumnType()
-{
-    return makeNullable(std::make_shared<DataTypeInt64>());
-}
-
-Names getMaterializedRowLineageColumns(
-    [[maybe_unused]] const ObjectInfo & object_info,
-    [[maybe_unused]] const ReadFromFormatInfo & read_from_format_info,
-    [[maybe_unused]] const String & format_name)
-{
-    Names result;
-#if USE_AVRO
-    if (Poco::toLower(format_name) != "parquet" || !dynamic_cast<const IcebergDataObjectInfo *>(&object_info))
-        return result;
-
-    for (const auto * name : {"_row_id", "_last_updated_sequence_number"})
+    DataTypePtr rowLineageColumnType()
     {
-        if (read_from_format_info.requested_virtual_columns.contains(name))
-            result.emplace_back(name);
+        return makeNullable(std::make_shared<DataTypeInt64>());
     }
+
+    Names getMaterializedRowLineageColumns(
+        [[maybe_unused]] const ObjectInfo & object_info,
+        [[maybe_unused]] const ReadFromFormatInfo & read_from_format_info,
+        [[maybe_unused]] const String & format_name)
+    {
+        Names result;
+#if USE_AVRO
+        if (Poco::toLower(format_name) != "parquet" || !dynamic_cast<const IcebergDataObjectInfo *>(&object_info))
+            return result;
+
+        for (const auto * name : {"_row_id", "_last_updated_sequence_number"})
+        {
+            if (read_from_format_info.requested_virtual_columns.contains(name))
+                result.emplace_back(name);
+        }
 #endif
-    return result;
-}
+        return result;
+    }
 }
 
 static void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & log)
