@@ -192,6 +192,20 @@ Field decodePartitionDecimalByType(const String & bytes, const IDataType & type)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected decimal type {} of an Iceberg partition column", type.getName());
 }
 
+/// ClickHouse writes a `DateTime64` partition value into the manifest as a bare Avro `long`, without the
+/// `timestamp-micros` annotation that other engines put there, so it arrives here as a plain integer while
+/// the partition key column, taken from the Iceberg schema, is a `DateTime64`. Comparing that raw count
+/// against the scaled decimal bounds of the key condition is off by the scale multiplier, so reinterpret
+/// the integer at the key's own scale: an Iceberg `timestamp` holds microseconds and maps to
+/// `DateTime64(6)`, a `timestamp_ns` holds nanoseconds and maps to `DateTime64(9)`.
+Field reinterpretPartitionDateTime64(const Field & field, const IDataType & type)
+{
+    const Int64 value = field.getType() == Field::Types::UInt64
+        ? static_cast<Int64>(field.safeGet<UInt64>())
+        : field.safeGet<Int64>();
+    return DecimalField<DateTime64>(value, getDecimalScale(type));
+}
+
 }
 
 PruningReturnStatus ManifestFilesPruner::canBePruned(
@@ -210,6 +224,9 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
                 field = POSITIVE_INFINITY;
             else if (field.getType() == Field::Types::String && WhichDataType(type).isDecimal())
                 field = decodePartitionDecimalByType(field.safeGet<String>(), *type);
+            else if (WhichDataType(type).isDateTime64()
+                && (field.getType() == Field::Types::Int64 || field.getType() == Field::Types::UInt64))
+                field = reinterpretPartitionDateTime64(field, *type);
         }
 
         bool can_be_true = partition_key_condition->mayBeTrueInRange(
