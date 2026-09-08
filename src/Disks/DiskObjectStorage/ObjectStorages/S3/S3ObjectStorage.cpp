@@ -290,7 +290,7 @@ auto S3ObjectStorage::refreshAndRetryOnExpiredCredentials(Fn && fn) const
         auto new_client = credentials_refresh_callback();
         if (!new_client)
             throw;
-        client->set(std::move(new_client));
+        client.set(std::move(new_client));
         return fn();
     }
 }
@@ -298,7 +298,7 @@ auto S3ObjectStorage::refreshAndRetryOnExpiredCredentials(Fn && fn) const
 bool S3ObjectStorage::exists(const StoredObject & object) const
 {
     auto settings_ptr = s3_settings.get();
-    const bool e = S3::objectExists(*client->get(), uri.bucket, object.remote_path, {});
+    const bool e = S3::objectExists(*client.get(), uri.bucket, object.remote_path, {});
     return e;
 }
 
@@ -342,12 +342,12 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
             /// object. The copied callback can itself capture a shorter-lived object --
             /// `StorageS3Configuration::createObjectStorage`'s refresher captures the configuration
             /// it was built from -- so the caller must keep that object alive as long as the buffer.
-            refresh_callback = [client_slot = client, refresh = credentials_refresh_callback]()
+            refresh_callback = [slot = client_slot, refresh = credentials_refresh_callback]()
                 -> std::unique_ptr<const S3::Client>
             {
                 auto new_client = refresh();
                 if (new_client)
-                    client_slot->set(std::move(new_client));
+                    slot->set(std::move(new_client));
                 /// The buffer will not reissue this read, so it has no use for a client; refreshing
                 /// the disk's is what lets the caller's next request sign with the new credentials.
                 return nullptr;
@@ -453,7 +453,7 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
 
     /// The SingleAttempt profile (e.g. CAS conditional writes, RFC cas-s3-timeout-retry-control) rides
     /// on WriteSettings instead of changing this disk's shared client — every other write keeps using
-    /// client->get() and its normal retry policy unchanged.
+    /// client.get() and its normal retry policy unchanged.
     auto used_client = clientForRetryProfile(ObjectStorageControlRequest{
         .profile = write_settings.object_storage_retry_profile,
         .attempt_timeout_ms = write_settings.object_storage_attempt_timeout_ms,
@@ -515,7 +515,7 @@ void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMet
 
         {
             ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
-            outcome = client->get()->ListObjectsV2(request);
+            outcome = client.get()->ListObjectsV2(request);
         }
 
         throwIfError(outcome, "while listing objects in bucket '{}' with prefix '{}' on disk '{}'", uri.bucket, path, disk_name);
@@ -553,7 +553,7 @@ void S3ObjectStorage::removeObjectImpl(const StoredObject & object, bool if_exis
 {
     auto blob_storage_log = BlobStorageLogWriter::create(disk_name);
 
-    deleteFileFromS3(client->get(), uri.bucket, object.remote_path, if_exists,
+    deleteFileFromS3(client.get(), uri.bucket, object.remote_path, if_exists,
                       blob_storage_log, object.local_path, object.bytes_size,
                       ProfileEvents::DiskS3DeleteObjects);
 }
@@ -581,7 +581,7 @@ void S3ObjectStorage::removeObjectsImpl(const StoredObjects & objects, bool if_e
 
     auto settings_ptr = s3_settings.get();
 
-    deleteFilesFromS3(client->get(), uri.bucket, keys, if_exists,
+    deleteFilesFromS3(client.get(), uri.bucket, keys, if_exists,
                       s3_capabilities, settings_ptr->request_settings[S3RequestSetting::objects_chunk_size_to_delete],
                       blob_storage_log, local_paths_for_blob_storage_log, file_sizes_for_blob_storage_log,
                       ProfileEvents::DiskS3DeleteObjects);
@@ -599,7 +599,7 @@ void S3ObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
 
 ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(const StoredObject & object, const std::string & etag)
 {
-    return removeObjectIfTokenMatchesImpl(object, etag, client->get(), /*attempt_seed=*/0);
+    return removeObjectIfTokenMatchesImpl(object, etag, client.get(), /*attempt_seed=*/0);
 }
 
 ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(
@@ -798,7 +798,7 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
 
 bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const
 {
-    return client->get()->supportsGcsNativeConditionalRequests();
+    return client.get()->supportsGcsNativeConditionalRequests();
 }
 
 bool S3ObjectStorage::supportsCopyMode(ObjectStorageCopyMode mode) const
@@ -818,7 +818,7 @@ std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled() const
     S3::GetBucketVersioningRequest request;
     request.SetBucket(uri.bucket);
 
-    auto outcome = client->get()->GetBucketVersioning(request);
+    auto outcome = client.get()->GetBucketVersioning(request);
     if (!outcome.IsSuccess())
     {
         /// The caller only learns "unknown"; the reason is what the operator needs to act on.
@@ -898,17 +898,17 @@ static void putObjectsTagOnS3(
 void S3ObjectStorage::tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value)
 {
     Strings keys = collectRemotePaths(objects);
-    putObjectsTagOnS3(client->get(), uri.bucket, keys, tag_key, tag_value);
+    putObjectsTagOnS3(client.get(), uri.bucket, keys, tag_key, tag_value);
 }
 
 std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadata(const std::string & path, bool with_tags) const
 {
-    return tryGetObjectMetadataImpl(path, with_tags, ObjectStorageRequestMode::Default, client->get());
+    return tryGetObjectMetadataImpl(path, with_tags, ObjectStorageRequestMode::Default, client.get());
 }
 
 std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const
 {
-    return tryGetObjectMetadataImpl(path, with_tags, ObjectStorageRequestMode::NativeConditional, client->get());
+    return tryGetObjectMetadataImpl(path, with_tags, ObjectStorageRequestMode::NativeConditional, client.get());
 }
 
 std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataWithNativeToken(
@@ -957,7 +957,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     S3::ObjectInfo object_info;
     try
     {
-        object_info = S3::getObjectInfo(*client->get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+        object_info = S3::getObjectInfo(*client.get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
     }
     catch (DB::Exception & e)
     {
@@ -967,8 +967,8 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
             auto new_client = credentials_refresh_callback();
             if (new_client)
             {
-                client->set(std::move(new_client));
-                object_info = S3::getObjectInfo(*client->get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+                client.set(std::move(new_client));
+                object_info = S3::getObjectInfo(*client.get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
                 updated = true;
             }
         }
@@ -1001,9 +1001,9 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
     /// Shortcut for S3
     if (auto * dest_s3 = dynamic_cast<S3ObjectStorage * >(&object_storage_to); dest_s3 != nullptr)
     {
-        auto current_client = dest_s3->client->get();
+        auto current_client = dest_s3->client.get();
         auto settings_ptr = s3_settings.get();
-        auto size = S3::getObjectSize(*client->get(), uri.bucket, object_from.remote_path, {});
+        auto size = S3::getObjectSize(*client.get(), uri.bucket, object_from.remote_path, {});
         auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::S3_COPY_POOL);
         const auto read_settings_to_use = patchSettings(read_settings);
 
@@ -1043,7 +1043,7 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                     if (new_client)
                     {
                         updated = true;
-                        client->set(std::move(new_client));
+                        client.set(std::move(new_client));
                     }
                 }
                 if (!updated)
@@ -1077,7 +1077,7 @@ void S3ObjectStorage::copyObject( // NOLINT
             "(allow_native_copy=false) for object storage {}",
             getName());
 
-    auto current_client = client->get();
+    auto current_client = client.get();
     auto settings_ptr = s3_settings.get();
     auto size = S3::getObjectSize(*current_client, uri.bucket, object_from.remote_path, {});
     auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::S3_COPY_POOL);
@@ -1107,7 +1107,7 @@ void S3ObjectStorage::shutdown()
     /// If S3 request is failed and the method below is executed S3 client immediately returns the last failed S3 request outcome.
     /// If S3 is healthy nothing wrong will be happened and S3 requests will be processed in a regular way without errors.
     /// This should significantly speed up shutdown process if S3 is unhealthy.
-    const_cast<S3::Client &>(*client->get()).DisableRequestProcessing();
+    const_cast<S3::Client &>(*client.get()).DisableRequestProcessing();
 
     /// Parity with the main client above, not a stronger guarantee. `DisableRequestProcessing` cannot
     /// prevent a request's INITIAL dispatch, and cannot interrupt an attempt already in flight: contrib/aws's
@@ -1135,7 +1135,7 @@ void S3ObjectStorage::shutdown()
 void S3ObjectStorage::startup()
 {
     /// Need to be enabled if it was disabled during shutdown() call.
-    const_cast<S3::Client &>(*client->get()).EnableRequestProcessing();
+    const_cast<S3::Client &>(*client.get()).EnableRequestProcessing();
 
     std::lock_guard lock(single_attempt_client_mutex);
     single_attempt_clients_disabled = false;
@@ -1219,7 +1219,7 @@ void S3ObjectStorage::applyNewSettings(
         && (current_settings->auth_settings.hasUpdates(modified_settings->auth_settings) || for_disk_s3))
     {
         auto new_client = getClient(uri, *modified_settings, context, for_disk_s3, disk_name);
-        client->set(std::move(new_client));
+        client.set(std::move(new_client));
     }
     s3_settings.set(std::move(modified_settings));
 }
@@ -1234,17 +1234,17 @@ ObjectStorageKeyGeneratorPtr S3ObjectStorage::createKeyGenerator() const
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::getS3StorageClient()
 {
-    return client->get();
+    return client.get();
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::tryGetS3StorageClient()
 {
-    return client->get();
+    return client.get();
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const
 {
-    auto base = client->get();
+    auto base = client.get();
     std::lock_guard lock(single_attempt_client_mutex);
     if (single_attempt_client_base != base)
     {
@@ -1296,7 +1296,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const O
     /// pays for building or locking the clone.
     if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
         return getSingleAttemptClient(request.attempt_timeout_ms, request.connect_timeout_cap_ms);
-    return client->get();
+    return client.get();
 }
 
 bool S3ObjectStorage::tryRefreshCredentialsViaCallback()
@@ -1308,7 +1308,7 @@ bool S3ObjectStorage::tryRefreshCredentialsViaCallback()
     auto new_client = credentials_refresh_callback();
     if (!new_client)
         return false;
-    client->set(std::move(new_client));
+    client.set(std::move(new_client));
     return true;
 }
 }
