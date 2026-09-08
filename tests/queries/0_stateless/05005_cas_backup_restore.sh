@@ -25,9 +25,9 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
-    cas_server_root_id = '05005',
-    name = '05005_cas_backup_restore',
-    path = '05005_cas_backup_restore_pool/');"
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_05005',
+    name = '${CLICKHOUSE_DATABASE}_05005_cas_backup_restore',
+    path = '${CLICKHOUSE_DATABASE}_05005_cas_backup_restore_pool/');"
 
 # Two inserts -> two parts; deterministic rows.
 ${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cas_br VALUES (1, 'a'), (2, 'b'), (1, 'c');"
@@ -51,8 +51,8 @@ ${CLICKHOUSE_CLIENT} --query "SELECT 'done';"
 
 # FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
 # stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
-# RESTORE re-created t_cas_br_restored on the same named pool ('05005_cas_backup_restore'), so one FORGET
+# RESTORE re-created t_cas_br_restored on the same named pool ('${CLICKHOUSE_DATABASE}_05005_cas_backup_restore'), so one FORGET
 # covers it.
 ${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
-    --query "SYSTEM CAS FORGET '05005_cas_backup_restore'" || {
+    --query "SYSTEM CAS FORGET '${CLICKHOUSE_DATABASE}_05005_cas_backup_restore'" || {
     echo "FORGET failed"; exit 1; }

@@ -1,10 +1,16 @@
--- Tags: no-fasttest
--- ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
+#!/usr/bin/env bash
+# Tags: no-fasttest
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- Projections on a cas disk: the projection's files are stored as nested keys
--- (<proj>.proj/<file>) in the parent part's manifest. Verify INSERT writes a projection, a
--- projection-optimized SELECT returns correct results, and a merge (OPTIMIZE FINAL) rebuilds it.
+# Projections on a cas disk: the projection's files are stored as nested keys
+# (<proj>.proj/<file>) in the parent part's manifest. Verify INSERT writes a projection, a
+# projection-optimized SELECT returns correct results, and a merge (OPTIMIZE FINAL) rebuilds it.
 
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_proj_cas;
 
 CREATE TABLE t_proj_cas (a UInt64, b UInt64, PROJECTION p_by_b (SELECT a, b ORDER BY b))
@@ -13,9 +19,9 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
-    cas_server_root_id = '04299',
-    name = '04299_cas_projection',
-    path = '04299_cas_projection_pool/');
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_04299',
+    name = '${CLICKHOUSE_DATABASE}_04299_cas_projection',
+    path = '${CLICKHOUSE_DATABASE}_04299_cas_projection_pool/');
 
 INSERT INTO t_proj_cas SELECT number, number % 10 FROM numbers(1000);
 INSERT INTO t_proj_cas SELECT number, number % 10 FROM numbers(1000, 1000);
@@ -39,10 +45,10 @@ FROM (EXPLAIN actions = 1 SELECT b, count() FROM t_proj_cas GROUP BY b);
 DROP TABLE t_proj_cas;
 
 -- ALTER ADD/DROP/MATERIALIZE PROJECTION + DETACH/ATTACH durability on the cas disk. We use
--- the server's default cas storage policy here rather than an inline `disk = disk(...)`
--- definition: an ALTER runs `checkColumnFilenamesForCollision`, which re-applies the table's raw
--- `settings_changes` AST through the generic settings path, and the inline `disk(...)` function value
--- is a CustomType that cannot be assigned to the String `disk` setting there (BAD_GET). That is a
+-- the server's default cas storage policy here rather than an inline \`disk = disk(...)\`
+-- definition: an ALTER runs \`checkColumnFilenamesForCollision\`, which re-applies the table's raw
+-- \`settings_changes\` AST through the generic settings path, and the inline \`disk(...)\` function value
+-- is a CustomType that cannot be assigned to the String \`disk\` setting there (BAD_GET). That is a
 -- pre-existing, metadata-type-independent inline-disk-vs-ALTER issue, unrelated to content addressing;
 -- the projection ALTER mechanics on the CA disk are identical with the default-disk table. On the
 -- cas-default test job this plain table lands on a CA disk; on the normal job it lands on
@@ -114,8 +120,8 @@ SELECT 'after_drop_projection_count', count() FROM t_proj_cas_alter;
 SELECT 'projections_after_drop', name, count() FROM system.projection_parts
 WHERE database = currentDatabase() AND table = 't_proj_cas_alter' AND active GROUP BY name ORDER BY name;
 
--- Persistence: reload from the disk and re-read. `p_by_b` is gone, so the count() query falls back to the
--- base table; the surviving `p_sum` still serves the sum(a) aggregation after the reload.
+-- Persistence: reload from the disk and re-read. \`p_by_b\` is gone, so the count() query falls back to the
+-- base table; the surviving \`p_sum\` still serves the sum(a) aggregation after the reload.
 DETACH TABLE t_proj_cas_alter;
 ATTACH TABLE t_proj_cas_alter;
 SELECT 'after_reload_by_b', b, count() FROM t_proj_cas_alter GROUP BY b ORDER BY b;
@@ -128,5 +134,6 @@ DROP TABLE t_proj_cas_alter;
 -- Only the first table's inline disk is forgotten here: t_proj_cas_alter uses the lane's own default
 -- storage policy, not a disk this test created.
 SET send_logs_level = 'fatal';
-SYSTEM CAS FORGET '04299_cas_projection';
+SYSTEM CAS FORGET '${CLICKHOUSE_DATABASE}_04299_cas_projection';
 SELECT 'dropped_ok';
+EOF

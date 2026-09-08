@@ -1,13 +1,19 @@
--- Tags: no-fasttest
--- ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
+#!/usr/bin/env bash
+# Tags: no-fasttest
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- Default-ON contract for `system.cas_log`: the per-event content-addressed audit log is
--- enabled by default. `programs/server/config.xml` ships a `<cas_log>` section because the
--- CAS disk feature is experimental and this audit log is its primary forensic instrument (it costs
--- nothing when no CAS disk is configured — events are emitted only by content-addressed disks). After we
--- exercise a content-addressed disk end-to-end (INSERT, OPTIMIZE), the table exists and carries this
--- disk's write-path events.
+# Default-ON contract for `system.cas_log`: the per-event content-addressed audit log is
+# enabled by default. `programs/server/config.xml` ships a `<cas_log>` section because the
+# CAS disk feature is experimental and this audit log is its primary forensic instrument (it costs
+# nothing when no CAS disk is configured — events are emitted only by content-addressed disks). After we
+# exercise a content-addressed disk end-to-end (INSERT, OPTIMIZE), the table exists and carries this
+# disk's write-path events.
 
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_cas_event_log;
 
 CREATE TABLE t_cas_event_log (a UInt64, s String)
@@ -16,9 +22,9 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
-    cas_server_root_id = '05009',
-    name = '05009_cas_event_log',
-    path = '05009_cas_event_log_pool/');
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_05009',
+    name = '${CLICKHOUSE_DATABASE}_05009_cas_event_log',
+    path = '${CLICKHOUSE_DATABASE}_05009_cas_event_log_pool/');
 
 -- Exercise the content-addressed write/merge path: this is exactly the work that emits put/ref events.
 INSERT INTO t_cas_event_log SELECT number, toString(number % 7) FROM numbers(1000);
@@ -33,17 +39,18 @@ SYSTEM FLUSH LOGS cas_log;
 -- Default-on assertion #1: the table exists (the config ships the section).
 EXISTS TABLE system.cas_log;
 
--- Default-on assertion #2: our disk's write path emitted at least one `blob_put` event. Filter by
+-- Default-on assertion #2: our disk's write path emitted at least one \`blob_put\` event. Filter by
 -- disk_name so parallel tests sharing this system table (e.g. the lane's own cas_s3 disk)
 -- cannot perturb the result.
 SELECT 'has_blob_put', count() > 0
 FROM system.cas_log
-WHERE disk_name = '05009_cas_event_log' AND event_type = 'blob_put';
+WHERE disk_name = '${CLICKHOUSE_DATABASE}_05009_cas_event_log' AND event_type = 'blob_put';
 
 DROP TABLE t_cas_event_log;
 
 -- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
 -- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
 SET send_logs_level = 'fatal';
-SYSTEM CAS FORGET '05009_cas_event_log';
+SYSTEM CAS FORGET '${CLICKHOUSE_DATABASE}_05009_cas_event_log';
 SELECT 'ok';
+EOF

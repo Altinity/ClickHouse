@@ -20,7 +20,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK="05008_cas_gc_snapshot_prune"
+DISK="${CLICKHOUSE_DATABASE}_05008_cas_gc_snapshot_prune"
 
 # CA-over-LOCAL object storage emits a one-time <Warning> about emulated conditional operations on
 # mount; the .sh harness fails on ANY client stderr, so send only error+ logs to the client (real

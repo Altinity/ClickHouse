@@ -1,20 +1,26 @@
--- Tags: no-fasttest
--- ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
+#!/usr/bin/env bash
+# Tags: no-fasttest
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- A projection built across MULTIPLE temp projection blocks (spill-and-merge) must read its own staged
--- temp blocks back on a content-addressed disk (B59). MergeProjectionPartsTask only EXERCISES the
--- read-back path when it has >1 temp projection part to merge (selected_parts.size() > 1); with a single
--- temp part it just renames it. The temp-part flush threshold is min_insert_block_size_rows, and the
--- background merge/mutation runs in the server's background context (NOT the client query settings), so
--- the threshold is the server default (DEFAULT_INSERT_BLOCK_SIZE = 1048449). We therefore make the
--- projection emit MORE rows than that: a high-cardinality GROUP BY key (1.3M distinct groups) forces >=2
--- temp projection parts for BOTH an OPTIMIZE merge and an ALTER ... MATERIALIZE PROJECTION rebuild.
+# A projection built across MULTIPLE temp projection blocks (spill-and-merge) must read its own staged
+# temp blocks back on a content-addressed disk (B59). MergeProjectionPartsTask only EXERCISES the
+# read-back path when it has >1 temp projection part to merge (selected_parts.size() > 1); with a single
+# temp part it just renames it. The temp-part flush threshold is min_insert_block_size_rows, and the
+# background merge/mutation runs in the server's background context (NOT the client query settings), so
+# the threshold is the server default (DEFAULT_INSERT_BLOCK_SIZE = 1048449). We therefore make the
+# projection emit MORE rows than that: a high-cardinality GROUP BY key (1.3M distinct groups) forces >=2
+# temp projection parts for BOTH an OPTIMIZE merge and an ALTER ... MATERIALIZE PROJECTION rebuild.
 
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_pmb;
 CREATE TABLE t_pmb (a UInt64, b UInt64, PROJECTION p_by_b (SELECT b, sum(a) GROUP BY b))
 ENGINE = MergeTree ORDER BY a
 SETTINGS disk = disk(type = object_storage, object_storage_type = local, metadata_type = cas,
-    name = '04300_pmb', cas_server_root_id = '04300', path = '04300_pmb_pool/'),
+    name = '${CLICKHOUSE_DATABASE}_04300_pmb', cas_server_root_id = '${CLICKHOUSE_DATABASE}_04300', path = '${CLICKHOUSE_DATABASE}_04300_pmb_pool/'),
     -- The final check asserts the optimizer SELECTS the projection, which holds only while the
     -- projection reads fewer marks than the base table. Randomized granularity (tiny
     -- index_granularity_bytes with enable_block_offset_column widening base rows) can bring the two
@@ -55,4 +61,5 @@ SELECT 'dropped_ok';
 -- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
 -- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
 SET send_logs_level = 'fatal';
-SYSTEM CAS FORGET '04300_pmb';
+SYSTEM CAS FORGET '${CLICKHOUSE_DATABASE}_04300_pmb';
+EOF

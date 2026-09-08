@@ -1,15 +1,21 @@
--- Tags: no-fasttest
--- ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
+#!/usr/bin/env bash
+# Tags: no-fasttest
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- Correctness-under-active-GC oracle. The `cas` disk below opts in to the background
--- reachability GC (`gc_enabled=1`, default OFF) and runs it aggressively
--- and `old_parts_lifetime=1` drops the merged-away source parts quickly so their footers/blobs become
--- unreferenced and turn into genuine GC fodder *during* the test. We assert the CA table stays
--- byte-for-byte identical to a normal MergeTree table on the same data: if a concurrent sweep ever
--- dropped a live blob, the oracle below would diverge. The test is fully deterministic — it never
--- waits on GC and never asserts that GC has run by a deadline; correctness must hold regardless of
--- whether (and how often) the background sweep fired.
+# Correctness-under-active-GC oracle. The `cas` disk below opts in to the background
+# reachability GC (`gc_enabled=1`, default OFF) and runs it aggressively
+# and `old_parts_lifetime=1` drops the merged-away source parts quickly so their footers/blobs become
+# unreferenced and turn into genuine GC fodder *during* the test. We assert the CA table stays
+# byte-for-byte identical to a normal MergeTree table on the same data: if a concurrent sweep ever
+# dropped a live blob, the oracle below would diverge. The test is fully deterministic — it never
+# waits on GC and never asserts that GC has run by a deadline; correctness must hold regardless of
+# whether (and how often) the background sweep fired.
 
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_cas_gc;
 DROP TABLE IF EXISTS t_ref_gc;
 
@@ -19,9 +25,9 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
-    cas_server_root_id = '04279',
-    name = '04279_cas_gc',
-    path = '04279_cas_gc_pool/',
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_04279',
+    name = '${CLICKHOUSE_DATABASE}_04279_cas_gc',
+    path = '${CLICKHOUSE_DATABASE}_04279_cas_gc_pool/',
     cas_gc_enabled = 1,
     cas_gc_interval_sec = 1),
     old_parts_lifetime = 1;
@@ -68,4 +74,5 @@ SELECT 'dropped_ok';
 -- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
 -- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
 SET send_logs_level = 'fatal';
-SYSTEM CAS FORGET '04279_cas_gc';
+SYSTEM CAS FORGET '${CLICKHOUSE_DATABASE}_04279_cas_gc';
+EOF

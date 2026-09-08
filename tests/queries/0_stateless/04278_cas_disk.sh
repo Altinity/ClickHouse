@@ -1,12 +1,18 @@
--- Tags: no-fasttest
--- ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
+#!/usr/bin/env bash
+# Tags: no-fasttest
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- Natural black-box oracle: a table on a `cas` disk must behave
--- identically to a normal MergeTree table for the same data. We compare the two
--- directly so the test is deterministic regardless of environment, and we also
--- exercise INSERT (content-addressed write), SELECT (ref->part_id->footer->blob
--- resolution), blob-level dedup of identical inserts, a merge, and DROP (removal).
+# Natural black-box oracle: a table on a `cas` disk must behave
+# identically to a normal MergeTree table for the same data. We compare the two
+# directly so the test is deterministic regardless of environment, and we also
+# exercise INSERT (content-addressed write), SELECT (ref->part_id->footer->blob
+# resolution), blob-level dedup of identical inserts, a merge, and DROP (removal).
 
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_cas;
 DROP TABLE IF EXISTS t_ref;
 
@@ -16,9 +22,9 @@ SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
-    cas_server_root_id = '04278',
-    name = '04278_cas',
-    path = '04278_cas_pool/');
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_04278',
+    name = '${CLICKHOUSE_DATABASE}_04278_cas',
+    path = '${CLICKHOUSE_DATABASE}_04278_cas_pool/');
 
 CREATE TABLE t_ref (a UInt64, s String, d Date)
 ENGINE = MergeTree ORDER BY a;
@@ -52,4 +58,5 @@ SELECT 'dropped_ok';
 -- clickhouse-test harness runs the client at --send_logs_level=warning, which would stream that expected
 -- warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
 SET send_logs_level = 'fatal';
-SYSTEM CAS FORGET '04278_cas';
+SYSTEM CAS FORGET '${CLICKHOUSE_DATABASE}_04278_cas';
+EOF

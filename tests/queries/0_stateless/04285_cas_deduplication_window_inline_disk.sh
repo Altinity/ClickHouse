@@ -1,12 +1,18 @@
--- Tags: no-fasttest
--- ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
+#!/usr/bin/env bash
+# Tags: no-fasttest
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- A non_replicated_deduplication_window > 0 on a plain MergeTree keeps an on-disk deduplication log
--- (deduplication_logs/deduplication_log_N.txt) at the table root. On a cas disk that log
--- works the same way it does on a plain s3 disk: the disk cannot host append writes, so the log
--- rewrites a fresh rotated log object per record, stored verbatim in the table's files/ namespace. This
--- test uses an INLINE cas disk, so it exercises the CA path on any test config.
+# A non_replicated_deduplication_window > 0 on a plain MergeTree keeps an on-disk deduplication log
+# (deduplication_logs/deduplication_log_N.txt) at the table root. On a cas disk that log
+# works the same way it does on a plain s3 disk: the disk cannot host append writes, so the log
+# rewrites a fresh rotated log object per record, stored verbatim in the table's files/ namespace. This
+# test uses an INLINE cas disk, so it exercises the CA path on any test config.
 
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_cas_deduplication;
 
 CREATE TABLE t_cas_deduplication (a UInt64)
@@ -15,9 +21,9 @@ SETTINGS non_replicated_deduplication_window = 100, disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
-    cas_server_root_id = '04285',
-    name = '04285_cas_deduplication',
-    path = '04285_cas_deduplication_pool/');
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_04285',
+    name = '${CLICKHOUSE_DATABASE}_04285_cas_deduplication',
+    path = '${CLICKHOUSE_DATABASE}_04285_cas_deduplication_pool/');
 
 -- Identical inserts are deduplicated; each insert also writes a record to the on-disk log (the write
 -- that used to fail closed with a null writer on a cas disk).
@@ -47,4 +53,5 @@ SELECT 'dropped_ok';
 -- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
 -- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
 SET send_logs_level = 'fatal';
-SYSTEM CAS FORGET '04285_cas_deduplication';
+SYSTEM CAS FORGET '${CLICKHOUSE_DATABASE}_04285_cas_deduplication';
+EOF

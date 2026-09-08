@@ -1,15 +1,21 @@
--- Tags: no-fasttest
--- ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
+#!/usr/bin/env bash
+# Tags: no-fasttest
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- B23 mutable-per-part-state oracle: with assign_part_uuids=1, two INSERTs of IDENTICAL data produce
--- two parts whose column content is byte-identical but whose per-part uuid.txt differs. On a
--- cas disk the two parts dedup to ONE shared manifest, while their mutable per-part
--- files (uuid.txt / txn_version.txt / metadata_version.txt) live in a per-ref sidecar and are
--- overlaid on read. Before B23 the second part read the FIRST part's uuid (the shared manifest
--- embedded one part's mutable files), so the two uuids collided. This is a natural black-box oracle:
--- the cas table must behave exactly like a normal MergeTree table, and the two parts
--- must carry two DISTINCT uuids.
+# B23 mutable-per-part-state oracle: with assign_part_uuids=1, two INSERTs of IDENTICAL data produce
+# two parts whose column content is byte-identical but whose per-part uuid.txt differs. On a
+# cas disk the two parts dedup to ONE shared manifest, while their mutable per-part
+# files (uuid.txt / txn_version.txt / metadata_version.txt) live in a per-ref sidecar and are
+# overlaid on read. Before B23 the second part read the FIRST part's uuid (the shared manifest
+# embedded one part's mutable files), so the two uuids collided. This is a natural black-box oracle:
+# the cas table must behave exactly like a normal MergeTree table, and the two parts
+# must carry two DISTINCT uuids.
 
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS t_cas_mut;
 DROP TABLE IF EXISTS t_ref_mut;
 
@@ -19,9 +25,9 @@ SETTINGS assign_part_uuids = 1, disk = disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = cas,
-    cas_server_root_id = '04282',
-    name = '04282_cas',
-    path = '04282_cas_pool/');
+    cas_server_root_id = '${CLICKHOUSE_DATABASE}_04282',
+    name = '${CLICKHOUSE_DATABASE}_04282_cas',
+    path = '${CLICKHOUSE_DATABASE}_04282_cas_pool/');
 
 CREATE TABLE t_ref_mut (a UInt64, s String)
 ENGINE = MergeTree ORDER BY a
@@ -59,4 +65,5 @@ SELECT 'dropped_ok';
 -- FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which would
 -- stream that expected warning to stderr and be flagged as a failure. Suppress it for the FORGET call only.
 SET send_logs_level = 'fatal';
-SYSTEM CAS FORGET '04282_cas';
+SYSTEM CAS FORGET '${CLICKHOUSE_DATABASE}_04282_cas';
+EOF
