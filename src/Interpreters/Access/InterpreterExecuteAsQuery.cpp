@@ -64,6 +64,14 @@ namespace
 
         context->setUser(context->getAccessControl().getID<User>(target_user_name));
 
+        /// Drop the bearer token this session authenticated with (see `ForwardedAuthToken`): it
+        /// authenticates the original user, not `target_user_name`. Forwarding it on would let an
+        /// external service authorize the original user while ClickHouse enforces the target
+        /// user's grants. Unlike `EXECUTE AS <user> <subquery>` and DEFINER views, which build a
+        /// fresh context from the global one and so never carry a token, this switches the
+        /// existing session context in place and outlives the current query.
+        context->setForwardedAuthToken(nullptr);
+
         /// We need to update the client info to make currentUser() return `target_user_name`.
         context->setCurrentUserName(target_user_name);
         context->setInitialUserName(target_user_name);

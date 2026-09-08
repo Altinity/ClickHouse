@@ -1,0 +1,118 @@
+{
+  "realm": "clickhouse-test",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 1800,
+  "clientScopes": [
+    {
+      "name": "lakekeeper",
+      "description": "Adds the `lakekeeper` audience, which Lakekeeper checks on every request.",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "lakekeeper-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "lakekeeper",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "clickhouse",
+      "enabled": true,
+      "secret": "clickhouse-secret",
+      "publicClient": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "standardFlowEnabled": true,
+      "protocol": "openid-connect",
+      "redirectUris": ["*"],
+      "webOrigins": ["*"],
+      "defaultClientScopes": [
+        "acr",
+        "basic",
+        "email",
+        "profile",
+        "roles",
+        "web-origins",
+        "lakekeeper"
+      ]
+    },
+    {
+      "clientId": "clickhouse-exchange",
+      "enabled": true,
+      "secret": "clickhouse-exchange-secret",
+      "publicClient": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "standardFlowEnabled": true,
+      "protocol": "openid-connect",
+      "redirectUris": ["*"],
+      "webOrigins": ["*"],
+      "attributes": {
+        "standard.token.exchange.enabled": "true"
+      },
+      "defaultClientScopes": ["acr", "basic", "email", "profile", "roles", "web-origins"],
+      "optionalClientScopes": ["lakekeeper"]
+    },
+    {
+      "clientId": "lakekeeper",
+      "enabled": true,
+      "secret": "lakekeeper-secret",
+      "publicClient": false,
+      "bearerOnly": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    }
+  ],
+  "users": [
+    {
+      "username": "lkadmin",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "lkadmin@example.com",
+      "firstName": "Lakekeeper",
+      "lastName": "Admin",
+      "requiredActions": [],
+      "credentials": [{ "type": "password", "value": "secret", "temporary": false }],
+      "realmRoles": ["default-roles-clickhouse-test"]
+    },
+    {
+      "username": "alice",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "alice@example.com",
+      "firstName": "Alice",
+      "lastName": "Tester",
+      "requiredActions": [],
+      "credentials": [{ "type": "password", "value": "secret", "temporary": false }],
+      "realmRoles": ["default-roles-clickhouse-test"]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "bob@example.com",
+      "firstName": "Bob",
+      "lastName": "Tester",
+      "requiredActions": [],
+      "credentials": [{ "type": "password", "value": "secret", "temporary": false }],
+      "realmRoles": ["default-roles-clickhouse-test"]
+    }
+  ]
+}

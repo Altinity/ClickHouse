@@ -1713,6 +1713,12 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation miss the cache using prefix matching.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsVended, "Number of table metadata requests to REST catalog asking to vend storage credentials.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsCacheHits, "Number of table metadata requests to REST catalog reusing cached storage credentials.", ValueType::Number) \
+    M(DataLakeRestCatalogCredentialsCacheMisses, "Number of table metadata requests to REST catalog that had to vend fresh storage credentials because the per-principal cache did not hold them. With user token forwarding, a non-zero value for a second user proves the cache is partitioned per principal.", ValueType::Number) \
+    M(DataLakeRestCatalogTokenExchange, "Number of RFC 8693 token exchanges performed to obtain a session token for the querying user.", ValueType::Number) \
+    M(DataLakeRestCatalogTokenExchangeMicroseconds, "Total time of RFC 8693 token exchanges.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogTokenExchangeFailures, "Number of RFC 8693 token exchanges that failed.", ValueType::Number) \
+    M(DataLakeRestCatalogUserTokenCacheHits, "Number of times a previously exchanged per-user session token was reused.", ValueType::Number) \
+    M(DataLakeRestCatalogClientCredentialsGrants, "Number of `client_credentials` grants performed as the catalog service principal. Must stay at zero while user token forwarding is enabled: a non-zero value means a request fell back to the shared identity.", ValueType::Number) \
     \
     M(DataLakeRestCatalogLoadConfig, "Number of 'load config' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogLoadConfigMicroseconds, "Total time of 'load config' requests to Iceberg REST catalog.", ValueType::Microseconds) \

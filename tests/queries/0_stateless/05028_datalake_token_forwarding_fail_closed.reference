@@ -1,0 +1,14 @@
+-- SELECT
+CATALOG_USER_TOKEN_NOT_AVAILABLE
+-- DESCRIBE
+CATALOG_USER_TOKEN_NOT_AVAILABLE
+-- EXISTS
+CATALOG_USER_TOKEN_NOT_AVAILABLE
+-- CHECK DATABASE
+CATALOG_USER_TOKEN_NOT_AVAILABLE
+-- SHOW TABLES discloses nothing
+0
+-- error message names the remedies
+enable_token_forwarding
+-- nothing token-shaped in query_log
+0

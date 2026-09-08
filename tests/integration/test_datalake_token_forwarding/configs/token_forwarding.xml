@@ -1,0 +1,28 @@
+<clickhouse>
+    <!--
+        Retain the bearer token a user authenticated with so that it can be forwarded to the
+        Iceberg REST catalog. Off by default; every test in this suite depends on it.
+    -->
+    <enable_token_forwarding>1</enable_token_forwarding>
+
+    <!--
+        HS256 with a static key, so tokens can be minted inline without an IdP. Precedent:
+        tests/integration/test_token_roles_mapping/configs/validators.xml
+    -->
+    <token_processors>
+        <hs256>
+            <type>jwt_static_key</type>
+            <algo>HS256</algo>
+            <static_key>datalake_token_forwarding_secret</static_key>
+            <static_key_in_base64>false</static_key_in_base64>
+            <allow_no_expiration>true</allow_no_expiration>
+        </hs256>
+    </token_processors>
+
+    <user_directories>
+        <token>
+            <processor>hs256</processor>
+            <default_profile>default</default_profile>
+        </token>
+    </user_directories>
+</clickhouse>

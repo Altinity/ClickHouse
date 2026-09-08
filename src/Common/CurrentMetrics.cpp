@@ -370,6 +370,8 @@
     M(DNSAddressesCacheSize, "Number of cached DNS addresses") \
     M(MarkCacheBytes, "Total size of mark cache in bytes") \
     M(MarkCacheFiles, "Total number of mark files cached in the mark cache") \
+    M(DataLakeCatalogUserTokenCacheBytes, "Total size in bytes of the per-user session tokens exchanged for data lake catalog access") \
+    M(DataLakeCatalogUserTokenCacheEntries, "Total number of per-user session tokens exchanged for data lake catalog access") \
     M(UniqueKeyIndexCacheBytes, "Total size of UNIQUE KEY index cache in bytes") \
     M(UniqueKeyIndexCacheEntries, "Total number of UNIQUE KEY index blocks cached") \
     M(DeleteBitmapCacheBytes, "Total size of the UNIQUE KEY delete-bitmap cache in bytes") \

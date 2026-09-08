@@ -141,7 +141,7 @@ void HiveCatalog::executeWithRetry(Func && func) const
         DB::ErrorCodes::NO_HIVEMETASTORE, "Hive Metastore connection failed after {} attempts. Last error: {}", max_retries, last_err_msg);
 }
 
-bool HiveCatalog::empty() const
+bool HiveCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     fiu_do_on(DB::FailPoints::check_database_datalake_negative,
     {
@@ -154,7 +154,7 @@ bool HiveCatalog::empty() const
     return result.empty();
 }
 
-DB::Names HiveCatalog::getTables() const
+DB::Names HiveCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Names result;
     DB::Names databases;
@@ -171,7 +171,7 @@ DB::Names HiveCatalog::getTables() const
     return result;
 }
 
-bool HiveCatalog::existsTable(const std::string & namespace_name, const std::string & table_name) const
+bool HiveCatalog::existsTable(const std::string & namespace_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     Apache::Hadoop::Hive::Table table;
 

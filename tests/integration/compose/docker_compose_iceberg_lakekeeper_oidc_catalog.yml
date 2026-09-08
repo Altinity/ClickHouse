@@ -1,0 +1,150 @@
+# Lakekeeper with OIDC authentication and a real authorization backend, plus the Keycloak that
+# issues the tokens. Used by `test_datalake_sso_lakekeeper` to prove end-to-end SSO: the identity
+# that authenticated to ClickHouse is the identity Lakekeeper authorizes.
+#
+# Differences from `docker_compose_iceberg_lakekeeper_catalog.yml`:
+#   * `LAKEKEEPER__OPENID_*` makes Lakekeeper accept and validate IdP tokens;
+#   * `LAKEKEEPER__AUTHZ_BACKEND=openfga` -- the default is `allowall`, under which a per-user
+#     authorization test proves nothing;
+#   * Keycloak lives in this file rather than in `docker_compose_keycloak.yml`, so that the issuer
+#     URL is the in-network `http://keycloak:8080/...` for every participant;
+#   * no unauthenticated `bootstrap` service: with OIDC on, bootstrap must present an admin token,
+#     so the test does it.
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    command:
+      - "start-dev"
+      - "--import-realm"
+      - "--health-enabled=true"
+    environment:
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+    volumes:
+      - ../test_datalake_sso_lakekeeper/keycloak/realm-export.json:/opt/keycloak/data/import/realm.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          exec 3<>/dev/tcp/127.0.0.1/8080;
+          echo -e "GET /realms/clickhouse-test/.well-known/openid-configuration HTTP/1.1\r\nhost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n" >&3;
+          grep "jwks_uri" <&3
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    cpus: 3
+
+  lakekeeper:
+    image: vakamo/lakekeeper:v0.13.1
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__AUTHZ_BACKEND=openfga
+      - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
+      - LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/clickhouse-test
+      - LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
+      - LAKEKEEPER__OPENID_SCOPE=openid profile email
+      - RUST_LOG=info
+    command: ["serve"]
+    ports:
+      - "${ICEBERG_REST_CATALOG_PORT}:8181"
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      openfga:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    cpus: 3
+
+  migrate:
+    image: vakamo/lakekeeper:v0.13.1
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__AUTHZ_BACKEND=openfga
+      - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
+      - RUST_LOG=info
+    restart: "no"
+    command: ["migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+      openfga:
+        condition: service_healthy
+    cpus: 3
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+    cpus: 3
+
+  openfga:
+    image: openfga/openfga:v1.8
+    command: run
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://postgres:postgres@openfga-db:5432/postgres?sslmode=disable
+      - OPENFGA_PLAYGROUND_ENABLED=false
+      # No IdP in front of OpenFGA: it is reachable only on the compose network, and adding a
+      # service-account client to the realm would buy the test nothing.
+      - OPENFGA_AUTHN_METHOD=none
+      - OPENFGA_HTTP_TLS_ENABLED=false
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=openfga:8081"]
+      interval: 5s
+      timeout: 30s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+      openfga-migrate:
+        condition: service_completed_successfully
+    cpus: 3
+
+  openfga-migrate:
+    image: openfga/openfga:v1.8
+    command: migrate
+    restart: "no"
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://postgres:postgres@openfga-db:5432/postgres?sslmode=disable
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+    cpus: 3
+
+  openfga-db:
+    image: postgres:16
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+    cpus: 3

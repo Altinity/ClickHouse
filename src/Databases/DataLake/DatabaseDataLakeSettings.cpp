@@ -25,6 +25,12 @@ namespace ErrorCodes
     DECLARE(String, auth_scope, "PRINCIPAL_ROLE:ALL", "Authorization scope for client credentials or token exchange", 0) \
     DECLARE(String, oauth_server_uri, "", "OAuth server uri", 0) \
     DECLARE(Bool, oauth_server_use_request_body, true, "Put parameters into request body or query params", 0) \
+    DECLARE(Bool, oauth_forward_user_token, false, "Authenticate to the catalog as the user running the query instead of as the shared service principal configured by `catalog_credential`. On its own this forwards the user's own bearer token unchanged (passthrough); set `oauth_token_exchange_uri` to exchange it first. Requires the server-level `enable_token_forwarding` setting and an Iceberg REST catalog", 0) \
+    DECLARE(String, oauth_token_exchange_uri, "", "Empty means passthrough: the user's token is presented to the catalog as-is. Non-empty switches to an RFC 8693 token exchange against this URL - point it at the IdP's token endpoint to obtain a token whose audience the catalog accepts, or at a catalog's `/v1/oauth/tokens` (which the Iceberg REST spec deprecates for removal). Requires `oauth_forward_user_token` and a non-empty `catalog_credential`", 0) \
+    DECLARE(String, oauth_subject_token_type, "urn:ietf:params:oauth:token-type:access_token", "RFC 8693 `subject_token_type` of the forwarded user token. Used only when `oauth_token_exchange_uri` is set", 0) \
+    DECLARE(String, oauth_requested_token_type, "urn:ietf:params:oauth:token-type:access_token", "RFC 8693 `requested_token_type`; empty omits the field. Used only when `oauth_token_exchange_uri` is set", 0) \
+    DECLARE(Bool, oauth_forward_actor_token, false, "Send the catalog service principal's own token as the RFC 8693 `actor_token`, giving delegation semantics (`sub=user, act=clickhouse`). Only meaningful against a server that can validate it - an IdP cannot. Used only when `oauth_token_exchange_uri` is set", 0) \
+    DECLARE(UInt64, oauth_user_token_cache_ttl, 300, "Maximum lifetime (in seconds) of a cached per-user session token obtained by token exchange; '0' disables caching. Used only when `oauth_token_exchange_uri` is set", 0) \
     DECLARE(String, warehouse, "", "Warehouse name inside the catalog", 0) \
     DECLARE(String, auth_header, "", "Authorization header of format 'Authorization: <scheme> <auth_info>'", 0) \
     DECLARE(String, aws_access_key_id, "", "Key for AWS connection for Glue catalog", 0) \

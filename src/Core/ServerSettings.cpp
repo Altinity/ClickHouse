@@ -890,6 +890,21 @@ namespace
 
     Default value: `true` (token authentication is enabled).
     )", 0) \
+    DECLARE(Bool, enable_token_forwarding, false, R"(
+    Controls whether the bearer token a user authenticated with is retained for the lifetime of
+    their session so that it can be forwarded to external services on their behalf -- currently
+    an Iceberg REST catalog, via the `oauth_forward_user_token` database setting.
+
+    When disabled (the default) the token is destroyed right after authentication, exactly as
+    before, and no database can forward it.
+
+    Enabling this is a privileged decision: the token is forwarded to a URL that whoever ran
+    `CREATE DATABASE ... ENGINE = DataLakeCatalog(<url>)` chose, so `CREATE DATABASE` becomes an
+    operation that can harvest the bearer tokens of every user who queries that database. Grant
+    it accordingly, and keep `remote_url_allow_hosts` restrictive.
+
+    Default value: `false` (the token is not retained).
+    )", 0) \
     DECLARE(UInt64, concurrent_threads_soft_limit_num, 0, R"(
     The maximum number of query processing threads, excluding threads for retrieving data from remote servers, allowed to run all queries. This is not a hard limit. In case if the limit is reached the query will still get at least one thread to run. Query can upscale to desired number of threads during execution if more threads become available.
 

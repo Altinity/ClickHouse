@@ -341,17 +341,17 @@ DB::SettingsChanges CatalogSettings::allChanged() const
     return changes;
 }
 
-void ICatalog::createTable(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*metadata_content*/) const
+void ICatalog::createTable(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*metadata_content*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createTable is not implemented");
 }
 
-void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/) const
+void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createNamespaceIfNotExists is not implemented");
 }
 
-bool ICatalog::updateMetadata(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*new_snapshot*/) const
+bool ICatalog::updateMetadata(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*new_snapshot*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateMetadata is not implemented");
 }
@@ -363,12 +363,13 @@ bool ICatalog::updateSchema(
     Poco::JSON::Object::Ptr /*new_schema*/,
     Int32 /*previous_schema_id*/,
     Int32 /*new_last_column_id*/,
-    Poco::JSON::Object::Ptr /*metadata*/) const
+    Poco::JSON::Object::Ptr /*metadata*/,
+    const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateSchema is not implemented");
 }
 
-void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/) const
+void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "dropTable is not implemented");
 }

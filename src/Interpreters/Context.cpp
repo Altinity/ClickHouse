@@ -7472,6 +7472,11 @@ void Context::setClientInfo(const ClientInfo & client_info_)
     need_recalculate_access = true;
 }
 
+void Context::setForwardedAuthToken(ForwardedAuthTokenPtr token)
+{
+    forwarded_auth_token = std::move(token);
+}
+
 void Context::setClientName(const String & client_name)
 {
     client_info.client_name = client_name;

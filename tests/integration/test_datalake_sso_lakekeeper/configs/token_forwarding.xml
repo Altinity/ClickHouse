@@ -1,0 +1,24 @@
+<clickhouse>
+    <!-- Retain the bearer token so the Iceberg REST catalog can be contacted as the querying user. -->
+    <enable_token_forwarding>1</enable_token_forwarding>
+
+    <token_processors>
+        <keycloak>
+            <type>openid</type>
+            <configuration_endpoint>http://keycloak:8080/realms/clickhouse-test/.well-known/openid-configuration</configuration_endpoint>
+            <allow_http_discovery_urls>true</allow_http_discovery_urls>
+            <username_claim>preferred_username</username_claim>
+            <verifier_leeway>60</verifier_leeway>
+            <!-- Short cache, so token rotation is observable inside a test. -->
+            <token_cache_lifetime>5</token_cache_lifetime>
+        </keycloak>
+    </token_processors>
+
+    <!-- Provision `alice` and `bob` from the IdP rather than declaring them in users.xml. -->
+    <user_directories>
+        <token>
+            <processor>keycloak</processor>
+            <default_profile>default</default_profile>
+        </token>
+    </user_directories>
+</clickhouse>
