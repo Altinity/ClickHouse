@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <mutex>
+
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
@@ -129,13 +131,14 @@ std::map<String, UInt64> runRoundCapturingIntake(Gc & gc, UniversePolicy policy 
 /// A store whose writer keeps pace with the walker EXACTLY: every time the fold reads the newest record
 /// by exact key, one more record lands above it.
 ///
-/// This is a mid-round appender expressed as a synchronous hook rather than as a thread, and the
-/// determinism is the point. The property under test is "the round stops at the tail it froze, however
-/// much arrives afterwards", and a thread can only make appends arrive at times the scheduler chooses --
-/// including, on an unlucky run, entirely after the walk has gone past. The hook reproduces the WORST
-/// case (writer rate == walker rate, the rate at which the unbounded walk provably never terminates) on
-/// every run, and `max_appends` bounds it so that the UNPATCHED walk still finishes and can be measured
-/// rather than hanging the suite.
+/// This is a mid-round appender expressed as a hook rather than as a background thread, and the
+/// determinism of WHEN it fires is the point: a real thread can only make appends arrive at times the
+/// scheduler chooses, including, on an unlucky run, entirely after the walk has gone past. The hook
+/// reproduces the WORST case (writer rate == walker rate, the rate at which the unbounded walk provably
+/// never terminates) on every run, and `max_appends` bounds it so that the UNPATCHED walk still finishes
+/// and can be measured rather than hanging the suite. The GC fold read-ahead can still land `read` calls
+/// for several hinted keys on different worker threads at once, so the hook's own state is mutex-guarded
+/// rather than assumed single-threaded.
 class ChasingWriterBackend : public CountingBackend
 {
 public:
@@ -143,6 +146,7 @@ public:
     /// `max_appends` further records.
     void arm(const Layout * layout_, const RootNamespace & ns_, uint64_t published_through, uint64_t max_appends)
     {
+        std::lock_guard lock(hook_mutex);
         layout = layout_;
         ns = ns_;
         published = published_through;
@@ -150,29 +154,54 @@ public:
     }
 
     /// Stop appending; the tail stands still from here on.
-    void disarm() { layout = nullptr; }
+    void disarm()
+    {
+        std::lock_guard lock(hook_mutex);
+        layout = nullptr;
+    }
 
-    uint64_t publishedThrough() const { return published; }
+    uint64_t publishedThrough() const
+    {
+        std::lock_guard lock(hook_mutex);
+        return published;
+    }
 
     std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
     {
         auto result = CountingBackend::read(key, access);
-        if (!layout || appending || published >= limit)
-            return result;
-        if (key != layout->refLogKey(fixture::fixtureLife(ns), RefTxnId{1, published}))
-            return result;
 
-        /// The walk just consumed the tail; the writer answers with the next record. Guarded against
-        /// re-entry because publishing issues backend calls of its own.
-        appending = true;
-        const uint64_t next = published + 1;
-        publishAt(*this, *layout, ns, RefTxnId{1, next}, "ref_" + std::to_string(next), next, DB::UInt128(next));
+        const Layout * layout_snapshot = nullptr;
+        RootNamespace ns_snapshot;
+        uint64_t next = 0;
+        {
+            std::lock_guard lock(hook_mutex);
+            if (!layout || appending || published >= limit)
+                return result;
+            if (key != layout->refLogKey(fixture::fixtureLife(ns), RefTxnId{1, published}))
+                return result;
+
+            /// The walk just consumed the tail; the writer answers with the next record. Guarded
+            /// against re-entry (by another read-ahead worker, not just the same thread) because
+            /// publishing issues backend calls of its own.
+            appending = true;
+            layout_snapshot = layout;
+            ns_snapshot = ns;
+            next = published + 1;
+        }
+
+        /// `publishAt` below must run with the mutex released: it issues backend calls of its own, and
+        /// holding the lock across them would either self-deadlock on a re-entrant call or serialize
+        /// every read-ahead worker behind this one append.
+        publishAt(*this, *layout_snapshot, ns_snapshot, RefTxnId{1, next}, "ref_" + std::to_string(next), next, DB::UInt128(next));
+
+        std::lock_guard lock(hook_mutex);
         published = next;
         appending = false;
         return result;
     }
 
 private:
+    mutable std::mutex hook_mutex;
     const Layout * layout = nullptr;
     RootNamespace ns{};
     uint64_t published = 0;
