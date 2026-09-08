@@ -108,7 +108,7 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS = 9;
 /// 10 is a version peers still advertise, and deleting the record of what it meant would leave the next
 /// reader unable to tell what an incoming 10 promises (a relink it will NOT confirm).
 [[maybe_unused]] constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK = 10;
-/// CAS replication, publish-then-confirm (spec §wire-protocol). A relink offer is now accompanied by a
+/// CAS replication, publish-then-confirm. A relink offer is now accompanied by a
 /// source token, and the endpoint answers a second, part-less request that asks whether that token is
 /// still exactly what the sender's ref names. A server advertising this version serves the confirm
 /// action; a receiver advertising it must confirm before it promotes.
@@ -128,15 +128,15 @@ constexpr auto CA_POOL_UUID_PARAM = "cas_pool_uuid";
 /// (the opaque encoded PartManifest body — self-contained, see part_manifest_v2 below) instead of the
 /// byte stream.
 constexpr auto CA_RELINK_COOKIE = "cas_relink";
-/// All-tree task 7: the manifest is now self-contained (uuid.txt/metadata_version.txt are ordinary
-/// manifest entries, task 6), so the wire payload dropped its trailing metadata_version field (the
+/// The manifest is now self-contained (uuid.txt/metadata_version.txt are ordinary
+/// manifest entries), so the wire payload dropped its trailing metadata_version field (the
 /// manifest bytes are now the ONLY field). Bumped from `part_manifest_v1` so a mixed-build pair (old
 /// sender, new receiver) does not try to parse the old two-field payload under the new one-field shape
 /// — the receiver rejects a cookie value it does not recognize and falls back to a byte fetch instead
 /// of desyncing on the wire format.
 constexpr auto CA_RELINK_COOKIE_VALUE = "part_manifest_v2";
 
-/// CAS fetch-by-relink, publish-then-confirm (spec §wire-protocol). Three names make up the second
+/// CAS fetch-by-relink, publish-then-confirm. Three names make up the second
 /// request of the handshake.
 ///
 /// The request parameter both selects the confirm action and carries its only argument: the opaque
@@ -163,7 +163,7 @@ constexpr auto CA_CONFIRM_ANSWER_UNPROVEN = "unproven";
 
 /// Resolve a disk to the content-addressed exchange facade, or nullptr if the disk is not CA. The
 /// cast targets the purpose-built INTERFACE (IContentAddressedExchange), never the concrete
-/// metadata-storage class (M-W design section 4). Used by both the relink sender (the part's
+/// metadata-storage class. Used by both the relink sender (the part's
 /// disk) and the relink receiver (the target disk).
 IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk)
 {
@@ -226,7 +226,7 @@ CasConfirmAnswer Service::resolveContentAddressedConfirm(
     const String & part_name,
     const String & manifest_ref_text) const
 {
-    /// CAS fetch-by-relink, publish-then-confirm (spec §confirm-primitive). The receiver's own `+1` is
+    /// CAS fetch-by-relink, publish-then-confirm. The receiver's own `+1` is
     /// already durable when this runs; a `Yes` is what authorizes it to promote a part whose blobs are
     /// protected only by THIS server's committed binding of that exact manifest. Every field below comes
     /// from a remote peer, so nothing here is trusted beyond being used as a lookup key.
@@ -253,8 +253,8 @@ CasConfirmAnswer Service::resolveContentAddressedConfirm(
         return CasConfirmAnswer::Unknown;
     const IContentAddressedExchange * matched = tryGetContentAddressedExchange(routing_disks[*routed]);
 
-    /// Gate 0 — the part-anchored fast filter. It is an AVAILABILITY filter and never a proof (spec
-    /// §confirm-primitive, demoted in rev.5): `rollbackDeletingParts` puts a part back to `Outdated`
+    /// Gate 0 — the part-anchored fast filter. It is an AVAILABILITY filter and never a proof:
+    /// `rollbackDeletingParts` puts a part back to `Outdated`
     /// after a failed filesystem removal, and the in-memory part path is deliberately not updated by a
     /// `delete_tmp_*` rename, so an `Active`/`Outdated` part object authorizes nothing. What it buys is
     /// a cheap `No` that costs no ledger work; every `Yes` is earned by gate 1 alone.
@@ -318,7 +318,7 @@ void Service::answerContentAddressedConfirm(const String & token_text, HTTPServe
 
 void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuffer & out, HTTPServerResponse & response)
 {
-    /// CAS fetch-by-relink, publish-then-confirm (spec §wire-protocol): the second request of the
+    /// CAS fetch-by-relink, publish-then-confirm: the second request of the
     /// handshake, dispatched before `part` is required because a confirm carries none — the part name
     /// is inside the token. Authentication parity with the fetch is inherent: the shared handler
     /// authenticates before it dispatches to any endpoint.
@@ -405,7 +405,7 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
             writeBinary(projections.size(), out);
         }
 
-        /// CAS replication 2b — fetch-by-relink (spec §4). If the part is on a content-addressed disk and
+        /// CAS replication — fetch-by-relink. If the part is on a content-addressed disk and
         /// the pool of the disk this part sits on is among the pools the receiver advertised in
         /// `cas_pool_uuid`, send only the part's content id + the mutable header — no file bytes — so
         /// the receiver can "fetch" by publishing its own ref to the blobs already in the shared pool.
@@ -438,8 +438,8 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
                     LOG_DEBUG(log, "Sending part {} by relink (content-addressed, shared pool {}), manifest payload {} bytes",
                         part_name, matched_pool, offer->manifest_bytes.size());
                     response.addCookie({CA_RELINK_COOKIE, CA_RELINK_COOKIE_VALUE});
-                    /// The source token for the confirm request the receiver makes before it promotes
-                    /// (spec §wire-protocol). It always accompanies the offer, and its ABSENCE is what
+                    /// The source token for the confirm request the receiver makes before it promotes.
+                    /// It always accompanies the offer, and its ABSENCE is what
                     /// tells a confirm-capable receiver that this sender predates the handshake.
                     response.addCookie({CA_CONFIRM_TOKEN_COOKIE, offer->confirm_token});
                     /// Which of the advertised pools this offer is for. A receiver with one pool does not
@@ -449,11 +449,11 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
                     fiu_do_on(FailPoints::cas_relink_sender_omit_pool_cookie, { omit_pool_cookie = true; });
                     if (!omit_pool_cookie)
                         response.addCookie({CA_POOL_UUID_PARAM, matched_pool});
-                    /// The relink payload (B7 part_manifest_v2, all-tree task 7): the opaque encoded
+                    /// The relink payload (`part_manifest_v2`): the opaque encoded
                     /// PartManifest body (the receiver decodes it, ignores the sender identity, and
                     /// stages its OWN local manifest over the shared-pool blobs; the legacy part_id wire
                     /// field carries it). Self-contained: uuid.txt/metadata_version.txt are ordinary
-                    /// manifest entries now (task 6), so no separate mutable-header field is sent.
+                    /// manifest entries now, so no separate mutable-header field is sent.
                     writeStringBinary(offer->manifest_bytes, out);
                     data.addLastSentPart(part->info);
                     return;
@@ -959,7 +959,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     if (server_protocol_version >= REPLICATION_PROTOCOL_VERSION_WITH_PARTS_PROJECTION)
         readBinary(projections, *in);
 
-    /// CAS replication 2b — fetch-by-relink (spec §4; B7 part_manifest_v2, all-tree task 7). The sender
+    /// CAS replication — fetch-by-relink (`part_manifest_v2`). The sender
     /// chose to relink: it sent only the part's encoded PartManifest body, no file bytes, and the
     /// reservation above already went to the offered pool's disk. Build the part by staging this
     /// server's OWN local manifest over the blobs already in the shared pool (adopt-by-hash -> revalidate
@@ -973,7 +973,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
         /// Re-request without the relink capability: pass the SAME (CA) disk but disable zero-copy/relink
         /// so the sender streams bytes; on CA the downloaded files content-address and dedup.
         ///
-        /// THE RECURSION BRAKE (B66b). `allow_ca_relink=false` is what bounds this: the re-request does
+        /// THE RECURSION BRAKE. `allow_ca_relink=false` is what bounds this: the re-request does
         /// not advertise the pool identity, so the sender cannot offer relink again, so this lambda
         /// cannot be reached a second time for the same fetch. Before relink had its own capability the
         /// brake was implicit in `try_zero_copy=false`; with the two decoupled it has to be spelled out,
@@ -1025,7 +1025,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
         readStringBinary(sender_manifest_bytes, *in);
         assertEOF(*in);
 
-        /// Publish-then-confirm (spec §core-idea) happens inside `relinkPartToDisk`, including the second
+        /// Publish-then-confirm happens inside `relinkPartToDisk`, including the second
         /// interserver request; the token cookie is the sender's offer identity and is opaque here. A
         /// `nullptr` means the mechanism cannot work but the sender still has the part, so the byte
         /// re-request below is sound; a THROW means the source did not prove the binding, and the whole
@@ -1407,8 +1407,8 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 ///    re-request goes back to the very source whose state is in doubt. That code, deliberately:
 ///    both queue executors (`processQueueEntry`, `ReplicatedMergeMutateTaskBase::executeStep`)
 ///    demote it to INFO with no stack trace -- a refusal is the designed outcome of racing a source
-///    whose ref moved on, not a network fault (issue #2219 records a multi-hour false triage chasing
-///    that label) -- yet, unlike `ABORTED`, it still records the exception on the queue entry, so a
+///    whose ref moved on, not a network fault, and logging it as an error invites exactly that
+///    misdiagnosis -- yet, unlike `ABORTED`, it still records the exception on the queue entry, so a
 ///    refusal storm stays visible in `system.replication_queue`. It is also the one fetch-transient
 ///    code the stateless corpus already tolerates in `part_log` checks (e.g. `02265_column_ttl`).
 ///    Lose a part? No -- the queue stores the exception, backs off, and re-executes the entry, which
@@ -1453,7 +1453,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 /// the source itself. `adoptPartFromManifest` used to collapse the two by catching every `Exception`
 /// and returning `false`.
 ///
-/// B66b — WHAT CHANGES WHEN THE TARGET IS `detached/`. Every row above still holds, and the two columns
+/// WHAT CHANGES WHEN THE TARGET IS `detached/`. Every row above still holds, and the two columns
 /// that matter are unchanged in every one of them, but two rows hold for a DIFFERENT reason and that
 /// difference is worth stating rather than rediscovering:
 ///
@@ -1476,11 +1476,11 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 /// keeps a failed detached relink from ever being visible as a live part: the abandoned precommit and
 /// the abandoned staging directory both live in the detached ref space.
 ///
-/// What a `yes` does NOT prove: `CaRelinkConfirmCore.tla` config `_sab_holeylist` shows that with every
-/// confirm rule intact and one incomplete listing page permitted, `ConfirmedRelinkNeverDangles` still
-/// breaks (BACKLOG `{#list-as-journal-dataloss-2026-07-25}`). A confirmed relink is therefore NOT proven
-/// dangle-free; a `yes` means only "the source still holds exactly this manifest right now", which is
-/// what closes the codex-6 handoff window and nothing more.
+/// What a `yes` does NOT prove: formal modelling of this protocol found that even with every confirm
+/// rule intact, one incomplete storage LIST page during a GC fold is enough to let a confirmed relink's
+/// blobs be reclaimed anyway. A confirmed relink is therefore NOT proven dangle-free; a `yes` means only
+/// "the source still holds exactly this manifest right now", which closes the window between this
+/// receiver's publish and the source's answer, and nothing more.
 MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     const String & part_name,
     const String & tmp_prefix,
@@ -1531,7 +1531,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     });
 
     /// Stage under the tmp-fetch dir OF THE TARGET PARENT — the table dir, or `TABLE/detached` when
-    /// the caller asked for a detached fetch (B66b). The parent is composed exactly as
+    /// the caller asked for a detached fetch. The parent is composed exactly as
     /// `downloadPartToDisk` composes it, so the two fetch paths put a part in the same place and the
     /// caller's finalization is unchanged: `renameTempPartAndReplace`'s moveDirectory(tmp-fetch_<part>
     /// -> <part>) for the active path, `renameTo(detached/<part>)` for the detached one. Both are ref
@@ -1550,16 +1550,16 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     LOG_DEBUG(log, "Relinking part {} (staged as {}) onto content-addressed disk {} from a {}-byte transferred manifest.",
         part_name, part_path, disk->getName(), sender_manifest_bytes.size());
 
-    /// T1 — PUBLISH. Adopt-from-manifest and precommit, stopping short of the promote (B7
-    /// part_manifest_v2, all-tree task 7): the receiver decodes the transferred body and stages its OWN
+    /// T1 — PUBLISH. Adopt-from-manifest and precommit, stopping short of the promote (`part_manifest_v2`):
+    /// the receiver decodes the transferred body and stages its OWN
     /// local manifest over the shared-pool blobs (adopt-by-hash). Self-contained:
-    /// uuid.txt/metadata_version.txt are ordinary entries in the transferred manifest (task 6), so there
+    /// uuid.txt/metadata_version.txt are ordinary entries in the transferred manifest, so there
     /// is no sidecar to reconstruct. Trust boundary is the interserver channel, as for a normal part
     /// fetch — see `prepareAdoptFromManifest`.
     ///
     /// The order is the whole protocol. This `+1` must be DURABLE before the source is asked anything,
     /// because the question "do you still hold it?" only excludes a later removal if the receiver's own
-    /// reference is already in the ref log when that removal is appended (spec §correctness). Asking
+    /// reference is already in the ref log when that removal is appended. Asking
     /// first and publishing after would prove nothing about the interval in between. What it does NOT
     /// establish is that every subsequent GC fold OBSERVES that reference -- see "What a `yes` does NOT
     /// prove" above; ordering is necessary here, not sufficient.
@@ -1581,10 +1581,10 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
 
     /// Test-only, and this is the ONE seam worth injecting on the whole path: it opens the window the
     /// protocol exists to make safe. The receiver's `+1` is durable and its release is armed, and the
-    /// source has not been asked anything yet, so a test that holds the fetch here can do to the source
-    /// exactly what codex-6 described — merge the part away, run GC to fixpoint — and then observe both
-    /// halves of the contract: the source's blobs survive the round (this receiver's binding protects
-    /// them) and the confirm that follows refuses to authorize a promote (the binding it named is gone).
+    /// source has not been asked anything yet, so a test that holds the fetch here can merge the part
+    /// away on the source and run GC to fixpoint, then observe both halves of the contract: the source's
+    /// blobs survive the round (this receiver's binding protects them) and the confirm that follows
+    /// refuses to authorize a promote (the binding it named is gone).
     FailPointInjection::pauseFailPoint(FailPoints::cas_relink_receiver_pause_before_confirm);
 
     /// T2 — CONFIRM. One read-only interserver question, aimed at the endpoint copied out of the fetch
