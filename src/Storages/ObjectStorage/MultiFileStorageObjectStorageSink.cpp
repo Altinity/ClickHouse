@@ -172,8 +172,7 @@ std::optional<std::vector<std::string>> MultiFileStorageObjectStorageSink::tryRe
     {
         String committed_path;
         readStringUntilNewlineInto(committed_path, *in);
-        if (!in->eof())
-            in->ignore(1);
+        in->tryIgnore(1);
         if (!committed_path.empty())
             committed_paths.emplace_back(std::move(committed_path));
     }
