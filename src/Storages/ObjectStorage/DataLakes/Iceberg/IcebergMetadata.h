@@ -218,7 +218,7 @@ public:
         StorageMetadataPtr storage_metadata,
         ContextPtr local_context) const override;
 
-    void drop(ContextPtr context) override;
+    void drop(bool delete_data) override;
 
     Poco::JSON::Object::Ptr getMetadataJSON(ContextPtr local_context) const;
 
