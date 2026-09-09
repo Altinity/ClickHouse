@@ -201,6 +201,11 @@ std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(const std::string & endp
     cfg.connectTimeoutMs = 10000;
     cfg.requestTimeoutMs = 10000;
     cfg.s3_use_adaptive_timeouts = false;
+    /// Every test here starts its own server on an ephemeral port; with keep-alive on, the process-wide
+    /// HTTP connection pool can hand a later test a connection to a port whose server is already gone
+    /// (`Connection reset by peer` under `--gtest_repeat`). One connection per request is what a
+    /// short-lived test server should get.
+    cfg.http_keep_alive_timeout = 0;
     auto client = DB::S3::ClientFactory::instance().create(
         cfg,
         DB::S3::ClientSettings{
