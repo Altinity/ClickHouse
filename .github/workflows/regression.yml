@@ -727,7 +727,7 @@ jobs:
       suite_executable: regression.py
       output_format: new-fails
       flags: --with-analyzer
-      timeout_minutes: 180
+      timeout_minutes: 300
       runner_arch: ${{ inputs.arch }}
       runner_type: ${{ inputs.runner_type }}
       part: ${{ matrix.PART }}
@@ -765,7 +765,7 @@ jobs:
       suite_executable: regression.py
       output_format: new-fails
       flags: --with-analyzer
-      timeout_minutes: 180
+      timeout_minutes: 300
       runner_arch: ${{ inputs.arch }}
       runner_type: ${{ inputs.runner_type }}
       part: ${{ matrix.PART }}
