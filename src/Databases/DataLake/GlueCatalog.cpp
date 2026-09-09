@@ -628,15 +628,15 @@ bool GlueCatalog::empty() const
 
 Poco::JSON::Object::Ptr GlueCatalog::getOrFetchMetadataObject(const String & metadata_uri, const TableMetadata & table_metadata) const
 {
-    if (!metadata_objects.get(metadata_uri))
+    auto [value, _] = metadata_objects.getOrSet(metadata_uri, [&]()
     {
         auto [object_storage, bucket_name, metadata_path] = createObjectStorageForEarlyTableAccess(metadata_uri, table_metadata);
         auto compression_method = DB::Iceberg::getCompressionMethodFromMetadataFile(metadata_uri);
         auto metadata_object = DB::Iceberg::getMetadataJSONObject(
             metadata_path, object_storage, nullptr, getContext(), log, compression_method, std::nullopt);
-        metadata_objects.set(metadata_uri, std::make_shared<Poco::JSON::Object::Ptr>(metadata_object));
-    }
-    return *metadata_objects.get(metadata_uri);
+        return std::make_shared<Poco::JSON::Object::Ptr>(metadata_object);
+    });
+    return *value;
 }
 
 String GlueCatalog::getActualTimestampType(const String & column_name, const TableMetadata & table_metadata, const String & glue_column_type) const
