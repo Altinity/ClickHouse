@@ -1,5 +1,4 @@
 import argparse
-import os
 import time
 from pathlib import Path
 
@@ -62,15 +61,6 @@ def main():
         if "/" in to:
             batch_num, total_batches = map(int, to.split("/"))
 
-    # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
-    os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
-        f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
-        verbose=True,
-    )
-    no_azure = False
-    if not os.environ["AZURE_CONNECTION_STRING"]:
-        no_azure = True
-
     ch_path = args.ch_path
     assert (
         Path(ch_path + "/clickhouse").is_file()
@@ -109,7 +99,7 @@ def main():
             f"ln -sf {ch_path}/clickhouse {ch_path}/clickhouse-format",
             f"rm -rf {temp_dir}/etc/ && mkdir -p {temp_dir}/etc/clickhouse-client {temp_dir}/etc/clickhouse-server",
             f"cp programs/server/config.xml programs/server/users.xml {temp_dir}/etc/clickhouse-server/",
-            f"./tests/config/install.sh {temp_dir}/etc/clickhouse-server {temp_dir}/etc/clickhouse-client --s3-storage {'--no-azure' if no_azure else ''}",
+            f"./tests/config/install.sh {temp_dir}/etc/clickhouse-server {temp_dir}/etc/clickhouse-client --s3-storage",
             # clickhouse benchmark segfaults with --config-path, so provide client config by its default location
             f"cp {temp_dir}/etc/clickhouse-client/* /etc/clickhouse-client/",
             # update_path_ch_config,
@@ -140,6 +130,9 @@ def main():
         res = res and Shell.check(
             "aws s3 ls s3://test --endpoint-url http://localhost:11111/", verbose=True
         )
+        azurite_log = f"{temp_dir}/azurite.log"
+        res = res and CH.start_azurite(log_file_path=azurite_log)
+        logs_to_attach += [azurite_log]
         res = res and CH.log_cluster_config()
         res = res and CH.start()
         res = res and CH.wait_ready()
