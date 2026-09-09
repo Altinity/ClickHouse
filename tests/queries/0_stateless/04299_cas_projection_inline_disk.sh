@@ -21,7 +21,12 @@ SETTINGS disk = disk(
     metadata_type = cas,
     cas_server_root_id = '${CLICKHOUSE_DATABASE}_04299',
     name = '${CLICKHOUSE_DATABASE}_04299_cas_projection',
-    path = '${CLICKHOUSE_DATABASE}_04299_cas_projection_pool/');
+    path = '${CLICKHOUSE_DATABASE}_04299_cas_projection_pool/'),
+    -- The normal projection p_by_b is asserted with force_optimize_projection below; a merge
+    -- re-granulates the base part but rebuilds the projection at the source parts' boundaries, so a
+    -- randomized index_granularity (703 in CI) can leave the projection with more marks than the
+    -- table and the planner rightly refuses it. Pin the defaults, as 04300 does.
+    index_granularity = 8192, index_granularity_bytes = 10485760;
 
 INSERT INTO t_proj_cas SELECT number, number % 10 FROM numbers(1000);
 INSERT INTO t_proj_cas SELECT number, number % 10 FROM numbers(1000, 1000);
@@ -58,7 +63,9 @@ DROP TABLE t_proj_cas;
 DROP TABLE IF EXISTS t_proj_cas_alter;
 
 CREATE TABLE t_proj_cas_alter (a UInt64, b UInt64, PROJECTION p_by_b (SELECT a, b ORDER BY b))
-ENGINE = MergeTree ORDER BY a;
+ENGINE = MergeTree ORDER BY a
+-- Same pin as t_proj_cas: the after_merge_reload_uses_projection check below forces p_by_b.
+SETTINGS index_granularity = 8192, index_granularity_bytes = 10485760;
 
 INSERT INTO t_proj_cas_alter SELECT number, number % 10 FROM numbers(1000);
 INSERT INTO t_proj_cas_alter SELECT number, number % 10 FROM numbers(1000, 1000);
