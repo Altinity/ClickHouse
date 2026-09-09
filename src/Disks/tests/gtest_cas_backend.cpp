@@ -15,6 +15,7 @@
 #include <IO/WriteHelpers.h>
 #include <IO/WriteSettings.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 
 #include <chrono>
 #include <atomic>
@@ -323,15 +324,28 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
     std::promise<void> source_opened;
     std::promise<void> release_source;
     const std::shared_future<void> release = release_source.get_future().share();
+    /// Set when `open_payload`'s own internal wait below times out instead of observing the release.
+    /// The timeout alone silently lets the publisher proceed either way -- this flag is what lets the
+    /// test body downstream (after calling `releaseOnce`) assert that the release actually reached the
+    /// publisher, so a regression that leaves it unreleased for the full bound FAILS instead of quietly
+    /// passing because the timeout eventually let it through anyway.
+    std::atomic<bool> release_wait_expired{false};
     const BlobPublishRequest request{
         .destination_key = "blob",
         .publication = StreamingBlobPublication{
             .payload_size = 7,
             .fresh_envelope = "fresh-envelope",
-            .open_payload = [&source_opened, release]
+            .open_payload = [&source_opened, release, &release_wait_expired]
             {
                 source_opened.set_value();
-                release.wait();
+                /// Bounded, not `.wait()`: even if the release guards below somehow never fire, this
+                /// lambda -- and therefore `publish()`, and therefore the `std::async` task wrapping it
+                /// -- must still return within a bounded time, so `publication`'s blocking destructor (a
+                /// `std::async` future's destructor blocks until its task finishes) can never hang the
+                /// whole process. This is the ONLY wait `open_payload` performs, so it also bounds
+                /// `publish()`'s total time to this 20s plus whatever negligible in-memory work follows.
+                if (release.wait_for(20s) != std::future_status::ready)
+                    release_wait_expired = true;
                 return std::make_unique<DB::ReadBufferFromOwnString>(String("payload"));
             }}};
 
@@ -340,11 +354,38 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
     /// racing on `op`.
     CasOperation publish_op = requests.admit();
     auto publication = std::async(std::launch::async, [&] { publish_op.publish(request, Retry::once()); });
-    source_opened.get_future().wait();
+
+    /// `publication` and (below) `observation` are both futures returned by `std::async`, so EACH one's
+    /// destructor blocks until its own task finishes. A failing ASSERT_*/EXPECT_* can unwind this
+    /// function while the publisher is still parked on `release`; this releases it promptly on that
+    /// exit rather than relying solely on the 20s bound above. Idempotent (the ordinary release near the
+    /// end sets `released` first) and declared right after `publication` so it protects every exit from
+    /// here on -- including the one right below, before `observation` exists.
+    bool released = false;
+    const auto releaseOnce = [&]
+    {
+        if (!released)
+        {
+            released = true;
+            release_source.set_value();
+        }
+    };
+    SCOPE_EXIT({ releaseOnce(); });
+
+    ASSERT_EQ(source_opened.get_future().wait_for(20s), std::future_status::ready)
+        << "publish() never reached open_payload";
 
     CasOperation read_op = requests.admit();
     auto observation = std::async(std::launch::async, [&] { return read_op.read("blob", Retry::once()); });
-    const auto observation_status = observation.wait_for(2s);
+    /// A SECOND copy of the same guard, declared AFTER `observation` so it tears down BEFORE
+    /// `observation`'s own blocking destructor on any unwind past this point. Without it, a genuine
+    /// visibility-lock regression (exactly what this test exists to catch) would leave `read_op.read`
+    /// blocked on the same lock `publish_op.publish` holds while parked on `release`, and the FIRST
+    /// guard above -- which, being declared earlier, tears down only AFTER `observation`'s destructor --
+    /// would then release the publisher too late to ever unblock that read.
+    SCOPE_EXIT({ releaseOnce(); });
+
+    const auto observation_status = observation.wait_for(20s);
     EXPECT_EQ(observation_status, std::future_status::ready)
         << "publication must not hold the visibility lock while draining its source";
     if (observation_status == std::future_status::ready)
@@ -354,7 +395,15 @@ TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteB
         EXPECT_EQ(visible->bytes, "old-complete-body");
     }
 
-    release_source.set_value();
+    releaseOnce();
+    /// `open_payload` above is the ONLY wait reachable from `publish_op.publish`, and it is itself
+    /// bounded to 20s: a stuck publisher therefore costs at most that 20s bound (plus negligible
+    /// in-memory work) before `publish()` returns and `publication`'s `std::async` destructor can
+    /// complete -- never an unbounded hang. `EXPECT_FALSE` below turns a timeout that silently released
+    /// the publisher into a visible test failure instead of a pass for the wrong reason.
+    ASSERT_EQ(publication.wait_for(20s), std::future_status::ready) << "publish() never completed after release";
+    EXPECT_FALSE(release_wait_expired.load())
+        << "open_payload's internal wait timed out instead of observing the release";
     EXPECT_NO_THROW(publication.get());
     const auto after = op.read("blob", Retry::once());
     ASSERT_TRUE(after.has_value());
@@ -765,6 +814,12 @@ struct PublicationWriteBarrier
     std::promise<void> opened;
     std::promise<void> release;
     std::shared_future<void> release_future = release.get_future().share();
+    /// Set when the wait on `release_future` below times out instead of observing the release. The
+    /// timeout alone silently lets the write proceed either way -- this flag is what lets the test body
+    /// assert (after calling the release itself) that it actually reached the write, so a regression
+    /// that leaves it unreleased for the full bound FAILS instead of quietly passing because the
+    /// timeout eventually let it through anyway.
+    std::atomic<bool> release_wait_expired{false};
 };
 
 class PublicationRecordingLocalObjectStorage final : public DB::LocalObjectStorage
@@ -792,7 +847,14 @@ public:
         if (write_barrier)
         {
             write_barrier->opened.set_value();
-            write_barrier->release_future.wait();
+            /// Bounded, not `.wait()`: even if a caller's release guard somehow never fires, this call
+            /// -- and therefore the `std::async` task wrapping the publish that reaches it -- must still
+            /// return within a bounded time, so that future's blocking destructor (a `std::async`
+            /// future's destructor blocks until its task finishes) can never hang the whole process.
+            /// This is the ONLY wait this write performs, so it also bounds the whole call's total time
+            /// to this 20s plus whatever negligible local-filesystem work follows.
+            if (write_barrier->release_future.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
+                write_barrier->release_wait_expired = true;
         }
         return out;
     }
@@ -938,12 +1000,35 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedKeepsDestinationCompleteUntilAt
         op.publish(streamingPublication(key, "fresh-envelope", "payload", 7), Retry::once());
     });
 
-    const auto opened_status = opened.wait_for(2s);
+    /// Same hazard as `PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteBodyIsReady`: an
+    /// exception unwinding out of this function (a failing ASSERT_*, or `readStorageObject` throwing)
+    /// while the write is still parked on `barrier->release_future.wait()` would deadlock `publication`'s
+    /// blocking `std::async` destructor against `barrier`'s own (later) teardown. Declared after
+    /// `publication` so it tears down FIRST, this guard releases the write unconditionally.
+    bool released = false;
+    SCOPE_EXIT({
+        if (!released)
+        {
+            released = true;
+            barrier->release.set_value();
+        }
+    });
+
+    const auto opened_status = opened.wait_for(20s);
     EXPECT_EQ(opened_status, std::future_status::ready);
     if (opened_status == std::future_status::ready)
         EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
 
+    released = true;
     barrier->release.set_value();
+    /// The write inside `writeObject` is the ONLY wait reachable from `op.publish`, and it is itself
+    /// bounded to 20s: a stuck write therefore costs at most that 20s bound (plus negligible
+    /// local-filesystem work) before `publish()` returns and `publication`'s `std::async` destructor
+    /// can complete -- never an unbounded hang. `EXPECT_FALSE` below turns a timeout that silently
+    /// released the write into a visible test failure instead of a pass for the wrong reason.
+    ASSERT_EQ(publication.wait_for(20s), std::future_status::ready) << "publish() never completed after release";
+    EXPECT_FALSE(barrier->release_wait_expired.load())
+        << "the write's internal wait timed out instead of observing the release";
     EXPECT_NO_THROW(publication.get());
     EXPECT_EQ(storage->metadata_calls, 0u);
     EXPECT_EQ(readStorageObject(storage, physical_key), "fresh-envelopepayload");
