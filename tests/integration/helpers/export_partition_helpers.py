@@ -7,10 +7,36 @@ previously duplicated across multiple test modules.
 
 import time
 import uuid
+from typing import NamedTuple
+
+import pytest
 
 
 MINIO_USER = "minio"
 MINIO_PASS = "ClickHouse_Minio_P@ssw0rd"
+
+# The `EXPORT PARTITION` implementation is shared between the two MergeTree flavours, so the
+# scenarios that do not depend on cross-replica coordination run once per engine. Suites expose
+# this through the `source_engine` fixture; a test that requests the fixture runs twice.
+SOURCE_ENGINES = ["MergeTree", "ReplicatedMergeTree"]
+SOURCE_ENGINE_IDS = ["mt", "rmt"]
+
+
+def is_replicated_engine(engine):
+    return engine == "ReplicatedMergeTree"
+
+
+def skip_if_remote_database_disk_enabled(cluster):
+    """Skip the test if any instance in the cluster has remote database disk enabled.
+
+    Tests that block MinIO cannot run when remote database disk is enabled, as the database
+    metadata is stored on MinIO and blocking it would break the database.
+    """
+    for instance in cluster.instances.values():
+        if instance.with_remote_database_disk:
+            pytest.skip(
+                "Test cannot run with remote database disk enabled (db disk), as it blocks MinIO which stores database metadata"
+            )
 
 
 def wait_for_export_status(
@@ -161,17 +187,100 @@ def make_mt(
     columns,
     partition_by,
     order_by="tuple()",
+    extra_settings="",
 ):
     """Create a MergeTree table with block-number settings."""
+    settings = f"{_BLOCK_SETTINGS}, {extra_settings}" if extra_settings else _BLOCK_SETTINGS
     node.query(
         f"""
         CREATE TABLE {name} ({columns})
         ENGINE = MergeTree()
         PARTITION BY {partition_by}
         ORDER BY {order_by}
-        SETTINGS {_BLOCK_SETTINGS}
+        SETTINGS {settings}
         """
     )
+
+
+def make_source(
+    node,
+    name,
+    columns,
+    partition_by,
+    engine="ReplicatedMergeTree",
+    order_by="tuple()",
+    replica_name="r1",
+    extra_settings="",
+):
+    """Create an export source table of the given MergeTree flavour.
+
+    *replica_name* is ignored for a plain MergeTree, which has no replicas.
+    """
+    if is_replicated_engine(engine):
+        make_rmt(
+            node,
+            name,
+            columns,
+            partition_by,
+            replica_name=replica_name,
+            order_by=order_by,
+            extra_settings=extra_settings,
+        )
+    else:
+        make_mt(
+            node,
+            name,
+            columns,
+            partition_by,
+            order_by=order_by,
+            extra_settings=extra_settings,
+        )
+
+
+def setup_source_tables(
+    nodes,
+    name,
+    columns,
+    partition_by,
+    engine,
+    insert_values=None,
+    order_by="tuple()",
+    extra_settings="",
+    replica_names=None,
+):
+    """Create the export source table on the nodes that can host it and insert the initial data.
+
+    A `ReplicatedMergeTree` source is created on every node, and the insert made on the first
+    node is synced to the others. A plain `MergeTree` only exists on the first node, which is
+    the only node that can drive its export, so there is nothing to create or sync elsewhere.
+
+    This is the single place that branches on the engine, so the tests themselves stay free of
+    engine conditionals. Returns the nodes hosting the source table.
+    """
+    nodes = list(nodes)
+    hosts = nodes if is_replicated_engine(engine) else nodes[:1]
+
+    if replica_names is None:
+        replica_names = [node.name for node in hosts]
+
+    for node, replica_name in zip(hosts, replica_names):
+        make_source(
+            node,
+            name,
+            columns,
+            partition_by,
+            engine=engine,
+            order_by=order_by,
+            replica_name=replica_name,
+            extra_settings=extra_settings,
+        )
+
+    if insert_values:
+        hosts[0].query(f"INSERT INTO {name} VALUES {insert_values}")
+        for node in hosts[1:]:
+            node.query(f"SYSTEM SYNC REPLICA {name}")
+
+    return hosts
 
 
 def make_iceberg_s3(
@@ -213,3 +322,60 @@ def first_partition_id(node, table):
 def unique_suffix():
     """Return a UUID with hyphens replaced by underscores, suitable for table names."""
     return str(uuid.uuid4()).replace("-", "_")
+
+
+# -- how a destination whose column count exceeds the source's is matched
+EXTRA_SOURCE_COLUMN_MODES = [
+    pytest.param("POSITION", id="by-position"),
+    pytest.param("NAME", id="by-name"),
+]
+
+
+class RejectedPartitionExportCase(NamedTuple):
+    src_columns: str
+    src_partition_by: str
+    dst_columns: str
+    dst_partition_by: str
+    insert_values: str
+    error_substrings: tuple = ()
+
+
+# Partition keys that must be rejected regardless of the destination kind. A destination-specific
+# suite may append its own cases (see the Iceberg transform case).
+REJECTED_PARTITION_EXPORT_CASES = [
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32",
+            src_partition_by="a",
+            dst_columns="b Int32, a Int32",
+            dst_partition_by="a",
+            insert_values="(1, 1), (1, 2)",
+            error_substrings=("partition key column",),
+        ),
+        id="same_partition_key_different_column_order_single_column",
+    ),
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b, c)",
+            dst_columns="c Int32, b Int32, a Int32, val String",
+            dst_partition_by="(a, b, c)",
+            insert_values="(1, 1, 1, 'x'), (1, 1, 1, 'y')",
+            error_substrings=("partition key column",),
+        ),
+        id="same_partition_key_different_column_order_multi_column",
+    ),
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b)",
+            dst_columns="a Int32, b Int32, c Int32, val String",
+            dst_partition_by="(a, b, c)",
+            insert_values="(1, 2, 3, 'x')",
+            error_substrings=(
+                "column 'c', which is not part of the source MergeTree partition key",
+            ),
+        ),
+        id="multi_column_partition_key_more_in_destination",
+    ),
+]

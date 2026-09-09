@@ -1,23 +1,25 @@
 import logging
-import time
-import uuid
 
 import pytest
 
 from helpers.cluster import ClickHouseCluster
 from helpers.export_partition_helpers import (
+    make_mt,
     unique_suffix,
     wait_for_export_status,
     wait_for_export_to_start,
-    wait_for_exception_count,
 )
 from helpers.network import PartitionManager
 
-# Plain (non-replicated) MergeTree EXPORT PARTITION. Unlike the replicated variant there is no
-# ZooKeeper coordination: the task descriptor is persisted on the table's disk and a local
-# background scheduler drives it, so these tests also cover restart-resume.
-
-SYSTEM_TABLE = "partition_exports"
+# What is left here is the plain-`MergeTree` behavior that the unified suites cannot express:
+#
+#  * this cluster has no ZooKeeper at all, which is what proves a plain `MergeTree` export needs no
+#    Keeper ensemble - `test_export_partition_to_object_storage` runs inside a Keeper-backed cluster,
+#  * the task descriptor lives on the table's disk instead of in Keeper, so it must survive a hard
+#    restart and resume on its own.
+#
+# Everything else that used to live here now runs as the `mt` parameter of
+# `test_export_partition_to_object_storage`.
 
 
 def skip_if_remote_database_disk_enabled(cluster):
@@ -37,16 +39,6 @@ def cluster():
             main_configs=[
                 "configs/named_collections.xml",
                 "configs/allow_experimental_export_partition.xml",
-            ],
-            user_configs=["configs/users.d/profile.xml"],
-            with_minio=True,
-            stay_alive=True,
-        )
-        cluster.add_instance(
-            "node_export_disabled",
-            main_configs=[
-                "configs/named_collections.xml",
-                "configs/disable_experimental_export_partition.xml",
             ],
             user_configs=["configs/users.d/profile.xml"],
             with_minio=True,
@@ -77,7 +69,10 @@ def drop_tables_after_test(cluster):
             logging.warning(f"drop_tables_after_test: cleanup failed on {instance_name}: {e}")
 
 
-def create_s3_table(node, s3_table):
+def create_tables_and_insert_data(node, mt_table, s3_table):
+    node.query(f"DROP TABLE IF EXISTS {mt_table} SYNC")
+    make_mt(node, mt_table, "id UInt64, year UInt16", "year")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
     node.query(
         f"CREATE TABLE {s3_table} (id UInt64, year UInt16) "
         f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
@@ -85,19 +80,17 @@ def create_s3_table(node, s3_table):
     )
 
 
-def create_tables_and_insert_data(node, mt_table, s3_table):
-    node.query(f"DROP TABLE IF EXISTS {mt_table} SYNC")
-    node.query(
-        f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = MergeTree "
-        f"PARTITION BY year ORDER BY tuple() "
-        f"SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1"
-    )
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
-    create_s3_table(node, s3_table)
-
-
-def test_export_partition_basic_roundtrip(cluster):
+def test_export_partition_without_keeper(cluster):
+    """A plain MergeTree export is driven entirely by the local scheduler, so it must work on a node
+    that has no ZooKeeper configured at all."""
     node = cluster.instances["node"]
+
+    # Asserted against the cluster definition rather than a system table: this is a property of
+    # how the instance was built, and it holds on every server version.
+    assert not node.with_zookeeper, (
+        "This suite must run without ZooKeeper, otherwise it proves nothing about a Keeper-less "
+        "export"
+    )
 
     postfix = unique_suffix()
     mt_table = f"basic_mt_{postfix}"
@@ -106,8 +99,7 @@ def test_export_partition_basic_roundtrip(cluster):
     create_tables_and_insert_data(node, mt_table, s3_table)
 
     node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
-
-    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED", system_table=SYSTEM_TABLE)
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
 
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "3\n"
     assert (
@@ -116,220 +108,6 @@ def test_export_partition_basic_roundtrip(cluster):
         )
         != "0\n"
     ), "Commit file missing for partition 2020"
-
-
-def test_export_partition_all(cluster):
-    node = cluster.instances["node"]
-
-    postfix = unique_suffix()
-    mt_table = f"all_mt_{postfix}"
-    s3_table = f"all_s3_{postfix}"
-
-    node.query(
-        f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = MergeTree "
-        f"PARTITION BY year ORDER BY tuple()"
-    )
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2021), (3, 2022)")
-    create_s3_table(node, s3_table)
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
-
-    for partition_id in ("2020", "2021", "2022"):
-        wait_for_export_status(node, mt_table, s3_table, partition_id, "COMPLETED", system_table=SYSTEM_TABLE)
-
-    assert node.query(f"SELECT count() FROM {s3_table}") == "3\n"
-
-
-def test_duplicate_export_rejected_and_force(cluster):
-    node = cluster.instances["node"]
-
-    postfix = unique_suffix()
-    mt_table = f"dup_mt_{postfix}"
-    s3_table = f"dup_s3_{postfix}"
-
-    create_tables_and_insert_data(node, mt_table, s3_table)
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
-    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED", system_table=SYSTEM_TABLE)
-
-    # Re-export without force must be rejected.
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-    )
-    assert "EXPORT_PARTITION_ALREADY_EXPORTED" in error, f"Expected duplicate rejection, got: {error}"
-
-    # With force + overwrite policy the re-export succeeds.
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
-        f"SETTINGS export_merge_tree_partition_force_export = 1, "
-        f"export_merge_tree_part_file_already_exists_policy = 'overwrite'"
-    )
-    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED", system_table=SYSTEM_TABLE)
-
-
-def test_kill_export(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node"]
-
-    postfix = unique_suffix()
-    mt_table = f"kill_mt_{postfix}"
-    s3_table = f"kill_s3_{postfix}"
-
-    create_tables_and_insert_data(node, mt_table, s3_table)
-
-    minio_ip = cluster.minio_ip
-    minio_port = cluster.minio_port
-
-    with PartitionManager() as pm:
-        pm.add_rule({
-            "instance": node,
-            "destination": node.ip_address,
-            "protocol": "tcp",
-            "source_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        })
-        pm.add_rule({
-            "instance": node,
-            "destination": minio_ip,
-            "protocol": "tcp",
-            "destination_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        })
-
-        node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
-        wait_for_export_to_start(node, mt_table, s3_table, "2020", system_table=SYSTEM_TABLE)
-
-        kill_result = node.query(
-            f"KILL EXPORT PARTITION WHERE partition_id = '2020'"
-            f" AND source_table = '{mt_table}' AND destination_table = '{s3_table}'"
-        )
-        kill_status = kill_result.split("\t")[0].strip()
-        assert kill_status == "waiting", (
-            f"Expected kill_status 'waiting' (CancelSent), got: {kill_result!r}"
-        )
-
-    wait_for_export_status(node, mt_table, s3_table, "2020", "KILLED", system_table=SYSTEM_TABLE, timeout=30)
-
-    # No commit file and no data must have landed.
-    assert (
-        node.query(
-            f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)"
-        )
-        == "0\n"
-    ), "Partition 2020 was committed despite being killed"
-    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "0\n"
-
-
-def test_export_task_timeout_kills_stuck_pending_task(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node"]
-
-    postfix = unique_suffix()
-    mt_table = f"timeout_mt_{postfix}"
-    s3_table = f"timeout_s3_{postfix}"
-
-    create_tables_and_insert_data(node, mt_table, s3_table)
-
-    minio_ip = cluster.minio_ip
-    minio_port = cluster.minio_port
-
-    with PartitionManager() as pm:
-        pm.add_rule({
-            "instance": node,
-            "destination": node.ip_address,
-            "protocol": "tcp",
-            "source_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        })
-        pm.add_rule({
-            "instance": node,
-            "destination": minio_ip,
-            "protocol": "tcp",
-            "destination_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        })
-
-        node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5"
-        )
-
-        wait_for_export_status(node, mt_table, s3_table, "2020", "KILLED", system_table=SYSTEM_TABLE, timeout=30)
-
-    last_exception = node.query(
-        f"SELECT last_exception FROM system.{SYSTEM_TABLE}"
-        f" WHERE source_table = '{mt_table}'"
-        f"   AND destination_table = '{s3_table}'"
-        f"   AND partition_id = '2020'"
-    ).strip()
-    assert "timed out" in last_exception, (
-        f"Expected last_exception to mention the timeout reason, got: {last_exception!r}"
-    )
-
-    assert (
-        node.query(
-            f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)"
-        )
-        == "0\n"
-    ), "Commit file exists despite task timeout"
-    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "0\n"
-
-
-def test_export_retry_backoff_paces_retries(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node"]
-
-    postfix = unique_suffix()
-    mt_table = f"backoff_mt_{postfix}"
-    s3_table = f"backoff_s3_{postfix}"
-
-    create_tables_and_insert_data(node, mt_table, s3_table)
-
-    minio_ip = cluster.minio_ip
-    minio_port = cluster.minio_port
-
-    with PartitionManager() as pm:
-        pm.add_rule({
-            "instance": node,
-            "destination": node.ip_address,
-            "protocol": "tcp",
-            "source_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        })
-        pm.add_rule({
-            "instance": node,
-            "destination": minio_ip,
-            "protocol": "tcp",
-            "destination_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        })
-
-        node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
-            f"SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = 30, "
-            f"export_merge_tree_partition_retry_max_backoff_seconds = 30"
-        )
-
-        count_after_first = wait_for_exception_count(
-            node, mt_table, s3_table, "2020", min_exception_count=1, timeout=60, system_table=SYSTEM_TABLE
-        )
-
-        # While the part is backing off (~30s) it must not be retried again. Without back-off the
-        # ~5s tick would add roughly five more failures.
-        time.sleep(25)
-        count_during_backoff = int(node.query(
-            f"SELECT exception_count FROM system.{SYSTEM_TABLE}"
-            f" WHERE source_table = '{mt_table}'"
-            f"   AND destination_table = '{s3_table}'"
-            f"   AND partition_id = '2020'"
-        ).strip())
-        assert count_during_backoff - count_after_first <= 2, (
-            f"exception_count jumped during the back-off window: "
-            f"{count_after_first} -> {count_during_backoff}; back-off was not applied"
-        )
-
-    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED", system_table=SYSTEM_TABLE, timeout=120)
-    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "3\n"
 
 
 def test_export_partition_resumes_after_restart(cluster):
@@ -364,7 +142,7 @@ def test_export_partition_resumes_after_restart(cluster):
         })
 
         node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
-        wait_for_export_to_start(node, mt_table, s3_table, "2020", system_table=SYSTEM_TABLE)
+        wait_for_export_to_start(node, mt_table, s3_table, "2020")
 
         # Kill the server while the export is still in flight (S3 blocked, nothing committed yet).
         node.stop_clickhouse(kill=True)
@@ -375,131 +153,5 @@ def test_export_partition_resumes_after_restart(cluster):
     # restart-resume behavior: the task must resume from its on-disk descriptor and complete.
     node.start_clickhouse()
 
-    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED", system_table=SYSTEM_TABLE, timeout=90)
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED", timeout=90)
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "3\n"
-
-
-def test_export_partition_feature_disabled(cluster):
-    node = cluster.instances["node_export_disabled"]
-
-    postfix = unique_suffix()
-    mt_table = f"disabled_mt_{postfix}"
-    s3_table = f"disabled_s3_{postfix}"
-
-    create_tables_and_insert_data(node, mt_table, s3_table)
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-    )
-    assert "experimental" in error, f"Expected experimental-feature error, got: {error}"
-
-    error = node.query_and_get_error(
-        f"KILL EXPORT PARTITION WHERE partition_id = '2020' AND source_table = '{mt_table}'"
-        f" AND destination_table = '{s3_table}'"
-    )
-    assert "experimental" in error, f"Expected experimental-feature error on KILL, got: {error}"
-
-
-def test_dispatch_fails_when_destination_dropped(cluster):
-    """A destination dropped after scheduling (while moves are stopped) must fail the
-    task on the first dispatch attempt: PENDING with no last_exception is the previous bug."""
-    node = cluster.instances["node"]
-
-    postfix = unique_suffix()
-    mt_table = f"dispatch_drop_mt_{postfix}"
-    s3_table = f"dispatch_drop_s3_{postfix}"
-
-    create_tables_and_insert_data(node, mt_table, s3_table)
-
-    node.query(f"SYSTEM STOP MOVES {mt_table}")
-    try:
-        node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
-        wait_for_export_to_start(node, mt_table, s3_table, "2020", system_table=SYSTEM_TABLE)
-
-        status = node.query(
-            f"SELECT status FROM system.{SYSTEM_TABLE}"
-            f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
-            f" AND partition_id = '2020'"
-        ).strip()
-        assert status == "PENDING", f"Expected PENDING while moves are stopped, got {status!r}"
-
-        node.query(f"DROP TABLE {s3_table} SYNC")
-        node.query(f"SYSTEM START MOVES {mt_table}")
-
-        wait_for_export_status(
-            node, mt_table, s3_table, "2020", "FAILED", system_table=SYSTEM_TABLE, timeout=30
-        )
-
-        last_exception = node.query(
-            f"SELECT last_exception FROM system.{SYSTEM_TABLE}"
-            f" WHERE source_table = '{mt_table}'"
-            f"   AND destination_table = '{s3_table}'"
-            f"   AND partition_id = '2020'"
-        ).strip()
-        assert last_exception, f"Expected last_exception to be recorded for the dropped destination, got {last_exception!r}"
-    finally:
-        node.query(f"SYSTEM START MOVES {mt_table}")
-
-
-def test_dispatch_fails_when_destination_schema_incompatible(cluster):
-    """An incompatible destination recreated after scheduling must fail on dispatch,
-    not stay PENDING until the task timeout."""
-    node = cluster.instances["node"]
-
-    postfix = unique_suffix()
-    mt_table = f"dispatch_schema_mt_{postfix}"
-    s3_table = f"dispatch_schema_s3_{postfix}"
-
-    create_tables_and_insert_data(node, mt_table, s3_table)
-
-    node.query(f"SYSTEM STOP MOVES {mt_table}")
-    try:
-        node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
-        wait_for_export_to_start(node, mt_table, s3_table, "2020", system_table=SYSTEM_TABLE)
-
-        node.query(f"DROP TABLE {s3_table} SYNC")
-        # Extra destination column is always rejected (source has only id, year).
-        node.query(
-            f"CREATE TABLE {s3_table} (id UInt64, year UInt16, extra String) "
-            f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
-            f"PARTITION BY year"
-        )
-        node.query(f"SYSTEM START MOVES {mt_table}")
-
-        wait_for_export_status(
-            node, mt_table, s3_table, "2020", "FAILED", system_table=SYSTEM_TABLE, timeout=30
-        )
-
-        last_exception = node.query(
-            f"SELECT last_exception FROM system.{SYSTEM_TABLE}"
-            f" WHERE source_table = '{mt_table}'"
-            f"   AND destination_table = '{s3_table}'"
-            f"   AND partition_id = '2020'"
-        ).strip()
-        assert last_exception, f"Expected last_exception for the schema mismatch, got {last_exception!r}"
-    finally:
-        node.query(f"SYSTEM START MOVES {mt_table}")
-
-
-def test_pending_mutations_throw_before_export(cluster):
-    node = cluster.instances["node"]
-
-    postfix = unique_suffix()
-    mt_table = f"pending_mut_mt_{postfix}"
-    s3_table = f"pending_mut_s3_{postfix}"
-
-    create_tables_and_insert_data(node, mt_table, s3_table)
-
-    node.query(f"SYSTEM STOP MERGES {mt_table}")
-    node.query(f"ALTER TABLE {mt_table} UPDATE id = id + 100 WHERE year = 2020")
-
-    mutations = node.query(
-        f"SELECT count() FROM system.mutations WHERE table = '{mt_table}' AND is_done = 0"
-    )
-    assert mutations.strip() != "0", "Mutation should be pending"
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
-        f"SETTINGS export_merge_tree_part_throw_on_pending_mutations = true"
-    )
-    assert "PENDING_MUTATIONS_NOT_ALLOWED" in error, f"Expected pending-mutations error, got: {error}"

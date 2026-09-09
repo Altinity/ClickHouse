@@ -171,10 +171,11 @@ The design should address the following topics in the near future.
 - `tests/queries/0_stateless/03572_export_merge_tree_part_special_columns.sh`
 - `tests/queries/0_stateless/03572_export_replicated_merge_tree_part_to_object_storage.sh`
 - `tests/queries/0_stateless/03572_export_replicated_merge_tree_part_to_object_storage_simple.sql`
-- `tests/queries/0_stateless/03604_export_merge_tree_partition.sh`
+- `tests/queries/0_stateless/05027_export_partition_merge_tree.sh`
+- `tests/queries/0_stateless/05028_export_partition_replicated_merge_tree.sh`
 - `tests/queries/0_stateless/03608_export_merge_tree_part_filename_pattern.sh`
 - `tests/integration/test_export_merge_tree_part_to_object_storage/test.py`
-- `tests/integration/test_export_replicated_mt_partition_to_object_storage/test.py`
+- `tests/integration/test_export_partition_to_object_storage/test.py`
 
 ---
 
@@ -619,8 +620,9 @@ path — a REST / Glue fixture. The commit-file test above only exercises plain
 object-storage atomicity.
 
 Do not add `no-parallel` to any new test unless explicitly required by shared S3 bucket paths;
-`03604` currently has the tag and should be re-examined to see whether unique per-run paths
-remove the need.
+the replicated wrappers (`05028`, `05030`) carry the tag inherited from the test they replaced,
+and should be re-examined: the shared bodies now derive every table and S3 filename from
+`$CLICKHOUSE_DATABASE`, so the per-run paths are already unique.
 
 ### Integration tests — `tests/integration`
 
@@ -628,19 +630,25 @@ remove the need.
 
 - `test_export_merge_tree_part_to_object_storage/` — part export in a multi-node setup.
   PR 1618 makes minor adjustments.
-- `test_export_replicated_mt_partition_to_object_storage/` — partition export across
-  replicas, including `wait_for_export_status`, retry counting, and replica failure
+- `test_export_partition_to_object_storage/` — partition export to a plain object-storage
+  destination, including `wait_for_export_status`, retry counting, and replica failure
   scenarios. PR 1618 removes the `s3_retries.xml` config and reshapes several test cases
-  against the new shared helpers.
+  against the new shared helpers. The scenarios that do not depend on cross-replica
+  coordination request the `source_engine` fixture and run once per MergeTree flavour; the
+  rest stay replicated-only.
 
 **New in PR 1618:**
 
 - `test_export_merge_tree_part_to_iceberg/` — per-part export to an Iceberg destination,
   covering golden path, sidecar emission, manifest shape, and error paths.
-- `test_export_replicated_mt_partition_to_iceberg/` — distributed partition export to
-  Iceberg across replicas, including `test_export_task_timeout_kills_stuck_pending_task`
-  (uses the `export_partition_commit_always_throw` failpoint to exhaust the commit path,
-  then asserts the timeout transitions the task to `KILLED`).
+- `test_export_partition_to_iceberg/` — partition export to Iceberg, including
+  `test_export_task_timeout_kills_stuck_pending_task` (uses the
+  `export_partition_commit_always_throw` failpoint to exhaust the commit path, then asserts
+  the timeout transitions the task to `KILLED`). Parametrized over the source engine on the
+  same terms as the object-storage suite.
+- `test_export_mt_partition_to_object_storage/` — the plain-`MergeTree` behavior the unified
+  suites cannot express: a Keeper-free cluster (proving no ensemble is needed) and
+  restart-resume from the on-disk task descriptor.
 - `test_storage_iceberg_with_spark/test_export_partition_iceberg.py` — catalog-less
   Iceberg round-trip; Spark reads ClickHouse-written data and verifies schema, partition
   layout, and snapshot atomicity.
@@ -652,6 +660,28 @@ remove the need.
     `wait_for_export_status`, manifest-inspection utilities.
   - `tests/integration/helpers/iceberg_export_stats.py` — sidecar decoders and stats
     assertion helpers.
+
+**Known divergence between the engines:**
+
+- Dispatch-time destination failures do not fail a `Replicated*MergeTree` task. When the
+  destination is dropped or recreated with an incompatible schema after the export was
+  scheduled but before the part task is dispatched, the plain scheduler fails the task, while
+  the replicated path leaves it `PENDING` until
+  `export_merge_tree_partition_task_timeout_seconds` (a day by default). For the dropped
+  destination the cause is that `UNKNOWN_TABLE` is missing from
+  `ExportPartitionUtils::isNonRetryableExportError`, so the failure counts as retryable. The
+  schema-mismatch case is not explained by that, since `INCOMPATIBLE_COLUMNS` is in the
+  non-retryable set — the replicated dispatch appears not to reach the classification.
+  `test_export_partition_to_object_storage/test_failures.py::test_dispatch_fails_when_destination_dropped`
+  and `::test_dispatch_fails_when_destination_schema_incompatible` cover the plain path only;
+  parametrize them over `source_engine` once the replicated path fails the task too.
+- The commit failpoint `export_partition_commit_always_throw` only exists in
+  `ExportPartitionUtils::commit`, the ZooKeeper-coordinated commit routine. A plain `MergeTree`
+  commits through `MergeTreePartitionExportScheduler::tryCommit`, so its commit-failure handling
+  (retry, `FAILED` transition, timeout kill) has no failpoint coverage.
+- An `IN PARTITION`-scoped mutation blocks the export of every other partition on a plain
+  `MergeTree`, because its mutations snapshot is not partition-scoped. See "Pending mutations"
+  under Plain (non-replicated) MergeTree in `docs/en/antalya/partition_export.md`.
 
 **Remaining gaps to add:**
 
@@ -668,7 +698,7 @@ remove the need.
   `EXPORT PARTITION` or the new Keeper manifest fields.
 
 Invocation:
-`python -m ci.praktika run "integration" --test test_export_merge_tree_part_to_object_storage,test_export_replicated_mt_partition_to_object_storage,test_export_merge_tree_part_to_iceberg,test_export_replicated_mt_partition_to_iceberg,test_storage_iceberg_with_spark`.
+`python -m ci.praktika run "integration" --test test_export_merge_tree_part_to_object_storage test_export_partition_to_object_storage test_export_merge_tree_part_to_iceberg test_export_partition_to_iceberg test_export_mt_partition_to_object_storage test_storage_iceberg_with_spark`.
 
 ### Failpoints
 

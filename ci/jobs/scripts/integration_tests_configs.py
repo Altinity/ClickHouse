@@ -58,7 +58,19 @@ TEST_CONFIGS = [
         True,
         "pins azurite to fixed host port 10000 (Spark emulator mode); concurrent --dist=each workers collide on bind",
     ),
-    TC("test_export_replicated_mt_partition_to_object_storage/", True, "ZooKeeper can't handle too many parallel requests"),
+    # The rest of test_export_partition_to_object_storage/ (validation, lifecycle) and all of
+    # test_export_partition_to_iceberg/ are parallel-safe: each xdist worker gets its own cluster,
+    # and those modules only create tables and assert on synchronous rejects.
+    TC(
+        "test_export_partition_to_object_storage/test_failures.py",
+        True,
+        "paces itself against retry back-off and scheduler ticks while object storage is cut off; host load makes the timings flaky",
+    ),
+    TC(
+        "test_export_partition_to_object_storage/test_replication.py",
+        True,
+        "ZooKeeper can't handle too many parallel requests",
+    ),
 ]
 
 IMAGES_ENV = {

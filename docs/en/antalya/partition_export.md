@@ -40,7 +40,18 @@ The source partition must not be split in the destination. This is validated at 
 
 Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<partition_id>_<transaction_id>`.
 
-## Plain (non-replicated) MergeTree
+## Plain (non-replicated) MergeTree {#plain-non-replicated-mergetree}
+
+The command, its settings, the partition-key compatibility rules and the destination file layout are the same for both engines. Only the coordination differs:
+
+- There is no ZooKeeper coordination and no `clickhouse-keeper` ensemble is needed. The node that received the command persists the task descriptor on the source table's disk and a local background scheduler drives it to completion.
+- The task is still persistent: a node that is restarted (or killed) mid-export resumes the export from the on-disk descriptor.
+- There are no other replicas to assist, so a single node exports every part of the partition. `source_replica` is empty in `system.partition_exports` and `last_exception_per_replica` holds at most one entry, whose `replica` is empty.
+- The commit-path columns (`committed_metadata_file`, `committed_manifest_list`, `committed_manifest_file`, `committed_marker_file`) are always empty, because a plain `MergeTree` does not persist the commit paths. See [Columns that depend on the source engine](#columns-that-depend-on-the-source-engine).
+
+### Pending mutations {#plain-merge-tree-pending-mutations}
+
+The pending-mutation gate is more conservative than on a `Replicated*MergeTree`. A plain `MergeTree` does not scope its mutation snapshot by partition, so a mutation restricted with `IN PARTITION` still marks the parts of every other partition as having pending mutations, and exporting an unaffected partition is refused with `PENDING_MUTATIONS_NOT_ALLOWED`. The gate fails closed - it never exports data that a pending mutation would have changed - so the effect is that you may have to wait for an unrelated mutation to finish, or set `export_merge_tree_part_throw_on_pending_mutations` to `false`.
 
 ## Syntax
 
@@ -282,7 +293,7 @@ These columns surface paths produced by the destination storage during commit, s
 - `committed_manifest_file` — for Iceberg destinations: path of the manifest file referenced by `committed_manifest_list`. Empty under the same conditions as `committed_metadata_file`.
 - `committed_marker_file` — for plain object storage destinations: path of the per-transaction commit marker file written by the destination. Empty for Iceberg destinations and for tasks that have not committed yet.
 
-### Columns that depend on the source engine
+### Columns that depend on the source engine {#columns-that-depend-on-the-source-engine}
 
 Rows for plain `MergeTree` sources share the schema with replicated ones, and leave the columns that only make sense with cross-replica coordination empty:
 
