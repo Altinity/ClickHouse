@@ -224,7 +224,8 @@ protected:
         const String & method = {},
         const Poco::URI & url = {},
         const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {}) const;
+        const String & body = {},
+        bool * used_cached_oauth_token = nullptr) const;
 
     void validateAuthHeaders(const DB::HTTPHeaderEntry & header) const;
 
@@ -307,7 +308,8 @@ public:
         const String & method = {},
         const Poco::URI & url = {},
         const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {}) const override;
+        const String & body = {},
+        bool * used_cached_oauth_token = nullptr) const override;
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }
