@@ -76,6 +76,9 @@ DISABLED_WORKFLOWS = [
     "nightly_docs_autogen.py",
     "nightly_sqlancer.py",
     "weekly_cfi.py",
+    "sync_silk.py",
+    "nightly_changelog.py",
+    "nightly_cloud_api_docs.py",
 ]
 
 DEFAULT_LOCAL_TEST_WORKFLOW = "pull_request.py"

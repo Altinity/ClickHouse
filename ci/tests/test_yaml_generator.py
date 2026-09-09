@@ -117,3 +117,6 @@ def test_altinity_injected_jobs_skip_undefined_pipeline_status():
 def test_upstream_release_workflows_are_disabled():
     assert "auto_releases.py" in DISABLED_WORKFLOWS
     assert "create_release.py" in DISABLED_WORKFLOWS
+    assert "sync_silk.py" in DISABLED_WORKFLOWS
+    assert "nightly_changelog.py" in DISABLED_WORKFLOWS
+    assert "nightly_cloud_api_docs.py" in DISABLED_WORKFLOWS
