@@ -19,6 +19,7 @@
 
 
 #include "Poco/Mutex.h"
+#include <atomic>
 #include "Poco/Net/HTTPRequestHandlerFactory.h"
 #include "Poco/Net/HTTPResponse.h"
 #include "Poco/Net/HTTPServerParams.h"
@@ -56,7 +57,9 @@ namespace Net
     private:
         HTTPServerParams::Ptr _pParams;
         HTTPRequestHandlerFactory::Ptr _pFactory;
-        bool _stopped;
+        /// Written by onServerStopped() from the thread that calls HTTPServer::stopAll(true) while run()
+        /// polls it outside _mutex; a plain bool is a data race (TSan), an atomic keeps the same semantics.
+        std::atomic<bool> _stopped;
         Poco::FastMutex _mutex;
     };
 
