@@ -898,9 +898,10 @@ namespace
 /// two-round scenario described below. Parameterized only by `config` so the same scenario can be run
 /// against the default `PoolConfig` (`ExpiredMountFencedOutAndExcluded`) and against
 /// `unsafe_remount_no_delay = true` (`CASGcFenceOut.ThresholdUnchangedByUnsafeKnob`), proving the knob
-/// changes nothing about the fence-out threshold or its round count. `backend` and `events` are declared
-/// BEFORE the Pool inside this same function so they outlive the background syncer's emits (ASan
-/// 2026-07-09) -- the Pool must never outlive the function that opened it.
+/// changes nothing about the fence-out threshold or its round count. `events` is heap-owned (not a
+/// plain local) because the Pool CAN outlive the function that opened it: a background publish can hold
+/// an extra `shared_from_this()` past this function's return, so a stack-local sink target -- even one
+/// declared before the Pool (the fix for the 2026-07-09 ASan finding) -- is not enough.
 ///
 /// A dead mount is fenced out by the round's heartbeat step: gc_fenced is set on its body (a
 /// token-guarded rewrite that bumps seq). The fence is pure liveness (re-arms the write fence so a
@@ -919,7 +920,10 @@ namespace
 void runExpiredMountFenceOutScenario(const PoolConfig & config)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    std::vector<CasEvent> events;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    /// Heap-owned, not a plain local: declaring it before the Pool (ASan 2026-07-09) only protects
+    /// against an ordinary same-thread unwind, not a detached background completion holding an extra
+    /// `shared_from_this()` that can still be running on another thread after this frame returns.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto store = Pool::open(backend, config);
     const Layout & layout = store->layout();
 
@@ -947,7 +951,10 @@ void runExpiredMountFenceOutScenario(const PoolConfig & config)
     Gc gc(store, kGc, [&] { return gc_now; }, [&] { return gc_mono; });
 
     // Capture the emitted events so we can assert the round emits exactly one GcFenceOut row for srid2.
-    store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+    store->setEventSink([events](const CasEvent & e)
+    {
+        events->push(e);
+    });
 
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
@@ -984,7 +991,7 @@ void runExpiredMountFenceOutScenario(const PoolConfig & config)
 
     // Exactly one GcFenceOut audit row was emitted, naming srid2 in its detail.
     size_t fence_out_rows = 0;
-    for (const CasEvent & e : events)
+    for (const CasEvent & e : events->snapshot())
         if (e.type == CasEventType::GcFenceOut)
         {
             ++fence_out_rows;
@@ -1040,9 +1047,15 @@ TEST(CASGcFenceOut, ThresholdUnchangedByUnsafeKnob)
 TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    uint64_t fake_boot = 0;
+    /// Held in a shared atomic, not a plain local: this test mutates the clock below, and the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-        .boot_ms_fn = [&] { return fake_boot; }});
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        }});
     const Layout & layout = store->layout();
 
     // A stale mount, exactly as `ExpiredMountFencedOutAndExcluded`: one claim, never renewed again.
@@ -1050,7 +1063,11 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
     CasRequests renewer_requests = openRequestsForTest(backend);
     MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
         /*writer_epoch=*/1,
-        std::chrono::milliseconds(100), [] { return 1000u; }, [&] { return fake_boot; });
+        std::chrono::milliseconds(100), [] { return 1000u; },
+        [fake_boot]
+        {
+            return fake_boot->load();
+        });
     srid2_renewer.start();
     ASSERT_FALSE(decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes).gc_fenced);
 
@@ -1065,7 +1082,7 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
     EXPECT_EQ(rep1.fence_outs, 0u);
 
     store->renewWatermarkOnce();
-    fake_boot = threshold_ms;   // advance the FAKE clock only; this test runs in well under a millisecond
+    fake_boot->store(threshold_ms);   // advance the FAKE clock only; this test runs in well under a millisecond
 
     const RoundReport rep2 = gc.runRegularRound();
     EXPECT_EQ(rep2.fence_outs, 1u)
@@ -1283,13 +1300,20 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
     /// millisecond, because full-jitter backoff may draw zero and a clock that never moves never closes
     /// the window. Scoped to the GC plane, which is where `writeCondemnedMeta` runs, so the mount
     /// plane's lease-bound policies keep their real clock.
-    std::atomic<uint64_t> engine_now_ms{0};
-    std::atomic<uint64_t> engine_sleeps{0};
-    store->openRequests().setNowFnForTest([&] { return engine_now_ms.load(); });
-    store->openRequests().setSleepFnForTest([&](uint64_t pause_ms)
+    /// Held in shared, heap-owned atomics, not plain locals: `store->openRequests()` is the Pool's own
+    /// persistent engine, and the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local -- even an already-atomic one --
+    /// would dangle once the frame returns.
+    auto engine_now_ms = std::make_shared<std::atomic<uint64_t>>(0);
+    auto engine_sleeps = std::make_shared<std::atomic<uint64_t>>(0);
+    store->openRequests().setNowFnForTest([engine_now_ms]
     {
-        engine_sleeps.fetch_add(1);
-        engine_now_ms.fetch_add(pause_ms + 1);
+        return engine_now_ms->load();
+    });
+    store->openRequests().setSleepFnForTest([engine_now_ms, engine_sleeps](uint64_t pause_ms)
+    {
+        engine_sleeps->fetch_add(1);
+        engine_now_ms->fetch_add(pause_ms + 1);
     });
 
     const RootNamespace ns{"00/aa@cas@"};
@@ -1310,9 +1334,9 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
     /// seconds, so it cannot happen before the clock has passed `Retry::standard()`'s window minus
     /// that draw. Both assertions pin the REISSUING, which is what the ambiguous kind buys; neither
     /// can tell the injected clock from the real one -- that seam bounds the reissuing in real time.
-    EXPECT_GT(engine_sleeps.load(), 1u)
+    EXPECT_GT(engine_sleeps->load(), 1u)
         << "an ambiguous marker write must be resolved and reissued, not surfaced on its first attempt";
-    EXPECT_GT(engine_now_ms.load(), 85'000u)
+    EXPECT_GT(engine_now_ms->load(), 85'000u)
         << "the marker write must have spent its whole retry window before reporting failure";
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), blob).has_value())
         << "precondition: the retired entry must have been committed despite the lost marker";

@@ -15,6 +15,7 @@
 #include <Poco/Exception.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -365,14 +366,20 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     budget.attempt_timeout_ms = 100;
     budget.lease_safety_margin_ms = 100;
 
-    uint64_t fake_now = 1'000'000;
+    /// Held in a shared atomic, not a plain local: this test mutates the clock below, and the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local would dangle.
+    auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
     PoolConfig config;
     config.snapshot_log_count_threshold = 0;              /// any nonempty tail is over-threshold
     config.snapshot_log_bytes_threshold = 1ULL << 40;
     config.snapshot_publish_backoff_initial_ms = 1000;
     config.snapshot_publish_backoff_max_ms = 4000;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.boot_ms_fn = [fake_now]
+    {
+        return fake_now->load();
+    };
     config.cas_request_budget = budget;
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
@@ -411,13 +418,13 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     EXPECT_EQ(dispatchCount(), d1) << "a read within the initial backoff window must not re-dispatch";
 
     /// Cross the 1000ms deadline: exactly one retry dispatches (and fails again, doubling to 2000ms).
-    fake_now += 1000;
+    *fake_now += 1000;
     store->resolveRef(ns, "ref_1");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d1 + 1) << "past the first deadline, exactly one retry dispatches";
 
     /// Short of the DOUBLED (2000ms) deadline: still refused.
-    fake_now += 1000;
+    *fake_now += 1000;
     store->resolveRef(ns, "ref_1");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d1 + 1)
@@ -425,7 +432,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
 
     /// Cross the doubled deadline: one more retry dispatches (and fails again -- the third and last armed
     /// failure -- doubling to the 4000ms cap).
-    fake_now += 1000;
+    *fake_now += 1000;
     store->resolveRef(ns, "ref_1");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d1 + 2) << "past the doubled deadline, exactly one more retry dispatches";
@@ -434,7 +441,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     /// 2000ms, or that read `initial` where it means `max`, would still pass -- the only check so far
     /// is AT the +4000 crossing below. 2000ms past the doubled deadline is still short of the capped
     /// 4000ms backoff, so no third retry may dispatch yet.
-    fake_now += 2000;
+    *fake_now += 2000;
     store->resolveRef(ns, "ref_1");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d1 + 2)
@@ -444,7 +451,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     /// `resetPublishBackoff` clears the cooldown -- proved by the NEXT trigger dispatching with no wait
     /// at all.
     backend->armWriteFailure("_snap/", 0);
-    fake_now += 2000;
+    *fake_now += 2000;
     store->resolveRef(ns, "ref_1");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d1 + 3) << "past the second (capped) deadline, the retry dispatches and succeeds";
@@ -467,11 +474,11 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     ASSERT_EQ(publishRef(store, ns, "ref_4", 4), (RefTxnId{store->writerEpoch(), 4}));
     store->waitForSnapshotPublishSettleForTest(ns);
     const uint64_t d2 = dispatchCount();
-    fake_now += 500;
+    *fake_now += 500;
     store->resolveRef(ns, "ref_1");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d2) << "short of 1000ms since the reset, no retry may dispatch yet";
-    fake_now += 500;
+    *fake_now += 500;
     store->resolveRef(ns, "ref_1");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d2 + 1)
@@ -493,14 +500,20 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
     budget.attempt_timeout_ms = 100;
     budget.lease_safety_margin_ms = 100;
 
-    uint64_t fake_now = 2'000'000;
+    /// Held in a shared atomic, not a plain local: this test mutates the clock below, and the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local would dangle.
+    auto fake_now = std::make_shared<std::atomic<uint64_t>>(2'000'000);
     PoolConfig config;
     config.snapshot_log_count_threshold = 0;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
     config.snapshot_publish_backoff_initial_ms = 200;
     config.snapshot_publish_backoff_max_ms = 30'000;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.boot_ms_fn = [fake_now]
+    {
+        return fake_now->load();
+    };
     config.cas_request_budget = budget;
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
@@ -584,14 +597,14 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
         400, 800, 1600, 3200, 6400, 12'800, 25'600, 30'000, 30'000};
     for (const uint64_t next_delay_ms : next_delays)
     {
-        fake_now += delay_ms - 1;
+        *fake_now += delay_ms - 1;
         store->resolveRef(ns, "ref_1");
         store->waitForSnapshotPublishSettleForTest(ns);
         EXPECT_EQ(dispatch_count(), production_dispatches + 1 + admitted_retries)
             << "no retry may dispatch one millisecond before the current deadline";
         EXPECT_EQ(backoff_count(), production_backoffs + 1 + admitted_retries);
 
-        ++fake_now;
+        ++(*fake_now);
         store->resolveRef(ns, "ref_1");
         store->waitForSnapshotPublishSettleForTest(ns);
         ++admitted_retries;

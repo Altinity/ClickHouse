@@ -12,6 +12,7 @@
 #include <Poco/Util/XMLConfiguration.h>
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -47,6 +48,7 @@ namespace DB::ErrorCodes
 
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
+using DB::Cas::tests::SharedWaitLog;
 using DB::Cas::tests::u128Of;
 
 namespace
@@ -352,18 +354,28 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
     backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
-    uint64_t fake_boot = 1'000'000;
-    std::vector<uint64_t> waits;
+    /// Held in shared, heap-owned state, not plain locals: the hooks below mutate them, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+    auto waits = std::make_shared<SharedWaitLog>();
     /// The append's own retry clock and its sleep log, installed further down; declared here, before
     /// the store, because the store's teardown still calls the now-function they back.
-    uint64_t fake_retry = 0;
-    std::vector<uint64_t> retry_sleeps;
+    auto fake_retry = std::make_shared<std::atomic<uint64_t>>(0);
+    auto retry_sleeps = std::make_shared<SharedWaitLog>();
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .cas_request_budget = budget,
-        .boot_ms_fn = [&] { return fake_boot; },
-        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+        {
+            *fake_boot += ms;
+            waits->push(ms);
+        },
     });
     ASSERT_TRUE(store);
     const Layout & layout = store->layout();
@@ -387,11 +399,14 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     /// give-up is the append's own retry window -- paced on ITS OWN virtual clock, separate from
     /// `fake_boot` (the mount fence's), so the standard policy's full window is available to reissue
     /// against rather than being cut short by the 30s lease `fake_boot` also measures.
-    store->setCasRequestNowFnForTest([&fake_retry] { return fake_retry; });
-    store->setCasRetrySleepForTest([&fake_retry, &retry_sleeps](uint64_t ms)
+    store->setCasRequestNowFnForTest([fake_retry]
     {
-        fake_retry += ms + 1;
-        retry_sleeps.push_back(ms);
+        return fake_retry->load();
+    });
+    store->setCasRetrySleepForTest([fake_retry, retry_sleeps](uint64_t ms)
+    {
+        *fake_retry += ms + 1;
+        retry_sleeps->push(ms);
     });
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -399,8 +414,8 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     EXPECT_GT(backend->fault_hits, 1)
         << "the append must have reissued more than once against the persistent fault before giving up "
            "-- a single attempt would not distinguish this from a non-retrying policy";
-    EXPECT_GT(retry_sleeps.size(), 1u) << "more than one paced retry must have occurred before the give-up";
-    EXPECT_GT(fake_retry, 0u) << "the retry clock must have advanced past the policy's own deadline";
+    EXPECT_GT(retry_sleeps->size(), 1u) << "more than one paced retry must have occurred before the give-up";
+    EXPECT_GT(fake_retry->load(), 0u) << "the retry clock must have advanced past the policy's own deadline";
 
     /// The id the straggler would occupy: one past the greatest record that is actually durable in the
     /// dying epoch. That is also, by construction, where the recovery seal goes.
@@ -411,11 +426,11 @@ TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
         << "the slot must be empty before recovery -- otherwise this test proves nothing about who won";
 
     /// Fence and remount. No wait: this is the case that used to cost 30 seconds.
-    fake_boot += 30001;
+    *fake_boot += 30001;
     fenceOutMount(*backend, layout.mountKey("test"));
     ASSERT_TRUE(store->tryRemountOnce());
     ASSERT_EQ(store->liveWriterEpoch(), 2u);
-    EXPECT_TRUE(waits.empty())
+    EXPECT_TRUE(waits->empty())
         << "the remount blocked on an operator-configured wait; the grace is supposed to be gone";
 
     /// Touch the namespace so it re-recovers under the new epoch: the walk closes epoch 1 in band. The

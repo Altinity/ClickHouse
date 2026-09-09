@@ -857,13 +857,19 @@ TEST(CASPartFolderAccess, GetViewEmitsRefResolveOnlyOnRealResolveWork)
     publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
     const Cas::PartRefKey key{ns, "part_1"};
 
-    std::vector<Cas::CasEvent> seen;
-    store->setEventSink([&](const Cas::CasEvent & e) { seen.push_back(e); });
+    /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto seen = std::make_shared<SharedEventLog>();
+    store->setEventSink([seen](const Cas::CasEvent & e)
+    {
+        seen->push(e);
+    });
     Cas::CachedPartFolderAccess access(store, cacheOn());   /// retention on
 
     const auto refResolveCount = [&]
     {
-        return std::count_if(seen.begin(), seen.end(),
+        const std::vector<Cas::CasEvent> observed = seen->snapshot();
+        return std::count_if(observed.begin(), observed.end(),
             [](const Cas::CasEvent & e) { return e.type == Cas::CasEventType::RefResolve; });
     };
 
@@ -1114,8 +1120,15 @@ TEST(CASPartFolderAccess, APostCommitFailureLeavesTheHandleTerminal)
 
     auto prepared = access.prepareEntries(key, {inlineEntry("f", "one")}, Cas::ProvenanceOp::Insert);
 
-    std::vector<Cas::CasEvent> seen;
-    store->setEventSink([&](const Cas::CasEvent & e) { seen.push_back(e); });
+    /// Heap-owned, not a plain local: `setEventSink(nullptr)` below only stops FUTURE sink installs
+    /// from using this closure -- it does not guarantee an already-in-flight background call is not
+    /// still executing the old one -- and the Pool can outlive this stack frame regardless (a
+    /// background publish holds `shared_from_this()`).
+    auto seen = std::make_shared<SharedEventLog>();
+    store->setEventSink([seen](const Cas::CasEvent & e)
+    {
+        seen->push(e);
+    });
 
     /// `MEMORY_LIMIT_EXCEEDED` -- what a tracked allocation failure actually raises -- and deliberately
     /// not `LOGICAL_ERROR`, which aborts at construction in debug/sanitizer builds.
@@ -1137,12 +1150,13 @@ TEST(CASPartFolderAccess, APostCommitFailureLeavesTheHandleTerminal)
     /// abandoned an ALREADY PROMOTED build -- which succeeds, because a promoted build no longer owes a
     /// precommit removal -- and so ended up terminal too, by accident. What the abandon leaves behind is
     /// the audit trail of a publish that is reported as thrown away while its ref is committed.
-    const auto build_aborts = std::count_if(seen.begin(), seen.end(),
+    const std::vector<Cas::CasEvent> observed = seen->snapshot();
+    const auto build_aborts = std::count_if(observed.begin(), observed.end(),
         [](const Cas::CasEvent & e) { return e.type == Cas::CasEventType::BuildAbort; });
     EXPECT_EQ(build_aborts, 0)
         << "a build whose promote is DURABLE was abandoned by the failed-promote catch: the handle had "
            "not yet recorded the commit when the post-commit work threw";
-    EXPECT_EQ(std::count_if(seen.begin(), seen.end(),
+    EXPECT_EQ(std::count_if(observed.begin(), observed.end(),
         [](const Cas::CasEvent & e) { return e.type == Cas::CasEventType::BuildPublish; }), 1);
 }
 

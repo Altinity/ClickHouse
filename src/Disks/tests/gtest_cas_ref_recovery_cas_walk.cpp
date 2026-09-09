@@ -1052,14 +1052,23 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesEveryOccupiedObjectBeforeAdvancingP
             : makeOrdinaryTxn(ns, test_case.occupant, "late", /*birth=*/false);
         backend->late_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(occupant));
 
-        uint64_t fake_now = 1'000'000;
+        /// Held in a shared atomic, not a plain local: the retry-sleep hook below mutates it, and the
+        /// Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+        /// by-reference capture of a local would dangle.
+        auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
         PoolConfig config = walkTestConfig();
-        config.boot_ms_fn = [&fake_now] { return fake_now; };
+        config.boot_ms_fn = [fake_now]
+        {
+            return fake_now->load();
+        };
         config.cas_request_budget.recovery_retry_budget_ms = 1;
         config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
         config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
         auto store = openWalkPool(backend, config);
-        store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
+        store->setCasRetrySleepForTest([fake_now](uint64_t ms)
+        {
+            *fake_now += ms;
+        });
 
         backend->ambiguous_cas_substr = layout.refCkptKey(life);
         backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
@@ -1128,15 +1137,24 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNex
     seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, initial_frontier));
     const NamespaceLifeId life = catalogLife(backend, layout, ns);
 
-    uint64_t fake_now = 1'000'000;
+    /// Held in a shared atomic, not a plain local: the retry-sleep hook below mutates it, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
     PoolConfig config = walkTestConfig();
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.boot_ms_fn = [fake_now]
+    {
+        return fake_now->load();
+    };
     config.cas_request_budget.recovery_retry_budget_ms = 1;
     config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
     config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
     auto store = openWalkPool(backend, config);
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
-    store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
+    store->setCasRetrySleepForTest([fake_now](uint64_t ms)
+    {
+        *fake_now += ms;
+    });
 
     backend->ambiguous_cas_substr = layout.refCkptKey(life);
     backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
@@ -1181,14 +1199,23 @@ TEST(CASRefRecoveryCasWalk, RecoveryPublishesAnAdoptedStragglerBeforeCreatingIts
     backend->late_bytes = sealObject(FormatId::RefLog,
         encodeRefLogTxn(makeOrdinaryTxn(ns, straggler, "late", /*birth=*/false)));
 
-    uint64_t fake_now = 1'000'000;
+    /// Held in a shared atomic, not a plain local: the retry-sleep hook below mutates it, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
     PoolConfig config = walkTestConfig();
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.boot_ms_fn = [fake_now]
+    {
+        return fake_now->load();
+    };
     config.cas_request_budget.recovery_retry_budget_ms = 1;
     config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
     config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
     auto store = openWalkPool(backend, config);
-    store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
+    store->setCasRetrySleepForTest([fake_now](uint64_t ms)
+    {
+        *fake_now += ms;
+    });
 
     backend->ambiguous_cas_substr = layout.refCkptKey(life);
     backend->ambiguous_cas_count = kFaultsBeyondTheRetryWindow;
@@ -1952,16 +1979,25 @@ TEST(CASRefRecoveryCasWalk, UnresolvedSealSlotFailsClosedWithoutInstalling)
     /// envelope is spent in a handful of iterations instead of spinning against a frozen clock. Not
     /// cosmetic: with a frozen clock this test burns ~700k retries and the same number of log lines,
     /// which is how a real regression in this arm would become invisible in the noise.
-    uint64_t fake_now = 1'000'000;
+    /// Held in a shared atomic, not a plain local: the retry-sleep hook below mutates it, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_now = std::make_shared<std::atomic<uint64_t>>(1'000'000);
     PoolConfig config = walkTestConfig();
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.boot_ms_fn = [fake_now]
+    {
+        return fake_now->load();
+    };
     auto store = openWalkPool(backend, config);
     ASSERT_TRUE(store);
 
-    store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
+    store->setCasRetrySleepForTest([fake_now](uint64_t ms)
+    {
+        *fake_now += ms;
+    });
     backend->ambiguous_put_substr = "/_log/";
 
-    const uint64_t fake_now_before = fake_now;
+    const uint64_t fake_now_before = fake_now->load();
     EXPECT_ANY_THROW(store->listRefs(ns));
     EXPECT_FALSE(store->refTableRecoveredForTest(ns))
         << "a table whose dead epoch may or may not be closed must never be exposed as recovered";
@@ -1969,7 +2005,7 @@ TEST(CASRefRecoveryCasWalk, UnresolvedSealSlotFailsClosedWithoutInstalling)
     /// injected clock before giving up; a fault settled by a single, unretried attempt would not
     /// exercise the transient-retry path this test's own name and docstring claim to drive.
     EXPECT_GT(backend->ambiguous_put_attempts.load(), 1u);
-    EXPECT_GT(fake_now, fake_now_before);
+    EXPECT_GT(fake_now->load(), fake_now_before);
 }
 
 /// ---------------------------------------------------------------------------------------------

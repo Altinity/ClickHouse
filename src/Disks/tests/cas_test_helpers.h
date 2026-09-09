@@ -158,6 +158,66 @@ private:
     bool released = false;
 };
 
+/// Heap-owned wait/sleep log for a `wait_sleep_fn`-shaped test hook: a hook that pushed into a
+/// stack-local vector would read (or write) a dead frame if a background completion outlives the test
+/// -- a `Pool`'s own detached publish can hold `shared_from_this()` past the test function's return.
+/// Mutex-guarded because that background call can race a foreground read. Construct via
+/// `std::make_shared` and capture the shared_ptr by value into the hook, never the bare object by
+/// reference.
+class SharedWaitLog
+{
+public:
+    void push(uint64_t ms)
+    {
+        std::lock_guard lock(mutex);
+        values.push_back(ms);
+    }
+    size_t size() const
+    {
+        std::lock_guard lock(mutex);
+        return values.size();
+    }
+    bool empty() const
+    {
+        std::lock_guard lock(mutex);
+        return values.empty();
+    }
+    std::vector<uint64_t> snapshot() const
+    {
+        std::lock_guard lock(mutex);
+        return values;
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::vector<uint64_t> values;
+};
+
+/// Heap-owned event log for an `event_sink`-shaped test hook: a hook that pushed into a stack-local
+/// vector would read (or write) a dead frame if a background completion outlives the test -- a `Pool`'s
+/// own detached publish can hold `shared_from_this()` past the test function's return, and its farewell
+/// or a background renewer can emit events from a thread the test itself never joins. Mutex-guarded
+/// because that background call can race a foreground read. Construct via `std::make_shared` and capture
+/// the shared_ptr by value into the sink, never the bare object by reference.
+class SharedEventLog
+{
+public:
+    void push(CasEvent event)
+    {
+        std::lock_guard lock(mutex);
+        values.push_back(std::move(event));
+    }
+    std::vector<CasEvent> snapshot() const
+    {
+        std::lock_guard lock(mutex);
+        return values;
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::vector<CasEvent> values;
+};
+
 /// Bring up the server-wide blob upload pool (stage-1 §1) if it is not already up, so any test that
 /// drives a `ContentAddressedTransaction` commit -- whose `uploadPendingBlobs` fans out on this pool --
 /// finds it initialized. ROBUST (init-if-not-initialized, NOT `call_once`): the raw-lifecycle suite in

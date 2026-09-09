@@ -9,6 +9,7 @@
 #include <Poco/Message.h>
 #include <Poco/StreamChannel.h>
 
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <map>
@@ -309,7 +310,11 @@ CasRequestBudget renewalLogBudget()
 /// attempts. No replacement test is needed: there is no per-attempt log call left to race.
 TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
 {
-    const auto open_store = [](const std::shared_ptr<RenewalLogBackend> & backend, uint64_t & boot_ms, const String & prefix)
+    /// `boot_ms` is a shared, heap-owned atomic, not a plain reference parameter: the last block below
+    /// mutates it after the Pool exists, and the Pool can outlive this lambda's own call (a background
+    /// publish holds `shared_from_this()`), so a by-reference capture of a caller-local would dangle.
+    const auto open_store = [](const std::shared_ptr<RenewalLogBackend> & backend,
+        const std::shared_ptr<std::atomic<uint64_t>> & boot_ms, const String & prefix)
     {
         /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
         /// budget field alone; pair the two so the fence math below matches what admits.
@@ -319,13 +324,16 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
             .server_root_id = "test",
             .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
             .cas_request_budget = renewalLogBudget(),
-            .boot_ms_fn = [&] { return boot_ms; },
+            .boot_ms_fn = [boot_ms]
+            {
+                return boot_ms->load();
+            },
         });
     };
 
     {
         auto backend = std::make_shared<RenewalLogBackend>();
-        uint64_t boot_ms = 100;
+        auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-silent");
         ScopedRenewalLogCapture capture("information");
         EXPECT_NO_THROW(store->renewWatermarkOnce());
@@ -334,7 +342,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
 
     {
         auto backend = std::make_shared<RenewalLogBackend>();
-        uint64_t boot_ms = 100;
+        auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-recovered");
         ScopedRenewalLogCapture capture("information");
         backend->throw_before_next_overwrite = true;
@@ -347,7 +355,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
 
     {
         auto backend = std::make_shared<RenewalLogBackend>();
-        uint64_t boot_ms = 100;
+        auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-debug");
         ScopedRenewalLogCapture capture("debug");
         backend->throw_before_next_overwrite = true;
@@ -357,13 +365,13 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
 
     {
         auto backend = std::make_shared<RenewalLogBackend>();
-        uint64_t boot_ms = 100;
+        auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-fenced");
         ScopedRenewalLogCapture capture("information");
         /// The lease was claimed at boot 100 with the 1000 ms TTL above, so it expires at 1100. The
         /// fence admits only while the remaining time strictly clears the safety margin plus whatever
         /// the attempt reserves, so exactly `margin` remaining (with the reservation on top) refuses.
-        boot_ms = 1100 - renewalLogBudget().lease_safety_margin_ms;
+        boot_ms->store(1100 - renewalLogBudget().lease_safety_margin_ms);
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
         const String output = capture.captured();
         EXPECT_EQ(countRenewalLogText(output, "CAS mount renewal"), 1u) << output;
@@ -1385,7 +1393,10 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
     /// fake `boot_ms_fn` + `wait_sleep_fn` (mirroring
     /// `CASMountOpenWaits.UncleanOpenPaysOnlyTheObservationWindow`) so the observation window resolves
     /// instantly instead of blocking this test on real time.
-    uint64_t a2_fake_boot = 0;
+    /// Held in a shared atomic, not a plain local: `wait_sleep_fn` below mutates it, and the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local would dangle.
+    auto a2_fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
     PoolPtr a2;
     EXPECT_NO_THROW(
         a2 = Pool::open(b, PoolConfig{
@@ -1393,8 +1404,14 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
             .mount_lease_ttl_ms = std::chrono::milliseconds(300),
             .mount_renew_period = std::chrono::milliseconds(100),
             .cas_request_budget = tiny_budget,
-            .boot_ms_fn = [&a2_fake_boot] { return a2_fake_boot; },
-            .wait_sleep_fn = [&a2_fake_boot](uint64_t ms) { a2_fake_boot += ms; }}));
+            .boot_ms_fn = [a2_fake_boot]
+            {
+                return a2_fake_boot->load();
+            },
+            .wait_sleep_fn = [a2_fake_boot](uint64_t ms)
+            {
+                *a2_fake_boot += ms;
+            }}));
     ASSERT_NE(a2, nullptr);
     EXPECT_GT(a2->writerEpoch(), e1);
 
@@ -1412,14 +1429,23 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
         .cas_request_budget = tiny_budget});
     const String overlap_mount_key = first->layout().mountKey("r");
 
-    uint64_t overlap_fake_boot = 0;
+    /// Held in a shared atomic, not a plain local: `wait_sleep_fn` below mutates it, and the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local would dangle.
+    auto overlap_fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
     auto replacement = Pool::open(overlap_backend, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
         .mount_lease_ttl_ms = std::chrono::milliseconds(300),
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = tiny_budget,
-        .boot_ms_fn = [&overlap_fake_boot] { return overlap_fake_boot; },
-        .wait_sleep_fn = [&overlap_fake_boot](uint64_t ms) { overlap_fake_boot += ms; }});
+        .boot_ms_fn = [overlap_fake_boot]
+        {
+            return overlap_fake_boot->load();
+        },
+        .wait_sleep_fn = [overlap_fake_boot](uint64_t ms)
+        {
+            *overlap_fake_boot += ms;
+        }});
     ASSERT_NE(replacement, nullptr);
 
     Ops overlap_ops(overlap_backend);

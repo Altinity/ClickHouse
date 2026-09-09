@@ -334,11 +334,13 @@ TEST(CASGCLog, TransientThrowIsClassifiedAborted)
 {
     auto backend = std::make_shared<NetworkThrowingBackend>();
     /// A PERSISTENT transient fault is reissued for the whole retry window, so the window has to run
-    /// on a clock this test advances -- otherwise one read spends ninety real seconds. Declared BEFORE
-    /// the store: the store's teardown still calls the now-function, so the clock must outlive it.
-    std::atomic<uint64_t> engine_now_ms{0};
+    /// on a clock this test advances -- otherwise one read spends ninety real seconds. Heap-owned, not
+    /// a plain local: the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local -- even an already-atomic one --
+    /// would dangle once the frame returns.
+    auto engine_now_ms = std::make_shared<std::atomic<uint64_t>>(0);
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    store->setCasRequestNowFnForTest([&] { return engine_now_ms.fetch_add(10'000) + 10'000; });
+    store->setCasRequestNowFnForTest([engine_now_ms] { return engine_now_ms->fetch_add(10'000) + 10'000; });
     store->setCasRetrySleepForTest([](uint64_t) {});
 
     std::vector<Rec> rows;
@@ -477,10 +479,12 @@ TEST(CASGCScheduler, TransientRoundFailureKeepsLeadershipAndHeartbeat)
 {
     auto backend = std::make_shared<ModalThrowingBackend>();
     /// See `TransientThrowIsClassifiedAborted`: the transient mode is persistent while it is armed, so
-    /// the retry window runs on a clock this test advances, declared before the store it outlives.
-    std::atomic<uint64_t> engine_now_ms{0};
+    /// the retry window runs on a clock this test advances. Heap-owned, not a plain local: the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local -- even an already-atomic one -- would dangle once the frame returns.
+    auto engine_now_ms = std::make_shared<std::atomic<uint64_t>>(0);
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    store->setCasRequestNowFnForTest([&] { return engine_now_ms.fetch_add(10'000) + 10'000; });
+    store->setCasRequestNowFnForTest([engine_now_ms] { return engine_now_ms->fetch_add(10'000) + 10'000; });
     store->setCasRetrySleepForTest([](uint64_t) {});
 
     std::mutex rows_mutex;

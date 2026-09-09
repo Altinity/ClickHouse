@@ -951,10 +951,23 @@ TEST(CASDecommission, PerObjectFailureWarnsAndContinuesDrain)
 
     /// The engine reissues an unresolved delete until its own retry window closes, measured on this
     /// clock, so the latched fault reaches a genuine give-up with no real time passing.
-    DB::Cas::tests::FakeClock clock;
+    /// Heap-owned, not a plain stack local: `decommissionPoolMember` installs this clock into the
+    /// Pool's `boot_ms_fn` background mount-lease renewer, which can still be running on a detached
+    /// thread after this function returns, so a by-reference capture of a local would dangle. Wrapped
+    /// (rather than passing `clock->nowFn()`/`clock->sleepFn()` directly) so the closures stored in
+    /// `PoolConfig` hold the shared_ptr itself, not just the raw `FakeClock*` those methods capture.
+    auto clock = std::make_shared<DB::Cas::tests::FakeClock>();
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim",
-        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+        /*sink=*/{}, /*request_gc_round=*/{},
+        [clock]
+        {
+            return clock->nowFn()();
+        },
+        [clock](uint64_t ms)
+        {
+            clock->sleepFn()(ms);
+        });
 
     EXPECT_EQ(report.staging_objects_removed, 1u)
         << "the OTHER staging object must still be deleted despite the injected failure on its sibling";
@@ -1018,10 +1031,23 @@ TEST(CASDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
 
     /// The engine reissues an unresolved delete until its own retry window closes, measured on this
     /// clock, so the latched fault reaches a genuine give-up with no real time passing.
-    DB::Cas::tests::FakeClock clock;
+    /// Heap-owned, not a plain stack local: `decommissionPoolMember` installs this clock into the
+    /// Pool's `boot_ms_fn` background mount-lease renewer, which can still be running on a detached
+    /// thread after this function returns, so a by-reference capture of a local would dangle. Wrapped
+    /// (rather than passing `clock->nowFn()`/`clock->sleepFn()` directly) so the closures stored in
+    /// `PoolConfig` hold the shared_ptr itself, not just the raw `FakeClock*` those methods capture.
+    auto clock = std::make_shared<DB::Cas::tests::FakeClock>();
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim",
-        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+        /*sink=*/{}, /*request_gc_round=*/{},
+        [clock]
+        {
+            return clock->nowFn()();
+        },
+        [clock](uint64_t ms)
+        {
+            clock->sleepFn()(ms);
+        });
 
     EXPECT_EQ(report.namespaces_removed, 1u)
         << "victim/db/t1's namespace erasure (Task 2) is untouched by either injected failure";
@@ -1341,11 +1367,19 @@ TEST(CASDecommission, FailedDrainKeepsSlotThenResumes)
     /// the way out would refuse against a deadline the retry exhaustion already ran past -- a real
     /// decommission's background renewer would have kept the deadline current over 90 real seconds, but
     /// nothing here advances real time to let it.
-    DB::Cas::tests::FakeClock clock;
+    auto clock = std::make_shared<DB::Cas::tests::FakeClock>();
     const auto first = decommissionPoolMember(
         failing,
         PoolConfig{.pool_prefix = "p", .server_root_id = "a1", .mount_lease_ttl_ms = std::chrono::milliseconds(300'000)},
-        "victim", /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+        "victim", /*sink=*/{}, /*request_gc_round=*/{},
+        [clock]
+        {
+            return clock->nowFn()();
+        },
+        [clock](uint64_t ms)
+        {
+            clock->sleepFn()(ms);
+        });
     EXPECT_FALSE(first.warnings.empty());
     EXPECT_FALSE(first.slot_removed);
     EXPECT_TRUE((*raw_op).head("p/gc/server-roots/victim/mount", Retry::once()).has_value())
@@ -1385,10 +1419,18 @@ TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 
     /// The engine reissues an unresolved delete until its own retry window closes, measured on this
     /// clock, so the latched fault reaches a genuine give-up with no real time passing.
-    DB::Cas::tests::FakeClock clock;
+    auto clock = std::make_shared<DB::Cas::tests::FakeClock>();
     const auto first = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
-        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+        /*sink=*/{}, /*request_gc_round=*/{},
+        [clock]
+        {
+            return clock->nowFn()();
+        },
+        [clock](uint64_t ms)
+        {
+            clock->sleepFn()(ms);
+        });
     EXPECT_FALSE(first.warnings.empty());
     EXPECT_FALSE(first.slot_removed);
     EXPECT_EQ(first.manifest_debris_removed, 0u);
@@ -1430,11 +1472,19 @@ TEST(CASDecommission, DrainClockUnifiesWithTheFarewellBootClockRegardlessOfHostU
     { auto victim = openVictim(backend); }   /// identity only -- no namespace, so retirement runs straight
                                               /// to the farewell instead of stopping on an unrelated warning
 
-    DB::Cas::tests::FakeClock clock;
-    clock.now = 1'000'000'000'000'000ULL;   /// dwarfs any real CLOCK_BOOTTIME on any host
+    auto clock = std::make_shared<DB::Cas::tests::FakeClock>();
+    clock->now = 1'000'000'000'000'000ULL;   /// dwarfs any real CLOCK_BOOTTIME on any host
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
-        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+        /*sink=*/{}, /*request_gc_round=*/{},
+        [clock]
+        {
+            return clock->nowFn()();
+        },
+        [clock](uint64_t ms)
+        {
+            clock->sleepFn()(ms);
+        });
 
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_TRUE(report.slot_removed);
@@ -1466,18 +1516,26 @@ TEST(CASDecommission, OpeningRetriesPaceOnTheSameFakeClockAndSleepAsTheDrain)
     const Layout layout("p");
     backend->failReadNTimes(layout.ownerKey("victim"), /*times=*/5);
 
-    DB::Cas::tests::FakeClock clock;
-    clock.now = 1'000'000'000'000'000ULL;
+    auto clock = std::make_shared<DB::Cas::tests::FakeClock>();
+    clock->now = 1'000'000'000'000'000ULL;
 
     const auto started = std::chrono::steady_clock::now();
     const auto report = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim",
-        /*sink=*/{}, /*request_gc_round=*/{}, clock.nowFn(), clock.sleepFn());
+        /*sink=*/{}, /*request_gc_round=*/{},
+        [clock]
+        {
+            return clock->nowFn()();
+        },
+        [clock](uint64_t ms)
+        {
+            clock->sleepFn()(ms);
+        });
     const auto wall_elapsed = std::chrono::steady_clock::now() - started;
 
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_TRUE(report.slot_removed);
-    EXPECT_FALSE(clock.sleeps.empty())
+    EXPECT_FALSE(clock->sleeps.empty())
         << "the opening retries must have been paced on the injected clock, not a real sleep";
     EXPECT_LT(wall_elapsed, std::chrono::seconds(5))
         << "paced on the fake clock, five retries during opening should cost no real wall time at all";

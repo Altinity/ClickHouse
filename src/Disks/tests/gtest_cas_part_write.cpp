@@ -1938,8 +1938,10 @@ TEST(CASPartWriteTxn, PromoteSucceedsWhenPrecommitIsLiveOwner)
 TEST(CASPartWriteTxnRepoint, PromoteRepointsCommittedRef)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
-    std::vector<CasEvent> events;
+    /// Heap-owned, not a plain local: `~Pool` emits terminate events into the sink, and a background
+    /// publish can hold an extra `shared_from_this()` past this frame's return regardless of
+    /// declaration order relative to the Pool, so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
@@ -1967,7 +1969,10 @@ TEST(CASPartWriteTxnRepoint, PromoteRepointsCommittedRef)
 
     /// The failed no-flag attempt threw BEFORE appendRefOps returned, so build2's precommit is still the
     /// live owner (no removal was appended) -- the SAME build/manifest can be retried with the flag.
-    s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+    s->setEventSink([events](const CasEvent & e)
+    {
+        events->push(e);
+    });
     EXPECT_NO_THROW(build2->promote(ns, "part_1", build2->buildId(), m2_id, /*allow_repoint=*/true));
     auto resolved = s->resolveRef(ns, "part_1");
     ASSERT_TRUE(resolved);
@@ -1976,7 +1981,7 @@ TEST(CASPartWriteTxnRepoint, PromoteRepointsCommittedRef)
     /// Every effective repoint is loud (spec §4): exactly one RefRepoint event, naming the ref and the
     /// old manifest it replaced.
     size_t repoint_events = 0;
-    for (const CasEvent & e : events)
+    for (const CasEvent & e : events->snapshot())
         if (e.type == CasEventType::RefRepoint)
         {
             ++repoint_events;
@@ -2490,12 +2495,17 @@ TEST(CASPartWriteTxnStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithi
 TEST(CASPartWriteTxnStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedWithoutReissue)
 {
     auto b = std::make_shared<ManifestPutFaultBackend>();
-    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
-    std::vector<CasEvent> events;
+    /// Heap-owned, not a plain local: `~Pool` emits terminate events into the sink, and a background
+    /// publish can hold an extra `shared_from_this()` past this frame's return regardless of
+    /// declaration order relative to the Pool, so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto s = openPool(b);
     const RootNamespace ns{"srv/tbl"};
 
-    s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+    s->setEventSink([events](const CasEvent & e)
+    {
+        events->push(e);
+    });
 
     auto build = startBuildFor(s, ns, "part_landed");
     b->fault_count = 1;
@@ -2509,9 +2519,10 @@ TEST(CASPartWriteTxnStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedW
         ASSERT_TRUE((*op).read(key, Retry::once()).has_value());
     }
 
-    const auto ev = std::find_if(events.begin(), events.end(),
+    const std::vector<CasEvent> observed_events = events->snapshot();
+    const auto ev = std::find_if(observed_events.begin(), observed_events.end(),
                                  [](const CasEvent & e) { return e.type == CasEventType::ManifestPut; });
-    ASSERT_NE(ev, events.end()) << "the stage must still emit its ManifestPut audit event";
+    ASSERT_NE(ev, observed_events.end()) << "the stage must still emit its ManifestPut audit event";
     CasRequests probe(b, Fence::open());
     CasOperation probe_op = probe.admit();
     const auto landed = probe_op.head(key, Retry::standard());
@@ -2703,13 +2714,18 @@ TEST(CASPartWrite, AmbiguousTimeoutsThenCommitRestreamsFromSource)
 TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
-    std::vector<CasEvent> events;
+    /// Heap-owned, not a plain local: `~Pool` emits terminate events into the sink, and a background
+    /// publish can hold an extra `shared_from_this()` past this frame's return regardless of
+    /// declaration order relative to the Pool, so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "blob-payload-B";
 
-    s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+    s->setEventSink([events](const CasEvent & e)
+    {
+        events->push(e);
+    });
 
     auto build = startBuildFor(s, ns, "part_blob_landed");
     const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
@@ -2726,16 +2742,17 @@ TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
     EXPECT_EQ(payload_streams, 1);
 
     const String key = s->layout().blobKey(idOf(payload));
-    const auto adopt = std::find_if(events.begin(), events.end(),
+    const std::vector<CasEvent> observed_events = events->snapshot();
+    const auto adopt = std::find_if(observed_events.begin(), observed_events.end(),
                                     [](const CasEvent & e) { return e.type == CasEventType::BlobReuseAdopt; });
-    ASSERT_NE(adopt, events.end()) << "the landed occupant must be ADOPTED (the standard dedup leg)";
+    ASSERT_NE(adopt, observed_events.end()) << "the landed occupant must be ADOPTED (the standard dedup leg)";
     CasRequests probe(b, Fence::open());
     CasOperation probe_op = probe.admit();
     const auto landed = probe_op.head(key, Retry::standard());
     ASSERT_TRUE(landed.has_value());
     EXPECT_EQ(adopt->token, landed->etag.render())
         << "the adopted token must be the landed incarnation, rendered";
-    EXPECT_EQ(std::count_if(events.begin(), events.end(),
+    EXPECT_EQ(std::count_if(observed_events.begin(), observed_events.end(),
                             [](const CasEvent & e) { return e.type == CasEventType::BlobPut; }), 0)
         << "no fresh-upload event: the body was never re-uploaded";
 }
@@ -2909,8 +2926,10 @@ TEST(CASPartWrite, AmbiguousNonLandingPublicationStopsAtOuterBound)
 TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
-    std::vector<CasEvent> events;
+    /// Heap-owned, not a plain local: `~Pool` emits terminate events into the sink, and a background
+    /// publish can hold an extra `shared_from_this()` past this frame's return regardless of
+    /// declaration order relative to the Pool, so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "staged-payload-A";
@@ -2922,7 +2941,10 @@ TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
         ASSERT_TRUE(std::holds_alternative<Committed>((*seed_op).create(staging_key, staging_bytes, Retry::once())));
     }
 
-    s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+    s->setEventSink([events](const CasEvent & e)
+    {
+        events->push(e);
+    });
 
     auto build = startBuildFor(s, ns, "part_copy_landed");
     const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
@@ -2944,9 +2966,10 @@ TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
     const auto got = (*op).read(key, Retry::once());
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->bytes, staging_bytes) << "the destination is the staging object's verbatim copy";
-    EXPECT_NE(std::find_if(events.begin(), events.end(),
+    const std::vector<CasEvent> observed_events = events->snapshot();
+    EXPECT_NE(std::find_if(observed_events.begin(), observed_events.end(),
                            [](const CasEvent & e) { return e.type == CasEventType::BlobReuseAdopt; }),
-              events.end()) << "the landed destination must be ADOPTED";
+              observed_events.end()) << "the landed destination must be ADOPTED";
 }
 
 /// A server-side copy publication is ambiguous-and-absent: the first copy attempt times out with

@@ -9,6 +9,7 @@
 
 #include <Poco/Exception.h>
 
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <memory>
@@ -20,6 +21,7 @@ extern const int NETWORK_ERROR;
 }
 
 using namespace DB::Cas;
+using DB::Cas::tests::SharedWaitLog;
 
 namespace
 {
@@ -403,8 +405,11 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
     EXPECT_NE(decodeMountLease(mount->bytes).min_active_build_sequence, std::numeric_limits<uint64_t>::max())
         << "a live writer-cleanup duty forbids the clean-release certificate";
 
-    uint64_t fake_boot = 0;
-    std::vector<uint64_t> waits;
+    /// Held in shared, heap-owned state, not plain locals: the hooks below mutate them, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+    auto waits = std::make_shared<SharedWaitLog>();
     auto successor_store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p",
         .server_id = UInt128(1),
@@ -413,11 +418,18 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
         .mount_lease_ttl_ms = std::chrono::milliseconds(500),
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = budget,
-        .boot_ms_fn = [&] { return fake_boot; },
-        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+        {
+            *fake_boot += ms;
+            waits->push(ms);
+        },
     });
     ASSERT_GT(successor_store->writerEpoch(), predecessor_epoch);
-    ASSERT_FALSE(waits.empty()) << "the predecessor supplied no clean-death certificate";
+    ASSERT_FALSE(waits->empty()) << "the predecessor supplied no clean-death certificate";
 
     ManifestId successor_id;
     auto successor = stageEmptyManifest(successor_store, ns, "successor", successor_id);
@@ -465,7 +477,10 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     /// lease, and on a loaded machine the give-up below stops being a retry give-up and becomes a
     /// no-budget refusal before the first attempt. Freeze the boot clock, exactly as the successor
     /// pool further down already does, so the only bound on that give-up is the one it asserts.
-    uint64_t predecessor_boot = 0;
+    /// Captured by value: `predecessor_boot` is never mutated in this test, and the Pool can outlive
+    /// this stack frame (a background publish holds `shared_from_this()`), so a by-reference capture
+    /// would dangle.
+    const uint64_t predecessor_boot = 0;
     auto predecessor = Pool::open(backend, PoolConfig{
         .pool_prefix = "p",
         .server_id = UInt128(1),
@@ -477,7 +492,10 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
         .mount_lease_ttl_ms = std::chrono::milliseconds(500),
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = budget,
-        .boot_ms_fn = [&] { return predecessor_boot; },
+        .boot_ms_fn = []
+        {
+            return predecessor_boot;
+        },
     });
     auto clock = DB::Cas::tests::VirtualRetryClock::installOn(predecessor);
 
@@ -512,8 +530,11 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     rejected.reset();
     predecessor.reset();
 
-    uint64_t fake_boot = 0;
-    std::vector<uint64_t> waits;
+    /// Held in shared, heap-owned state, not plain locals: the hooks below mutate them, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+    auto waits = std::make_shared<SharedWaitLog>();
     auto successor_store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p",
         .server_id = UInt128(1),
@@ -525,11 +546,18 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
         .mount_lease_ttl_ms = std::chrono::milliseconds(500),
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = budget,
-        .boot_ms_fn = [&] { return fake_boot; },
-        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+        {
+            *fake_boot += ms;
+            waits->push(ms);
+        },
     });
     ASSERT_GT(successor_store->writerEpoch(), predecessor_epoch);
-    ASSERT_FALSE(waits.empty()) << "the predecessor supplied no clean-death certificate";
+    ASSERT_FALSE(waits->empty()) << "the predecessor supplied no clean-death certificate";
 
     /// An ordinary successor mutation both drains the inherited duty as a no-op (the rejected grant
     /// was never durable) and forces the predecessor's dead epoch to close with an arithmetic seal --

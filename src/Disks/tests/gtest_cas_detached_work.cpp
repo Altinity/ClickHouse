@@ -632,38 +632,42 @@ TEST(CASDetachedWork, FailedPublisherDispatchKeepsMutationAndClearsReservation)
 TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
 {
     auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
-    std::atomic<bool> handler_ran{false};
+    /// Held in shared, heap-owned atomics, not plain locals: an `ASSERT_*` below can return early and
+    /// skip the `stopAndDrainDetachedWork` cleanup at the bottom, and even a successful drain there only
+    /// guarantees no NEW detached task starts -- an already-dispatched one can still be running and can
+    /// still invoke these hooks against a frame that has already unwound.
+    auto handler_ran = std::make_shared<std::atomic<bool>>(false);
     PoolConfig config;
     /// No real backoff wait: the injected throw leaves the tail over-threshold, and a REAL backoff
     /// sleep here would still be paid at teardown drain even though the test's own assertions never
     /// wait on it directly.
     config.snapshot_publish_backoff_initial_ms = 0;
     config.snapshot_publish_backoff_max_ms = 0;
-    config.publish_error_hook_for_test = [&handler_ran]
+    config.publish_error_hook_for_test = [handler_ran]
     {
-        handler_ran.store(true);
+        handler_ran->store(true);
         throw std::runtime_error("injected: the error handler itself throws");
     };
     auto store = openPublishingPool(backend, config);
     const RootNamespace ns{"srv1/handler_throws"};
 
-    std::atomic<bool> capture_hook_ran{false};
-    std::atomic<bool> capture_hook_armed{true};
-    store->setSnapshotAfterCaptureHookForTest([&capture_hook_ran, &capture_hook_armed]
+    auto capture_hook_ran = std::make_shared<std::atomic<bool>>(false);
+    auto capture_hook_armed = std::make_shared<std::atomic<bool>>(true);
+    store->setSnapshotAfterCaptureHookForTest([capture_hook_ran, capture_hook_armed]
     {
-        capture_hook_ran.store(true);
-        if (capture_hook_armed.exchange(false))
+        capture_hook_ran->store(true);
+        if (capture_hook_armed->exchange(false))
             throw std::runtime_error("injected: the dispatched attempt itself throws");
     });
 
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
     store->waitForSnapshotPublishSettleForTest(ns);
-    ASSERT_TRUE(capture_hook_ran.load()) << "the dispatched attempt never reached the injected throw";
-    EXPECT_TRUE(handler_ran.load()) << "the injected throw must have reached the (throwing) error handler";
+    ASSERT_TRUE(capture_hook_ran->load()) << "the dispatched attempt never reached the injected throw";
+    EXPECT_TRUE(handler_ran->load()) << "the injected throw must have reached the (throwing) error handler";
     EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 0);
 
-    /// Same lifetime rule as below: the detached publisher reads the hooks' captured locals, so it is
-    /// stopped and drained before they go out of scope.
+    /// Same lifetime rule as below: the detached publisher reads the hooks' captured state, so it is
+    /// stopped and drained before this function returns.
     ASSERT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/10000));
     store->setSnapshotAfterCaptureHookForTest(nullptr);
 }
@@ -678,22 +682,33 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
 {
     auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
     constexpr uint64_t step_ms = 100;
-    std::atomic<uint64_t> fake_boot{1000};
-    std::atomic<uint64_t> error_hook_calls{0};
+    /// Held in shared, heap-owned atomics, not plain locals: `stopAndDrainDetachedWork` at the bottom
+    /// permanently closes admission of NEW detached tasks (via `beginTeardown`), but an `ASSERT_*` above
+    /// it can return early and skip that call entirely, and even a call that runs only guarantees no new
+    /// task starts -- an already-dispatched redispatch can still be running (or the drain can simply time
+    /// out) and can still invoke these hooks against a frame that has already unwound.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1000);
+    auto error_hook_calls = std::make_shared<std::atomic<uint64_t>>(0);
     PoolConfig config;
-    config.boot_ms_fn = [&fake_boot] { return fake_boot.load(); };
+    config.boot_ms_fn = [fake_boot]
+    {
+        return fake_boot->load();
+    };
     /// Initial == max, so every step of the schedule is the same virtual `step_ms` and the test can
     /// advance the clock by a constant.
     config.snapshot_publish_backoff_initial_ms = step_ms;
     config.snapshot_publish_backoff_max_ms = step_ms;
-    config.publish_error_hook_for_test = [&error_hook_calls] { error_hook_calls.fetch_add(1); };
+    config.publish_error_hook_for_test = [error_hook_calls]
+    {
+        error_hook_calls->fetch_add(1);
+    };
     auto store = openPublishingPool(backend, config);
     const RootNamespace ns{"srv1/throwing_publisher_pacing"};
 
-    std::atomic<uint64_t> attempts{0};
-    store->setSnapshotAfterCaptureHookForTest([&attempts]
+    auto attempts = std::make_shared<std::atomic<uint64_t>>(0);
+    store->setSnapshotAfterCaptureHookForTest([attempts]
     {
-        attempts.fetch_add(1);
+        attempts->fetch_add(1);
         throw std::runtime_error("injected: every publish attempt throws before its write");
     });
 
@@ -702,10 +717,10 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
     /// The virtual clock does not move here, so the armed deadline is still in the future for the whole
     /// window and exactly ONE attempt may have run.
     const auto observe_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    while (std::chrono::steady_clock::now() < observe_until && attempts.load() <= 1)
+    while (std::chrono::steady_clock::now() < observe_until && attempts->load() <= 1)
         std::this_thread::yield();
-    EXPECT_EQ(attempts.load(), 1u) << "the throwing attempt redispatched without arming the publish backoff";
-    EXPECT_GE(error_hook_calls.load(), 1u) << "the injected throw never reached the error handler";
+    EXPECT_EQ(attempts->load(), 1u) << "the throwing attempt redispatched without arming the publish backoff";
+    EXPECT_GE(error_hook_calls->load(), 1u) << "the injected throw never reached the error handler";
 
     /// One step of the schedule per iteration: the tail is still over threshold, so each mutation
     /// re-evaluates admission, and AT MOST one attempt may pass per elapsed backoff interval. At most,
@@ -716,7 +731,7 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
     /// is what catches it; progress is asserted once after the loop.
     for (uint64_t step = 1; step <= 3; ++step)
     {
-        fake_boot.fetch_add(step_ms);
+        fake_boot->fetch_add(step_ms);
         ASSERT_NO_THROW(publishRef(store, ns, "ref_" + std::to_string(step + 1), step + 1));
         /// Bounded poll rather than `waitForSnapshotPublishSettleForTest`: that call waits on a condvar
         /// predicate with no deadline, and on an unpaced-redispatch regression the reservation count
@@ -730,14 +745,14 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
                 << "pending_snapshot_publishes stayed nonzero";
             std::this_thread::yield();
         }
-        EXPECT_LE(attempts.load(), 1 + step) << "more than one publish attempt ran within one backoff step";
+        EXPECT_LE(attempts->load(), 1 + step) << "more than one publish attempt ran within one backoff step";
     }
 
     /// Progress, on the injected clock so it is deterministic rather than a race with a worker: an
     /// elapsed backoff must eventually admit a further attempt, or the pacing gate would be a wedge.
-    for (uint64_t extra = 0; attempts.load() < 2 && extra < 20; ++extra)
+    for (uint64_t extra = 0; attempts->load() < 2 && extra < 20; ++extra)
     {
-        fake_boot.fetch_add(step_ms);
+        fake_boot->fetch_add(step_ms);
         ASSERT_NO_THROW(publishRef(store, ns, "ref_progress_" + std::to_string(extra), 100 + extra));
         const auto settle = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (store->pendingSnapshotPublishesForTest(ns) != 0)
@@ -746,10 +761,10 @@ TEST(CASDetachedWork, ThrowingPublishAttemptIsPacedByTheBackoff)
             std::this_thread::yield();
         }
     }
-    EXPECT_GE(attempts.load(), 2u)
+    EXPECT_GE(attempts->load(), 2u)
         << "no elapsed backoff ever admitted a further publish attempt: the gate is a wedge, not a pace";
 
-    EXPECT_EQ(error_hook_calls.load(), attempts.load());
+    EXPECT_EQ(error_hook_calls->load(), attempts->load());
     /// The publisher is detached work: a redispatch admitted by the last elapsed backoff can still be
     /// running when this body returns, and it reads `fake_boot` through `boot_ms_fn`. Stop and drain it
     /// while the locals it reads are alive.

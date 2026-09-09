@@ -54,6 +54,7 @@ using namespace DB::Cas;
 using DB::Cas::tests::blobEntryFor;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
+using DB::Cas::tests::SharedWaitLog;
 using DB::Cas::tests::u128Of;
 
 namespace
@@ -1529,13 +1530,22 @@ TEST(CASPoolMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
     /// -> `MountPriorState::Fenced` (a fenced prior is reclaimed on the first attempt, with no
     /// observation polling -- see `CASMountOpenWaits.FencedPriorReclaimsWithoutAnyWait`). The injected
     /// `boot_ms_fn`/`wait_sleep_fn` below keep this test off the real clock regardless.
-    uint64_t fake_boot = 0;
+    /// Held in a shared atomic, not a plain local: `wait_sleep_fn` below mutates it, and the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
     DB::Cas::PoolPtr store;
     ASSERT_NO_THROW(
         store = DB::Cas::Pool::open(fencing,
             DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                .boot_ms_fn = [&fake_boot] { return fake_boot; },
-                .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; }}))
+                .boot_ms_fn = [fake_boot]
+                {
+                    return fake_boot->load();
+                },
+                .wait_sleep_fn = [fake_boot](uint64_t ms)
+                {
+                    *fake_boot += ms;
+                }}))
         << "open must recover from a fence in the adopt window, not wedge (exit-49 S13 bug)";
     ASSERT_TRUE(store);
 
@@ -1557,25 +1567,31 @@ TEST(CASPoolMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
 TEST(CASPool, WriteFenceUsesInjectedBootClock)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    uint64_t fake_boot = 1'000'000;   /// arbitrary boottime origin (ms)
+    /// Held in a shared atomic, not a plain local: this test mutates the clock below, and the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);   /// arbitrary boottime origin (ms)
     auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{
         .pool_prefix = "p",
         .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
-        .boot_ms_fn = [&] { return fake_boot; },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
     });
 
     /// Freshly armed at open (deadline = fake_boot + ttl): well within the ttl, mutations are allowed.
     EXPECT_TRUE(store->mayMutate());
 
     /// Advance the boot clock just short of the deadline — still armed.
-    fake_boot += 29999;
+    *fake_boot += 29999;
     EXPECT_TRUE(store->mayMutate());
 
     /// Cross the deadline (ttl elapsed with no renew — a resumed sleeper's view). The fence must expire.
     /// (The "a gated mutate then fails closed with ABORTED" leg used `mutateShardForTest` -- the held
     /// Phase-E shard lane -- and moves there; here we pin the boot-clock fence flip itself.)
-    fake_boot += 2;   /// now fake_boot = origin + 30001 > origin + 30000
+    *fake_boot += 2;   /// now fake_boot = origin + 30001 > origin + 30000
     EXPECT_FALSE(store->mayMutate());
 }
 
@@ -1768,12 +1784,17 @@ struct SequencedBootClock
 /// report, not re-asserted here: this test body only encodes the FIXED expectation.)
 TEST(CASPoolRemount, RemountArmAnchorsAtClaimAttemptNotResponseTime)
 {
-    SequencedBootClock clock;
+    /// Heap-owned, not a plain stack local: the Pool can outlive this stack frame (a background
+    /// publish holds `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto clock = std::make_shared<SequencedBootClock>();
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30'000),
-        .boot_ms_fn = [&] { return clock(); },
+        .boot_ms_fn = [clock]
+        {
+            return (*clock)();
+        },
     });
     ASSERT_TRUE(store);
 
@@ -1784,8 +1805,8 @@ TEST(CASPoolRemount, RemountArmAnchorsAtClaimAttemptNotResponseTime)
     /// an unrelated number of `bootMsNow()` calls (all served from `.steady = 0` -- irrelevant, since
     /// nothing probes the resulting arm before this point). Reset the counter so the FIRST call from
     /// here on is the remount attempt's own call #1.
-    clock.queue = {10000, 11000};
-    clock.next = 0;
+    clock->queue = {10000, 11000};
+    clock->next = 0;
 
     ASSERT_TRUE(store->tryRemountOnce());
 
@@ -1793,7 +1814,7 @@ TEST(CASPoolRemount, RemountArmAnchorsAtClaimAttemptNotResponseTime)
     /// (10000), so the fence has JUST expired here -- `mayMutate` must be false. (The pre-fix code
     /// would still read `mayMutate` as true here, armed from 11000 + 30000 -- see the TDD run in the
     /// report.)
-    clock.steady = 40000;
+    clock->steady = 40000;
     EXPECT_FALSE(store->mayMutate())
         << "the remount arm must anchor at the claim attempt's pre-I/O instant, not a later "
            "response-time reading taken after renewerStart/quiesceRefTablesForRemount";
@@ -1810,14 +1831,17 @@ TEST(CASPoolRemount, RemountArmAnchorsAtClaimAttemptNotResponseTime)
 TEST(CASMountRemount, SupersededIncarnationDoesNotReclaimALiveSuccessor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    uint64_t boot_a = 0;
-    uint64_t boot_b = 0;
+    /// Held in shared atomics, not plain locals: `wait_sleep_fn`/`setWaitSleepForTest` below mutate
+    /// them, and each Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference or by-raw-pointer capture of a local would dangle.
+    auto boot_a = std::make_shared<std::atomic<uint64_t>>(0);
+    auto boot_b = std::make_shared<std::atomic<uint64_t>>(0);
     /// Mirrors `UncleanOpenPaysOnlyTheObservationWindow`'s tiny budget: the 1s lease TTL below is far
     /// under the default `cas_request_budget`, so it must be scaled down to fit the required-timeout
     /// inequality (attempt_timeout + safety_margin < lease TTL).
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
-    auto config_for = [&](uint64_t * boot, bool unsafe)
+    auto config_for = [&](const std::shared_ptr<std::atomic<uint64_t>> & boot, bool unsafe)
     {
         return PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
@@ -1825,16 +1849,22 @@ TEST(CASMountRemount, SupersededIncarnationDoesNotReclaimALiveSuccessor)
             .mount_renew_period = std::chrono::milliseconds(200),
             .unsafe_remount_no_delay = unsafe,
             .cas_request_budget = tiny_budget,
-            .boot_ms_fn = [boot] { return *boot; },
-            .wait_sleep_fn = [boot](uint64_t ms) { *boot += ms; },
+            .boot_ms_fn = [boot]
+            {
+                return boot->load();
+            },
+            .wait_sleep_fn = [boot](uint64_t ms)
+            {
+                *boot += ms;
+            },
         };
     };
 
-    PoolPtr pool_a = Pool::open(backend, config_for(&boot_a, /*unsafe=*/false));
+    PoolPtr pool_a = Pool::open(backend, config_for(boot_a, /*unsafe=*/false));
     ASSERT_TRUE(pool_a);
     /// B carries the SAME (server_root_id, server_id) as A -- a copied uuid file -- and opens over A's
     /// still-live slot under the operator's unsafe knob, reclaiming it at once (no observation).
-    PoolPtr pool_b = Pool::open(backend, config_for(&boot_b, /*unsafe=*/true));
+    PoolPtr pool_b = Pool::open(backend, config_for(boot_b, /*unsafe=*/true));
     ASSERT_TRUE(pool_b);
     EXPECT_NE(pool_a->liveWriterEpoch(), pool_b->liveWriterEpoch())
         << "the unsafe reclaim must have minted B a fresh epoch over A's slot";
@@ -1866,12 +1896,13 @@ TEST(CASMountRemount, SupersededIncarnationDoesNotReclaimALiveSuccessor)
     /// `remount_mutex`), and the wait fires between `claimMountAwaitingExpiry`'s polls -- with no
     /// backend request of A's own in flight -- so B's call is the only one touching the shared
     /// in-memory backend at that instant.
-    size_t polls = 0;
-    pool_a->setWaitSleepForTest([&](uint64_t ms)
+    /// Heap-owned, not a plain local: same lifetime rule as `boot_a`/`boot_b` above.
+    auto polls = std::make_shared<std::atomic<size_t>>(0);
+    pool_a->setWaitSleepForTest([boot_a, boot_b, polls, pool_b](uint64_t ms)
     {
-        boot_a += ms;
-        ++polls;
-        boot_b += ms;
+        *boot_a += ms;
+        ++(*polls);
+        *boot_b += ms;
         EXPECT_NO_THROW(pool_b->renewWatermarkOnce());
     });
     EXPECT_FALSE(pool_a->tryRemountOnce())
@@ -1882,7 +1913,7 @@ TEST(CASMountRemount, SupersededIncarnationDoesNotReclaimALiveSuccessor)
     /// `sleep_ms_fn` call per iteration that does not itself exceed the bound, and none on the
     /// terminal iteration that does. A widened or removed restart bound would make this hang instead
     /// of failing, so pin the exact count rather than only asserting it ran.
-    EXPECT_EQ(polls, DB::Cas::kMaxObservationRestarts + 1)
+    EXPECT_EQ(polls->load(), DB::Cas::kMaxObservationRestarts + 1)
         << "the observation must give up after exactly kMaxObservationRestarts restarts, not wait "
            "indefinitely for a live twin to go quiet";
 
@@ -1898,7 +1929,10 @@ TEST(CASMountRemount, SupersededIncarnationDoesNotReclaimALiveSuccessor)
 TEST(CASMountRemount, CutoffFencesWithoutRenewals)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    uint64_t boot = 0;
+    /// Held in a shared atomic, not a plain local: this test mutates the clock below, and the Pool can
+    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
+    /// capture of a local would dangle.
+    auto boot = std::make_shared<std::atomic<uint64_t>>(0);
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
     PoolPtr store = Pool::open(backend, PoolConfig{
@@ -1906,15 +1940,21 @@ TEST(CASMountRemount, CutoffFencesWithoutRenewals)
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
         .mount_renew_period = std::chrono::milliseconds(200),
         .cas_request_budget = tiny_budget,
-        .boot_ms_fn = [&] { return boot; },
-        .wait_sleep_fn = [&](uint64_t ms) { boot += ms; },
+        .boot_ms_fn = [boot]
+        {
+            return boot->load();
+        },
+        .wait_sleep_fn = [boot](uint64_t ms)
+        {
+            *boot += ms;
+        },
     });
     ASSERT_TRUE(store);
     EXPECT_TRUE(store->mayMutate()) << "freshly armed at open, well within the ttl";
 
     /// No renewals at all -- advance the boot clock past the armed deadline (open's claim anchor plus
     /// the lease ttl) on this incarnation's own clock alone.
-    boot += 1001;
+    *boot += 1001;
     EXPECT_FALSE(store->mayMutate())
         << "crossing the armed deadline must fence closed on the boot clock alone, with no renewal "
            "conflict needed to trip it";
@@ -2367,14 +2407,26 @@ TEST(CASPoolShutdown, UnresolvedWedgeSkipsFarewell)
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
     backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
-    uint64_t fake_boot = 1'000'000;
+    /// Held in a shared atomic, not a plain local: `wait_sleep_fn` and the retry-sleep hook below
+    /// mutate it, and the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
     auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{
         .pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget,
-        .boot_ms_fn = [&fake_boot] { return fake_boot; },
-        .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; }});
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .wait_sleep_fn = [fake_boot](uint64_t ms)
+        {
+            *fake_boot += ms;
+        }});
     /// The engine's own inter-attempt sleep advances the same clock its deadlines are read from, so the
     /// retry bound is reached in test time rather than in ninety real seconds.
-    store->setCasRetrySleepForTest([&fake_boot](uint64_t ms) { fake_boot += ms; });
+    store->setCasRetrySleepForTest([fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+    });
     /// By value: `layout` is used after `store.reset()` below, a reference would dangle.
     const Layout layout = store->layout();
     const RootNamespace ns{"srv/wedge_shutdown"};
@@ -2441,8 +2493,11 @@ TEST(CASMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
 
-    uint64_t fake_boot = 0;
-    std::vector<uint64_t> waits;
+    /// Held in shared, heap-owned state, not plain locals: the hooks below mutate them, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+    auto waits = std::make_shared<SharedWaitLog>();
     PoolPtr store;
     ASSERT_NO_THROW(
         store = Pool::open(b, PoolConfig{
@@ -2450,8 +2505,15 @@ TEST(CASMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
             .mount_lease_ttl_ms = std::chrono::milliseconds(500),
             .mount_renew_period = std::chrono::milliseconds(100),
             .cas_request_budget = tiny_budget,
-            .boot_ms_fn = [&] { return fake_boot; },
-            .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+            .boot_ms_fn = [fake_boot]
+            {
+                return fake_boot->load();
+            },
+            .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+            {
+                *fake_boot += ms;
+                waits->push(ms);
+            },
         }));
     ASSERT_TRUE(store);
 
@@ -2461,15 +2523,16 @@ TEST(CASMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
     /// loop only re-checks the threshold between polls, so the observed wait rounds UP to the next
     /// whole poll: ceil(575 / 50) * 50 = 600 ms, i.e. exactly 12 polls of 50 ms each -- because this
     /// predecessor's death was never certified, only observed.
+    const std::vector<uint64_t> observed_waits = waits->snapshot();
     uint64_t total = 0;
-    for (uint64_t w : waits)
+    for (uint64_t w : observed_waits)
         total += w;
     EXPECT_EQ(total, 600u) << "the observation window must be paid in full, poll-rounded to the "
                               "configured threshold -- neither less (a shortened wait) nor more "
                               "(a reintroduced grace period)";
     /// And every one of those polls is exactly one poll interval -- no wait beyond the observation
     /// poll (the straggler it used to wait out is fenced by the recovery seal instead).
-    for (uint64_t w : waits)
+    for (uint64_t w : observed_waits)
         EXPECT_EQ(w, 50u)
             << "an unclean reclaim must not block on any wait beyond the observation poll -- the "
                "straggler it used to wait out is fenced by the recovery seal instead";
@@ -2488,32 +2551,46 @@ TEST(CASMountOpenWaits, UnsafeNoDelayOpensWithoutTheObservationWindow)
     /// A real predecessor at epoch 7 durably minted this first; seed it here too, or the successor's
     /// own `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
     createObj(*b, l.epochKey("test"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
-    std::vector<CasEvent> events;
-    uint64_t fake_boot = 0;
-    std::vector<uint64_t> waits;
+    /// Held in shared, heap-owned state, not plain locals: the hooks below mutate them, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+    auto waits = std::make_shared<SharedWaitLog>();
     PoolPtr store;
     /// Same server_id (uuid) as the seeded predecessor and a different epoch -- exactly the shape
     /// `unsafe_remount_no_delay` is for. Unlike the neighbour test, no wait is expected: the bare
     /// `claimMount` reclaims at once under the operator's authorization.
     ASSERT_NO_THROW(store = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
-        .event_sink = [&](CasEvent e) { events.push_back(std::move(e)); },
+        .event_sink = [events](CasEvent e)
+        {
+            events->push(std::move(e));
+        },
         .mount_lease_ttl_ms = std::chrono::milliseconds(500), .mount_renew_period = std::chrono::milliseconds(100),
         .unsafe_remount_no_delay = true,
         .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt},
-        .boot_ms_fn = [&] { return fake_boot; },
-        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+        {
+            *fake_boot += ms;
+            waits->push(ms);
+        },
     }));
     ASSERT_TRUE(store);
-    EXPECT_TRUE(waits.empty()) << "no observation window under the unsafe setting";
+    EXPECT_TRUE(waits->snapshot().empty()) << "no observation window under the unsafe setting";
     /// `Pool` has no test accessor for the adopted `MountPriorState`, so the `UncleanUnsafe`
     /// classification is asserted through the mount audit event instead: `claimMount`'s unsafe-reclaim
     /// branch (`CasServerRoot.cpp`) emits exactly one `MountClaim`/"reclaim" event whose reason names
     /// the setting, and `CASMountClaim.UnsafeAuthorizationIsTokenExact` already pins the classification
     /// itself at the `claimMount` level.
-    const auto reclaim_event = std::ranges::find_if(events,
+    const std::vector<CasEvent> observed_events = events->snapshot();
+    const auto reclaim_event = std::ranges::find_if(observed_events,
         [](const CasEvent & e) { return e.reason.find("cas_unsafe_remount_no_delay") != String::npos; });
-    ASSERT_NE(reclaim_event, events.end());
+    ASSERT_NE(reclaim_event, observed_events.end());
     EXPECT_EQ(reclaim_event->type, CasEventType::MountClaim);
     EXPECT_EQ(reclaim_event->outcome, "reclaim");
     EXPECT_EQ(decodeMountLease((*DB::Cas::tests::OperationForTest(b)).read(l.mountKey("test"), Retry::standard())->bytes).writer_epoch, 8u);
@@ -2528,16 +2605,21 @@ TEST(CASMountOpenWaits, CleanOpenSkipsAllWaits)
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test"});
     predecessor.reset();
 
-    std::vector<uint64_t> waits;
+    /// Heap-owned, not a plain local: the hook below mutates it, and the Pool can outlive this stack
+    /// frame (a background publish holds `shared_from_this()`), so a by-reference capture would dangle.
+    auto waits = std::make_shared<SharedWaitLog>();
     PoolPtr successor;
     ASSERT_NO_THROW(
         successor = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
-            .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
+            .wait_sleep_fn = [waits](uint64_t ms)
+            {
+                waits->push(ms);
+            },
         }));
     ASSERT_TRUE(successor);
 
-    EXPECT_TRUE(waits.empty())
+    EXPECT_TRUE(waits->snapshot().empty())
         << "a clean farewell (Task 5) needs no observation window";
 }
 
@@ -2576,15 +2658,20 @@ TEST(CASMountOpenWaits, CleanTeardownUnderDefaultBudgetLeavesAFarewell)
            "shipped default budget (2 * 7000 ms) -- otherwise a clean teardown never hands the mount "
            "slot back";
 
-    std::vector<uint64_t> waits;
+    /// Heap-owned, not a plain local: the hook below mutates it, and the Pool can outlive this stack
+    /// frame (a background publish holds `shared_from_this()`), so a by-reference capture would dangle.
+    auto waits = std::make_shared<SharedWaitLog>();
     PoolPtr successor;
     ASSERT_NO_THROW(
         successor = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
-            .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
+            .wait_sleep_fn = [waits](uint64_t ms)
+            {
+                waits->push(ms);
+            },
         }));
     ASSERT_TRUE(successor);
-    EXPECT_TRUE(waits.empty())
+    EXPECT_TRUE(waits->snapshot().empty())
         << "a clean farewell needs no observation window on reopen, even at the shipped default budget";
 }
 
@@ -2607,21 +2694,26 @@ TEST(CASMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = std::nullopt};
 
-    std::vector<uint64_t> waits;
+    /// Heap-owned, not a plain local: the hook below mutates it, and the Pool can outlive this stack
+    /// frame (a background publish holds `shared_from_this()`), so a by-reference capture would dangle.
+    auto waits = std::make_shared<SharedWaitLog>();
     PoolPtr store;
     ASSERT_NO_THROW(
         store = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
             .mount_lease_ttl_ms = std::chrono::milliseconds(500),
             .cas_request_budget = tiny_budget,
-            .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
+            .wait_sleep_fn = [waits](uint64_t ms)
+            {
+                waits->push(ms);
+            },
         }));
     ASSERT_TRUE(store);
 
     /// A GC-fenced prior is a terminal, already-threshold-gated certificate of death -- reclaimed on the
     /// FIRST attempt, with no observation polling. It is also an UNCLEAN prior, which used to mean it
     /// paid the materialization grace; nothing is owed now, so this open blocks on nothing at all.
-    EXPECT_TRUE(waits.empty())
+    EXPECT_TRUE(waits->snapshot().empty())
         << "a certified-dead predecessor needs neither the observation window nor any grace period";
 }
 
@@ -2642,14 +2734,23 @@ TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
         auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
         Layout l{"p"};
         DB::Cas::tests::seedPoolMetaForRestart(*b);
-        uint64_t fake_boot = 0;
+        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
+        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
+        /// a by-reference capture of a local would dangle.
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
         PoolPtr store;
         store = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
             .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
             .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
-            .boot_ms_fn = [&] { const uint64_t now = fake_boot; fake_boot += per_call_ms; return now; },
-            .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; },
+            .boot_ms_fn = [fake_boot, per_call_ms]
+            {
+                return fake_boot->fetch_add(per_call_ms);
+            },
+            .wait_sleep_fn = [fake_boot](uint64_t ms)
+            {
+                *fake_boot += ms;
+            },
         });
         if (!store)
             return 0;
@@ -2684,23 +2785,38 @@ TEST(CASPoolRemount, RemountRenewerRedoUsesTheEnvelope)
     const auto remountConditionalMountWrites = [](uint64_t quiesce_ms) -> uint64_t
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-        uint64_t fake_boot = 1'000'000;
-        DB::Cas::tests::ManualBarrier committed;
+        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
+        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
+        /// a by-reference capture of a local would dangle.
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+        /// Heap-owned, not a plain local: declaration order relative to `store` only protects against an
+        /// ordinary same-thread unwind, not a detached background completion that holds an extra
+        /// `shared_from_this()` and can still be running on another thread after this call returns.
+        auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
         auto store = Pool::open(backend, PoolConfig{
             .pool_prefix = "remount-renewer-redo-envelope",
             .server_root_id = "test",
             .background_watermark = true,
-            .event_sink = [&committed](const CasEvent & event)
+            .event_sink = [committed](const CasEvent & event)
             {
                 if (event.type == CasEventType::MountRemount && event.outcome == "ok")
-                    committed.arriveAndWait();
+                    committed->arriveAndWait();
             },
             .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
             .mount_renew_period = std::chrono::milliseconds(100),
             .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
-            .boot_ms_fn = [&fake_boot] { return fake_boot; },
-            .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; },
-            .remount_quiesce_hook_for_test = [&fake_boot, quiesce_ms] { fake_boot += quiesce_ms; },
+            .boot_ms_fn = [fake_boot]
+            {
+                return fake_boot->load();
+            },
+            .wait_sleep_fn = [fake_boot](uint64_t ms)
+            {
+                *fake_boot += ms;
+            },
+            .remount_quiesce_hook_for_test = [fake_boot, quiesce_ms]
+            {
+                *fake_boot += quiesce_ms;
+            },
         });
         const String mount_key = store->layout().mountKey("test");
 
@@ -2708,9 +2824,9 @@ TEST(CASPoolRemount, RemountRenewerRedoUsesTheEnvelope)
         const uint64_t before = backend->putOverwriteCount(mount_key);
         EXPECT_TRUE(store->scheduleRemountForTest())
             << "the remount must be latched with quiesce_ms=" << quiesce_ms;
-        committed.waitUntilArrived();
+        committed->waitUntilArrived();
         const uint64_t writes = backend->putOverwriteCount(mount_key) - before;
-        committed.release();
+        committed->release();
         return writes;
     };
 
@@ -2799,18 +2915,27 @@ TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
     /// before the mount claim); seed that durable epoch object here too, or `Pool::open`'s own
     /// `allocateWriterEpoch` trips the Phase C guard (epoch absent, mount present -> fail closed).
     createObj(*backend, layout.epochKey(srid), DB::Cas::encodeServerEpoch(DB::Cas::ServerEpoch{.next_writer_epoch = 8}));
-    uint64_t fake_boot_ms = 10'000;
+    /// Held in a shared atomic, not a plain local: `on_second_mount_write` below mutates it, and the
+    /// Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_boot_ms = std::make_shared<std::atomic<uint64_t>>(10'000);
     DB::Cas::PoolConfig cfg;
     cfg.pool_prefix = "pool";
     cfg.server_id = uuid;
     cfg.server_root_id = srid;
     cfg.background_watermark = true;
     cfg.mount_lease_ttl_ms = std::chrono::milliseconds(30'000);
-    cfg.boot_ms_fn = [&] { return fake_boot_ms; };
+    cfg.boot_ms_fn = [fake_boot_ms]
+    {
+        return fake_boot_ms->load();
+    };
     /// The renewer's adopt write stalls for 15 s of boot clock. That consumes the publication horizon
     /// (one 10 s cadence plus one 5 s attempt) while leaving one physical attempt admissible inside
     /// the old lease's safety window, so the synchronous redo can safely re-anchor.
-    backend->on_second_mount_write = [&] { fake_boot_ms += 15'000; };
+    backend->on_second_mount_write = [fake_boot_ms]
+    {
+        *fake_boot_ms += 15'000;
+    };
 
     auto store = DB::Cas::Pool::open(backend, cfg);
     ASSERT_NE(store, nullptr);
@@ -2836,28 +2961,41 @@ TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
 TEST(CASRemountWaits, DrainedRemountPaysNoWait)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    uint64_t fake_boot = 1'000'000;
-    std::vector<uint64_t> waits;
+    /// Held in shared, heap-owned state, not plain locals: the hooks below mutate them, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+    auto waits = std::make_shared<SharedWaitLog>();
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
-        .boot_ms_fn = [&] { return fake_boot; },
-        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+        {
+            *fake_boot += ms;
+            waits->push(ms);
+        },
     });
     ASSERT_TRUE(store);
-    EXPECT_TRUE(waits.empty()) << "a fresh mount (no predecessor) pays no wait at open";
-    store->setCasRetrySleepForTest([&fake_boot](uint64_t ms) { fake_boot += ms; });
+    EXPECT_TRUE(waits->snapshot().empty()) << "a fresh mount (no predecessor) pays no wait at open";
+    store->setCasRetrySleepForTest([fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+    });
 
     /// Trip the fence: advance the local boot clock past the deadline (as in `WriteFenceUsesInjectedBootClock`
     /// above) and mark the durable lease `gc_fenced` (the certificate `claimMountAwaitingExpiry` reclaims
     /// on its FIRST attempt, no observation polling -- avoids a real sleep in this test).
-    fake_boot += 30001;
+    *fake_boot += 30001;
     fenceOutMount(*backend, store->layout().mountKey("test"));
 
     /// No in-flight ref-log PUT at all -- the easy direction.
     ASSERT_TRUE(store->tryRemountOnce());
 
-    EXPECT_TRUE(waits.empty())
+    EXPECT_TRUE(waits->snapshot().empty())
         << "a drained self-remount must pay no wait";
 }
 
@@ -2871,23 +3009,36 @@ TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
     backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
-    uint64_t fake_boot = 1'000'000;
-    std::vector<uint64_t> waits;
+    /// Held in shared, heap-owned state, not plain locals: the hooks below mutate them, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+    auto waits = std::make_shared<SharedWaitLog>();
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .cas_request_budget = budget,
-        .boot_ms_fn = [&] { return fake_boot; },
-        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+        {
+            *fake_boot += ms;
+            waits->push(ms);
+        },
     });
     ASSERT_TRUE(store);
-    EXPECT_TRUE(waits.empty()) << "a fresh mount (no predecessor) pays no wait at open";
+    EXPECT_TRUE(waits->snapshot().empty()) << "a fresh mount (no predecessor) pays no wait at open";
     /// `dropRef` below drives the fault through `ensureRefTableRecovered`'s own recovery-retry loop,
     /// which sleeps via `recovery_retry_sleep_fn` (a REAL 200ms-slice sleep by default) while measuring
     /// elapsed time against `boot_ms_now_fn` -- the frozen `fake_boot` this fixture already injects.
     /// Without also virtualizing the sleep, that elapsed check never advances and the loop spins for
     /// real until the harness times the test out.
-    store->setCasRetrySleepForTest([&fake_boot](uint64_t ms) { fake_boot += ms; });
+    store->setCasRetrySleepForTest([fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+    });
 
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv/remount_wedge"};
@@ -2904,7 +3055,7 @@ TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     /// Trip the fence exactly as in `DrainedRemountSkipsGrace` above.
-    fake_boot += 30001;
+    *fake_boot += 30001;
     fenceOutMount(*backend, store->layout().mountKey("test"));
 
     /// THE HARD DIRECTION, and the one the retired wait existed for: a ref lane that still holds an
@@ -2913,7 +3064,7 @@ TEST(CASRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     /// recovery writes into its slot.
     ASSERT_TRUE(store->tryRemountOnce());
 
-    EXPECT_TRUE(waits.empty())
+    EXPECT_TRUE(waits->snapshot().empty())
         << "an unresolved ref-lane wedge must not make the remount block: the straggler it describes is "
            "fenced by the recovery seal, not waited out";
 }
@@ -2940,16 +3091,28 @@ TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the budget
     /// field alone; pair the two so the mount lease's admission arithmetic sees what the budget claims.
     backend->setAttemptTimeoutMs(budget.attempt_timeout_ms);
-    uint64_t fake_boot = 1'000'000;
+    /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can outlive
+    /// this stack frame (a background publish holds `shared_from_this()`), so a by-reference capture
+    /// of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .cas_request_budget = budget,
-        .boot_ms_fn = [&] { return fake_boot; },
-        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .wait_sleep_fn = [fake_boot](uint64_t ms)
+        {
+            *fake_boot += ms;
+        },
     });
     ASSERT_TRUE(store);
-    store->setCasRetrySleepForTest([&fake_boot](uint64_t ms) { fake_boot += ms; });
+    store->setCasRetrySleepForTest([fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+    });
 
     const Layout & layout = store->layout();
     const RootNamespace ns1{"srv/table_a"};
@@ -2974,14 +3137,14 @@ TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     ASSERT_TRUE(store->refLaneWedgedForTest(ns1));
 
     /// Self-remount #1: UNCLEAN (the wedge above). Epoch 1 -> 2.
-    fake_boot += 30001;
+    *fake_boot += 30001;
     fenceOutMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->tryRemountOnce());
     ASSERT_EQ(store->liveWriterEpoch(), 2u);
 
     /// Self-remount #2: CLEAN (no wedge left behind -- `quiesceRefTablesForRemount` already cleared the
     /// cache). Epoch 2 -> 3.
-    fake_boot += 30001;
+    *fake_boot += 30001;
     fenceOutMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->tryRemountOnce());
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
@@ -3052,8 +3215,15 @@ TEST(CASPool, ReadManifestAbsentBodyEmitsReadMissingWithOneGetAndNoHead)
     const ManifestId id{.root_namespace = ns, .ref = manifestRefFor("absent-body-event")};
     const String key = layout.manifestKey(id);
 
-    std::vector<CasEvent> events;
-    s->setEventSink([&](CasEvent e) { events.push_back(std::move(e)); });
+    /// Heap-owned, not a plain local: `setEventSink(nullptr)` below only stops FUTURE sink installs from
+    /// using this closure -- it does not guarantee an already-in-flight background call is not still
+    /// executing the old one -- and the Pool can outlive this stack frame regardless (a background
+    /// publish holds `shared_from_this()`).
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    s->setEventSink([events](CasEvent e)
+    {
+        events->push(std::move(e));
+    });
     b->resetCounts();
     expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->readManifest(id); });
     s->setEventSink(nullptr);
@@ -3061,7 +3231,7 @@ TEST(CASPool, ReadManifestAbsentBodyEmitsReadMissingWithOneGetAndNoHead)
     EXPECT_EQ(b->getCount(key), 1u);
     EXPECT_EQ(b->headCount(key), 0u);
     size_t read_missing = 0;
-    for (const auto & e : events)
+    for (const auto & e : events->snapshot())
     {
         if (e.type != CasEventType::ReadMissing)
             continue;
@@ -3884,56 +4054,70 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
 TEST(CASPoolRemount, StaleRemountAnchorPerformsParkedRedo)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
-    uint64_t fake_boot = 100;
-    DB::Cas::tests::ManualBarrier committed;
+    /// Held in a shared atomic, not a plain local: `remount_quiesce_hook_for_test` below mutates it,
+    /// and the Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so
+    /// a by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
+    /// Heap-owned, not a plain local: declaration order relative to the Pool below only protects
+    /// against an ordinary same-thread unwind, not a detached background completion that holds an
+    /// extra `shared_from_this()` and can still be running on another thread after this frame returns.
+    auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
     PoolConfig config{
         .pool_prefix = "stale-remount-anchor",
         .server_root_id = "test",
         .background_watermark = true,
-        .event_sink = [&](const CasEvent & event)
+        .event_sink = [committed](const CasEvent & event)
         {
             if (event.type == CasEventType::MountRemount && event.outcome == "ok")
-                committed.arriveAndWait();
+                committed->arriveAndWait();
         },
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [&] { return fake_boot; },
-        .remount_quiesce_hook_for_test = [&] { fake_boot += 900; },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
+        .remount_quiesce_hook_for_test = [fake_boot]
+        {
+            *fake_boot += 900;
+        },
     };
     auto store = Pool::open(backend, config);
     const String key = store->layout().mountKey("test");
     fenceOutMount(*backend, key);
     const uint64_t writes_before = backend->putOverwriteCount(key);
     ASSERT_TRUE(store->scheduleRemountForTest());
-    committed.waitUntilArrived();
+    committed->waitUntilArrived();
     EXPECT_GE(backend->putOverwriteCount(key), writes_before + 3)
         << "claim, renewer start, and the stale-anchor parked redo must all write";
-    committed.release();
+    committed->release();
 }
 
 TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
-    uint64_t fake_boot = 100;
-    std::promise<void> result_observed;
-    std::future<void> result_future = result_observed.get_future();
-    std::atomic<bool> result_published{false};
-    std::mutex events_mutex;
-    std::vector<CasEvent> events;
+    /// Held in a shared atomic, not a plain local: `remount_quiesce_hook_for_test` below mutates it,
+    /// and the Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so
+    /// a by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
+    /// Heap-owned, not plain locals: `event_sink` below mutates them, and the Pool can outlive this
+    /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture of a
+    /// local -- including a non-copyable `std::promise` -- would dangle.
+    auto result_observed = std::make_shared<std::promise<void>>();
+    std::future<void> result_future = result_observed->get_future();
+    auto result_published = std::make_shared<std::atomic<bool>>(false);
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     PoolConfig config{
         .pool_prefix = "parked-redo-recovered-observability",
         .server_root_id = "test",
         .background_watermark = true,
-        .event_sink = [&](CasEvent event)
+        .event_sink = [result_observed, result_published, events](CasEvent event)
         {
             const bool final_remount = event.type == CasEventType::MountRemount && event.outcome == "ok";
-            {
-                std::lock_guard lock(events_mutex);
-                events.push_back(std::move(event));
-            }
-            if (final_remount && !result_published.exchange(true))
-                result_observed.set_value();
+            events->push(std::move(event));
+            if (final_remount && !result_published->exchange(true))
+                result_observed->set_value();
         },
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
         /// 500 with a 700 ms quiescence, so the redo's window (period + attempt timeout = 510) does not
@@ -3941,10 +4125,16 @@ TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
         /// the engine's jittered backoff draws from its first-reissue range of at most 200 ms.
         .mount_renew_period = std::chrono::milliseconds(500),
         .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [&] { return fake_boot; },
-        .remount_quiesce_hook_for_test = [&]
+        .boot_ms_fn = [fake_boot]
         {
-            fake_boot += 700;
+            return fake_boot->load();
+        },
+        /// `backend` is captured BY VALUE (a copy of the shared_ptr, not the stack slot holding it):
+        /// the Pool can outlive this frame, so a by-reference capture of the local `shared_ptr` itself
+        /// would dangle even though the pointee it owns is heap-allocated.
+        .remount_quiesce_hook_for_test = [fake_boot, backend]
+        {
+            *fake_boot += 700;
             backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
         },
     };
@@ -3955,11 +4145,7 @@ TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
     ASSERT_TRUE(store->scheduleRemountForTest());
     ASSERT_EQ(result_future.wait_for(std::chrono::seconds(20)), std::future_status::ready);
 
-    std::vector<CasEvent> observed;
-    {
-        std::lock_guard lock(events_mutex);
-        observed = events;
-    }
+    const std::vector<CasEvent> observed = events->snapshot();
     const auto recovered = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
     {
         return event.type == CasEventType::WatermarkRenew && event.outcome == "recovered";
@@ -3986,37 +4172,47 @@ TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
 TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
-    uint64_t fake_boot = 100;
-    std::promise<void> result_observed;
-    std::future<void> result_future = result_observed.get_future();
-    std::atomic<bool> result_published{false};
-    std::mutex events_mutex;
-    std::vector<CasEvent> events;
+    /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can outlive
+    /// this stack frame (a background publish holds `shared_from_this()`), so a by-reference capture
+    /// of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
+    /// Heap-owned, not plain locals: `event_sink` below mutates them, and the Pool can outlive this
+    /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture of a
+    /// local -- including a non-copyable `std::promise` -- would dangle.
+    auto result_observed = std::make_shared<std::promise<void>>();
+    std::future<void> result_future = result_observed->get_future();
+    auto result_published = std::make_shared<std::atomic<bool>>(false);
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     PoolConfig config{
         .pool_prefix = "parked-redo-failed-observability",
         .server_root_id = "test",
         .background_watermark = true,
-        .event_sink = [&](CasEvent event)
+        .event_sink = [result_observed, result_published, events](CasEvent event)
         {
             const bool final_remount = event.type == CasEventType::MountRemount && event.outcome == "failed";
-            {
-                std::lock_guard lock(events_mutex);
-                events.push_back(std::move(event));
-            }
-            if (final_remount && !result_published.exchange(true))
-                result_observed.set_value();
+            events->push(std::move(event));
+            if (final_remount && !result_published->exchange(true))
+                result_observed->set_value();
         },
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [&] { return fake_boot; },
-        .remount_quiesce_hook_for_test = [&]
+        .boot_ms_fn = [fake_boot]
         {
-            fake_boot += 900;
+            return fake_boot->load();
+        },
+        /// `backend` is captured BY VALUE (a copy of the shared_ptr): the Pool can outlive this frame,
+        /// so a by-reference capture of the local `shared_ptr` itself would dangle.
+        .remount_quiesce_hook_for_test = [fake_boot, backend]
+        {
+            *fake_boot += 900;
             backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
             /// The attempt is admitted 80 ms before its lease-safe bound; spending 90 inside it puts the
             /// resolve read past that bound, so the ambiguity is refused instead of reissued.
-            backend->before_throw = [&] { fake_boot += 90; };
+            backend->before_throw = [fake_boot]
+            {
+                *fake_boot += 90;
+            };
         },
     };
     auto store = Pool::open(backend, config);
@@ -4026,11 +4222,7 @@ TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
     ASSERT_TRUE(store->scheduleRemountForTest());
     ASSERT_EQ(result_future.wait_for(std::chrono::seconds(20)), std::future_status::ready);
 
-    std::vector<CasEvent> observed;
-    {
-        std::lock_guard lock(events_mutex);
-        observed = events;
-    }
+    const std::vector<CasEvent> observed = events->snapshot();
     const auto failed_renew = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
     {
         return event.type == CasEventType::WatermarkRenew && event.outcome == "failed";
@@ -4058,21 +4250,26 @@ TEST(CASPoolRemount, ThrowingEventSinkAfterCommitLeavesRuntimeLive)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "throwing-remount-event", .server_root_id = "test", .background_watermark = true});
-    DB::Cas::tests::ManualBarrier committed;
-    store->setEventSink([&](const CasEvent & event)
+    /// Heap-owned, not a plain local declared after `store`: if `waitUntilArrived` below throws on its
+    /// own internal timeout, unwinding would destroy a stack-local barrier before `store`'s destructor
+    /// joins the remount worker, and that worker can still be inside `arriveAndWait` on the dangling
+    /// reference. A `shared_ptr` capture keeps the barrier alive for as long as the worker needs it,
+    /// independent of declaration order.
+    auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
+    store->setEventSink([committed](const CasEvent & event)
     {
         if (event.type == CasEventType::MountRemount && event.outcome == "ok")
         {
-            committed.arriveAndWait();
+            committed->arriveAndWait();
             throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected remount event sink failure");
         }
     });
     fenceOutMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->scheduleRemountForTest());
-    committed.waitUntilArrived();
+    committed->waitUntilArrived();
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::Live);
     EXPECT_TRUE(store->mayMutate());
-    committed.release();
+    committed->release();
     EXPECT_NO_THROW(store.reset());
 }
 
@@ -4215,7 +4412,10 @@ TEST(CASPool, DecommissionCadenceValidationPrecedesAuthorityWrites)
 TEST(CASPool, DisabledBackgroundDoesNotReserveRenewalCadence)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
-    uint64_t fake_boot = 100;
+    /// Captured by value: `fake_boot` is never mutated in this test, and the Pool can outlive this
+    /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture would
+    /// dangle.
+    const uint64_t fake_boot = 100;
     PoolConfig config{
         .pool_prefix = "disabled-renew-cadence",
         .server_root_id = "test",
@@ -4223,7 +4423,7 @@ TEST(CASPool, DisabledBackgroundDoesNotReserveRenewalCadence)
         .mount_lease_ttl_ms = std::chrono::milliseconds(100),
         .mount_renew_period = std::chrono::hours(24),
         .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [&] { return fake_boot; },
+        .boot_ms_fn = [] { return fake_boot; },
     };
     auto store = Pool::open(backend, config);
     const String key = store->layout().mountKey("test");
@@ -4270,25 +4470,34 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
 TEST(CASPool, RenewWatermarkOnceRefreshesFenceAndDepositsOneFailure)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
-    uint64_t fake_boot = 100;
+    /// Held in a shared atomic, not a plain local: this test mutates it directly below, and the Pool
+    /// can outlive this stack frame (a background publish holds `shared_from_this()`), so a
+    /// by-reference capture of a local would dangle.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
     PoolConfig config{
         .pool_prefix = "direct-renew",
         .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
         .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [&] { return fake_boot; },
+        .boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        },
     };
     auto store = Pool::open(backend, config);
-    fake_boot = 500;
+    fake_boot->store(500);
     EXPECT_NO_THROW(store->renewWatermarkOnce());
-    fake_boot = 1200;
+    fake_boot->store(1200);
     EXPECT_TRUE(store->mayMutate()) << "direct success must refresh the local fence from attempt start";
 
     backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
     /// The renewal that succeeded at 500 anchored the lease for its 1000 ms TTL, so it expires at 1500.
     /// Expire it from inside the attempt: the fault alone no longer ends a renewal, because the engine
     /// settles the ambiguity by reading and reissues, and the reissue commits.
-    backend->before_throw = [&] { fake_boot = 1500; };
+    backend->before_throw = [fake_boot]
+    {
+        fake_boot->store(1500);
+    };
     const uint64_t schedules_before = store->scheduleRemountCallCountForTest();
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->renewWatermarkOnce(); });
     EXPECT_FALSE(store->mayMutate());
@@ -4298,12 +4507,17 @@ TEST(CASPool, RenewWatermarkOnceRefreshesFenceAndDepositsOneFailure)
 TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
 {
     auto backend = std::make_shared<RemountStepBackend>();
-    std::vector<CasEvent> events;
+    /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "remount-observability",
         .server_root_id = "test",
     });
-    store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+    store->setEventSink([events](CasEvent event)
+    {
+        events->push(std::move(event));
+    });
     ScopedRemountLogCapture logs;
 
     store->tripMountLost();
@@ -4320,8 +4534,9 @@ TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountSucceeded].load(), succeeded_before + 1);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load(), failed_before + 1);
 
+    const std::vector<CasEvent> observed_events = events->snapshot();
     std::vector<CasEvent> remounts;
-    std::copy_if(events.begin(), events.end(), std::back_inserter(remounts), [](const CasEvent & event)
+    std::copy_if(observed_events.begin(), observed_events.end(), std::back_inserter(remounts), [](const CasEvent & event)
     {
         return event.type == CasEventType::MountRemount;
     });
@@ -4357,20 +4572,35 @@ TEST(CASPoolRemount, TheRenewerRedoRenewsOnTheOpenPlane)
     const auto remountConditionalMountWrites = [](uint64_t quiesce_ms) -> uint64_t
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-        uint64_t fake_boot = 1'000'000;
-        DB::Cas::tests::ManualBarrier committed;
+        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
+        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
+        /// a by-reference capture of a local would dangle.
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
+        /// Heap-owned, not a plain local: declaration order relative to `store` only protects against an
+        /// ordinary same-thread unwind, not a detached background completion that holds an extra
+        /// `shared_from_this()` and can still be running on another thread after this call returns.
+        auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
         auto store = Pool::open(backend, PoolConfig{
             .pool_prefix = "remount-renewer-redo",
             .server_root_id = "test",
             .background_watermark = true,
-            .event_sink = [&committed](const CasEvent & event)
+            .event_sink = [committed](const CasEvent & event)
             {
                 if (event.type == CasEventType::MountRemount && event.outcome == "ok")
-                    committed.arriveAndWait();
+                    committed->arriveAndWait();
             },
-            .boot_ms_fn = [&fake_boot] { return fake_boot; },
-            .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; },
-            .remount_quiesce_hook_for_test = [&fake_boot, quiesce_ms] { fake_boot += quiesce_ms; },
+            .boot_ms_fn = [fake_boot]
+            {
+                return fake_boot->load();
+            },
+            .wait_sleep_fn = [fake_boot](uint64_t ms)
+            {
+                *fake_boot += ms;
+            },
+            .remount_quiesce_hook_for_test = [fake_boot, quiesce_ms]
+            {
+                *fake_boot += quiesce_ms;
+            },
         });
         const String mount_key = store->layout().mountKey("test");
 
@@ -4378,9 +4608,9 @@ TEST(CASPoolRemount, TheRenewerRedoRenewsOnTheOpenPlane)
         const uint64_t before = backend->putOverwriteCount(mount_key);
         EXPECT_TRUE(store->scheduleRemountForTest())
             << "the remount must be latched with quiesce_ms=" << quiesce_ms;
-        committed.waitUntilArrived();
+        committed->waitUntilArrived();
         const uint64_t writes = backend->putOverwriteCount(mount_key) - before;
-        committed.release();
+        committed->release();
         return writes;
     };
 

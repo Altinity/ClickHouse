@@ -651,7 +651,10 @@ TEST(CASGCRebuild, LeaseConflictRefuses)
 TEST(CASGCClampSuppression, LandedEdgeBehindClampNeverDeleted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    /// Heap-owned, not a plain local: declaring it before the Pool (ASan 2026-07-09) only protects
+    /// against an ordinary same-thread unwind, not a detached background completion holding an extra
+    /// `shared_from_this()` that can still be running on another thread after this frame returns.
+    auto seen = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -679,7 +682,11 @@ TEST(CASGCClampSuppression, LandedEdgeBehindClampNeverDeleted)
     /// Rounds with acks current: X reaches folded in-degree 0 and is condemned, but every pass is
     /// CLAMPED (the bodiless precommit persists), so nothing may graduate or delete.
     /// Observability (2026-07-03): every clamp emits a gc_fold_clamp event with the reason.
-    store->setEventSink([&](const CasEvent & e){ if (e.type == CasEventType::GcFoldClamp) seen.push_back(e); });
+    store->setEventSink([seen](const CasEvent & e)
+    {
+        if (e.type == CasEventType::GcFoldClamp)
+            seen->push(e);
+    });
     const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
     for (int i = 0; i < 6; ++i)
     {
@@ -689,13 +696,14 @@ TEST(CASGCClampSuppression, LandedEdgeBehindClampNeverDeleted)
             << "round " << i << ": X was deleted while its landed +1 sat unfolded behind the clamp";
     }
 
-    ASSERT_FALSE(seen.empty()) << "each clamped pass must emit a gc_fold_clamp event";
-    EXPECT_NE(seen.front().reason.find("fold barrier"), String::npos);
+    const std::vector<CasEvent> observed_events = seen->snapshot();
+    ASSERT_FALSE(observed_events.empty()) << "each clamped pass must emit a gc_fold_clamp event";
+    EXPECT_NE(observed_events.front().reason.find("fold barrier"), String::npos);
     /// Snapshot+log ref model: the clamp is per-table (one ref-log stream per namespace, no ref shards),
     /// so the event names the clamped `log` and the `resolved_through` cursor rather than a shard number.
-    EXPECT_TRUE(seen.front().detail.contains("log"))
+    EXPECT_TRUE(observed_events.front().detail.contains("log"))
         << "clamp event must name the clamped log id";
-    EXPECT_TRUE(seen.front().detail.contains("resolved_through"))
+    EXPECT_TRUE(observed_events.front().detail.contains("resolved_through"))
         << "clamp event must name the cursor it resolved through";
     store->setEventSink(nullptr);
 

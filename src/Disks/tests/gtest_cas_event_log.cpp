@@ -130,9 +130,12 @@ CasRequestBudget renewalEventBudget()
     };
 }
 
+/// `boot_ms` is a shared, heap-owned atomic, not a plain reference parameter: some callers mutate it
+/// after the Pool exists, and the Pool can outlive this function's own call (a background publish
+/// holds `shared_from_this()`), so a by-reference capture of a caller-local would dangle.
 PoolPtr openRenewalEventPool(
     const std::shared_ptr<RenewalEventBackend> & backend,
-    uint64_t & boot_ms,
+    const std::shared_ptr<std::atomic<uint64_t>> & boot_ms,
     CasRequestBudget budget = renewalEventBudget(),
     String prefix = "renewal-events",
     String server_root_id = "test")
@@ -145,7 +148,10 @@ PoolPtr openRenewalEventPool(
         .server_root_id = std::move(server_root_id),
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
         .cas_request_budget = budget,
-        .boot_ms_fn = [&] { return boot_ms; },
+        .boot_ms_fn = [boot_ms]
+        {
+            return boot_ms->load();
+        },
     });
 }
 
@@ -194,47 +200,63 @@ TEST(CASEvent, ConstructAndCopyAndName)
 TEST(CASEvent, PoolEmitsToSink)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    /// Heap-owned, not a plain local: declaring it before the Pool (ASan 2026-07-09) only protects
+    /// against an ordinary same-thread unwind, not a detached background completion holding an extra
+    /// `shared_from_this()` that can still be running on another thread after this frame returns.
+    auto seen = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
+    s->setEventSink([seen](const CasEvent & e)
+    {
+        seen->push(e);
+    });
     CasEvent e;
     e.type = CasEventType::BlobPut;
     e.object_hash = "h";
     s->emitEvent(std::move(e));
-    ASSERT_EQ(seen.size(), 1u);
-    EXPECT_EQ(seen[0].type, CasEventType::BlobPut);
+    ASSERT_EQ(seen->snapshot().size(), 1u);
+    EXPECT_EQ(seen->snapshot()[0].type, CasEventType::BlobPut);
     /// null sink => no-op (no crash, no row); a fresh event, not the one already moved above.
     s->setEventSink(nullptr);
     CasEvent e2;
     e2.type = CasEventType::BlobPut;
     s->emitEvent(std::move(e2));
-    EXPECT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen->snapshot().size(), 1u);
 }
 
 TEST(CASEvent, FirstAttemptRenewalIsSilent)
 {
     auto backend = std::make_shared<RenewalEventBackend>();
-    uint64_t boot_ms = 100;
-    std::vector<CasEvent> events;
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
+    /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto store = openRenewalEventPool(backend, boot_ms);
-    store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+    store->setEventSink([events](CasEvent event)
+    {
+        events->push(std::move(event));
+    });
 
     EXPECT_NO_THROW(store->renewWatermarkOnce());
-    EXPECT_TRUE(watermarkRenewEvents(events).empty());
+    EXPECT_TRUE(watermarkRenewEvents(events->snapshot()).empty());
 }
 
 TEST(CASEvent, WatermarkRenewEventsAreBoundedAndComplete)
 {
     auto backend = std::make_shared<RenewalEventBackend>();
-    uint64_t boot_ms = 100;
-    std::vector<CasEvent> events;
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
+    /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto store = openRenewalEventPool(backend, boot_ms);
-    store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+    store->setEventSink([events](CasEvent event)
+    {
+        events->push(std::move(event));
+    });
 
     backend->throw_before_next_write = true;
     EXPECT_NO_THROW(store->renewWatermarkOnce());
 
-    const std::vector<CasEvent> renewals = watermarkRenewEvents(events);
+    const std::vector<CasEvent> renewals = watermarkRenewEvents(events->snapshot());
     /// ONE event per logical renewal, whatever the physical attempts cost: the engine owns its own
     /// reissues, and the terminal event carries their count rather than announcing each one.
     ASSERT_EQ(renewals.size(), 1u);
@@ -270,22 +292,30 @@ TEST(CASEvent, WatermarkRenewEventsAreBoundedAndComplete)
 TEST(CASEvent, AnAmbiguityPastTheLeaseBoundNeverStartsTheResolvingRead)
 {
     auto backend = std::make_shared<RenewalEventBackend>();
-    uint64_t boot_ms = 100;
-    std::vector<CasEvent> events;
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
+    /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto store = openRenewalEventPool(
         backend, boot_ms, renewalEventBudget(), "renewal-inflight-ambiguity");
-    store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+    store->setEventSink([events](CasEvent event)
+    {
+        events->push(std::move(event));
+    });
 
     /// The lease was anchored at 100 with a 1000 ms TTL, so the fence expires at 1100 and holds a 20 ms
     /// safety margin. At 1081 only 19 ms remain, and admission refuses the resolve read.
-    backend->before_throw = [&] { boot_ms = 1'081; };
+    backend->before_throw = [boot_ms]
+    {
+        boot_ms->store(1'081);
+    };
     backend->throw_before_next_write = true;
     backend->armResolveProbe();
     EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
 
     EXPECT_FALSE(backend->resolveStarted())
         << "an attempt that consumed the lease must not start the resolving read";
-    const std::vector<CasEvent> renewals = watermarkRenewEvents(events);
+    const std::vector<CasEvent> renewals = watermarkRenewEvents(events->snapshot());
     ASSERT_EQ(renewals.size(), 1u);
     EXPECT_EQ(renewals[0].outcome, "failed");
     EXPECT_EQ(renewals[0].detail.at("attempts_sent"), "1");
@@ -385,7 +415,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
 TEST(CASEvent, WatermarkRenewSinkFailureCannotChangeOutcome)
 {
     auto backend = std::make_shared<RenewalEventBackend>();
-    uint64_t boot_ms = 100;
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
     auto store = openRenewalEventPool(backend, boot_ms);
     const String mount_key = store->layout().mountKey("test");
     const uint64_t seq_before = decodeMountLease(backend->readForTest(mount_key)->bytes).seq;
@@ -421,14 +451,19 @@ TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
 
     {
         auto backend = std::make_shared<RenewalEventBackend>();
-        uint64_t boot_ms = 100;
-        std::vector<CasEvent> events;
+        auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
+        /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish
+        /// holds `shared_from_this()`), so a by-reference capture of a local would dangle.
+        auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
         auto store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-deterministic-details");
-        store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+        store->setEventSink([events](CasEvent event)
+        {
+            events->push(std::move(event));
+        });
         backend->throw_nonretryable_next_write = true;
 
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
-        const std::optional<CasEvent> failed = one_failed_event(events);
+        const std::optional<CasEvent> failed = one_failed_event(events->snapshot());
         ASSERT_TRUE(failed.has_value()) << "the store's refusal must reach the event log";
         /// A deterministic failure reaches the renewer as the exception the engine refuses to reissue,
         /// and an exception carries no attempt count -- so the classification is all this ending states.
@@ -437,16 +472,21 @@ TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
 
     {
         auto backend = std::make_shared<RenewalEventBackend>();
-        uint64_t boot_ms = 100;
-        std::vector<CasEvent> events;
+        auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
+        /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish
+        /// holds `shared_from_this()`), so a by-reference capture of a local would dangle.
+        auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
         auto store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-deadline-details");
-        store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+        store->setEventSink([events](CasEvent event)
+        {
+            events->push(std::move(event));
+        });
         /// The lease was anchored at 100 with a 1000 ms TTL and holds a 20 ms safety margin, so 1090
         /// leaves 10 ms of it and admission refuses the renewal before its first attempt.
-        boot_ms = 1090;
+        boot_ms->store(1090);
 
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
-        const std::optional<CasEvent> failed = one_failed_event(events);
+        const std::optional<CasEvent> failed = one_failed_event(events->snapshot());
         ASSERT_TRUE(failed.has_value()) << "the refused admission must reach the event log";
         EXPECT_EQ(failed->detail.at("attempts_sent"), "0");
         EXPECT_EQ(failed->detail.at("classification"), "external_lease_deadline");
@@ -456,30 +496,40 @@ TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
 TEST(CASEvent, ReentrantRenewalSinkPreservesOuterObservationIdentity)
 {
     auto backend = std::make_shared<RenewalEventBackend>();
-    uint64_t boot_ms = 100;
-    std::vector<CasEvent> events;
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
+    /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     PoolPtr store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-reentrant-sink");
-    bool reentered = false;
-    store->setEventSink([&](CasEvent event)
+    auto reentered = std::make_shared<std::atomic<bool>>(false);
+    /// `store` is captured as a raw pointer (`store.get()`), not by reference and not by `shared_ptr`: a
+    /// `shared_ptr` capture here would make the Pool's own `event_sink` hold a permanent reference to
+    /// its owning Pool, a cycle that leaks it; a by-reference capture of the local `store` would dangle
+    /// once this frame returns. Validity is the same invariant every self-referencing hook in the
+    /// production code relies on (e.g. `CasPool.cpp`'s `[s = store.get()]`): the hook can only run while
+    /// some other `shared_ptr` keeps the Pool alive.
+    Pool * const store_ptr = store.get();
+    store->setEventSink([events, reentered, store_ptr](CasEvent event)
     {
         if (event.type != CasEventType::WatermarkRenew)
             return;
-        events.push_back(event);
-        if (event.outcome == "recovered" && !std::exchange(reentered, true))
-            store->renewWatermarkOnce();
+        events->push(event);
+        if (event.outcome == "recovered" && !reentered->exchange(true))
+            store_ptr->renewWatermarkOnce();
     });
 
     backend->throw_before_next_write = true;
     EXPECT_NO_THROW(store->renewWatermarkOnce());
 
-    ASSERT_TRUE(reentered);
+    ASSERT_TRUE(reentered->load());
     /// The nested renewal commits on its first attempt, which is silent, so the outer recovery is the
     /// only event -- and it still names the outer renewal's own seq while the durable lease has already
     /// moved past it. An observation the nested call reused would report seq 3 here.
-    ASSERT_EQ(events.size(), 1u);
-    EXPECT_EQ(events[0].outcome, "recovered");
-    EXPECT_EQ(events[0].detail.at("attempts_sent"), "2");
-    EXPECT_EQ(events[0].detail.at("seq"), "2");
+    const std::vector<CasEvent> observed_events = events->snapshot();
+    ASSERT_EQ(observed_events.size(), 1u);
+    EXPECT_EQ(observed_events[0].outcome, "recovered");
+    EXPECT_EQ(observed_events[0].detail.at("attempts_sent"), "2");
+    EXPECT_EQ(observed_events[0].detail.at("seq"), "2");
     EXPECT_EQ(decodeMountLease(backend->readForTest(store->layout().mountKey("test"))->bytes).seq, 3u)
         << "the nested first-attempt success must run without replacing the outer observation";
 }
@@ -487,20 +537,24 @@ TEST(CASEvent, ReentrantRenewalSinkPreservesOuterObservationIdentity)
 TEST(CASEvent, PreCompletionConflictReentrancyPreservesOuterTerminalObservation)
 {
     auto inner_backend = std::make_shared<RenewalEventBackend>();
-    uint64_t inner_boot_ms = 100;
+    auto inner_boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
     auto inner = openRenewalEventPool(
         inner_backend, inner_boot_ms, renewalEventBudget(), "renewal-reentrant-inner", "inner");
 
     auto outer_backend = std::make_shared<RenewalEventBackend>();
-    uint64_t outer_boot_ms = 100;
+    auto outer_boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
     auto outer = openRenewalEventPool(
         outer_backend, outer_boot_ms, renewalEventBudget(), "renewal-reentrant-outer", "outer");
-    std::vector<CasEvent> outer_events;
-    bool reentered = false;
-    outer->setEventSink([&](CasEvent event)
+    /// Heap-owned, not plain locals: `outer`'s `event_sink` mutates them, and the Pool can outlive this
+    /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture of a
+    /// local would dangle. `inner` (a DIFFERENT Pool from `outer`) is captured by value -- a `shared_ptr`
+    /// copy here is not a self-reference cycle, unlike capturing `outer` into its own sink would be.
+    auto outer_events = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto reentered = std::make_shared<std::atomic<bool>>(false);
+    outer->setEventSink([outer_events, reentered, inner](CasEvent event)
     {
-        outer_events.push_back(event);
-        if (event.type == CasEventType::MountConflict && !std::exchange(reentered, true))
+        outer_events->push(event);
+        if (event.type == CasEventType::MountConflict && !reentered->exchange(true))
             inner->renewWatermarkOnce();
     });
 
@@ -510,8 +564,8 @@ TEST(CASEvent, PreCompletionConflictReentrancyPreservesOuterTerminalObservation)
     outer_backend->vanish_on_next_write = true;
     EXPECT_THROW(outer->renewWatermarkOnce(), DB::Exception);
 
-    ASSERT_TRUE(reentered);
-    const std::vector<CasEvent> renewals = watermarkRenewEvents(outer_events);
+    ASSERT_TRUE(reentered->load());
+    const std::vector<CasEvent> renewals = watermarkRenewEvents(outer_events->snapshot());
     ASSERT_EQ(renewals.size(), 1u);
     EXPECT_EQ(renewals[0].outcome, "failed");
     EXPECT_EQ(renewals[0].detail.at("server_root_id"), "outer");
@@ -525,21 +579,33 @@ TEST(CASEvent, PreCompletionConflictReentrancyPreservesOuterTerminalObservation)
 TEST(CASEvent, EmitEventMovesSourceIntoSink)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    String captured_reason;
-    std::map<String, String> captured_detail;
-    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    s->setEventSink([&](CasEvent ev)
+    /// Heap-owned, mutex-guarded, not plain locals: the Pool can outlive this stack frame (a background
+    /// publish holds `shared_from_this()`), so a by-reference capture of a local would dangle, and a
+    /// background emit could race the foreground read below.
+    struct Captured
     {
-        captured_reason = std::move(ev.reason);
-        captured_detail = std::move(ev.detail);
+        std::mutex mutex;
+        String reason;
+        std::map<String, String> detail;
+    };
+    auto captured = std::make_shared<Captured>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    s->setEventSink([captured](CasEvent ev)
+    {
+        std::lock_guard lock(captured->mutex);
+        captured->reason = std::move(ev.reason);
+        captured->detail = std::move(ev.detail);
     });
     CasEvent e;
     e.type = CasEventType::BlobPut;
     e.reason = "sentinel-reason";
     e.detail["k"] = "v";
     s->emitEvent(std::move(e));
-    EXPECT_EQ(captured_reason, "sentinel-reason");
-    EXPECT_EQ(captured_detail.at("k"), "v");
+    {
+        std::lock_guard lock(captured->mutex);
+        EXPECT_EQ(captured->reason, "sentinel-reason");
+        EXPECT_EQ(captured->detail.at("k"), "v");
+    }
     /// the source event must be MOVED-FROM after emit, not merely aliased/copied through -- reading
     /// `e` here is the whole point of the test, not an oversight.
     EXPECT_TRUE(e.reason.empty()); // NOLINT(bugprone-use-after-move, hicpp-invalid-access-moved)
@@ -614,18 +680,17 @@ bool hasType(const std::vector<CasEvent> & events, CasEventType t)
 TEST(CASEvent, LifecycleReconstructionFromRows)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    /// Declared BEFORE the Pool so they OUTLIVE it: the Pool's background retired-view syncer can emit
-    /// (e.g. a view-advance event) right up to the Pool's destructor, and a sink capturing locals that
-    /// die first is a use-after-scope (found by ASan 2026-07-09; the production sink captures the Context
-    /// shared_ptr by value and is immune).
-    std::vector<CasEvent> events;
-    std::mutex events_mutex;
+    /// Heap-owned, not a plain local: the Pool's background retired-view syncer can emit (e.g. a
+    /// view-advance event) right up to the Pool's destructor, and a background publish can hold an
+    /// extra `shared_from_this()` past this frame's return regardless of declaration order relative to
+    /// the Pool (found by ASan 2026-07-09; the production sink captures the Context shared_ptr by value
+    /// and is immune) -- a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
-    s->setEventSink([&](const CasEvent & e)
+    s->setEventSink([events](const CasEvent & e)
     {
-        std::lock_guard lock(events_mutex);
-        events.push_back(e);
+        events->push(e);
     });
 
     const RootNamespace ns{"srv1/tbl"};
@@ -651,27 +716,28 @@ TEST(CASEvent, LifecycleReconstructionFromRows)
     }
 
     /// (a) the expected taxonomy was emitted across the lifecycle (manifest model: no standalone trees).
-    EXPECT_TRUE(hasType(events, CasEventType::BlobPut));
-    EXPECT_TRUE(hasType(events, CasEventType::RootAdd))
+    const std::vector<CasEvent> observed_events = events->snapshot();
+    EXPECT_TRUE(hasType(observed_events, CasEventType::BlobPut));
+    EXPECT_TRUE(hasType(observed_events, CasEventType::RootAdd))
         << "a fold must have recorded the manifest owner's blob edge (+1)";
-    EXPECT_TRUE(hasType(events, CasEventType::RefDrop));
-    EXPECT_TRUE(hasType(events, CasEventType::IndegZero));
-    EXPECT_TRUE(hasType(events, CasEventType::GcRetireObserve)
-        || hasType(events, CasEventType::GcRetireDecision)
-        || hasType(events, CasEventType::GcRecheckVerdict))
+    EXPECT_TRUE(hasType(observed_events, CasEventType::RefDrop));
+    EXPECT_TRUE(hasType(observed_events, CasEventType::IndegZero));
+    EXPECT_TRUE(hasType(observed_events, CasEventType::GcRetireObserve)
+        || hasType(observed_events, CasEventType::GcRetireDecision)
+        || hasType(observed_events, CasEventType::GcRecheckVerdict))
         << "a GC retire/recheck transition must be recorded";
-    EXPECT_TRUE(hasType(events, CasEventType::BlobDelete) || hasType(events, CasEventType::ManifestDelete))
+    EXPECT_TRUE(hasType(observed_events, CasEventType::BlobDelete) || hasType(observed_events, CasEventType::ManifestDelete))
         << "the single content-delete site must emit a delete row";
 
     /// (b) completeness mandate: every emitted event has a non-empty reason (the human WHY).
-    for (const auto & e : events)
+    for (const auto & e : observed_events)
         EXPECT_FALSE(e.reason.empty())
             << "event " << toString(e.type) << " (" << e.object_hash << ") has an empty reason";
 
     /// (c) lifecycle reconstruction: filtering by the deleted blob's object_hash yields, in time
     /// order, at least its in-degree-zero -> retire-observe -> delete chain — its whole story.
     std::vector<CasEventType> chain;
-    for (const auto & e : events)
+    for (const auto & e : observed_events)
         if (e.object_hash == blob_hash)
             chain.push_back(e.type);
 
