@@ -1,0 +1,5 @@
+-- results identical with tiny and huge read tasks
+400000	79999800000	204704512	4260311861857840551
+400000	79999800000	204704512	4260311861857840551
+-- one coalesced read spanned both row groups and decoding started before it finished
+1	1

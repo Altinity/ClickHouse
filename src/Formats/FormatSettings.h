@@ -359,12 +359,28 @@ struct FormatSettings
         UInt64 max_block_size = DEFAULT_BLOCK_SIZE;
         size_t prefer_block_bytes = DEFAULT_BLOCK_SIZE * 256;
         size_t local_read_min_bytes_for_seek = 8192;
+        /// 0 = derive from max_download_threads / max_parsing_threads.
+        size_t max_io_threads = 0;
+        /// 0 = derive from the storage's min-bytes-for-seek.
+        size_t bytes_per_read_task = 0;
+        /// Cap on the gap the reader reads through when coalescing nearby ranges (the smaller of
+        /// this and the storage's min-bytes-for-seek wins); 0 = use the storage's value only.
+        size_t coalesce_gap_bytes = 2097152;
+        /// Bound on bytes read / bytes needed per coalesced read; 0 = no bound, otherwise >= 1.
+        double max_read_amplification = 8;
+        /// A read wasting no more than this many bytes is exempt from `max_read_amplification`.
+        size_t read_amplification_floor_bytes = 256 * 1024;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
-        /// Reader scheduler knobs: share of the column-data memory budget given to compressed
-        /// read-ahead vs decode, and ColumnData's share of the parsing thread pool.
-        double prefetch_memory_fraction = 0.6;
+        /// Reader scheduler knob: share of the parsing thread pool given to column decoding.
         double decode_thread_fraction = 0.375;
+        /// Share of the memory budget held as compressed data pages in flight or awaiting decode
+        /// (the rest, minus a fixed 5% for metadata, holds decoded columns). See `MemoryPool`.
+        double compressed_memory_fraction = 0.35;
+        /// Lower bound for the reader's bytes-in-flight target (see `ReadManager::pumpIssueQueue`
+        /// and `Prefetcher::targetBytesInFlight`), used before the fitted round-trip time and
+        /// bandwidth are trustworthy and on storage whose fitted product is tiny.
+        size_t min_bytes_in_flight = 67108864;
 
         /// Write.
         UInt64 row_group_rows = 1000000;

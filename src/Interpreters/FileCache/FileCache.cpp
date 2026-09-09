@@ -1041,7 +1041,7 @@ FileSegmentsHolderPtr FileCache::get(
     return holder;
 }
 
-FileSegmentsHolderPtr FileCache::getDownloadedContiguousOrEmpty(
+bool FileCache::isRangeDownloadedContiguously(
     const Key & key,
     size_t offset,
     size_t size,
@@ -1050,38 +1050,54 @@ FileSegmentsHolderPtr FileCache::getDownloadedContiguousOrEmpty(
     assertInitialized();
     chassert(size);
 
+    /// Deliberately does not go through `getImpl`: that hands back `FileSegment`s, and every
+    /// `getImpl` result has to be completed through a `FileSegmentsHolder`. Completing a segment is
+    /// not a read-only act -- `FileSegment::complete` removes an EMPTY or
+    /// PARTIALLY_DOWNLOADED_NO_CONTINUATION segment and shrinks a PARTIALLY_DOWNLOADED one whenever
+    /// the completing holder is the last one. A caller that only wants to *ask* whether a range is
+    /// cached must therefore never take ownership of a segment, or the question deletes part of the
+    /// answer: readers that had already concluded the range was cached then fail to open its file
+    /// (`FILE_DOESNT_EXIST` on a `filesystem_caches/.../<offset>` path).
+    ///
+    /// So walk the key's metadata under its lock and only read from it.
     auto locked_key = metadata.lockKeyMetadata(key, CacheMetadata::KeyNotFoundPolicy::RETURN_NULL, OriginInfo(user_id));
     if (!locked_key)
-        return std::make_unique<FileSegmentsHolder>();
+        return false;
 
-    const FileSegment::Range range(offset, offset + size - 1);
-    /// `ignore_bypass_threshold` = true: temporary data has no remote backing, and this
-    /// function must inspect the actual downloaded segments. Without it, a read larger than
-    /// `bypass_cache_threshold` (when `enable_bypass_cache_with_threshold` is on) would get a
-    /// synthetic DETACHED placeholder from getImpl() and be wrongly reported as missing.
-    auto file_segments = getImpl(*locked_key, range, /* file_segments_limit */0, /* ignore_bypass_threshold */true);
+    const size_t end = offset + size; /// exclusive
+    size_t expected_left = offset;
 
-    if (file_segments.empty()
-        || file_segments.front()->range().left > offset
-        || file_segments.back()->range().right < range.right)
-        return std::make_unique<FileSegmentsHolder>();
-
-    size_t expected_left = file_segments.front()->range().left;
-    for (const auto & file_segment : file_segments)
+    for (const auto & [segment_offset, segment_metadata] : *locked_key)
     {
-        /// A hole: part of the range was never written or was already removed.
-        if (file_segment->range().left != expected_left)
-            return std::make_unique<FileSegmentsHolder>();
+        const FileSegment & segment = *segment_metadata->file_segment;
+        const auto range = segment.range();
 
-        /// The downloaded prefix must reach the needed part of the range; this also rejects
-        /// DETACHED placeholders from getImpl() — their downloaded prefix is empty.
-        if (file_segment->getCurrentWriteOffset() < std::min(file_segment->range().right + 1, offset + size))
-            return std::make_unique<FileSegmentsHolder>();
+        if (range.right < offset)
+            continue; /// entirely before what was asked about
 
-        expected_left = file_segment->range().right + 1;
+        if (range.left > expected_left)
+            return false; /// a hole: never written, or already removed
+
+        /// A segment on its way out may have no file left even though its metadata is still here.
+        if (segment_metadata->isEvictingOrRemoved(*locked_key))
+            return false;
+
+        /// Only a fully downloaded segment can be relied on. A PARTIALLY_DOWNLOADED one whose
+        /// downloaded prefix happens to cover the asked-for range is not enough: it is exactly the
+        /// state whose completion shrinks it, so treating it as present is what made the question
+        /// destructive in the first place.
+        if (segment.state() != FileSegment::State::DOWNLOADED)
+            return false;
+
+        if (segment.getCurrentWriteOffset() < std::min(range.right + 1, end))
+            return false;
+
+        expected_left = range.right + 1;
+        if (expected_left >= end)
+            return true;
     }
 
-    return std::make_unique<FileSegmentsHolder>(std::move(file_segments));
+    return false;
 }
 
 KeyMetadata::iterator FileCache::addFileSegment(

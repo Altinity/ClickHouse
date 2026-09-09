@@ -223,8 +223,9 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.enable_json_parsing = settings[Setting::input_format_parquet_enable_json_parsing];
     format_settings.parquet.memory_low_watermark = settings[Setting::input_format_parquet_memory_low_watermark];
     format_settings.parquet.memory_high_watermark = settings[Setting::input_format_parquet_memory_high_watermark];
-    format_settings.parquet.prefetch_memory_fraction = settings[Setting::input_format_parquet_prefetch_memory_fraction];
     format_settings.parquet.decode_thread_fraction = settings[Setting::input_format_parquet_decode_thread_fraction];
+    format_settings.parquet.compressed_memory_fraction = settings[Setting::input_format_parquet_compressed_memory_fraction];
+    format_settings.parquet.min_bytes_in_flight = settings[Setting::input_format_parquet_min_bytes_in_flight];
     format_settings.parquet.allow_missing_columns = settings[Setting::input_format_parquet_allow_missing_columns];
     format_settings.parquet.skip_columns_with_unsupported_types_in_schema_inference = settings[Setting::input_format_parquet_skip_columns_with_unsupported_types_in_schema_inference];
     format_settings.parquet.output_string_as_string = settings[Setting::output_format_parquet_string_as_string];
@@ -248,6 +249,11 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.bloom_filter_bits_per_value = settings[Setting::output_format_parquet_bloom_filter_bits_per_value];
     format_settings.parquet.bloom_filter_flush_threshold_bytes = settings[Setting::output_format_parquet_bloom_filter_flush_threshold_bytes];
     format_settings.parquet.local_read_min_bytes_for_seek = settings[Setting::input_format_parquet_local_file_min_bytes_for_seek];
+    format_settings.parquet.max_io_threads = settings[Setting::input_format_parquet_max_io_threads];
+    format_settings.parquet.bytes_per_read_task = settings[Setting::input_format_parquet_bytes_per_read_task];
+    format_settings.parquet.coalesce_gap_bytes = settings[Setting::input_format_parquet_coalesce_gap_bytes];
+    format_settings.parquet.max_read_amplification = settings[Setting::input_format_parquet_max_read_amplification];
+    format_settings.parquet.read_amplification_floor_bytes = settings[Setting::input_format_parquet_read_amplification_floor_bytes];
     format_settings.parquet.enable_row_group_prefetch = settings[Setting::input_format_parquet_enable_row_group_prefetch];
     format_settings.parquet.verify_checksums = settings[Setting::input_format_parquet_verify_checksums];
     format_settings.parquet.local_time_as_utc = settings[Setting::input_format_parquet_local_time_as_utc];

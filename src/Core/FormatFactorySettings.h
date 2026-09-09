@@ -201,8 +201,11 @@ Schedule prefetches more aggressively if memory usage is below than threshold. P
     DECLARE(UInt64, input_format_parquet_memory_high_watermark, 4ul << 30, R"(
 Approximate memory limit for the Parquet reader. Limits how many row groups or columns can be read in parallel. When reading multiple files in one query, the limit is on total memory usage across those files.
 )", 0) \
-    DECLARE(Double, input_format_parquet_prefetch_memory_fraction, 0.6, R"(
-Advanced tuning knob for the Parquet reader scheduler. Of the memory budget reserved for column data, the fraction given to compressed read-ahead (the `ColumnDataPrefetch` stage) versus decoded output (the `ColumnData` stage); the rest goes to decode. A higher value keeps more compressed pages in flight to hide read latency (useful on high-latency storage such as S3); a lower value caps read-ahead and leaves more budget for decoded columns. Must be in [0, 1]. The index and bloom-filter stages keep a fixed share of the memory budget regardless of this setting.
+    DECLARE(Double, input_format_parquet_compressed_memory_fraction, 0.35, R"(
+Share of `input_format_parquet_memory_high_watermark` the Parquet reader may hold as compressed data
+pages that are in flight or waiting to be decoded. This bounds how far ahead of decoding the reader
+reads. The rest of the budget (minus 5% for metadata) holds decoded columns, including chunks already
+handed to the query pipeline. Range `(0, 0.95)`.
 )", 0) \
     DECLARE(Double, input_format_parquet_decode_thread_fraction, 0.375, R"(
 Advanced tuning knob for the Parquet reader scheduler. The fraction of the Parquet parsing thread pool dedicated to column decoding (the `ColumnData` stage); the remaining stages, which only issue asynchronous reads, share the rest. Raise it to give decoding (the only CPU-bound stage) more parallelism on fast/local storage; the default suits latency-bound remote reads where memory, not threads, limits concurrency. Must be in [0, 1].
@@ -248,8 +251,67 @@ Allow missing columns while reading Parquet input formats
     DECLARE(UInt64, input_format_parquet_local_file_min_bytes_for_seek, 8192, R"(
 Min bytes required for local read (file) to do seek, instead of read with ignore in Parquet input format
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_max_io_threads, 0, R"(
+Size of the thread pool that issues reads for the Parquet reader, shared by all files read by the
+query. `0` derives it as `max(max_download_threads, min(max_parsing_threads, 16))`.
+
+With too few reads in flight to cover the storage's response time, decoding threads end up waiting
+for reads.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_bytes_per_read_task, 0, R"(
+Target size of a single read issued by the Parquet reader; nearby column chunks and pages are
+coalesced up to this size. `0` derives it as four times the min-bytes-for-seek of the underlying
+storage. Bytes of a coalesced read become available to decoding as they arrive, so a large value
+does not delay the first row group of the read.
+)", 0) \
     DECLARE(Bool, input_format_parquet_enable_row_group_prefetch, true, R"(
 Enable row group prefetching during parquet parsing. Currently, only single-threaded parsing can prefetch.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_coalesce_gap_bytes, 2097152, R"(
+Largest gap between two needed byte ranges of a Parquet file that the reader reads through in order to
+serve both with one request. Applied on top of the storage's min-bytes-for-seek (the smaller wins);
+`0` uses the storage value only. On object storage the useful gap is about one round trip's worth of
+bandwidth, ~2 MiB; reading through larger gaps costs bytes without saving time.
+)", 0) \
+    DECLARE(Double, input_format_parquet_max_read_amplification, 8, R"(
+Upper bound on `bytes read / bytes needed` for one coalesced Parquet read. Coalescing stops extending a
+read when the span would exceed this multiple of the useful bytes it covers, so a few small column chunks
+cannot drag megabytes of unrelated data through the cache or the network. `0` disables the bound. Any other
+value must be `>= 1` (a read always spans at least the bytes it serves); values in `(0, 1)` are rejected.
+
+The bound is checked while a read is being grown one neighbouring range at a time, so it also rejects merges
+whose *intermediate* ratio is too high even when the finished read would be well within the bound. Tight
+values therefore cost round trips: on a query reading six narrow columns of a wide table, `4` split the reads
+of a row group into 1.6x as many requests as no bound at all and made the decoding threads wait 3.6x longer,
+while `8` and up reached the same bytes-read as no bound with the same request count. Values from 6 to 16
+measured the same on that dataset; below 6 the request count climbs.
+
+See also `input_format_parquet_read_amplification_floor_bytes`, which exempts reads that waste little in
+absolute terms from this bound.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_read_amplification_floor_bytes, 262144, R"(
+A coalesced Parquet read that wastes no more than this many bytes -- reads at most this much beyond the bytes
+it was asked for -- is never split by `input_format_parquet_max_read_amplification`, whatever its ratio.
+
+A ratio alone says nothing about how much is actually wasted, and on small files it reads as alarming when the
+waste is trivial: five columns of a 25 KiB file lie a few KB apart, so reading the file in one request wastes
+about 20 KB, which the ratio scores as a bad read. Measured on a 17,554-file Iceberg table, the ratio bound
+alone split each file's read three to four ways, buying 13% fewer bytes for 65% more requests and 45% more
+wall time; with this floor the same query matched the reader without any bound at all, while a query whose
+reads waste megabytes per useful range kept the bound's full effect (330 MiB read down to 11 MiB).
+
+`0` applies the amplification bound to every read regardless of how little it wastes.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_min_bytes_in_flight, 67108864, R"(
+Lower bound for the Parquet reader's bytes-in-flight target: the reader issues the index and data-page
+reads it has planned ahead of time until this many bytes (or more, if the fitted bandwidth times
+round-trip time of the storage asks for more) are being read at once. Higher values give the storage
+more concurrent requests to work on, at the cost of holding more compressed bytes in memory; the index
+reads of the row group that is next to be delivered, and the pages of the subgroup it reads next, are
+always issued regardless of this bound.
+
+`0` disables read-ahead planning; the reader issues reads on demand as before. Values below the fitted
+floor of 4 x `input_format_parquet_bytes_per_read_task` have no additional effect.
 )", 0) \
     DECLARE(Bool, input_format_arrow_allow_missing_columns, true, R"(
 Allow missing columns while reading Arrow input formats
@@ -1655,6 +1717,7 @@ Supported modes:
     MAKE_OBSOLETE(M, ParquetVersion, output_format_parquet_version, "2.latest") \
     MAKE_OBSOLETE(M, Bool, output_format_parquet_compliant_nested_types, true) \
     MAKE_OBSOLETE(M, Bool, output_format_parquet_unsupported_types_as_binary, false) \
+    MAKE_OBSOLETE(M, Double, input_format_parquet_prefetch_memory_fraction, 0.6) \
 
 #endif // __CLION_IDE__
 

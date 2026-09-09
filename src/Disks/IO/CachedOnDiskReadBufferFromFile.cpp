@@ -201,6 +201,7 @@ bool CachedOnDiskReadBufferFromFile::nextFileSegmentsBatch()
             size,
             info.cache_settings.segments_batch_size,
             origin.user_id);
+        info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
     }
     else
     {
@@ -216,6 +217,7 @@ bool CachedOnDiskReadBufferFromFile::nextFileSegmentsBatch()
             info.cache_settings.segments_batch_size,
             origin,
             info.cache_settings.boundary_alignment);
+        info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
     }
 
     return !info.file_segments->empty();
@@ -1546,10 +1548,15 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
             /* size */n,
             /* batch_size */0,
             origin.user_id);
+        current_info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
     }
     else
     {
         CreateFileSegmentSettings create_settings(FileSegmentKind::Regular);
+        /// Random-access reads must honour the per-query alignment like the sequential path does
+        /// (`nextFileSegmentsBatch`): a small read in the middle of a large aligned segment has to
+        /// download from the segment's committed frontier up to the requested end before it can
+        /// be served, so the alignment is the read amplification for small ranges.
         current_info.file_segments = cache->getOrSet(
             info.cache_key,
             /* offset */range_begin,
@@ -1557,7 +1564,9 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
             file_size.value(),
             create_settings,
             /* batch_size */0,
-            origin);
+            origin,
+            info.cache_settings.boundary_alignment);
+        current_info.file_segments->setAllowBackgroundDownload(info.cache_settings.allow_background_download);
     }
 
     if (current_info.file_segments->empty())
@@ -1668,8 +1677,14 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
                 offset, range_begin, read_bytes, n);
         }
 
+        /// The contract in `SeekableReadBuffer::readBigAt` is that the callback reports how much of
+        /// `to` has been filled so far, with increasing values -- not the size of the last chunk.
+        /// `read_bytes` was already advanced by `size` above, so it is exactly that cumulative
+        /// count. Callers such as the Parquet `Prefetcher` (`publishBytesReady`) treat the value as
+        /// cumulative and drop non-increasing reports, so passing the per-file-segment delta made
+        /// every report after the first one inert for a multi-segment read.
         if (progress_callback)
-            cancelled = progress_callback(size);
+            cancelled = progress_callback(read_bytes);
     }
 
     return read_bytes;
@@ -1841,6 +1856,24 @@ static bool isRangeContainedInSegments(size_t left, size_t right, const FileSegm
             }
             return segment->state() == FileSegment::State::DOWNLOADED;
         });
+}
+
+bool CachedOnDiskReadBufferFromFile::isRangeLocal(size_t offset, size_t n) const
+{
+    /// Unlike `isContentCached`, this asks the cache rather than this buffer: no `initialize()`, no
+    /// buffer state touched, so it is const and safe to call from another thread while a positioned
+    /// read is in flight -- `readBigAt` works the same way.
+    ///
+    /// `isRangeDownloadedContiguously` only reads the key's metadata under its lock and never takes
+    /// ownership of a segment, which matters: an earlier version of this asked through a
+    /// `FileSegmentsHolder`, and destroying that holder completed every segment it had inspected --
+    /// removing the EMPTY ones and shrinking the partially downloaded ones. Readers that had
+    /// already concluded a range was cached then failed to open its file.
+    if (n == 0)
+        return true;
+    if (!cache)
+        return false;
+    return cache->isRangeDownloadedContiguously(info.cache_key, offset, n, origin.user_id);
 }
 
 bool CachedOnDiskReadBufferFromFile::isContentCached(size_t offset, size_t size)

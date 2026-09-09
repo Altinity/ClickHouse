@@ -31,6 +31,14 @@ struct ReadOptions
     size_t min_bytes_for_seek = 64 << 10;
     size_t bytes_per_read_task = 4 << 20;
 
+    /// Cap on the gap the reader reads through when coalescing nearby ranges (the smaller of this
+    /// and min_bytes_for_seek wins); 0 means use min_bytes_for_seek only.
+    size_t coalesce_gap_bytes = 0;
+    /// Bound on bytes read / bytes needed per coalesced read; 0 means no bound.
+    double max_read_amplification = 0;
+    /// A read wasting no more than this many bytes is exempt from `max_read_amplification`.
+    size_t read_amplification_floor_bytes = 0;
+
     /// Don't use bloom filter for `x IN (...)` if the set `(...)` is has more than this many
     /// elements. There's no point using bloom filter for big sets because false positive
     /// probability becomes very high. E.g. if bloom filter has 1% false positive probability,
@@ -74,8 +82,9 @@ struct SharedResourcesExt
 /// parallel. We'd like the parallelism to automatically scale based on memory usage.
 /// But also we don't want to get into a situation where e.g. most of the memory budget is used by
 /// column indexes and there's not enough left to read main data for a few row groups in parallel.
-/// To solve these two problems at once, we do memory accounting separately for each stage, with
-/// separate memory budget for each stage (see ReadManager::Stage).
+/// To solve these two problems at once, we do memory accounting separately for each of a few pools
+/// grouping stages by how long their memory lives (see `MemoryPool`, `ReadManager::pool_usage`), so
+/// e.g. small short-lived index/bloom-filter reads don't compete for budget with column data.
 /// Memory is attributed to the stage that allocated it. E.g. ReadManager::read() (Deliver stage)
 /// may release a column that was allocated by PrewhereData stage, reducing PrewhereData's memory
 /// usage and potentially kicking off more PrewhereData read tasks.
@@ -98,14 +107,51 @@ enum class ReadStage
     Deallocated,
 };
 
+/// Memory is budgeted by how long bytes live and what they cost, not by pipeline stage:
+///  Metadata   - bloom filters, column/offset indexes, dictionary pages. Small, short-lived.
+///  Compressed - data pages in flight or awaiting decode. ~20-30 MB per row group, released as
+///               pages are decoded. Depth of read-ahead is bounded by this pool.
+///  Decoded    - IColumn memory for decoded subgroups *including chunks already delivered* to the
+///               pipeline but not yet consumed. ~10-20x Compressed per row group.
+enum class MemoryPool : UInt8
+{
+    Metadata,
+    Compressed,
+    Decoded,
+};
+constexpr size_t NUM_MEMORY_POOLS = 3;
+static_assert(NUM_MEMORY_POOLS == magic_enum::enum_count<MemoryPool>());
+
+constexpr MemoryPool poolOf(ReadStage stage)
+{
+    switch (stage)
+    {
+        case ReadStage::BloomFilterHeader:
+        case ReadStage::BloomFilterBlocksOrDictionary:
+        case ReadStage::ColumnIndexAndOffsetIndex:
+        case ReadStage::OffsetIndex:
+            return MemoryPool::Metadata;
+        /// `ColumnDataPrefetch` no longer issues the data-page reads (the issue queue does), but the
+        /// stage is kept: it is where a subgroup waits for its planned reads to be issued, and the
+        /// compressed pages it holds are charged to `Compressed`.
+        case ReadStage::ColumnDataPrefetch:
+            return MemoryPool::Compressed;
+        case ReadStage::NotStarted:
+        case ReadStage::ColumnData:
+        case ReadStage::Deliver:
+        case ReadStage::Deallocated:
+            return MemoryPool::Decoded;
+    }
+}
+
 
 /// We track approximate current memory usage per ReadStage that allocated the memory (*).
 /// This struct aggregates how much memory was allocated by some operation.
-/// ReadManager then uses it to update per-stage memory usage std::atomic counters.
+/// `ReadManager` then uses it to update the per-`MemoryPool` (see `poolOf(ReadStage)`) atomic counters.
 /// (We do this instead of updating the std::atomics directly to reduce contention on the atomics.
 ///  I haven't checked whether this makes a difference.)
 ///
-/// (*) This is to have a separate memory limit on each stage to automatically get higher parallelism
+/// (*) This is to have a separate memory limit on each pool to automatically get higher parallelism
 /// for stages that use little memory (e.g. prefetch small bloom filters and indexes for lots of row
 /// groups in parallel, but read large column data for few row groups to not run out of memory).
 /// TODO [parquet]: Try using thread-locals instead of manually error-pronely passing this everywhere.

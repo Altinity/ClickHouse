@@ -353,8 +353,14 @@ struct FileSegmentsHolder final : private boost::noncopyable
 
     void reset();
 
+    /// Whether segments left partially downloaded when this holder is destroyed may be queued for
+    /// background download. Defaults to true (see the comment in `reset`); a reader that knows its
+    /// reads are one-shot random accesses (`filesystem_cache_allow_background_download = 0`) opts out.
+    void setAllowBackgroundDownload(bool value) { allow_background_download_on_reset = value; }
+
 private:
     FileSegments file_segments{};
+    bool allow_background_download_on_reset = true;
 
     FileSegments::iterator completeAndPopFrontImpl(bool allow_background_download, bool force_shrink_to_downloaded_size);
 };

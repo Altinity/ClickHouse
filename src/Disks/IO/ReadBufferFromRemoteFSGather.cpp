@@ -257,6 +257,25 @@ bool ReadBufferFromRemoteFSGather::isSeekCheap()
     return !current_buf || current_buf->isSeekCheap();
 }
 
+bool ReadBufferFromRemoteFSGather::isRangeLocal(size_t offset, size_t n) const
+{
+    /// Const, so no `initialize()`: before the first read there is nothing to ask, and the answer is
+    /// advisory anyway. Only the blob currently being read can answer, and only for a range that lies
+    /// inside it.
+    if (!current_buf || current_buf_idx >= blobs_to_read.size())
+        return false;
+    size_t blob_offset = offset;
+    for (size_t i = 0; i < current_buf_idx; ++i)
+    {
+        if (blob_offset < blobs_to_read[i].bytes_size)
+            return false;
+        blob_offset -= blobs_to_read[i].bytes_size;
+    }
+    if (blob_offset + n > blobs_to_read[current_buf_idx].bytes_size)
+        return false;
+    return current_buf->isRangeLocal(blob_offset, n);
+}
+
 bool ReadBufferFromRemoteFSGather::isContentCached(size_t offset, size_t size)
 {
     if (!current_buf)

@@ -1311,7 +1311,8 @@ void FileSegmentsHolder::reset()
             /// But actually we would only do that, if those file segments were already read partially by some other thread/query
             /// but they were not put to the download queue, because current thread was holding them in Holder.
             /// So as a culprit, we need to allow to happen what would have happened if we did not exist.
-            file_segment_it = completeAndPopFrontImpl(/*allow_background_download=*/true, /*force_shrink_to_downloaded_size=*/false);
+            /// `allow_background_download_on_reset` lets a reader opt out per query.
+            file_segment_it = completeAndPopFrontImpl(allow_background_download_on_reset, /*force_shrink_to_downloaded_size=*/false);
         }
         catch (...)
         {

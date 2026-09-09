@@ -1,0 +1,7 @@
+-- results identical
+19999900000	619996900000
+19999900000	619996900000
+19999900000	619996900000
+-- the cap and the gap each cut bytes read by more than 2x versus uncapped
+capped	1
+gap	1

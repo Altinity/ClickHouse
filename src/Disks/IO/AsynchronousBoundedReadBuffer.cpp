@@ -477,50 +477,69 @@ size_t AsynchronousBoundedReadBuffer::readBigAt(char * to, size_t n, size_t rang
     /// readBigAt() and the sequential prefetch must not run against impl concurrently, so consume the
     /// prefetch first: serve the part of the requested range that the prefetch covers straight from the
     /// prefetched buffer, and read only the missing suffix (if any) directly.
-    if (prefetch_future.valid())
+    ///
+    /// This runs under `prefetch_consume_mutex` because readBigAt() is called from several threads at
+    /// once (the Parquet reader's io pool issues many positioned reads on one buffer). Without it,
+    /// two callers both pass `valid()` and both call `get()` on the same future -- or one calls `get()`
+    /// while the other resets it -- which is a use-after-free of the future's shared state, and one of
+    /// them would also reach `impl` while the prefetch task is still reading through it. Only the
+    /// claim-and-copy phase is under the lock: no storage read is issued while holding it, so the
+    /// other callers wait exactly as long as the already-in-flight prefetch takes to land.
+    size_t served_from_prefetch = 0;
+    bool prefetch_covered_head = false;
     {
-        IAsynchronousReader::Result result;
+        std::lock_guard lock(prefetch_consume_mutex);
+        if (prefetch_future.valid())
         {
-            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AsynchronousRemoteReadWaitMicroseconds);
-            CurrentMetrics::Increment metric_increment{CurrentMetrics::AsynchronousReadWait};
-            result = prefetch_future.get();
-        }
-        prefetch_future = {};
-        last_prefetch_info = {};
-
-        const size_t prefetched_bytes = result.size - result.offset;
-        const size_t prefetch_end = result.file_offset_of_buffer_end;
-        const size_t prefetch_begin = prefetch_end - prefetched_bytes;
-
-        /// Serve the prefix of the range that the prefetch covers.
-        if (prefetched_bytes != 0 && range_begin >= prefetch_begin && range_begin < prefetch_end)
-        {
-            const size_t from_prefetch = std::min(n, prefetch_end - range_begin);
-            memcpy(to, result.buf + result.offset + (range_begin - prefetch_begin), from_prefetch);
-            ProfileEvents::increment(ProfileEvents::RemoteFSPrefetchedReads);
-            ProfileEvents::increment(ProfileEvents::RemoteFSPrefetchedBytes, from_prefetch);
-
-            if (from_prefetch == n)
+            IAsynchronousReader::Result result;
             {
-                if (progress_callback)
-                    progress_callback(n);
-                return n;
+                ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AsynchronousRemoteReadWaitMicroseconds);
+                CurrentMetrics::Increment metric_increment{CurrentMetrics::AsynchronousReadWait};
+                result = prefetch_future.get();
             }
+            prefetch_future = {};
+            last_prefetch_info = {};
 
-            /// Read the missing suffix directly. impl->readBigAt reports progress relative to its own
-            /// request (starting from 0), but the progress reported for the whole readBigAt must stay
-            /// cumulative and monotonic (e.g. ParallelReadBuffer::on_progress ignores non-increasing
-            /// values), so shift the suffix progress by the prefix already served.
-            std::function<bool(size_t)> suffix_progress;
+            const size_t prefetched_bytes = result.size - result.offset;
+            const size_t prefetch_end = result.file_offset_of_buffer_end;
+            const size_t prefetch_begin = prefetch_end - prefetched_bytes;
+
+            /// Serve the prefix of the range that the prefetch covers.
+            if (prefetched_bytes != 0 && range_begin >= prefetch_begin && range_begin < prefetch_end)
+            {
+                served_from_prefetch = std::min(n, prefetch_end - range_begin);
+                prefetch_covered_head = true;
+                memcpy(to, result.buf + result.offset + (range_begin - prefetch_begin), served_from_prefetch);
+                ProfileEvents::increment(ProfileEvents::RemoteFSPrefetchedReads);
+                ProfileEvents::increment(ProfileEvents::RemoteFSPrefetchedBytes, served_from_prefetch);
+            }
+            else
+            {
+                /// The prefetched range does not cover the head of the request; drop it and read directly.
+                ProfileEvents::increment(ProfileEvents::RemoteFSCancelledPrefetches);
+            }
+        }
+    }
+
+    if (prefetch_covered_head)
+    {
+        if (served_from_prefetch == n)
+        {
             if (progress_callback)
-                suffix_progress = [&](size_t copied) { return progress_callback(from_prefetch + copied); };
-
-            return from_prefetch
-                + impl->readBigAt(to + from_prefetch, n - from_prefetch, range_begin + from_prefetch, suffix_progress);
+                progress_callback(n);
+            return n;
         }
 
-        /// The prefetched range does not cover the head of the request; drop it and read directly.
-        ProfileEvents::increment(ProfileEvents::RemoteFSCancelledPrefetches);
+        /// Read the missing suffix directly. impl->readBigAt reports progress relative to its own
+        /// request (starting from 0), but the progress reported for the whole readBigAt must stay
+        /// cumulative and monotonic (e.g. ParallelReadBuffer::on_progress ignores non-increasing
+        /// values), so shift the suffix progress by the prefix already served.
+        std::function<bool(size_t)> suffix_progress;
+        if (progress_callback)
+            suffix_progress = [&](size_t copied) { return progress_callback(served_from_prefetch + copied); };
+
+        return served_from_prefetch
+            + impl->readBigAt(to + served_from_prefetch, n - served_from_prefetch, range_begin + served_from_prefetch, suffix_progress);
     }
 
     return impl->readBigAt(to, n, range_begin, progress_callback);

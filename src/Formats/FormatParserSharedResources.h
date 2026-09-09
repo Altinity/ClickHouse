@@ -21,6 +21,9 @@ struct FormatParserSharedResources
 {
     const size_t max_parsing_threads = 0;
     const size_t max_io_threads = 0;
+    /// Size of `io_runner`'s pool once created (see ParquetV3BlockInputFormat::initializeIfNeeded);
+    /// 0 until then. Readers size their read-ahead from this, not from `max_io_threads`.
+    std::atomic<size_t> io_threads {0};
 
     std::atomic<size_t> num_streams{0};
     ThreadPoolCallbackRunnerFast parsing_runner;
