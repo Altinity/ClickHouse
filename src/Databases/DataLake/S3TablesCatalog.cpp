@@ -246,10 +246,13 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
     }
     catch (const DB::HTTPException & ex)
     {
-        if (ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
+        /// `404` is returned by the API when the table does not exist - someone else dropped it first.
+        if (if_exists && ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
+        {
             LOG_DEBUG(log, "S3 Tables: table {}.{} already does not exist (404 on purge-delete)", namespace_name, table_name);
-        else
-            throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
+            return;
+        }
+        throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
     }
 }
 
