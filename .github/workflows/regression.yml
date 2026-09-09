@@ -800,6 +800,7 @@ jobs:
       runner_arch: ${{ inputs.arch }}
       runner_type: ${{ inputs.runner_type }}
       part: ${{ matrix.PART }}
+      storage_path: /${{ matrix.ONLY }}_partition
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: cas_alter_${{ matrix.ONLY }}
@@ -835,6 +836,7 @@ jobs:
       runner_arch: ${{ inputs.arch }}
       runner_type: ${{ inputs.runner_type }}
       part: ${{ matrix.PART }}
+      storage_path: /${{ matrix.ONLY }}_partition
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: cas_s3_cache_alter_${{ matrix.ONLY }}
