@@ -127,7 +127,6 @@ class AltinityWorkflowTemplates:
         if: ${{ !cancelled() }}
         uses: ./.github/actions/create_workflow_report
         with:
-          workflow_config: ${{ toJson(needs) }}
           final: true
 """,
     }
