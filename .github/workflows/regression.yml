@@ -716,7 +716,9 @@ jobs:
           - PART: 2
             FILTER: --only "/lightweight delete/hard restart/*"
           - PART: 3
-            FILTER: --skip "/lightweight delete/disk space/*" "/lightweight delete/hard restart/*"
+            FILTER: --skip "/lightweight delete/disk space/*" "/lightweight delete/hard restart/*" "/lightweight delete/alter after delete/*" "/lightweight delete/concurrent alter and delete/*" "/lightweight delete/concurrent delete/*" "/lightweight delete/basic checks/*" "/lightweight delete/performance/*" "/lightweight delete/ontime tests/*"
+          - PART: 4
+            FILTER: --only "/lightweight delete/alter after delete/*" "/lightweight delete/concurrent alter and delete/*" "/lightweight delete/concurrent delete/*" "/lightweight delete/basic checks/*" "/lightweight delete/performance/*" "/lightweight delete/ontime tests/*"
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -725,7 +727,7 @@ jobs:
       suite_executable: regression.py
       output_format: new-fails
       flags: --with-analyzer
-      timeout_minutes: 240
+      timeout_minutes: 180
       runner_arch: ${{ inputs.arch }}
       runner_type: ${{ inputs.runner_type }}
       part: ${{ matrix.PART }}
@@ -752,7 +754,9 @@ jobs:
           - PART: 2
             FILTER: --only "/lightweight delete/hard restart/*"
           - PART: 3
-            FILTER: --skip "/lightweight delete/disk space/*" "/lightweight delete/hard restart/*"
+            FILTER: --skip "/lightweight delete/disk space/*" "/lightweight delete/hard restart/*" "/lightweight delete/alter after delete/*" "/lightweight delete/concurrent alter and delete/*" "/lightweight delete/concurrent delete/*" "/lightweight delete/basic checks/*" "/lightweight delete/performance/*" "/lightweight delete/ontime tests/*"
+          - PART: 4
+            FILTER: --only "/lightweight delete/alter after delete/*" "/lightweight delete/concurrent alter and delete/*" "/lightweight delete/concurrent delete/*" "/lightweight delete/basic checks/*" "/lightweight delete/performance/*" "/lightweight delete/ontime tests/*"
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -761,7 +765,7 @@ jobs:
       suite_executable: regression.py
       output_format: new-fails
       flags: --with-analyzer
-      timeout_minutes: 240
+      timeout_minutes: 180
       runner_arch: ${{ inputs.arch }}
       runner_type: ${{ inputs.runner_type }}
       part: ${{ matrix.PART }}
@@ -788,6 +792,8 @@ jobs:
             PART: 1
           - ONLY: attach
             PART: 2
+          - ONLY: attach
+            PART: 3
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -823,6 +829,8 @@ jobs:
             PART: 1
           - ONLY: attach
             PART: 2
+          - ONLY: attach
+            PART: 3
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
