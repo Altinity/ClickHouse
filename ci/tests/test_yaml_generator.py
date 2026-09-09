@@ -3,6 +3,7 @@ from ci.praktika.parser import WorkflowConfigParser
 from ci.praktika.yaml_additional_templates import AltinityWorkflowTemplates
 from ci.praktika.yaml_generator import PullRequestPushYamlGen
 from ci.settings.altinity_overrides import DISABLED_WORKFLOWS
+from praktika.settings import Settings
 
 
 def _generate(workflow: Workflow.Config) -> str:
@@ -120,3 +121,7 @@ def test_upstream_release_workflows_are_disabled():
     assert "sync_silk.py" in DISABLED_WORKFLOWS
     assert "nightly_changelog.py" in DISABLED_WORKFLOWS
     assert "nightly_cloud_api_docs.py" in DISABLED_WORKFLOWS
+
+
+def test_altinity_does_not_mint_tokens_via_inc_lambda():
+    assert Settings.GH_AUTH_LAMBDA_NAME == ""

@@ -48,6 +48,11 @@ SECRET_CI_DB_PASSWORD = "CLICKHOUSE_TEST_STAT_PASSWORD"
 CI_DB_READ_USER: str = ""
 CI_DB_READ_URL: str = os.environ.get("CLICKHOUSE_TEST_STAT_URL", "") + "play"
 
+# ClickHouse Inc mints GH tokens via AWS Lambda. Altinity jobs use the
+# ambient workflow token instead; a failed lambda auth used to skip
+# post_commit_status entirely and empty the report job table.
+GH_AUTH_LAMBDA_NAME: str = ""
+GH_AUTH_LAMBDA_REGION: str = ""
 USE_CUSTOM_GH_AUTH = False
 # SECRET_GH_APP_ID: str = "woolenwolf_gh_app.clickhouse-app-id"
 # SECRET_GH_APP_PEM_KEY: str = "woolenwolf_gh_app.clickhouse-app-key"
