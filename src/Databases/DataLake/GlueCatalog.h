@@ -129,6 +129,10 @@ private:
 
     ObjectStorageWithPath createObjectStorageForEarlyTableAccess(const String & s3_location, const TableMetadata & table_metadata) const;
 
+    /// Fetches and caches the parsed Iceberg metadata JSON for `metadata_uri`.
+    /// Returns the cached object on subsequent calls for the same URI.
+    Poco::JSON::Object::Ptr getOrFetchMetadataObject(const String & metadata_uri, const TableMetadata & table_metadata) const;
+
     /// Shared implementation for updateMetadata / updateSchema that optionally
     /// sets StorageDescriptor columns in the Glue UpdateTable call.
     bool updateTableInGlue(

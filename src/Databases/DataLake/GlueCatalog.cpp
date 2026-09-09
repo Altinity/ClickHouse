@@ -535,17 +535,7 @@ bool GlueCatalog::tryGetTableMetadata(
                 auto table_specific_properties = result.getDataLakeSpecificProperties();
                 if (table_specific_properties.has_value() && !table_specific_properties->iceberg_metadata_file_location.empty())
                 {
-                    const String & metadata_uri = table_specific_properties->iceberg_metadata_file_location;
-                    if (!metadata_objects.get(metadata_uri))
-                    {
-                        auto [object_storage, bucket_name, metadata_path] = createObjectStorageForEarlyTableAccess(metadata_uri, result);
-                        auto compression_method = DB::Iceberg::getCompressionMethodFromMetadataFile(metadata_uri);
-                        auto metadata_object = DB::Iceberg::getMetadataJSONObject(
-                            metadata_path, object_storage, nullptr, getContext(), log, compression_method, std::nullopt);
-                        metadata_objects.set(metadata_uri, std::make_shared<Poco::JSON::Object::Ptr>(metadata_object));
-                    }
-
-                    auto metadata_object = *metadata_objects.get(metadata_uri);
+                    auto metadata_object = getOrFetchMetadataObject(table_specific_properties->iceberg_metadata_file_location, result);
                     const bool allow_geo_parser
                         = getContext()->getSettingsRef()[DB::Setting::allow_experimental_geo_types_in_iceberg].value;
                     auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(context_, allow_geo_parser);
@@ -636,14 +626,8 @@ bool GlueCatalog::empty() const
     return true;
 }
 
-String GlueCatalog::getActualTimestampType(const String & column_name, const TableMetadata & table_metadata, const String & glue_column_type) const
+Poco::JSON::Object::Ptr GlueCatalog::getOrFetchMetadataObject(const String & metadata_uri, const TableMetadata & table_metadata) const
 {
-    auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
-    if (!table_specific_properties.has_value())
-        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Failed to read table metadata, reason why table is unreadable: {}", table_metadata.getReasonWhyTableIsUnreadable());
-
-    const String & metadata_uri = table_specific_properties->iceberg_metadata_file_location;
-
     if (!metadata_objects.get(metadata_uri))
     {
         auto [object_storage, bucket_name, metadata_path] = createObjectStorageForEarlyTableAccess(metadata_uri, table_metadata);
@@ -652,8 +636,16 @@ String GlueCatalog::getActualTimestampType(const String & column_name, const Tab
             metadata_path, object_storage, nullptr, getContext(), log, compression_method, std::nullopt);
         metadata_objects.set(metadata_uri, std::make_shared<Poco::JSON::Object::Ptr>(metadata_object));
     }
+    return *metadata_objects.get(metadata_uri);
+}
 
-    auto metadata_object = *metadata_objects.get(metadata_uri);
+String GlueCatalog::getActualTimestampType(const String & column_name, const TableMetadata & table_metadata, const String & glue_column_type) const
+{
+    auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
+    if (!table_specific_properties.has_value())
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Failed to read table metadata, reason why table is unreadable: {}", table_metadata.getReasonWhyTableIsUnreadable());
+
+    auto metadata_object = getOrFetchMetadataObject(table_specific_properties->iceberg_metadata_file_location, table_metadata);
     return resolveTimestampTypeFromMetadata(metadata_object, column_name, glue_column_type);
 }
 
