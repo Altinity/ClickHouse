@@ -171,7 +171,15 @@ class ClickHouseProc:
                 command, stdout=log_file, stderr=subprocess.STDOUT, shell=True
             )
         print(f"Started azurite asynchronously with PID {self.azurite_proc.pid}")
-        return True
+
+        if Shell.check(
+            "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/ | grep -qE '400|200'",
+            verbose=False,
+            retries=6,
+        ):
+            return True
+        print("Failed to start azurite")
+        return False
 
     def start_kafka(self):
         command = [
@@ -1358,6 +1366,8 @@ if __name__ == "__main__":
             param = sys.argv[2]
             assert param in ["stateless"]
             res = ch.start_minio(param)
+        elif command == "start_azurite":
+            res = ch.start_azurite()
         else:
             raise ValueError(f"Unknown command: {command}")
     except Exception as e:
