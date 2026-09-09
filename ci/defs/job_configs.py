@@ -978,7 +978,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.FUNC_TESTER_AMD,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
             )
-            for total_batches in (5,)
+            for total_batches in (8,)
             for batch in range(1, total_batches + 1)
         ],
         *[
