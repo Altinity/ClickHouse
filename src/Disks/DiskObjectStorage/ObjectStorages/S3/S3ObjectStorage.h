@@ -212,6 +212,11 @@ public:
     /// pair, so two callers asking for the same request timeout but different caps get distinct clones.
     std::shared_ptr<const S3::Client> getSingleAttemptClient(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms = 0) const;
 
+    /// True iff a clone for exactly this (request timeout, connect cap) pair is already cached --
+    /// never builds one. Lets a test prove dispatch used a SPECIFIC key (and no other) without ever
+    /// creating a clone itself and without measuring anything.
+    bool hasSingleAttemptClientForTest(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const;
+
 private:
     void removeObjectImpl(const StoredObject & object, bool if_exists);
     void removeObjectsImpl(const StoredObjects & objects, bool if_exists);

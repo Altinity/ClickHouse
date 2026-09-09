@@ -1255,6 +1255,12 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(uint64
     return clone;
 }
 
+bool S3ObjectStorage::hasSingleAttemptClientForTest(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const
+{
+    std::lock_guard lock(single_attempt_client_mutex);
+    return single_attempt_clients.contains(std::make_pair(request_timeout_ms, connect_timeout_cap_ms));
+}
+
 std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const ObjectStorageControlRequest & request) const
 {
     /// getSingleAttemptClient is only invoked when actually selected, so an ordinary request never

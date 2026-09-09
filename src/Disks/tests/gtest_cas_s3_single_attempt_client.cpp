@@ -20,14 +20,12 @@
 
 #include <atomic>
 #include <chrono>
-#include <fstream>
 #include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
-#include <vector>
 
 #include <fmt/format.h>
 
@@ -40,8 +38,6 @@
 #include <Poco/Net/HTTPServerRequest.h>
 #include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Net/ServerSocket.h>
-#include <Poco/Net/SocketAddress.h>
-#include <Poco/Net/StreamSocket.h>
 #include <Poco/Util/XMLConfiguration.h>
 
 #include <IO/S3Common.h>
@@ -195,114 +191,6 @@ public:
     void resetRequestsSeen() { requests_seen = 0; }
 };
 
-/// A TCP listener whose accept queue is permanently full of connections it never accept()s: `backlog =
-/// 1` requests a one-entry queue, but Linux's actual capacity for a given backlog is not exactly that
-/// number (historically `backlog + 1`, and kernel-version-dependent besides), so a single pre-filled
-/// connection is not reliably enough to make the very next connect attempt stall. Instead, this keeps
-/// connecting -- each attempt bounded by a short timeout -- until an attempt itself times out: that IS
-/// the proof the queue is now genuinely full, whatever slack the nominal backlog actually bought, and
-/// every established connection up to that point is kept (never accepted) to hold the queue full for
-/// the rest of this object's life. Once full, every FURTHER inbound SYN finds no room: Linux's default
-/// `tcp_abort_on_overflow = 0` then just drops that SYN instead of answering it (no RST, no SYN-ACK),
-/// so a connecting client's kernel silently retransmits in the background while the client's OWN
-/// socket-connect timeout -- not the kernel's SYN retry timer -- is what actually bounds how long a
-/// caller waits. Nothing here ever completes a handshake with a real peer, so a call against this
-/// listener can only ever fail on CONNECT, never on request/response -- unlike `DelayedResponseServer`
-/// above, which answers every request and so can only discriminate the request/response phase.
-class ConnectStallServer
-{
-    Poco::Net::ServerSocket listener;
-    std::vector<Poco::Net::StreamSocket> prefill_connections;
-
-public:
-    ConnectStallServer() : listener(Poco::Net::SocketAddress("127.0.0.1", 0), /*backlog=*/1)
-    {
-        /// The loop bound is only a safety net (the queue always fills well before it on Linux): without
-        /// one, an environment where the queue somehow never fills would hang the constructor forever.
-        for (size_t i = 0; i < 64; ++i)
-        {
-            Poco::Net::StreamSocket prefill;
-            try
-            {
-                prefill.connect(listener.address(), Poco::Timespan(200 * 1000));
-            }
-            catch (const Poco::TimeoutException &)
-            {
-                return;
-            }
-            prefill_connections.push_back(prefill);
-        }
-        throw Poco::RuntimeException("ConnectStallServer: accept queue never filled");
-    }
-
-    std::string getUrl() const { return "http://" + listener.address().toString(); }
-};
-
-/// `ConnectStallServer` relies on Linux dropping the overflow SYN silently, which only happens while
-/// `net.ipv4.tcp_abort_on_overflow` stays at its default 0; a host with it set to 1 resets the
-/// connection instead, so the queue-full state this fixture depends on never actually stalls a connect.
-/// An unreadable file is treated the same as "1": this is a fixture precondition, not the behaviour
-/// under test, so silently assuming the default would risk fencing that at the fixture layer.
-bool tcpAbortOnOverflowPreventsStallServer()
-{
-    std::ifstream sysctl_file("/proc/sys/net/ipv4/tcp_abort_on_overflow");
-    char value = '\0';
-    if (!(sysctl_file >> value))
-        return true;
-    return value != '0';
-}
-
-/// A genuine `S3ObjectStorage` for the CONNECT-phase discriminator: `connect_timeout_ms` governs only
-/// the base client's TCP connect deadline, while `requestTimeoutMs` is set far wider so a call against
-/// `ConnectStallServer` can only ever fail on connect, never on request/response (the peer there never
-/// completes a handshake at all, so no request is ever sent). Adaptive timeouts are disabled for the
-/// same reason `makeDispatchStorageForTest` disables them: the adaptive strategy would shrink the first
-/// attempt's own connect deadline below whatever this function configures.
-std::shared_ptr<DB::S3ObjectStorage> makeConnectStallStorageForTest(const std::string & endpoint, long connect_timeout_ms)
-{
-    DB::RemoteHostFilter remote_host_filter;
-    DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
-        "us-east-1",
-        remote_host_filter,
-        /* s3_max_redirects = */ 100,
-        DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 0},
-        /* s3_slow_all_threads_after_network_error = */ false,
-        /* s3_slow_all_threads_after_retryable_error = */ false,
-        /* enable_s3_requests_logging = */ false,
-        /* for_disk_s3 = */ true,
-        /* opt_disk_name = */ {},
-        /* request_throttler = */ {});
-    cfg.endpointOverride = endpoint;
-    cfg.connectTimeoutMs = connect_timeout_ms;
-    cfg.requestTimeoutMs = 30000;
-    cfg.s3_use_adaptive_timeouts = false;
-    auto client = DB::S3::ClientFactory::instance().create(
-        cfg, clientSettingsForTest(), "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "", {}, {}, DB::S3::CredentialsConfiguration{});
-    return std::make_shared<DB::S3ObjectStorage>(
-        std::move(client), std::make_unique<DB::S3Settings>(),
-        DB::S3::URI(endpoint + "/test-bucket/"), DB::S3Capabilities{},
-        DB::ObjectStorageKeyGeneratorPtr{}, "disk");
-}
-
-/// Runs `attempt`, expecting a connection-class failure -- a stalled connect is classified by
-/// `PocoHTTPClient` as `Aws::Client::CoreErrors::NETWORK_CONNECTION` from the `Poco::TimeoutException`
-/// its connect poll raises, never as a request/response error -- and returns how long it took.
-template <typename F>
-std::chrono::milliseconds expectConnectFailureAndMeasure(F && attempt)
-{
-    const auto start = std::chrono::steady_clock::now();
-    try
-    {
-        attempt();
-        ADD_FAILURE() << "expected a connection failure, the call unexpectedly succeeded";
-    }
-    catch (const DB::S3Exception & e)
-    {
-        EXPECT_EQ(e.getS3ErrorCode(), Aws::S3::S3Errors::NETWORK_CONNECTION);
-    }
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-}
-
 /// A genuine `S3ObjectStorage` pointed at `endpoint`. `base_request_timeout_ms` is the base client's
 /// request AND connect timeout -- comfortably above the server's simulated delay, so a `Default` call
 /// succeeds. No SDK-level retry (`RetryStrategy{.max_retries = 0}`,
@@ -330,6 +218,14 @@ std::shared_ptr<DB::S3ObjectStorage> makeDispatchStorageForTest(const std::strin
     /// first (short) deadline is the only one this client ever gets, which would time out well under
     /// `server_delay` regardless of `requestTimeoutMs`. Off, so `requestTimeoutMs` governs uniformly.
     cfg.s3_use_adaptive_timeouts = false;
+    /// Each `{ }` block below creates and destroys its OWN ephemeral-port server; the default 30 s
+    /// keep-alive would let the client pool a persistent connection that can outlive it. If a LATER
+    /// block's server happens to be assigned that same now-free port (routine under many back-to-back
+    /// server creations within one process), the pooled connection is reused against an unrelated dead
+    /// peer and the request fails with "Connection reset by peer" -- reproduced empirically by running
+    /// this file's dispatch tests together under `--gtest_repeat`. Disabling keep-alive forces a fresh
+    /// connection per request, which is what a short-lived test server should get anyway.
+    cfg.http_keep_alive_timeout = 0;
     auto client = DB::S3::ClientFactory::instance().create(
         cfg, clientSettingsForTest(), "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "", {}, {}, DB::S3::CredentialsConfiguration{});
     return std::make_shared<DB::S3ObjectStorage>(
@@ -633,19 +529,19 @@ TEST(CASEnvelopeWiring, ProductionDispatchSelectsTheFrozenSingleAttemptClientPer
 /// The test above proves production dispatch selects a short-REQUEST-timeout clone, but every server
 /// there answers every request -- it can never tell whether the frozen `connect_timeout_cap_ms` reaches
 /// the CONNECTION phase at all, only whether SOME clone with a short deadline was picked. This test
-/// closes that gap with `ConnectStallServer`, which never completes a handshake with anyone: a call
-/// against it can only fail on connect. Under `Default`, the base client's own 2000 ms connect timeout
-/// governs; under `SingleAttempt` with a 100 ms `connect_timeout_cap_ms` and a much wider 5000 ms
-/// `attempt_timeout_ms` (so the request/response budget, which this discriminator never reaches, is not
-/// what is being measured), a dropped or ignored cap would fall back to the base client's 2000 ms
-/// connect timeout -- making the SingleAttempt call take just as long as Default. The discrimination is
-/// therefore specifically on the CAP, not merely on whether a SingleAttempt clone was selected at all.
+/// closes that gap WITHOUT any wall-clock measurement or stalled connect: every call below goes through
+/// production dispatch against an ordinary, immediately-answering server, so it can only prove two
+/// clock-free facts. First, that dispatch built (or reused) the single-attempt clone under EXACTLY the
+/// (attempt timeout, connect cap) key the request carried -- `hasSingleAttemptClientForTest` only
+/// inspects `S3ObjectStorage`'s clone cache, it never creates an entry, so a wrong key or a missing clone
+/// fails the assertion immediately rather than timing out. Second, that the clone found under that key
+/// actually carries the cap as its `connectTimeoutMs`, while the Default profile's own client keeps the
+/// disk's (wider) base connect timeout untouched. Whether Poco's HTTP client actually enforces
+/// `connectTimeoutMs` at the socket level is `PocoHTTPClient`/`Poco::Net::HTTPClientSession` behaviour
+/// upstream of this class, and is not re-proved here; `S3SingleAttemptClient.ConnectTimeoutIsCappedAndFrozen`
+/// above pins the MIN/cache-key arithmetic `getSingleAttemptClient` applies in isolation.
 TEST(CASEnvelopeWiring, ProductionDispatchAppliesTheFrozenConnectCapAtConnectTime)
 {
-    if (tcpAbortOnOverflowPreventsStallServer())
-        GTEST_SKIP() << "net.ipv4.tcp_abort_on_overflow is not 0 (or unreadable): ConnectStallServer "
-                        "cannot reliably stall a connect on this host";
-
     (void)contextForTest(); // getThreadPoolWriter/BlobStorageLogWriter::create fall back to the global context
 
     constexpr long base_connect_timeout_ms = 2000;
@@ -654,8 +550,14 @@ TEST(CASEnvelopeWiring, ProductionDispatchAppliesTheFrozenConnectCapAtConnectTim
 
     /// PUT: writeObject; the profile and cap ride on WriteSettings, not an ObjectStorageControlRequest.
     {
-        ConnectStallServer server;
-        auto storage = makeConnectStallStorageForTest(server.getUrl(), base_connect_timeout_ms);
+        DelayedResponseServer server(std::chrono::milliseconds(0), [](Poco::Net::HTTPServerResponse & response)
+        {
+            response.set("ETag", "\"put-etag\"");
+            response.setContentLength(0);
+            response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+            response.send();
+        });
+        auto storage = makeDispatchStorageForTest(server.getUrl(), base_connect_timeout_ms);
 
         auto put = [&](DB::ObjectStorageRetryProfile profile, uint64_t attempt_timeout_ms, uint64_t connect_cap_ms)
         {
@@ -669,83 +571,84 @@ TEST(CASEnvelopeWiring, ProductionDispatchAppliesTheFrozenConnectCapAtConnectTim
             buffer->finalize();
         };
 
-        const auto default_elapsed = expectConnectFailureAndMeasure(
-            [&] { put(DB::ObjectStorageRetryProfile::Default, 0, 0); });
-        EXPECT_GE(default_elapsed.count(), 1500);
+        EXPECT_NO_THROW(put(DB::ObjectStorageRetryProfile::Default, 0, 0));
+        EXPECT_EQ(storage->getS3StorageClient()->getClientConfiguration().connectTimeoutMs, base_connect_timeout_ms)
+            << "the Default profile must dispatch on the disk's own client, unchanged";
 
-        const auto capped_elapsed = expectConnectFailureAndMeasure([&]
-        {
-            put(DB::ObjectStorageRetryProfile::SingleAttempt, single_attempt_timeout_ms, single_attempt_connect_cap_ms);
-        });
-        EXPECT_LT(capped_elapsed.count(), 1000);
+        EXPECT_NO_THROW(put(DB::ObjectStorageRetryProfile::SingleAttempt, single_attempt_timeout_ms, single_attempt_connect_cap_ms));
+        ASSERT_TRUE(storage->hasSingleAttemptClientForTest(single_attempt_timeout_ms, single_attempt_connect_cap_ms))
+            << "dispatch must have built the single-attempt clone under exactly this (attempt timeout, cap) key";
+        EXPECT_FALSE(storage->hasSingleAttemptClientForTest(single_attempt_timeout_ms, 0))
+            << "dispatch must not fall back to an uncapped clone for this attempt timeout";
+        EXPECT_EQ(
+            storage->getSingleAttemptClient(single_attempt_timeout_ms, single_attempt_connect_cap_ms)
+                ->getClientConfiguration().connectTimeoutMs,
+            static_cast<long>(single_attempt_connect_cap_ms));
     }
 
     /// HEAD: tryGetObjectMetadataWithNativeToken's ObjectStorageControlRequest-taking overload.
     {
-        ConnectStallServer server;
-        auto storage = makeConnectStallStorageForTest(server.getUrl(), base_connect_timeout_ms);
-
-        const auto default_elapsed = expectConnectFailureAndMeasure([&]
+        DelayedResponseServer server(std::chrono::milliseconds(0), [](Poco::Net::HTTPServerResponse & response)
         {
-            storage->tryGetObjectMetadataWithNativeToken("head-key", /*with_tags=*/false, DB::ObjectStorageControlRequest{});
+            response.set("ETag", "\"head-etag\"");
+            response.setContentLength(5);
+            response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+            response.send();
         });
-        EXPECT_GE(default_elapsed.count(), 1500);
+        auto storage = makeDispatchStorageForTest(server.getUrl(), base_connect_timeout_ms);
 
-        const auto capped_elapsed = expectConnectFailureAndMeasure([&]
-        {
-            storage->tryGetObjectMetadataWithNativeToken(
-                "head-key", /*with_tags=*/false,
-                DB::ObjectStorageControlRequest{
-                    .profile = DB::ObjectStorageRetryProfile::SingleAttempt,
-                    .attempt_timeout_ms = single_attempt_timeout_ms,
-                    .connect_timeout_cap_ms = single_attempt_connect_cap_ms});
-        });
-        EXPECT_LT(capped_elapsed.count(), default_elapsed.count())
-            << "the cap must remove SOME of the connect budget, unconditionally";
-        /// A sanitizer build adds a roughly constant addend to both measurements, so the PRIMARY fence
-        /// is the DIFFERENCE the cap made, not an absolute bound: at least half of the connect budget it
-        /// removed.
-        EXPECT_GE(default_elapsed.count() - capped_elapsed.count(),
-                  (base_connect_timeout_ms - static_cast<long>(single_attempt_connect_cap_ms)) / 2);
-#if !defined(DEBUG_OR_SANITIZER_BUILD)
-        /// Release builds keep the original tighter absolute bound too: sanitizer instrumentation
-        /// overhead is the only reason it was loosened to a difference above.
-        EXPECT_LT(capped_elapsed.count(), 1000);
-#endif
+        EXPECT_TRUE(storage->tryGetObjectMetadataWithNativeToken(
+            "head-key", /*with_tags=*/false, DB::ObjectStorageControlRequest{}).has_value());
+        EXPECT_EQ(storage->getS3StorageClient()->getClientConfiguration().connectTimeoutMs, base_connect_timeout_ms)
+            << "the Default profile must dispatch on the disk's own client, unchanged";
+
+        EXPECT_TRUE(storage->tryGetObjectMetadataWithNativeToken(
+            "head-key", /*with_tags=*/false,
+            DB::ObjectStorageControlRequest{
+                .profile = DB::ObjectStorageRetryProfile::SingleAttempt,
+                .attempt_timeout_ms = single_attempt_timeout_ms,
+                .connect_timeout_cap_ms = single_attempt_connect_cap_ms}).has_value());
+        ASSERT_TRUE(storage->hasSingleAttemptClientForTest(single_attempt_timeout_ms, single_attempt_connect_cap_ms))
+            << "dispatch must have built the single-attempt clone under exactly this (attempt timeout, cap) key";
+        EXPECT_FALSE(storage->hasSingleAttemptClientForTest(single_attempt_timeout_ms, 0))
+            << "dispatch must not fall back to an uncapped clone for this attempt timeout";
+        EXPECT_EQ(
+            storage->getSingleAttemptClient(single_attempt_timeout_ms, single_attempt_connect_cap_ms)
+                ->getClientConfiguration().connectTimeoutMs,
+            static_cast<long>(single_attempt_connect_cap_ms));
     }
 
     /// Conditional DELETE: removeObjectIfTokenMatches's ObjectStorageControlRequest-taking overload.
     {
-        ConnectStallServer server;
-        auto storage = makeConnectStallStorageForTest(server.getUrl(), base_connect_timeout_ms);
-
-        const auto default_elapsed = expectConnectFailureAndMeasure([&]
+        DelayedResponseServer server(std::chrono::milliseconds(0), [](Poco::Net::HTTPServerResponse & response)
         {
-            storage->removeObjectIfTokenMatches(DB::StoredObject("delete-key"), "\"etag\"", DB::ObjectStorageControlRequest{});
+            response.setStatus(Poco::Net::HTTPResponse::HTTP_NO_CONTENT);
+            response.setContentLength(0);
+            response.send();
         });
-        EXPECT_GE(default_elapsed.count(), 1500);
+        auto storage = makeDispatchStorageForTest(server.getUrl(), base_connect_timeout_ms);
 
-        const auto capped_elapsed = expectConnectFailureAndMeasure([&]
-        {
-            storage->removeObjectIfTokenMatches(
-                DB::StoredObject("delete-key"), "\"etag\"",
-                DB::ObjectStorageControlRequest{
-                    .profile = DB::ObjectStorageRetryProfile::SingleAttempt,
-                    .attempt_timeout_ms = single_attempt_timeout_ms,
-                    .connect_timeout_cap_ms = single_attempt_connect_cap_ms});
-        });
-        EXPECT_LT(capped_elapsed.count(), default_elapsed.count())
-            << "the cap must remove SOME of the connect budget, unconditionally";
-        /// A sanitizer build adds a roughly constant addend to both measurements, so the PRIMARY fence
-        /// is the DIFFERENCE the cap made, not an absolute bound: at least half of the connect budget it
-        /// removed.
-        EXPECT_GE(default_elapsed.count() - capped_elapsed.count(),
-                  (base_connect_timeout_ms - static_cast<long>(single_attempt_connect_cap_ms)) / 2);
-#if !defined(DEBUG_OR_SANITIZER_BUILD)
-        /// Release builds keep the original tighter absolute bound too: sanitizer instrumentation
-        /// overhead is the only reason it was loosened to a difference above.
-        EXPECT_LT(capped_elapsed.count(), 1000);
-#endif
+        const auto default_result = storage->removeObjectIfTokenMatches(
+            DB::StoredObject("delete-key"), "\"etag\"", DB::ObjectStorageControlRequest{});
+        EXPECT_EQ(default_result.outcome, DB::ConditionalRemoveOutcome::Removed);
+        EXPECT_EQ(storage->getS3StorageClient()->getClientConfiguration().connectTimeoutMs, base_connect_timeout_ms)
+            << "the Default profile must dispatch on the disk's own client, unchanged";
+
+        const auto capped_result = storage->removeObjectIfTokenMatches(
+            DB::StoredObject("delete-key"), "\"etag\"",
+            DB::ObjectStorageControlRequest{
+                .profile = DB::ObjectStorageRetryProfile::SingleAttempt,
+                .attempt_timeout_ms = single_attempt_timeout_ms,
+                .connect_timeout_cap_ms = single_attempt_connect_cap_ms});
+        EXPECT_EQ(capped_result.outcome, DB::ConditionalRemoveOutcome::Removed);
+        ASSERT_TRUE(storage->hasSingleAttemptClientForTest(single_attempt_timeout_ms, single_attempt_connect_cap_ms))
+            << "dispatch must have built the single-attempt clone under exactly this (attempt timeout, cap) key";
+        EXPECT_FALSE(storage->hasSingleAttemptClientForTest(single_attempt_timeout_ms, 0))
+            << "dispatch must not fall back to an uncapped clone for this attempt timeout";
+        EXPECT_EQ(
+            storage->getSingleAttemptClient(single_attempt_timeout_ms, single_attempt_connect_cap_ms)
+                ->getClientConfiguration().connectTimeoutMs,
+            static_cast<long>(single_attempt_connect_cap_ms));
     }
 }
 
@@ -757,29 +660,32 @@ TEST(CASEnvelopeWiring, ProductionDispatchAppliesTheFrozenConnectCapAtConnectTim
 /// constructor (the backend handoff at ~812-822) exactly as a writable Native mount does. This test
 /// drives that whole chain end to end -- real client -> freezeConnectTimeoutCapMs -> ObjectStorageBackend
 /// -> CasRequests/CasOperation -> the SAME production S3ObjectStorage dispatch the tests above cover --
-/// with no recording subclass anywhere in it. `Pool::open` itself is not driven here: it needs a live
-/// store (PoolMeta creation/validation) that a stalled-connect endpoint cannot provide, so the backend
-/// composition above is the reachable end of the chain from a unit test.
+/// with no recording subclass anywhere in it, and, like the test above, with no wall-clock measurement:
+/// both backends' HEAD goes through an ordinary, immediately-answering server.
 ///
-/// A read-only backend (`single_attempt_control_plane_ = false`, matching `openPoolView`'s own choice
-/// for a read-only mount) keeps the storage's DEFAULT client for its read-class requests -- the base
-/// 2000 ms connect timeout -- as the uncapped control. The SAME derived cap and attempt timeout, handed
-/// to a WRITABLE Native backend exactly as `openPoolView` constructs one, must then fail an order of
-/// magnitude faster: a dropped or corrupted handoff anywhere in the chain would silently fall back to
-/// the uncapped control's timing instead.
+/// A read-only backend (`single_attempt_control_plane_ = false`, matching `openPoolView`'s own choice for
+/// a read-only mount) dispatches its read-class requests under the Default profile -- proven here by the
+/// storage never having built ANY single-attempt clone afterward, i.e. it used the disk's own client
+/// untouched. The SAME derived cap and attempt timeout, handed to a WRITABLE Native backend exactly as
+/// `openPoolView` constructs one, must then dispatch under EXACTLY that (attempt timeout, cap) key, and
+/// the clone found under that key must carry the cap as its `connectTimeoutMs`: a dropped or corrupted
+/// handoff anywhere in the chain would either leave no clone under that key or leave one with the wrong
+/// timeout, and either way the assertion below fails immediately rather than by timing out.
 TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDispatch)
 {
-    if (tcpAbortOnOverflowPreventsStallServer())
-        GTEST_SKIP() << "net.ipv4.tcp_abort_on_overflow is not 0 (or unreadable): ConnectStallServer "
-                        "cannot reliably stall a connect on this host";
-
     (void)contextForTest();
 
     constexpr long base_connect_timeout_ms = 2000;
     constexpr uint64_t cas_attempt_timeout_ms = 100;
 
-    ConnectStallServer server;
-    auto storage = makeConnectStallStorageForTest(server.getUrl(), base_connect_timeout_ms);
+    DelayedResponseServer server(std::chrono::milliseconds(0), [](Poco::Net::HTTPServerResponse & response)
+    {
+        response.set("ETag", "\"head-etag\"");
+        response.setContentLength(5);
+        response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+        response.send();
+    });
+    auto storage = makeDispatchStorageForTest(server.getUrl(), base_connect_timeout_ms);
 
     /// The exact derivation `ContentAddressedMetadataStorage::openPoolView` uses: min(base connect
     /// timeout, attempt timeout) = 100 here, never the wide 2000 ms base timeout.
@@ -790,12 +696,12 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
     auto uncapped_backend = std::make_shared<DB::Cas::ObjectStorageBackend>(
         storage, DB::Cas::ObjectStorageBackend::Mode::Native,
         /*single_attempt_control_plane_=*/false, /*attempt_timeout_ms_=*/0, /*connect_timeout_cap_ms_=*/0);
-    std::chrono::milliseconds uncapped_elapsed{};
     {
         DB::Cas::CasRequests requests(DB::Cas::BackendPtr(uncapped_backend), DB::Cas::Fence::open());
         auto op = requests.admit();
-        uncapped_elapsed = expectConnectFailureAndMeasure([&] { (void)op.head("k", DB::Cas::Retry::once()); });
-        EXPECT_GE(uncapped_elapsed.count(), 1500);
+        EXPECT_TRUE(op.head("k", DB::Cas::Retry::once()).has_value());
+        EXPECT_FALSE(storage->hasSingleAttemptClientForTest(0, 0))
+            << "a read-only (Default-profile) backend must never build a single-attempt clone";
     }
 
     /// The derived cap, handed to the backend exactly as `openPoolView` constructs it (:812-822) for a
@@ -803,26 +709,22 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
     auto capped_backend = std::make_shared<DB::Cas::ObjectStorageBackend>(
         storage, DB::Cas::ObjectStorageBackend::Mode::Native,
         /*single_attempt_control_plane_=*/true, cas_attempt_timeout_ms, *cap);
-    /// Deterministic, non-timing corroboration alongside the timing assertions below: cheap because
-    /// `ObjectStorageBackend` already exposes its own budget, though it only proves the constructor
-    /// argument the line above passed was stored -- not that it reached the S3 client's actual connect
-    /// timeout, which only the timing assertions below can show.
+    /// Cheap, deterministic corroboration alongside the dispatch-level assertions below: it proves the
+    /// constructor argument was stored, not that it reached the S3 client's actual connect timeout, which
+    /// only `hasSingleAttemptClientForTest`/`getSingleAttemptClient` below can show.
     EXPECT_EQ(capped_backend->connectTimeoutCapMs(), *cap);
     {
         DB::Cas::CasRequests requests(DB::Cas::BackendPtr(capped_backend), DB::Cas::Fence::open());
         auto op = requests.admit();
-        const auto elapsed = expectConnectFailureAndMeasure([&] { (void)op.head("k", DB::Cas::Retry::once()); });
-        EXPECT_LT(elapsed.count(), uncapped_elapsed.count())
-            << "the cap must remove SOME of the connect budget, unconditionally";
-        /// A sanitizer build adds a roughly constant addend to both measurements, so the PRIMARY fence
-        /// is the DIFFERENCE the cap made, not an absolute bound: at least half of the connect budget it
-        /// removed.
-        EXPECT_GE(uncapped_elapsed.count() - elapsed.count(), (base_connect_timeout_ms - static_cast<long>(*cap)) / 2);
-#if !defined(DEBUG_OR_SANITIZER_BUILD)
-        /// Release builds keep the original tighter absolute bound too: sanitizer instrumentation
-        /// overhead is the only reason it was loosened to a difference above.
-        EXPECT_LT(elapsed.count(), 1000);
-#endif
+        EXPECT_TRUE(op.head("k", DB::Cas::Retry::once()).has_value());
+        ASSERT_TRUE(storage->hasSingleAttemptClientForTest(cas_attempt_timeout_ms, *cap))
+            << "the WRITABLE backend must dispatch its read-class requests under exactly the frozen "
+               "(attempt timeout, cap) key";
+        EXPECT_EQ(
+            storage->getSingleAttemptClient(cas_attempt_timeout_ms, *cap)->getClientConfiguration().connectTimeoutMs,
+            static_cast<long>(*cap))
+            << "socket-level enforcement of connectTimeoutMs is PocoHTTPClient behaviour upstream of this "
+               "class, not re-proved here";
     }
 }
 
