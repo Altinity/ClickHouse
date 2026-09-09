@@ -235,7 +235,7 @@ jobs:
 
         TEMPLATE_PY_INSTALL = """
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: {PYTHON_VERSION}
 """
