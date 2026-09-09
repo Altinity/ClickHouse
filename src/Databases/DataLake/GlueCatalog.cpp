@@ -791,16 +791,8 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
 
     if (metadata_content)
     {
-        try
-        {
-            auto schema = getCurrentSchemaFromMetadata(metadata_content);
-            sd.SetColumns(icebergSchemaToGlueColumns(schema));
-        }
-        catch (...)
-        {
-            LOG_WARNING(log, "Failed to extract schema from metadata for table {}.{}: {}",
-                namespace_name, table_name, DB::getCurrentExceptionMessage(false));
-        }
+        auto schema = getCurrentSchemaFromMetadata(metadata_content);
+        sd.SetColumns(icebergSchemaToGlueColumns(schema));
     }
 
     table_input.SetStorageDescriptor(sd);
@@ -892,17 +884,7 @@ bool GlueCatalog::updateSchema(
 {
     std::vector<Aws::Glue::Model::Column> columns;
     if (new_schema)
-    {
-        try
-        {
-            columns = icebergSchemaToGlueColumns(new_schema);
-        }
-        catch (...)
-        {
-            LOG_WARNING(log, "Failed to convert schema to Glue columns for table {}.{}: {}",
-                namespace_name, table_name, DB::getCurrentExceptionMessage(false));
-        }
-    }
+        columns = icebergSchemaToGlueColumns(new_schema);
     return updateTableInGlue(namespace_name, table_name, new_metadata_path, columns);
 }
 
