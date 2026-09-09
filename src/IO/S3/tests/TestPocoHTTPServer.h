@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Common/HTTPConnectionPool.h>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -81,11 +82,13 @@ public:
         server->start();
     }
 
-    /// `stopAll(true)` aborts any active connection immediately, so its worker thread isn't still
-    /// blocked reading for a next request when `thread_pool`'s destructor tries to join it.
+    /// Closing the cached client sockets wakes the server workers without Poco's abort notification,
+    /// whose unlocked socket shutdown races the worker's own close. Precondition: callers have released
+    /// their sessions, otherwise `joinAll` waits for the server's request timeout.
     ~TestPocoHTTPServer()
     {
-        server->stopAll(true);
+        DB::HTTPConnectionPools::instance().dropCache();
+        server->stop();
         thread_pool.joinAll();
     }
 
@@ -196,7 +199,8 @@ public:
     /// See `TestPocoHTTPServer`'s destructor above.
     ~TestPocoHTTPStsServer()
     {
-        server->stopAll(true);
+        DB::HTTPConnectionPools::instance().dropCache();
+        server->stop();
         thread_pool.joinAll();
     }
 
