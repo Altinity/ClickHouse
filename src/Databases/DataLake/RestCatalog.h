@@ -396,9 +396,10 @@ protected:
     virtual DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const;
 
     /// The user's own token, or the session token obtained by exchanging it, depending on whether
-    /// `oauth_token_exchange_uri` is set. Throws `CATALOG_USER_TOKEN_NOT_AVAILABLE` when forwarding
-    /// is enabled and there is no token: never fall back to the service principal, which would
-    /// turn an authorization failure into a query that succeeds under the wrong identity.
+    /// `oauth_token_exchange_uri` is set. Throws `CATALOG_USER_TOKEN_NOT_AVAILABLE` when there is
+    /// no token, and also when the hot-reloadable server-level `enable_token_forwarding` setting
+    /// has since been turned off: never fall back to the service principal, which would turn an
+    /// authorization failure into a query that succeeds under the wrong identity.
     String getForwardedToken(const CatalogState & catalog_state, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const;
 
     /// Whether a failed catalog request should be retried once with a freshly minted token.
@@ -434,6 +435,11 @@ protected:
     AccessToken exchangeUserToken(const CatalogState & catalog_state, const DB::ForwardedAuthToken & auth_token) const;
 
     AccessToken retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const;
+
+    /// The catalog service principal's own token, minted on demand with a `client_credentials`
+    /// grant and cached in `access_token` until it expires. Used as the RFC 8693 `actor_token`,
+    /// never as the identity a catalog request is signed with while forwarding is on.
+    String getServicePrincipalToken(const CatalogState & catalog_state) const;
 
     struct PreparedAuthChanges;
 

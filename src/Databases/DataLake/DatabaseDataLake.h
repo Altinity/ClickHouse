@@ -52,7 +52,7 @@ public:
 
     Strings getAllTableNames(ContextPtr context) const override;
 
-    void checkDatabase() const override;
+    void checkDatabase(ContextPtr context) const override;
 
     void shutdown() override {}
 

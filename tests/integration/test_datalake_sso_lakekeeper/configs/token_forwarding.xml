@@ -19,6 +19,16 @@
         <token>
             <processor>keycloak</processor>
             <default_profile>default</default_profile>
+            <!--
+                Auto-provisioned token users hold no privileges of their own, so every statement
+                here would be refused by ClickHouse before ever reaching the catalog, and a test
+                about what the catalog authorizes would prove nothing. Hand every token user this
+                role; the fixture creates it and grants it what the tests need. Same arrangement as
+                `test_datalake_token_forwarding`.
+            -->
+            <common_roles>
+                <token_users />
+            </common_roles>
         </token>
     </user_directories>
 </clickhouse>

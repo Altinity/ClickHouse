@@ -23,6 +23,15 @@
         <token>
             <processor>hs256</processor>
             <default_profile>default</default_profile>
+            <!--
+                Auto-provisioned token users hold no privileges of their own, so statements such as
+                `CHECK DATABASE`, `INSERT` and `DROP TABLE` would be refused before ever reaching
+                the catalog. Hand every token user this role; the suite's fixture creates it and
+                grants it exactly what the tests need.
+            -->
+            <common_roles>
+                <token_users />
+            </common_roles>
         </token>
     </user_directories>
 </clickhouse>

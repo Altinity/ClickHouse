@@ -9,6 +9,8 @@
 # No catalog is contacted: the database is created with forwarding on, which defers `/v1/config`
 # to the first user query.
 
+CLICKHOUSE_CLIENT_SERVER_LOGS_LEVEL=fatal
+
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
@@ -32,7 +34,7 @@ SETTINGS
 echo '-- secrets stay hidden'
 ${CLICKHOUSE_CLIENT} --query "SHOW CREATE DATABASE ${DB}" | grep -c 'super_secret'
 ${CLICKHOUSE_CLIENT} --query "SELECT engine_full FROM system.databases WHERE name = '${DB}'" | grep -c 'super_client'
-${CLICKHOUSE_CLIENT} --query "SHOW CREATE DATABASE ${DB}" | grep -o "catalog_credential = '\[HIDDEN\]'"
+${CLICKHOUSE_CLIENT} --query "SHOW CREATE DATABASE ${DB} FORMAT TSVRaw" | grep -o "catalog_credential = '\[HIDDEN\]'"
 
 echo '-- forwarding settings stay visible'
 ${CLICKHOUSE_CLIENT} --query "SHOW CREATE DATABASE ${DB}" | grep -o 'oauth_forward_user_token = 1'

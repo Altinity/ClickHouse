@@ -33,12 +33,19 @@ KEYCLOAK_INTERNAL = f"http://keycloak:8080/realms/{REALM}"
 TOKEN_ENDPOINT = f"{KEYCLOAK_INTERNAL}/protocol/openid-connect/token"
 CATALOG_INTERNAL_URL = "http://lakekeeper:8181/catalog"
 
-# Client whose tokens already carry `aud=lakekeeper` (default client scope), for passthrough.
+# The client ClickHouse itself is registered as. Its audience mapper puts `lakekeeper` in every
+# token it issues, which is what makes passthrough work, and it is also the client that performs
+# the RFC 8693 exchange.
 CLIENT_ID = "clickhouse"
 CLIENT_SECRET = "clickhouse-secret"
-# Client whose tokens do NOT, so an exchange is what has to produce the audience.
+# A second client standing in for some other application the user came from. Its tokens are
+# audienced for `clickhouse`, never for `lakekeeper`, so an exchange is what has to produce the
+# audience the catalog requires.
 EXCHANGE_CLIENT_ID = "clickhouse-exchange"
 EXCHANGE_CLIENT_SECRET = "clickhouse-exchange-secret"
+# `LAKEKEEPER__OPENID_SCOPE` in the compose file; Lakekeeper rejects a token whose `scope` claim
+# does not contain it.
+SCOPE = "openid"
 
 WAREHOUSES = ["wh_alice", "wh_bob", "wh_shared"]
 
@@ -55,7 +62,7 @@ def lakekeeper_host_url(cluster):
 
 
 def get_token(node, username, password="secret", client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
-              scope=None):
+              scope=SCOPE):
     """
     Tokens are fetched from inside the ClickHouse container so that every participant -- ClickHouse,
     Lakekeeper and this test -- sees the same issuer, `http://keycloak:8080/realms/...`.
@@ -92,6 +99,20 @@ def management(cluster, method, path, token, json_body=None, expected=(200, 201,
     )
     assert response.status_code in expected, f"{method} {path} -> {response.status_code}: {response.text}"
     return response
+
+
+def lakekeeper_rejects(cluster, token):
+    """
+    Whether Lakekeeper refuses this token outright. Used as a precondition, so that a test which
+    claims "this token would not have worked" says so on the catalog's authority rather than on a
+    reading of the token's own claims.
+    """
+    response = requests.get(
+        f"{lakekeeper_host_url(cluster)}/management/v1/whoami",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60,
+    )
+    return response.status_code == 401
 
 
 def create_warehouse(cluster, token, name):
@@ -235,7 +256,11 @@ def started_cluster():
         for name in ("node1", "node2"):
             cluster.add_instance(
                 name,
-                main_configs=["configs/token_forwarding.xml", "configs/cluster.xml"],
+                main_configs=[
+                    "configs/token_forwarding.xml",
+                    "configs/cluster.xml",
+                    "configs/session_log.xml",
+                ],
                 user_configs=["configs/users.xml"],
                 stay_alive=True,
                 with_iceberg_catalog=True,
@@ -247,6 +272,17 @@ def started_cluster():
         cluster.start()
 
         node = cluster.instances["node1"]
+        # Auto-provisioned token users hold no privileges of their own; `common_roles` in
+        # `token_forwarding.xml` hands them this role. Access storage is local to each node, so
+        # both nodes need it. Granted broadly on purpose: every denial these tests assert has to
+        # come from the catalog, never from ClickHouse's own access control.
+        for instance in cluster.instances.values():
+            instance.query("CREATE ROLE IF NOT EXISTS token_users")
+            instance.query("GRANT CHECK, DROP TABLE, INSERT, SELECT, SHOW ON *.* TO token_users")
+            # Reading table data goes to S3, guarded separately by the `SOURCES` privileges.
+            instance.query("GRANT S3 ON *.* TO token_users")
+            instance.query("GRANT REMOTE ON *.* TO token_users")
+
         wait_for_lakekeeper(cluster)
 
         admin_token = get_token(node, "lkadmin")
@@ -319,9 +355,11 @@ def test_users_see_different_tables(started_cluster):
     assert query_as_ok(node, alice, listing_sql.format(db="db_alice")).strip() == "ns.t_alice"
     assert query_as_ok(node, bob, listing_sql.format(db="db_bob")).strip() == "ns.t_bob"
 
-    # And neither can list the other's warehouse.
-    assert query_as(node, alice, listing_sql.format(db="db_bob")).status_code != 200
-    assert query_as(node, bob, listing_sql.format(db="db_alice")).status_code != 200
+    # And neither sees anything in the other's warehouse. Empty is the catalog's answer, not a
+    # symptom of nothing working: the two assertions above went through the same code path and did
+    # return a table, so an empty listing here can only be Lakekeeper withholding it.
+    assert query_as_ok(node, alice, listing_sql.format(db="db_bob")).strip() == ""
+    assert query_as_ok(node, bob, listing_sql.format(db="db_alice")).strip() == ""
 
 
 def test_alice_cannot_read_bobs_table(started_cluster):
@@ -331,8 +369,12 @@ def test_alice_cannot_read_bobs_table(started_cluster):
     assert int(query_as_ok(node, get_token(node, "bob"), "SELECT count() FROM db_bob.`ns.t_bob`")) == 3
 
     denied = query_as(node, get_token(node, "alice"), "SELECT count() FROM db_bob.`ns.t_bob`")
-    assert denied.status_code != 200
-    assert "t_bob" not in denied.text or "403" in denied.text or "Forbidden" in denied.text
+    assert denied.status_code != 200, denied.text
+    # Bob read that very table a line ago, so the only thing that can make it unknown to Alice is
+    # the catalog refusing to describe it to her.
+    assert (
+        "UNKNOWN_TABLE" in denied.text or "403" in denied.text or "Forbidden" in denied.text
+    ), denied.text
 
 
 def test_warm_credentials_cache_does_not_serve_another_user(started_cluster):
@@ -439,6 +481,9 @@ def test_no_token_in_system_logs(started_cluster):
     query_as_ok(node, token, "SELECT count() FROM db_alice.`ns.t_alice`")
     # Also exercise a failing path, which is where an error message could echo the token.
     query_as(node, token, "SELECT count() FROM db_alice.`ns.does_not_exist`")
+    # And a failing authentication, which is what writes to `system.session_log` at all. The
+    # signature prefix the needle below is taken from survives the mangling.
+    query_as(node, token[:-4] + "AAAA", "SELECT 1")
 
     node.query("SYSTEM FLUSH LOGS")
     # The signature segment is the part that is unique to this token and long enough not to
@@ -447,13 +492,19 @@ def test_no_token_in_system_logs(started_cluster):
     for table, columns in (
         ("system.query_log", ["query", "exception", "stack_trace"]),
         ("system.text_log", ["message"]),
-        ("system.session_log", ["auth_id"]),
+        # `auth_id` is a UUID and could not carry a token; `failure_reason` is the free-text
+        # column, and the rejected token above is what puts a row in it.
+        ("system.session_log", ["failure_reason"]),
     ):
         condition = " OR ".join(f"{column} LIKE '%{needle}%'" for column in columns)
         found = node.query(f"SELECT count() FROM {table} WHERE {condition}").strip()
         assert found == "0", f"token leaked into {table}"
 
-    running = node.query(f"SELECT count() FROM system.processes WHERE query LIKE '%{needle}%'").strip()
+    # This query's own text contains the needle, so it matches itself; exclude it by id.
+    running = node.query(
+        f"SELECT count() FROM system.processes "
+        f"WHERE query LIKE '%{needle}%' AND query_id != queryID()"
+    ).strip()
     assert running == "0"
 
 
@@ -465,7 +516,7 @@ def test_swarm_read_does_not_reach_the_catalog_from_workers(started_cluster):
     started = started_cluster
     node1 = started.instances["node1"]
     node2 = started.instances["node2"]
-    create_database(node1, "db_shared", "wh_shared", {"object_storage_cluster": "cluster_simple"})
+    create_database(node1, "db_shared", "wh_shared")
 
     def catalog_requests(node):
         node.query("SYSTEM FLUSH LOGS")
@@ -474,8 +525,27 @@ def test_swarm_read_does_not_reach_the_catalog_from_workers(started_cluster):
         ).strip()
         return int(value) if value else 0
 
+    query_id = f"swarm-{uuid.uuid4()}"
     before = catalog_requests(node2)
-    assert int(query_as_ok(node1, get_token(node1, "alice"), "SELECT count() FROM db_shared.`ns.t_shared`")) == 3
+    # `object_storage_cluster` is a query setting, not a `DataLakeCatalog` one. An aggregate over a
+    # column rather than `count()`, so the answer cannot come from Iceberg metadata alone and the
+    # data files really are read.
+    assert int(query_as_ok(
+        node1,
+        get_token(node1, "alice"),
+        "SELECT sum(id) FROM db_shared.`ns.t_shared` "
+        "SETTINGS object_storage_cluster = 'cluster_simple'",
+        query_id,
+    )) == 3
+
+    # The worker has to have taken part, otherwise "it made no catalog request" is vacuously true.
+    node2.query("SYSTEM FLUSH LOGS")
+    worker_queries = node2.query(
+        f"SELECT count() FROM system.query_log "
+        f"WHERE initial_query_id = '{query_id}' AND type = 'QueryFinish'"
+    ).strip()
+    assert int(worker_queries) > 0, "node2 never ran a part of the query"
+
     assert catalog_requests(node2) == before
 
 
@@ -490,8 +560,10 @@ def test_exchange_at_the_idp(started_cluster):
         "db_exchange",
         "wh_alice",
         {
-            "catalog_credential": f"{EXCHANGE_CLIENT_ID}:{EXCHANGE_CLIENT_SECRET}",
-            "auth_scope": "lakekeeper",
+            # The exchange is performed as the `clickhouse` client, the only one Keycloak lets
+            # mint tokens carrying the `lakekeeper` audience.
+            "catalog_credential": f"{CLIENT_ID}:{CLIENT_SECRET}",
+            "auth_scope": SCOPE,
             "oauth_token_exchange_uri": TOKEN_ENDPOINT,
         },
     )
@@ -500,7 +572,9 @@ def test_exchange_at_the_idp(started_cluster):
         node, "alice", client_id=EXCHANGE_CLIENT_ID, client_secret=EXCHANGE_CLIENT_SECRET
     )
     # Precondition: this token on its own is not accepted by Lakekeeper.
-    assert "lakekeeper" not in (jwt_claim(token, "aud") or [])
+    audience = jwt_claim(token, "aud")
+    assert "lakekeeper" not in ([audience] if isinstance(audience, str) else audience)
+    assert lakekeeper_rejects(started_cluster, token)
 
     query_id = f"exchange-{uuid.uuid4()}"
     assert int(query_as_ok(node, token, "SELECT count() FROM db_exchange.`ns.t_alice`", query_id)) == 3

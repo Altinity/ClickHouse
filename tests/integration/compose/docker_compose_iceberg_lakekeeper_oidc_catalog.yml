@@ -21,6 +21,10 @@ services:
       - KC_BOOTSTRAP_ADMIN_USERNAME=admin
       - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
     volumes:
+      # The realm deliberately declares no top-level `clientScopes`: an import that supplies that
+      # array gets only the scopes it lists and none of Keycloak's built-ins, so tokens come back
+      # without `sub` (from `basic`) or `preferred_username` (from `profile`) and Lakekeeper
+      # answers 401 to everything. The `lakekeeper` audience is a client protocol mapper instead.
       - ../test_datalake_sso_lakekeeper/keycloak/realm-export.json:/opt/keycloak/data/import/realm.json:ro
     healthcheck:
       test:
@@ -45,7 +49,9 @@ services:
       - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
       - LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/clickhouse-test
       - LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
-      - LAKEKEEPER__OPENID_SCOPE=openid profile email
+      # A single scope, not a list: Lakekeeper compares the configured value against the
+      # token's `scope` claim as one entry, so `openid profile email` would never match.
+      - LAKEKEEPER__OPENID_SCOPE=openid
       - RUST_LOG=info
     command: ["serve"]
     ports:

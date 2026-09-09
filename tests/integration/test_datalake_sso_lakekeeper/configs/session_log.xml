@@ -1,0 +1,12 @@
+<clickhouse>
+    <!--
+        Off by default. `test_no_token_in_system_logs` checks that a rejected token does not reach
+        `failure_reason`, and that check has to run against a table that exists.
+    -->
+    <session_log>
+        <database>system</database>
+        <table>session_log</table>
+        <partition_by>toYYYYMM(event_date)</partition_by>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </session_log>
+</clickhouse>

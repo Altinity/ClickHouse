@@ -1280,6 +1280,9 @@ ContextData::ContextData()
 ContextData::ContextData(const ContextData &o) :
     shared(o.shared),
     client_info(o.client_info),
+    /// Must be copied like `client_info`: a query context is built with `Context::createCopy` from
+    /// the session context, so a token left out here is lost before the query can forward it.
+    forwarded_auth_token(o.forwarded_auth_token),
     external_tables_initializer_callback(o.external_tables_initializer_callback),
     input_initializer_callback(o.input_initializer_callback),
     input_blocks_reader(o.input_blocks_reader),

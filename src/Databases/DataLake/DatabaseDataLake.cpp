@@ -1073,13 +1073,14 @@ ASTPtr DatabaseDataLake::getCreateDatabaseQueryImpl() const
     return create_query;
 }
 
-void DatabaseDataLake::checkDatabase() const
+void DatabaseDataLake::checkDatabase(ContextPtr context_) const
 {
     auto catalog = getCatalog();
     /// This function checks if we can access catalog and get tables list.
     /// We do not check if there are tables in catalog, because even if catalog is empty, it still can be valid and working.
-    /// No context here either, so with forwarding enabled this fails closed -- see `empty()`.
-    std::ignore = catalog->empty(/* auth_token */ {});
+    /// The query context carries the querying user's token, so with `oauth_forward_user_token` the check
+    /// runs under that user's identity; a session without a token still fails closed.
+    std::ignore = catalog->empty(getForwardedAuthToken(context_));
 
 
     LOG_TEST(log, "Database '{}' is OK", getDatabaseName());

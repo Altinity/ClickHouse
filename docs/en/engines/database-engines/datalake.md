@@ -65,7 +65,7 @@ The following settings are supported:
 | `oauth_token_exchange_uri` | Empty (the default) forwards the user's token unchanged; non-empty performs an RFC 8693 token exchange at this URL first |
 | `oauth_subject_token_type` | RFC 8693 `subject_token_type` of the forwarded token. Default `urn:ietf:params:oauth:token-type:access_token` |
 | `oauth_requested_token_type` | RFC 8693 `requested_token_type`; empty omits the field. Default `urn:ietf:params:oauth:token-type:access_token` |
-| `oauth_forward_actor_token` | Send the service principal's own token as the RFC 8693 `actor_token`. Default `0` |
+| `oauth_forward_actor_token` | Send the service principal's own token as the RFC 8693 `actor_token`. Default `0`. See [Delegation with an actor token](#user-token-forwarding-actor-token) |
 | `oauth_user_token_cache_ttl` | Maximum lifetime (in seconds) of a cached exchanged session token; `0` disables caching. Default `300` |
 
 ## Examples {#examples}
@@ -172,6 +172,28 @@ the Iceberg REST specification marks that endpoint **deprecated for removal** ("
 implement… will be removed in Iceberg 2.0"), and several widely deployed catalogs (Lakekeeper among
 them) do not implement it at all. That is why the endpoint can only be reached by writing its URL
 out in full.
+
+### Delegation with an actor token {#user-token-forwarding-actor-token}
+
+By default the exchange asks for plain impersonation: the token the catalog sees names the user and
+nothing else. With `oauth_forward_actor_token = 1` the exchange also carries an `actor_token`, so a
+server that implements RFC 8693 delegation can see both parties -- `sub` is the user and `act` is
+ClickHouse -- and log or authorize accordingly. The setting requires `oauth_token_exchange_uri` and
+is rejected without it.
+
+The actor token is the service principal's own token, obtained with a `client_credentials` grant
+against `oauth_server_uri` (or the catalog's `/v1/oauth/tokens` when that setting is empty) using
+the credentials from `catalog_credential`. It is minted on first use and reused until it expires,
+and it is only ever sent as `actor_token` -- no catalog request is signed with it. Because of it,
+the `DataLakeRestCatalogClientCredentialsGrants` profile event is expected to be non-zero with this
+setting on; with it off, a non-zero value while forwarding still means a request fell back to the
+shared identity.
+
+If minting the actor token fails, the query fails. ClickHouse does not fall back to an exchange
+without delegation: silently downgrading is exactly what enabling the setting asks to avoid.
+
+Only turn it on against a server that can validate the token. An IdP cannot validate a token it did
+not issue for that purpose and will normally reject the whole exchange.
 
 ### What is and is not covered {#user-token-forwarding-scope}
 

@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <Access/AccessControl.h>
 #include <Access/Credentials.h>
 #include <Access/ForwardedAuthToken.h>
 #include <Common/Exception.h>
@@ -161,11 +162,38 @@ std::map<std::string, std::string> parseForm(const std::string & body)
     return result;
 }
 
+/// The server-level `enable_token_forwarding` switch, which `RestCatalog::getForwardedToken`
+/// re-reads on every request. It lives on the `AccessControl` of the process-wide test context and
+/// is off by default, so turning it on is a precondition of forwarding anything at all.
+struct TokenForwardingSwitch
+{
+    explicit TokenForwardingSwitch(bool enabled)
+        : previous(getContext().context->getAccessControl().isTokenForwardingEnabled())
+    {
+        set(enabled);
+    }
+
+    ~TokenForwardingSwitch() { set(previous); }
+
+    static void set(bool enabled) { getContext().context->getAccessControl().setTokenForwardingEnabled(enabled); }
+
+    const bool previous;
+};
+
 }
+
+/// A fixture rather than a line in each test: the switch is process-wide, so restoring it has to
+/// happen even when a test fails an assertion or throws -- a member destructor always runs, a
+/// trailing statement does not.
+class RestCatalogTokenForwarding : public ::testing::Test
+{
+protected:
+    TokenForwardingSwitch forwarding{true};
+};
 
 /// --- Passthrough -------------------------------------------------------------------------
 
-TEST(RestCatalogTokenForwarding, PassthroughSendsUserTokenOnEveryCall)
+TEST_F(RestCatalogTokenForwarding, PassthroughSendsUserTokenOnEveryCall)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -190,7 +218,7 @@ TEST(RestCatalogTokenForwarding, PassthroughSendsUserTokenOnEveryCall)
     EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 0u);
 }
 
-TEST(RestCatalogTokenForwarding, ForwardingOffKeepsClientCredentials)
+TEST_F(RestCatalogTokenForwarding, ForwardingOffKeepsClientCredentials)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -216,7 +244,7 @@ TEST(RestCatalogTokenForwarding, ForwardingOffKeepsClientCredentials)
 
 /// The single most important test of the feature: a session with no token must be refused, and
 /// must NOT quietly acquire the service principal's identity instead.
-TEST(RestCatalogTokenForwarding, NoUserTokenFailsClosed)
+TEST_F(RestCatalogTokenForwarding, NoUserTokenFailsClosed)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -239,7 +267,7 @@ TEST(RestCatalogTokenForwarding, NoUserTokenFailsClosed)
     EXPECT_EQ(server->countRequestsTo(NAMESPACES_PATH), 0u);
 }
 
-TEST(RestCatalogTokenForwarding, ForbiddenIsNotRetriedAsServicePrincipal)
+TEST_F(RestCatalogTokenForwarding, ForbiddenIsNotRetriedAsServicePrincipal)
 {
     TestServer server;
     installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
@@ -256,7 +284,7 @@ TEST(RestCatalogTokenForwarding, ForbiddenIsNotRetriedAsServicePrincipal)
     EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
 }
 
-TEST(RestCatalogTokenForwarding, VendedCredentialsCacheIsPerPrincipal)
+TEST_F(RestCatalogTokenForwarding, VendedCredentialsCacheIsPerPrincipal)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -317,7 +345,7 @@ TEST(RestCatalogTokenForwarding, VendedCredentialsCacheIsPerPrincipal)
 
 /// --- Token exchange ----------------------------------------------------------------------
 
-TEST(RestCatalogTokenForwarding, ExchangeRequestHasRfc8693Shape)
+TEST_F(RestCatalogTokenForwarding, ExchangeRequestHasRfc8693Shape)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -353,7 +381,7 @@ TEST(RestCatalogTokenForwarding, ExchangeRequestHasRfc8693Shape)
     EXPECT_EQ(form.count("actor_token_type"), 0u);
 }
 
-TEST(RestCatalogTokenForwarding, CatalogCallsCarryExchangedTokenNotSubjectToken)
+TEST_F(RestCatalogTokenForwarding, CatalogCallsCarryExchangedTokenNotSubjectToken)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -375,7 +403,7 @@ TEST(RestCatalogTokenForwarding, CatalogCallsCarryExchangedTokenNotSubjectToken)
     EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
 }
 
-TEST(RestCatalogTokenForwarding, ExchangedTokensAreNotSharedBetweenPrincipals)
+TEST_F(RestCatalogTokenForwarding, ExchangedTokensAreNotSharedBetweenPrincipals)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -398,7 +426,7 @@ TEST(RestCatalogTokenForwarding, ExchangedTokensAreNotSharedBetweenPrincipals)
         EXPECT_EQ(request.header("Authorization"), "Bearer session_token_1");
 }
 
-TEST(RestCatalogTokenForwarding, ExpiredSessionTokenIsExchangedAgain)
+TEST_F(RestCatalogTokenForwarding, ExpiredSessionTokenIsExchangedAgain)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -420,11 +448,13 @@ TEST(RestCatalogTokenForwarding, ExpiredSessionTokenIsExchangedAgain)
     EXPECT_GT(server->countRequestsTo(IDP_TOKEN_PATH), after_first_query);
 }
 
-TEST(RestCatalogTokenForwarding, ActorTokenIsSentOnlyWhenEnabled)
+TEST_F(RestCatalogTokenForwarding, ActorTokenCarriesServicePrincipalTokenWhenEnabled)
 {
     TestServer server;
     installCatalogShape(*server);
-    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
+    /// The service principal's own `client_credentials` grant. A hand-written route rather than
+    /// `installTokenEndpoint` so that the minted token is distinguishable from the exchanged one.
+    server->setStaticRoute(CATALOG_TOKEN_PATH, R"({"access_token":"service_principal_token","expires_in":3600})");
     installTokenEndpoint(*server, IDP_TOKEN_PATH);
 
     auto alice = makeToken(ALICE_TOKEN, "alice");
@@ -434,15 +464,52 @@ TEST(RestCatalogTokenForwarding, ActorTokenIsSentOnlyWhenEnabled)
 
     ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
 
+    /// Delegation needs a token for the actor, so exactly one `client_credentials` grant happens.
+    /// This is the one case where such a grant is legitimate while forwarding is on.
+    const auto grants = server->requestsTo(CATALOG_TOKEN_PATH);
+    ASSERT_EQ(grants.size(), 1u);
+    EXPECT_EQ(parseForm(grants.front().body).at("grant_type"), "client_credentials");
+
     const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
     ASSERT_EQ(exchanges.size(), 1u);
     const auto form = parseForm(exchanges.front().body);
-    /// No service-principal token has been minted, so there is nothing to delegate from and the
-    /// field stays absent rather than empty.
-    EXPECT_EQ(form.count("actor_token"), 0u);
+    EXPECT_EQ(form.at("subject_token"), ALICE_TOKEN);
+    EXPECT_EQ(form.at("actor_token"), "service_principal_token");
+    EXPECT_EQ(form.at("actor_token_type"), "urn:ietf:params:oauth:token-type:access_token");
+
+    /// `sub=user, act=clickhouse`: the catalog is still called with the exchanged user session,
+    /// never with the service principal's own token.
+    for (const auto & request : server->requestsTo(NAMESPACES_PATH))
+        EXPECT_EQ(request.header("Authorization"), "Bearer session_token_0");
 }
 
-TEST(RestCatalogTokenForwarding, ExchangeErrorDoesNotEchoSubjectToken)
+TEST_F(RestCatalogTokenForwarding, ActorTokenIsAbsentWhenDisabled)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    /// Registered so that a `client_credentials` grant is *recorded* rather than throwing.
+    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
+    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(
+        server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH, /* cache_ttl */ 300, /* actor */ false), "client:secret");
+
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+
+    const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
+    ASSERT_EQ(exchanges.size(), 1u);
+    const auto form = parseForm(exchanges.front().body);
+    /// Absent rather than empty: an empty `actor_token` is not the same thing as no delegation,
+    /// and strict servers reject it.
+    EXPECT_EQ(form.count("actor_token"), 0u);
+    EXPECT_EQ(form.count("actor_token_type"), 0u);
+    /// With delegation off nothing is minted for the service principal either.
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+}
+
+TEST_F(RestCatalogTokenForwarding, ExchangeErrorDoesNotEchoSubjectToken)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -470,7 +537,7 @@ TEST(RestCatalogTokenForwarding, ExchangeErrorDoesNotEchoSubjectToken)
     }
 }
 
-TEST(RestCatalogTokenForwarding, ResponseWithoutAccessTokenIsReportedClearly)
+TEST_F(RestCatalogTokenForwarding, ResponseWithoutAccessTokenIsReportedClearly)
 {
     TestServer server;
     installCatalogShape(*server);
@@ -490,6 +557,60 @@ TEST(RestCatalogTokenForwarding, ResponseWithoutAccessTokenIsReportedClearly)
         EXPECT_EQ(e.code(), DB::ErrorCodes::DATALAKE_DATABASE_ERROR);
         EXPECT_NE(e.displayText().find("no `access_token` field"), std::string::npos) << e.displayText();
     }
+}
+
+/// --- Runtime toggle ----------------------------------------------------------------------
+
+/// `enable_token_forwarding` is hot-reloadable, but it is consulted at authentication time, so a
+/// session that captured a token before the operator turned it off would otherwise keep forwarding
+/// that token for the whole life of the connection. An operator responding to a credential leak
+/// cannot wait for every open connection to be closed, so the switch is re-read per request.
+TEST_F(RestCatalogTokenForwarding, DisablingTheServerSwitchAtRuntimeStopsForwarding)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    /// Registered so that a fallback to the service principal is *recorded* rather than throwing.
+    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
+    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+
+    /// With the switch on, forwarding works and the exchanged session token is cached.
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+
+    TokenForwardingSwitch::set(false);
+    server->clearRequests();
+
+    try
+    {
+        catalog->getTables(alice);
+        FAIL() << "expected the catalog to stop forwarding once the server setting was turned off";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE);
+        /// The session does have a token, so the message must name the real reason rather than
+        /// reuse the "no token on this session" wording.
+        const std::string message = e.displayText();
+        EXPECT_NE(message.find("`enable_token_forwarding` setting is off"), std::string::npos) << message;
+        EXPECT_EQ(message.find("this session has none"), std::string::npos) << message;
+    }
+
+    /// Refused, not quietly downgraded to the service principal.
+    EXPECT_EQ(server->countRequestsTo(NAMESPACES_PATH), 0u);
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+    EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 0u);
+
+    /// Turning the switch back on must not resurrect the session token minted under the old
+    /// policy: it was dropped, so the catalog exchanges again.
+    TokenForwardingSwitch::set(true);
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    for (const auto & request : server->requestsTo(NAMESPACES_PATH))
+        EXPECT_EQ(request.header("Authorization"), "Bearer session_token_1");
 }
 
 #endif

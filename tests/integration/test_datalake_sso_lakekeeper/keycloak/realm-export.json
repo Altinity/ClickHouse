@@ -4,14 +4,24 @@
   "sslRequired": "none",
   "registrationAllowed": false,
   "accessTokenLifespan": 1800,
-  "clientScopes": [
+  "clients": [
     {
-      "name": "lakekeeper",
-      "description": "Adds the `lakekeeper` audience, which Lakekeeper checks on every request.",
+      "clientId": "clickhouse",
+      "enabled": true,
+      "secret": "clickhouse-secret",
+      "publicClient": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "standardFlowEnabled": true,
       "protocol": "openid-connect",
+      "redirectUris": [
+        "*"
+      ],
+      "webOrigins": [
+        "*"
+      ],
       "attributes": {
-        "include.in.token.scope": "true",
-        "display.on.consent.screen": "false"
+        "standard.token.exchange.enabled": "true"
       },
       "protocolMappers": [
         {
@@ -27,29 +37,6 @@
           }
         }
       ]
-    }
-  ],
-  "clients": [
-    {
-      "clientId": "clickhouse",
-      "enabled": true,
-      "secret": "clickhouse-secret",
-      "publicClient": false,
-      "directAccessGrantsEnabled": true,
-      "serviceAccountsEnabled": false,
-      "standardFlowEnabled": true,
-      "protocol": "openid-connect",
-      "redirectUris": ["*"],
-      "webOrigins": ["*"],
-      "defaultClientScopes": [
-        "acr",
-        "basic",
-        "email",
-        "profile",
-        "roles",
-        "web-origins",
-        "lakekeeper"
-      ]
     },
     {
       "clientId": "clickhouse-exchange",
@@ -60,24 +47,26 @@
       "serviceAccountsEnabled": false,
       "standardFlowEnabled": true,
       "protocol": "openid-connect",
-      "redirectUris": ["*"],
-      "webOrigins": ["*"],
-      "attributes": {
-        "standard.token.exchange.enabled": "true"
-      },
-      "defaultClientScopes": ["acr", "basic", "email", "profile", "roles", "web-origins"],
-      "optionalClientScopes": ["lakekeeper"]
-    },
-    {
-      "clientId": "lakekeeper",
-      "enabled": true,
-      "secret": "lakekeeper-secret",
-      "publicClient": false,
-      "bearerOnly": false,
-      "directAccessGrantsEnabled": false,
-      "serviceAccountsEnabled": false,
-      "standardFlowEnabled": false,
-      "protocol": "openid-connect"
+      "redirectUris": [
+        "*"
+      ],
+      "webOrigins": [
+        "*"
+      ],
+      "protocolMappers": [
+        {
+          "name": "clickhouse-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "clickhouse",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "users": [
@@ -89,8 +78,16 @@
       "firstName": "Lakekeeper",
       "lastName": "Admin",
       "requiredActions": [],
-      "credentials": [{ "type": "password", "value": "secret", "temporary": false }],
-      "realmRoles": ["default-roles-clickhouse-test"]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "secret",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-clickhouse-test"
+      ]
     },
     {
       "username": "alice",
@@ -100,8 +97,16 @@
       "firstName": "Alice",
       "lastName": "Tester",
       "requiredActions": [],
-      "credentials": [{ "type": "password", "value": "secret", "temporary": false }],
-      "realmRoles": ["default-roles-clickhouse-test"]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "secret",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-clickhouse-test"
+      ]
     },
     {
       "username": "bob",
@@ -111,8 +116,16 @@
       "firstName": "Bob",
       "lastName": "Tester",
       "requiredActions": [],
-      "credentials": [{ "type": "password", "value": "secret", "temporary": false }],
-      "realmRoles": ["default-roles-clickhouse-test"]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "secret",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-clickhouse-test"
+      ]
     }
   ]
 }

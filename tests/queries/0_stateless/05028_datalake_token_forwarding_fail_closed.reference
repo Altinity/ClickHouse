@@ -8,7 +8,9 @@ CATALOG_USER_TOKEN_NOT_AVAILABLE
 CATALOG_USER_TOKEN_NOT_AVAILABLE
 -- SHOW TABLES discloses nothing
 0
--- error message names the remedies
-enable_token_forwarding
--- nothing token-shaped in query_log
+-- the error names the server-level switch as the cause
+server-level `enable_token_forwarding` setting is off
+-- the credential never reaches system.query_log
+0
+-- nor the server log
 0

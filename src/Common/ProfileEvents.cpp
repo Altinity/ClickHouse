@@ -1718,7 +1718,7 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeRestCatalogTokenExchangeMicroseconds, "Total time of RFC 8693 token exchanges.", ValueType::Microseconds) \
     M(DataLakeRestCatalogTokenExchangeFailures, "Number of RFC 8693 token exchanges that failed.", ValueType::Number) \
     M(DataLakeRestCatalogUserTokenCacheHits, "Number of times a previously exchanged per-user session token was reused.", ValueType::Number) \
-    M(DataLakeRestCatalogClientCredentialsGrants, "Number of `client_credentials` grants performed as the catalog service principal. Must stay at zero while user token forwarding is enabled: a non-zero value means a request fell back to the shared identity.", ValueType::Number) \
+    M(DataLakeRestCatalogClientCredentialsGrants, "Number of `client_credentials` grants performed as the catalog service principal. While user token forwarding is enabled the only legitimate source is `oauth_forward_actor_token`, which mints this token to send as the RFC 8693 `actor_token`; with that setting off the event must stay at zero, and a non-zero value means a request fell back to the shared identity.", ValueType::Number) \
     \
     M(DataLakeRestCatalogLoadConfig, "Number of 'load config' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogLoadConfigMicroseconds, "Total time of 'load config' requests to Iceberg REST catalog.", ValueType::Microseconds) \

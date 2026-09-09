@@ -1,6 +1,7 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Net/HTTPRequest.h>
+#include <Access/AccessControl.h>
 #include <Access/ForwardedAuthToken.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
@@ -683,6 +684,36 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_conte
 String RestCatalog::getForwardedToken(
     const CatalogState & catalog_state, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const
 {
+    /// Re-read the server-level switch on every forwarded request instead of trusting the decision
+    /// `Session::authenticate` made once. `enable_token_forwarding` is hot-reloadable
+    /// (`AccessControl::setExternalAuthenticatorsConfig` re-reads it on `SYSTEM RELOAD CONFIG`), so
+    /// without this an operator turning it off in response to a credential leak or an IdP outage
+    /// would keep forwarding the token captured by every already-authenticated session -- for the
+    /// whole life of a native connection or a named session -- until the server restarts.
+    ///
+    /// Checked before the token itself: when the switch is off it is the reason a session has no
+    /// token in the first place, so reporting the missing token would name a symptom, not a cause.
+    if (!getContext()->getGlobalContext()->getAccessControl().isTokenForwardingEnabled())
+    {
+        /// Session tokens exchanged while the previous policy was in force must not outlive it:
+        /// dropping them means turning the switch back on cannot serve a token minted under the
+        /// policy the operator has just revoked, and every user is exchanged for anew. The clear
+        /// costs nothing that matters -- this path throws, so it is only ever reached by a request
+        /// that is about to fail anyway.
+        user_token_cache.clear();
+
+        throw DB::Exception(
+            DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
+            "Catalog `{}` is configured with `oauth_forward_user_token = 1`, but the server-level "
+            "`enable_token_forwarding` setting is off, so the querying user's token cannot be "
+            "presented to the catalog. Falling back to the catalog's service principal would run "
+            "the query under the wrong identity, so the request is refused instead. Set "
+            "`enable_token_forwarding` to `1` in the server configuration and reconnect (a session "
+            "authenticated while the setting was off carries no token), or recreate the database "
+            "without `oauth_forward_user_token`.",
+            warehouse);
+    }
+
     if (!auth_token || auth_token->token.empty())
         throw DB::Exception(
             DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
@@ -745,13 +776,13 @@ AccessToken RestCatalog::exchangeUserToken(const CatalogState & catalog_state, c
     /// An `actor_token` is only meaningful to a server that can validate it, and the catalog's
     /// own service token is not something an IdP can. Off by default; turn it on for a
     /// spec-implementing catalog to get RFC 8693 delegation semantics (`sub=user, act=clickhouse`).
+    /// Minting it is a `client_credentials` grant; if it fails the error propagates, because an
+    /// exchange silently downgraded from delegation to plain impersonation is exactly what
+    /// enabling the setting was meant to prevent.
     if (token_forwarding.forward_actor_token)
     {
-        if (auto current = access_token.get(); current && !current->token.empty())
-        {
-            request.actor_token = current->token;
-            request.actor_token_type = "urn:ietf:params:oauth:token-type:access_token";
-        }
+        request.actor_token = getServicePrincipalToken(catalog_state);
+        request.actor_token_type = "urn:ietf:params:oauth:token-type:access_token";
     }
 
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogTokenExchange);
@@ -1189,6 +1220,21 @@ AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, cons
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
     return requestToken(request);
+}
+
+String RestCatalog::getServicePrincipalToken(const CatalogState & catalog_state) const
+{
+    /// Same caching rule as the `client_credentials` branch of `getAuthHeaders`: reuse the token
+    /// held in `access_token` until it falls outside its validity window, then mint a new one.
+    /// Storing it there is what that member is for -- it is the service principal's token, shared
+    /// by every user of the database, and never a per-user one.
+    auto current = access_token.get();
+    if (!current || current->isExpired())
+    {
+        access_token.set(std::make_unique<AccessToken>(retrieveAccessToken(catalog_state.client_id, catalog_state.client_secret)));
+        current = access_token.get();
+    }
+    return current->token;
 }
 
 BigLakeCatalog::BigLakeCatalog(
