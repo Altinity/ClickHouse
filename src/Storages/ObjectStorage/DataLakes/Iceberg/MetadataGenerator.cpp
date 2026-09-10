@@ -526,6 +526,19 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
                             ErrorCodes::BAD_ARGUMENTS,
                             "Cannot drop column '{}' (field id {}): it is referenced by the active sort order",
                             column_name, dropped_field_id);
+                    /// Also check multi-arg V3 sort fields
+                    if (sf->has(Iceberg::f_source_ids))
+                    {
+                        auto ids = sf->getArray(Iceberg::f_source_ids);
+                        for (UInt32 k = 0; k < ids->size(); ++k)
+                        {
+                            if (ids->getElement<Int32>(k) == dropped_field_id)
+                                throw Exception(
+                                    ErrorCodes::BAD_ARGUMENTS,
+                                    "Cannot drop column '{}' (field id {}): it is referenced by the active sort order (multi-arg transform)",
+                                    column_name, dropped_field_id);
+                        }
+                    }
                 }
                 break;
             }
@@ -553,6 +566,19 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
                         ErrorCodes::BAD_ARGUMENTS,
                         "Cannot drop column '{}' (field id {}): it is referenced by the active partition spec",
                         column_name, dropped_field_id);
+                /// Also check multi-arg V3 partition fields
+                if (pf->has(Iceberg::f_source_ids))
+                {
+                    auto ids = pf->getArray(Iceberg::f_source_ids);
+                    for (UInt32 k = 0; k < ids->size(); ++k)
+                    {
+                        if (ids->getElement<Int32>(k) == dropped_field_id)
+                            throw Exception(
+                                ErrorCodes::BAD_ARGUMENTS,
+                                "Cannot drop column '{}' (field id {}): it is referenced by the active partition spec (multi-arg transform)",
+                                column_name, dropped_field_id);
+                    }
+                }
             }
             break;
         }
