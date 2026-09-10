@@ -973,7 +973,7 @@ QueryTreeNodePtr buildQueryTreeForShard(
             auto tables_count = cross_join_node->getTableExpressions().size();
             for (size_t i = 1; i < tables_count; ++i)
             {
-                QueryTreeNodePtr join_table_expression = cross_join_node->getTableExpressions()[i];
+                TableExpressionNodePtr join_table_expression = cross_join_node->getTableExpressionTypedAt(i);
 
                 auto subquery_node = getSubqueryFromTableExpression(join_table_expression, column_source_to_columns, planner_context->getQueryContext());
 
@@ -992,7 +992,8 @@ QueryTreeNodePtr buildQueryTreeForShard(
                     const auto * descendant = descendants_to_map.back();
                     descendants_to_map.pop_back();
 
-                    replacement_map.emplace(descendant, temporary_table_expression_node);
+                    if (const auto * ptr = descendant->asTableExpression())
+                        replacement_map.emplace(ptr, temporary_table_expression_node);
 
                     for (const auto & child : descendant->getChildren())
                         if (child)
@@ -1162,7 +1163,7 @@ public:
             if (!rewrite_for_distributed)
             {
                 bool no_replace = true;
-                for (const auto & table_node : extractTableExpressions(query->getJoinTree(), false, true))
+                for (const auto & table_node : extractTableExpressions(query->getJoinTreeNodeTyped(), false, true))
                 {
                     const StorageDistributed * storage_distributed = nullptr;
                     if (const TableNode * table_node_typed = table_node->as<TableNode>())

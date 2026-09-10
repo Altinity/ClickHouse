@@ -1761,7 +1761,8 @@ DataLakeMetadataPtr IcebergMetadata::createWithDeserialization(
             configuration_ptr->getTypeName(),
             configuration_ptr->getNamespace()),
         /// Consistent with the resolver above, which is rooted at `table_path` itself.
-        .table_root_was_derived = false};
+        .table_root_was_derived = false,
+        .common_namespace = configuration_ptr->getNamespace()};
     auto metadata = std::make_unique<IcebergMetadata>(object_storage, configuration.lock(), std::move(deserialized_persistent_components), local_context);
     return metadata;
 }
@@ -1884,7 +1885,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
     Int64 partition_spec_id,
     const std::vector<Field> & partition_values,
     const std::vector<String> & partition_columns,
-    const std::vector<DataTypePtr> & partition_types,
+    const DataTypes & partition_types,
     SharedHeader sample_block,
     const std::vector<String> & data_file_paths,
     const std::vector<IcebergSerializedFileStats> & per_file_stats,

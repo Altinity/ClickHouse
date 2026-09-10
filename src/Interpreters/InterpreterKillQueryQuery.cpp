@@ -311,7 +311,8 @@ BlockIO InterpreterKillQueryQuery::execute()
                     alter_command.to_table = dst_table;
 
                     required_access_rights = InterpreterAlterQuery::getRequiredAccessForCommand(
-                        alter_command, table_id.database_name, table_id.table_name);
+                        alter_command, table_id.database_name, table_id.table_name,
+                        InterpreterAlterQuery::isRowExistsLightweightDeleteMarker(storage, getContext()));
                     if (!access->isGranted(required_access_rights))
                     {
                         access_denied = true;

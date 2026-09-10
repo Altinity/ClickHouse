@@ -266,7 +266,7 @@ TEST(RendezvousHashing, DoesNotDeduplicateSamePathFromDifferentReadSources)
 
     auto iterator = std::make_shared<TestIterator>(paths);
     std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
 
     std::vector<std::optional<size_t>> read_source_indices;
     ASSERT_TRUE(extractNForReplica(distributor, read_source_indices, 0, 2));

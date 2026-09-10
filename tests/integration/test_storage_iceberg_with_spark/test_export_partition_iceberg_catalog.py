@@ -130,6 +130,10 @@ def connect_catalog(cluster):
 def setup_ch_catalog_db(node, db_name: str = CH_CATALOG_DB) -> None:
     """Drop-and-recreate the ClickHouse DataLakeCatalog database pointing at Glue (Moto)."""
     node.query(f"DROP DATABASE IF EXISTS {db_name}")
+    # The Glue catalog API client is subject to the server-managed credential restriction:
+    # unless the session opts in via `s3_allow_server_credentials_in_user_queries`, the creator
+    # must pass explicit catalog credentials instead of falling back to the server's AWS
+    # identity (moto accepts any non-empty values). Same convention as test_database_glue.
     node.query(
         f"""
         SET write_full_path_in_iceberg_metadata = 1;
@@ -139,7 +143,9 @@ def setup_ch_catalog_db(node, db_name: str = CH_CATALOG_DB) -> None:
         SETTINGS catalog_type = 'glue',
                  warehouse = 'test',
                  storage_endpoint = '{GLUE_WAREHOUSE_ENDPOINT}',
-                 region = 'us-east-1'
+                 region = 'us-east-1',
+                 aws_access_key_id = '{minio_access_key}',
+                 aws_secret_access_key = '{minio_secret_key}'
         """
     )
 

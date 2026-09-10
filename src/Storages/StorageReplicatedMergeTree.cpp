@@ -568,19 +568,19 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
 
         export_merge_tree_partition_task_scheduler = std::make_shared<ExportPartitionTaskScheduler>(*this);
 
-        export_merge_tree_partition_updating_task = getContext()->getSchedulePool().createTask(
+        export_merge_tree_partition_updating_task = getContext()->getSchedulePool()->createTask(
             getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_updating_task)", [this] { exportMergeTreePartitionUpdatingTask(); });
 
         export_merge_tree_partition_updating_task->deactivate();
 
-        export_merge_tree_partition_status_handling_task = getContext()->getSchedulePool().createTask(
+        export_merge_tree_partition_status_handling_task = getContext()->getSchedulePool()->createTask(
             getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_status_handling_task)", [this] { exportMergeTreePartitionStatusHandlingTask(); });
 
         export_merge_tree_partition_status_handling_task->deactivate();
 
         export_merge_tree_partition_watch_callback = export_merge_tree_partition_updating_task->getWatchCallback();
 
-        export_merge_tree_partition_select_task = getContext()->getSchedulePool().createTask(
+        export_merge_tree_partition_select_task = getContext()->getSchedulePool()->createTask(
             getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_select_task)", [this] { selectPartsToExport(); });
 
         export_merge_tree_partition_select_task->deactivate();

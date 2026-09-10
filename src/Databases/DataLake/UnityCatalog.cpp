@@ -15,6 +15,9 @@
 #include <Databases/DataLake/StorageCredentials.h>
 #include <fmt/ranges.h>
 
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+
 namespace DB::ErrorCodes
 {
     extern const int DATALAKE_DATABASE_ERROR;

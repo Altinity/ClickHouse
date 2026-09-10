@@ -327,8 +327,8 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
 
             if (info.has_join)
             {
-                auto join_node = query_node.getJoinTree();
-                query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
+                const auto & join_node = query_node.getJoinTreeNode();
+                query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpressionNode()->clone();
             }
             else if (info.has_cross_join)
             {
@@ -360,7 +360,8 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
                 auto column_nodes_to_select = std::make_shared<ListNode>();
                 column_nodes_to_select->getNodes().reserve(columns.size());
                 for (auto & column : columns)
-                    column_nodes_to_select->getNodes().emplace_back(std::make_shared<ColumnNode>(column, table_function_node));
+                    column_nodes_to_select->getNodes().emplace_back(
+                        std::make_shared<ColumnNode>(column, std::static_pointer_cast<ITableExpressionNode>(table_function_node)));
                 query_node.getProjectionNode() = column_nodes_to_select;
             }
 
@@ -383,7 +384,8 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
             if (query_tree_distributed)
             {
                 // Left only table function to send on cluster nodes
-                modified_query_tree = modified_query_tree->cloneAndReplace(query_node.getJoinTree(), query_tree_distributed);
+                modified_query_tree = modified_query_tree->cloneAndReplace(
+                    query_node.getJoinTreeNodeTyped(), std::static_pointer_cast<ITableExpressionNode>(query_tree_distributed));
             }
 
             query_to_send = queryNodeToDistributedSelectQuery(modified_query_tree);
@@ -730,7 +732,7 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
     QueryTreeInfo info;
 
     auto & query_node = query_tree->as<QueryNode &>();
-    if (auto join_node = query_node.getJoinTree())
+    if (const auto & join_node = query_node.getJoinTreeNode())
     {
         if (join_node->getNodeType() == QueryTreeNodeType::JOIN)
             info.has_join = true;

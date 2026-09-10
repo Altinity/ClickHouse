@@ -510,6 +510,9 @@ StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
 {
     /// TODO: add tests for azure, local storage types.
 
+    const auto settings_version = database_settings.get();
+    const DatabaseDataLakeSettings & settings = *settings_version;
+
     auto catalog = getCatalog();
     switch (catalog->getCatalogType())
     {

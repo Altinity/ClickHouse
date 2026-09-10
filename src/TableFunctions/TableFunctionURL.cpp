@@ -418,7 +418,10 @@ ColumnsDescription TableFunctionURL::getActualTableStructure(ContextPtr context,
         {
             checkExperimentalURLWildcardFromIndexPages(context);
 
-            auto object_storage_configuration = std::make_shared<StorageWebConfiguration>();
+            /// Note: the base-class pointer type is required because
+            /// StorageObjectStorage::resolveSchemaAndFormatFromData() takes a non-const
+            /// reference to StorageObjectStorageConfigurationPtr.
+            StorageObjectStorageConfigurationPtr object_storage_configuration = std::make_shared<StorageWebConfiguration>();
             auto engine_args = makeWebObjectStorageEngineArgs(filename, format, structure, compression_method, configuration.headers);
             object_storage_configuration->initialize(engine_args, context, /* with_table_structure */ true);
             object_storage_configuration->check(context);

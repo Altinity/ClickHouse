@@ -298,6 +298,24 @@ void StorageObjectStorageConfiguration::initPartitionStrategy(ASTPtr partition_b
     {
         LOG_DEBUG(getLogger("StorageObjectStorageConfiguration"), "Initialized partition strategy {}", magic_enum::enum_name(partition_strategy_type));
     }
+
+    /// `initialize()` picks the file path generator from the `partition_strategy_type` known at
+    /// parse time, which is before the strategy can be inferred here (a `PARTITION BY` without an
+    /// explicit `partition_strategy` resolves to `hive` by default). Rebuild the generator once the
+    /// effective strategy is known, otherwise every hive partition would be written to the raw path
+    /// and reads would not look into the partition directories.
+    if (partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE
+        && !std::dynamic_pointer_cast<ObjectStorageAppendFilePathGenerator>(file_path_generator))
+    {
+        /// Keep a read path that does not come from the generator (e.g. set up from a disk) as is.
+        const bool read_path_derived_from_generator
+            = file_path_generator && read_path.path == file_path_generator->getPathForRead();
+
+        file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(getRawPath().path, format);
+
+        if (read_path_derived_from_generator)
+            read_path = Path{file_path_generator->getPathForRead()};
+    }
 }
 
 const StorageObjectStorageConfiguration::Path & StorageObjectStorageConfiguration::getPathForRead() const

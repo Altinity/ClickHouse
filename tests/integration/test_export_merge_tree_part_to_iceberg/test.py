@@ -809,6 +809,18 @@ def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_igno
 
 def test_export_part_ignore_extra_column_breaks_hybrid_over_source_and_destination(cluster):
     node = cluster.instances["node1"]
+
+    # The Hybrid table engine (and its `allow_experimental_hybrid_table` guard) is an
+    # Antalya feature that is not present in every base version, so exercise this
+    # scenario only where the server actually knows the engine.
+    if (
+        node.query(
+            "SELECT count() FROM system.settings WHERE name = 'allow_experimental_hybrid_table'"
+        ).strip()
+        == "0"
+    ):
+        pytest.skip("The Hybrid table engine is not available in this build")
+
     sfx = unique_suffix()
     mt = f"mt_hybrid_extra_{sfx}"
     iceberg = f"iceberg_hybrid_extra_{sfx}"

@@ -429,7 +429,7 @@ public:
 
     bool supportsLazyMaterialization(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override
     {
-        assertInitialized();
+        assertInitializedDL();
         return current_metadata->supportsLazyMaterialization(storage_metadata_snapshot, context);
     }
 

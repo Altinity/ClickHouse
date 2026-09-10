@@ -277,7 +277,7 @@ private:
         Int64 partition_spec_id,
         const std::vector<Field> & partition_values,
         const std::vector<String> & partition_columns,
-        const std::vector<DataTypePtr> & partition_types,
+        const DataTypes & partition_types,
         SharedHeader sample_block,
         const std::vector<String> & data_file_paths,
         const std::vector<IcebergSerializedFileStats> & per_file_stats,
