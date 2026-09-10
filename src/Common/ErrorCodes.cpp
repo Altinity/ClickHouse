@@ -681,6 +681,7 @@
     M(1006, INVALID_CURSOR_LOOKUP) \
     M(1007, ILLEGAL_STREAM) \
     M(1008, TEMPORARY_DATA_NOT_IN_CACHE) \
+<<<<<<< HEAD
     M(1009, S3_OBJECT_CHANGED_DURING_READ) \
     M(1010, UNIQUE_KEY_DENSE_INDEX_UNREADABLE) \
     M(1011, HANDLER_ALREADY_EXISTS) \
@@ -691,6 +692,21 @@
     M(1016, PENDING_MUTATIONS_NOT_ALLOWED) \
     M(1017, EXPORT_PARTITION_ALREADY_EXPORTED) \
     M(1018, PARTITION_EXPORT_FAILED) \
+=======
+    M(1009, PENDING_MUTATIONS_NOT_ALLOWED) \
+    /* 1010 and 1011 predate the fork's error-code range policy stated below, and are kept as-is \
+     * rather than renumbered: they currently collide with upstream ClickHouse's own 1010 \
+     * (UNIQUE_KEY_DENSE_INDEX_UNREADABLE) and 1011 (HANDLER_ALREADY_EXISTS). */ \
+    M(1010, EXPORT_PARTITION_ALREADY_EXPORTED) \
+    M(1011, PARTITION_EXPORT_FAILED) \
+    /* 1012 and 1013 are intentionally skipped: they collide with upstream ClickHouse's \
+     * HANDLER_DOESNT_EXIST and AMBIGUOUS_HANDLER. Fork-specific error codes live in the 1030-1099 \
+     * range, chosen to sit well above upstream's maximum error code (1017 at the time this range \
+     * was reserved) so upstream can keep adding codes below it without colliding with the fork's. \
+     * A new fork error code goes in this range, not below 1030. CAS codes occupy 1037-1038. */ \
+    M(1037, CAS_WRITE_UNATTRIBUTED) \
+    M(1038, CAS_DELETE_MARKER) \
+>>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -707,6 +723,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
+<<<<<<< HEAD
     constexpr ErrorCode END = 1018;
 
 #if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
@@ -715,6 +732,9 @@ namespace ErrorCodes
       * around 150 KB of data for the whole table, which the server wants for `system.errors` but a
       * standalone build of the parser has nothing to do with: the names above are all it needs.
       */
+=======
+    constexpr ErrorCode END = 1038;
+>>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
     ErrorPairHolder values[END + 1]{};
 #endif
 

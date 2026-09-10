@@ -371,7 +371,9 @@ static struct InitFiu
     REGULAR(smt_force_takeover_predicate_true) \
     REGULAR(smt_takeover_fake_hardware_error_after_set) \
     REGULAR(cas_relink_receiver_force_mechanism_failure) \
-    PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm)
+    PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm) \
+    REGULAR(cas_relink_sender_omit_pool_cookie) \
+    REGULAR(cas_relink_receiver_drop_forced_disk)
 
 namespace FailPoints
 {
