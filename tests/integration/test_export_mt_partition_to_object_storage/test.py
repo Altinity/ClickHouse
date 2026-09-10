@@ -61,10 +61,14 @@ def drop_tables_after_test(cluster):
             ).strip()
             if not tables_str:
                 continue
-            for table in tables_str.split("\n"):
-                table = table.strip()
-                if table:
-                    instance.query(f"DROP TABLE IF EXISTS default.`{table}` SYNC")
+            # One client invocation for the whole batch. Every query spawns a fresh client
+            # process, which costs seconds on a sanitizer build, so dropping tables one at a
+            # time made teardown a large share of this suite's runtime.
+            tables = [table.strip() for table in tables_str.split("\n") if table.strip()]
+            if tables:
+                instance.query(
+                    "".join(f"DROP TABLE IF EXISTS default.`{table}` SYNC;" for table in tables)
+                )
         except Exception as e:
             logging.warning(f"drop_tables_after_test: cleanup failed on {instance_name}: {e}")
 
