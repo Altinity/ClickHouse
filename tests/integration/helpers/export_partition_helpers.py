@@ -79,6 +79,55 @@ def wait_for_export_status(
     )
 
 
+def export_transaction_id(
+    node,
+    source_table,
+    dest_table,
+    partition_id,
+    system_table="partition_exports",
+):
+    """Return the current transaction id of a partition export, or an empty string if none."""
+    dest_filter = f" AND destination_table = '{dest_table}'" if dest_table else ""
+    return node.query(
+        f"SELECT transaction_id FROM system.{system_table}"
+        f" WHERE source_table = '{source_table}'"
+        f"{dest_filter}"
+        f" AND partition_id = '{partition_id}'"
+    ).strip()
+
+
+def wait_for_new_export_transaction(
+    node,
+    source_table,
+    dest_table,
+    partition_id,
+    previous_transaction_id,
+    timeout=60,
+    poll_interval=0.2,
+    system_table="partition_exports",
+):
+    """Wait until the export entry carries a transaction id other than *previous_transaction_id*.
+
+    A force re-export replaces the entry. Without this wait, the COMPLETED status of the export
+    being replaced can still be visible in the in-memory mirror and satisfy a status wait
+    immediately, before the new export has even started.
+    """
+    start_time = time.time()
+    last_transaction_id = None
+    while time.time() - start_time < timeout:
+        last_transaction_id = export_transaction_id(
+            node, source_table, dest_table, partition_id, system_table=system_table
+        )
+        if last_transaction_id and last_transaction_id != previous_transaction_id:
+            return last_transaction_id
+        time.sleep(poll_interval)
+
+    raise TimeoutError(
+        f"Export transaction id did not change from {previous_transaction_id!r} within {timeout}s. "
+        f"Last seen: {last_transaction_id!r}"
+    )
+
+
 def wait_for_export_to_start(
     node,
     source_table,

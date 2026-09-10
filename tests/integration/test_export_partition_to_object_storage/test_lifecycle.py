@@ -1,9 +1,11 @@
 import uuid
 
 from helpers.export_partition_helpers import (
+    export_transaction_id,
     is_replicated_engine,
     make_source,
     wait_for_export_status,
+    wait_for_new_export_transaction,
 )
 
 from .common import (
@@ -138,6 +140,228 @@ def test_export_partition_file_already_exists_policy(cluster, source_engine):
           AND status = 'FAILED'
         """
     ) == '1\n', "Expected the export to be marked as FAILED"
+
+
+def create_split_export_tables(node, mt_table, s3_table, replica_name, engine):
+    """Create a source table whose part splits into one destination file per row on export.
+
+    `export_merge_tree_part_max_rows_per_file` is evaluated once per chunk rather than per row
+    (see `MultiFileStorageObjectStorageSink::consume`), and `MergeTreeSequentialSource` emits one
+    chunk per index granule, so a part can only split at granule boundaries. With the default
+    granularity a small part is a single granule and never splits at all, hence
+    `index_granularity = 1`. `index_granularity_bytes = 0` disables adaptive granularity, which
+    would otherwise choose the granule size itself.
+    """
+    node.query(f"DROP TABLE IF EXISTS {mt_table} SYNC")
+    make_source(
+        node, mt_table, "id UInt64, year UInt16", "year",
+        engine=engine, replica_name=replica_name,
+        extra_settings="index_granularity = 1, index_granularity_bytes = 0",
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
+    create_s3_table(node, s3_table)
+
+
+def export_partition_split_into_files(
+    node, mt_table, s3_table, force=False, policy=None, previous_transaction_id=None
+):
+    """Export partition 2020 with one row per destination file and wait for completion.
+
+    Only splits per row for a table built by `create_split_export_tables`.
+    """
+    settings = ["export_merge_tree_part_max_rows_per_file = 1"]
+    if force:
+        settings.append("export_merge_tree_partition_force_export = 1")
+    if policy:
+        settings.append(f"export_merge_tree_part_file_already_exists_policy = '{policy}'")
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS {', '.join(settings)}"
+    )
+
+    if previous_transaction_id is not None:
+        wait_for_new_export_transaction(node, mt_table, s3_table, "2020", previous_transaction_id)
+
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
+
+
+def recorded_export_paths(node, mt_table, s3_table):
+    """Destination file paths recorded for the exported parts, in the order the sink wrote them.
+
+    This is what the commit phase turns into the partition commit marker.
+    """
+    paths = node.query(
+        f"""
+        SELECT arrayJoin(arrayFlatten(mapValues(destination_file_paths)))
+        FROM system.partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    )
+    return [path for path in paths.splitlines() if path]
+
+
+def partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engine):
+    """Data-file paths listed inside the partition-level commit marker."""
+    committed_marker_file = node.query(
+        f"""
+        SELECT committed_marker_file FROM system.partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    ).strip()
+
+    if is_replicated_engine(source_engine):
+        assert f"{s3_table}/commit_2020_" in committed_marker_file, \
+            f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
+        marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
+    else:
+        # A plain MergeTree does not persist the commit path, so find the marker in object storage.
+        assert committed_marker_file == "", (
+            f"Expected an empty committed_marker_file for a plain MergeTree source, "
+            f"got: {committed_marker_file!r}"
+        )
+        exported_paths = recorded_export_paths(node, mt_table, s3_table)
+        assert exported_paths, "Need at least one recorded data path to locate the partition commit marker"
+        table_prefix = exported_paths[0][:exported_paths[0].index(f"{s3_table}/") + len(s3_table) + 1]
+        marker_keys = [
+            obj.object_name
+            for obj in cluster.minio_client.list_objects(
+                cluster.minio_bucket, prefix=table_prefix, recursive=True
+            )
+            if obj.object_name.rsplit("/", 1)[-1].startswith("commit_2020_")
+        ]
+        assert len(marker_keys) == 1, \
+            f"Expected one partition commit marker under {table_prefix}, got {marker_keys}"
+        marker_relative_path = marker_keys[0][marker_keys[0].index(f"{s3_table}/"):]
+
+    lines = node.query(
+        f"SELECT * FROM s3(s3_conn, filename='{marker_relative_path}', format=LineAsString)"
+    )
+    return [line for line in lines.splitlines() if line]
+
+
+def list_partition_directory(cluster, data_path):
+    """Object keys sitting next to *data_path*, split into data files and commit markers.
+
+    The per-part commit marker is written by `MultiFileStorageObjectStorageSink::commit` in the
+    same directory as the data files, named `commit_<destination file name>`.
+    """
+    directory = data_path.rsplit("/", 1)[0] + "/"
+    object_names = sorted(
+        obj.object_name
+        for obj in cluster.minio_client.list_objects(
+            cluster.minio_bucket, prefix=directory, recursive=True
+        )
+    )
+    data_files = [n for n in object_names if not n.rsplit("/", 1)[-1].startswith("commit_")]
+    markers = [n for n in object_names if n.rsplit("/", 1)[-1].startswith("commit_")]
+    return data_files, markers
+
+
+def test_export_partition_skip_policy_reports_every_split_file(cluster, source_engine):
+    """A `skip` re-export of an already-exported multi-file part must record every destination
+    file, not just the first one.
+
+    The recorded list is what the commit phase turns into the partition commit marker, so
+    dropping the later split files from it misrepresents the export even though the data is all
+    there.
+    """
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"skip_reports_all_files_mt_table_{postfix}"
+    s3_table = f"skip_reports_all_files_s3_table_{postfix}"
+
+    create_split_export_tables(node, mt_table, s3_table, "replica1", engine=source_engine)
+    # The destination file name is derived from the part name, so part names have to stay stable
+    # across the two exports, otherwise the second one writes to fresh paths and skips nothing.
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    export_partition_split_into_files(node, mt_table, s3_table)
+    first_transaction_id = export_transaction_id(node, mt_table, s3_table, "2020")
+
+    exported_paths = recorded_export_paths(node, mt_table, s3_table)
+    assert len(exported_paths) == 3, \
+        f"Expected the 3-row partition to split into 3 files, got {exported_paths}"
+    assert len(partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engine)) == 3
+
+    # Re-export. Every destination file is already there, so `skip` short-circuits the part --
+    # but it must do so with the complete file list.
+    export_partition_split_into_files(
+        node, mt_table, s3_table, force=True, policy="skip",
+        previous_transaction_id=first_transaction_id,
+    )
+
+    skipped_paths = recorded_export_paths(node, mt_table, s3_table)
+    assert sorted(skipped_paths) == sorted(exported_paths), (
+        f"Skipped re-export recorded {skipped_paths} instead of all 3 split files {exported_paths}"
+    )
+
+    committed = partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engine)
+    assert len(committed) == 3, \
+        f"Skipped re-export committed {len(committed)} path(s) instead of all 3 split files: {committed}"
+
+
+def test_export_partition_skip_policy_reexports_incomplete_part(cluster, source_engine):
+    """A part whose multi-file export was interrupted must be re-exported in full under `skip`.
+
+    The first split file existing proves nothing on its own: only the per-part commit marker,
+    written after the last file is finalized, proves the part was fully exported. Removing the
+    trailing files together with the marker reproduces what an attempt that died mid-part leaves
+    behind, and the retry has to rewrite them -- the rows in those files are produced by no other
+    attempt.
+    """
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"skip_reexports_partial_mt_table_{postfix}"
+    s3_table = f"skip_reexports_partial_s3_table_{postfix}"
+
+    create_split_export_tables(node, mt_table, s3_table, "replica1", engine=source_engine)
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    export_partition_split_into_files(node, mt_table, s3_table)
+    first_transaction_id = export_transaction_id(node, mt_table, s3_table, "2020")
+
+    written_in_order = recorded_export_paths(node, mt_table, s3_table)
+    assert len(written_in_order) == 3, \
+        f"Expected the 3-row partition to split into 3 files, got {written_in_order}"
+
+    data_files, markers = list_partition_directory(cluster, written_in_order[0])
+    assert data_files == sorted(written_in_order), \
+        f"Objects in the partition directory {data_files} do not match the recorded paths {written_in_order}"
+    assert len(markers) == 1, f"Expected one per-part commit marker, got {markers}"
+
+    # Roll the destination back to "first file finalized, nothing else": drop the trailing files
+    # and the marker that would otherwise prove the part complete.
+    for key in written_in_order[1:] + markers:
+        cluster.minio_client.remove_object(cluster.minio_bucket, key)
+
+    surviving_data_files, surviving_markers = list_partition_directory(cluster, written_in_order[0])
+    assert surviving_data_files == [written_in_order[0]], \
+        f"Expected only the first split file to remain, got {surviving_data_files}"
+    assert surviving_markers == [], \
+        f"Expected the per-part commit marker to be gone, got {surviving_markers}"
+
+    export_partition_split_into_files(
+        node, mt_table, s3_table, force=True, policy="skip",
+        previous_transaction_id=first_transaction_id,
+    )
+
+    data_files_after, markers_after = list_partition_directory(cluster, written_in_order[0])
+    assert len(data_files_after) == 3, (
+        f"Retry left the part partially exported: {data_files_after} "
+        f"(the interrupted attempt's missing files were never rewritten)"
+    )
+    assert len(markers_after) == 1, \
+        f"Retry did not rewrite the per-part commit marker: {markers_after}"
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "3\n", \
+        "Rows from the split files the interrupted attempt never wrote are missing from the destination"
+    assert len(partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engine)) == 3
 
 
 def test_export_partition_feature_is_disabled(cluster, source_engine):
