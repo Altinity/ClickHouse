@@ -613,4 +613,65 @@ TEST_F(RestCatalogTokenForwarding, DisablingTheServerSwitchAtRuntimeStopsForward
         EXPECT_EQ(request.header("Authorization"), "Bearer session_token_1");
 }
 
+/// --- Auth change -------------------------------------------------------------------------
+
+/// `ALTER DATABASE ... MODIFY SETTING catalog_credential = ...` is how an operator rotates a
+/// leaked client secret. Both caches hold artifacts derived from the old one -- session tokens
+/// exchanged with it, and the credentials the catalog vended to the resulting identity -- so
+/// leaving them warm would keep the rotated secret working for the rest of the cache TTL.
+TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAndCredentials)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+    /// The eager `client_credentials` fetch the ALTER makes with the not-yet-published credentials.
+    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
+    server->setStaticRoute(TABLE_PATH, loadTableResponse("AKIA_VENDED"));
+
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+    catalog->setVendedCredentialsCacheTTL(std::chrono::seconds(300));
+
+    auto load = [&]
+    {
+        auto query_context = makeQueryContext(alice);
+        TableMetadata metadata;
+        metadata.withLocation().withStorageCredentials();
+        catalog->getTableMetadata("ns", "t", query_context, metadata);
+    };
+
+    /// The `X-Iceberg-Access-Delegation` header is sent only when credentials have to be vended,
+    /// so its presence is the exact signal for "the credentials cache missed".
+    auto vending_requests = [&]
+    {
+        size_t count = 0;
+        for (const auto & request : server->requestsTo(TABLE_PATH))
+            if (request.header("X-Iceberg-Access-Delegation") == "vended-credentials")
+                ++count;
+        return count;
+    };
+
+    load();
+    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    ASSERT_EQ(vending_requests(), 1u);
+
+    /// Both caches are warm: nothing is exchanged and nothing is vended again.
+    load();
+    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    ASSERT_EQ(vending_requests(), 1u);
+
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes));
+
+    load();
+    EXPECT_EQ(vending_requests(), 2u);
+
+    const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
+    ASSERT_EQ(exchanges.size(), 2u);
+    /// Re-exchanged, and with the rotated secret rather than the one it replaced.
+    EXPECT_EQ(parseForm(exchanges.back().body).at("client_secret"), "rotated_secret");
+}
+
 #endif

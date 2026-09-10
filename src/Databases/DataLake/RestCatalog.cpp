@@ -928,6 +928,18 @@ void RestCatalog::commitSettingsChanges(ICatalog::PreparedSettingsChangesPtr pre
     state.set(std::move(prepared_auth->new_state));
     if (prepared_auth->new_access_token)
         access_token.set(std::move(prepared_auth->new_access_token));
+
+    /// Both caches hold artifacts derived from the credentials that were just replaced: session
+    /// tokens exchanged with the old `client_id`/`client_secret`, and credentials the catalog
+    /// vended to the old identity. Keeping them lets a rotated -- typically leaked -- credential
+    /// keep working for the rest of the cache TTL, which is what the ALTER was meant to stop.
+    /// Cleared after the new state is published, so that a request racing with the ALTER
+    /// re-populates from the new credentials and not the old ones.
+    user_token_cache.clear();
+    {
+        std::lock_guard lock(credentials_cache_mutex);
+        credentials_cache.clear();
+    }
 }
 
 void RestCatalog::applySettingsChangesToState(
