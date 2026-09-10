@@ -13,9 +13,14 @@
 #include <Databases/DataLake/tests/rest_catalog_test_server.h>
 #include <Interpreters/Context.h>
 
+#include <base/scope_guard.h>
+
 #include <chrono>
+#include <condition_variable>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 
 using namespace DataLake;
 using namespace RestCatalogTest;
@@ -672,6 +677,181 @@ TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAnd
     ASSERT_EQ(exchanges.size(), 2u);
     /// Re-exchanged, and with the rotated secret rather than the one it replaced.
     EXPECT_EQ(parseForm(exchanges.back().body).at("client_secret"), "rotated_secret");
+}
+
+
+/// A request that authenticated before the ALTER can only finish writing its result afterwards.
+/// Clearing the caches at commit time does not cover that: the window is a whole catalog round
+/// trip, so the write lands after the clear and puts the pre-rotation artifacts straight back.
+/// Both are keyed to the auth generation instead, so such a write is unreachable.
+
+/// Parks a route until the test releases it, so an ALTER can be made to land while a request is
+/// still in flight. Releasing from the destructor keeps a failed assertion from hanging the run.
+class ParkedRoute
+{
+public:
+    RestCatalogTest::ServerState::Route handler(RestCatalogTest::ServerState::Route response)
+    {
+        return [this, response](const RecordedRequest & request)
+        {
+            {
+                std::unique_lock lock(mutex);
+                if (enabled && !arrived)
+                {
+                    arrived = true;
+                    cv.notify_all();
+                    cv.wait(lock, [this] { return released; });
+                }
+            }
+            return response(request);
+        };
+    }
+
+    void enable()
+    {
+        std::lock_guard lock(mutex);
+        enabled = true;
+    }
+
+    bool isEnabled() const
+    {
+        std::lock_guard lock(mutex);
+        return enabled;
+    }
+
+    void waitUntilParked()
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [this] { return arrived; });
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard lock(mutex);
+            released = true;
+        }
+        cv.notify_all();
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    bool enabled = false;
+    bool arrived = false;
+    bool released = false;
+};
+
+TEST_F(RestCatalogTokenForwarding, InFlightVendedCredentialsDoNotOutliveTheirGeneration)
+{
+    /// Declared before the server so that it outlives the threads serving its routes.
+    ParkedRoute parked;
+    TestServer server;
+    installCatalogShape(*server);
+    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
+    server->setRoute(TABLE_PATH, parked.handler([](const RecordedRequest &) { return json(loadTableResponse("AKIA_VENDED")); }));
+
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+    catalog->setVendedCredentialsCacheTTL(std::chrono::seconds(300));
+
+    auto load = [&]
+    {
+        auto query_context = makeQueryContext(alice);
+        TableMetadata metadata;
+        metadata.withLocation().withStorageCredentials();
+        catalog->getTableMetadata("ns", "t", query_context, metadata);
+    };
+
+    auto vending_requests = [&]
+    {
+        size_t count = 0;
+        for (const auto & request : server->requestsTo(TABLE_PATH))
+            if (request.header("X-Iceberg-Access-Delegation") == "vended-credentials")
+                ++count;
+        return count;
+    };
+
+    parked.enable();
+    std::thread in_flight(load);
+    /// Only reached when an assertion below aborts the test early; the normal path joins inline.
+    SCOPE_EXIT({
+        parked.release();
+        if (in_flight.joinable())
+            in_flight.join();
+    });
+
+    parked.waitUntilParked();
+
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes));
+
+    parked.release();
+    in_flight.join();
+
+    const auto vends_before = vending_requests();
+
+    /// The parked query wrote its credentials back after the clear. They belong to the previous
+    /// generation, so this read must miss the cache and vend again.
+    load();
+    EXPECT_EQ(vending_requests(), vends_before + 1);
+}
+
+TEST_F(RestCatalogTokenForwarding, InFlightGrantDoesNotClobberRotatedServiceToken)
+{
+    ParkedRoute parked;
+    TestServer server;
+    installCatalogShape(*server);
+
+    server->setRoute(CATALOG_TOKEN_PATH, parked.handler([&parked](const RecordedRequest & request)
+    {
+        const auto secret = parseForm(request.body).at("client_secret");
+        if (secret != "secret")
+            return json(R"({"access_token":"tok_for_rotated_secret","expires_in":3600})");
+
+        /// Before parking is armed every grant is already outside its validity window, so the
+        /// warm-up leaves nothing reusable and the in-flight query is guaranteed to mint again.
+        /// The parked grant itself is long-lived, so that a clobber would actually stick and the
+        /// assertion is not satisfied by the token merely expiring.
+        const auto expires_in = parked.isEnabled() ? 3600 : 1;
+        return json(fmt::format(R"({{"access_token":"tok_for_secret","expires_in":{}}})", expires_in));
+    }));
+
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, TokenForwardingConfig{}, "client:secret");
+
+    /// Warm up outside the parked window: loads the config and establishes pooled connections.
+    ASSERT_EQ(catalog->getTables(/* auth_token */ {}), DB::Names{"ns.t"});
+
+    parked.enable();
+    std::thread in_flight([&] { catalog->getTables(/* auth_token */ {}); });
+    /// Only reached when an assertion below aborts the test early; the normal path joins inline.
+    SCOPE_EXIT({
+        parked.release();
+        if (in_flight.joinable())
+            in_flight.join();
+    });
+
+    parked.waitUntilParked();
+
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes));
+
+    parked.release();
+    in_flight.join();
+
+    server->clearRequests();
+    ASSERT_EQ(catalog->getTables(/* auth_token */ {}), DB::Names{"ns.t"});
+
+    /// The parked grant used the pre-rotation secret, so it must not have replaced the token the
+    /// ALTER eagerly published -- nothing bounds how long that would keep the old credential live.
+    const auto requests = server->requestsTo(NAMESPACES_PATH);
+    ASSERT_FALSE(requests.empty());
+    EXPECT_EQ(requests.front().header("Authorization"), "Bearer tok_for_rotated_secret");
 }
 
 #endif

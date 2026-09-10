@@ -98,13 +98,18 @@ struct TokenRequest
     String actor_token_type;
 };
 
-/// Key of the vended-credentials cache. `principal` comes first so that one user's entries are
+/// Key of the vended-credentials cache. `generation` comes first so that entries derived from
+/// superseded catalog credentials sort together and, more importantly, become unreachable the
+/// moment the generation moves on: a request that started before an `ALTER DATABASE ... MODIFY
+/// SETTING catalog_credential` may only finish writing its result afterwards, and that write
+/// must not be readable by anyone. `principal` comes next so that one user's entries are
 /// contiguous, and is the empty string on the non-forwarding path -- which reproduces the
 /// pre-forwarding `(namespace, table)` key semantics exactly. Without `principal` in the key a
 /// warm cache would hand Bob the STS credentials the catalog vended for Alice, without the
 /// catalog ever being consulted.
 struct CredentialsCacheKey
 {
+    UInt64 generation = 0;
     std::string principal;
     std::string namespace_name;
     std::string table_name;
@@ -220,6 +225,8 @@ public:
         /// The snapshot the caller derived the endpoint from, so that one request never mixes
         /// the endpoint of one state version with the auth of another.
         const CatalogState & catalog_state;
+        /// The auth generation `catalog_state` was taken in -- see `StateSnapshot`.
+        UInt64 generation = 0;
         /// Force a fresh token instead of reusing the cached one. Under forwarding this re-runs
         /// the *user's* exchange, never a `client_credentials` grant -- see
         /// `RestCatalog::getAuthHeaders`.
@@ -236,7 +243,27 @@ public:
         bool * used_cached_oauth_token = nullptr;
     };
 
-    CatalogStateVersion getStateSnapshot() const { return state.get(); }
+    /// A `CatalogState` snapshot paired with the auth generation in force when it was taken.
+    /// Everything a request derives from the snapshot -- an exchanged session token, vended
+    /// storage credentials, a freshly minted service token -- is tagged with that generation and
+    /// is discarded, or made unreachable, once `commitSettingsChanges` moves the generation on.
+    struct StateSnapshot
+    {
+        UInt64 generation = 0;
+        CatalogStateVersion state;
+
+        const CatalogState & operator*() const { return *state; }
+        const CatalogState * operator->() const { return state.get(); }
+    };
+
+    /// Reads the generation *before* the state, never after. Pairing a new generation with an old
+    /// state would let a request that authenticated with superseded credentials cache its result
+    /// as if it were current; the reverse pairing only costs one wasted cache fill.
+    StateSnapshot getStateSnapshot() const
+    {
+        const UInt64 generation = auth_generation.load(std::memory_order_acquire);
+        return StateSnapshot{generation, state.get()};
+    }
 
     ICatalog::PreparedSettingsChangesPtr prepareSettingsChanges(const DB::SettingsChanges & changes) override;
 
@@ -295,6 +322,19 @@ protected:
     static constexpr size_t user_token_cache_max_entries = 1024;
     mutable DB::CacheBase<String, AccessToken> user_token_cache;
 
+    /// Bumped by `commitSettingsChanges` once per auth change. A request tags everything it
+    /// derives from a state snapshot with the generation it read, so a request that authenticated
+    /// with credentials the operator has since rotated cannot publish or cache its result as if
+    /// it were current. Deliberately not a field of `CatalogState`: the state is republished for
+    /// unrelated reasons (`loadConfigIfNeeded`), and a counter that only ever moves forward must
+    /// not be able to travel back with it.
+    std::atomic<UInt64> auth_generation{0};
+
+    /// Serializes publishing an auth artifact against `commitSettingsChanges` publishing a new
+    /// one, so that the generation check and the publish it guards cannot be split by an ALTER.
+    /// Never held across a network request.
+    mutable std::mutex auth_publish_mutex;
+
     /// TTL for caching vended credentials per table (0 means no caching).
     std::atomic<std::chrono::seconds> vended_credentials_cache_ttl{std::chrono::seconds::zero()};
 
@@ -338,6 +378,7 @@ protected:
     /// request never mixes the endpoint of one state version with the auth of another.
     DB::ReadWriteBufferFromHTTPPtr createReadBuffer(
         const CatalogState & catalog_state,
+        UInt64 generation,
         const std::string & endpoint,
         const DB::ForwardedAuthTokenPtr & auth_token,
         const Poco::URI::QueryParameters & params = {},
@@ -390,6 +431,7 @@ protected:
     /// Load catalog config (special http handler) utilizing information from catalog_state and auth_headers.
     Config loadConfig(
         const CatalogState & catalog_state,
+        UInt64 generation,
         const DB::ForwardedAuthTokenPtr & auth_token,
         const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt) const;
 
@@ -400,7 +442,8 @@ protected:
     /// no token, and also when the hot-reloadable server-level `enable_token_forwarding` setting
     /// has since been turned off: never fall back to the service principal, which would turn an
     /// authorization failure into a query that succeeds under the wrong identity.
-    String getForwardedToken(const CatalogState & catalog_state, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const;
+    String getForwardedToken(
+        const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const;
 
     /// Whether a failed catalog request should be retried once with a freshly minted token.
     bool shouldRetryWithFreshToken(Poco::Net::HTTPResponse::HTTPStatus status) const;
@@ -411,6 +454,7 @@ protected:
 
     void sendRequest(
         const CatalogState & catalog_state,
+        UInt64 generation,
         const String & endpoint,
         Poco::JSON::Object::Ptr request_body,
         const DB::ForwardedAuthTokenPtr & auth_token,
@@ -426,20 +470,25 @@ protected:
 
     void cacheCredentials(const CredentialsCacheKey & key, const VendedStorageCredentials & parsed) const;
 
+    /// Publishes a freshly minted service-principal token into `access_token`, but only if the
+    /// credentials it was minted with are still in force. Returns it either way.
+    MultiVersion<AccessToken>::Version publishServiceToken(AccessToken minted, UInt64 generation) const;
+
     /// Performs one OAuth token-endpoint request. Both grants share this so that the
     /// `client_credentials` path stays byte-identical to what it was before token exchange existed.
     AccessToken requestToken(const TokenRequest & request) const;
 
     /// RFC 8693 exchange of the user's token for a catalog session token, against
     /// `oauth_token_exchange_uri`.
-    AccessToken exchangeUserToken(const CatalogState & catalog_state, const DB::ForwardedAuthToken & auth_token) const;
+    AccessToken exchangeUserToken(
+        const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token) const;
 
     AccessToken retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const;
 
     /// The catalog service principal's own token, minted on demand with a `client_credentials`
     /// grant and cached in `access_token` until it expires. Used as the RFC 8693 `actor_token`,
     /// never as the identity a catalog request is signed with while forwarding is on.
-    String getServicePrincipalToken(const CatalogState & catalog_state) const;
+    String getServicePrincipalToken(const CatalogState & catalog_state, UInt64 generation) const;
 
     struct PreparedAuthChanges;
 

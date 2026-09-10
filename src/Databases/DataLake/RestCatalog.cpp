@@ -518,7 +518,7 @@ RestCatalog::RestCatalog(
     /// so either identity is appropriate.
     if (!token_forwarding.forward_user_token)
     {
-        initial_state.config = loadConfig(initial_state, /* auth_token */ {});
+        initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
         initial_state.config_loaded = true;
     }
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
@@ -554,18 +554,19 @@ void RestCatalog::loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_toke
         return;
 
     std::lock_guard lock(config_mutex);
-    const auto old_state = state.get();
+    const auto old_state = getStateSnapshot();
     if (old_state->config_loaded)
         return;
 
     auto new_state = std::make_unique<CatalogState>(*old_state);
-    new_state->config = loadConfig(*old_state, auth_token);
+    new_state->config = loadConfig(*old_state, old_state.generation, auth_token);
     new_state->config_loaded = true;
     state.set(std::move(new_state));
 }
 
 RestCatalog::Config RestCatalog::loadConfig(
     const CatalogState & catalog_state,
+    UInt64 generation,
     const DB::ForwardedAuthTokenPtr & auth_token,
     const std::optional<DB::HTTPHeaderEntries> & auth_headers) const
 {
@@ -576,7 +577,7 @@ RestCatalog::Config RestCatalog::loadConfig(
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogLoadConfig);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogLoadConfigMicroseconds);
-        auto buf = createReadBuffer(catalog_state, CONFIG_ENDPOINT, auth_token, params, /* headers */{}, auth_headers);
+        auto buf = createReadBuffer(catalog_state, generation, CONFIG_ENDPOINT, auth_token, params, /* headers */{}, auth_headers);
         readJSONObjectPossiblyInvalid(json_str, *buf);
     }
 
@@ -650,7 +651,9 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_conte
     {
         DB::HTTPHeaderEntries headers;
         headers.emplace_back(
-            "Authorization", "Bearer " + getForwardedToken(catalog_state, auth_context.auth_token, auth_context.update_token));
+            "Authorization",
+            "Bearer "
+                + getForwardedToken(catalog_state, auth_context.generation, auth_context.auth_token, auth_context.update_token));
         return headers;
     }
 
@@ -666,8 +669,8 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_conte
         auto current = access_token.get();
         if (!current || auth_context.update_token || current->isExpired())
         {
-            access_token.set(std::make_unique<AccessToken>(retrieveAccessToken(catalog_state.client_id, catalog_state.client_secret)));
-            current = access_token.get();
+            current = publishServiceToken(
+                retrieveAccessToken(catalog_state.client_id, catalog_state.client_secret), auth_context.generation);
         }
         else if (auth_context.used_cached_oauth_token)
         {
@@ -681,8 +684,26 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_conte
     return {};
 }
 
+MultiVersion<AccessToken>::Version RestCatalog::publishServiceToken(AccessToken minted, UInt64 generation) const
+{
+    auto result = std::make_shared<const AccessToken>(std::move(minted));
+
+    /// A grant that started before `ALTER DATABASE ... MODIFY SETTING catalog_credential` can only
+    /// finish after it, and would otherwise overwrite the token the ALTER eagerly published --
+    /// putting the rotated-away credential back in force for the whole lifetime of that token,
+    /// which no cache TTL bounds. The generation says whether the credentials it was minted with
+    /// are still the ones in force; the lock stops the ALTER from landing between the two.
+    std::lock_guard lock(auth_publish_mutex);
+    if (auth_generation.load(std::memory_order_acquire) == generation)
+        access_token.set(std::make_unique<AccessToken>(*result));
+
+    /// Returned regardless: the catalog accepted this request under these credentials, so the
+    /// request itself completes. Only sharing the token with later requests is withheld.
+    return result;
+}
+
 String RestCatalog::getForwardedToken(
-    const CatalogState & catalog_state, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const
+    const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const
 {
     /// Re-read the server-level switch on every forwarded request instead of trusting the decision
     /// `Session::authenticate` made once. `enable_token_forwarding` is hot-reloadable
@@ -735,15 +756,20 @@ String RestCatalog::getForwardedToken(
 
     auto exchange = [&]
     {
-        return std::make_shared<AccessToken>(exchangeUserToken(catalog_state, *auth_token));
+        return std::make_shared<AccessToken>(exchangeUserToken(catalog_state, generation, *auth_token));
     };
 
     if (!caching_enabled)
         return exchange()->token;
 
+    /// Scoped to the generation the exchange authenticated in, so that an exchange still in
+    /// flight when the catalog credentials are rotated writes its result under a key nothing
+    /// reads any more, instead of reinstating a session minted with the old client secret.
+    const String cache_key = fmt::format("{}:{}", generation, auth_token->fingerprint);
+
     if (!update_token)
     {
-        if (auto cached = user_token_cache.get(auth_token->fingerprint); cached && !cached->isExpired())
+        if (auto cached = user_token_cache.get(cache_key); cached && !cached->isExpired())
         {
             ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUserTokenCacheHits);
             return cached->token;
@@ -754,14 +780,15 @@ String RestCatalog::getForwardedToken(
     /// `getOrSetWithOutcome` reloads instead of handing back the stale value, and so that the
     /// stampede protection still collapses the concurrent re-exchanges a single `SHOW TABLES`
     /// fanned across the catalog thread pool would otherwise cause.
-    user_token_cache.remove(auth_token->fingerprint);
-    auto [session_token, outcome] = user_token_cache.getOrSetWithOutcome(auth_token->fingerprint, exchange);
+    user_token_cache.remove(cache_key);
+    auto [session_token, outcome] = user_token_cache.getOrSetWithOutcome(cache_key, exchange);
     if (outcome == DB::CacheGetOrSetOutcome::Hit)
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUserTokenCacheHits);
     return session_token->token;
 }
 
-AccessToken RestCatalog::exchangeUserToken(const CatalogState & catalog_state, const DB::ForwardedAuthToken & auth_token) const
+AccessToken RestCatalog::exchangeUserToken(
+    const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token) const
 {
     TokenRequest request;
     request.grant = TokenRequest::Grant::TokenExchange;
@@ -781,7 +808,7 @@ AccessToken RestCatalog::exchangeUserToken(const CatalogState & catalog_state, c
     /// enabling the setting was meant to prevent.
     if (token_forwarding.forward_actor_token)
     {
-        request.actor_token = getServicePrincipalToken(catalog_state);
+        request.actor_token = getServicePrincipalToken(catalog_state, generation);
         request.actor_token_type = "urn:ietf:params:oauth:token-type:access_token";
     }
 
@@ -843,7 +870,7 @@ OneLakeCatalog::OneLakeCatalog(
         initial_state.client_secret = onelake_client_secret;
         update_token_if_expired = true;
     }
-    initial_state.config = loadConfig(initial_state, /* auth_token */ {});
+    initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
     initial_state.config_loaded = true;
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
@@ -905,7 +932,7 @@ struct RestCatalog::PreparedAuthChanges : ICatalog::PreparedSettingsChanges
 
 ICatalog::PreparedSettingsChangesPtr RestCatalog::prepareSettingsChanges(const DB::SettingsChanges & changes)
 {
-    const auto old_state = state.get();
+    const auto old_state = getStateSnapshot();
     CatalogState new_state = *old_state;
 
     auto prepared = std::make_unique<PreparedAuthChanges>();
@@ -914,7 +941,7 @@ ICatalog::PreparedSettingsChangesPtr RestCatalog::prepareSettingsChanges(const D
 
     /// The config was loaded with the old credentials; the new ones may resolve the
     /// warehouse to a different prefix or base location, so reload it before publishing.
-    new_state.config = loadConfig(new_state, /* auth_token */ {}, new_auth_headers);
+    new_state.config = loadConfig(new_state, old_state.generation, /* auth_token */ {}, new_auth_headers);
     prepared->new_state = std::make_unique<const CatalogState>(std::move(new_state));
     return prepared;
 }
@@ -925,16 +952,28 @@ void RestCatalog::commitSettingsChanges(ICatalog::PreparedSettingsChangesPtr pre
     if (!prepared_auth || !prepared_auth->new_state)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Settings changes to commit were not prepared by this catalog");
 
-    state.set(std::move(prepared_auth->new_state));
-    if (prepared_auth->new_access_token)
-        access_token.set(std::move(prepared_auth->new_access_token));
+    {
+        /// Under the lock so that a request cannot check the generation, find it unchanged, and
+        /// only then publish a token minted with the credentials being replaced here.
+        std::lock_guard lock(auth_publish_mutex);
+        state.set(std::move(prepared_auth->new_state));
+        if (prepared_auth->new_access_token)
+            access_token.set(std::move(prepared_auth->new_access_token));
+
+        /// Bumped after the state is published, never before: a reader takes the generation
+        /// first and the state second, so this order leaves it either correct or paired with a
+        /// generation older than its state, which merely costs a wasted cache fill.
+        auth_generation.fetch_add(1, std::memory_order_release);
+    }
 
     /// Both caches hold artifacts derived from the credentials that were just replaced: session
     /// tokens exchanged with the old `client_id`/`client_secret`, and credentials the catalog
     /// vended to the old identity. Keeping them lets a rotated -- typically leaked -- credential
     /// keep working for the rest of the cache TTL, which is what the ALTER was meant to stop.
-    /// Cleared after the new state is published, so that a request racing with the ALTER
-    /// re-populates from the new credentials and not the old ones.
+    ///
+    /// Cleared after the generation is bumped, which is what makes the two mechanisms cover each
+    /// other: a write that slips past the generation check necessarily started before this clear
+    /// and is wiped by it, and a write that lands after it is already keyed to a dead generation.
     user_token_cache.clear();
     {
         std::lock_guard lock(credentials_cache_mutex);
@@ -1234,7 +1273,7 @@ AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, cons
     return requestToken(request);
 }
 
-String RestCatalog::getServicePrincipalToken(const CatalogState & catalog_state) const
+String RestCatalog::getServicePrincipalToken(const CatalogState & catalog_state, UInt64 generation) const
 {
     /// Same caching rule as the `client_credentials` branch of `getAuthHeaders`: reuse the token
     /// held in `access_token` until it falls outside its validity window, then mint a new one.
@@ -1242,10 +1281,7 @@ String RestCatalog::getServicePrincipalToken(const CatalogState & catalog_state)
     /// by every user of the database, and never a per-user one.
     auto current = access_token.get();
     if (!current || current->isExpired())
-    {
-        access_token.set(std::make_unique<AccessToken>(retrieveAccessToken(catalog_state.client_id, catalog_state.client_secret)));
-        current = access_token.get();
-    }
+        current = publishServiceToken(retrieveAccessToken(catalog_state.client_id, catalog_state.client_secret), generation);
     return current->token;
 }
 
@@ -1277,7 +1313,7 @@ BigLakeCatalog::BigLakeCatalog(
         access_token.set(std::make_unique<AccessToken>(retrieveGoogleCloudAccessToken()));
     }
     CatalogState initial_state;
-    initial_state.config = loadConfig(initial_state, /* auth_token */ {});
+    initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
     initial_state.config_loaded = true;
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
@@ -1454,7 +1490,7 @@ DB::ForwardedAuthTokenPtr RestCatalog::getForwardedAuthToken(const DB::ContextPt
 
 std::optional<StorageType> RestCatalog::getStorageType() const
 {
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
     /// Under forwarding the config is filled in lazily by the first user query.
     if (!state_snapshot->config_loaded || state_snapshot->config.default_base_location.empty())
         return std::nullopt;
@@ -1463,6 +1499,7 @@ std::optional<StorageType> RestCatalog::getStorageType() const
 
 DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
     const CatalogState & catalog_state,
+    UInt64 generation,
     const std::string & endpoint,
     const DB::ForwardedAuthTokenPtr & auth_token,
     const Poco::URI::QueryParameters & params,
@@ -1480,6 +1517,7 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
     {
         AuthContext auth_context{
             .catalog_state = catalog_state,
+            .generation = generation,
             .update_token = update_token,
             .method = Poco::Net::HTTPRequest::HTTP_GET,
             .url = url,
@@ -1668,7 +1706,7 @@ Poco::URI::QueryParameters RestCatalog::createParentNamespaceParams(const std::s
 
 RestCatalog::Namespaces RestCatalog::getNamespaces(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
 
     Poco::URI::QueryParameters base_params;
     if (!base_namespace.empty())
@@ -1696,7 +1734,8 @@ RestCatalog::Namespaces RestCatalog::getNamespaces(const std::string & base_name
 
             ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetNamespaces);
             auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetNamespacesMicroseconds);
-            auto buf = createReadBuffer(*state_snapshot, state_snapshot->config.prefix / NAMESPACES_ENDPOINT, auth_token, params);
+            auto buf = createReadBuffer(
+                *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / NAMESPACES_ENDPOINT, auth_token, params);
             String next_page_token;
             auto page_namespaces = parseNamespaces(*buf, base_namespace, next_page_token);
             LOG_DEBUG(
@@ -1829,7 +1868,7 @@ DB::Names RestCatalog::getTablesInNamespace(const std::string & base_namespace, 
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Namespace {} is filtered by `namespaces` database parameter", base_namespace);
 
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
 
     auto encoded_namespace = encodeNamespaceForURI(base_namespace);
     const std::string endpoint = std::filesystem::path(NAMESPACES_ENDPOINT) / encoded_namespace / "tables";
@@ -1854,7 +1893,7 @@ DB::Names RestCatalog::getTablesInNamespace(const std::string & base_namespace, 
 
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetTables);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetTablesMicroseconds);
-        auto buf = createReadBuffer(*state_snapshot, state_snapshot->config.prefix / endpoint, auth_token, params);
+        auto buf = createReadBuffer(*state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, params);
 
         /// Pass through the remaining limit so that single-page short-circuiting still works
         /// when the caller is in `empty()` (limit=1) and the first page already contains a row.
@@ -2090,8 +2129,11 @@ bool RestCatalog::getTableMetadataImpl(
 
     DB::HTTPHeaderEntries headers;
 
+    const auto state_snapshot = getStateSnapshot();
+
     const bool want_credentials = result.requiresCredentials();
-    const CredentialsCacheKey credentials_key{getCredentialsCachePrincipal(auth_token), namespace_name, table_name};
+    const CredentialsCacheKey credentials_key{
+        state_snapshot.generation, getCredentialsCachePrincipal(auth_token), namespace_name, table_name};
 
     /// Reuse previously vended credentials is possible
     std::optional<VendedStorageCredentials> cached_credentials;
@@ -2114,14 +2156,14 @@ bool RestCatalog::getTableMetadataImpl(
         }
     }
 
-    const auto state_snapshot = state.get();
     const std::string endpoint = std::filesystem::path(NAMESPACES_ENDPOINT) / encodeNamespaceForURI(namespace_name) / "tables" / table_name;
     String json_str;
 
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetTableMetadata);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetTableMetadataMicroseconds);
-        auto buf = createReadBuffer(*state_snapshot, state_snapshot->config.prefix / endpoint, auth_token, /* params */{}, headers);
+        auto buf = createReadBuffer(
+            *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, /* params */{}, headers);
 
         if (buf->eof())
         {
@@ -2222,6 +2264,7 @@ bool RestCatalog::getTableMetadataImpl(
 
 void RestCatalog::sendRequest(
     const CatalogState & catalog_state,
+    UInt64 generation,
     const String & endpoint,
     Poco::JSON::Object::Ptr request_body,
     const DB::ForwardedAuthTokenPtr & auth_token,
@@ -2257,6 +2300,7 @@ void RestCatalog::sendRequest(
     {
         AuthContext auth_context{
             .catalog_state = catalog_state,
+            .generation = generation,
             .update_token = update_token,
             .method = method,
             .url = url,
@@ -2314,7 +2358,7 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
 {
     loadConfigIfNeeded(auth_token);
 
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
 
     /// Check existence first: creation may be denied to a principal that is still
     /// allowed to use a pre-provisioned namespace.
@@ -2323,7 +2367,7 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     try
     {
         sendRequest(
-            *state_snapshot, check_endpoint, /* request_body */ nullptr, auth_token,
+            *state_snapshot, state_snapshot.generation, check_endpoint, /* request_body */ nullptr, auth_token,
             Poco::Net::HTTPRequest::HTTP_GET, /* ignore_result */ true);
         return;
     }
@@ -2351,7 +2395,7 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogCreateNamespace);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogCreateNamespaceMicroseconds);
-        sendRequest(*state_snapshot, endpoint, request_body, auth_token);
+        sendRequest(*state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token);
     }
     catch (const DB::HTTPException & e)
     {
@@ -2369,7 +2413,7 @@ void RestCatalog::createTable(const String & namespace_name, const String & tabl
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter", table_name, namespace_name);
 
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
     const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables").generic_string();
 
     Poco::JSON::Object::Ptr request_body = new Poco::JSON::Object;
@@ -2402,7 +2446,7 @@ void RestCatalog::createTable(const String & namespace_name, const String & tabl
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogCreateTable);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogCreateTableMicroseconds);
-        sendRequest(*state_snapshot, endpoint, request_body, auth_token);
+        sendRequest(*state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -2421,7 +2465,7 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
             "REST catalog does not support metadata-only updates without a snapshot "
             "(required for EXPIRE SNAPSHOTS)");
 
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
     const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string();
 
     auto request_body = buildUpdateMetadataRequestBody(namespace_name, table_name, new_snapshot);
@@ -2430,7 +2474,7 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUpdateTable);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogUpdateTableMicroseconds);
-        sendRequest(*state_snapshot, endpoint, request_body, auth_token);
+        sendRequest(*state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -2460,7 +2504,7 @@ bool RestCatalog::updateSchema(
 
     loadConfigIfNeeded(auth_token);
 
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
     const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string();
 
     auto request_body = buildUpdateSchemaRequestBody(
@@ -2468,7 +2512,7 @@ bool RestCatalog::updateSchema(
 
     try
     {
-        sendRequest(*state_snapshot, endpoint, request_body, auth_token);
+        sendRequest(*state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -2498,7 +2542,7 @@ void RestCatalog::dropTable(const String & namespace_name, const String & table_
             "Failed to drop table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
 
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
     const std::string endpoint
         = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string()
         + "?purgeRequested=False";
@@ -2508,7 +2552,8 @@ void RestCatalog::dropTable(const String & namespace_name, const String & table_
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogDropTable);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogDropTableMicroseconds);
-        sendRequest(*state_snapshot, endpoint, request_body, auth_token, Poco::Net::HTTPRequest::HTTP_DELETE, true);
+        sendRequest(
+            *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token, Poco::Net::HTTPRequest::HTTP_DELETE, true);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -2743,7 +2788,7 @@ ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCal
         DB::HTTPHeaderEntries headers;
         headers.emplace_back("X-Iceberg-Access-Delegation", "vended-credentials");
 
-        const auto state_snapshot = state.get();
+        const auto state_snapshot = getStateSnapshot();
         const auto & table = storage_id.getTableName();
         auto [namespace_name, table_name] = DataLake::parseTableName(table);
         const std::string endpoint = std::filesystem::path(NAMESPACES_ENDPOINT) / encodeNamespaceForURI(namespace_name) / "tables" / table_name;
@@ -2752,7 +2797,8 @@ ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCal
         {
             ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetCredentials);
             auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetCredentialsMicroseconds);
-            auto buf = createReadBuffer(*state_snapshot, state_snapshot->config.prefix / endpoint, auth_token, /* params */{}, headers);
+            auto buf = createReadBuffer(
+                *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, /* params */{}, headers);
 
             if (buf->eof())
             {
@@ -2792,7 +2838,8 @@ ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCal
         if (metadata_object)
             parsed.table_uuid = parseTableUuid(metadata_object);
         /// Refresh the per-table cache so subsequent queries reuse these freshly vended credentials.
-        cacheCredentials({getCredentialsCachePrincipal(auth_token), namespace_name, table_name}, parsed);
+        cacheCredentials(
+            {state_snapshot.generation, getCredentialsCachePrincipal(auth_token), namespace_name, table_name}, parsed);
         return parsed.credentials;
     };
 }

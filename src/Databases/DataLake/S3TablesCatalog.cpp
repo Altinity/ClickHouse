@@ -114,7 +114,7 @@ S3TablesCatalog::S3TablesCatalog(
         /* urlEscapePath = */ false);
 
     CatalogState initial_state;
-    initial_state.config = loadConfig(initial_state, /* auth_token */ {});
+    initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
     initial_state.config_loaded = true;
 
     if (initial_state.config.prefix.empty())
@@ -221,7 +221,7 @@ ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfiguratio
 
 void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
     const std::string endpoint
         = (base_url / state_snapshot->config.prefix / "namespaces" / namespace_name / "tables" / table_name).string()
         + "?purgeRequested=True";
@@ -231,7 +231,8 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogDropTable);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogDropTableMicroseconds);
-        sendRequest(*state_snapshot, endpoint, request_body, auth_token, Poco::Net::HTTPRequest::HTTP_DELETE, true);
+        sendRequest(
+            *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token, Poco::Net::HTTPRequest::HTTP_DELETE, true);
     }
     catch (const DB::HTTPException & ex)
     {
