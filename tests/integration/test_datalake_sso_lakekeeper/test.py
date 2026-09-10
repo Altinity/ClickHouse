@@ -355,11 +355,16 @@ def test_users_see_different_tables(started_cluster):
     assert query_as_ok(node, alice, listing_sql.format(db="db_alice")).strip() == "ns.t_alice"
     assert query_as_ok(node, bob, listing_sql.format(db="db_bob")).strip() == "ns.t_bob"
 
-    # And neither sees anything in the other's warehouse. Empty is the catalog's answer, not a
-    # symptom of nothing working: the two assertions above went through the same code path and did
-    # return a table, so an empty listing here can only be Lakekeeper withholding it.
-    assert query_as_ok(node, alice, listing_sql.format(db="db_bob")).strip() == ""
-    assert query_as_ok(node, bob, listing_sql.format(db="db_alice")).strip() == ""
+    # And neither sees anything in the other's warehouse. The refusal is the catalog's answer, not
+    # a symptom of nothing working: the two assertions above went through the same code path and
+    # did return a table. `show_data_lake_catalogs_in_system_tables` is on, so
+    # `DatabaseDataLake::getTablesIterator` reports the catalog error rather than swallowing it
+    # into an empty listing, and Lakekeeper answers a listing the principal has no grant for with
+    # `NoSuchWarehouseException` ("Warehouse not found or access denied").
+    denied = query_as(node, alice, listing_sql.format(db="db_bob"))
+    assert denied.status_code != 200, denied.text
+    denied = query_as(node, bob, listing_sql.format(db="db_alice"))
+    assert denied.status_code != 200, denied.text
 
 
 def test_alice_cannot_read_bobs_table(started_cluster):

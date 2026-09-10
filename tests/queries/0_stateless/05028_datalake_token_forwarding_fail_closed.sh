@@ -64,11 +64,14 @@ ${CLICKHOUSE_CLIENT} --query "EXISTS TABLE ${DB}.\`ns.t\`" 2>&1 | grep -o 'CATAL
 echo '-- CHECK DATABASE'
 ${CLICKHOUSE_CLIENT} --query "CHECK DATABASE ${DB}" 2>&1 | grep -o 'CATALOG_USER_TOKEN_NOT_AVAILABLE'
 
-# `system.tables` (and therefore SHOW TABLES) deliberately swallows catalog errors so that a
-# single unreachable database cannot break the whole system table. Fail-closed there means an
-# empty list -- no table names are disclosed -- rather than an exception.
+# `system.tables` swallows catalog errors so that a single unreachable database cannot break the
+# whole system table, but an explicit `SHOW TABLES` turns `show_data_lake_catalogs_in_system_tables`
+# on for its own query, and `DatabaseDataLake::getTablesIterator` rethrows under that setting. So
+# the refusal surfaces here, and either way no table name is disclosed.
 echo '-- SHOW TABLES discloses nothing'
-${CLICKHOUSE_CLIENT} --query "SHOW TABLES FROM ${DB}" | wc -l
+${CLICKHOUSE_CLIENT} --query "SHOW TABLES FROM ${DB}" 2>/dev/null | wc -l
+echo '-- and reports the refusal rather than an empty list'
+${CLICKHOUSE_CLIENT} --query "SHOW TABLES FROM ${DB}" 2>&1 >/dev/null | grep -c 'CATALOG_USER_TOKEN_NOT_AVAILABLE'
 
 # Two `CATALOG_USER_TOKEN_NOT_AVAILABLE` branches share the error code, so pin down which one
 # fired: this one is about the server switch, not about a session that merely lacks a token. The
