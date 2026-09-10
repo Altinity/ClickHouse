@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <Core/Defines.h>
 #include <IO/DistributedCacheSettings.h>
+#include <IO/ObjectStorageRequestMode.h>
+#include <IO/ObjectStorageRequestProfile.h>
 #include <IO/ReadMethod.h>
 #include <Interpreters/FileCache/FileCache_fwd.h>
 #include <Common/Priority.h>
@@ -161,6 +163,23 @@ struct ReadSettings
 
     bool read_through_distributed_cache = false;
     DistributedCacheSettings distributed_cache_settings;
+
+    /// Selects the object storage request mode this read should carry; see ObjectStorageRequestMode.
+    ObjectStorageRequestMode object_storage_request_mode = ObjectStorageRequestMode::Default;
+
+    /// Selects the retry profile the object storage should execute this read under, and the request
+    /// timeout of the client it picks for it; see ObjectStorageRetryProfile. 0 = the storage's own.
+    ObjectStorageRetryProfile object_storage_retry_profile = ObjectStorageRetryProfile::Default;
+    uint64_t object_storage_attempt_timeout_ms = 0;
+
+    /// The cap the single-attempt client's clone puts on one TCP connect and again on one TLS
+    /// handshake, frozen by the mount at open; see `CasRequestBudget::attemptEnvelopeMs`. 0 = no cap.
+    uint64_t object_storage_connect_timeout_cap_ms = 0;
+
+    /// The caller's own attempt number for the request built from these settings, 1-based; 0 leaves the
+    /// buffer's own numbering. A caller reissuing this read passes its count so the HTTP client sees
+    /// attempt ≥ 2.
+    size_t object_storage_attempt_number = 0;
 
     ReadSettings adjustBufferSize(size_t file_size) const;
 

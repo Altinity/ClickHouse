@@ -6848,6 +6848,14 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     /// `FORGET PARTITION` is SUPPORTED on CA — it only manipulates ZooKeeper partition metadata
                     /// (removes block-number nodes from ZooKeeper) and does not write, clone, or touch any part
                     /// files on disk, so it is safe on a content-addressed disk.
+                    /// `EXPORT PARTITION` is SUPPORTED because the reason this list exists does not apply
+                    /// to it. The rejection below is about commands that clone parts file-by-file;
+                    /// exporting does not clone at all. `ExportPartTask` reads the source part through
+                    /// `MergeTreeSequentialSource` (`MergeTreeSequentialSourceType::Export`) and writes
+                    /// rows into the destination through a `SinkToStorage` on an ordinary query
+                    /// pipeline, so the source's part files are only READ, under `readLockParts`, and
+                    /// nothing is hard-linked or copied on the content-addressed disk. The command's
+                    /// own bookkeeping is ZooKeeper-side.
                     /// NOTE: `MOVE_PARTITION` also admits cross-disk
                     /// `MOVE ... TO DISK/VOLUME` (this check cannot distinguish the destination); that uses
                     /// the byte-copy `clonePart` path (NOT the corrupting per-file hardlink), but only
@@ -6864,6 +6872,7 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                         PartitionCommand::FREEZE_ALL_PARTITIONS,
                         PartitionCommand::UNFREEZE_PARTITION,
                         PartitionCommand::UNFREEZE_ALL_PARTITIONS,
+                        PartitionCommand::EXPORT_PARTITION,
                     };
 
                     if (!std::ranges::contains(supported_commands, command.type))
