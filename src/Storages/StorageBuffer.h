@@ -88,7 +88,10 @@ public:
         size_t max_block_size,
         size_t num_streams) override;
     bool isRemote() const override;
+
     StoragePtr getDestinationTable() const;
+    
+    bool readsFromOtherTables() const override { return static_cast<bool>(destination_id); }
 
     bool supportsParallelInsert() const override { return true; }
 
