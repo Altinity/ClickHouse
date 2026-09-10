@@ -163,14 +163,21 @@ class ClickHouseProc:
         return False
 
     def start_azurite(self):
+        # Raise the open files limit before launching azurite-rs.
+        # Each concurrent test query opens a TCP connection plus an in-memory
+        # blob handle, and the default soft limit (1024) was exhausted under
+        # parallel load, causing `accept error: Too many open files`.
+        # Fall back to the hard limit if 1048576 cannot be set.
         command = (
-            f"cd {temp_dir} && azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --silent --inMemoryPersistence",
+            f"cd {temp_dir} && "
+            "(ulimit -n 1048576 2>/dev/null || ulimit -n $(ulimit -Hn)) && "
+            "azurite-rs --host 0.0.0.0 --blob-port 10000 --silent --in-memory"
         )
         with open(self.AZURITE_LOG, "w") as log_file:
             self.azurite_proc = subprocess.Popen(
                 command, stdout=log_file, stderr=subprocess.STDOUT, shell=True
             )
-        print(f"Started azurite asynchronously with PID {self.azurite_proc.pid}")
+        print(f"Started azurite-rs asynchronously with PID {self.azurite_proc.pid}")
 
         if Shell.check(
             "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/ | grep -qE '400|200'",
@@ -178,7 +185,7 @@ class ClickHouseProc:
             retries=6,
         ):
             return True
-        print("Failed to start azurite")
+        print("Failed to start azurite-rs")
         return False
 
     def start_kafka(self):
