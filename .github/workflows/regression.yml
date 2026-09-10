@@ -3,7 +3,7 @@ name: Regression test workflow - Release
   workflow_call:
     inputs:
       runner_type:
-        description: the label of runner to use, can be a simple string or a comma-separated list
+        description: the (meta-)label of runner to use
         required: true
         type: string
       commit:
@@ -85,648 +85,276 @@ name: Regression test workflow - Release
         description: gcs uri used for regression tests.
         required: true
 
-env:
-  # Force the stdout and stderr streams to be unbuffered
-  PYTHONUNBUFFERED: 1
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-  CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
-  CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
-  CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
-  LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
-  args: --test-to-end
-    --no-colors
-    --local
-    --collect-service-logs
-    --output classic
-    --parallel 1
-    --log raw.log
-    --with-analyzer
-  artifacts: builds
-  artifact_paths: |
-    ./report.html
-    ./*.log.txt
-    ./*.log
-    ./*.html
-    ./*/_instances/*.log
-    ./*/_instances/*/logs/*.log
-    ./*/*/_instances/*/logs/*.log
-    ./*/*/_instances/*.log
-  build_sha: ${{ inputs.build_sha }}
-  pr_number: ${{ github.event.number }}
-  event_name: ${{ github.event_name }}
-
 jobs:
-  runner_labels_setup:
-    name: Compute proper runner labels for the rest of the jobs
-    runs-on: ubuntu-latest
-    outputs:
-      runner_labels: ${{ steps.setVariables.outputs.runner_labels }}
-    steps:
-      - id: setVariables
-        name: Prepare runner_labels variables for the later steps
-        run: |
-
-          # Prepend self-hosted
-          input="self-hosted, ${input}"
-
-          # Remove all whitespace
-          input="$(echo ${input} | tr -d [:space:])"
-          # Make something like a JSON array from comma-separated list
-          input="[ '${input//\,/\'\, \'}' ]"
-
-          echo "runner_labels=$input" >> ${GITHUB_OUTPUT}
-        env:
-          input: ${{ inputs.runner_type }}
-
   Common:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, iceberg, kafka, kerberos, key_value, lightweight_delete, memory, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, swarms, tiered_storage, version, window_functions]
-    needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=${{ matrix.SUITE }}
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run: EXITCODE=0;
-              python3
-              -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.SUITE }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} ${{ matrix.SUITE }}"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
-          path: ${{ env.artifact_paths}}
+        SUITE: [aes_encryption, atomic_insert, base_58, clickhouse_keeper_failover, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, jwt_authentication, kafka, kerberos, key_value, lightweight_delete, memory, part_moves_between_shards, selects, session_timezone, settings, swarms, version, window_functions]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: ${{ matrix.SUITE }}
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: ${{ matrix.SUITE }}
+    secrets: inherit
+
+  AggregateFunctions:
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [1, 2, 3]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: aggregate_functions
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: aggregate_functions
+      extra_args: --only "part ${{ matrix.PART }}/*"
+    secrets: inherit
 
   Alter:
-   strategy:
-     fail-fast: false
-     matrix:
-      ONLY: [replace, attach, move]
-   needs: [runner_labels_setup]
-   runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-   timeout-minutes: ${{ inputs.timeout_minutes }}
-   steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=alter
-          STORAGE=/${{ matrix.ONLY }}_partition
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run:  EXITCODE=0;
-              python3
-              -u alter/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --only "/alter/${{ matrix.ONLY }} partition/*"
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.ONLY }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} Alter ${{ matrix.ONLY }} partition"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: alter-${{ matrix.ONLY }}-${{ inputs.arch }}-artifacts
-          path: ${{ env.artifact_paths}}
+    strategy:
+      fail-fast: false
+      matrix:
+        ONLY: [replace, move]
+        include:
+          - ONLY: attach
+            PART: 1
+          - ONLY: attach
+            PART: 2
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: alter
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: /${{ matrix.ONLY }}_partition
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: alter_${{ matrix.ONLY }}
+      extra_args: --only "/alter/${{ matrix.ONLY }} partition/${{ matrix.PART && format('part {0}/', matrix.PART) || '' }}*"
+    secrets: inherit
 
   Benchmark:
     strategy:
       fail-fast: false
       matrix:
         STORAGE: [minio, aws_s3, gcs]
-    needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=ontime_benchmark
-          STORAGE=/${{ matrix.STORAGE }}
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run:  EXITCODE=0;
-              python3
-              -u ${{ env.SUITE }}/benchmark.py
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --storage ${{ matrix.STORAGE }}
-              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
-              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
-              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
-              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
-              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
-              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
-              --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.STORAGE }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} Benchmark ${{ matrix.STORAGE }}"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: benchmark-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts
-          path: ${{ env.artifact_paths }}
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: ontime_benchmark
+      suite_executable: benchmark.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: /${{ matrix.STORAGE }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: benchmark_${{ matrix.STORAGE }}
+      regression_args: --storage ${{ matrix.STORAGE }} --gcs-uri {{GCS_URI}} --gcs-key-id {{GCS_KEY_ID}} --gcs-key-secret {{GCS_KEY_SECRET}} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}}
+    secrets: inherit
 
-  ClickHouseKeeperSSL:
-    needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          SUITE=clickhouse_keeper
-          STORAGE=/ssl
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run:  EXITCODE=0;
-              python3
-              -u ${{ env.SUITE }}/regression.py
-              --ssl
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} Clickhouse Keeper SSL"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ env.SUITE }}-${{ inputs.arch }}-ssl-artifacts
-          path: ${{ env.artifact_paths }}
+  ClickHouseKeeper:
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [1, 2]
+        SSL: [ssl, no_ssl]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: clickhouse_keeper
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: /${{ matrix.SSL }}
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: clickhouse_keeper_${{ matrix.SSL }}
+      extra_args: ${{ matrix.SSL == 'ssl' && '--ssl' || '' }} --only "part ${{ matrix.PART }}/*"
+    secrets: inherit
+
+  Iceberg:
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [1, 2]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: iceberg
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: iceberg
+      extra_args: --only ${{ matrix.PART == 1 && '"/iceberg/iceberg engine/rest catalog/*" "/iceberg/s3 table function/*" "/iceberg/icebergS3 table function/*" "/iceberg/iceberg cache/*"' || '"/iceberg/iceberg engine/glue catalog/*" "/iceberg/iceberg table engine/*"' }}
+    secrets: inherit
 
   LDAP:
     strategy:
       fail-fast: false
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
-    needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=ldap/${{ matrix.SUITE }}
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run:  EXITCODE=0;
-              python3
-              -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.SUITE }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} LDAP ${{ matrix.SUITE }}"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ldap-${{ matrix.SUITE }}-${{ inputs.arch }}-artifacts
-          path: ${{ env.artifact_paths }}
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: ldap/${{ matrix.SUITE }}
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: ldap_${{ matrix.SUITE }}
+    secrets: inherit
 
   Parquet:
-    needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=parquet
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run:  EXITCODE=0;
-              python3
-              -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} Parquet"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
-          path: ${{ env.artifact_paths }}
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: parquet
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: parquet
+    secrets: inherit
 
   ParquetS3:
     strategy:
       fail-fast: false
       matrix:
         STORAGE: [minio, aws_s3]
-    needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=parquet
-          STORAGE=${{ matrix.STORAGE}}
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run:  EXITCODE=0;
-              python3
-              -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --storage ${{ matrix.STORAGE }}
-              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
-              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
-              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
-              --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.STORAGE }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} Parquet ${{ matrix.STORAGE }}"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ env.SUITE }}-${{ env.STORAGE }}-${{ inputs.arch }}-artifacts
-          path: ${{ env.artifact_paths }}
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: parquet
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: ${{ matrix.STORAGE }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: parquet_${{ matrix.STORAGE }}
+      regression_args: --storage ${{ matrix.STORAGE }} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}}
+    secrets: inherit
+
+  RBAC:
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [1, 2, 3]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: rbac
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: rbac
+      extra_args: --only "/rbac/part ${{ matrix.PART }}/*"
+    secrets: inherit
+
+  SSLServer:
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [1, 2, 3]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: ssl_server
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: ssl_server
+      extra_args: --only "part ${{ matrix.PART }}/*"
+    secrets: inherit
 
   S3:
     strategy:
       fail-fast: false
       matrix:
-        STORAGE: [minio, aws_s3, gcs, azure]
-    needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=s3
-          STORAGE=/${{ matrix.STORAGE }}
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run:  EXITCODE=0;
-              python3
-              -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --storage ${{ matrix.STORAGE }}
-              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
-              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
-              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
-              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
-              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
-              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
-              --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --azure-account-name ${{ secrets.AZURE_ACCOUNT_NAME }}
-              --azure-storage-key ${{ secrets.AZURE_STORAGE_KEY }}
-              --azure-container ${{ secrets.AZURE_CONTAINER_NAME }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.STORAGE }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} S3 ${{ matrix.STORAGE }}"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts
-          path: ${{ env.artifact_paths}}
+        STORAGE: [aws_s3, gcs, azure, minio]
+        PART: [1, 2]
+        include:
+          - STORAGE: minio
+            PART: 3
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: s3
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: /${{ matrix.STORAGE }}
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: s3_${{ matrix.STORAGE }}
+      regression_args: --storage ${{ matrix.STORAGE }} --gcs-uri {{GCS_URI}} --gcs-key-id {{GCS_KEY_ID}} --gcs-key-secret {{GCS_KEY_SECRET}} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}} --azure-account-name {{AZURE_ACCOUNT_NAME}} --azure-storage-key {{AZURE_STORAGE_KEY}} --azure-container {{AZURE_CONTAINER_NAME}}
+      extra_args: --only ":/try*" ":/part ${{ matrix.PART }}/*"
+    secrets: inherit
+
+  S3Export:
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [part, partition]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: s3
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: /minio
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: s3_export
+      regression_args: --storage minio
+      extra_args: --only ":/try*" "minio/export tests/export ${{ matrix.PART }}/*"
+    secrets: inherit
 
   TieredStorage:
     strategy:
       fail-fast: false
       matrix:
-        STORAGE: [minio, s3amazon, s3gcs]
-    needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
-      - name: Checkout regression repo
-        uses: actions/checkout@v4
-        with:
-          repository: Altinity/clickhouse-regression
-          ref: ${{ inputs.commit }}
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=tiered_storage
-          STORAGE=/${{ matrix.STORAGE }}
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.REPORTS_PATH }}
-          name: build_report_package_${{ inputs.arch }}
-      - name: Rename reports
-        run: |
-          mv ${{ env.REPORTS_PATH }}/build_report_*.json ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}.json
-      - name: Setup
-        run: .github/setup.sh
-      - name: Get deb url
-        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
-      - name: Run ${{ env.SUITE }} suite
-        id: run_suite
-        run:  EXITCODE=0;
-              python3
-              -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_path }}
-              --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
-              --aws-s3-uri https://s3.${{ secrets.REGRESSION_AWS_S3_REGION}}.amazonaws.com/${{ secrets.REGRESSION_AWS_S3_BUCKET }}/data/
-              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
-              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
-              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
-              --with-${{ matrix.STORAGE }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.STORAGE }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              ${{ env.args }} || EXITCODE=$?;
-              .github/add_link_to_logs.sh;
-              exit $EXITCODE
-      - name: Set Commit Status
-        if: always()
-        run: python3 .github/set_builds_status.py
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ inputs.arch }} Tiered Storage ${{ matrix.STORAGE }}"
-      - name: Create and upload logs
-        if: always()
-        run: .github/create_and_upload_logs.sh 1
-      - name: Upload logs to regression results database
-        if: always()
-        timeout-minutes: 20
-        run: .github/upload_results_to_database.sh 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts
-          path: ${{ env.artifact_paths}}
+        STORAGE: [local, minio, s3amazon, s3gcs]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      arch: ${{ inputs.arch }}
+      suite_name: tiered_storage
+      suite_executable: regression.py
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: /${{ matrix.STORAGE }}
+      build_sha: ${{ inputs.build_sha }}
+      job_name: tiered_storage_${{ matrix.STORAGE }}
+      regression_args: --aws-s3-access-key {{AWS_ACCESS_KEY}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-uri https://s3.{{AWS_REGION}}.amazonaws.com/{{AWS_BUCKET}}/data/ --gcs-key-id {{GCS_KEY_ID}} --gcs-key-secret {{GCS_KEY_SECRET}} --gcs-uri {{GCS_URI}}
+      extra_args: ${{ matrix.STORAGE != 'local' && format('--with-{0}', matrix.STORAGE) || '' }}
+    secrets: inherit
