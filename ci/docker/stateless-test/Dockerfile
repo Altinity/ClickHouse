@@ -1,7 +1,7 @@
 # docker build -t altinityinfra/stateless-test .
 ARG FROM_TAG=latest
 ARG REDPANDA_VERSION=v25.1.3
-FROM docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION} AS redpanda
+FROM redpandadata/redpanda:${REDPANDA_VERSION} AS redpanda
 
 FROM altinityinfra/test-base:$FROM_TAG
 
