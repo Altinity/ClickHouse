@@ -185,6 +185,42 @@ SETTINGS object_storage_cluster = 'swarm';
 You can also pin the cluster in a user profile so every query from that user uses the swarm without
 repeating the setting.
 
+### Fallback when the swarm is empty {#fallback-if-empty}
+
+Because the initiator is only an observer, it is possible that **no swarm worker is registered**:
+every node was stopped, discovery has not listed anyone yet, or the cluster name is unknown on this
+host. By default a read then fails with `CLUSTER_DOESNT_EXIST`.
+
+Set `object_storage_cluster_fallback_to_local_if_empty = 1` to run that **read on the initiator**
+instead:
+
+```sql
+SELECT count()
+FROM catalog.`iceberg.table`
+SETTINGS
+    object_storage_cluster = 'swarm',
+    object_storage_cluster_fallback_to_local_if_empty = 1;
+```
+
+The cluster is treated as empty when it is missing from `system.clusters` or has zero configured
+nodes. That is the usual case for a discovered swarm after all workers have left. Hosts that are
+still listed in a static `<remote_servers>` entry are not empty, even if none of them accept
+connections.
+
+Fallback applies to `s3` / `iceberg` / engines / catalog tables that use the
+`object_storage_cluster` **setting**. It does **not** apply to:
+
+- Explicit `*Cluster` table functions (`s3Cluster('swarm', ...)`, `icebergCluster('swarm', ...)`).
+  Those still fail if the named cluster is empty.
+- Writes. Inserts are not executed on the swarm today; they still fail when the cluster is empty
+  so a write does not succeed only while the swarm is down and start failing once workers return.
+- A missing or unknown `object_storage_remote_initiator_cluster`. That setting must still resolve
+  to a real cluster.
+
+With a remote initiator, the original initiator may not know `object_storage_cluster` at all. It
+sends a plain `s3(...)` / `iceberg(...)` and the remote initiator decides whether to fan out or
+fall back locally.
+
 ### `storage_type` for Iceberg {#storage-type}
 
 Antalya unifies Iceberg table functions and engines with a `storage_type` argument (`local`, `s3`,
@@ -420,6 +456,7 @@ connections drain.
 | Setting | Role |
 | --- | --- |
 | `object_storage_cluster` | Cluster that executes the object-storage scan. Empty = local read on the initiator. |
+| `object_storage_cluster_fallback_to_local_if_empty` | If `object_storage_cluster` is set but the cluster is missing or has no nodes, run the read on the initiator instead of throwing `CLUSTER_DOESNT_EXIST`. Default `0`. |
 | `object_storage_max_nodes` | Cap on how many hosts from that cluster run a given query. `0` = all. |
 | `object_storage_remote_initiator` | Run the cluster query on a random swarm node instead of coordinating from the client-facing initiator. |
 | `object_storage_remote_initiator_cluster` | Cluster used only to pick that remote initiator. When empty, `object_storage_cluster` is used. |
