@@ -11,6 +11,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from ci.jobs import revert_ci_regressions as job
 
+# Inc-only: revert_broken_prs.yml is disabled. These tests hard-code `master`.
+pytestmark = pytest.mark.skip(reason="revert_broken_prs workflow is disabled")
+
 NOW = datetime(2026, 7, 31, 22, 0, 0, tzinfo=timezone.utc)
 
 

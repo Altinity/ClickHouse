@@ -70,7 +70,7 @@ def test_schedule_concurrency_does_not_cancel_in_progress():
     assert "cancel-in-progress:" not in yaml_text
 
 
-def test_per_job_secret_is_exported_into_setup_script():
+def test_per_job_secret_is_not_dumped_into_setup_script():
     yaml_text = _generate(
         Workflow.Config(
             name="CreateRelease",
@@ -89,8 +89,9 @@ def test_per_job_secret_is_exported_into_setup_script():
         )
     )
 
-    assert "export ROBOT_CLICKHOUSE_COMMIT_TOKEN=$(cat<<'EOF'" in yaml_text
-    assert "${{ secrets.ROBOT_CLICKHOUSE_COMMIT_TOKEN }}" in yaml_text
+    # Secrets stay in the workflow env block; they are not copied into
+    # praktika_setup_env.sh (that dump is unused and made the YAML huge).
+    assert "export ROBOT_CLICKHOUSE_COMMIT_TOKEN=$(cat<<'EOF'" not in yaml_text
 
 
 def test_skip_condition_is_emitted_when_cache_is_disabled():
