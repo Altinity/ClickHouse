@@ -854,4 +854,52 @@ TEST_F(RestCatalogTokenForwarding, InFlightGrantDoesNotClobberRotatedServiceToke
     EXPECT_EQ(requests.front().header("Authorization"), "Bearer tok_for_rotated_secret");
 }
 
+
+/// `loadConfigIfNeeded` is a read-modify-write on the state with a slow `/v1/config` request in
+/// the middle, and `config_mutex` does not exclude `commitSettingsChanges`. Republishing the
+/// snapshot it started from would carry the pre-ALTER credentials back with it -- undoing the
+/// rotation for good, not for a cache TTL. Reachable only under forwarding, where `/v1/config`
+/// is deferred to the first user query rather than fetched in the constructor.
+TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentialChange)
+{
+    /// Declared before the server so that it outlives the threads serving its routes.
+    ParkedRoute parked;
+    TestServer server;
+    installCatalogShape(*server);
+    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
+    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+    server->setRoute("/v1/config", parked.handler([](const RecordedRequest &) { return json(R"({"defaults":{},"overrides":{}})"); }));
+
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+
+    parked.enable();
+    std::thread in_flight([&] { catalog->getTables(alice); });
+    /// Only reached when an assertion below aborts the test early; the normal path joins inline.
+    SCOPE_EXIT({
+        parked.release();
+        if (in_flight.joinable())
+            in_flight.join();
+    });
+
+    parked.waitUntilParked();
+
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes));
+
+    parked.release();
+    in_flight.join();
+
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+
+    /// The parked query resumes in the new generation, so it exchanges again -- and that
+    /// exchange authenticates with whatever credentials the published state now holds. They must
+    /// still be the rotated ones.
+    const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
+    ASSERT_GE(exchanges.size(), 2u);
+    EXPECT_EQ(parseForm(exchanges.back().body).at("client_secret"), "rotated_secret");
+}
+
 #endif

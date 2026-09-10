@@ -561,6 +561,22 @@ void RestCatalog::loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_toke
     auto new_state = std::make_unique<CatalogState>(*old_state);
     new_state->config = loadConfig(*old_state, old_state.generation, auth_token);
     new_state->config_loaded = true;
+
+    /// `config_mutex` keeps two config loads apart but says nothing about `commitSettingsChanges`,
+    /// which publishes without it. Publishing a state built from a snapshot taken before an
+    /// `ALTER DATABASE ... MODIFY SETTING catalog_credential` would carry that snapshot's
+    /// credentials back with it and undo the ALTER -- permanently, with no TTL to bound it.
+    ///
+    /// The config just loaded is dropped rather than merged into the current state: it was read
+    /// with credentials that are no longer in force, and they may resolve the warehouse to a
+    /// different prefix or base location. `config_loaded` stays false, so the next request loads
+    /// it again against the credentials that are.
+    std::lock_guard publish_lock(auth_publish_mutex);
+    if (auth_generation.load(std::memory_order_acquire) != old_state.generation)
+    {
+        LOG_DEBUG(log, "Catalog credentials changed while `/v1/config` was loading; discarding it");
+        return;
+    }
     state.set(std::move(new_state));
 }
 
