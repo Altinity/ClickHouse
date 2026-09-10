@@ -106,6 +106,8 @@ def get_run_command(
         "docker run --cap-add=SYS_PTRACE "
         # For dmesg and sysctl
         "--privileged "
+        # azurite-rs (in-process Azure Blob Storage emulator) needs many fds under parallel load
+        "--ulimit nofile=1048576:1048576 "
         # a static link, don't use S3_URL or S3_DOWNLOAD
         "-e S3_URL='https://s3.amazonaws.com/clickhouse-datasets' "
         "--tmpfs /tmp/clickhouse:mode=1777 "
