@@ -224,8 +224,8 @@ workflow = Workflow.Config(
         # ],
         # JobConfigs.llvm_coverage_job,
         JobConfigs.promql_compliance_job,
-        # TODO: stabilize and remove set_allow_failure
-        JobConfigs.build_profile_diff_job.set_allow_failure(),
+        # NOTE (strtgbb): Inc-only — needs AWS SSM CI logs cluster credentials
+        # JobConfigs.build_profile_diff_job.set_allow_failure(),
         JobConfigs.sqllogic_test_master_job.set_run_after(
             CORE_BLOCKING_JOB_NAMES
         ),
