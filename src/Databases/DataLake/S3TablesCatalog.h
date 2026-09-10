@@ -47,6 +47,7 @@ public:
 
 protected:
     DB::HTTPHeaderEntries getAuthHeaders(
+        const CatalogState & catalog_state,
         bool update_token,
         const String & method = {},
         const Poco::URI & url = {},
