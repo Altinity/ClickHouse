@@ -49,6 +49,13 @@ struct Optimization
 
         // parallel replicas
         bool parallel_replicas_filter_pushdown = false;
+
+        /// Top-K optimizations rely on a runtime `TopKThresholdTracker` shared between
+        /// `SortingStep` and `ReadFromMergeTree`, and the dynamic-filtering path adds
+        /// an internal `__topKFilter` function that is not registered in `FunctionFactory`.
+        /// Neither can survive serialization to remote workers, so we suppress the
+        /// optimization when the plan is going to be distributed.
+        bool make_distributed_plan = false;
     };
 
     using Function = size_t (*)(QueryPlan::Node *, QueryPlan::Nodes &, const ExtraSettings &);
@@ -205,15 +212,12 @@ void applyOrder(const QueryPlanOptimizationSettings & optimization_settings, Que
 std::optional<String> optimizeUseAggregateProjections(
     QueryPlan::Node & node,
     QueryPlan::Nodes & nodes,
-    bool allow_implicit_projections,
-    bool is_parallel_replicas_initiator_with_projection_support,
-    size_t max_step_description_length);
+    const QueryPlanOptimizationSettings & optimization_settings);
 
 std::optional<String> optimizeUseNormalProjections(
     Stack & stack,
     QueryPlan::Nodes & nodes,
-    bool is_parallel_replicas_initiator_with_projection_support,
-    size_t max_step_description_length);
+    const QueryPlanOptimizationSettings & optimization_settings);
 
 bool addPlansForSets(const QueryPlanOptimizationSettings & optimization_settings, QueryPlan & plan, QueryPlan::Node & node, QueryPlan::Nodes & nodes);
 

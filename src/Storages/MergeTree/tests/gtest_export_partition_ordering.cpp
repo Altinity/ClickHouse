@@ -1,8 +1,46 @@
 #include <gtest/gtest.h>
+#include <sstream>
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
+#include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Common/tests/gtest_global_context.h>
+#include <Core/Settings.h>
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Parser.h>
+#include <Poco/JSON/Stringifier.h>
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
+}
+
+namespace
+{
+    ExportReplicatedMergeTreePartitionManifest makeValidManifest()
+    {
+        ExportReplicatedMergeTreePartitionManifest manifest;
+        manifest.transaction_id = "tx1";
+        manifest.query_id = "query1";
+        manifest.partition_id = "2020";
+        manifest.destination_database = "db1";
+        manifest.destination_table = "table1";
+        manifest.source_replica = "r1";
+        manifest.number_of_parts = 1;
+        manifest.create_time = 1000;
+        manifest.task_timeout_seconds = 60;
+        manifest.max_threads = 1;
+        manifest.parallel_formatting = true;
+        manifest.parquet_parallel_encoding = true;
+        manifest.max_bytes_per_file = 1000000;
+        manifest.max_rows_per_file = 1000;
+        manifest.file_already_exists_policy = MergeTreePartExportManifest::FileAlreadyExistsPolicy::error;
+        manifest.filename_pattern = "{part_name}";
+        return manifest;
+    }
+}
 
 class ExportPartitionOrderingTest : public ::testing::Test
 {
@@ -16,6 +54,10 @@ protected:
         , by_create_time(container.get<ExportPartitionTaskEntryTagByCreateTime>())
     {
     }
+};
+
+class ExportPartitionManifestBackCompatTest : public ::testing::Test
+{
 };
 
 TEST_F(ExportPartitionOrderingTest, IterationOrderMatchesCreateTime)
@@ -43,9 +85,9 @@ TEST_F(ExportPartitionOrderingTest, IterationOrderMatchesCreateTime)
     manifest3.transaction_id = "tx3";
     manifest3.create_time = base_time; // Oldest
 
-    ExportReplicatedMergeTreePartitionTaskEntry entry1{manifest1, ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING, {}, {}};
-    ExportReplicatedMergeTreePartitionTaskEntry entry2{manifest2, ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING, {}, {}};
-    ExportReplicatedMergeTreePartitionTaskEntry entry3{manifest3, ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING, {}, {}};
+    ExportReplicatedMergeTreePartitionTaskEntry entry1{manifest1, ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING, {}, {}, {}, {}};
+    ExportReplicatedMergeTreePartitionTaskEntry entry2{manifest2, ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING, {}, {}, {}, {}};
+    ExportReplicatedMergeTreePartitionTaskEntry entry3{manifest3, ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING, {}, {}, {}, {}};
 
     // Insert in reverse order
     by_key.insert(entry1);
@@ -70,6 +112,113 @@ TEST_F(ExportPartitionOrderingTest, IterationOrderMatchesCreateTime)
     
     ++it;
     EXPECT_EQ(it, by_create_time.end());
+}
+
+
+TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMatchModeParsesAsNullopt)
+{
+    auto manifest = makeValidManifest();
+    manifest.schema_match_mode = MergeTreePartExportSchemaMatchMode::NAME;
+
+    Poco::JSON::Parser parser;
+    auto json = parser.parse(manifest.toJsonString()).extract<Poco::JSON::Object::Ptr>();
+    json->remove("schema_match_mode");
+    std::ostringstream oss;
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+
+    auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(oss.str());
+    EXPECT_FALSE(parsed.schema_match_mode.has_value());
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, SchemaMatchModeRoundTripsForEveryValue)
+{
+    for (const auto value : magic_enum::enum_values<MergeTreePartExportSchemaMatchMode>())
+    {
+        auto manifest = makeValidManifest();
+        manifest.schema_match_mode = value;
+
+        auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(manifest.toJsonString());
+
+        ASSERT_TRUE(parsed.schema_match_mode.has_value()) << "value=" << magic_enum::enum_name(value);
+        EXPECT_EQ(*parsed.schema_match_mode, value) << "value=" << magic_enum::enum_name(value);
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, MissingIgnoreExtraSourceColumnsParsesAsNullopt)
+{
+    auto manifest = makeValidManifest();
+    manifest.ignore_extra_source_columns = true;
+
+    Poco::JSON::Parser parser;
+    auto json = parser.parse(manifest.toJsonString()).extract<Poco::JSON::Object::Ptr>();
+    json->remove("ignore_extra_source_columns");
+    std::ostringstream oss;
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+
+    auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(oss.str());
+    EXPECT_FALSE(parsed.ignore_extra_source_columns.has_value());
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsRoundTripsForEveryValue)
+{
+    for (const bool value : {false, true})
+    {
+        auto manifest = makeValidManifest();
+        manifest.ignore_extra_source_columns = value;
+
+        auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(manifest.toJsonString());
+
+        ASSERT_TRUE(parsed.ignore_extra_source_columns.has_value()) << "value=" << value;
+        EXPECT_EQ(*parsed.ignore_extra_source_columns, value) << "value=" << value;
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMatchSettingsFallBackToDefaultsInWorkerContext)
+{
+    auto manifest = makeValidManifest();
+    ASSERT_FALSE(manifest.schema_match_mode.has_value());
+    ASSERT_FALSE(manifest.ignore_extra_source_columns.has_value());
+
+    auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
+
+    EXPECT_EQ(
+        worker_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value,
+        MergeTreePartExportSchemaMatchMode::POSITION);
+    EXPECT_EQ(
+        worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
+        false);
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, SchemaMatchModeAppliedToWorkerContextForEveryValue)
+{
+    for (const auto value : magic_enum::enum_values<MergeTreePartExportSchemaMatchMode>())
+    {
+        auto manifest = makeValidManifest();
+        manifest.schema_match_mode = value;
+
+        auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
+
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value,
+            value) << "value=" << magic_enum::enum_name(value);
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsAppliedToWorkerContextForEveryValue)
+{
+    for (const bool value : {false, true})
+    {
+        auto manifest = makeValidManifest();
+        manifest.ignore_extra_source_columns = value;
+
+        auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
+
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
+            value) << "value=" << value;
+    }
 }
 
 }

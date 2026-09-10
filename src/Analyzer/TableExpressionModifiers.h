@@ -5,6 +5,9 @@
 namespace DB
 {
 
+class ReadBuffer;
+class WriteBuffer;
+
 /** Modifiers that can be used for table, table function and subquery in JOIN TREE.
   *
   * Example: SELECT * FROM test_table SAMPLE 0.1 OFFSET 0.1 FINAL
@@ -73,6 +76,9 @@ private:
     std::optional<Rational> sample_size_ratio;
     std::optional<Rational> sample_offset_ratio;
 };
+
+void serializeRational(TableExpressionModifiers::Rational val, WriteBuffer & out);
+TableExpressionModifiers::Rational deserializeRational(ReadBuffer & in);
 
 inline bool operator==(const TableExpressionModifiers & lhs, const TableExpressionModifiers & rhs)
 {

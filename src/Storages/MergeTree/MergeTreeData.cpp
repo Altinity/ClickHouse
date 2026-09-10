@@ -16,6 +16,7 @@
 #include <Columns/ColumnAggregateFunction.h>
 #include <Common/Config/ConfigHelper.h>
 #include <Common/CurrentMetrics.h>
+#include <Common/FailPoint.h>
 #include <Common/Increment.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEventsScope.h>
@@ -373,6 +374,15 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
     extern const int PENDING_MUTATIONS_NOT_ALLOWED;
+    extern const int FAULT_INJECTED;
+}
+
+namespace FailPoints
+{
+    /// Throws once from the background data-parts refresh of a read-only table to emulate a
+    /// transient error (e.g. temporary disk unavailability). Used to test that the refresh task
+    /// reschedules itself after such an error instead of stopping permanently.
+    extern const char merge_tree_refresh_parts_throw_once[];
 }
 
 static String getPartNameFromAST(const ASTPtr & partition)
@@ -1192,6 +1202,21 @@ void MergeTreeData::checkProperties(
     }
 
     checkKeyExpression(*new_sorting_key.expression, new_sorting_key.sample_block, "Sorting", allow_nullable_key_);
+}
+
+void MergeTreeData::checkMetadataProperties(
+    const StorageInMemoryMetadata & new_metadata,
+    const StorageInMemoryMetadata & old_metadata,
+    ContextPtr local_context) const
+{
+    checkProperties(
+        new_metadata,
+        old_metadata,
+        /*attach=*/false,
+        /*allow_empty_sorting_key=*/false,
+        allow_reverse_key,
+        allow_nullable_key,
+        local_context);
 }
 
 void MergeTreeData::setProperties(
@@ -2622,6 +2647,11 @@ void MergeTreeData::startStatisticsCache()
 void MergeTreeData::refreshDataParts(UInt64 interval_milliseconds)
 try
 {
+    fiu_do_on(FailPoints::merge_tree_refresh_parts_throw_once,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "Injected transient failure into MergeTreeData::refreshDataParts");
+    });
+
     for (auto & disk : getStoragePolicy()->getDisks())
         disk->refresh(interval_milliseconds);
 
@@ -2718,6 +2748,10 @@ try
 catch (...)
 {
     tryLogCurrentException(log, "Failed to refresh parts");
+    /// A transient error (e.g. temporary disk unavailability) must not permanently disable the background
+    /// refresh task; otherwise the read-only table stays stale until the server restarts. Mirror the
+    /// reschedule that refreshStatistics performs in its own catch block.
+    refresh_parts_task->scheduleAfter(interval_milliseconds);
 }
 
 void MergeTreeData::refreshStatistics(UInt64 interval_seconds)
@@ -6692,25 +6726,29 @@ void MergeTreeData::exportPartToTable(
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
-    auto query_to_string = [] (const ASTPtr & ast)
-    {
-        return ast ? ast->formatWithSecretsOneLine() : "";
-    };
-
     auto source_metadata_ptr = getInMemoryMetadataPtr();
     auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr();
+
+    if (dest_storage->isDataLake() && !query_context->getSettingsRef()[Setting::allow_insert_into_iceberg])
+    {
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Iceberg writes are experimental. "
+            "To allow its usage, enable the setting `allow_insert_into_iceberg`.");
+    }
+
+    ExportPartitionUtils::verifyExportSchemaCastable(
+        source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
+
+    auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+
+    if (!part)
+        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
+                        part_name, getStorageID().getFullTableName());
 
     std::string iceberg_metadata_json;
 
     if (dest_storage->isDataLake())
     {
-        if (!query_context->getSettingsRef()[Setting::allow_insert_into_iceberg])
-        {
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-                "Iceberg writes are experimental. "
-                "To allow its usage, enable the setting `allow_insert_into_iceberg`.");
-        }
-
 #if USE_AVRO
         if (iceberg_metadata_json_)
         {
@@ -6745,31 +6783,29 @@ void MergeTreeData::exportPartToTable(
 
             ExportPartitionUtils::verifyIcebergPartitionCompatibility(
                 metadata_object,
-                source_metadata_ptr->getPartitionKeyAST());
+                source_metadata_ptr,
+                destination_metadata_ptr,
+                {part},
+                part->info.getPartitionId(),
+                query_context);
         }
 #else
         (void)iceberg_metadata_json_;
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
     }
-
-    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
-    ExportPartitionUtils::verifyExportSchemaCastable(
-        source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
-
-    /// Iceberg partition compatibility is checked above; here we only need the
-    /// partition-key ASTs to match (partition-column types follow the lossy-cast gate).
-    if (!dest_storage->isDataLake())
+    else
     {
-        if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+        /// Plain (hive) object storage writes every row of the part to the one directory computed from
+        /// the destination PARTITION BY on the part's min row, so the source partition must map to a
+        /// single destination partition. Equivalent or finer source keys are accepted.
+        ExportPartitionUtils::verifyPlainPartitionCompatibility(
+            source_metadata_ptr,
+            destination_metadata_ptr,
+            {part},
+            part->info.getPartitionId(),
+            query_context);
     }
-
-    auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-
-    if (!part)
-        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
-                        part_name, getStorageID().getFullTableName());
 
     if (part->getState() == MergeTreeDataPartState::Outdated && !allow_outdated_parts)
         throw Exception(
