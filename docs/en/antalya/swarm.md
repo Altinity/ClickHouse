@@ -185,6 +185,46 @@ SETTINGS object_storage_cluster = 'swarm';
 You can also pin the cluster in a user profile so every query from that user uses the swarm without
 repeating the setting.
 
+### `storage_type` for Iceberg {#storage-type}
+
+Antalya unifies Iceberg table functions and engines with a `storage_type` argument (`local`, `s3`,
+`azure`, or `hdfs`). The default is `s3`. Use the same `iceberg` / `Iceberg` name with
+`object_storage_cluster` (or `icebergCluster`) regardless of the backend.
+
+Old syntax:
+
+```sql
+SELECT * FROM icebergS3('http://minio1:9000/root/table_data', 'minio', 'minio123', 'Parquet');
+SELECT * FROM icebergAzureCluster('mycluster', 'http://azurite1:30000/devstoreaccount1', 'cont', '/table_data', 'devstoreaccount1', 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==', 'Parquet');
+CREATE TABLE mytable ENGINE = IcebergHDFS('/table_data', 'Parquet');
+```
+
+New syntax:
+
+```sql
+SELECT * FROM iceberg(storage_type = 's3', 'http://minio1:9000/root/table_data', 'minio', 'minio123', 'Parquet');
+SELECT * FROM icebergCluster('mycluster', storage_type = 'azure', 'http://azurite1:30000/devstoreaccount1', 'cont', '/table_data', 'devstoreaccount1', 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==', 'Parquet');
+CREATE TABLE mytable ENGINE = Iceberg('/table_data', 'Parquet', storage_type = 'hdfs');
+```
+
+`storage_type` can live in a named collection:
+
+```xml
+<named_collections>
+    <s3>
+        <url>http://minio1:9001/root/</url>
+        <access_key_id>minio</access_key_id>
+        <secret_access_key>minio123</secret_access_key>
+        <storage_type>s3</storage_type>
+    </s3>
+</named_collections>
+```
+
+```sql
+SELECT * FROM iceberg(s3, filename = 'table_data')
+SETTINGS object_storage_cluster = 'swarm';
+```
+
 ### Limit how many swarm nodes take part {#object-storage-max-nodes}
 
 `object_storage_max_nodes` limits how many hosts from the cluster participate in one query (`0` =
@@ -385,42 +425,3 @@ connections drain.
 | `object_storage_remote_initiator_cluster` | Cluster used only to pick that remote initiator. When empty, `object_storage_cluster` is used. |
 | `object_storage_cluster_join_mode` | How to rewrite `JOIN`s when workers cannot see the right-hand table: `allow`, `local`, `global`. |
 | `lock_object_storage_task_distribution_ms` | How long a free worker waits before stealing another node's files. Higher values favor cache locality. Default `500`. |
-
-## Antalya differences from upstream {#antalya-differences}
-
-Besides the swarm settings and `SYSTEM STOP/START SWARM MODE`, Antalya unifies Iceberg table
-functions and engines with a `storage_type` argument (`local`, `s3`, `azure`, or `hdfs`). The
-default is `s3`.
-
-Old syntax:
-
-```sql
-SELECT * FROM icebergS3('http://minio1:9000/root/table_data', 'minio', 'minio123', 'Parquet');
-SELECT * FROM icebergAzureCluster('mycluster', 'http://azurite1:30000/devstoreaccount1', 'cont', '/table_data', 'devstoreaccount1', 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==', 'Parquet');
-CREATE TABLE mytable ENGINE = IcebergHDFS('/table_data', 'Parquet');
-```
-
-New syntax:
-
-```sql
-SELECT * FROM iceberg(storage_type = 's3', 'http://minio1:9000/root/table_data', 'minio', 'minio123', 'Parquet');
-SELECT * FROM icebergCluster('mycluster', storage_type = 'azure', 'http://azurite1:30000/devstoreaccount1', 'cont', '/table_data', 'devstoreaccount1', 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==', 'Parquet');
-CREATE TABLE mytable ENGINE = Iceberg('/table_data', 'Parquet', storage_type = 'hdfs');
-```
-
-`storage_type` can live in a named collection:
-
-```xml
-<named_collections>
-    <s3>
-        <url>http://minio1:9001/root/</url>
-        <access_key_id>minio</access_key_id>
-        <secret_access_key>minio123</secret_access_key>
-        <storage_type>s3</storage_type>
-    </s3>
-</named_collections>
-```
-
-```sql
-SELECT * FROM iceberg(s3, filename = 'table_data');
-```
