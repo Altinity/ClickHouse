@@ -34,7 +34,22 @@ namespace ExportPartitionUtils
     /// `retry_count` is the number of failures so far (>= 1 when a retry is pending).
     size_t computeRetryBackoffSeconds(size_t retry_count, size_t initial_backoff_seconds, size_t max_backoff_seconds);
 
-    std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
+    struct ExportedPaths
+    {
+        /// Number of `<export_path>/processed` leaves, that is, parts this export has finished.
+        size_t processed_parts_count = 0;
+
+        /// Destination paths recorded by those leaves, flattened. A leaf may carry none, so this
+        /// can legitimately be shorter than `processed_parts_count`: an Iceberg destination writes
+        /// no data file for a part with no surviving rows (a plain object-storage one still ships
+        /// an empty Parquet).
+        std::vector<std::string> paths;
+    };
+
+    /// Reads the destination paths recorded under `<export_path>/processed`.
+    /// Throws `Coordination::Exception` when Keeper cannot be read: a transport failure must not be
+    /// indistinguishable from "this export produced nothing".
+    ExportedPaths getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
     /// Build a query context carrying the export task's persisted settings. Templated on the
     /// descriptor type so it serves both the replicated manifest (backed by ZooKeeper) and the

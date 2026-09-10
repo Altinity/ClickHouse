@@ -19,9 +19,11 @@ The export task can be killed by issuing the kill command: `KILL EXPORT PARTITIO
 
 The task is persistent - it should be resumed after crashes, failures and etc.
 
+A part with no surviving rows writes no file. This happens when every row of the part was removed by a lightweight delete: the part is still exported, and counts as done, but it contributes nothing to the destination. If that is true of every part of the partition, the export produces no files at all and there is nothing to commit, so the task reaches `COMPLETED` without touching the destination. Such a part therefore has no entry in the `destination_file_paths` column of `system.partition_exports`.
+
 ### On Apache Iceberg storage exports:
 
-Each MergeTree part will become a separate file (or more depending on `max_bytes` and `max_rows` settings) following the engine naming convention. Once all parts have been exported, new snapshots / manifest files are generated and the data is comitted using the Apache Iceberg commit mechanism.
+Each MergeTree part that has surviving rows will become a separate file (or more depending on `max_bytes` and `max_rows` settings) following the engine naming convention. Once all parts have been exported, new snapshots / manifest files are generated and the data is comitted using the Apache Iceberg commit mechanism.
 
 The manifest file produced by the commit contains a summary field `clickhouse.export-partition-transaction-id` that stores the transaction id. This field is used to implement idempotency and avoid data duplication. Some Apache Iceberg storage managers employ old manifests cleanup, ClickHouse does not.
 

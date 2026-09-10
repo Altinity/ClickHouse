@@ -1663,6 +1663,7 @@ void IcebergImportSink::consume(Chunk & chunk)
     if (isCancelled())
         return;
 
+    consumed_rows = true;
     writer->consume(chunk);
 }
 
@@ -1702,6 +1703,13 @@ void IcebergImportSink::onException(std::exception_ptr /* exception */)
 
 void IcebergImportSink::finalizeBuffers()
 {
+    /// `MultipleFileWriter` opens its first data file when it receives a chunk, not when it is
+    /// constructed, so finalizing a writer that was never fed anything would dereference the
+    /// buffer it never created. Exporting a part whose rows were all removed by a lightweight
+    /// delete reaches exactly that state.
+    if (!consumed_rows)
+        return;
+
     writer->finalize();
 }
 

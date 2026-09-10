@@ -109,6 +109,83 @@ def test_export_partition_all_to_iceberg(cluster, source_engine):
     assert count_2021 == 1, f"Expected 1 row for year=2021, got {count_2021}"
 
 
+def setup_deleted_rows_tables(node, mt_table: str, iceberg_table: str, engine: str):
+    """Source holding partition 2020 in two separate parts, plus the Iceberg destination.
+
+    Merges are disabled because a merge applies the deleted mask: it would rewrite the parts
+    below into one without the deleted rows, removing the case these tests are about.
+    """
+    make_source(
+        node, mt_table, "id Int64, year Int32", "year",
+        engine=engine, replica_name="replica1",
+        extra_settings="max_bytes_to_merge_at_max_space_in_pool = 1",
+    )
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020)")
+    node.query(f"INSERT INTO {mt_table} VALUES (3, 2020)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, year Int32", partition_by="year")
+
+
+def test_export_partition_with_a_fully_deleted_part(cluster, source_engine):
+    """
+    A part whose rows were all removed by a lightweight delete exports successfully without
+    writing a data file. The export must still commit, carrying the files the other parts
+    produced.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_deleted_part_{uid}"
+    iceberg_table = f"iceberg_deleted_part_{uid}"
+
+    setup_deleted_rows_tables(node, mt_table, iceberg_table, source_engine)
+
+    node.query(f"DELETE FROM {mt_table} WHERE id IN (1, 2)", settings={"mutations_sync": 2})
+
+    active_parts = node.query(
+        f"SELECT count() FROM system.parts WHERE table = '{mt_table}' AND active"
+    ).strip()
+    assert active_parts == "2", (
+        f"Expected both inserted parts to survive the delete, got {active_parts}"
+    )
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT id, year FROM {iceberg_table} ORDER BY id").strip()
+    assert result == "3\t2020", f"Unexpected data in Iceberg table:\n{result}"
+
+
+def test_export_partition_where_every_row_is_deleted(cluster, source_engine):
+    """
+    When no part of the partition has a surviving row the export produces no files at all.
+    An empty export is not corrupted state: the task must reach COMPLETED and leave the
+    destination untouched.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_deleted_all_{uid}"
+    iceberg_table = f"iceberg_deleted_all_{uid}"
+
+    setup_deleted_rows_tables(node, mt_table, iceberg_table, source_engine)
+
+    node.query(f"DELETE FROM {mt_table} WHERE year = 2020", settings={"mutations_sync": 2})
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, f"Expected the Iceberg table to stay empty, got {count} rows"
+
+
 def setup_stats_tables(node, mt_table: str, iceberg_table: str, engine: str = "ReplicatedMergeTree"):
     """Local variant of setup_tables using the wider schema with a Nullable column."""
     columns = "id Int32, name String, tag Nullable(String), year Int32"

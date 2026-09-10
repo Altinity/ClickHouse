@@ -36,12 +36,14 @@ MultiFileStorageObjectStorageSink::MultiFileStorageObjectStorageSink(
     sample_block(sample_block_),
     context(context_)
 {
-    current_sink = createNewSink();
+    /// The first sink is opened on the first chunk, not here, so a source that yields no rows
+    /// leaves nothing behind in the destination. This matches an `INSERT` of zero rows into the
+    /// same partitioned table and an Iceberg export of a part with no surviving rows.
 }
 
 MultiFileStorageObjectStorageSink::~MultiFileStorageObjectStorageSink()
 {
-    if (isCancelled())
+    if (isCancelled() && current_sink)
         current_sink->cancel();
 }
 
@@ -99,20 +101,28 @@ void MultiFileStorageObjectStorageSink::consume(Chunk & chunk)
 {
     if (isCancelled())
     {
-        current_sink->cancel();
+        if (current_sink)
+            current_sink->cancel();
         return;
     }
 
-    const auto written_bytes = current_sink->getWrittenBytes();
-    
-    const bool exceeded_bytes_limit = max_bytes_per_file && written_bytes >= max_bytes_per_file;
-    const bool exceeded_rows_limit = max_rows_per_file && current_sink_written_rows >= max_rows_per_file;
-
-    if (exceeded_bytes_limit || exceeded_rows_limit)
+    if (!current_sink)
     {
-        current_sink->onFinish();
         current_sink = createNewSink();
-        current_sink_written_rows = 0;
+    }
+    else
+    {
+        const auto written_bytes = current_sink->getWrittenBytes();
+
+        const bool exceeded_bytes_limit = max_bytes_per_file && written_bytes >= max_bytes_per_file;
+        const bool exceeded_rows_limit = max_rows_per_file && current_sink_written_rows >= max_rows_per_file;
+
+        if (exceeded_bytes_limit || exceeded_rows_limit)
+        {
+            current_sink->onFinish();
+            current_sink = createNewSink();
+            current_sink_written_rows = 0;
+        }
     }
 
     current_sink->consume(chunk);
@@ -121,6 +131,12 @@ void MultiFileStorageObjectStorageSink::consume(Chunk & chunk)
 
 void MultiFileStorageObjectStorageSink::onFinish()
 {
+    /// No chunk ever arrived, so no file was opened and none has to be accounted for. Writing a
+    /// commit file listing nothing would only leave a marker for data that does not exist, and a
+    /// later re-export of the same empty part writes nothing again, so this stays idempotent.
+    if (!current_sink)
+        return;
+
     current_sink->onFinish();
     commit();
 }

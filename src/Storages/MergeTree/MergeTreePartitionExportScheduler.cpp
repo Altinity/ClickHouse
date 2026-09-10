@@ -372,7 +372,19 @@ void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transacti
         auto it = findByTransactionId(transaction_id);
         if (it == tasks.end())
             return;
-        descriptor_copy = it->second.getDescriptor();
+
+        auto & entry = it->second;
+
+        /// run() marked the part in flight and released the mutex, so a KILL from a query thread
+        /// may have made the task terminal since then. Dispatching now would write destination
+        /// objects for an export the user already cancelled.
+        if (entry.getDescriptor().status != MergeTreePartitionExportTask::Status::PENDING)
+        {
+            entry.in_flight_parts.erase(part_name);
+            return;
+        }
+
+        descriptor_copy = entry.getDescriptor();
     }
 
     const StorageID destination_storage_id{descriptor_copy.destination_database, descriptor_copy.destination_table};
@@ -394,6 +406,21 @@ void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transacti
             {
                 handlePartCompletion(transaction_id, part_name, result);
             });
+
+        /// killExportPart can only cancel a task that is already registered in `export_manifests`.
+        /// A KILL that ran between the status check above and this registration therefore found
+        /// nothing to cancel. Its terminal status is durable by then, so re-read it now that the
+        /// task is visible and cancel it ourselves if it lost that race.
+        bool still_pending = false;
+        {
+            std::lock_guard lock(mutex);
+            auto it = findByTransactionId(transaction_id);
+            still_pending = it != tasks.end()
+                && it->second.getDescriptor().status == MergeTreePartitionExportTask::Status::PENDING;
+        }
+
+        if (!still_pending)
+            storage.killExportPart(transaction_id);
     }
     catch (const Exception & e)
     {
@@ -556,31 +583,40 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
     std::optional<Exception> failure;
     try
     {
-        auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
-        if (!destination_storage)
-            throw Exception(ErrorCodes::UNKNOWN_TABLE, "Destination table {} not found for export commit",
-                destination_storage_id.getNameForLogs());
-
         const auto exported_paths = descriptor_copy.collectExportedPaths();
+
+        /// Every part is done and its paths were recorded durably at completion, so an empty set
+        /// here is not a lost-data symptom: an Iceberg destination writes no data file for a part
+        /// with no surviving rows, so a partition that is entirely deleted produces nothing at all.
+        /// There is no file to make visible, so there is nothing to commit.
         if (exported_paths.empty())
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "No exported paths found for export {}, will not commit. This might be a bug", transaction_id);
+        {
+            LOG_INFO(storage.log,
+                "ExportPartition: task {} produced no destination files, nothing to commit", transaction_id);
+        }
+        else
+        {
+            auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
+            if (!destination_storage)
+                throw Exception(ErrorCodes::UNKNOWN_TABLE, "Destination table {} not found for export commit",
+                    destination_storage_id.getNameForLogs());
 
-        auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), descriptor_copy);
+            auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), descriptor_copy);
 
-        LOG_INFO(storage.log, "ExportPartition: all parts exported for task {}, committing", transaction_id);
+            LOG_INFO(storage.log, "ExportPartition: all parts exported for task {}, committing", transaction_id);
 
-        ExportPartitionUtils::commitExportedPaths(
-            descriptor_copy.transaction_id,
-            descriptor_copy.partition_id,
-            descriptor_copy.iceberg_metadata_json,
-            descriptor_copy.write_full_path_in_iceberg_metadata,
-            descriptor_copy.iceberg_partition_timezone,
-            exported_paths,
-            descriptor_copy.partNames(),
-            destination_storage,
-            storage,
-            context);
+            ExportPartitionUtils::commitExportedPaths(
+                descriptor_copy.transaction_id,
+                descriptor_copy.partition_id,
+                descriptor_copy.iceberg_metadata_json,
+                descriptor_copy.write_full_path_in_iceberg_metadata,
+                descriptor_copy.iceberg_partition_timezone,
+                exported_paths,
+                descriptor_copy.partNames(),
+                destination_storage,
+                storage,
+                context);
+        }
 
         success = true;
     }

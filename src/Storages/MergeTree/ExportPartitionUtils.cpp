@@ -385,10 +385,12 @@ namespace ExportPartitionUtils
     /// Collect all the exported paths from the processed parts
     /// If multiRead is supported by the keeper implementation, it is done in a single request
     /// Otherwise, multiple async requests are sent
-    std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path)
+    ///
+    /// Keeper failures propagate rather than degrading to an empty result: the caller cannot tell
+    /// "Keeper is unreachable" from "this export wrote nothing" and would otherwise report the
+    /// transport failure as corrupted data.
+    ExportedPaths getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path)
     {
-        std::vector<std::string> exported_paths;
-
         LOG_DEBUG(log, "ExportPartition: Getting exported paths for {}", export_path);
 
         const auto processed_parts_path = fs::path(export_path) / "processed";
@@ -396,14 +398,11 @@ namespace ExportPartitionUtils
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         std::vector<std::string> processed_parts;
-        if (Coordination::Error::ZOK != zk->tryGetChildren(processed_parts_path, processed_parts))
-        {
-            /// todo arthur do something here
-            LOG_WARNING(log, "ExportPartition: Failed to get parts children, exiting");
-            return {};
-        }
+        if (const auto code = zk->tryGetChildren(processed_parts_path, processed_parts); code != Coordination::Error::ZOK)
+            throw Coordination::Exception::fromPath(code, processed_parts_path);
 
         std::vector<std::string> get_paths;
+        get_paths.reserve(processed_parts.size());
 
         for (const auto & processed_part : processed_parts)
         {
@@ -416,26 +415,23 @@ namespace ExportPartitionUtils
 
         responses.waitForResponses();
 
+        ExportedPaths result;
+        result.processed_parts_count = processed_parts.size();
+
         for (size_t i = 0; i < responses.size(); ++i)
         {
             if (responses[i].error != Coordination::Error::ZOK)
-            {
-                /// todo arthur what to do in this case?
-                /// It could be that zk is corrupt, in that case we should fail the task
-                /// but it can also be some temporary network issue? not sure
-                LOG_WARNING(log, "ExportPartition: Failed to get exported path, exiting");
-                return {};
-            }
+                throw Coordination::Exception::fromPath(responses[i].error, get_paths[i]);
 
             const auto processed_part_entry = ExportReplicatedMergeTreePartitionProcessedPartEntry::fromJsonString(responses[i].data);
 
             for (const auto & path_in_destination : processed_part_entry.paths_in_destination)
             {
-                exported_paths.emplace_back(path_in_destination);
+                result.paths.emplace_back(path_in_destination);
             }
         }
 
-        return exported_paths;
+        return result;
     }
 
     void commit(
@@ -481,30 +477,42 @@ namespace ExportPartitionUtils
             return;
         }
 
-        const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
+        const auto exported = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
-        if (exported_paths.empty())
+        /// Completeness is measured in processed parts, not in paths: whether a part writes a file
+        /// is the destination's choice. A plain object-storage sink opens its file eagerly and ships
+        /// an empty Parquet for a part with no surviving rows, while the Iceberg writer only creates
+        /// a data file once a row arrives, exactly as an `INSERT` of zero rows adds no manifest
+        /// entry. A missing `processed` leaf is never legitimate, though: commit is only reached
+        /// once `processing` is empty, and a part leaves it only by being created there.
+        if (exported.processed_parts_count < manifest.parts.size())
         {
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "ExportPartition: No exported paths found, will not commit export. This might be a bug");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "ExportPartition: Reached the commit phase, but only {} of {} parts are marked as processed, "
+                "will not commit export. This might be a bug",
+                exported.processed_parts_count, manifest.parts.size());
         }
 
-        //// not checking for an exact match because a single part might generate multiple files
-        if (exported_paths.size() < manifest.parts.size())
-        {
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "ExportPartition: Reached the commit phase, but exported paths size is less than the number of parts, will not commit export. This might be a bug");
-        }
+        IStorage::ExportPartitionCommitInfo destination_commit_info;
 
-        const auto destination_commit_info = commitExportedPaths(
-            manifest.transaction_id,
-            manifest.partition_id,
-            manifest.iceberg_metadata_json,
-            manifest.write_full_path_in_iceberg_metadata,
-            manifest.iceberg_partition_timezone,
-            exported_paths,
-            manifest.parts,
-            destination_storage,
-            source_storage,
-            context_in);
+        if (exported.paths.empty())
+        {
+            LOG_INFO(log, "ExportPartition: {} produced no destination files, nothing to commit", entry_path);
+        }
+        else
+        {
+            destination_commit_info = commitExportedPaths(
+                manifest.transaction_id,
+                manifest.partition_id,
+                manifest.iceberg_metadata_json,
+                manifest.write_full_path_in_iceberg_metadata,
+                manifest.iceberg_partition_timezone,
+                exported.paths,
+                manifest.parts,
+                destination_storage,
+                source_storage,
+                context_in);
+        }
 
         /// Failpoint to simulate a crash after the Iceberg commit succeeds but before
         /// ZooKeeper is updated to COMPLETED. Used by idempotency integration tests.

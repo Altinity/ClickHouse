@@ -2,6 +2,7 @@ import uuid
 
 from helpers.export_partition_helpers import (
     is_replicated_engine,
+    make_source,
     wait_for_export_status,
 )
 
@@ -574,4 +575,91 @@ def test_export_partition_all_failure_modes(cluster, source_engine):
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
         f" SETTINGS export_merge_tree_partition_all_on_error = 'skip_conflicts'"
+    )
+
+
+def test_export_partition_with_a_fully_deleted_part(cluster, source_engine):
+    """
+    A part whose rows were all removed by a lightweight delete exports successfully without
+    writing a file. The export must still commit, carrying only what the other parts produced.
+    """
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"deleted_part_mt_{postfix}"
+    s3_table = f"deleted_part_s3_{postfix}"
+
+    # Merges are disabled because a merge applies the deleted mask: it would rewrite the two
+    # parts below into one without the deleted rows, removing the case under test.
+    make_source(
+        node, mt_table, "id UInt64, year UInt16", "year",
+        engine=source_engine, replica_name="replica1",
+        extra_settings="max_bytes_to_merge_at_max_space_in_pool = 1",
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020)")
+    node.query(f"INSERT INTO {mt_table} VALUES (3, 2020)")
+    create_s3_table(node, s3_table)
+
+    node.query(f"DELETE FROM {mt_table} WHERE id IN (1, 2)", settings={"mutations_sync": 2})
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT id, year FROM {s3_table} ORDER BY id").strip()
+    assert result == "3\t2020", f"Unexpected data in the destination table:\n{result}"
+
+    exported_files = node.query(
+        f"""
+        SELECT length(arrayFlatten(mapValues(destination_file_paths)))
+        FROM system.partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    ).strip()
+    assert exported_files == "1", (
+        f"Expected only the surviving part to write a file, got {exported_files}"
+    )
+
+
+def test_export_partition_where_every_row_is_deleted(cluster, source_engine):
+    """
+    When no part of the partition has a surviving row the export produces no files at all.
+    An empty export is not corrupted state: the task must reach COMPLETED and leave the
+    destination untouched.
+    """
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"deleted_all_mt_{postfix}"
+    s3_table = f"deleted_all_s3_{postfix}"
+
+    make_source(
+        node, mt_table, "id UInt64, year UInt16", "year",
+        engine=source_engine, replica_name="replica1",
+        extra_settings="max_bytes_to_merge_at_max_space_in_pool = 1",
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020)")
+    node.query(f"INSERT INTO {mt_table} VALUES (3, 2020)")
+    create_s3_table(node, s3_table)
+
+    node.query(f"DELETE FROM {mt_table} WHERE year = 2020", settings={"mutations_sync": 2})
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected the destination table to stay empty, got {count} rows"
+
+    exported_files = node.query(
+        f"""
+        SELECT length(arrayFlatten(mapValues(destination_file_paths)))
+        FROM system.partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    ).strip()
+    assert exported_files == "0", (
+        f"Expected no files to be written for an entirely deleted partition, got {exported_files}"
     )
