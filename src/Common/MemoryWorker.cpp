@@ -926,7 +926,7 @@ void MemoryWorker::updateResidentMemoryThread()
                 }
             }
 
-            /// update MemoryTracker with `allocated` information from jemalloc when:
+            /// update MemoryTracker with resident memory information (cgroup or jemalloc) when:
             ///  - it's a first run of MemoryWorker (MemoryTracker could've missed some allocation before its initialization)
             ///  - MemoryTracker stores a negative value
             ///  - `correct_tracker` is set to true
