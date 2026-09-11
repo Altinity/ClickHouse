@@ -19,12 +19,6 @@ namespace ErrorCodes
 }
 
 /// On-disk descriptor for a plain (non-replicated) `MergeTree` partition export task.
-///
-/// Unlike the replicated variant, there is a single node and no cross-replica coordination,
-/// so this descriptor is the whole source of truth. It is persisted as one JSON file per task
-/// under the table data directory and rewritten on every state transition (part done, status
-/// change). The scheduler keeps an in-memory copy guarded by a mutex; the descriptor is small
-/// and self-contained so it can be reloaded verbatim after a server restart.
 struct MergeTreePartitionExportTask
 {
     using FileAlreadyExistsPolicy = MergeTreePartExportManifest::FileAlreadyExistsPolicy;

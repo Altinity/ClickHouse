@@ -8,15 +8,6 @@
 namespace DB
 {
 
-/// One `EXPORT PARTITION` task as exposed by `system.partition_exports`, for both plain
-/// `MergeTree` and `Replicated*MergeTree` sources. Producers fill it from their own in-memory
-/// mirror, so building it never touches disk or ZooKeeper.
-///
-/// Fields that only a replicated source can populate are documented below; a plain `MergeTree`
-/// leaves them empty rather than inventing a value.
-///
-/// `source_database` / `source_table` are absent on purpose: the system table emits the names it
-/// iterated in `DatabaseCatalog`, which stay correct after a `RENAME`.
 struct PartitionExportInfo
 {
     /// Most recent exception recorded for this task by one replica. A plain `MergeTree` reports a

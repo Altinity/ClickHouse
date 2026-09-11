@@ -45,9 +45,7 @@ private:
 
     struct TaskEntry
     {
-        /// Pins the source parts so they are not physically removed before the export finishes,
-        /// including already-exported parts that Iceberg commit still reads for partition values.
-        /// Cleared by `setDescriptor` when the installed snapshot is terminal.
+        /// Pins the source parts so they are not physically removed
         std::vector<DataPartPtr> part_references;
         /// Parts currently scheduled on the background move executor (avoids double scheduling).
         std::unordered_set<String> in_flight_parts;

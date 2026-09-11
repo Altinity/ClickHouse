@@ -72,10 +72,6 @@ MultiFileStorageObjectStorageSink::MultiFileStorageObjectStorageSink(
     /// file. `error` still reports the leftovers as a conflict, but `skip` has to rewrite them --
     /// the files that attempt never reached carry rows no later attempt produces.
     overwrite_data_files = file_already_exists_policy != FileAlreadyExistsPolicy::error;
-
-    /// The first sink is opened on the first chunk, not here, so a source that yields no rows
-    /// leaves nothing behind in the destination. This matches an `INSERT` of zero rows into the
-    /// same partitioned table and an Iceberg export of a part with no surviving rows.
 }
 
 MultiFileStorageObjectStorageSink::~MultiFileStorageObjectStorageSink()
@@ -166,9 +162,6 @@ void MultiFileStorageObjectStorageSink::consume(Chunk & chunk)
 
 void MultiFileStorageObjectStorageSink::onFinish()
 {
-    /// No chunk ever arrived, so no file was opened and none has to be accounted for. Writing a
-    /// commit file listing nothing would only leave a marker for data that does not exist, and a
-    /// later re-export of the same empty part writes nothing again, so this stays idempotent.
     if (!current_sink)
         return;
 
