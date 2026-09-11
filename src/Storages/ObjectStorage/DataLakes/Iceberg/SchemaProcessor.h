@@ -128,6 +128,15 @@ private:
         String & current_full_name = default_link,
         bool is_subfield_of_root = false);
 
+    /// The type as the Iceberg field type alone describes it, before any `clickhouse.type` annotation.
+    DataTypePtr getDerivedFieldType(
+        const Poco::JSON::Object::Ptr & field,
+        const String & type_key,
+        ContextPtr context_,
+        bool required,
+        String & current_full_name = default_link,
+        bool is_subfield_of_root = false);
+
     bool allowPrimitiveTypeConversion(const String & old_type, const String & new_type);
     const Node * getDefaultNodeForField(const Poco::JSON::Object::Ptr & field);
 

@@ -1,14 +1,27 @@
 #include <gtest/gtest.h>
 
 #include <Common/tests/gtest_global_context.h>
+#include <Common/tests/gtest_global_register.h>
 #include <DataTypes/IDataType.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
+
+#include "config.h"
+#if USE_AVRO
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#endif
 
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
 
 using namespace DB::Iceberg;
+
+namespace DB::ErrorCodes
+{
+extern const int ICEBERG_SPECIFICATION_VIOLATION;
+extern const int SUPPORT_IS_DISABLED;
+}
 
 namespace
 {
@@ -16,6 +29,32 @@ Poco::JSON::Object::Ptr parseSchema(const std::string & json)
 {
     Poco::JSON::Parser parser;
     return parser.parse(json).extract<Poco::JSON::Object::Ptr>();
+}
+
+/// The gate is read from the context the schema processor is called with, not one captured at
+/// construction, so a test sets it on a copy of the global context and passes that copy in.
+DB::ContextMutablePtr contextWithAggregateFunctionStates(bool allow)
+{
+    auto context = DB::Context::createCopy(getContext().context);
+    context->setSetting("allow_experimental_aggregate_function_states_in_iceberg", DB::Field(allow));
+    return context;
+}
+
+/// An annotation that does not describe the field it sits on must be rejected as malformed metadata,
+/// and by that check rather than by some unrelated failure.
+void expectAnnotatedSchemaRejected(const Poco::JSON::Object::Ptr & schema)
+{
+    auto context = contextWithAggregateFunctionStates(true);
+    IcebergSchemaProcessor processor(context);
+    try
+    {
+        processor.addIcebergTableSchema(schema, context);
+        FAIL() << "The annotation does not describe the field type and must be rejected";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION) << e.message();
+    }
 }
 }
 
@@ -369,3 +408,232 @@ TEST(IcebergSchemaProcessor, GetSimpleTypeDecimalSignOnlyScaleThrows)
 {
     EXPECT_THROW(IcebergSchemaProcessor::getSimpleType("decimal(20,+)", getContext().context), DB::Exception);
 }
+
+/// An optional field derives as `Nullable(String)`, and `AggregateFunction` cannot be inside
+/// `Nullable`, so the annotation is returned exactly as it stands.
+TEST(IcebergSchemaProcessor, AnnotatedAggregateFunctionFieldIsHonoured)
+{
+    tryRegisterAggregateFunctions();
+    auto schema = parseSchema(
+        R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":false,"type":"binary","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json");
+    auto context = contextWithAggregateFunctionStates(true);
+    IcebergSchemaProcessor processor(context);
+    processor.addIcebergTableSchema(schema, context);
+
+    auto columns = processor.getClickhouseTableSchemaById(0);
+    ASSERT_EQ(columns->size(), 1u);
+    EXPECT_EQ(columns->front().name, "u");
+    EXPECT_EQ(columns->front().type->getName(), "AggregateFunction(uniq, UInt64)");
+}
+
+/// Without the opt-in the same annotation must be refused, rather than fall back to the derived
+/// `Nullable(String)`: reading the states as strings would be a wrong result, not an error.
+TEST(IcebergSchemaProcessor, AnnotatedAggregateFunctionFieldIsRefusedWithoutTheSetting)
+{
+    tryRegisterAggregateFunctions();
+    auto schema = parseSchema(
+        R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":false,"type":"binary","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json");
+    auto context = contextWithAggregateFunctionStates(false);
+    IcebergSchemaProcessor processor(context);
+    try
+    {
+        processor.addIcebergTableSchema(schema, context);
+        FAIL() << "The annotation names an aggregate function and must not be honoured without the setting";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
+    }
+}
+
+/// `SimpleAggregateFunction` stays ungated: the field holds ordinary values and no state
+/// deserializer is involved.
+TEST(IcebergSchemaProcessor, AnnotatedSimpleAggregateFunctionFieldNeedsNoSetting)
+{
+    tryRegisterAggregateFunctions();
+    auto schema = parseSchema(
+        R"json({"schema-id":0,"fields":[{"id":1,"name":"s","required":true,"type":"long","clickhouse.type":"SimpleAggregateFunction(sum, Int64)"}]})json");
+    auto context = contextWithAggregateFunctionStates(false);
+    IcebergSchemaProcessor processor(context);
+    processor.addIcebergTableSchema(schema, context);
+
+    auto columns = processor.getClickhouseTableSchemaById(0);
+    ASSERT_EQ(columns->size(), 1u);
+    EXPECT_EQ(columns->front().name, "s");
+    EXPECT_EQ(columns->front().type->getName(), "SimpleAggregateFunction(sum, Int64)");
+}
+
+/// The value in force is the one on the context of the call, not one frozen into the processor. A
+/// table engine builds its processor at `ATTACH`, so only a per-call read lets a query opt in at all.
+TEST(IcebergSchemaProcessor, AnnotatedAggregateFunctionFieldFollowsTheCallingContext)
+{
+    tryRegisterAggregateFunctions();
+    IcebergSchemaProcessor processor(getContext().context);
+
+    auto allowed_context = contextWithAggregateFunctionStates(true);
+    processor.addIcebergTableSchema(
+        parseSchema(
+            R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":false,"type":"binary","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json"),
+        allowed_context);
+    auto columns = processor.getClickhouseTableSchemaById(0);
+    ASSERT_EQ(columns->size(), 1u);
+    EXPECT_EQ(columns->front().type->getName(), "AggregateFunction(uniq, UInt64)");
+
+    auto refused_context = contextWithAggregateFunctionStates(false);
+    try
+    {
+        processor.addIcebergTableSchema(
+            parseSchema(
+                R"json({"schema-id":1,"fields":[{"id":2,"name":"v","required":false,"type":"binary","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json"),
+            refused_context);
+        FAIL() << "The setting is off on the context of this call and the annotation must be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
+    }
+}
+
+/// A stale or hand-edited annotation must be rejected: a `long` field holds ordinary integers, not
+/// serialized states.
+TEST(IcebergSchemaProcessor, AnnotationNotMatchingTheFieldTypeIsRejected)
+{
+    tryRegisterAggregateFunctions();
+    expectAnnotatedSchemaRejected(parseSchema(
+        R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":true,"type":"long","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json"));
+}
+
+/// `addIcebergTableSchema` publishes a schema-id only once all of its fields have parsed, and drops
+/// whatever it wrote if parsing throws. Otherwise the next call for that schema-id would take the
+/// "already added" branch and hand out a schema that was never built. The retries below reuse one
+/// processor, as a table engine does - it builds its processor once, at `ATTACH`.
+
+/// The aggregate-state gate is the everyday way in: a read is refused, the user enables the setting,
+/// and the retry runs against the processor the refused read left behind.
+TEST(IcebergSchemaProcessor, RetryAfterRefusedAggregateFunctionStateSchemaSucceeds)
+{
+    tryRegisterAggregateFunctions();
+    const std::string json
+        = R"json({"schema-id":0,"fields":[{"id":1,"name":"u","required":false,"type":"binary","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json";
+    IcebergSchemaProcessor processor(getContext().context);
+
+    auto refused_context = contextWithAggregateFunctionStates(false);
+    try
+    {
+        processor.addIcebergTableSchema(parseSchema(json), refused_context);
+        FAIL() << "The annotation names an aggregate function and must be refused without the setting";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
+    }
+
+    /// Nothing of the refused schema may survive the throw.
+    EXPECT_FALSE(processor.hasClickhouseTableSchemaById(0));
+    EXPECT_FALSE(processor.tryGetFieldCharacteristics(0, 1).has_value());
+    EXPECT_FALSE(processor.tryGetColumnIDByName(0, "u").has_value());
+
+    auto allowed_context = contextWithAggregateFunctionStates(true);
+    ASSERT_NO_THROW(processor.addIcebergTableSchema(parseSchema(json), allowed_context));
+    auto columns = processor.getClickhouseTableSchemaById(0);
+    ASSERT_EQ(columns->size(), 1u);
+    EXPECT_EQ(columns->front().name, "u");
+    EXPECT_EQ(columns->front().type->getName(), "AggregateFunction(uniq, UInt64)");
+}
+
+/// The same invariant without an aggregate state: an Iceberg type string the parser rejects. The
+/// first field does parse, so this also pins that the per-field characteristics recorded before the
+/// throw are dropped rather than left to shadow the retry, which renames that field.
+TEST(IcebergSchemaProcessor, RetryAfterUnparsableTypeUnderTheSameSchemaIdSucceeds)
+{
+    IcebergSchemaProcessor processor(getContext().context);
+    EXPECT_THROW(
+        processor.addIcebergTableSchema(
+            parseSchema(
+                R"json({"schema-id":0,"fields":[{"id":1,"name":"a","required":false,"type":"long"},{"id":2,"name":"b","required":false,"type":"decimal(20,)"}]})json"),
+            getContext().context),
+        DB::Exception);
+
+    EXPECT_FALSE(processor.hasClickhouseTableSchemaById(0));
+    EXPECT_FALSE(processor.tryGetFieldCharacteristics(0, 1).has_value());
+    EXPECT_FALSE(processor.tryGetColumnIDByName(0, "a").has_value());
+
+    ASSERT_NO_THROW(processor.addIcebergTableSchema(
+        parseSchema(
+            R"json({"schema-id":0,"fields":[{"id":1,"name":"a2","required":false,"type":"int"},{"id":2,"name":"b","required":false,"type":"decimal(20,0)"}]})json"),
+        getContext().context));
+
+    auto columns = processor.getClickhouseTableSchemaById(0);
+    ASSERT_EQ(columns->size(), 2u);
+    EXPECT_EQ(columns->front().name, "a2");
+    auto field = processor.getFieldCharacteristics(0, 1);
+    EXPECT_EQ(field.name, "a2");
+    EXPECT_EQ(field.type->getName(), "Nullable(Int32)");
+    EXPECT_FALSE(processor.tryGetColumnIDByName(0, "a").has_value());
+}
+
+#if USE_AVRO
+/// `IcebergMetadata::backgroundMetadataPrefetcherThread` warms the metadata files cache on a timer,
+/// with no query behind it, so it asks for the schema-id with `SchemaParsing::Skip`. That must neither
+/// apply the gates `IcebergSchemaProcessor::getFieldType` reads from the query - a background task
+/// carries none, so an `AggregateFunction` column would be refused on every period - nor publish a
+/// parsed schema, which the processor would then serve to queries that never enabled the setting.
+TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesTheSchema)
+{
+    tryRegisterAggregateFunctions();
+    Poco::JSON::Parser parser;
+    auto metadata = parser
+                        .parse(
+                            R"json({"format-version":2,"current-schema-id":0,"schemas":[{"schema-id":0,)json"
+                            R"json("fields":[{"id":1,"name":"u","required":false,"type":"binary",)json"
+                            R"json("clickhouse.type":"AggregateFunction(uniq, UInt64)"}]}]})json")
+                        .extract<Poco::JSON::Object::Ptr>();
+
+    auto log = getLogger("IcebergSchemaProcessorTest");
+    auto context = contextWithAggregateFunctionStates(false);
+    DB::Iceberg::IcebergSchemaProcessor processor(context);
+
+    /// A query without the setting is refused, which is what the gate is for.
+    try
+    {
+        DB::IcebergMetadata::parseTableSchema(
+            metadata, processor, context, log, DB::IcebergMetadata::SchemaParsing::Parse);
+        FAIL() << "The annotation names an aggregate function and must be refused without the setting";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
+    }
+
+    /// The prefetcher, asking for the schema-id alone, is not.
+    Int32 schema_id = -1;
+    ASSERT_NO_THROW(
+        schema_id = DB::IcebergMetadata::parseTableSchema(
+            metadata, processor, context, log, DB::IcebergMetadata::SchemaParsing::Skip));
+    EXPECT_EQ(schema_id, 0);
+
+    /// And it published nothing, so the gate still decides for the queries that follow.
+    EXPECT_FALSE(processor.hasClickhouseTableSchemaById(0));
+    EXPECT_FALSE(processor.tryGetFieldCharacteristics(0, 1).has_value());
+    EXPECT_FALSE(processor.tryGetColumnIDByName(0, "u").has_value());
+
+    try
+    {
+        DB::IcebergMetadata::parseTableSchema(
+            metadata, processor, context, log, DB::IcebergMetadata::SchemaParsing::Parse);
+        FAIL() << "Skipping the schema must not have made the annotation acceptable without the setting";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
+    }
+
+    auto allowed_context = contextWithAggregateFunctionStates(true);
+    ASSERT_NO_THROW(DB::IcebergMetadata::parseTableSchema(
+        metadata, processor, allowed_context, log, DB::IcebergMetadata::SchemaParsing::Parse));
+    auto columns = processor.getClickhouseTableSchemaById(0);
+    ASSERT_EQ(columns->size(), 1u);
+    EXPECT_EQ(columns->front().name, "u");
+    EXPECT_EQ(columns->front().type->getName(), "AggregateFunction(uniq, UInt64)");
+}
+#endif

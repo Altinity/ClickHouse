@@ -1,0 +1,92 @@
+-- without the setting writing a state is refused, as it was before Parquet supported states
+1
+-- a state nested in an Array is refused just the same, the recursion reaching the leaf first
+1
+-- a SimpleAggregateFunction is an ordinary value of its storage type, so it needs no setting
+s	SimpleAggregateFunction(sum, UInt64)					
+-- without the setting the recorded state type is refused, not silently read as String
+1
+-- schema inference recovers the aggregate types from the file
+k	UInt8					
+u	AggregateFunction(uniq, UInt8)					
+s	SimpleAggregateFunction(sum, UInt64)					
+-- states round-trip: merged per group
+0	17	1683
+1	17	1617
+2	17	1650
+-- merging across all groups matches the source too
+1	1
+-- an explicit structure overrides the recorded type - and needs no setting, being the query's own
+17
+17
+-- a column chunk holding both a dictionary page and a plain page
+['PLAIN','RLE_DICTIONARY']
+500	1
+-- a state nested in an Array
+a	Array(AggregateFunction(uniq, UInt64))					
+[10,10]
+-- a state pinned to a non-default version keeps that version
+AggregateFunction(0, sumMap, Array(UInt8), Array(UInt32))
+1
+-- a refused state column can be skipped instead of refusing the whole file
+k	UInt8					
+s	SimpleAggregateFunction(sum, UInt64)					
+3
+-- an annotation naming an aggregate function this server does not have breaks only its column
+1
+k	UInt8					
+s	SimpleAggregateFunction(sum, UInt64)					
+3
+-- every annotated type this writer can produce still reads back, values intact
+num	SimpleAggregateFunction(sum, UInt64)					
+str	SimpleAggregateFunction(anyLast, String)					
+nullable	SimpleAggregateFunction(anyLast, Nullable(String))					
+low_cardinality	SimpleAggregateFunction(anyLast, LowCardinality(String))					
+arr	SimpleAggregateFunction(anyLast, Array(UInt64))					
+m	SimpleAggregateFunction(anyLast, Map(String, UInt64))					
+d	SimpleAggregateFunction(anyLast, Date)					
+dt	SimpleAggregateFunction(anyLast, DateTime(\'UTC\'))					
+dt64	SimpleAggregateFunction(anyLast, DateTime64(4, \'UTC\'))					
+e	SimpleAggregateFunction(anyLast, Enum8(\'a\' = 1, \'b\' = 2))					
+ip4	SimpleAggregateFunction(anyLast, IPv4)					
+ip6	SimpleAggregateFunction(anyLast, IPv6)					
+i128	SimpleAggregateFunction(anyLast, Int128)					
+fs	SimpleAggregateFunction(anyLast, FixedString(16))					
+uu	SimpleAggregateFunction(anyLast, UUID)					
+dec	SimpleAggregateFunction(anyLast, Decimal(18, 4))					
+state	AggregateFunction(uniq, UInt64)					
+tup	Tuple(AggregateFunction(uniq, UInt64), UInt64)					
+Row 1:
+──────
+num:             3
+str:             abc
+nullable:        xyz
+low_cardinality: lc
+arr:             [1,2]
+m:               {'k':7}
+d:               2020-01-02
+dt:              2020-01-02 03:04:05
+dt64:            2020-01-02 03:04:05.1234
+e:               b
+ip4:             1.2.3.4
+ip6:             ::1
+i128:            170141183460469231731687303715884105727
+hex(fs):         66697865640000000000000000000000
+uu:              00000000-0000-0000-0000-000000000001
+dec:             1.25
+uniq_state:      3
+uniq_in_tuple:   3
+plain_in_tuple:  7
+-- the same file reads back with the nullability the reader is told to infer
+1
+1
+-- a recorded type that re-reads the stored bytes as something else is refused
+1
+3
+-- a schema inferred with the setting on is not served to a query that has it off
+k	UInt8					
+u	AggregateFunction(uniq, UInt8)					
+1
+-- nor is a schema inferred with the refused column skipped served to a query that is not skipping
+k	UInt8					
+1

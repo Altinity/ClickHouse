@@ -1,4 +1,6 @@
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
@@ -246,6 +248,16 @@ Poco::JSON::Object::Ptr MetadataGenerator::getCurrentSchema() const
     return current_schema;
 }
 
+/// The annotation is part of a field's identity: any two `AggregateFunction` states share the same
+/// Iceberg type (`binary`), and only the annotation tells them apart.
+static bool clickHouseTypeAnnotationMatches(const Poco::JSON::Object::Ptr & field, const DataTypePtr & type)
+{
+    const bool expected = needsClickHouseTypeAnnotation(type);
+    if (expected != field->has(Iceberg::f_clickhouse_type))
+        return false;
+    return !expected || field->getValue<String>(Iceberg::f_clickhouse_type) == getClickHouseTypeAnnotationName(type);
+}
+
 bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypePtr type) const
 {
     auto current_schema = findCurrentSchema();
@@ -264,7 +276,8 @@ bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypeP
         /// The stored descriptor was produced from a lower `last-column-id` than the one we
         /// just used, so the ids of nested elements differ even for the very same type.
         return field->getValue<bool>(Iceberg::f_required) == expected_type.second
-            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first);
+            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
+            && clickHouseTypeAnnotationMatches(field, type);
     }
     return false;
 }
@@ -319,7 +332,8 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
         if (field->getValue<String>(Iceberg::f_name) != column_name)
             continue;
         return field->getValue<bool>(Iceberg::f_required) == expected_type.second
-            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first);
+            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
+            && clickHouseTypeAnnotationMatches(field, type);
     }
     return false;
 }
@@ -587,6 +601,8 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
     new_field->set(Iceberg::f_name, column_name);
     new_field->set(Iceberg::f_required, new_type.second);
     new_field->set(Iceberg::f_type, new_type.first);
+    if (needsClickHouseTypeAnnotation(type))
+        new_field->set(Iceberg::f_clickhouse_type, getClickHouseTypeAnnotationName(type));
 
     metadata_object->set(Iceberg::f_last_column_id, last_column_id + 1);
 
@@ -613,18 +629,32 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
                 && icebergTypesEqualIgnoringIds(current_field->get(Iceberg::f_type), new_type.first))
             {
                 auto existing_iceberg_type = current_field->get(Iceberg::f_type);
-                if (existing_iceberg_type.isString())
+                if (!existing_iceberg_type.isString())
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Cannot MODIFY COLUMN '{}': the requested and existing types both map to the same "
+                        "Iceberg complex type, and the change cannot be recorded in the Iceberg schema",
+                        column_name);
+
+                /// A `clickhouse.type` annotation spells the existing type out exactly; without it the
+                /// type has to be derived from the Iceberg type string.
+                DataTypePtr reconstructed_ch_type;
+                if (current_field->has(Iceberg::f_clickhouse_type))
                 {
-                    auto reconstructed_ch_type = Iceberg::IcebergSchemaProcessor::getSimpleType(
+                    reconstructed_ch_type
+                        = DataTypeFactory::instance().get(current_field->getValue<String>(Iceberg::f_clickhouse_type));
+                }
+                else
+                {
+                    reconstructed_ch_type = Iceberg::IcebergSchemaProcessor::getSimpleType(
                         existing_iceberg_type.extract<String>(),
                         context,
                         context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
                     if (!current_field->getValue<bool>(Iceberg::f_required) && reconstructed_ch_type->canBeInsideNullable())
                         reconstructed_ch_type = makeNullable(reconstructed_ch_type);
+                }
 
-                    if (reconstructed_ch_type->equals(*type))
-                        return false;
-
+                if (!reconstructed_ch_type->equals(*type))
                     throw Exception(
                         ErrorCodes::BAD_ARGUMENTS,
                         "Cannot MODIFY COLUMN '{}' from {} to {}: both map to the same Iceberg type '{}' "
@@ -633,13 +663,15 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
                         reconstructed_ch_type->getName(),
                         type->getName(),
                         existing_iceberg_type.extract<String>());
-                }
 
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot MODIFY COLUMN '{}': the requested and existing types both map to the same "
-                    "Iceberg complex type, and the change cannot be recorded in the Iceberg schema",
-                    column_name);
+                /// `IDataType::equals` compares only the type id for numeric and string types, so
+                /// `UInt64` and `SimpleAggregateFunction(sum, UInt64)` compare equal; the annotation
+                /// has to be compared on its own.
+                if (clickHouseTypeAnnotationMatches(current_field, type))
+                    return false;
+
+                /// Only the annotation differs, and it is stored in the schema field itself, so the
+                /// change is representable: fall through and write the new schema.
             }
 
             if (!checkValidSchemaEvolution(current_field->get(Iceberg::f_type), new_type.first))
@@ -656,6 +688,10 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
 
             current_field->set(Iceberg::f_type, new_type.first);
             current_field->set(Iceberg::f_required, new_type.second);
+            if (needsClickHouseTypeAnnotation(type))
+                current_field->set(Iceberg::f_clickhouse_type, getClickHouseTypeAnnotationName(type));
+            else
+                current_field->remove(Iceberg::f_clickhouse_type);
 
             metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
             current_schema->set(Iceberg::f_schema_id, next_schema_id);

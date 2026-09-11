@@ -1,8 +1,12 @@
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
 
 #include <base/arithmeticOverflow.h>
+#include <AggregateFunctions/IAggregateFunction.h>
+#include <Columns/ColumnAggregateFunction.h>
 #include <Columns/ColumnString.h>
+#include <Common/Arena.h>
 #include <Common/FloatUtils.h>
+#include <IO/ReadBufferFromMemory.h>
 
 #include <arrow/util/bit_stream_utils_internal.h>
 #include <arrow/util/byte_stream_split_internal.h>
@@ -1710,6 +1714,51 @@ void Int96Converter::convertColumn(std::span<const char> data, size_t num_values
             throw Exception(ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE, "INT96 timestamp out of range: julian day {}, time of day {} ns", julian_day, nanos);
 
         to[i] = x;
+    }
+}
+
+void AggregateFunctionStateConverter::convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const
+{
+    auto & column = assert_cast<ColumnAggregateFunction &>(col);
+    column.set(function, version);
+
+    /// A dictionary page earlier in the same column chunk arrives via insertRangeFrom(), which shares
+    /// ownership by setting `src`; while `src` is set the destructor frees nothing, so the states
+    /// allocated below would leak.
+    column.ensureOwnership();
+
+    auto & data = column.getData();
+    data.reserve(data.size() + num_values);
+
+    Arena & arena = column.createOrGetArena();
+    const size_t size_of_state = function->sizeOfData();
+    const size_t align_of_state = function->alignOfData();
+
+    chassert(chars.size() >= offsets[num_values - 1]);
+    for (ssize_t i = 0; i < ssize_t(num_values); ++i)
+    {
+        const char * ptr = chars.data() + offsets[i - 1];
+        const size_t length = offsets[i] - offsets[i - 1] - separator_bytes;
+        ReadBufferFromMemory in(ptr, length);
+
+        AggregateDataPtr place = arena.alignedAlloc(size_of_state, align_of_state);
+        function->create(place);
+        try
+        {
+            function->deserialize(place, in, version, &arena);
+            if (!in.eof())
+                throw Exception(
+                    ErrorCodes::INCORRECT_DATA,
+                    "Aggregate function state for `{}` has {} trailing byte(s) after deserialization",
+                    function->getName(),
+                    in.available());
+        }
+        catch (...)
+        {
+            function->destroy(place);
+            throw;
+        }
+        data.push_back(place);
     }
 }
 

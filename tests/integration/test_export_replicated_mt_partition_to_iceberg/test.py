@@ -3020,3 +3020,64 @@ def test_export_partition_multicolumn_identity_metadata_matches_data(cluster):
         f"WHERE event_date = '2024-03-05' AND retention = 30"
     ).strip())
     assert filtered == 3, f"Partition-filtered read expected 3 rows, got {filtered}"
+
+
+def test_export_partition_aggregate_function_states(cluster):
+    """
+    Export a partition holding pre-aggregated states into an Iceberg table.
+
+    Unlike EXPORT PART, whose background task is handed the full settings snapshot of the ALTER,
+    EXPORT PARTITION rebuilds the task settings on every replica from a fixed whitelist persisted in
+    the ZooKeeper manifest. Both aggregate-state gates are on that whitelist; without the Parquet one
+    the background writer refuses the AggregateFunction column with UNKNOWN_TYPE and the task never
+    reaches COMPLETED.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_agg_states_{uid}"
+    iceberg_table = f"iceberg_agg_states_{uid}"
+
+    # `k` is Int32 rather than UInt32 because Iceberg maps both to `int`, so a UInt32 source would
+    # additionally need export_merge_tree_part_allow_lossy_cast - a separate concern.
+    columns = (
+        "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64)"
+    )
+
+    make_rmt(node, mt_table, columns, "k", replica_name="replica1", order_by="k")
+    # The Iceberg setting gates the DDL as well as honouring the recorded `AggregateFunction` type.
+    make_iceberg_s3(
+        node,
+        iceberg_table,
+        columns,
+        partition_by="k",
+        extra_settings="allow_experimental_aggregate_function_states_in_iceberg = 1",
+    )
+
+    # One INSERT leaves each partition with a single part, so no merge can rewrite the states out
+    # from under the export. It writes MergeTree, not Parquet, so it needs no Parquet setting.
+    node.query(
+        f"INSERT INTO {mt_table} "
+        f"SELECT toInt32(number % 2), uniqState(toUInt64(number % 23)), sumSimpleState(number) "
+        f"FROM numbers(200) GROUP BY number % 2"
+    )
+
+    # Both gates are given here and nowhere else: the ALTER records them in the manifest, and the
+    # replica executing the task applies them in place of its own profile, in which both are off.
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '0' TO TABLE {iceberg_table}",
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "allow_experimental_aggregate_function_states_in_parquet": 1,
+            "allow_experimental_aggregate_function_states_in_iceberg": 1,
+        },
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "0", "COMPLETED")
+
+    exported = node.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {iceberg_table} GROUP BY k ORDER BY k "
+        f"SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1"
+    )
+    assert exported == node.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {mt_table} WHERE k = 0 GROUP BY k ORDER BY k"
+    ), f"Exported states do not match the source partition:\n{exported}"

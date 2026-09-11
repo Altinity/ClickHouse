@@ -3,6 +3,7 @@
 #include <Processors/Formats/Impl/ArrowGeoTypes.h>
 #include <Processors/Formats/Impl/Parquet/ReadCommon.h>
 #include <Processors/Formats/Impl/Parquet/ThriftUtil.h>
+#include <AggregateFunctions/IAggregateFunction_fwd.h>
 
 namespace DB::ErrorCodes
 {
@@ -316,6 +317,24 @@ struct GeoConverter : public StringConverter
     GeoColumnMetadata geo_metadata;
 
     explicit GeoConverter(const GeoColumnMetadata & geo_metadata_) : geo_metadata(geo_metadata_) {}
+
+    void convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const override;
+};
+
+/// Input physical type: BYTE_ARRAY holding serialized aggregate-function states, as written by
+/// convertAggregateFunctionColumnToString() in PrepareForWrite.cpp.
+/// Output column type: ColumnAggregateFunction.
+///
+/// Not castColumn(String -> AggregateFunction), which goes through
+/// SerializationAggregateFunction::deserializeWholeText and so depends on the session setting
+/// `aggregate_function_input_format`.
+struct AggregateFunctionStateConverter : public StringConverter
+{
+    AggregateFunctionPtr function;
+    size_t version;
+
+    AggregateFunctionStateConverter(AggregateFunctionPtr function_, size_t version_)
+        : function(std::move(function_)), version(version_) {}
 
     void convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const override;
 };

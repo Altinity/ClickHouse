@@ -6,6 +6,8 @@
 
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
+#include <Common/tests/gtest_global_register.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
@@ -388,6 +390,39 @@ Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata
     return {};
 }
 
+/// Metadata whose current schema holds one field carrying a `clickhouse.type` annotation.
+Poco::JSON::Object::Ptr makeMetadataWithAnnotatedField(
+    const String & name, const Poco::Dynamic::Var & iceberg_type, bool required, const String & annotation)
+{
+    auto metadata = makeMetadataWithField(name, iceberg_type, required);
+    metadata->getArray(f_schemas)->getObject(0)->getArray(f_fields)->getObject(0)->set(f_clickhouse_type, annotation);
+    return metadata;
+}
+
+/// The `clickhouse.type` annotation recorded for `name` in the schema `current-schema-id` points at.
+std::optional<String> findCurrentFieldAnnotation(const Poco::JSON::Object::Ptr & metadata, const String & name)
+{
+    auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
+    auto schemas = metadata->getArray(f_schemas);
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+    {
+        auto schema = schemas->getObject(i);
+        if (schema->getValue<Int32>(f_schema_id) != current_schema_id)
+            continue;
+        auto fields = schema->getArray(f_fields);
+        for (UInt32 j = 0; j < fields->size(); ++j)
+        {
+            auto field = fields->getObject(j);
+            if (field->getValue<String>(f_name) != name)
+                continue;
+            if (!field->has(f_clickhouse_type))
+                return std::nullopt;
+            return field->getValue<String>(f_clickhouse_type);
+        }
+    }
+    return std::nullopt;
+}
+
 void expectModifyRejected(
     const Poco::JSON::Object::Ptr & metadata, const String & column, const DataTypePtr & requested_type)
 {
@@ -489,6 +524,124 @@ TEST(IcebergMetadataGenerator, ModifyColumnWideningRecordsTheNewTypeInANewSchema
     auto stored_type = findCurrentFieldType(metadata, "x");
     ASSERT_TRUE(stored_type.isString());
     EXPECT_EQ(stored_type.extract<String>(), "long");
+}
+
+/// The tests below cover the changes only the `clickhouse.type` annotation records: to
+/// `IDataType::equals`, `UInt64` and `SimpleAggregateFunction(sum, UInt64)` are the same type.
+
+TEST(IcebergMetadataGenerator, ModifyColumnToTheSameSimpleAggregateFunctionAddsNoSchema)
+{
+    tryRegisterAggregateFunctions();
+    auto metadata
+        = makeMetadataWithAnnotatedField("s", "long", /* required */ true, "SimpleAggregateFunction(sum, UInt64)");
+    const auto before = readSchemaState(metadata);
+
+    EXPECT_FALSE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "s", DataTypeFactory::instance().get("SimpleAggregateFunction(sum, UInt64)"), getContext().context));
+    expectSchemaUnchanged(metadata, before);
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnChangingTheSimpleAggregateFunctionRewritesTheAnnotation)
+{
+    tryRegisterAggregateFunctions();
+    auto metadata
+        = makeMetadataWithAnnotatedField("s", "long", /* required */ true, "SimpleAggregateFunction(sum, UInt64)");
+    const auto before = readSchemaState(metadata);
+
+    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "s", DataTypeFactory::instance().get("SimpleAggregateFunction(max, UInt64)"), getContext().context));
+
+    const auto after = readSchemaState(metadata);
+    EXPECT_EQ(after.schema_count, before.schema_count + 1);
+    EXPECT_NE(after.current_schema_id, before.current_schema_id);
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(max, UInt64)");
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnAddingASimpleAggregateFunctionRecordsTheAnnotation)
+{
+    tryRegisterAggregateFunctions();
+    /// `Int64` rather than `UInt64` because `long` reads back as `Int64`; only the annotation is new.
+    auto metadata = makeMetadataWithField("s", "long", /* required */ true);
+    ASSERT_EQ(findCurrentFieldAnnotation(metadata, "s"), std::nullopt);
+
+    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "s", DataTypeFactory::instance().get("SimpleAggregateFunction(sum, Int64)"), getContext().context));
+
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), "SimpleAggregateFunction(sum, Int64)");
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnDroppingASimpleAggregateFunctionRemovesTheAnnotation)
+{
+    tryRegisterAggregateFunctions();
+    auto metadata
+        = makeMetadataWithAnnotatedField("s", "long", /* required */ true, "SimpleAggregateFunction(sum, UInt64)");
+
+    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "s", std::make_shared<DataTypeUInt64>(), getContext().context));
+
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "s"), std::nullopt);
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnRejectsChangingTheAggregateFunctionOfAState)
+{
+    tryRegisterAggregateFunctions();
+    /// States serialized by `uniq` cannot be reinterpreted as `sum` states, so this MODIFY has to be
+    /// rejected rather than recorded by rewriting the annotation.
+    auto metadata
+        = makeMetadataWithAnnotatedField("u", f_binary, /* required */ true, "AggregateFunction(uniq, UInt64)");
+    expectModifyRejected(metadata, "u", DataTypeFactory::instance().get("AggregateFunction(sum, UInt64)"));
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "u"), "AggregateFunction(uniq, UInt64)");
+}
+
+/// A retry after a "commit state unknown" failure has to recognise its own aggregate-state column,
+/// of which the annotation is the only record.
+
+TEST(IcebergMetadataGenerator, AddColumnRecordsAndDetectsTheClickHouseTypeAnnotation)
+{
+    tryRegisterAggregateFunctions();
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    /// Iceberg only allows adding optional columns, hence the Nullable state type.
+    auto type = DataTypeFactory::instance().get("SimpleAggregateFunction(anyLast, Nullable(String))");
+    EXPECT_FALSE(gen.isAddColumnApplied("extra", type));
+
+    /// Emulate the commit that the catalog applied while reporting a failure.
+    gen.generateAddColumnMetadata("extra", type);
+    EXPECT_EQ(findCurrentFieldAnnotation(metadata, "extra"), "SimpleAggregateFunction(anyLast, Nullable(String))");
+    EXPECT_TRUE(gen.isAddColumnApplied("extra", type));
+}
+
+TEST(IcebergMetadataGenerator, AddColumnAppliedComparesTheClickHouseTypeAnnotation)
+{
+    tryRegisterAggregateFunctions();
+    {
+        auto metadata = makeMetadataWithAnnotatedField(
+            "s", "string", /* required */ false, "SimpleAggregateFunction(anyLast, Nullable(String))");
+        MetadataGenerator gen(metadata);
+
+        EXPECT_TRUE(gen.isAddColumnApplied("s", DataTypeFactory::instance().get("SimpleAggregateFunction(anyLast, Nullable(String))")));
+        /// A different aggregate function over the same storage type is a different column.
+        EXPECT_FALSE(gen.isAddColumnApplied("s", DataTypeFactory::instance().get("SimpleAggregateFunction(any, Nullable(String))")));
+        /// So is the plain storage type, which would lose the aggregate function entirely.
+        EXPECT_FALSE(gen.isAddColumnApplied("s", makeNullable(std::make_shared<DataTypeString>())));
+    }
+    {
+        auto metadata = makeMetadataWithAnnotatedField("u", f_binary, /* required */ true, "AggregateFunction(uniq, UInt64)");
+        MetadataGenerator gen(metadata);
+
+        EXPECT_TRUE(gen.isAddColumnApplied("u", DataTypeFactory::instance().get("AggregateFunction(uniq, UInt64)")));
+        EXPECT_FALSE(gen.isAddColumnApplied("u", DataTypeFactory::instance().get("AggregateFunction(uniqExact, UInt64)")));
+    }
+    {
+        /// A plain column committed under the same name is not the aggregate-state column the ALTER
+        /// asked for.
+        auto metadata = makeMetadataWithField("s", "string", /* required */ false);
+        MetadataGenerator gen(metadata);
+
+        EXPECT_TRUE(gen.isAddColumnApplied("s", makeNullable(std::make_shared<DataTypeString>())));
+        EXPECT_FALSE(gen.isAddColumnApplied("s", DataTypeFactory::instance().get("SimpleAggregateFunction(anyLast, Nullable(String))")));
+    }
 }
 
 #endif

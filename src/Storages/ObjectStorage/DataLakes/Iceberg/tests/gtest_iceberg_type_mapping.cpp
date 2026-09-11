@@ -5,6 +5,9 @@
 #include <gtest/gtest.h>
 
 #include <Common/Exception.h>
+#include <Common/assert_cast.h>
+#include <Common/tests/gtest_global_register.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -162,6 +165,75 @@ TEST(IcebergTypeMapping, DecimalPrecisionAboveSpecLimitIsRejected)
 TEST(IcebergTypeMapping, NullableDecimalPrecisionAboveSpecLimitIsRejected)
 {
     expectIcebergTypeRejected(makeNullable(createDecimal<DataTypeDecimal>(76, 1)));
+}
+
+TEST(IcebergTypeMapping, AggregateFunctionMapsToBinary)
+{
+    tryRegisterAggregateFunctions();
+    auto type = DataTypeFactory::instance().get("AggregateFunction(uniq, UInt64)");
+    Int32 iter = 0;
+    auto [iceberg_type, required] = getIcebergType(type, iter);
+    ASSERT_TRUE(iceberg_type.isString());
+    EXPECT_EQ(iceberg_type.extract<String>(), "binary");
+    EXPECT_TRUE(required);
+}
+
+TEST(IcebergTypeMapping, AggregateStatesNeedATypeAnnotation)
+{
+    tryRegisterAggregateFunctions();
+    /// Both are indistinguishable from a plain binary/long column in the Iceberg schema, so the
+    /// ClickHouse type name has to be recorded alongside it.
+    EXPECT_TRUE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("AggregateFunction(uniq, UInt64)")));
+    EXPECT_TRUE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("SimpleAggregateFunction(sum, UInt64)")));
+    EXPECT_TRUE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("Array(AggregateFunction(uniq, UInt64))")));
+    EXPECT_TRUE(
+        needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("SimpleAggregateFunction(anyLast, Nullable(String))")));
+
+    EXPECT_FALSE(needsClickHouseTypeAnnotation(std::make_shared<DataTypeUInt64>()));
+    EXPECT_FALSE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("Array(Nullable(String))")));
+    EXPECT_FALSE(needsClickHouseTypeAnnotation(DataTypeFactory::instance().get("Tuple(a UInt32, b String)")));
+}
+
+TEST(IcebergTypeMapping, AnnotationNamePinsAggregateStateVersion)
+{
+    tryRegisterAggregateFunctions();
+
+    /// `sumMap` is versioned (default 1) and serializes version 0 differently. getName() drops the 0,
+    /// so the annotation has to spell it out or inference would rebuild the type with the default
+    /// version and misread the bytes.
+    auto v0 = DataTypeFactory::instance().get("AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8))");
+    EXPECT_EQ(v0->getName(), "AggregateFunction(sumMap, Array(UInt8), Array(UInt8))");
+    EXPECT_EQ(getClickHouseTypeAnnotationName(v0), "AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8))");
+    /// The recorded name must round-trip back to the exact same version.
+    EXPECT_EQ(
+        assert_cast<const DataTypeAggregateFunction &>(
+            *DataTypeFactory::instance().get(getClickHouseTypeAnnotationName(v0)))
+            .getVersion(),
+        0u);
+
+    /// The version pinned inside a container is preserved too.
+    EXPECT_EQ(
+        getClickHouseTypeAnnotationName(
+            DataTypeFactory::instance().get("Array(AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8)))")),
+        "Array(AggregateFunction(0, sumMap, Array(UInt8), Array(UInt8)))");
+
+    /// Every other case is identical to getName(): a versioned state keeps its explicit or default
+    /// version, and a non-versioned one (`groupBitmap`, `uniq`, `sum`) gains no spurious "0,".
+    for (const auto * name :
+         {"AggregateFunction(sumMap, Array(UInt8), Array(UInt8))",
+          "AggregateFunction(1, sumMap, Array(UInt8), Array(UInt8))",
+          "AggregateFunction(1, groupBitmap, UInt64)",
+          "AggregateFunction(groupBitmap, UInt64)",
+          "AggregateFunction(uniq, UInt64)",
+          "AggregateFunction(sum, UInt64)",
+          "Array(AggregateFunction(uniq, UInt64))",
+          "SimpleAggregateFunction(sum, UInt64)",
+          "SimpleAggregateFunction(anyLast, Nullable(String))",
+          "Tuple(a UInt32, b String)"})
+    {
+        auto type = DataTypeFactory::instance().get(name);
+        EXPECT_EQ(getClickHouseTypeAnnotationName(type), type->getName()) << name;
+    }
 }
 
 #endif

@@ -15,6 +15,8 @@ namespace Setting
 {
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
     extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
+    extern const SettingsBool allow_experimental_aggregate_function_states_in_parquet;
+    extern const SettingsBool allow_experimental_aggregate_function_states_in_iceberg;
 }
 
 namespace
@@ -217,6 +219,44 @@ TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsAppliedToW
 
         EXPECT_EQ(
             worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
+            value) << "value=" << value;
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, MissingAggregateFunctionStateGatesParseAsDisabled)
+{
+    auto manifest = makeValidManifest();
+    manifest.allow_aggregate_function_states_in_parquet = true;
+    manifest.allow_aggregate_function_states_in_iceberg = true;
+
+    Poco::JSON::Parser parser;
+    auto json = parser.parse(manifest.toJsonString()).extract<Poco::JSON::Object::Ptr>();
+    json->remove("allow_aggregate_function_states_in_parquet");
+    json->remove("allow_aggregate_function_states_in_iceberg");
+    std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+
+    auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(oss.str());
+    EXPECT_FALSE(parsed.allow_aggregate_function_states_in_parquet);
+    EXPECT_FALSE(parsed.allow_aggregate_function_states_in_iceberg);
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, AggregateFunctionStateGatesAppliedToWorkerContextForEveryValue)
+{
+    for (const bool value : {false, true})
+    {
+        auto manifest = makeValidManifest();
+        manifest.allow_aggregate_function_states_in_parquet = value;
+        manifest.allow_aggregate_function_states_in_iceberg = value;
+
+        auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
+
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_parquet].value,
+            value) << "value=" << value;
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_iceberg].value,
             value) << "value=" << value;
     }
 }

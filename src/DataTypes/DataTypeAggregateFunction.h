@@ -3,6 +3,7 @@
 #include <AggregateFunctions/IAggregateFunction_fwd.h>
 #include <Core/Field.h>
 #include <DataTypes/IDataType.h>
+#include <Parsers/IAST_fwd.h>
 
 
 namespace DB
@@ -24,7 +25,7 @@ private:
     Array parameters;
     mutable std::optional<size_t> version;
 
-    String getNameImpl(bool with_version) const;
+    String getNameImpl(bool with_version, bool always_emit_version) const;
 
 public:
     static constexpr bool is_parametric = true;
@@ -39,6 +40,9 @@ public:
 
     String doGetName() const override;
     String getNameWithoutVersion() const;
+    /// Like getName(), but keeps an explicit 0 version, which getName() drops. Used by
+    /// getClickHouseTypeAnnotationName().
+    String getNameForAnnotation() const;
     const char * getFamilyName() const override { return "AggregateFunction"; }
     TypeIndex getTypeId() const override { return TypeIndex::AggregateFunction; }
 
@@ -93,5 +97,34 @@ void setVersionToAggregateFunctions(DataTypePtr & type, bool if_empty, std::opti
 
 /// Checks type of any nested type is DataTypeAggregateFunction.
 bool hasAggregateFunctionType(const DataTypePtr & type);
+
+/// Same as `hasAggregateFunctionType`, but for a parsed type name instead of a resolved type, so that
+/// a name that came from a file can be gated before `DataTypeFactory` looks the aggregate function up.
+/// `SimpleAggregateFunction` does not count: it holds an ordinary value, not a serialized state.
+bool astHasAggregateFunctionType(const ASTPtr & ast);
+
+/// True when the name of `type` cannot be recovered from a Parquet or Iceberg schema alone, so it has
+/// to be recorded next to the data: `AggregateFunction` or `SimpleAggregateFunction` anywhere inside.
+bool needsClickHouseTypeAnnotation(const DataTypePtr & type);
+
+/// The type name recorded in the Parquet `clickhouse.column_types` / Iceberg `clickhouse.type`
+/// annotation. Same as `type->getName()`, except that every `AggregateFunction` state, nested ones
+/// included, keeps its version: states are serialized with exactly `getVersion()`, and getName() drops
+/// a zero version, so a state pinned to version 0 would be rebuilt with the default one and misread.
+String getClickHouseTypeAnnotationName(const DataTypePtr & type);
+
+/// Checks that the annotated type name describes the same physical data as `derived`, the type the
+/// Parquet or Iceberg schema derives on its own. `Nullable` and `LowCardinality` are ignored at every
+/// level: neither format derives a `LowCardinality`, and either side may carry a `Nullable` the other
+/// does not.
+///
+/// An `AggregateFunction` position must sit over a `String`. Every other position is checked only as
+/// strictly as the format allows, so that a stale or crafted annotation cannot re-type a column to
+/// anything of the same nesting shape:
+///  - Lenient (the default, and all Iceberg can do): only the nesting structure has to match, since
+///    Iceberg cannot express most ClickHouse types (`UInt64` is stored as `long`, derives as `Int64`).
+///  - Strict (the Parquet reader): the annotated type must also be one the parquet writer maps to what
+///    the file holds. That mapping is not injective, so it is a directed relation, not an equality.
+bool annotatedTypeMatchesDerived(const DataTypePtr & annotated, const DataTypePtr & derived, bool strict = false);
 
 }
