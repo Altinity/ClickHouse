@@ -60,12 +60,9 @@ namespace ExportPartitionUtils
         const ContextPtr & context);
 #endif
 
-    /// ZooKeeper-free commit core shared by the replicated and plain partition-export paths:
-    /// assembles the Iceberg commit arguments (deriving the partition source block from the
-    /// exported parts when the destination is a data lake with a partition key) and invokes
-    /// `commitExportPartitionTransaction` on the destination storage, returning its commit info so
-    /// the caller can persist it.
-    IStorage::ExportPartitionCommitInfo commitExportedPaths(
+    /// Invokes `commitExportPartitionTransaction` on the destination storage. Does not mark the export
+    /// task complete; the caller persists the returned commit info.
+    IStorage::ExportPartitionCommitInfo commitExportOnDestination(
         const String & transaction_id,
         const String & partition_id,
         const String & iceberg_metadata_json,

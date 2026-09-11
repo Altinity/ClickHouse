@@ -343,7 +343,7 @@ namespace ExportPartitionUtils
     }
 #endif
 
-    IStorage::ExportPartitionCommitInfo commitExportedPaths(
+    IStorage::ExportPartitionCommitInfo commitExportOnDestination(
         const String & transaction_id,
         const String & partition_id,
         const String & iceberg_metadata_json,
@@ -485,7 +485,7 @@ namespace ExportPartitionUtils
         }
         else
         {
-            destination_commit_info = commitExportedPaths(
+            destination_commit_info = commitExportOnDestination(
                 manifest.transaction_id,
                 manifest.partition_id,
                 manifest.iceberg_metadata_json,

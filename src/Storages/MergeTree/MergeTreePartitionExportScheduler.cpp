@@ -605,7 +605,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
 
             LOG_INFO(storage.log, "ExportPartition: all parts exported for task {}, committing", transaction_id);
 
-            ExportPartitionUtils::commitExportedPaths(
+            ExportPartitionUtils::commitExportOnDestination(
                 descriptor_copy.transaction_id,
                 descriptor_copy.partition_id,
                 descriptor_copy.iceberg_metadata_json,
