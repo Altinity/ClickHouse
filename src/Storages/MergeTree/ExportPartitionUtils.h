@@ -51,10 +51,6 @@ namespace ExportPartitionUtils
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ManifestT & manifest);
 
 #if USE_AVRO
-    /// Iceberg-only: verifies `dest_storage` is a legal Iceberg export target for the specific
-    /// partition (`allow_insert_into_iceberg`, partition-spec compatibility) and returns the
-    /// serialized destination `metadata.json` to persist in the task descriptor. Callers must
-    /// use `verifyPlainPartitionCompatibility` for non-data-lake destinations.
     std::string verifyAndExtractDestinationIcebergMetadataJson(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
