@@ -29,9 +29,6 @@ namespace ExportPartitionUtils
 {
     bool isNonRetryableExportError(int code);
 
-    /// Capped exponential back-off, matching the standard ClickHouse convention
-    /// (see ZooKeeperRetriesControl): delay = min(initial << (retry_count - 1), max).
-    /// `retry_count` is the number of failures so far (>= 1 when a retry is pending).
     size_t computeRetryBackoffSeconds(size_t retry_count, size_t initial_backoff_seconds, size_t max_backoff_seconds);
 
     struct ExportedPaths
@@ -40,15 +37,11 @@ namespace ExportPartitionUtils
         size_t processed_parts_count = 0;
 
         /// Destination paths recorded by those leaves, flattened. A leaf may carry none, so this
-        /// can legitimately be shorter than `processed_parts_count`: an Iceberg destination writes
-        /// no data file for a part with no surviving rows (a plain object-storage one still ships
-        /// an empty Parquet).
+        /// can legitimately be shorter than `processed_parts_count`.
         std::vector<std::string> paths;
     };
 
     /// Reads the destination paths recorded under `<export_path>/processed`.
-    /// Throws `Coordination::Exception` when Keeper cannot be read: a transport failure must not be
-    /// indistinguishable from "this export produced nothing".
     ExportedPaths getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
     /// Build a query context carrying the export task's persisted settings. Templated on the
@@ -60,13 +53,6 @@ namespace ExportPartitionUtils
     /// Validates that `dest_storage` is a legal export target for the specific partition being
     /// exported and, for Iceberg destinations, returns the serialized destination `metadata.json`
     /// to persist in the task descriptor; returns an empty string for non-data-lake destinations.
-    ///
-    /// For data lakes this resolves the destination `IcebergMetadata`, gates on
-    /// `allow_insert_into_iceberg` and runs `verifyIcebergPartitionCompatibility`. For every other
-    /// destination it runs `verifyPlainPartitionCompatibility`. Because both checks fold the
-    /// exported parts' min/max index, this must be called after the part list is collected; the
-    /// destination checks that do not depend on the partition (self-export, `supportsImport`,
-    /// `verifyExportSchemaCastable`) are done by the caller up-front. Throws on any incompatibility.
     std::string extractDestinationIcebergMetadataJson(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,

@@ -385,10 +385,6 @@ namespace ExportPartitionUtils
     /// Collect all the exported paths from the processed parts
     /// If multiRead is supported by the keeper implementation, it is done in a single request
     /// Otherwise, multiple async requests are sent
-    ///
-    /// Keeper failures propagate rather than degrading to an empty result: the caller cannot tell
-    /// "Keeper is unreachable" from "this export wrote nothing" and would otherwise report the
-    /// transport failure as corrupted data.
     ExportedPaths getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path)
     {
         LOG_DEBUG(log, "ExportPartition: Getting exported paths for {}", export_path);
@@ -479,12 +475,6 @@ namespace ExportPartitionUtils
 
         const auto exported = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
-        /// Completeness is measured in processed parts, not in paths: whether a part writes a file
-        /// is the destination's choice. A plain object-storage sink opens its file eagerly and ships
-        /// an empty Parquet for a part with no surviving rows, while the Iceberg writer only creates
-        /// a data file once a row arrives, exactly as an `INSERT` of zero rows adds no manifest
-        /// entry. A missing `processed` leaf is never legitimate, though: commit is only reached
-        /// once `processing` is empty, and a part leaves it only by being created there.
         if (exported.processed_parts_count < manifest.parts.size())
         {
             throw Exception(ErrorCodes::CORRUPTED_DATA,
