@@ -132,6 +132,7 @@ Iceberg::ManifestFileIterator::ManifestFileEntriesHandle getManifestFileEntriesH
         *persistent_table_components.schema_processor,
         cache_key.added_sequence_number,
         cache_key.added_snapshot_id,
+        cache_key.first_row_id,
         local_context,
         nullptr,
         table_snapshot_schema_id);
@@ -221,8 +222,17 @@ ManifestFileCacheKeys getManifestList(
                 content_type = Iceberg::ManifestFileContentType(
                     manifest_list_deserializer.getValueFromRowByName(i, f_content, TypeIndex::Int32).safeGet<Int32>());
             }
+
+            std::optional<UInt64> first_row_id;
+            if (manifest_list_format_version > 2 && manifest_list_deserializer.hasPath(f_manifest_first_row_id))
+            {
+                auto first_row_id_value = manifest_list_deserializer.getValueFromRowByName(i, f_manifest_first_row_id);
+                if (!first_row_id_value.isNull())
+                    first_row_id = first_row_id_value.safeGet<Int64>();
+            }
+
             manifest_file_cache_keys.emplace_back(
-                manifest_file_name, static_cast<size_t>(manifest_length), added_sequence_number, added_snapshot_id.safeGet<Int64>(), content_type);
+                manifest_file_name, static_cast<size_t>(manifest_length), added_sequence_number, added_snapshot_id.safeGet<Int64>(), content_type, first_row_id);
 
             auto dump_row_metadata = [&]()->String { return manifest_list_deserializer.getContent(i); };
             insertRowToLogTable(
