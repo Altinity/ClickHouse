@@ -1,0 +1,9 @@
+
+<clickhouse>
+  <filesystem_caches>
+    <cache_54176>
+      <max_size>1Gi</max_size>
+      <path>cache_54176</path>
+    </cache_54176>
+  </filesystem_caches>
+</clickhouse>
