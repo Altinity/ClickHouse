@@ -1,7 +1,7 @@
 # docker build -t altinityinfra/stateless-test .
 ARG FROM_TAG=latest
 ARG REDPANDA_VERSION=v25.1.3
-FROM docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION} AS redpanda
+FROM redpandadata/redpanda:${REDPANDA_VERSION} AS redpanda
 
 FROM altinityinfra/test-base:$FROM_TAG
 
@@ -108,6 +108,14 @@ ENV HOME="/home"
 
 RUN npm install -g azurite@3.35.0 \
     && npm install -g tslib
+
+# Download azurite-rs (Azure Blob Storage emulator in Rust)
+# https://github.com/ClickHouse/azurite-rs
+ARG AZURITE_RS_VERSION=v0.1.0-1bc0ba9
+RUN arch=${TARGETARCH:-amd64} \
+    && curl -fsSL "https://github.com/ClickHouse/azurite-rs/releases/download/${AZURITE_RS_VERSION}/azurite-rs-linux-${arch}.tar.gz" | tar -xz -C /usr/local/bin/ \
+    && mv /usr/local/bin/azurite-rs-linux-${arch} /usr/local/bin/azurite-rs \
+    && chmod +x /usr/local/bin/azurite-rs
 
 # Install Redpanda (Kafka-compatible broker, no JVM required)
 COPY --from=redpanda /opt/redpanda /opt/redpanda
