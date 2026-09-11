@@ -576,9 +576,10 @@ MemoryWorker::MemoryUsage MemoryWorker::getMemoryUsage(bool log_error)
         }
     }
 
-    usage.allocated = usage.resident;
 #if defined(ADDRESS_SANITIZER)
     usage.allocated = __sanitizer_get_current_allocated_bytes();
+#else
+    usage.allocated = usage.resident;
 #endif
 
     return usage;
