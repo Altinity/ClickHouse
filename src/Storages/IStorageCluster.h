@@ -111,8 +111,47 @@ protected:
 
     NamesAndTypesList hive_partition_columns_to_read_from_file_path;
 
+    struct ResolvedClusterRead
+    {
+        /// True for local pure read, or for pure s3()/iceberg() sent to a remote initiator (not *Cluster).
+        bool fallback_to_pure = false;
+        /// Cached shouldFallbackToLocalOnEmptyCluster(context).
+        bool local_fallback = false;
+        /// Pre-resolved object-storage cluster when local-fallback prefetch was done.
+        ClusterPtr object_storage_cluster;
+        /// Resolved remote-initiator cluster when object_storage_remote_initiator_cluster is set.
+        ClusterPtr remote_initiator_cluster;
+    };
+
+    ResolvedClusterRead resolveClusterRead(ContextPtr context) const;
+
+    /// True for alternative syntax / table engines (object_storage_cluster setting path).
+    /// False for explicit *Cluster(...) and for non-object-storage IStorageCluster subclasses.
+    virtual bool usesObjectStorageClusterSettingSyntax() const { return false; }
+
+    /// Setting enabled, setting-syntax storage, and non-empty object_storage_cluster.
+    bool shouldFallbackToLocalOnEmptyCluster(ContextPtr context) const;
+
+    /// Shared by read() and getQueryProcessingStage: local pure path vs throw vs remote pure send.
+    bool shouldReadLocallyOnFallbackToPure(const ResolvedClusterRead & resolved, ContextPtr context) const;
+
+    void readFromRemoteInitiator(
+        QueryPlan & query_plan,
+        const Names & column_names,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        size_t max_block_size,
+        size_t num_streams,
+        ASTPtr query_to_send,
+        ClusterPtr remote_initiator_cluster,
+        const String & remote_initiator_cluster_name);
+
 private:
-    static ClusterPtr getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts = 0);
+    // With 'allow_null=true' returns nullptr when cluster does not exist or empty
+    // With 'allow_null=false' throws exception
+    static ClusterPtr getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts = 0, bool allow_null = false);
 
     virtual bool isClusterSupported() const { return true; }
 

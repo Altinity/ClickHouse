@@ -1,0 +1,30 @@
+pure
+10	45
+case1 unknown OSC without fallback still errors
+case1 unknown OSC with fallback runs locally
+10	45
+valid OSC with fallback unchanged
+10	45
+s3Cluster ignores fallback
+s3Cluster ignores fallback even with OSC setting
+s3Cluster with valid argument unchanged
+10	45
+case2 unknown OSC + RI without RI-cluster with fallback runs locally
+10	45
+empty OSC + RI without RI-cluster with fallback still BAD_ARGUMENTS
+empty OSC + RI without RI-cluster without fallback still BAD_ARGUMENTS
+case3-like unknown OSC + RI-cluster with fallback (pure send, remote local)
+10	45
+missing RI-cluster is not masked by OSC fallback
+engine case1 unknown OSC without fallback still errors
+engine case1 unknown OSC with fallback runs locally
+10	45
+engine case2 unknown OSC + RI without RI-cluster with fallback runs locally
+10	45
+engine case3-like unknown OSC + RI-cluster with fallback
+10	45
+engine empty OSC + RI without RI-cluster with fallback still BAD_ARGUMENTS
+aggregate with fallback
+285
+pure aggregate
+285
