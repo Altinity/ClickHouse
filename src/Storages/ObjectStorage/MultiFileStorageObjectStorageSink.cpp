@@ -72,13 +72,11 @@ MultiFileStorageObjectStorageSink::MultiFileStorageObjectStorageSink(
     /// file. `error` still reports the leftovers as a conflict, but `skip` has to rewrite them --
     /// the files that attempt never reached carry rows no later attempt produces.
     overwrite_data_files = file_already_exists_policy != FileAlreadyExistsPolicy::error;
-
-    current_sink = createNewSink();
 }
 
 MultiFileStorageObjectStorageSink::~MultiFileStorageObjectStorageSink()
 {
-    if (isCancelled())
+    if (isCancelled() && current_sink)
         current_sink->cancel();
 }
 
@@ -134,20 +132,28 @@ void MultiFileStorageObjectStorageSink::consume(Chunk & chunk)
 {
     if (isCancelled())
     {
-        current_sink->cancel();
+        if (current_sink)
+            current_sink->cancel();
         return;
     }
 
-    const auto written_bytes = current_sink->getWrittenBytes();
-    
-    const bool exceeded_bytes_limit = max_bytes_per_file && written_bytes >= max_bytes_per_file;
-    const bool exceeded_rows_limit = max_rows_per_file && current_sink_written_rows >= max_rows_per_file;
-
-    if (exceeded_bytes_limit || exceeded_rows_limit)
+    if (!current_sink)
     {
-        current_sink->onFinish();
         current_sink = createNewSink();
-        current_sink_written_rows = 0;
+    }
+    else
+    {
+        const auto written_bytes = current_sink->getWrittenBytes();
+
+        const bool exceeded_bytes_limit = max_bytes_per_file && written_bytes >= max_bytes_per_file;
+        const bool exceeded_rows_limit = max_rows_per_file && current_sink_written_rows >= max_rows_per_file;
+
+        if (exceeded_bytes_limit || exceeded_rows_limit)
+        {
+            current_sink->onFinish();
+            current_sink = createNewSink();
+            current_sink_written_rows = 0;
+        }
     }
 
     current_sink->consume(chunk);
@@ -156,6 +162,9 @@ void MultiFileStorageObjectStorageSink::consume(Chunk & chunk)
 
 void MultiFileStorageObjectStorageSink::onFinish()
 {
+    if (!current_sink)
+        return;
+
     current_sink->onFinish();
     commit();
 }
