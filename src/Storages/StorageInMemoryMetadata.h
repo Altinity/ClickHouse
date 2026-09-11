@@ -78,6 +78,10 @@ struct StorageInMemoryMetadata
     ///  Current state of a datalake table.
     std::optional<DataLakeTableStateSnapshot> datalake_table_state;
 
+    /// Names of identity-partition columns (constant within every data file),
+    /// resolved for the same pinned `datalake_table_state` snapshot above.
+    Names identity_partition_columns;
+
     StorageInMemoryMetadata() = default;
 
     StorageInMemoryMetadata(const StorageInMemoryMetadata & other);
@@ -130,6 +134,7 @@ struct StorageInMemoryMetadata
     void setSQLSecurity(const ASTSQLSecurity & sql_security);
 
     void setDataLakeTableState(const DataLakeTableStateSnapshot & datalake_table_state_);
+    void setIdentityPartitionColumns(const Names & identity_partition_columns_);
     UUID getDefinerID(ContextPtr context) const;
 
     /// Returns a copy of the context with the correct user from SQL security options.

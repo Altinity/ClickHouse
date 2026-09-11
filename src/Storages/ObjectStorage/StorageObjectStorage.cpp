@@ -53,6 +53,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 max_streams_for_files_processing_in_cluster_functions;
+    extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
 namespace ErrorCodes
@@ -338,7 +339,21 @@ bool StorageObjectStorage::canMoveConditionsToPrewhere() const
 
 std::optional<NameSet> StorageObjectStorage::supportedPrewhereColumns() const
 {
-    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/ hive_partition_columns_to_read_from_file_path);
+    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/hive_partition_columns_to_read_from_file_path);
+}
+
+std::optional<NameSet> StorageObjectStorage::supportedAutomaticPrewhereColumns(const StorageMetadataPtr & metadata) const
+{
+    auto exclude = hive_partition_columns_to_read_from_file_path;
+
+    for (const auto & identity_partition_column : metadata->identity_partition_columns)
+    {
+        if (metadata->getColumns().has(identity_partition_column))
+            exclude.emplace_back(identity_partition_column, metadata->getColumns().get(identity_partition_column).type);
+    }
+
+    LOG_DEBUG(log, "Automatic-PREWHERE exclude list: [{}]", exclude.toString());
+    return metadata->getColumnsWithoutDefaultExpressions(/*exclude=*/exclude);
 }
 
 IStorage::ColumnSizeByName StorageObjectStorage::getColumnSizes() const
