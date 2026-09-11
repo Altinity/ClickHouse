@@ -62,21 +62,6 @@ def get_additional_envs(info, check_name: str) -> List[str]:
     from ci.jobs.ci_utils import is_extended_run
 
     result = []
-    if not info.is_local_run:
-        # azure_connection_string = Shell.get_output(
-        #     f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
-        #     verbose=True,
-        #     strict=True,
-        # )
-        # result.append(f"AZURE_CONNECTION_STRING='{azure_connection_string}'")
-        # NOTE(strtgbb): We pass azure credentials through the docker command, not SSM.
-        # NOTE(strtgbb): Azure credentials don't exist in community workflow
-        if info.is_community_pr:
-            print(
-                "NOTE: No azure credentials provided for community PR - disable azure storage"
-            )
-            os.environ["USE_AZURE_STORAGE_FOR_MERGE_TREE"] = "0"
-
     # some cloud-specific features require feature flags enabled
     # so we need this ENV to be able to disable the randomization
     # of feature flags
@@ -121,6 +106,8 @@ def get_run_command(
         "docker run --cap-add=SYS_PTRACE "
         # For dmesg and sysctl
         "--privileged "
+        # azurite-rs (in-process Azure Blob Storage emulator) needs many fds under parallel load
+        "--ulimit nofile=1048576:1048576 "
         # a static link, don't use S3_URL or S3_DOWNLOAD
         "-e S3_URL='https://s3.amazonaws.com/clickhouse-datasets' "
         "--tmpfs /tmp/clickhouse:mode=1777 "

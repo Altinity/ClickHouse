@@ -214,6 +214,11 @@ def main():
         elif "msan" in args.options:
             # MSan is slow
             nproc = int(Utils.cpu_count() * 0.4)
+        elif is_azure_storage:
+            # azure FT runs only under ASan; concurrent heavy queries overrun the
+            # shared server memory cap, so the OvercommitTracker kills queries across
+            # all co-scheduled tests. Lower concurrency to keep peak total RSS under it.
+            nproc = int(Utils.cpu_count() * 0.4)
         elif is_coverage:
             cidb_cluster = CIDBCluster()
             assert cidb_cluster.is_ready()
@@ -246,26 +251,6 @@ def main():
     elif is_targeted_check:
         print(f"Rerun count set to 5 for targeted check")
         rerun_count = 5
-
-    if not info.is_local_run:
-        # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
-        # os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
-        #     f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
-        #     verbose=True,
-        # )
-        # NOTE(strtgbb): We pass azure credentials through the docker command, not SSM.
-        # NOTE(strtgbb): Azure credentials don't exist in community workflow
-        if info.is_community_pr:
-            print(
-                "NOTE: No azure credentials provided for community PR - disable azure storage"
-            )
-            config_installs_args += " --no-azure"
-
-            # NOTE(strtgbb): With the above, some tests are still trying to use azure, try this:
-            os.environ["USE_AZURE_STORAGE_FOR_MERGE_TREE"] = "0"
-    else:
-        print("Disable azure for a local run")
-        config_installs_args += " --no-azure"
 
     if (is_azure_storage or is_s3_storage) and is_encrypted_storage:
         config_installs_args += " --encrypted-storage"
