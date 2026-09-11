@@ -8,8 +8,10 @@
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreePartitionExportTask.h>
+#if USE_AVRO
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#endif
 #include <Parsers/IAST.h>
 #include <algorithm>
 #include <limits>
@@ -300,7 +302,8 @@ namespace ExportPartitionUtils
     template ContextPtr getContextCopyWithTaskSettings<MergeTreePartitionExportTask>(
         const ContextPtr &, const MergeTreePartitionExportTask &);
 
-    std::string extractDestinationIcebergMetadataJson(
+#if USE_AVRO
+    std::string verifyAndExtractDestinationIcebergMetadataJson(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
         const StoragePtr & dest_storage,
@@ -308,13 +311,6 @@ namespace ExportPartitionUtils
         const String & partition_id,
         const ContextPtr & context)
     {
-        if (!dest_storage->isDataLake())
-        {
-            verifyPlainPartitionCompatibility(source_metadata, destination_metadata, parts, partition_id, context);
-            return {};
-        }
-
-#if USE_AVRO
         auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
         auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
 
@@ -344,10 +340,8 @@ namespace ExportPartitionUtils
         oss.exceptions(std::ios::failbit);
         metadata_object->stringify(oss);
         return oss.str();
-#else
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
-#endif
     }
+#endif
 
     IStorage::ExportPartitionCommitInfo commitExportedPaths(
         const String & transaction_id,

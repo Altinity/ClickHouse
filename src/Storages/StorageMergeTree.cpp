@@ -3898,22 +3898,27 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     descriptor.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
     descriptor.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;
 
-    /// Validate the destination against the partition being exported (Iceberg partition-spec
-    /// compatibility, or a matching partition key for plain destinations) and, for Iceberg
-    /// destinations, capture the destination metadata.json to persist in the descriptor.
-    /// Shared with the `Replicated*MergeTree` export path.
-    descriptor.iceberg_metadata_json = ExportPartitionUtils::extractDestinationIcebergMetadataJson(
-        src_snapshot,
-        destination_snapshot,
-        dest_storage,
-        parts,
-        partition_id,
-        query_context);
-
     if (dest_storage->isDataLake())
     {
+#if USE_AVRO
+        descriptor.iceberg_metadata_json = ExportPartitionUtils::verifyAndExtractDestinationIcebergMetadataJson(
+            src_snapshot,
+            destination_snapshot,
+            dest_storage,
+            parts,
+            partition_id,
+            query_context);
+
         descriptor.max_bytes_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file];
         descriptor.max_rows_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_rows_in_data_file];
+#else
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
+#endif
+    }
+    else
+    {
+        ExportPartitionUtils::verifyPlainPartitionCompatibility(
+            src_snapshot, destination_snapshot, parts, partition_id, query_context);
     }
 
     std::vector<MergeTreeData::DataPartPtr> part_references(parts.begin(), parts.end());

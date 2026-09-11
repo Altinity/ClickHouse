@@ -50,16 +50,19 @@ namespace ExportPartitionUtils
     template <typename ManifestT>
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ManifestT & manifest);
 
-    /// Validates that `dest_storage` is a legal export target for the specific partition being
-    /// exported and, for Iceberg destinations, returns the serialized destination `metadata.json`
-    /// to persist in the task descriptor; returns an empty string for non-data-lake destinations.
-    std::string extractDestinationIcebergMetadataJson(
+#if USE_AVRO
+    /// Iceberg-only: verifies `dest_storage` is a legal Iceberg export target for the specific
+    /// partition (`allow_insert_into_iceberg`, partition-spec compatibility) and returns the
+    /// serialized destination `metadata.json` to persist in the task descriptor. Callers must
+    /// use `verifyPlainPartitionCompatibility` for non-data-lake destinations.
+    std::string verifyAndExtractDestinationIcebergMetadataJson(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
         const StoragePtr & dest_storage,
         const MergeTreeData::DataPartsVector & parts,
         const String & partition_id,
         const ContextPtr & context);
+#endif
 
     /// ZooKeeper-free commit core shared by the replicated and plain partition-export paths:
     /// assembles the Iceberg commit arguments (deriving the partition source block from the
