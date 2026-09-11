@@ -3,11 +3,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/CurrentThread.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
 #include <Common/ProfileEventsScope.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
+#include <Common/UniqueLock.h>
 #include <base/scope_guard.h>
 #include <algorithm>
 #include <optional>
@@ -20,6 +22,13 @@ namespace DB::ErrorCodes
     extern const int TIMEOUT_EXCEEDED;
     extern const int SOCKET_TIMEOUT;
     extern const int MEMORY_LIMIT_EXCEEDED;
+    extern const int FAULT_INJECTED;
+}
+
+namespace DB::FailPoints
+{
+    extern const char cas_gc_scheduler_fail_before_heartbeat_worker_start[];
+    extern const char cas_gc_scheduler_fail_before_worker_start[];
 }
 
 namespace DB::Cas
@@ -90,19 +99,53 @@ CasGcScheduler::~CasGcScheduler()
 
 void CasGcScheduler::start()
 {
-    std::lock_guard lock(mutex);
-    if (thread.joinable())
-        return;
-    stopping = false;
-    thread = ThreadFromGlobalPool([this] { loop(); });
-    hb_thread = ThreadFromGlobalPool([this] { heartbeatLoop(); });
+    std::lock_guard threads_lock(threads_mutex);
+    {
+        std::lock_guard lock(mutex);
+        if (scheduler_state == SchedulerState::Running)
+            return;
+        scheduler_state = SchedulerState::Running;
+    }
+    try
+    {
+        fiu_do_on(FailPoints::cas_gc_scheduler_fail_before_heartbeat_worker_start,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure before starting CAS GC heartbeat worker");
+        });
+        hb_thread = ThreadFromGlobalPool([this] { heartbeatLoop(); });
+        fiu_do_on(FailPoints::cas_gc_scheduler_fail_before_worker_start,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure before starting CAS GC worker");
+        });
+        thread = ThreadFromGlobalPool([this] { loop(); });
+    }
+    catch (...)
+    {
+        {
+            std::lock_guard lock(mutex);
+            scheduler_state = SchedulerState::Stopped;
+        }
+        wake.notify_all();
+        if (thread.joinable())
+            thread.join();
+        if (hb_thread.joinable())
+            hb_thread.join();
+        i_am_leader.store(false, std::memory_order_relaxed);
+        throw;
+    }
 }
 
 void CasGcScheduler::stop()
 {
+    std::lock_guard threads_lock(threads_mutex);
     {
         std::lock_guard lock(mutex);
-        stopping = true;
+        if (scheduler_state == SchedulerState::Stopped)
+        {
+            i_am_leader.store(false, std::memory_order_relaxed);
+            return;
+        }
+        scheduler_state = SchedulerState::Stopped;
     }
     wake.notify_all();
     if (thread.joinable())
@@ -122,7 +165,7 @@ void CasGcScheduler::requestRoundSoon()
 {
     {
         std::lock_guard lock(mutex);
-        if (stopping || !thread.joinable())
+        if (scheduler_state != SchedulerState::Running)
             return;
         round_requested = true;
     }
@@ -299,9 +342,10 @@ void CasGcScheduler::loop()
     while (true)
     {
         {
-            std::unique_lock lock(mutex);
-            wake.wait_for(lock, interval, [this] { return stopping || round_requested; });
-            if (stopping)
+            UniqueLock lock(mutex);
+            wake.wait_for(lock.getUnderlyingLock(), interval, [this]() TSA_NO_THREAD_SAFETY_ANALYSIS
+                { return scheduler_state == SchedulerState::Stopped || round_requested; });
+            if (scheduler_state == SchedulerState::Stopped)
                 return;
             round_requested = false;
         }
@@ -332,9 +376,9 @@ void CasGcScheduler::loop()
         }
         try
         {
-            /// LOW/benign: if stop() flips `stopping` while we're blocked here (a concurrent manual
+            /// LOW/benign: if stop() flips `scheduler_state` while we're blocked here (a concurrent manual
             /// round holds gc_round_mutex), we still run one more Scheduled round once it unblocks,
-            /// before the next wait_for() observes `stopping` - an accepted extra round, not a
+            /// before the next wait_for() observes `scheduler_state` - an accepted extra round, not a
             /// correctness issue.
             std::lock_guard round_lock(gc_round_mutex);
 
@@ -427,8 +471,9 @@ void CasGcScheduler::heartbeatLoop()
     while (true)
     {
         {
-            std::unique_lock lock(mutex);
-            if (wake.wait_for(lock, hb_interval, [this] { return stopping; }))
+            UniqueLock lock(mutex);
+            if (wake.wait_for(lock.getUnderlyingLock(), hb_interval, [this]() TSA_NO_THREAD_SAFETY_ANALYSIS
+                { return scheduler_state == SchedulerState::Stopped; }))
                 return;
         }
         /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit on ANY terminal (or FORGET-intent) pool, same as

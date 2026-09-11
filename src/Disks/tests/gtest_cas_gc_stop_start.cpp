@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 
 #include <atomic>
 #include <chrono>
@@ -34,7 +35,14 @@
 
 namespace DB::ErrorCodes
 {
+extern const int FAULT_INJECTED;
 extern const int INVALID_STATE;
+}
+
+namespace DB::FailPoints
+{
+extern const char cas_gc_scheduler_fail_before_heartbeat_worker_start[];
+extern const char cas_gc_scheduler_fail_before_worker_start[];
 }
 
 using namespace DB;
@@ -340,6 +348,42 @@ TEST(CASGCStopStart, StopAndStartAreIdempotent)
     const RoundReport rep = sched.runOneRoundNow();
     EXPECT_TRUE(rep.acquired_lease) << "the restarted scheduler still runs rounds after idempotent stop/start";
     sched.stop();
+}
+
+TEST(CASGCStopStart, StopClearsLeadershipAfterManualRoundWithoutStart)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcManualStopTest", "ca-disk");
+
+    const RoundReport report = sched.runOneRoundNow();
+    ASSERT_TRUE(report.acquired_lease);
+    ASSERT_TRUE(sched.gcHealth().is_leader);
+
+    sched.stop();
+    EXPECT_FALSE(sched.gcHealth().is_leader);
+}
+
+TEST(CASGCStopStart, StartFailureRollsBackAndCanBeRetried)
+{
+    for (const char * failpoint :
+        {FailPoints::cas_gc_scheduler_fail_before_heartbeat_worker_start,
+         FailPoints::cas_gc_scheduler_fail_before_worker_start})
+    {
+        SCOPED_TRACE(failpoint);
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = openPoolForTest(backend);
+        CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcStartFailureTest", "ca-disk");
+
+        FailPointInjection::enableFailPoint(failpoint);
+        Cas::tests::expectThrowsCode(ErrorCodes::FAULT_INJECTED, [&] { sched.start(); });
+        FailPointInjection::disableFailPoint(failpoint);
+        EXPECT_TRUE(sched.isQuiescent());
+
+        EXPECT_NO_THROW(sched.start());
+        sched.stop();
+        EXPECT_TRUE(sched.isQuiescent());
+    }
 }
 
 /// (d) START refuses on a Vanished disk with the typed 668 (`INVALID_STATE`) error -- restarting GC on a
