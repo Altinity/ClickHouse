@@ -348,6 +348,11 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     read_pool = std::make_unique<ThreadPool>(
         CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled,
         /*max_threads*/ read_concurrency, /*max_free_threads*/ read_concurrency, /*queue_size*/ 0);
+    const size_t redelete_concurrency = std::max<size_t>(1, store->poolConfig().gc_redelete_concurrency);
+    if (redelete_concurrency > 1)
+        redelete_pool = std::make_unique<ThreadPool>(
+            CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled,
+            /*max_threads*/ redelete_concurrency, /*max_free_threads*/ redelete_concurrency, /*queue_size*/ 0);
 }
 
 void Gc::runNamespaceJanitorPage(
@@ -396,6 +401,132 @@ uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<Wri
         /// +1: the failed bulk attempt above is itself a call this helper made.
         return 1 + chunk.size();
     }
+}
+
+Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op)
+{
+    RedeleteIo io;
+    io.blob_key = layout.blobKey(entry.ref);
+    const std::optional<Meta> observed = op.head(io.blob_key, Retry::standard());
+    if (observed)
+        io.del = entry.token.matches(observed->etag) ? op.remove(io.blob_key, observed->etag, Retry::standard()) : Removal::Mismatch;
+    return io;
+}
+
+void Gc::applyRedeleteOutcome(
+    const RetiredEntry & entry,
+    const RedeleteIo & io,
+    uint64_t new_round,
+    uint64_t generation,
+    GcRoundWorkBudget & round_work_budget,
+    RoundReport & report,
+    OutcomeLog & outcome_log)
+{
+    const OutcomeKind outcome_kind = io.del == Removal::Removed ? OutcomeKind::Deleted
+        : io.del == Removal::Gone                               ? OutcomeKind::Absent
+                                                                : OutcomeKind::Replaced;
+    OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token, .outcome = outcome_kind};
+    const String del_outcome{removalName(io.del)};
+    EventEmitter{*store}.emit(
+        [&](CasEvent & e)
+        {
+            e.type = CasEventType::BlobDelete;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = blobIdOf(entry.ref);
+            e.token = renderIncarnation(entry.token);
+            e.round = new_round;
+            e.gen = generation;
+            e.outcome = del_outcome;
+            e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
+            e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}, {"key", io.blob_key}};
+        });
+    if (round_work_budget.outcomeEntryAvailable())
+    {
+        outcome_log.entries.push_back(std::move(outcome));
+        ++round_work_budget.outcome_entries_used;
+    }
+    ++report.redeleted;
+    ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
+    if (io.del == Removal::Removed || io.del == Removal::Gone)
+    {
+        meta_writer->scheduleConfirmedMetaDelete(entry.ref);
+    }
+    meta_writer->forgetCondemnMarker(entry.ref, entry.token);
+}
+
+void Gc::redeleteBlob(
+    const RetiredEntry & entry,
+    const Layout & layout,
+    CasOperation & op,
+    uint64_t new_round,
+    uint64_t generation,
+    GcRoundWorkBudget & round_work_budget,
+    RoundReport & report,
+    OutcomeLog & outcome_log)
+{
+    const RedeleteIo io = performRedeleteIo(entry, layout, op);
+    applyRedeleteOutcome(entry, io, new_round, generation, round_work_budget, report, outcome_log);
+}
+
+void Gc::redeleteBlobs(
+    const std::vector<RetiredEntry> & entries,
+    const Layout & layout,
+    CasOperation & op,
+    uint64_t new_round,
+    uint64_t generation,
+    GcRoundWorkBudget & round_work_budget,
+    RoundReport & report,
+    OutcomeLog & outcome_log)
+{
+    if (!redelete_pool || entries.size() < store->poolConfig().gc_redelete_min_batch_size)
+    {
+        for (const RetiredEntry & entry : entries)
+            redeleteBlob(entry, layout, op, new_round, generation, round_work_budget, report, outcome_log);
+        return;
+    }
+
+    std::vector<RedeleteIo> io_results(entries.size());
+    const uint64_t gen = op.generation();
+    size_t scheduled = 0;
+    std::exception_ptr first_error;
+    try
+    {
+        for (; scheduled < entries.size(); ++scheduled)
+        {
+            redelete_pool->scheduleOrThrowOnError(
+                [&, i = scheduled]
+                {
+                    try
+                    {
+                        CasOperation job_op = store->openRequests().resume(gen);
+                        io_results[i] = performRedeleteIo(entries[i], layout, job_op);
+                    }
+                    catch (...)
+                    {
+                        io_results[i].error = std::current_exception();
+                    }
+                });
+        }
+    }
+    catch (...)
+    {
+        first_error = std::current_exception();
+    }
+    redelete_pool->wait();
+
+    for (size_t i = 0; i < scheduled; ++i)
+    {
+        if (io_results[i].error)
+        {
+            if (!first_error)
+                first_error = io_results[i].error;
+            continue;
+        }
+        applyRedeleteOutcome(entries[i], io_results[i], new_round, generation, round_work_budget, report, outcome_log);
+    }
+
+    if (first_error)
+        std::rethrow_exception(first_error);
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy,
@@ -717,62 +848,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         static const std::vector<RetiredEntry> kNothingToDelete;
         const std::vector<RetiredEntry> & redelete_now =
             suppress_destructive ? kNothingToDelete : merge.redelete;
-        for (const RetiredEntry & entry : redelete_now)
-        {
-            /// The condemned incarnation is a PERSISTED pair and cannot itself be a precondition, so
-            /// the round observes the blob and compares the two renderings. Observing first also
-            /// settles the absent case without spending a conditional delete against a key that is
-            /// already gone.
-            const String blob_key = layout.blobKey(entry.ref);
-            const std::optional<Meta> observed = op.head(blob_key, Retry::standard());
-            Removal del = Removal::Gone;
-            if (observed)
-                del = entry.token.matches(observed->etag)
-                    ? op.remove(blob_key, observed->etag, Retry::standard())
-                    : Removal::Mismatch;
-
-            const OutcomeKind outcome_kind = del == Removal::Removed ? OutcomeKind::Deleted
-                                            : del == Removal::Gone  ? OutcomeKind::Absent
-                                                                    : OutcomeKind::Replaced;
-            OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token, .outcome = outcome_kind};
-            const String del_outcome{removalName(del)};
-            /// The single content-delete site is attributable per row. A mismatch (a writer recreated
-            /// the incarnation) is terminal-OK: the fresh incarnation is a live object.
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::BlobDelete;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = blobIdOf(entry.ref);
-                e.token = renderIncarnation(entry.token);
-                e.round = new_round;
-                e.gen = generation;
-                e.outcome = del_outcome;
-                e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
-                e.detail = {{"condemn_round", std::to_string(entry.condemn_round)},
-                            {"key", blob_key}};
-            });
-            /// The audit row is observability only -- the delete above already executed regardless of
-            /// this cap. Skipping it here bounds the per-shard `GcOutcomes` body without skipping or
-            /// deferring any destructive work.
-            if (round_work_budget.outcomeEntryAvailable())
-            {
-                outcomes[shard].entries.push_back(std::move(outcome));
-                ++round_work_budget.outcome_entries_used;
-            }
-            ++report.redeleted;
-            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
-            /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
-            /// writer already resurrected a fresh incarnation at this hash, and that writer's
-            /// own republication path already flipped the meta back to Clean; blindly deleting here
-            /// would race that legitimate Clean write for no reason (the meta is advisory, but there is
-            /// no reason to touch it on that path at all).
-            if (del == Removal::Removed || del == Removal::Gone)
-            {
-                meta_writer->scheduleConfirmedMetaDelete(entry.ref);
-            }
-            /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
-            meta_writer->forgetCondemnMarker(entry.ref, entry.token);
-        }
+        redeleteBlobs(redelete_now, layout, op, new_round, generation, round_work_budget, report, outcomes[shard]);
         for (const RetiredEntry & entry : merge.spared)
         {
             /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted

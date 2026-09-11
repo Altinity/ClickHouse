@@ -227,6 +227,8 @@ the user-facing configuration surface.
 |---|---|---|
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes |
 | `cas_gc_read_concurrency` | 16 | bounded pool for the fold's read-ahead; `1` disables |
+| `cas_gc_redelete_concurrency` | 1 | bounded pool for the `pending_deletes` `HEAD` + conditional `DELETE` fan-out; `1` keeps it sequential |
+| `cas_gc_redelete_min_batch_size` | 2 | minimum `pending_deletes` batch size required to enable the parallel fan-out |
 
 ## Observability {#observability}
 

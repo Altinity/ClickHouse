@@ -179,6 +179,8 @@ struct PoolConfig
     /// only the fetch overlaps. `1` issues no read-ahead at all and is the sequential round, request
     /// for request.
     uint64_t gc_read_concurrency = 16;
+    uint64_t gc_redelete_concurrency = 1;
+    uint64_t gc_redelete_min_batch_size = 2;
     /// Tests drive `renewWatermarkOnce` explicitly; gates both persistent runtime workers.
     bool background_watermark = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.
