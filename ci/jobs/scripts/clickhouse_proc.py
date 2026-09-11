@@ -154,12 +154,16 @@ class ClickHouseProc:
             )
         print(f"Started azurite asynchronously with PID {self.azurite_proc.pid}")
 
-        if Shell.check(
-            "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/ | grep -qE '400|200'",
-            verbose=False,
-            retries=6,
-        ):
-            return True
+        print("Waiting for azurite to start...")
+        for _ in range(10):
+            res = Shell.check(
+                "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/ | grep -qE '400|200'",
+                verbose=False,
+            )
+            if res:
+                print("Azurite started successfully")
+                return True
+            time.sleep(3)
         print("Failed to start azurite")
         return False
 
