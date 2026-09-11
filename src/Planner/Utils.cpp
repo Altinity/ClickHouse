@@ -1,5 +1,7 @@
 #include <Planner/Utils.h>
 
+#include <Core/Block.h>
+
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSubquery.h>
@@ -51,6 +53,7 @@
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/AggregatingStep.h>
 #include <Processors/QueryPlan/LimitStep.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -199,62 +202,13 @@ ASTPtr queryNodeToSelectQuery(const QueryTreeNodePtr & query_node, bool set_subq
     return result_ast;
 }
 
-namespace
-{
-class NormalizeAliasMarkerVisitor : public InDepthQueryTreeVisitor<NormalizeAliasMarkerVisitor>
-{
-public:
-    void visitImpl(QueryTreeNodePtr & node)
-    {
-        auto * function_node = node->as<FunctionNode>();
-        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
-            return;
-
-        auto & arguments = function_node->getArguments().getNodes();
-        if (arguments.size() != 2)
-            return;
-
-        while (true)
-        {
-            auto * inner_function = arguments.front()->as<FunctionNode>();
-            if (!inner_function || inner_function->getFunctionName() != "__aliasMarker")
-                break;
-
-            auto & inner_arguments = inner_function->getArguments().getNodes();
-            if (inner_arguments.size() != 2)
-                break;
-
-            arguments.front() = inner_arguments.front();
-        }
-    }
-
-    bool needChildVisit(QueryTreeNodePtr & parent, QueryTreeNodePtr & child)
-    {
-        auto * parent_function = parent->as<FunctionNode>();
-        if (parent_function && parent_function->getFunctionName() == "__aliasMarker")
-            return false;
-
-        auto child_node_type = child->getNodeType();
-        return !(child_node_type == QueryTreeNodeType::QUERY || child_node_type == QueryTreeNodeType::UNION);
-    }
-};
-
-void normalizeAliasMarkersInQueryTree(QueryTreeNodePtr & node)
-{
-    NormalizeAliasMarkerVisitor visitor;
-    visitor.visit(node);
-}
-}
-
 ASTPtr queryNodeToDistributedSelectQuery(const QueryTreeNodePtr & query_node)
 {
     /// Remove CTEs information from distributed queries.
     /// Now, if cte_name is set for subquery node, AST -> String serialization will only print cte name.
     /// But CTE is defined only for top-level query part, so may not be sent.
     /// Removing cte_name forces subquery to be always printed.
-    auto query_node_to_convert = query_node->clone();
-    normalizeAliasMarkersInQueryTree(query_node_to_convert);
-    auto ast = queryNodeToSelectQuery(query_node_to_convert, /*set_subquery_cte_name=*/false);
+    auto ast = queryNodeToSelectQuery(query_node, /*set_subquery_cte_name=*/false);
     return ast;
 }
 
@@ -755,6 +709,61 @@ QueryPlanStepPtr projectOnlyUsedColumns(
     auto step = std::make_unique<ExpressionStep>(stream_header, std::move(project_only_used_columns_actions));
     step->setStepDescription("Project only used columns");
     return step;
+}
+
+static bool canMatchByNameWithoutAmbiguity(
+    const ColumnsWithTypeAndName & source,
+    const ColumnsWithTypeAndName & result)
+{
+    if (source.size() != result.size())
+        return false;
+
+    NameSet source_names;
+    NameSet result_names;
+
+    for (const auto & source_column : source)
+        if (!source_names.insert(source_column.name).second)
+            return false;
+
+    for (const auto & result_column : result)
+        if (!result_names.insert(result_column.name).second)
+            return false;
+
+    return source_names == result_names;
+}
+
+ActionsDAG makeConvertingActionsPreferNameThenPosition(
+    const ColumnsWithTypeAndName & source_columns,
+    const ColumnsWithTypeAndName & result_columns,
+    const ContextPtr & context,
+    std::string_view location,
+    bool ignore_constant_values,
+    bool add_cast_columns,
+    NameToNameMap * new_names)
+{
+    const auto mode = canMatchByNameWithoutAmbiguity(source_columns, result_columns)
+        ? ActionsDAG::MatchColumnsMode::Name
+        : ActionsDAG::MatchColumnsMode::Position;
+
+    if (mode == ActionsDAG::MatchColumnsMode::Position)
+    {
+        static auto log = getLogger("Planner");
+        LOG_TEST(
+            log,
+            "Position match at {} (names not matchable as a set): source=[{}] result=[{}]",
+            location,
+            Block(source_columns).dumpNames(),
+            Block(result_columns).dumpNames());
+    }
+
+    return ActionsDAG::makeConvertingActions(
+        source_columns,
+        result_columns,
+        mode,
+        context,
+        ignore_constant_values,
+        add_cast_columns,
+        new_names);
 }
 
 }

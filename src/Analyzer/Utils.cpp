@@ -49,6 +49,7 @@
 
 #include <Analyzer/Resolve/IdentifierResolveScope.h>
 
+
 #include <ranges>
 namespace DB
 {
@@ -977,6 +978,97 @@ void resolveAggregateFunctionNodeByName(FunctionNode & function_node, const Stri
 {
     auto aggregate_function = resolveAggregateFunction(function_node, function_name);
     function_node.resolveAsAggregateFunction(std::move(aggregate_function));
+}
+
+namespace
+{
+
+/// Finalize __aliasMarker nodes right before distributed SQL boundaries.
+/// This pass preserves nested markers and materializes arg2 to String constant
+/// only when arg2 is ColumnNode.
+class FinalizeAliasMarkersForDistributedSerializationVisitor : public InDepthQueryTreeVisitor<FinalizeAliasMarkersForDistributedSerializationVisitor>
+{
+public:
+    explicit FinalizeAliasMarkersForDistributedSerializationVisitor(ContextPtr context_)
+        : context(std::move(context_))
+    {}
+
+    bool shouldTraverseTopToBottom() const
+    {
+        return false;
+    }
+
+    static bool needChildVisit(const QueryTreeNodePtr & parent, const QueryTreeNodePtr &)
+    {
+        /// Do not descend into lambda bodies. A marker inside a lambda (e.g. a user-written
+        /// `arrayMap(x -> __aliasMarker(x, x), ...)`) is a per-row identity computation, not a
+        /// distributed-serialization-boundary column; its argument column resolves to the lambda
+        /// parameter which has no table source to materialize. Visiting it would otherwise hit the
+        /// "unnamed source" path below and raise a user-triggerable LOGICAL_ERROR (see 03933).
+        if (parent && parent->getNodeType() == QueryTreeNodeType::LAMBDA)
+            return false;
+
+        /// Keep traversing marker payload recursively so nested chains are preserved
+        /// and each marker can materialize its own arg2 when needed.
+        return true;
+    }
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        auto * function_node = node->as<FunctionNode>();
+        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
+            return;
+
+        auto & arguments = function_node->getArguments().getNodes();
+        if (arguments.size() != 2 || !arguments[0] || !arguments[1])
+            return;
+
+        String alias_id;
+        if (const auto * marker_column_node = arguments[1]->as<ColumnNode>())
+        {
+            if (const auto & marker_source = marker_column_node->getColumnSourceOrNull();
+                marker_source && marker_source->hasAlias())
+            {
+                alias_id = marker_source->getAlias() + "." + marker_column_node->getColumnName();
+            }
+            else
+            {
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "__aliasMarker expects the second argument to resolve to a column with a source alias before distributed serialization. "
+                    "Column '{}' has an unnamed or missing source",
+                    marker_column_node->getColumnName());
+            }
+        }
+        else if (const auto * marker_id_node = arguments[1]->as<ConstantNode>();
+                 marker_id_node && isString(marker_id_node->getResultType()))
+        {
+            /// Already materialized marker id from a previous hop. Keep as is.
+            return;
+        }
+
+        /// arg2 was neither a column with a source alias nor an already-materialized String id
+        /// (e.g. a user-supplied marker with an arbitrary second argument). Leave it untouched -
+        /// the function is a pass-through identity, so no materialization is the safe, non-throwing
+        /// behavior. Our own injected markers always carry an aliased column source, so this path
+        /// is not reachable for them.
+        if (alias_id.empty())
+            return;
+
+        arguments[1] = std::make_shared<ConstantNode>(std::move(alias_id), std::make_shared<DataTypeString>());
+        resolveOrdinaryFunctionNodeByName(*function_node, "__aliasMarker", context);
+    }
+
+private:
+    ContextPtr context;
+};
+
+}
+
+void finalizeAliasMarkersForDistributedSerialization(QueryTreeNodePtr & node, const ContextPtr & context)
+{
+    FinalizeAliasMarkersForDistributedSerializationVisitor visitor(context);
+    visitor.visit(node);
 }
 
 std::pair<QueryTreeNodePtr, bool> getExpressionSource(const QueryTreeNodePtr & node)

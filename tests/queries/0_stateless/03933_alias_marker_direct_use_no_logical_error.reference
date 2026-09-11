@@ -1,0 +1,14 @@
+2arg_identity
+42
+lambda_local
+[1]
+[2]
+[3]
+lambda_over_distributed
+[1]
+[2]
+[3]
+lambda_over_distributed_plan
+[1]
+[2]
+[3]
