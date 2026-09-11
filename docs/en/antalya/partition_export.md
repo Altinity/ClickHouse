@@ -4,16 +4,16 @@
 
 The `ALTER TABLE EXPORT PARTITION` command exports entire partitions from `MergeTree`-family tables to object storage (S3, Azure Blob Storage, etc.) or data lakes like Apache Iceberg tables (with and without catalogs), typically in Parquet format.
 
+- On non replicated `MergeTree` tables the export runs entirely on the single node that received the command.
 - On `Replicated*MergeTree` tables the export is coordinated across all replicas using ZooKeeper.
-- On plain (non-replicated) `MergeTree` tables the export runs entirely on the single node that received the command. No ZooKeeper / `clickhouse-keeper` ensemble is required. See [Plain (non-replicated) MergeTree](#plain-non-replicated-mergetree) below.
 
 The set of parts that are exported is based on the list of parts the replica that received the export command sees. On `Replicated*MergeTree`, the other replicas will assist in the export process if they have those parts locally. Otherwise they will ignore it.
 
-The partition export tasks of both engines can be observed through `system.partition_exports`. The table is served from an in-memory mirror, so queries do not contact ZooKeeper or disk and are cheap to run. For a `Replicated*MergeTree` source the mirror is refreshed on the manifest-updater poll cycle and on every status change, so a freshly written exception or terminal state may take up to one poll interval to appear; for a plain `MergeTree` source it is updated synchronously with every state change. Individual part export progress can be observed as usual through `system.exports`.
+The partition export tasks of both engines can be observed through `system.partition_exports`.
 
 `system.replicated_partition_exports` is kept as an alias of `system.partition_exports` for backwards compatibility. It returns exactly the same rows, including exports of plain `MergeTree` tables. Filter on `source_table` (or join against `system.tables`) if you need only one engine.
 
-The same partition can not be exported to the same destination more than once. There are two ways to override this behavior: either by setting the `export_merge_tree_partition_force_export` setting or waiting for the task to expire.
+The same partition can not be exported to the same destination more than once. This behavior can be overriden with `export_merge_tree_partition_force_export`.
 
 The export task can be killed by issuing the kill command: `KILL EXPORT PARTITION <where predicate for system.partition_exports>`.
 
@@ -44,12 +44,7 @@ Each MergeTree part will become a separate file with the following name conventi
 
 ## Plain (non-replicated) MergeTree {#plain-non-replicated-mergetree}
 
-The command, its settings, the partition-key compatibility rules and the destination file layout are the same for both engines. Only the coordination differs:
-
-- There is no ZooKeeper coordination and no `clickhouse-keeper` ensemble is needed. The node that received the command persists the task descriptor on the source table's disk and a local background scheduler drives it to completion.
-- The task is still persistent: a node that is restarted (or killed) mid-export resumes the export from the on-disk descriptor.
-- There are no other replicas to assist, so a single node exports every part of the partition. `source_replica` is empty in `system.partition_exports` and `last_exception_per_replica` holds at most one entry, whose `replica` is empty.
-- The commit-path columns (`committed_metadata_file`, `committed_manifest_list`, `committed_manifest_file`, `committed_marker_file`) are always empty, because a plain `MergeTree` does not persist the commit paths. See [Columns that depend on the source engine](#columns-that-depend-on-the-source-engine).
+The command, its settings, the partition-key compatibility rules and the destination file layout are the same for both engines. Only the coordination differs as it is performed by a single node in the plain MergeTree case.
 
 ### Pending mutations {#plain-merge-tree-pending-mutations}
 
@@ -203,8 +198,6 @@ WHERE partition_id = '2020'
   AND destination_table = 's3_table'
 ```
 
-The `WHERE` clause filters exports from the `system.partition_exports` table, which covers both `Replicated*MergeTree` and plain `MergeTree` sources, so a single `KILL EXPORT PARTITION` targets either engine. You can use any column of that table in the filter (for example `partition_id`, `source_table`, `destination_table`).
-
 ## Monitoring
 
 ### Active and Completed Exports
@@ -294,16 +287,6 @@ These columns surface paths produced by the destination storage during commit, s
 - `committed_manifest_list` — for Iceberg destinations: path of the manifest list file (`snap-*.avro`) referenced by the new snapshot. Empty under the same conditions as `committed_metadata_file`.
 - `committed_manifest_file` — for Iceberg destinations: path of the manifest file referenced by `committed_manifest_list`. Empty under the same conditions as `committed_metadata_file`.
 - `committed_marker_file` — for plain object storage destinations: path of the per-transaction commit marker file written by the destination. Empty for Iceberg destinations and for tasks that have not committed yet.
-
-### Columns that depend on the source engine {#columns-that-depend-on-the-source-engine}
-
-Rows for plain `MergeTree` sources share the schema with replicated ones, and leave the columns that only make sense with cross-replica coordination empty:
-
-- `source_replica` — empty, since there is a single node.
-- `last_exception_per_replica` — at most one tuple, with an empty `replica`.
-- `committed_metadata_file`, `committed_manifest_list`, `committed_manifest_file`, `committed_marker_file` — always empty.
-
-`local_backoff_per_part` is local to the node answering the query for both engines.
 
 To pick the latest exception across replicas:
 

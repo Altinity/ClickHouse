@@ -35,18 +35,11 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
     mutable std::vector<DataPartPtr> part_references;
 
     /// In-memory mirror of <export-entry>/last_exception/<replica> leaves in ZK,
-    /// keyed by replica name (verbatim, not escaped). Refreshed on every poll() cycle
-    /// and on every status-change handler invocation; served verbatim to
-    /// system.replicated_partition_exports without any extra ZK read.
-    /// An empty map means no replica has recorded an exception yet for this task.
+    /// keyed by replica name (verbatim, not escaped).
     mutable std::map<String, LastExceptionEntry> last_exception_per_replica;
 
     /// In-memory mirror of <export-entry>/processed/<part> leaves in ZK, keyed by
-    /// part name. Each value is the list of destination file paths produced by the
-    /// per-part export (typically Parquet object-storage keys). Refreshed on every
-    /// poll() cycle and on status-change handler invocations; served verbatim to
-    /// system.replicated_partition_exports without any extra ZK read at query time.
-    /// An empty map means no part has finished exporting yet for this task.
+    /// part name. An empty map means no part has finished exporting yet for this task.
     /// Incomplete Keeper refreshes (or unreadable processed leaves) publish
     /// "<failed to read from zk>" as a whole-map key, or as the sole path value
     /// for the affected part leaf.

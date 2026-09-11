@@ -41,8 +41,7 @@ namespace FailPoints
 namespace
 {
     /// Value published into destination_file_paths when a processed/ Keeper refresh
-    /// is incomplete (or a leaf is unreadable), so system.replicated_partition_exports
-    /// can show that the in-memory mirror failed to sync instead of silently under-counting.
+    /// is incomplete (or a leaf is unreadable).
     constexpr std::string_view zk_sync_failed_marker = "<failed to read from zk>";
 
     /// Describes pending commits
@@ -467,9 +466,7 @@ std::vector<PartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartiti
 void ExportPartitionManifestUpdatingTask::poll()
 {
     /// Commit-recovery work collected while the storage-wide mutex is held.
-    /// Executed AFTER the mutex is released - committing to Iceberg/REST-catalog can take
-    /// many seconds (up to MAX_TRANSACTION_RETRIES=100 catalog round-trips) and blocking
-    /// `system.replicated_partition_exports` for that long is what we are fixing here.
+    /// Executed AFTER the mutex is released.
     std::vector<CommitRecoveryWork> deferred_commits;
 
     auto zk = storage.getZooKeeper();
@@ -733,7 +730,7 @@ void ExportPartitionManifestUpdatingTask::addTask(
     /// If the status is PENDING, we grab references to the data parts to prevent them from being deleted from the disk
     /// Otherwise, the operation has already been completed and there is no need to keep the data parts alive
     /// You might also ask: why bother adding tasks that have already been completed (i.e, status != PENDING)?
-    /// The reason is the `replicated_partition_exports` table might miss entries if they are not added here.
+    /// The reason is the `partition_exports` table might miss entries if they are not added here.
     if (status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
     {
         for (const auto & part_name : metadata.parts)
@@ -761,7 +758,7 @@ void ExportPartitionManifestUpdatingTask::addTask(
             LOG_ERROR(storage.log,
                 "ExportPartition Manifest Updating Task: failed to replace in-memory entry for {} (transaction_id {}). "
                 "This most likely means another export already holds the same transaction_id (id collision); "
-                "this export will be missing from system.replicated_partition_exports.",
+                "this export will be missing from system.partition_exports.",
                 key, entry.getTransactionId());
     }
     else if (!entries_by_key.insert(entry).second)
@@ -769,7 +766,7 @@ void ExportPartitionManifestUpdatingTask::addTask(
         LOG_ERROR(storage.log,
             "ExportPartition Manifest Updating Task: failed to insert in-memory entry for {} (transaction_id {}). "
             "Another entry already holds this transaction_id (id collision); "
-            "this export will be invisible in system.replicated_partition_exports.",
+            "this export will be invisible in system.partition_exports.",
             key, entry.getTransactionId());
     }
 }

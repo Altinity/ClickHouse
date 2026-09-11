@@ -489,7 +489,7 @@ It is currently only implemented in StorageObjectStorage.
     };
 
     /// Paths produced by the destination storage during commit. Surfaced via
-    /// system.replicated_partition_exports for debugging
+    /// system.partition_exports for debugging
     struct ExportPartitionCommitInfo
     {
       /// Iceberg destinations only.

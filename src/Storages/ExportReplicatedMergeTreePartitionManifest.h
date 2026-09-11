@@ -153,9 +153,7 @@ struct ExportReplicatedMergeTreePartitionProcessedPartEntry
 /// Per-task "commit info" record persisted at <export-entry>/commit_info.
 ///
 /// Written exactly once, atomically with the status -> COMPLETED transition
-/// (see ExportPartitionUtils::commit). Captures the metadata-layer file paths
-/// produced by the destination storage during commit so they can be surfaced in
-/// system.replicated_partition_exports for debugging.
+/// (see ExportPartitionUtils::commit).
 ///
 /// All Iceberg fields are empty for non-Iceberg destinations. They may also be
 /// empty for an Iceberg destination if the committing replica crashed between
