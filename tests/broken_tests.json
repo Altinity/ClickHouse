@@ -289,5 +289,8 @@
     },
     "03032_dynamically_resize_filesystem_cache_2": {
         "reason": "KNOWN - Flaky upstream"
+    },
+    "test_race_condition_for_replicated_merge_tree/test.py::test_partition_move_drop_race": {
+        "reason": "NEEDSFIX - requires CommittingBlock lock content (25.8+); on 25.3 DROP PARTITION cancels the concurrent INSERT"
     }
 }
