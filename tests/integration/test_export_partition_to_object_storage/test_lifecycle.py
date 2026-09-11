@@ -219,7 +219,12 @@ def partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engi
             f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
         marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
     else:
-        # A plain MergeTree does not persist the commit path, so find the marker in object storage.
+        # A plain MergeTree does not persist the commit path, so reconstruct it: the partition
+        # marker is `commit_<partition id>_<transaction id>` in the destination table root
+        # (see `StorageObjectStorage::commitExportPartitionTransaction`). Scanning for a
+        # `commit_2020_` prefix instead would be ambiguous - each transaction leaves its own
+        # marker behind, and the per-part markers are named `commit_<part name>_<checksum>`,
+        # which for a part of partition 2020 also starts with `commit_2020_`.
         assert committed_marker_file == "", (
             f"Expected an empty committed_marker_file for a plain MergeTree source, "
             f"got: {committed_marker_file!r}"
@@ -227,16 +232,16 @@ def partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engi
         exported_paths = recorded_export_paths(node, mt_table, s3_table)
         assert exported_paths, "Need at least one recorded data path to locate the partition commit marker"
         table_prefix = exported_paths[0][:exported_paths[0].index(f"{s3_table}/") + len(s3_table) + 1]
-        marker_keys = [
+        transaction_id = export_transaction_id(node, mt_table, s3_table, "2020")
+        assert transaction_id, "Need the export transaction id to locate the partition commit marker"
+        marker_key = f"{table_prefix}commit_2020_{transaction_id}"
+        assert [
             obj.object_name
             for obj in cluster.minio_client.list_objects(
-                cluster.minio_bucket, prefix=table_prefix, recursive=True
+                cluster.minio_bucket, prefix=marker_key, recursive=True
             )
-            if obj.object_name.rsplit("/", 1)[-1].startswith("commit_2020_")
-        ]
-        assert len(marker_keys) == 1, \
-            f"Expected one partition commit marker under {table_prefix}, got {marker_keys}"
-        marker_relative_path = marker_keys[0][marker_keys[0].index(f"{s3_table}/"):]
+        ] == [marker_key], f"Expected the partition commit marker at {marker_key}"
+        marker_relative_path = marker_key[marker_key.index(f"{s3_table}/"):]
 
     lines = node.query(
         f"SELECT * FROM s3(s3_conn, filename='{marker_relative_path}', format=LineAsString)"

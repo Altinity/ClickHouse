@@ -58,9 +58,6 @@ TEST_CONFIGS = [
         True,
         "pins azurite to fixed host port 10000 (Spark emulator mode); concurrent --dist=each workers collide on bind",
     ),
-    # The rest of test_export_partition_to_object_storage/ (validation, lifecycle) and all of
-    # test_export_partition_to_iceberg/ are parallel-safe: each xdist worker gets its own cluster,
-    # and those modules only create tables and assert on synchronous rejects.
     TC(
         "test_export_partition_to_object_storage/test_failures.py",
         True,
