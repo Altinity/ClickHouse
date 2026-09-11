@@ -24,7 +24,7 @@
 
 #include <unistd.h>
 
-#if defined(ADDRESS_SANITIZER)
+#if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER) || defined(MEMORY_SANITIZER)
 #include <sanitizer/allocator_interface.h>
 #endif
 
@@ -576,7 +576,7 @@ MemoryWorker::MemoryUsage MemoryWorker::getMemoryUsage(bool log_error)
         }
     }
 
-#if defined(ADDRESS_SANITIZER)
+#if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER) || defined(MEMORY_SANITIZER)
     usage.allocated = __sanitizer_get_current_allocated_bytes();
 #else
     usage.allocated = usage.resident;
