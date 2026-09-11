@@ -55,7 +55,6 @@ struct PartitionExportInfo
     std::map<String, std::vector<String>> destination_file_paths_per_part;
 
     /// Commit-time paths reported by the destination storage. All empty before the commit lands.
-    /// Plain MergeTree does not persist them yet, so they stay empty there.
     String committed_metadata_file;
     String committed_manifest_list;
     String committed_manifest_file;

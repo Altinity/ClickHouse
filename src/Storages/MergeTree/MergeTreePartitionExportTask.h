@@ -8,6 +8,7 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Parser.h>
+#include <Storages/ExportPartitionCommitInfoEntry.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
 
 namespace DB
@@ -62,6 +63,10 @@ struct MergeTreePartitionExportTask
     std::vector<PartProgress> parts;
     Status status = Status::PENDING;
     LastException last_exception;
+
+    /// Paths reported by the destination storage, recorded together with the COMPLETED transition.
+    /// Stays nullopt until the commit lands, and for descriptors written before this field existed.
+    std::optional<ExportPartitionCommitInfoEntry> commit_info;
 
     size_t retry_initial_backoff_seconds = 5;
     size_t retry_max_backoff_seconds = 300;
@@ -171,6 +176,9 @@ struct MergeTreePartitionExportTask
         exception_object->set("count", last_exception.count);
         json.set("last_exception", exception_object);
 
+        if (commit_info)
+            json.set("commit_info", commit_info->toJsonObject());
+
         json.set("retry_initial_backoff_seconds", retry_initial_backoff_seconds);
         json.set("retry_max_backoff_seconds", retry_max_backoff_seconds);
         json.set("task_timeout_seconds", task_timeout_seconds);
@@ -248,6 +256,14 @@ struct MergeTreePartitionExportTask
             task.last_exception.part = exception_object->getValue<String>("part");
             task.last_exception.time = exception_object->getValue<time_t>("time");
             task.last_exception.count = exception_object->getValue<size_t>("count");
+        }
+
+        if (json->has("commit_info"))
+        {
+            const auto commit_info_object = json->getObject("commit_info");
+            if (!commit_info_object)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "Field 'commit_info' of a partition export descriptor is not an object");
+            task.commit_info = ExportPartitionCommitInfoEntry::fromJsonObject(commit_info_object);
         }
 
         task.retry_initial_backoff_seconds = json->getValue<size_t>("retry_initial_backoff_seconds");

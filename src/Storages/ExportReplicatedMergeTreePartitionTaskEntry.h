@@ -49,7 +49,7 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
     /// with the COMPLETED status transition; see ExportPartitionUtils::commit).
     /// nullopt until commit_info is observed in ZK. Empty fields inside the struct
     /// for non-Iceberg destinations.
-    mutable std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> commit_info;
+    mutable std::optional<ExportPartitionCommitInfoEntry> commit_info;
 
     std::string getCompositeKey() const
     {

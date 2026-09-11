@@ -516,7 +516,7 @@ namespace ExportPartitionUtils
         Coordination::Requests ops;
         ops.emplace_back(zkutil::makeSetRequest(status_path, completed_name, -1));
 
-        ExportReplicatedMergeTreePartitionCommitInfoEntry commit_info_entry {
+        ExportPartitionCommitInfoEntry commit_info_entry {
             destination_commit_info.iceberg_metadata_file,
             destination_commit_info.iceberg_manifest_list,
             destination_commit_info.iceberg_manifest_file,

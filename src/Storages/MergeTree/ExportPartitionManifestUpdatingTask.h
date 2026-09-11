@@ -35,7 +35,7 @@ private:
         ExportReplicatedMergeTreePartitionTaskEntry::Status status,
         std::map<String, LastExceptionEntry> last_exception_per_replica,
         std::map<String, std::vector<String>> destination_file_paths_per_part,
-        std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> commit_info,
+        std::optional<ExportPartitionCommitInfoEntry> commit_info,
         const std::string & key,
         auto & entries_by_key
     );

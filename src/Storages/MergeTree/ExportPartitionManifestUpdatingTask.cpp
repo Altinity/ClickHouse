@@ -244,7 +244,7 @@ namespace
     /// Returns nullopt when the znode is absent (task has not committed yet, peer
     /// crashed before writing it, or transient ZK error). Callers should treat
     /// nullopt as "leave the in-memory copy untouched".
-    std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> readCommitInfo(
+    std::optional<ExportPartitionCommitInfoEntry> readCommitInfo(
         const zkutil::ZooKeeperPtr & zk,
         const std::filesystem::path & entry_path,
         const std::string & log_key,
@@ -260,7 +260,7 @@ namespace
 
         try
         {
-            return ExportReplicatedMergeTreePartitionCommitInfoEntry::fromJsonString(data);
+            return ExportPartitionCommitInfoEntry::fromJsonString(data);
         }
         catch (...)
         {
@@ -720,7 +720,7 @@ void ExportPartitionManifestUpdatingTask::addTask(
     ExportReplicatedMergeTreePartitionTaskEntry::Status status,
     std::map<String, LastExceptionEntry> last_exception_per_replica,
     std::map<String, std::vector<String>> destination_file_paths_per_part,
-    std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> commit_info,
+    std::optional<ExportPartitionCommitInfoEntry> commit_info,
     const std::string & key,
     auto & entries_by_key
 )

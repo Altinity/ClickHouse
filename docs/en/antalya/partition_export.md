@@ -281,7 +281,7 @@ Status values include:
 
 ### Commit info columns
 
-These columns surface paths produced by the destination storage during commit, so it is possible to inspect what was written without consulting the destination directly. They are populated for `Replicated*MergeTree` sources only; a plain `MergeTree` does not persist the commit paths, so they stay empty there even after a successful commit.
+These columns surface paths produced by the destination storage during commit, so it is possible to inspect what was written without consulting the destination directly. They are recorded together with the transition to `COMPLETED` - in ZooKeeper for a `Replicated*MergeTree` source, and in the on-disk task descriptor for a plain `MergeTree`.
 
 - `committed_metadata_file` — for Iceberg destinations: path of the new `vN.metadata.json` written by the commit. Empty for non-Iceberg destinations and before the commit lands. If the commit was already finished by a previous run (detected via the transaction id stored in the snapshot summary), this column carries a human-readable sentinel string instead of a path because the original committer's paths are not recoverable from inside the impl.
 - `committed_manifest_list` — for Iceberg destinations: path of the manifest list file (`snap-*.avro`) referenced by the new snapshot. Empty under the same conditions as `committed_metadata_file`.

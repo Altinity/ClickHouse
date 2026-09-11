@@ -2,7 +2,6 @@ import uuid
 
 from helpers.export_partition_helpers import (
     export_transaction_id,
-    is_replicated_engine,
     make_source,
     wait_for_export_status,
     wait_for_new_export_transaction,
@@ -61,27 +60,18 @@ def test_export_partition_file_already_exists_policy(cluster, source_engine):
           AND partition_id = '2020'
         """
     ).strip()
-    if is_replicated_engine(source_engine):
-        # `committed_marker_file` is the absolute key in the bucket (same convention as
-        # `destination_file_paths`); it may carry the s3_conn URL's in-bucket prefix on
-        # top of the table's `filename` argument, so use a "contains" check that does
-        # not depend on knowing that prefix.
-        assert f"{s3_table}/commit_2020_" in committed_marker_file, \
-            f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
-        # Path relative to the `s3_conn` URL, derived from the absolute key without
-        # assuming a particular URL prefix.
-        marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
-        assert node.query(
-            f"SELECT count() FROM s3(s3_conn, filename='{marker_relative_path}', format=LineAsString)"
-        ) == '1\n', f"Commit marker file does not exist at {committed_marker_file!r}"
-    else:
-        # A plain MergeTree does not persist the commit paths, so the column stays empty even
-        # after a successful commit (documented in docs/en/antalya/partition_export.md). The
-        # marker itself is still written - the commit-file assertions elsewhere cover that.
-        assert committed_marker_file == "", (
-            f"Expected an empty committed_marker_file for a plain MergeTree source, "
-            f"got: {committed_marker_file!r}"
-        )
+    # `committed_marker_file` is the absolute key in the bucket (same convention as
+    # `destination_file_paths`); it may carry the s3_conn URL's in-bucket prefix on
+    # top of the table's `filename` argument, so use a "contains" check that does
+    # not depend on knowing that prefix.
+    assert f"{s3_table}/commit_2020_" in committed_marker_file, \
+        f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
+    # Path relative to the `s3_conn` URL, derived from the absolute key without
+    # assuming a particular URL prefix.
+    marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
+    assert node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{marker_relative_path}', format=LineAsString)"
+    ) == '1\n', f"Commit marker file does not exist at {committed_marker_file!r}"
 
     # try to export the partition
     node.query(
@@ -203,7 +193,7 @@ def recorded_export_paths(node, mt_table, s3_table):
     return [path for path in paths.splitlines() if path]
 
 
-def partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engine):
+def partition_commit_marker_lines(node, mt_table, s3_table):
     """Data-file paths listed inside the partition-level commit marker."""
     committed_marker_file = node.query(
         f"""
@@ -214,34 +204,9 @@ def partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engi
         """
     ).strip()
 
-    if is_replicated_engine(source_engine):
-        assert f"{s3_table}/commit_2020_" in committed_marker_file, \
-            f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
-        marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
-    else:
-        # A plain MergeTree does not persist the commit path, so reconstruct it: the partition
-        # marker is `commit_<partition id>_<transaction id>` in the destination table root
-        # (see `StorageObjectStorage::commitExportPartitionTransaction`). Scanning for a
-        # `commit_2020_` prefix instead would be ambiguous - each transaction leaves its own
-        # marker behind, and the per-part markers are named `commit_<part name>_<checksum>`,
-        # which for a part of partition 2020 also starts with `commit_2020_`.
-        assert committed_marker_file == "", (
-            f"Expected an empty committed_marker_file for a plain MergeTree source, "
-            f"got: {committed_marker_file!r}"
-        )
-        exported_paths = recorded_export_paths(node, mt_table, s3_table)
-        assert exported_paths, "Need at least one recorded data path to locate the partition commit marker"
-        table_prefix = exported_paths[0][:exported_paths[0].index(f"{s3_table}/") + len(s3_table) + 1]
-        transaction_id = export_transaction_id(node, mt_table, s3_table, "2020")
-        assert transaction_id, "Need the export transaction id to locate the partition commit marker"
-        marker_key = f"{table_prefix}commit_2020_{transaction_id}"
-        assert [
-            obj.object_name
-            for obj in cluster.minio_client.list_objects(
-                cluster.minio_bucket, prefix=marker_key, recursive=True
-            )
-        ] == [marker_key], f"Expected the partition commit marker at {marker_key}"
-        marker_relative_path = marker_key[marker_key.index(f"{s3_table}/"):]
+    assert f"{s3_table}/commit_2020_" in committed_marker_file, \
+        f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
+    marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
 
     lines = node.query(
         f"SELECT * FROM s3(s3_conn, filename='{marker_relative_path}', format=LineAsString)"
@@ -292,7 +257,7 @@ def test_export_partition_skip_policy_reports_every_split_file(cluster, source_e
     exported_paths = recorded_export_paths(node, mt_table, s3_table)
     assert len(exported_paths) == 3, \
         f"Expected the 3-row partition to split into 3 files, got {exported_paths}"
-    assert len(partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engine)) == 3
+    assert len(partition_commit_marker_lines(node, mt_table, s3_table)) == 3
 
     # Re-export. Every destination file is already there, so `skip` short-circuits the part --
     # but it must do so with the complete file list.
@@ -306,7 +271,7 @@ def test_export_partition_skip_policy_reports_every_split_file(cluster, source_e
         f"Skipped re-export recorded {skipped_paths} instead of all 3 split files {exported_paths}"
     )
 
-    committed = partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engine)
+    committed = partition_commit_marker_lines(node, mt_table, s3_table)
     assert len(committed) == 3, \
         f"Skipped re-export committed {len(committed)} path(s) instead of all 3 split files: {committed}"
 
@@ -366,7 +331,7 @@ def test_export_partition_skip_policy_reexports_incomplete_part(cluster, source_
         f"Retry did not rewrite the per-part commit marker: {markers_after}"
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "3\n", \
         "Rows from the split files the interrupted attempt never wrote are missing from the destination"
-    assert len(partition_commit_marker_lines(node, cluster, mt_table, s3_table, source_engine)) == 3
+    assert len(partition_commit_marker_lines(node, mt_table, s3_table)) == 3
 
 
 def test_export_partition_feature_is_disabled(cluster, source_engine):

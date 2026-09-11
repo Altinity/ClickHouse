@@ -196,6 +196,14 @@ std::vector<PartitionExportInfo> MergeTreePartitionExportScheduler::getInfo() co
             if (!part.paths_in_destination.empty())
                 info.destination_file_paths_per_part.emplace(part.part_name, part.paths_in_destination);
 
+        if (descriptor.commit_info)
+        {
+            info.committed_metadata_file = descriptor.commit_info->iceberg_metadata_file;
+            info.committed_manifest_list = descriptor.commit_info->iceberg_manifest_list;
+            info.committed_manifest_file = descriptor.commit_info->iceberg_manifest_file;
+            info.committed_marker_file = descriptor.commit_info->commit_marker_file;
+        }
+
         info.backoff_per_part.reserve(entry.part_backoff.size());
         for (const auto & [part_name, backoff] : entry.part_backoff)
             info.backoff_per_part.push_back({part_name, backoff.attempts, backoff.next_retry_time});
@@ -581,6 +589,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
 
     bool success = false;
     std::optional<Exception> failure;
+    IStorage::ExportPartitionCommitInfo destination_commit_info;
     try
     {
         const auto exported_paths = descriptor_copy.collectExportedPaths();
@@ -605,7 +614,7 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
 
             LOG_INFO(storage.log, "ExportPartition: all parts exported for task {}, committing", transaction_id);
 
-            ExportPartitionUtils::commitExportOnDestination(
+            destination_commit_info = ExportPartitionUtils::commitExportOnDestination(
                 descriptor_copy.transaction_id,
                 descriptor_copy.partition_id,
                 descriptor_copy.iceberg_metadata_json,
@@ -651,6 +660,14 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
         if (success)
         {
             updated.status = MergeTreePartitionExportTask::Status::COMPLETED;
+            /// Recorded in the same descriptor write as COMPLETED. A task that had nothing to
+            /// commit records an entry with empty paths, matching the replicated path, which also
+            /// always writes commit_info together with the status transition.
+            updated.commit_info = ExportPartitionCommitInfoEntry{
+                destination_commit_info.iceberg_metadata_file,
+                destination_commit_info.iceberg_manifest_list,
+                destination_commit_info.iceberg_manifest_file,
+                destination_commit_info.commit_marker_file};
         }
         else
         {
