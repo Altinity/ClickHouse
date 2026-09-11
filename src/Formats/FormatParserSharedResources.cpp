@@ -10,11 +10,13 @@ namespace Setting
 {
     extern const SettingsMaxThreads max_download_threads;
     extern const SettingsMaxThreads max_parsing_threads;
+    extern const SettingsUInt64 object_storage_max_files_to_prefetch;
 }
 
 FormatParserSharedResources::FormatParserSharedResources(const Settings & settings, size_t num_streams_)
     : max_parsing_threads(settings[Setting::max_parsing_threads])
     , max_io_threads(settings[Setting::max_download_threads])
+    , max_concurrent_readers_per_stream(std::max<size_t>(settings[Setting::object_storage_max_files_to_prefetch], 1))
     , num_streams(num_streams_)
 {
 }

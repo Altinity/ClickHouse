@@ -871,6 +871,7 @@ The server successfully detected this situation and will download merged part fr
     M(RemoteFSBuffers, "Number of buffers created for asynchronous reading from remote filesystem", ValueType::Number) \
     M(MergeTreePrefetchedReadPoolInit, "Time spent preparing tasks in MergeTreePrefetchedReadPool", ValueType::Microseconds) \
     M(WaitPrefetchTaskMicroseconds, "Time spend waiting for prefetched reader", ValueType::Microseconds) \
+    M(ObjectStorageWaitPrefetchedReaderMicroseconds, "Time spent waiting for a primed object storage file reader to become available (see object_storage_max_files_to_prefetch)", ValueType::Microseconds) \
     \
     M(ThreadpoolReaderTaskMicroseconds, "Time spent getting the data in asynchronous reading", ValueType::Microseconds) \
     M(ThreadpoolReaderPrepareMicroseconds, "Time spent on preparation (e.g. call to reader seek() method)", ValueType::Microseconds) \

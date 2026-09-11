@@ -44,6 +44,7 @@
 #include <boost/operators.hpp>
 #include <Poco/String.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/SipHash.h>
 #include <Common/parseGlobs.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
@@ -56,6 +57,8 @@
 #endif
 
 #include <fmt/ranges.h>
+#include <base/sleep.h>
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 #include <Common/ProfileEvents.h>
 #include <Core/SettingsEnums.h>
 #include <Poco/String.h>
@@ -73,6 +76,7 @@ namespace ProfileEvents
     extern const Event ObjectStorageReadObjects;
     extern const Event ObjectStorageClusterProcessedTasks;
     extern const Event ObjectStorageClusterWaitingMicroseconds;
+    extern const Event ObjectStorageWaitPrefetchedReaderMicroseconds;
 }
 
 namespace CurrentMetrics
@@ -84,6 +88,14 @@ namespace CurrentMetrics
 
 namespace DB
 {
+/// The failpoints are defined in `DB::FailPoints`, so this has to be declared inside `namespace DB`
+/// - at global scope it declares a different symbol and the build fails to link.
+namespace FailPoints
+{
+    extern const char object_storage_file_prefetch_failpoint[];
+    extern const char object_storage_reader_pool_pause[];
+}
+
 namespace Setting
 {
     extern const SettingsUInt64 max_download_buffer_size;
@@ -99,6 +111,7 @@ namespace Setting
     extern const SettingsBool input_format_parquet_use_native_reader_v3;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
     extern const SettingsBool use_object_storage_list_objects_cache;
+    extern const SettingsUInt64 object_storage_max_files_to_prefetch;
 }
 
 namespace ErrorCodes
@@ -153,22 +166,35 @@ StorageObjectStorageSource::StorageObjectStorageSource(
     , parser_shared_resources(std::move(parser_shared_resources_))
     , format_filter_info(std::move(format_filter_info_))
     , read_from_format_info(info)
-    , create_reader_pool(
+    , own_reader_pool(
           std::make_shared<ThreadPool>(
               CurrentMetrics::StorageObjectStorageThreads,
               CurrentMetrics::StorageObjectStorageThreadsActive,
               CurrentMetrics::StorageObjectStorageThreadsScheduled,
               1 /* max_threads */))
+    , create_reader_pool(
+          context_->getSettingsRef()[Setting::object_storage_max_files_to_prefetch] <= 1
+          ? *own_reader_pool
+          : context_->getPrefetchThreadpool())
     , file_iterator(file_iterator_)
     , schema_cache(StorageObjectStorage::getSchemaCache(context_, configuration->getTypeName()))
-    , create_reader_scheduler(threadPoolCallbackRunnerUnsafe<ReaderHolder>(*create_reader_pool, ThreadName::READER_POOL))
+    , create_reader_scheduler(threadPoolCallbackRunnerUnsafe<ReaderHolder>(create_reader_pool, ThreadName::READER_POOL))
+    , max_files_to_prefetch(std::max<size_t>(context_->getSettingsRef()[Setting::object_storage_max_files_to_prefetch], 1))
 {
 }
 
 StorageObjectStorageSource::~StorageObjectStorageSource()
 {
     LOG_DEBUG(log, "Source finished: files_read={}", total_files_read);
-    create_reader_pool->wait();
+    /// The scheduled work captures `this`. When create_reader_pool is the shared server-wide pool
+    /// (max_files_to_prefetch > 1), waiting for the whole pool would also be wrong (it would wait
+    /// for unrelated queries) and insufficient to express what we need. Wait for exactly this
+    /// source's own futures instead, which also covers the dedicated-pool case below.
+    for (auto & reader_future : reader_futures)
+    {
+        if (reader_future.valid())
+            reader_future.wait();
+    }
 }
 
 std::string StorageObjectStorageSource::getUniqueStoragePathIdentifier(
@@ -406,9 +432,38 @@ void StorageObjectStorageSource::lazyInitialize()
     if (reader)
     {
         ++total_files_read;
-        reader_future = createReaderAsync();
+        refillReaderFutures();
     }
     initialized = true;
+}
+
+void StorageObjectStorageSource::refillReaderFutures()
+{
+    while (reader_futures.size() < max_files_to_prefetch)
+    {
+        /// The first queued future preserves the pre-existing pipeline-object-only lookahead
+        /// (unprimed), so max_files_to_prefetch=1 never primes anything - identical to the
+        /// behaviour before this setting existed. Every subsequent slot is primed.
+        const bool prime = !reader_futures.empty();
+        reader_futures.push_back(createReaderAsync(prime));
+    }
+}
+
+StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::takeNextQueuedReader()
+{
+    /// Stopping at the first empty slot would silently drop files: the queued tasks race each other
+    /// for file_iterator->next(), so a slot queued earlier can resolve to nothing while later-queued
+    /// slots already hold files that have been fetched (and, when primed, read ahead) and still have
+    /// to be returned. Only when every queued slot has been drained and none held a file is this
+    /// stream really out of work.
+    while (!reader_futures.empty())
+    {
+        auto next_reader = reader_futures.front().get();
+        reader_futures.pop_front();
+        if (next_reader)
+            return next_reader;
+    }
+    return {};
 }
 
 Chunk StorageObjectStorageSource::generate()
@@ -634,18 +689,23 @@ Chunk StorageObjectStorageSource::generate()
 
         total_rows_in_file = 0;
 
-        assert(reader_future.valid());
-        reader = reader_future.get();
+        chassert(!reader_futures.empty());
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::ObjectStorageWaitPrefetchedReaderMicroseconds);
+            reader = takeNextQueuedReader();
+        }
 
         if (!reader)
             break;
 
         ++total_files_read;
 
-        /// Even if task is finished the thread may be not freed in pool.
-        /// So wait until it will be freed before scheduling a new task.
-        create_reader_pool->wait();
-        reader_future = createReaderAsync();
+        /// There used to be a `create_reader_pool->wait` here for the single-lookahead case, to let
+        /// the private one-thread pool free its thread before the next task was scheduled. The pool
+        /// is now the shared server-wide one, so there is no private thread to wait for, and waiting
+        /// on it would block on unrelated queries' prefetches. Taking a reader from the queue
+        /// already means its callback has finished, which is all that wait actually guaranteed.
+        refillReaderFutures();
     }
 
     return {};
@@ -1308,9 +1368,25 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         std::move(constant_columns_with_values));
 }
 
-std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource::createReaderAsync()
+std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource::createReaderAsync(bool prime)
 {
-    return create_reader_scheduler([=, this] { return createReader(); }, Priority{});
+    return create_reader_scheduler([=, this]
+    {
+        /// Lets a test observe, via `system.metrics`, which pool (own_reader_pool or the shared
+        /// context_->getPrefetchThreadpool()) this task actually runs on while it is held here.
+        FailPointInjection::pauseFailPoint(FailPoints::object_storage_reader_pool_pause);
+        auto reader_holder = createReader();
+        if (prime && reader_holder)
+        {
+            fiu_do_on(FailPoints::object_storage_file_prefetch_failpoint,
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for object storage file prefetch enabled");
+            });
+            if (auto * input_format = reader_holder.getInputFormat())
+                input_format->prefetch();
+        }
+        return reader_holder;
+    }, Priority{});
 }
 
 std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
