@@ -26,6 +26,8 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
+    extern const ContentAddressedSettingsUInt64 gc_redelete_concurrency;
+    extern const ContentAddressedSettingsUInt64 gc_redelete_min_batch_size;
     extern const ContentAddressedSettingsString scratch_path;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
 }
@@ -207,6 +209,46 @@ TEST(CASSettings, BulkDeleteChunkKeysBoundsAreEnforced)
     ContentAddressedSettings s;
     EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
     EXPECT_EQ(s[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value, 1u);
+}
+
+TEST(CASSettings, RedeleteConcurrencyBoundsAreEnforced)
+{
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_redelete_concurrency>0</cas_gc_redelete_concurrency>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "content_addressed disk: cas_gc_redelete_concurrency must be >= 1 (got 0)");
+
+    {
+        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
+        ContentAddressedSettings s;
+        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        EXPECT_EQ(s[ContentAddressedSetting::gc_redelete_concurrency].value, 1u);
+        EXPECT_EQ(s[ContentAddressedSetting::gc_redelete_min_batch_size].value, 2u);
+    }
+
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_redelete_concurrency>8</cas_gc_redelete_concurrency>");
+    ContentAddressedSettings s;
+    EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
+    EXPECT_EQ(s[ContentAddressedSetting::gc_redelete_concurrency].value, 8u);
+}
+
+TEST(CASSettings, RedeleteMinBatchSizeBoundsAreEnforced)
+{
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_redelete_min_batch_size>0</cas_gc_redelete_min_batch_size>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "content_addressed disk: cas_gc_redelete_min_batch_size must be >= 1 (got 0)");
+
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_redelete_min_batch_size>7</cas_gc_redelete_min_batch_size>");
+    ContentAddressedSettings s;
+    EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
+    EXPECT_EQ(s[ContentAddressedSetting::gc_redelete_min_batch_size].value, 7u);
 }
 
 TEST(CASContentAddressedSettings, InvalidEnumDiagnosticsNameExternalConfigKeys)

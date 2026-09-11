@@ -782,6 +782,8 @@ the chunk size reject `0`:
 | `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes (phase 12) |
 | `cas_gc_read_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9); `1` disables |
+| `cas_gc_redelete_concurrency` | 1 | bounded pool for the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); `1` keeps it sequential |
+| `cas_gc_redelete_min_batch_size` | 2 | minimum `pending_deletes` batch size required to enable the parallel fan-out (phase 11) |
 
 The fold-batching controls `gc_fold_threshold` (default 1), `gc_fold_max_defer_rounds` (default 8)
 and `gc_frontier_probe_budget` (default unbounded) are internal `PoolConfig` fields with no disk

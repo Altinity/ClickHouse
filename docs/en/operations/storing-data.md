@@ -553,6 +553,13 @@ disk-level and server-level settings surface.
 - `cas_gc_read_concurrency` — `16` by default. Bounded thread-pool size for the GC fold's read-ahead of
   checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s. The fold's decisions stay on the
   round thread in their original order; only the fetches overlap. `1` disables read-ahead.
+- `cas_gc_redelete_concurrency` — `1` by default. Bounded thread-pool size for the GC `pending_deletes`
+  phase, which runs one `HEAD` and one conditional `DELETE` (`If-Match`) per blob. Only these requests
+  run in parallel; outcomes, events and the audit log are applied on the round thread in their original
+  order. If one blob fails, the other blobs are still deleted and recorded, and then the round fails.
+  `1` keeps the phase sequential.
+- `cas_gc_redelete_min_batch_size` — `2` by default. Minimum `pending_deletes` batch size required to
+  enable the re-delete thread pool; smaller batches stay sequential.
 - `skip_access_check` — `false` by default. Skips the disk's `CAS` capability probe ("start now,
   fix later"). The server-level `skip_access_check` flag skips the generic disk access check;
   this disk key governs the `CAS` capability probe.

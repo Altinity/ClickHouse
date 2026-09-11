@@ -726,6 +726,44 @@ private:
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
                     GcRoundWorkBudget & work_budget);
 
+    struct RedeleteIo
+    {
+        String blob_key;
+        Removal del = Removal::Gone;
+        std::exception_ptr error;
+    };
+
+    RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);
+
+    void applyRedeleteOutcome(
+        const RetiredEntry & entry,
+        const RedeleteIo & io,
+        uint64_t new_round,
+        uint64_t generation,
+        GcRoundWorkBudget & round_work_budget,
+        RoundReport & report,
+        OutcomeLog & outcome_log);
+
+    void redeleteBlob(
+        const RetiredEntry & entry,
+        const Layout & layout,
+        CasOperation & op,
+        uint64_t new_round,
+        uint64_t generation,
+        GcRoundWorkBudget & round_work_budget,
+        RoundReport & report,
+        OutcomeLog & outcome_log);
+
+    void redeleteBlobs(
+        const std::vector<RetiredEntry> & entries,
+        const Layout & layout,
+        CasOperation & op,
+        uint64_t new_round,
+        uint64_t generation,
+        GcRoundWorkBudget & round_work_budget,
+        RoundReport & report,
+        OutcomeLog & outcome_log);
+
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
     ///
@@ -980,6 +1018,8 @@ private:
     /// as `meta_writer`: the size comes from `store->poolConfig()`, which may only be read after the
     /// constructor body has validated `store`.
     std::unique_ptr<ThreadPool> read_pool;
+
+    std::unique_ptr<ThreadPool> redelete_pool;
 
     /// Probe B1's two numbers for the round: the ref-log POSITIONS the sealed coverage declares covered
     /// (counted arithmetically over each namespace's cut -- not by listed ids, which under arithmetic
