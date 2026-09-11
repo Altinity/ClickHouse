@@ -24,7 +24,7 @@
 
 #include <unistd.h>
 
-#if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER) || defined(MEMORY_SANITIZER)
+#if defined(ADDRESS_SANITIZER)
 #include <sanitizer/allocator_interface.h>
 #endif
 
