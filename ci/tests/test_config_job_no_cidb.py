@@ -44,6 +44,7 @@ class FakeInfo:
     """
 
     job_name = "Config Workflow"
+    workflow_name = "PR"
     pr_number = PR_NUMBER
     pr_labels = ()
     pr_body = ""
@@ -79,12 +80,17 @@ class _FakeSecret:
         return ("http://cidb.invalid/", "user", "passwd")
 
 
+class _EmptyRunConfig:
+    custom_data = {}
+
+
 def _use_fake_info(monkeypatch, changed_files=(CHANGED_TEST,)):
     info = FakeInfo(changed_files)
     monkeypatch.setattr(fj, "_info_cache", info)
     # `has_new_*_tests` and the release-branch guard construct their own `Info()`.
     monkeypatch.setattr(fj, "Info", lambda: info)
     monkeypatch.setattr(ntc, "Info", lambda: info)
+    monkeypatch.setattr(fj.RunConfig, "from_fs", lambda _name: _EmptyRunConfig())
     return info
 
 

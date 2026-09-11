@@ -965,17 +965,17 @@ class Runner:
         if (
             workflow.enable_commit_status_on_failure and not result.is_ok()
         ) or job.enable_commit_status:
-            if GHAuth.auth(workflow, no_strict=True):
-                if not GH.post_commit_status(
-                    name=job.name,
-                    status=result.status,
-                    description=result.info.splitlines()[0] if result.info else "",
-                    url=report_url,
-                ):
-                    env.add_workflow_error(
-                        "Failed to post GH commit status for the job"
-                    )
-                    print("ERROR: Failed to post commit status for the job")
+            GHAuth.auth(workflow, no_strict=True)
+            if not GH.post_commit_status(
+                name=job.name,
+                status=result.status,
+                description=result.info.splitlines()[0] if result.info else "",
+                url=report_url,
+            ):
+                env.add_workflow_error(
+                    "Failed to post GH commit status for the job"
+                )
+                print("ERROR: Failed to post commit status for the job")
 
         # Always run report generation at the end to finalize workflow status with latest job result
         if workflow.enable_report:
@@ -983,13 +983,13 @@ class Runner:
             status_updated = HtmlRunnerHooks.post_run(workflow, job)
             if status_updated:
                 print(f"Update GH commit status [{result.name}]: [{status_updated}]")
-                if GHAuth.auth(workflow, no_strict=True):
-                    GH.post_commit_status(
-                        name=workflow.name,
-                        status=status_updated,
-                        description="",
-                        url=Info().get_report_url(latest=False),
-                    )
+                GHAuth.auth(workflow, no_strict=True)
+                GH.post_commit_status(
+                    name=workflow.name,
+                    status=status_updated,
+                    description="",
+                    url=Info().get_report_url(latest=False),
+                )
 
             workflow_result = Result.from_fs(workflow.name)
             if is_final_job and ci_db:

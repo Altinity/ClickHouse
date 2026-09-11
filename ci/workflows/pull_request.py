@@ -96,10 +96,10 @@ workflow = Workflow.Config(
             job.set_run_after(REGULAR_BUILD_NAMES)
             for job in JobConfigs.release_build_jobs_with_examples
         ],
-        *[
-            job.set_run_after(CORE_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.special_build_jobs
-        ],
+        # *[ # NOTE (strtgbb): we don't run special build jobs
+        #     job.set_run_after(CORE_BLOCKING_JOB_NAMES)
+        #     for job in JobConfigs.special_build_jobs
+        # ],
         # Gated like the regular builds rather than like the special ones: it is the only job
         # that compiles the standalone parser at all, and it needs no build artifact, so there
         # is nothing to gain by deferring it behind the functional tests.
@@ -224,8 +224,8 @@ workflow = Workflow.Config(
         # ],
         # JobConfigs.llvm_coverage_job,
         JobConfigs.promql_compliance_job,
-        # TODO: stabilize and remove set_allow_failure
-        JobConfigs.build_profile_diff_job.set_allow_failure(),
+        # NOTE (strtgbb): Inc-only — needs AWS SSM CI logs cluster credentials
+        # JobConfigs.build_profile_diff_job.set_allow_failure(),
         JobConfigs.sqllogic_test_master_job.set_run_after(
             CORE_BLOCKING_JOB_NAMES
         ),

@@ -1,6 +1,7 @@
--- Tags: long, no-flaky-check, no-sanitizers
+-- Tags: long, no-flaky-check, no-sanitizers, no-random-settings
 -- https://github.com/ClickHouse/ClickHouse/issues/47713
 -- Verify that CTE with LEFT JOIN runs quickly and does not hang.
+-- no-random-settings: random join settings can turn the probe into O(n²) and time out.
 
 -- joined_block_split_single_row disables lazy join counting, turning O(n) probe into O(n²).
 SET joined_block_split_single_row = 0;

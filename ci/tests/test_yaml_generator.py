@@ -3,6 +3,7 @@ from ci.praktika.parser import WorkflowConfigParser
 from ci.praktika.yaml_additional_templates import AltinityWorkflowTemplates
 from ci.praktika.yaml_generator import PullRequestPushYamlGen
 from ci.settings.altinity_overrides import DISABLED_WORKFLOWS
+from praktika.settings import Settings
 
 
 def _generate(workflow: Workflow.Config) -> str:
@@ -69,7 +70,7 @@ def test_schedule_concurrency_does_not_cancel_in_progress():
     assert "cancel-in-progress:" not in yaml_text
 
 
-def test_per_job_secret_is_exported_into_setup_script():
+def test_per_job_secret_is_not_dumped_into_setup_script():
     yaml_text = _generate(
         Workflow.Config(
             name="CreateRelease",
@@ -88,8 +89,9 @@ def test_per_job_secret_is_exported_into_setup_script():
         )
     )
 
-    assert "export ROBOT_CLICKHOUSE_COMMIT_TOKEN=$(cat<<'EOF'" in yaml_text
-    assert "${{ secrets.ROBOT_CLICKHOUSE_COMMIT_TOKEN }}" in yaml_text
+    # Secrets stay in the workflow env block; they are not copied into
+    # praktika_setup_env.sh (that dump is unused and made the YAML huge).
+    assert "export ROBOT_CLICKHOUSE_COMMIT_TOKEN=$(cat<<'EOF'" not in yaml_text
 
 
 def test_skip_condition_is_emitted_when_cache_is_disabled():
@@ -117,3 +119,10 @@ def test_altinity_injected_jobs_skip_undefined_pipeline_status():
 def test_upstream_release_workflows_are_disabled():
     assert "auto_releases.py" in DISABLED_WORKFLOWS
     assert "create_release.py" in DISABLED_WORKFLOWS
+    assert "sync_silk.py" in DISABLED_WORKFLOWS
+    assert "nightly_changelog.py" in DISABLED_WORKFLOWS
+    assert "nightly_cloud_api_docs.py" in DISABLED_WORKFLOWS
+
+
+def test_altinity_does_not_mint_tokens_via_inc_lambda():
+    assert Settings.GH_AUTH_LAMBDA_NAME == ""
