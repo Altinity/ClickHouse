@@ -7,33 +7,20 @@
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Databases/DataLake/RestCatalog.h>
-#include <IO/HTTPCommon.h>
+#include <Databases/DataLake/tests/rest_catalog_test_server.h>
 #include <Interpreters/Context.h>
 
-#include <Poco/AutoPtr.h>
-#include <Poco/Net/HTTPRequestHandler.h>
-#include <Poco/Net/HTTPRequestHandlerFactory.h>
-#include <Poco/Net/HTTPServer.h>
-#include <Poco/Net/HTTPServerParams.h>
-#include <Poco/Net/HTTPServerRequest.h>
-#include <Poco/Net/HTTPServerResponse.h>
-#include <Poco/Net/ServerSocket.h>
-#include <Poco/Net/SocketAddress.h>
-#include <Poco/SharedPtr.h>
-#include <Poco/URI.h>
-
-#include <memory>
+#include <functional>
 #include <string>
 
 using namespace DataLake;
+using namespace RestCatalogTest;
 
 namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
-    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -47,177 +34,66 @@ enum class CatalogShape
     Empty,
 };
 
-void writeJSON(Poco::Net::HTTPServerResponse & response, const std::string & body)
+std::string getParent(const std::string & query)
 {
-    response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
-    response.setContentType("application/json");
-    response.setContentLength(body.size());
-    response.send() << body;
+    Poco::URI uri;
+    uri.setRawQuery(query);
+    for (const auto & [key, value] : uri.getQueryParameters())
+        if (key == "parent")
+            return value;
+    return {};
 }
 
-void writeError(Poco::Net::HTTPServerResponse & response, Poco::Net::HTTPResponse::HTTPStatus status, const std::string & body)
+void installShape(ServerState & state, CatalogShape shape)
 {
-    response.setStatus(status);
-    response.setContentType("application/json");
-    response.setContentLength(body.size());
-    response.send() << body;
+    state.setRoute("/v1/namespaces", [shape](const RecordedRequest & request)
+    {
+        const auto parent = getParent(request.query);
+        if (parent.empty())
+        {
+            if (shape == CatalogShape::NestedTableThenEmptySibling)
+                return json(R"({"namespaces":[["parent"],["empty_later"]]})");
+            return json(R"({"namespaces":[["namespace"]]})");
+        }
+
+        if (shape == CatalogShape::NestedTableThenEmptySibling && parent == "parent")
+            return json(R"({"namespaces":[["leaf_with_table"]]})");
+        return json(R"({"namespaces":[]})");
+    });
+
+    state.setRoute("/v1/namespaces/namespace/tables", [shape](const RecordedRequest &)
+    {
+        if (shape == CatalogShape::TopLevelTable)
+            return json(R"({"identifiers":[{"name":"table_a"}]})");
+        return json(R"({"identifiers":[]})");
+    });
+
+    state.setStaticRoute("/v1/namespaces/parent/tables", R"({"identifiers":[]})");
+    state.setStaticRoute("/v1/namespaces/empty_later/tables", R"({"identifiers":[]})");
+    state.setStaticRoute("/v1/namespaces/parent%1Fleaf_with_table/tables", R"({"identifiers":[{"name":"table_a"}]})");
 }
 
-std::string getRawPath(const std::string & uri)
+/// The service-principal grant, for the catalogs created with `catalog_credential`.
+void installTokenEndpoint(ServerState & state)
 {
-    const auto query_pos = uri.find('?');
-    if (query_pos == std::string::npos)
-        return uri;
-    return uri.substr(0, query_pos);
+    state.setStaticRoute("/v1/oauth/tokens", R"({"token_type":"Bearer","expires_in":3600,"access_token":"mock-access-token"})");
 }
 
-class RestCatalogRequestHandler final : public Poco::Net::HTTPRequestHandler
+void installTableRoutes(ServerState & state)
 {
-public:
-    explicit RestCatalogRequestHandler(CatalogShape shape_)
-        : shape(shape_)
+    state.setStaticRoute(
+        "/v1/namespaces/namespace/tables/table_a", R"({"metadata":{"table-uuid":"11111111-2222-3333-4444-555555555555"}})");
+    state.setRoute("/v1/namespaces/namespace/tables/missing_table", [](const RecordedRequest &)
     {
-    }
-
-    void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override
+        return respondWithStatus(
+            404, R"({"error":{"message":"Table does not exist","type":"NoSuchTableException","code":404}})");
+    });
+    state.setRoute("/v1/namespaces/namespace/tables/unauthorized_table", [](const RecordedRequest &)
     {
-        Poco::URI uri(request.getURI());
-        const auto path = getRawPath(request.getURI());
-        const auto params = uri.getQueryParameters();
-
-        if (path == "/v1/config")
-        {
-            writeJSON(response, R"({"defaults":{},"overrides":{}})");
-            return;
-        }
-
-        if (path == "/v1/oauth/tokens")
-        {
-            writeJSON(response, R"({"token_type":"Bearer","expires_in":3600,"access_token":"mock-access-token"})");
-            return;
-        }
-
-        if (path == "/v1/namespaces")
-        {
-            const auto parent = getParent(params);
-            if (parent.empty())
-            {
-                if (shape == CatalogShape::NestedTableThenEmptySibling)
-                    writeJSON(response, R"({"namespaces":[["parent"],["empty_later"]]})");
-                else
-                    writeJSON(response, R"({"namespaces":[["namespace"]]})");
-                return;
-            }
-
-            if (shape == CatalogShape::NestedTableThenEmptySibling && parent == "parent")
-                writeJSON(response, R"({"namespaces":[["leaf_with_table"]]})");
-            else
-                writeJSON(response, R"({"namespaces":[]})");
-            return;
-        }
-
-        if (path == "/v1/namespaces/namespace/tables")
-        {
-            if (shape == CatalogShape::TopLevelTable)
-                writeJSON(response, R"({"identifiers":[{"name":"table_a"}]})");
-            else
-                writeJSON(response, R"({"identifiers":[]})");
-            return;
-        }
-
-        if (path == "/v1/namespaces/parent/tables"
-            || path == "/v1/namespaces/empty_later/tables")
-        {
-            writeJSON(response, R"({"identifiers":[]})");
-            return;
-        }
-
-        if (path == "/v1/namespaces/parent%1Fleaf_with_table/tables")
-        {
-            writeJSON(response, R"({"identifiers":[{"name":"table_a"}]})");
-            return;
-        }
-
-        if (path == "/v1/namespaces/namespace/tables/table_a")
-        {
-            writeJSON(response, R"({"metadata":{"table-uuid":"11111111-2222-3333-4444-555555555555"}})");
-            return;
-        }
-
-        if (path == "/v1/namespaces/namespace/tables/missing_table")
-        {
-            writeError(response, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, R"({"error":{"message":"Table does not exist","type":"NoSuchTableException","code":404}})");
-            return;
-        }
-
-        if (path == "/v1/namespaces/namespace/tables/unauthorized_table")
-        {
-            writeError(response, Poco::Net::HTTPResponse::HTTP_UNAUTHORIZED, R"({"error":{"message":"The access token has expired","type":"NotAuthorizedException","code":401}})");
-            return;
-        }
-
-        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Unexpected request to fake Iceberg REST catalog: {}", request.getURI());
-    }
-
-private:
-    static std::string getParent(const Poco::URI::QueryParameters & params)
-    {
-        for (const auto & [key, value] : params)
-        {
-            if (key == "parent")
-                return value;
-        }
-        return {};
-    }
-
-    CatalogShape shape;
-};
-
-class RestCatalogRequestHandlerFactory final : public Poco::Net::HTTPRequestHandlerFactory
-{
-public:
-    explicit RestCatalogRequestHandlerFactory(CatalogShape shape_)
-        : shape(shape_)
-    {
-    }
-
-    Poco::Net::HTTPRequestHandler * createRequestHandler(const Poco::Net::HTTPServerRequest &) override
-    {
-        return new RestCatalogRequestHandler(shape);
-    }
-
-private:
-    CatalogShape shape;
-};
-
-class RestCatalogTestServer
-{
-public:
-    explicit RestCatalogTestServer(CatalogShape shape)
-        : server_socket(std::make_unique<Poco::Net::ServerSocket>(Poco::Net::SocketAddress("127.0.0.1", 0)))
-        , handler_factory(new RestCatalogRequestHandlerFactory(shape))
-        , server_params(new Poco::Net::HTTPServerParams())
-        , server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, *server_socket, server_params))
-    {
-        server->start();
-    }
-
-    ~RestCatalogTestServer()
-    {
-        server->stop();
-    }
-
-    std::string getUrl() const
-    {
-        return "http://" + server_socket->address().toString();
-    }
-
-private:
-    std::unique_ptr<Poco::Net::ServerSocket> server_socket;
-    Poco::SharedPtr<RestCatalogRequestHandlerFactory> handler_factory;
-    Poco::AutoPtr<Poco::Net::HTTPServerParams> server_params;
-    std::unique_ptr<Poco::Net::HTTPServer> server;
-};
+        return respondWithStatus(
+            401, R"({"error":{"message":"The access token has expired","type":"NotAuthorizedException","code":401}})");
+    });
+}
 
 void expectThrowsCode(std::function<void()> fn, int expected_code)
 {
@@ -234,7 +110,9 @@ void expectThrowsCode(std::function<void()> fn, int expected_code)
 
 bool restCatalogEmpty(CatalogShape shape)
 {
-    RestCatalogTestServer server(shape);
+    TestServer server;
+    installShape(*server, shape);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -249,7 +127,7 @@ bool restCatalogEmpty(CatalogShape shape)
         /* namespaces */"*",
         context);
 
-    return catalog.empty();
+    return catalog.empty(/* auth_token */ {});
 }
 
 }
@@ -271,7 +149,9 @@ TEST(RestCatalog, EmptyReturnsTrueWhenNoTablesExist)
 
 TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
 {
-    RestCatalogTestServer server(CatalogShape::Empty);
+    TestServer server;
+    installShape(*server, CatalogShape::Empty);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -293,7 +173,10 @@ TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
 
 TEST(RestCatalog, ApplySettingsChangesCredentialMode)
 {
-    RestCatalogTestServer server(CatalogShape::Empty);
+    TestServer server;
+    installShape(*server, CatalogShape::Empty);
+    installTokenEndpoint(*server);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -335,7 +218,9 @@ TEST(RestCatalog, ApplySettingsChangesCredentialMode)
 
 TEST(RestCatalog, ApplySettingsChangesAuthHeaderMode)
 {
-    RestCatalogTestServer server(CatalogShape::Empty);
+    TestServer server;
+    installShape(*server, CatalogShape::Empty);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -365,7 +250,9 @@ TEST(RestCatalog, ApplySettingsChangesAuthHeaderMode)
 
 TEST(RestCatalog, OneLakeApplySettingsChangesBearerMode)
 {
-    RestCatalogTestServer server(CatalogShape::Empty);
+    TestServer server;
+    installShape(*server, CatalogShape::Empty);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -419,7 +306,10 @@ TEST(RestCatalog, OneLakeApplySettingsChangesBearerMode)
 
 TEST(RestCatalog, TryGetTableMetadataDistinguishesMissingTableFromOtherErrors)
 {
-    RestCatalogTestServer server(CatalogShape::TopLevelTable);
+    TestServer server;
+    installShape(*server, CatalogShape::TopLevelTable);
+    installTableRoutes(*server);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -436,15 +326,15 @@ TEST(RestCatalog, TryGetTableMetadataDistinguishesMissingTableFromOtherErrors)
 
     TableMetadata existing;
     EXPECT_TRUE(catalog.tryGetTableMetadata("namespace", "table_a", context, existing));
-    EXPECT_TRUE(catalog.existsTable("namespace", "table_a"));
+    EXPECT_TRUE(catalog.existsTable("namespace", "table_a", /* auth_token */ {}));
 
     TableMetadata missing;
     EXPECT_FALSE(catalog.tryGetTableMetadata("namespace", "missing_table", context, missing));
-    EXPECT_FALSE(catalog.existsTable("namespace", "missing_table"));
+    EXPECT_FALSE(catalog.existsTable("namespace", "missing_table", /* auth_token */ {}));
 
     TableMetadata unauthorized;
     EXPECT_THROW(catalog.tryGetTableMetadata("namespace", "unauthorized_table", context, unauthorized), DB::HTTPException);
-    EXPECT_THROW(catalog.existsTable("namespace", "unauthorized_table"), DB::HTTPException);
+    EXPECT_THROW(catalog.existsTable("namespace", "unauthorized_table", /* auth_token */ {}), DB::HTTPException);
 }
 
 #endif

@@ -1557,7 +1557,7 @@ bool IcebergStorageSink::initializeMetadata()
                 auto catalog_filename = resolver.resolveForCatalog(metadata_info.path);
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
                 {
                     cleanup(true);
                     return false;

@@ -3,6 +3,7 @@
 #include <base/isSharedPtrUnique.h>
 #include <Access/AccessControl.h>
 #include <Access/Credentials.h>
+#include <Access/ForwardedAuthToken.h>
 #include <Access/ContextAccess.h>
 #include <Access/User.h>
 #include <Access/Role.h>
@@ -409,6 +410,23 @@ void Session::authenticate(const Credentials & credentials_, const Poco::Net::So
     prepared_client_info->authenticated_user = auth_result.user_name;
     prepared_client_info->current_address = std::make_shared<Poco::Net::SocketAddress>(address);
     prepared_client_info->connection_address = std::make_shared<Poco::Net::SocketAddress>(connection_address ? *connection_address : address);
+
+    /// Capture the bearer token only after the attempt succeeded: `onAuthenticationFailure` copies
+    /// `*prepared_client_info` into a `SessionLogElement`, so anything captured earlier would end
+    /// up on the failure-logging path. This is also the only point where the canonical
+    /// `auth_result.user_name` is known.
+    ///
+    /// `typeid_cast` is `nullptr` for every other credential kind -- interserver
+    /// `AlwaysAllowCredentials`, SSL certificate, SSH, ArrowFlight, gRPC, MySQL, PostgreSQL -- so
+    /// those paths are untouched. The token must come from the credentials that were actually
+    /// verified here and never from `ExternalAuthenticators`' username-to-token cache: that cache
+    /// holds one token per user name, so a password-authenticated `alice` could otherwise pick up
+    /// a token-authenticated `alice`'s bearer token.
+    if (const auto * token_credentials = typeid_cast<const TokenCredentials *>(&credentials_))
+    {
+        if (global_context->getAccessControl().isTokenForwardingEnabled())
+            forwarded_auth_token = makeForwardedAuthToken(*token_credentials, auth_result.user_name);
+    }
 }
 
 void Session::checkIfUserIsStillValid()
@@ -580,6 +598,7 @@ ContextMutablePtr Session::makeSessionContext()
 
     /// Copy prepared client info to the new session context.
     new_session_context->setClientInfo(*prepared_client_info);
+    new_session_context->setForwardedAuthToken(forwarded_auth_token);
     prepared_client_info.reset();
 
     /// Set user information for the new context: current profiles, roles, access rights.
@@ -651,6 +670,15 @@ ContextMutablePtr Session::makeSessionContext(const String & session_name_, std:
             max_sessions_for_user = max_session_for_user_field->safeGet<UInt64>();
     }
 
+    /// Must overwrite, not merge: a named session reuses a previously created context, which may
+    /// still hold the token of the request that created it. `ClientInfo` is replaced wholesale
+    /// above for exactly the same reason. Stamped only while the session still runs as the user
+    /// that authenticated: `EXECUTE AS <user>` switches a named session to another identity that
+    /// outlives the request that issued it, and that identity must not be handed this token.
+    /// Done after the user is set, so that a freshly created named session is already resolved.
+    const bool runs_as_authenticated_user = new_session_context->getAccess()->getUserID() == user_id;
+    new_session_context->setForwardedAuthToken(runs_as_authenticated_user ? forwarded_auth_token : nullptr);
+
     /// Session context is ready.
     session_context = std::move(new_session_context);
     named_session = new_named_session;
@@ -710,6 +738,16 @@ ContextMutablePtr Session::makeQueryContextImpl(const ClientInfo * client_info_t
         query_context->setClientInfo(*client_info_to_move);
     else if (client_info_to_copy && (client_info_to_copy != &getClientInfo()))
         query_context->setClientInfo(*client_info_to_copy);
+
+    /// The forwarded token is carried separately from `ClientInfo` precisely so that a
+    /// peer-supplied `ClientInfo` (secondary queries skip `validateClientInfo`) can never set it.
+    ///
+    /// Stamped only when there is no session context to inherit it from: a query context copied
+    /// from the session context already carries the session's token, and that copy is the
+    /// authoritative one. `EXECUTE AS <user>` switches a session to another identity and clears
+    /// the token there, and re-stamping it from `forwarded_auth_token` would hand it right back.
+    if (!from_session_context)
+        query_context->setForwardedAuthToken(forwarded_auth_token);
 
     /// Copy current user's name and address if it was authenticated after query_client_info was initialized.
     if (prepared_client_info && !prepared_client_info->current_user.empty())

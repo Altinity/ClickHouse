@@ -37,11 +37,12 @@ public:
 
     ~GlueCatalog() override;
 
-    bool empty() const override;
+    /// AWS SigV4, not OAuth: the user's token is accepted and ignored.
+    bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    DB::Names getTables() const override;
+    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool existsTable(const std::string & database_name, const std::string & table_name) const override;
+    bool existsTable(const std::string & database_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
         const std::string & database_name,
@@ -66,11 +67,11 @@ public:
         return DB::DatabaseDataLakeCatalogType::GLUE;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
+    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
+    void createNamespaceIfNotExists(const String & namespace_name, const String & location, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
+    bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     bool updateSchema(
         const String & namespace_name,
@@ -79,15 +80,17 @@ public:
         Poco::JSON::Object::Ptr new_schema,
         Int32 previous_schema_id,
         Int32 new_last_column_id,
-        Poco::JSON::Object::Ptr metadata = nullptr) const override;
+        Poco::JSON::Object::Ptr metadata,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name) const override;
+    void dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     /// Returns a callback that re-vends fresh AWS credentials from the configured
     /// credentials provider chain. Invoked by `ReadBufferFromS3` when an S3 call
     /// fails with `ExpiredToken`, so that a long-running read can recover without
     /// the user having to restart the query.
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
     /// Resolves the precise Iceberg timestamp type for `column_name` by searching the current schema
     /// in the Iceberg `metadata_object`. Falls back to `"timestamp_ns"` when `glue_column_type` is
