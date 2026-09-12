@@ -34,6 +34,11 @@ private:
         const String part_name;
         const UInt64 condition_hash;
 
+        /// A part name can be reused after its data has been replaced. The mark layout is
+        /// part of the cached value's shape, so it must be part of the cache identity too.
+        const size_t marks_count;
+        const bool has_final_mark;
+
         /// -- Additional members, conceptually not part of the key. Only included for pretty-printing
         ///    in system.query_condition_cache:
         const String condition;
@@ -80,7 +85,8 @@ public:
         const MarkRanges & mark_ranges, size_t marks_count, bool has_final_mark);
 
     /// Check the cache if it contains an entry for the given table + part id and predicate hash.
-    std::optional<MatchingMarks> read(const UUID & table_id, const String & part_name, UInt64 condition_hash);
+    std::optional<MatchingMarks> read(
+        const UUID & table_id, const String & part_name, UInt64 condition_hash, size_t marks_count, bool has_final_mark);
 
     /// For debugging and system tables
     std::vector<QueryConditionCache::Cache::KeyMapped> dump() const;
