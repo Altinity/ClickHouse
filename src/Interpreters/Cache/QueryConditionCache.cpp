@@ -10,10 +10,6 @@ namespace ProfileEvents
 {
     extern const Event QueryConditionCacheHits;
     extern const Event QueryConditionCacheMisses;
-    /// TODO(#2342): register this event in src/Common/ProfileEvents.cpp:
-    ///   M(QueryConditionCacheLayoutMismatch, "Number of times a query condition cache entry was skipped "
-    ///     "because its mark layout did not match the current part's layout. A non-zero count here is direct "
-    ///     "evidence of the use-after-free / OOB-write hazard described in Altinity/ClickHouse#2342.", ValueType::Number) \
     extern const Event QueryConditionCacheLayoutMismatch;
 }
 
