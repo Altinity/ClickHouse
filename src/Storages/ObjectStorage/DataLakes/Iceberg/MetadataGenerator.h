@@ -43,12 +43,12 @@ public:
         std::optional<Int64> user_defined_timestamp = std::nullopt,
         bool is_truncate = false);
 
-    void generateAddColumnMetadata(const String & column_name, DataTypePtr type);
+    void generateAddColumnMetadata(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {});
     void generateDropColumnMetadata(const String & column_name);
-    /// Returns false when the column already has the requested type (no metadata change).
+    /// Returns false when neither the type nor the position changed (true no-op).
     /// `context` supplies the settings used to map the stored Iceberg type back to a ClickHouse
     /// type (the timestamptz timezone and whether geo types are allowed).
-    bool generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context);
+    bool generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first = false, const String & after_column = {});
     void generateRenameColumnMetadata(const String & column_name, const String & new_column_name);
 
     /// A commit attempt can land in the catalog even when the client observes a failure

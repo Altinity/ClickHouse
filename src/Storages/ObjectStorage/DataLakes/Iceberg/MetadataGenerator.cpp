@@ -564,7 +564,7 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
     metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
 }
 
-void MetadataGenerator::generateAddColumnMetadata(const String & column_name, DataTypePtr type)
+void MetadataGenerator::generateAddColumnMetadata(const String & column_name, DataTypePtr type, bool first, const String & after_column)
 {
     if (!type->isNullable())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow to add non-nullable columns");
@@ -590,81 +590,174 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
 
     metadata_object->set(Iceberg::f_last_column_id, last_column_id + 1);
 
-    current_schema->getArray(Iceberg::f_fields)->add(new_field);
+    if (first || !after_column.empty())
+    {
+        Poco::JSON::Array::Ptr new_fields = new Poco::JSON::Array;
+        if (first)
+        {
+            new_fields->add(new_field);
+            for (UInt32 i = 0; i < existing_fields->size(); ++i)
+                new_fields->add(existing_fields->get(i));
+        }
+        else
+        {
+            bool inserted = false;
+            for (UInt32 i = 0; i < existing_fields->size(); ++i)
+            {
+                new_fields->add(existing_fields->get(i));
+                if (existing_fields->getObject(i)->getValue<String>(Iceberg::f_name) == after_column)
+                {
+                    new_fields->add(new_field);
+                    inserted = true;
+                }
+            }
+            if (!inserted)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Column {} not found for AFTER positioning", after_column);
+        }
+        current_schema->set(Iceberg::f_fields, new_fields);
+    }
+    else
+    {
+        existing_fields->add(new_field);
+    }
+
     current_schema->set(Iceberg::f_schema_id, next_schema_id);
     metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
     metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
 }
 
-bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context)
+bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first, const String & after_column)
 {
     auto current_schema = getCurrentSchema();
 
     auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
-    auto new_type = Iceberg::getIcebergType(type, last_column_id);
     auto schema_fields = current_schema->getArray(Iceberg::f_fields);
 
-    for (UInt32 i = 0; i < schema_fields->size(); ++i)
+    bool needs_reposition = first || !after_column.empty();
+    bool type_changed = false;
+
+    if (type)
     {
-        auto current_field = schema_fields->getObject(i);
-        if (current_field->getValue<String>(Iceberg::f_name) == column_name)
+        auto new_type = Iceberg::getIcebergType(type, last_column_id);
+
+        for (UInt32 i = 0; i < schema_fields->size(); ++i)
         {
+            auto current_field = schema_fields->getObject(i);
+            if (current_field->getValue<String>(Iceberg::f_name) != column_name)
+                continue;
+
             if (current_field->getValue<bool>(Iceberg::f_required) == new_type.second
                 && icebergTypesEqualIgnoringIds(current_field->get(Iceberg::f_type), new_type.first))
             {
-                auto existing_iceberg_type = current_field->get(Iceberg::f_type);
-                if (existing_iceberg_type.isString())
+                if (!needs_reposition)
                 {
-                    auto reconstructed_ch_type = Iceberg::IcebergSchemaProcessor::getSimpleType(
-                        existing_iceberg_type.extract<String>(),
-                        context,
-                        context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
-                    if (!current_field->getValue<bool>(Iceberg::f_required) && reconstructed_ch_type->canBeInsideNullable())
-                        reconstructed_ch_type = makeNullable(reconstructed_ch_type);
+                    auto existing_iceberg_type = current_field->get(Iceberg::f_type);
+                    if (existing_iceberg_type.isString())
+                    {
+                        auto reconstructed_ch_type = Iceberg::IcebergSchemaProcessor::getSimpleType(
+                            existing_iceberg_type.extract<String>(),
+                            context,
+                            context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
+                        if (!current_field->getValue<bool>(Iceberg::f_required) && reconstructed_ch_type->canBeInsideNullable())
+                            reconstructed_ch_type = makeNullable(reconstructed_ch_type);
 
-                    if (reconstructed_ch_type->equals(*type))
-                        return false;
+                        if (reconstructed_ch_type->equals(*type))
+                            return false;
+
+                        throw Exception(
+                            ErrorCodes::BAD_ARGUMENTS,
+                            "Cannot MODIFY COLUMN '{}' from {} to {}: both map to the same Iceberg type '{}' "
+                            "so the change cannot be recorded in the Iceberg schema",
+                            column_name,
+                            reconstructed_ch_type->getName(),
+                            type->getName(),
+                            existing_iceberg_type.extract<String>());
+                    }
 
                     throw Exception(
                         ErrorCodes::BAD_ARGUMENTS,
-                        "Cannot MODIFY COLUMN '{}' from {} to {}: both map to the same Iceberg type '{}' "
-                        "so the change cannot be recorded in the Iceberg schema",
-                        column_name,
-                        reconstructed_ch_type->getName(),
-                        type->getName(),
-                        existing_iceberg_type.extract<String>());
+                        "Cannot MODIFY COLUMN '{}': the requested and existing types both map to the same "
+                        "Iceberg complex type, and the change cannot be recorded in the Iceberg schema",
+                        column_name);
                 }
-
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot MODIFY COLUMN '{}': the requested and existing types both map to the same "
-                    "Iceberg complex type, and the change cannot be recorded in the Iceberg schema",
-                    column_name);
             }
+            else
+            {
+                if (!checkValidSchemaEvolution(current_field->get(Iceberg::f_type), new_type.first))
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow schema evolution to type {}", type->getPrettyName());
 
-            if (!checkValidSchemaEvolution(current_field->get(Iceberg::f_type), new_type.first))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow schema evolution to type {}", type->getPrettyName());
+                if (!current_field->getValue<bool>(Iceberg::f_required) && !type->isNullable())
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow change type from nullable to non-nullable {}", type->getPrettyName());
 
-            if (!current_field->getValue<bool>(Iceberg::f_required) && !type->isNullable())
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow change type from nullable to non-nullable {}", type->getPrettyName());
-
-            const auto next_schema_id = getNextSchemaId(metadata_object);
-
-            current_schema = deepCopy(current_schema);
-            schema_fields = current_schema->getArray(Iceberg::f_fields);
-            current_field = schema_fields->getObject(i);
-
-            current_field->set(Iceberg::f_type, new_type.first);
-            current_field->set(Iceberg::f_required, new_type.second);
-
-            metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
-            current_schema->set(Iceberg::f_schema_id, next_schema_id);
-            metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
-            return true;
+                type_changed = true;
+            }
+            break;
         }
     }
 
-    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Column {} not found in schema", column_name);
+    UInt32 target_index = static_cast<UInt32>(schema_fields->size());
+    for (UInt32 i = 0; i < schema_fields->size(); ++i)
+    {
+        if (schema_fields->getObject(i)->getValue<String>(Iceberg::f_name) == column_name)
+        {
+            target_index = i;
+            break;
+        }
+    }
+    if (target_index == schema_fields->size())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Column {} not found in schema", column_name);
+
+    if (!type_changed && !needs_reposition)
+        return false;
+
+    const auto next_schema_id = getNextSchemaId(metadata_object);
+    current_schema = deepCopy(current_schema);
+    schema_fields = current_schema->getArray(Iceberg::f_fields);
+    auto target_field = schema_fields->getObject(target_index);
+
+    if (type_changed)
+    {
+        auto new_type = Iceberg::getIcebergType(type, last_column_id);
+        target_field->set(Iceberg::f_type, new_type.first);
+        target_field->set(Iceberg::f_required, new_type.second);
+    }
+
+    if (needs_reposition)
+    {
+        Poco::JSON::Array::Ptr new_fields = new Poco::JSON::Array;
+        if (first)
+        {
+            new_fields->add(schema_fields->get(target_index));
+            for (UInt32 i = 0; i < schema_fields->size(); ++i)
+            {
+                if (i != target_index)
+                    new_fields->add(schema_fields->get(i));
+            }
+        }
+        else
+        {
+            bool inserted = false;
+            for (UInt32 i = 0; i < schema_fields->size(); ++i)
+            {
+                if (i == target_index)
+                    continue;
+                new_fields->add(schema_fields->get(i));
+                if (schema_fields->getObject(i)->getValue<String>(Iceberg::f_name) == after_column)
+                {
+                    new_fields->add(schema_fields->get(target_index));
+                    inserted = true;
+                }
+            }
+            if (!inserted)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Column {} not found for AFTER positioning", after_column);
+        }
+        current_schema->set(Iceberg::f_fields, new_fields);
+    }
+
+    metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
+    current_schema->set(Iceberg::f_schema_id, next_schema_id);
+    metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
+    return true;
 }
 
 void MetadataGenerator::generateRenameColumnMetadata(const String & column_name, const String & new_column_name)
