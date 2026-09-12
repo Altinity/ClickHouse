@@ -96,6 +96,10 @@
     M(VectorSimilarityIndexCacheWeightLost, "Approximate number of bytes evicted from the vector index cache.", ValueType::Number) \
     M(QueryConditionCacheHits, "Number of times an entry has been found in the query condition cache (and reading of marks can be skipped). Only updated for SELECT queries with SETTING use_query_condition_cache = 1.", ValueType::Number) \
     M(QueryConditionCacheMisses, "Number of times an entry has not been found in the query condition cache (and reading of mark cannot be skipped). Only updated for SELECT queries with SETTING use_query_condition_cache = 1.", ValueType::Number) \
+    M(QueryConditionCacheLayoutMismatch, "Number of times a query condition cache entry was skipped "  \
+      "on write or read because its mark layout (marks_count/has_final_mark) did not match the "       \
+      "current part's layout (see Altinity/ClickHouse#2342).",                                         \
+      ValueType::Number) \
     M(QueryCacheHits, "Number of times a query result has been found in the query cache (and query computation was avoided). Only updated for SELECT queries with SETTING use_query_cache = 1.", ValueType::Number) \
     M(QueryCacheMisses, "Number of times a query result has not been found in the query cache (and required query computation). Only updated for SELECT queries with SETTING use_query_cache = 1.", ValueType::Number) \
     M(CreatedReadBufferOrdinary, "Number of times ordinary read buffer was created for reading data (while choosing among other read methods).", ValueType::Number) \
