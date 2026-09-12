@@ -85,6 +85,10 @@ public:
         const MarkRanges & mark_ranges, size_t marks_count, bool has_final_mark);
 
     /// Check the cache if it contains an entry for the given table + part id and predicate hash.
+    /// marks_count/has_final_mark describe the caller's current mark layout for the part; they are
+    /// part of the cache key and are also checked against the found entry's stored layout, since a
+    /// part_name can be reused with a different layout after the underlying data has changed. On a
+    /// layout mismatch, the entry is treated as a cache miss (see Altinity/ClickHouse#2342).
     std::optional<MatchingMarks> read(
         const UUID & table_id, const String & part_name, UInt64 condition_hash, size_t marks_count, bool has_final_mark);
 

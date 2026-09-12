@@ -38,5 +38,11 @@ TEST(QueryConditionCache, RejectsRangesOutsideEntryMarkLayout)
     MarkRanges invalid_range;
     invalid_range.emplace_back(0, 2);
 
-    EXPECT_THROW(cache.write(UUID(1), "part", 42, "", invalid_range, 1, false), Exception);
+    /// An invalid mark range (out of bounds for the given marks_count) is a caller bug, but write()
+    /// logs and skips rather than throwing from inside the query pipeline (see Altinity/ClickHouse#2342).
+    EXPECT_NO_THROW(cache.write(UUID(1), "part", 42, "", invalid_range, 1, false));
+
+    /// Nothing should have been cached for this key.
+    auto result = cache.read(UUID(1), "part", 42, 1, false);
+    EXPECT_FALSE(result);
 }
