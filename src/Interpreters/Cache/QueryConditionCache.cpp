@@ -1,5 +1,4 @@
 #include <Interpreters/Cache/QueryConditionCache.h>
-#include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/SipHash.h>
@@ -21,11 +20,6 @@ namespace CurrentMetrics
 
 namespace DB
 {
-
-namespace ErrorCodes
-{
-    extern const int LOGICAL_ERROR;
-}
 
 bool QueryConditionCache::Key::operator==(const Key & other) const
 {
