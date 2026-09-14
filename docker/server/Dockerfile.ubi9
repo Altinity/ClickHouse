@@ -21,6 +21,10 @@ RUN if [ -z "${DIRECT_DOWNLOAD_URLS}" ]; then \
 
 FROM ${UBI_IMAGE}
 
+# Pull in security patches released against this UBI9 stream since the base
+# image tag was last published - a pinned tag does not update on its own.
+RUN dnf update -y && dnf clean all
+
 ARG VERSION
 ARG RELEASE=1
 
