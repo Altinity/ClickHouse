@@ -56,6 +56,7 @@ class RunnerLabels:
         "altinity-on-demand",
         "altinity-style-checker-aarch64",
     ]
+    RELEASE_RUNNER = ["self-hosted", "release-runner"]
 
 
 class CIFiles:
@@ -103,6 +104,23 @@ SECRETS = [
     Secret.Config(
         name="GPG_BINARY_SIGNING_PASSPHRASE",
         type=Secret.Type.GH_SECRET,
+    ),
+]
+
+# Push-only secrets: consumed by the loom code.refresh pre_hook, which runs
+# only in MasterCI and ReleaseBranchCI. Kept out of the shared SECRETS list
+# so untrusted lanes (pull_request, backport) never register them and PR
+# code cannot resolve the loom writer token via Info.get_secret.
+LOOM_SECRETS = [
+    Secret.Config(
+        name="loom-url",
+        type=Secret.Type.AWS_SSM_PARAMETER,
+        region="us-east-1",
+    ),
+    Secret.Config(
+        name="loom-ci-token",
+        type=Secret.Type.AWS_SSM_PARAMETER,
+        region="us-east-1",
     ),
 ]
 

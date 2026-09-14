@@ -831,6 +831,7 @@ public:
         MAX_PENDING_MUTATIONS_OVER_THRESHOLD,
         MAYBE_BROKEN_TABLES,
         MERGE_TREE_JEMALLOC_ARENA_POOL_DEGRADED,
+        JEMALLOC_PERCPU_ARENA_DISABLED,
         OBSOLETE_MONGO_TABLE_DEFINITION,
         OBSOLETE_SETTINGS,
         PROCESS_USER_MATCHES_DATA_OWNER,
@@ -1496,7 +1497,8 @@ public:
 #endif
     void initializeKeeperDispatcher(bool start_async) const;
     void signalKeeperDispatcherShutdown() const;
-    void shutdownKeeperDispatcher(bool closed_all_connections) const;
+    void shutdownKeeperDispatcherBeforeConnectionsFinish() const;
+    void shutdownKeeperDispatcherAfterConnectionsFinish(bool closed_all_connections) const;
     void updateKeeperConfiguration(const Poco::Util::AbstractConfiguration & config) const;
 
     /// Set auxiliary zookeepers configuration at server starting or configuration reloading.

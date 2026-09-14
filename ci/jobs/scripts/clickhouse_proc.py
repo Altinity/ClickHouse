@@ -707,7 +707,14 @@ fi
             tail = ""
             try:
                 with open(log_file, errors="ignore") as f:
-                    tail = "".join(f.readlines()[-15:]).strip()
+                    lines = f.readlines()
+                # SHOW TABLES rows land in the same log; prefer the CH error.
+                for line in reversed(lines):
+                    if "Code:" in line or "POCO_EXCEPTION" in line:
+                        tail = line.strip()
+                        break
+                if not tail:
+                    tail = "".join(lines[-15:]).strip()
             except OSError:
                 pass
             self.stateful_setup_error = (
