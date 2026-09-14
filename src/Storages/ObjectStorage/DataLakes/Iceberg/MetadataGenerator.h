@@ -23,9 +23,7 @@ public:
     struct NextMetadataResult
     {
         Poco::JSON::Object::Ptr snapshot = nullptr;
-        /// Metadata path for the manifest list file (e.g. "wasb://container@account/table/metadata/snap-xxx.avro").
-        /// Use IcebergPathResolver::resolve to get storage path for I/O.
-        /// Use .serialize() to get the path for writing into Iceberg metadata.
+        /// Metadata path for the manifest list file; resolve for I/O, serialize for writing into Iceberg metadata.
         Iceberg::IcebergPathFromMetadata manifest_list_path;
     };
 
@@ -44,6 +42,13 @@ public:
         bool is_truncate = false);
 
     void generateAddColumnMetadata(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {});
+    /// Create a manifest-only rewrite snapshot (`replace` operation) carrying `total-*` counters forward so `OPTIMIZE ... MANIFEST` is idempotent.
+    NextMetadataResult generateManifestOnlySnapshot(
+        FileNamesGenerator & generator,
+        const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+        Int64 parent_snapshot_id);
+
+    void generateAddColumnMetadata(const String & column_name, DataTypePtr type);
     void generateDropColumnMetadata(const String & column_name);
     /// Returns false when neither the type nor the position changed (true no-op).
     /// `context` supplies the settings used to map the stored Iceberg type back to a ClickHouse
