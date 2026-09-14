@@ -59,6 +59,22 @@ class ClickHouseProc:
         print(f"Started setup_minio.sh asynchronously with PID {process.pid}")
         return True
 
+    def start_azurite(self, log_file_path):
+        command = f"cd {temp_dir} && azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --silent --inMemoryPersistence"
+        with open(log_file_path, "w") as log_file:
+            process = subprocess.Popen(
+                command, stdout=log_file, stderr=subprocess.STDOUT, shell=True
+            )
+        print(f"Started azurite asynchronously with PID {process.pid}")
+        if Shell.check(
+            "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:10000/ | grep -qE '400|200'",
+            verbose=False,
+            retries=6,
+        ):
+            return True
+        print("Failed to start azurite")
+        return False
+
     @staticmethod
     def log_cluster_config():
         return Shell.check(

@@ -155,6 +155,16 @@ def read_build_urls(build_name: str, reports_path: Union[Path, str]) -> List[str
     if artifact_report.is_file():
         with open(artifact_report, "r", encoding="utf-8") as f:
             return json.load(f)["build_urls"]  # type: ignore
+    pr_info = None
+    try:
+        from pr_info import PRInfo  # pylint: disable=import-outside-toplevel
+
+        pr_info = PRInfo()
+    except Exception as ex:
+        logger.warning("Failed to init PRInfo while selecting build report: %s", ex)
+
+    reports_by_sha = []  # type: List[List[str]]
+    fallback_reports = []  # type: List[List[str]]
     for root, _, files in os.walk(reports_path):
         for file in files:
             if file.endswith(f"_{build_name}.json"):
@@ -163,7 +173,29 @@ def read_build_urls(build_name: str, reports_path: Union[Path, str]) -> List[str
                     os.path.join(root, file), "r", encoding="utf-8"
                 ) as file_handler:
                     build_report = json.load(file_handler)
-                    return build_report["build_urls"]  # type: ignore
+                    build_urls = build_report.get("build_urls", [])
+                    if not isinstance(build_urls, list):
+                        continue
+                    fallback_reports.append(build_urls)
+                    if pr_info and pr_info.sha and any(
+                        f"/{pr_info.sha}/" in str(url) for url in build_urls
+                    ):
+                        reports_by_sha.append(build_urls)
+
+    if reports_by_sha:
+        logger.info(
+            "Using build report matched by SHA [%s] for [%s]",
+            pr_info.sha if pr_info else "",
+            build_name,
+        )
+        return reports_by_sha[0]
+
+    if fallback_reports:
+        logger.warning(
+            "No SHA-matched build report found for [%s], fallback to first discovered",
+            build_name,
+        )
+        return fallback_reports[0]
 
     logger.info("A build report is not found for %s", build_name)
     return []

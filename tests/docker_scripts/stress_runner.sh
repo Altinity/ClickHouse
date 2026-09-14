@@ -54,6 +54,7 @@ export ZOOKEEPER_FAULT_INJECTION=1
 configure
 
 /repo/tests/docker_scripts/setup_minio.sh stateless # to have a proper environment
+azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --silent --inMemoryPersistence &
 
 config_logs_export_cluster /etc/clickhouse-server/config.d/system_logs_export.yaml
 

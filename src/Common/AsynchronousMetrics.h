@@ -190,6 +190,7 @@ private:
         ProcStatValuesOther operator-(const ProcStatValuesOther & other) const;
     };
 
+    ProcStatValuesCPU cgroup_values_all_cpus TSA_GUARDED_BY(data_mutex){};
     ProcStatValuesCPU proc_stat_values_all_cpus TSA_GUARDED_BY(data_mutex) {};
     ProcStatValuesOther proc_stat_values_other TSA_GUARDED_BY(data_mutex) {};
     std::vector<ProcStatValuesCPU> proc_stat_values_per_cpu TSA_GUARDED_BY(data_mutex);
@@ -241,6 +242,14 @@ private:
     void openBlockDevices();
     void openSensorsChips();
     void openEDAC();
+
+    void applyCgroupCPUMetricsUpdate(AsynchronousMetricValues & new_values, const ProcStatValuesCPU & delta_values, double multiplier);
+
+    void applyCgroupNormalizedCPUMetricsUpdate(
+        AsynchronousMetricValues & new_values,
+        double num_cpus_to_normalize,
+        const ProcStatValuesCPU & delta_values_all_cpus,
+        double multiplier);
 
     void applyCPUMetricsUpdate(
         AsynchronousMetricValues & new_values, const std::string & cpu_suffix, const ProcStatValuesCPU & delta_values, double multiplier);
