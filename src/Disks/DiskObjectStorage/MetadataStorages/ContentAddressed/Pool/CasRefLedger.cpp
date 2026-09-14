@@ -62,6 +62,7 @@ namespace ProfileEvents
     extern const Event CASRelinkConfirmRefusedLaneBroken;
     extern const Event CASRelinkConfirmRefusedStateLockBusy;
     extern const Event CASRelinkConfirmRefusedMountCannotSpeak;
+    extern const Event CASRelinkConfirmRefusedTableNotResident;
     extern const Event CASRefNeedsRecovery;
     extern const Event CASRefSweepDeferred;
     extern const Event CASRefSweepRearmed;
@@ -444,29 +445,13 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     /// than it should have is a different defect, in a different component.
     std::lock_guard<std::mutex> qlock(ref_queue_mutex);
 
-    /// Rule 2 (residency). Direct slot lookup, never a catalog observation or exact-runtime acquisition:
-    /// a read-only query must not let a peer grow this writer's cache or make the next reader pay for a
-    /// recovery it invented. A cold or evicted table is simply unknown here.
-    ///
-    /// These two arms are the ONLY refusals in this function that are deliberately not counted: a table
-    /// this mount has never touched, or has dropped under cache-budget pressure, is ordinary cache
-    /// behaviour rather than the lane, mount or load condition each counter below separates. Counting
-    /// it would put a number that moves with cache size next to numbers that describe this writer's
-    /// health. There is also no runtime here to attribute the refusal to.
-    const auto it = ref_name_slots.find(ns.string());
-    if (it == ref_name_slots.end())
-        return ConfirmAnswer::Unknown;
-    if (!it->second.current)
-        return ConfirmAnswer::Unknown;
-    RefTableRuntime & rt = *it->second.current;
-
-    /// Every refusal below is attributed here, on the node that computed it: `ConfirmAnswer` crosses
-    /// two interfaces as a three-value enum and stays that way, so the counters and this trace line are
-    /// the only way a live gate can tell load (`RefMutationInFlight`) from a fault (`LaneWedged`,
-    /// `LaneBroken`), from contention (`StateLockBusy`), or from this mount losing its claim to the
-    /// namespace (`MountCannotSpeak`). The invariant to keep when editing below: every
-    /// `return ConfirmAnswer::Unknown` past this point goes through `refuse`, and the only uncounted
-    /// refusals in this function are the two residency arms above, which say why.
+    /// Every refusal in this function is attributed here, on the node that computed it: `ConfirmAnswer`
+    /// crosses two interfaces as a three-value enum and stays that way, so the counters and this trace
+    /// line are the only way a live gate can tell residency (`TableNotResident`) from load
+    /// (`RefMutationInFlight`) from a fault (`LaneWedged`, `LaneBroken`), from contention
+    /// (`StateLockBusy`), or from this mount losing its claim to the namespace (`MountCannotSpeak`). The
+    /// invariant to keep when editing below: every `return ConfirmAnswer::Unknown` in this function goes
+    /// through `refuse`.
     const auto refuse = [&](ProfileEvents::Event reason, std::string_view why)
     {
         ProfileEvents::increment(reason);
@@ -474,6 +459,23 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
                   ref_name, ns.string(), why);
         return ConfirmAnswer::Unknown;
     };
+
+    /// Rule 2 (residency). Direct slot lookup, never a catalog observation or exact-runtime acquisition:
+    /// a read-only query must not let a peer grow this writer's cache or make the next reader pay for a
+    /// recovery it invented. A namespace this mount has never opened has no slot; one it dropped under
+    /// the whole-table cache budget (`enforceRefTableCacheBudget`) erases the slot the same way, so the
+    /// two arms below see identical map state and are counted under one event: what a field `Unknown`
+    /// needs to separate is residency from this mount being unable to speak for a table it DOES hold
+    /// (`MountCannotSpeak`, below), not cold from evicted. The second arm is kept as the safe answer in
+    /// case a future eviction path ever leaves a slot behind with its runtime released.
+    const auto it = ref_name_slots.find(ns.string());
+    if (it == ref_name_slots.end())
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedTableNotResident,
+                      "no ref-table slot for the namespace on this mount");
+    if (!it->second.current)
+        return refuse(ProfileEvents::CASRelinkConfirmRefusedTableNotResident,
+                      "the namespace's ref-table slot holds no runtime");
+    RefTableRuntime & rt = *it->second.current;
 
     /// `try_to_lock`, not a blocking acquire: this function already holds `ref_queue_mutex`, which is
     /// pool-wide append admission, so blocking here would stall EVERY table's lane for as long as
