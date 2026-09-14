@@ -594,3 +594,161 @@ TEST(CASPartManifestFormat, EntryRangeContiguousPrefix)
     auto [n1, n2] = entryRange(entries, "zzz/");              /// no match
     EXPECT_EQ(n1, n2);
 }
+
+/// ---- Chunked placement ----
+
+namespace
+{
+
+/// A chunked entry alongside an inline and a whole-file blob entry, so the round trip exercises all
+/// three placements in one object and the chunk lines interleaving with ordinary records.
+PartManifest chunkedSample()
+{
+    PartManifest m;
+    m.ref = ManifestRef{7, 21, 2};
+    m.root_namespace_id = RootNamespace("00/bb@cas@");
+
+    ManifestEntry inl;
+    inl.path = "checksums.txt";
+    inl.placement = EntryPlacement::Inline;
+    inl.inline_bytes = "cs";
+
+    ManifestEntry whole;
+    whole.path = "a/whole.bin";
+    whole.placement = EntryPlacement::Blob;
+    whole.ref = BlobRef{BlobHashAlgo::CityHash128, codecFor(BlobHashAlgo::CityHash128).fromHex("0102030405060708090a0b0c0d0e0f10")};
+    whole.blob_size = 99;
+
+    ManifestEntry chunked;
+    chunked.path = "a/split.bin";
+    chunked.placement = EntryPlacement::Chunked;
+    /// Deliberately mixed algorithms: each chunk is an ordinary blob and carries its own algo.
+    chunked.chunks = {
+        ChunkRef{BlobRef{BlobHashAlgo::CityHash128, codecFor(BlobHashAlgo::CityHash128).fromHex("aabbccddeeff00112233445566778899")}, 1024},
+        ChunkRef{BlobRef{BlobHashAlgo::XXH3_128, codecFor(BlobHashAlgo::XXH3_128).fromHex("00112233445566778899aabbccddeeff")}, 2048},
+        ChunkRef{BlobRef{BlobHashAlgo::CityHash128, codecFor(BlobHashAlgo::CityHash128).fromHex("ffffffffffffffffffffffffffffffff")}, 512},
+    };
+
+    m.entries = {inl, chunked, whole};
+    m.payload_digest = computePayloadDigest(m);
+    return m;
+}
+
+}
+
+TEST(CASPartManifestFormat, ChunkedRoundTrip)
+{
+    const PartManifest m = chunkedSample();
+    const PartManifest got = decodePartManifest(encodePartManifest(m));
+
+    ASSERT_EQ(got.entries.size(), 3u);
+    /// canonical path order: "a/split.bin" < "a/whole.bin" < "checksums.txt"
+    EXPECT_EQ(got.entries[0].path, "a/split.bin");
+    EXPECT_EQ(got.entries[0].placement, EntryPlacement::Chunked);
+    ASSERT_EQ(got.entries[0].chunks.size(), 3u);
+
+    /// Chunk order is FILE order and must survive the round trip unsorted -- sorting it would
+    /// reorder the file's bytes.
+    const auto & src_chunks = [&]() -> const std::vector<ChunkRef> & {
+        for (const auto & e : m.entries)
+            if (e.path == "a/split.bin")
+                return e.chunks;
+        throw std::logic_error("missing");
+    }();
+    EXPECT_EQ(got.entries[0].chunks, src_chunks);
+
+    /// `size()` is the sum of the chunk lengths, not `blob_size`.
+    EXPECT_EQ(got.entries[0].size(), 1024u + 2048u + 512u);
+    EXPECT_EQ(got.entries[1].placement, EntryPlacement::Blob);
+    EXPECT_EQ(got.entries[2].placement, EntryPlacement::Inline);
+    EXPECT_EQ(got.entries[2].inline_bytes, "cs");
+}
+
+TEST(CASPartManifestFormat, ChunkedEncodingIsDeterministic)
+{
+    const PartManifest m = chunkedSample();
+    EXPECT_EQ(encodePartManifest(m), encodePartManifest(m));
+}
+
+TEST(CASPartManifestFormat, ChunkedPayloadDigestCoversChunkList)
+{
+    const PartManifest m = chunkedSample();
+    PartManifest changed = m;
+    for (auto & e : changed.entries)
+        if (e.placement == EntryPlacement::Chunked)
+            e.chunks[1].size += 1;
+    /// A chunk length is part of the canonical encoding, so the digest must move with it.
+    EXPECT_NE(computePayloadDigest(m), computePayloadDigest(changed));
+}
+
+TEST(CASPartManifestFormat, ChunkedEntryExposesEveryChunkAsABlobRef)
+{
+    const PartManifest m = chunkedSample();
+    std::vector<BlobRef> seen;
+    uint64_t total = 0;
+    for (const auto & e : m.entries)
+        forEachEntryBlobRef(e, [&](const BlobRef & ref, uint64_t size) { seen.push_back(ref); total += size; });
+
+    /// Three chunks plus the one whole-file blob; the inline entry contributes nothing.
+    EXPECT_EQ(seen.size(), 4u);
+    EXPECT_EQ(total, 1024u + 2048u + 512u + 99u);
+}
+
+TEST(CASPartManifestFormat, ChunkedWireWordIsPinned)
+{
+    EXPECT_EQ(entryPlacementToWireWord(EntryPlacement::Chunked), "chunked");
+    EXPECT_EQ(entryPlacementFromWireWord("chunked"), EntryPlacement::Chunked);
+}
+
+/// A chunk count that disagrees with the chunk lines, or a total that disagrees with their sum, means
+/// the record and its group do not describe one file. Either would make the read path serve the wrong
+/// number of bytes, so both fail closed.
+TEST(CASPartManifestFormat, ChunkedRejectsInconsistentTotals)
+{
+    const PartManifest m = chunkedSample();
+    const String text = encodePartManifest(m);
+
+    /// The chunked record declares size 3584; corrupt it to 3585 while leaving the chunks alone.
+    const String needle = "\"size\":3584,";
+    const size_t at = text.find(needle);
+    ASSERT_NE(at, String::npos);
+    String bad = text;
+    bad.replace(at, needle.size(), "\"size\":3585,");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
+}
+
+TEST(CASPartManifestFormat, ChunkedRejectsZeroChunkCount)
+{
+    const PartManifest m = chunkedSample();
+    const String text = encodePartManifest(m);
+    const String needle = "\"!nchunks\":3";
+    const size_t at = text.find(needle);
+    ASSERT_NE(at, String::npos);
+    String bad = text;
+    bad.replace(at, needle.size(), "\"!nchunks\":0");
+    /// An empty chunk list is not a representable file: a file with no chunks is written as a blob.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
+}
+
+/// The chunk count sizes a `reserve` straight from the object, and manifest bytes arrive over the
+/// interserver relink channel, so an absurd declared count must be refused rather than allocated.
+TEST(CASPartManifestFormat, ChunkedRejectsChunkCountAboveCap)
+{
+    const PartManifest m = chunkedSample();
+    const String text = encodePartManifest(m);
+    const String needle = "\"!nchunks\":3";
+    const size_t at = text.find(needle);
+    ASSERT_NE(at, String::npos);
+    String bad = text;
+    bad.replace(at, needle.size(), "\"!nchunks\":99999999");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
+}
+
+/// The chunk count key is `!`-prefixed so a build that does not know this placement reports a
+/// format-version error instead of accusing the object of corruption. Assert the spelling, because
+/// that leading `!` is the entire mechanism.
+TEST(CASPartManifestFormat, ChunkCountKeyIsCriticalForForwardCompatibility)
+{
+    const String text = encodePartManifest(chunkedSample());
+    EXPECT_NE(text.find("\"!nchunks\":"), String::npos);
+}

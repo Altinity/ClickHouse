@@ -116,7 +116,15 @@ public:
     /// Joins multiple stored objects into a single seekable buffer.
     /// Required for object storage where one logical file maps to multiple blobs.
     /// Not needed for local disk where one file = one file.
-    void needGather();
+    ///
+    /// `object_payload_offset` names a fixed prefix present in EVERY object that is not part of the
+    /// logical file. Content-addressed chunked reads use it: each chunk object is
+    /// `[envelope][payload]` with a pool-wide envelope length, and `StoredObject::bytes_size` carries
+    /// the payload length. The gather skips the prefix per object while keeping its file-offset
+    /// arithmetic in logical bytes. Zero (the default) is the behaviour every other caller gets.
+    /// Prefer this over the `FileView` stage for a multi-object file: `FileView` is ONE window over
+    /// the whole concatenated chain and cannot express a per-object prefix.
+    void needGather(size_t object_payload_offset = 0);
 
     /// -- Filesystem cache stage --
     void needFilesystemCache(FileCachePtr cache, FilesystemCacheSettings cache_settings, std::shared_ptr<FilesystemCacheLog> cache_log = nullptr);
@@ -240,6 +248,7 @@ private:
 
     std::optional<SourceStage> source;
     bool gather = false;
+    size_t gather_object_payload_offset = 0;
     VectorWithMemoryTracking<FilesystemCacheStage> filesystem_caches;
     std::optional<MemoryCacheStage> memory_cache;
     std::optional<DistributedCacheStage> distributed_cache;

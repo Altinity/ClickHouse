@@ -52,9 +52,15 @@ public:
     std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
 
     /// Computes the object key and payload window for a `Blob` entry without performing I/O. An
-    /// `Inline` entry, or any unsupported placement value, throws `BAD_ARGUMENTS` because it has no
-    /// standalone object to read.
+    /// `Inline` entry has no standalone object, and a `Chunked` entry spans several, so both throw
+    /// `BAD_ARGUMENTS` rather than answer with something a caller could mistake for the whole file.
     BlobLocation locate(const ManifestEntry & entry) const;
+
+    /// The per-chunk object keys and payload windows of a `Chunked` entry, in file byte order, with
+    /// no I/O. Throws `BAD_ARGUMENTS` for any other placement. All chunks share the pool-wide
+    /// envelope length as their payload offset, which is what lets the read path drive them through
+    /// one gather with a single uniform offset.
+    std::vector<BlobLocation> locateChunks(const ManifestEntry & entry) const;
 
     /// Test seam: retained bytes of the manifest decode cache (0 when disabled).
     size_t manifestDecodeCacheBytes() const { return manifest_cache ? manifest_cache->sizeInBytes() : 0; }

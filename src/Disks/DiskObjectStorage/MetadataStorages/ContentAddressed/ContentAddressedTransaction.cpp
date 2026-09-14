@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBuffer.h>
+#include <IO/ConcatReadBufferFromFile.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -46,6 +47,7 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
+    extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
@@ -222,27 +224,32 @@ ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const Cas::
     return nullptr;
 }
 
-void ContentAddressedTransaction::adoptStagedBlob(
-    const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
+void ContentAddressedTransaction::adoptStagedEntry(
+    const PartStaging * src_st, const Cas::ManifestEntry & entry,
     PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending)
 {
-    if (pb)
+    /// Adopt one manifest entry into another part, deciding PER BLOB whether it is still staged or
+    /// already published. A whole-file blob has exactly one; a `Chunked` entry has one per chunk and
+    /// the states can be mixed, so the decision cannot be made once for the entry.
+    Cas::forEachEntryBlobRef(entry, [&](const Cas::BlobRef & ref, uint64_t size)
     {
-        /// Pending blob (not yet uploaded): no dependency exists until publication succeeds. If
-        /// copy_pending, push a copy of the pb record into dst_st so publishStaging uploads it
-        /// for the dst part too (hardlink = copy semantics). If !copy_pending, the record is already
-        /// in dst_st (moved by caller) — skip the push.
-        if (copy_pending)
-            dst_st.pending_blobs.push_back(*pb);
-    }
-    else
-    {
+        const PartStaging::PendingBlob * pb = src_st ? findPendingBlob(*src_st, ref) : nullptr;
+        if (pb)
+        {
+            /// Pending blob (not yet uploaded): no dependency exists until publication succeeds. If
+            /// copy_pending, push a copy of the pb record into dst_st so publishStaging uploads it
+            /// for the dst part too (hardlink = copy semantics). If !copy_pending, the record is already
+            /// in dst_st (moved by caller) — skip the push.
+            if (copy_pending)
+                dst_st.pending_blobs.push_back(*pb);
+            return;
+        }
         /// Uploaded / committed: record trusted-manifest evidence — no pool HEAD/GET before precommit.
         /// §4 manifest-trust: the publish gate (promote) TRUSTS this committed-source adopted leaf via the
         /// durable manifest edge — it does not observe or republish it. Pending uploads establish
         /// `Materialized` through `putBlob` before promote; a genuinely absent adopted blob is an fsck finding.
-        dst_build.adoptEvidence(entry);
-    }
+        dst_build.adoptEvidenceForRef(ref, size);
+    });
 }
 
 std::optional<ContentAddressedMetadataStorage::Route>
@@ -262,8 +269,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
     /// (it is an orphan). Its temp file is still cleaned by cleanupPendingTempFiles at commit end.
     std::unordered_set<Cas::BlobRef, Cas::BlobRefHash> referenced_hashes;
     for (const auto & entry : st.entries)
-        if (entry.placement == Cas::EntryPlacement::Blob)
-            referenced_hashes.insert(entry.ref);
+        Cas::forEachEntryBlobRef(entry, [&](const Cas::BlobRef & ref, uint64_t) { referenced_hashes.insert(ref); });
 
     /// Build one upload request per referenced pending blob. Duplicate refs (staged-hardlink copies push
     /// a copy of the record) are collapsed by `fanOutBlobUploads`' grouping, which SUBSUMES the former
@@ -598,6 +604,21 @@ std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageO
             const auto location = metadata_storage.store()->locate(*entry);
             return StoredObjects{StoredObject(location.key, path, location.length)};
         }
+        if (entry->placement == Cas::EntryPlacement::Chunked)
+        {
+            /// All-or-nothing, as for a single blob: if ANY chunk is still in staging the file cannot
+            /// be served from the pool, so fall back to `tryReadFileInFlight`, which concatenates the
+            /// staged chunk files. A partially-uploaded chunk list would otherwise resolve to objects
+            /// that do not all exist yet.
+            for (const Cas::ChunkRef & c : entry->chunks)
+                if (findPendingBlob(it->second, c.ref))
+                    return {};
+            StoredObjects objects;
+            objects.reserve(entry->chunks.size());
+            for (const auto & location : metadata_storage.store()->locateChunks(*entry))
+                objects.emplace_back(location.key, path, location.length);
+            return objects;
+        }
         /// An Inline entry carries its bytes in `inline_bytes`; `size()` (not `blob_size`, which is 0
         /// for an inline entry carried forward from a decoded source manifest — createHardLink) reports
         /// the real inline byte count, so an in-flight read of a carried-forward inline sidecar (e.g. a
@@ -649,6 +670,28 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
                 return std::make_unique<ReadBufferFromFile>(pb->staging_key);
             }
             return metadata_storage.readBlobPayload(metadata_storage.store()->locate(*entry), path, settings);
+        }
+        if (entry->placement == Cas::EntryPlacement::Chunked)
+        {
+            /// Read-your-writes over a chunked file: the logical file is the concatenation of its
+            /// chunks, each of which is either still a local staging temp file (holding the payload
+            /// verbatim, no envelope) or already published as a pool blob. Mixed states are handled
+            /// per chunk, so a partially-uploaded file still reads correctly.
+            auto concat = std::make_unique<ConcatReadBufferFromFile>(path);
+            const auto locations = metadata_storage.store()->locateChunks(*entry);
+            for (size_t i = 0; i < entry->chunks.size(); ++i)
+            {
+                const Cas::ChunkRef & c = entry->chunks[i];
+                if (const auto * pb = findPendingBlob(it->second, c.ref))
+                {
+                    /// Chunked staging is Local-only (see `CaContentWriteBuffer`'s chunked
+                    /// constructor), so the staged path is always a filesystem path.
+                    concat->appendBuffer(std::make_unique<ReadBufferFromFile>(pb->staging_key), c.size);
+                    continue;
+                }
+                concat->appendBuffer(metadata_storage.readBlobPayload(locations[i], path, settings), c.size);
+            }
+            return concat;
         }
     }
     return nullptr;
@@ -741,6 +784,42 @@ void ContentAddressedTransaction::stageBlobPartFile(
     entry.placement = Cas::EntryPlacement::Blob;
     entry.ref = ref;
     entry.blob_size = size;
+    std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
+    st.entries.push_back(std::move(entry));
+}
+
+void ContentAddressedTransaction::stageChunkedPartFile(
+    const ContentAddressedMetadataStorage::Route & route,
+    Cas::BlobHashAlgo hash_algo,
+    std::vector<Cas::StagedChunk> chunks)
+{
+    /// Mirrors `stageBlobPartFile`, except one part FILE contributes several pending blobs and the
+    /// manifest entry names them as an ordered list. Nothing is uploaded here: publication happens
+    /// post-precommit, and every chunk rides the same `fanOutBlobUploads` path a whole-file blob
+    /// does (it groups by `BlobRef`, so a chunk that repeats inside the file is uploaded once).
+    auto & st = stagingFor(route);
+    (void)buildFor(route, st);
+
+    Cas::ManifestEntry entry;
+    entry.path = route.file;
+    entry.placement = Cas::EntryPlacement::Chunked;
+    entry.chunks.reserve(chunks.size());
+    for (const auto & c : chunks)
+    {
+        const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(c.hash_hex)};
+        st.pending_blobs.push_back({ref, c.temp_path, c.size, Cas::StagingBackend::Local});
+        entry.chunks.push_back(Cas::ChunkRef{ref, c.size});
+    }
+
+    /// Refuse to stage a manifest this build could not read back (`decodePartManifest` enforces the
+    /// same ceiling). Reachable only for an absurdly large single column file, but failing here is
+    /// far better than publishing an unreadable manifest.
+    if (entry.chunks.size() > Cas::kMaxChunksPerEntry)
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+            "ContentAddressed: part file {} split into {} chunks, above the cap {}; raise "
+            "cas_chunk_min_bytes or cas_chunk_max_bytes",
+            route.file, entry.chunks.size(), Cas::kMaxChunksPerEntry);
+
     std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
     st.entries.push_back(std::move(entry));
 }
@@ -928,6 +1007,40 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                     stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
                 },
                 [pool, admitted_generation] { pool->checkFenceOrThrow(admitted_generation); });
+        }
+
+        /// Content-defined chunking, when this disk opts in. There is no file-size gate here and none
+        /// is needed: the chunker never accepts a boundary below `cas_chunk_min_bytes`, so a file
+        /// smaller than that yields exactly one chunk and is published below as an ordinary
+        /// whole-file blob -- same bytes, same key, same dedup against a non-chunked pool. The size
+        /// at which splitting starts IS `cas_chunk_min_bytes`, so expressing it twice would only
+        /// create a second knob that could disagree with the first.
+        if (metadata_storage.chunkingEnabled())
+        {
+            return std::make_unique<Cas::CaContentWriteBuffer>(
+                metadata_storage.scratchPath(),
+                hash_algo,
+                metadata_storage.chunkerParams(),
+                buf_size,
+                settings.use_adaptive_write_buffer,
+                settings.adaptive_write_buffer_initial_size,
+                [this, route = *r, hash_algo](std::vector<Cas::StagedChunk> chunks)
+                {
+                    /// One chunk (or none, for an empty file) is published as an ordinary whole-file
+                    /// blob: identical bytes, identical key, and it still deduplicates against a
+                    /// non-chunked pool. Only a genuinely split file becomes a `Chunked` entry.
+                    if (chunks.size() <= 1)
+                    {
+                        if (chunks.empty())
+                            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                                "ContentAddressed: chunked write of {} produced no chunks; even an empty "
+                                "file must yield one zero-length chunk", route.file);
+                        const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(chunks[0].hash_hex)};
+                        stageBlobPartFile(route, ref, chunks[0].size, chunks[0].temp_path, Cas::StagingBackend::Local);
+                        return;
+                    }
+                    stageChunkedPartFile(route, hash_algo, std::move(chunks));
+                });
         }
 
         return std::make_unique<Cas::CaContentWriteBuffer>(
@@ -1192,17 +1305,14 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
         if (it != src_st->entries.end())
         {
             entry = *it;
-            if (entry.placement == Cas::EntryPlacement::Blob)
+            if (entry.placement != Cas::EntryPlacement::Inline)
             {
                 /// Unified adopt dispatch. copy_pending=(&dst_st != src_st) so the pending
                 /// blob record is copied into dst_st only when the destination is a different part
                 /// (hardlink = copy semantics; same-part is a self-ref that shouldn't duplicate the record).
-                const auto * pb = findPendingBlob(*src_st, entry.ref);
-                adoptStagedBlob(pb, entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/(&dst_st != src_st));
+                /// Covers `Chunked` too: the adopt runs per chunk.
+                adoptStagedEntry(src_st, entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/(&dst_st != src_st));
             }
-            else if (entry.placement != Cas::EntryPlacement::Inline)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "ContentAddressed: staged hardlink of unsupported placement for {}", path_from);
             entry.path = dst->file;
             std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
             dst_st.entries.push_back(std::move(entry));
@@ -1399,11 +1509,11 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 /// time is unnecessary - entries staged via putBlob/adopt carry deps in the SOURCE
                 /// build... merge conservatively by abandoning nothing and re-observing):
                 for (const auto & entry : dst_st.entries)
-                    if (entry.placement == Cas::EntryPlacement::Blob)
+                    if (entry.placement != Cas::EntryPlacement::Inline)
                     {
                         /// Unified adopt dispatch. Pending blob records were already moved
                         /// to dst_st.pending_blobs above (MOVE semantics), so copy_pending=false.
-                        adoptStagedBlob(findPendingBlob(dst_st, entry.ref), entry, dst_st, *dst_st.build, /*copy_pending=*/false);
+                        adoptStagedEntry(&dst_st, entry, dst_st, *dst_st.build, /*copy_pending=*/false);
                     }
                 src_st.build->abandon();
             }
@@ -1536,19 +1646,25 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
         auto entry = std::move(*it);
         src_st.entries.erase(it);
         entry.path = dst->file;
-        if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)
+        if (&src_st != &dst_st && entry.placement != Cas::EntryPlacement::Inline)
         {
             /// Unified adopt dispatch. MOVE semantics — physically move the pending blob
-            /// record from src_st to dst_st FIRST (so dst_st owns the upload), then call adoptStagedBlob
-            /// with copy_pending=false (the record is already in dst_st; no additional copy needed).
-            auto pb_it = std::find_if(src_st.pending_blobs.begin(), src_st.pending_blobs.end(),
-                [&](const PartStaging::PendingBlob & pb) { return pb.ref == entry.ref; });
-            if (pb_it != src_st.pending_blobs.end())
+            /// record(s) from src_st to dst_st FIRST (so dst_st owns the upload), then call
+            /// `adoptStagedEntry` with copy_pending=false (the records are already in dst_st; no
+            /// additional copy needed). A `Chunked` entry moves one record per chunk, so the loop is
+            /// over the entry's referenced blobs rather than its single `ref`, which names nothing
+            /// for that placement.
+            Cas::forEachEntryBlobRef(entry, [&](const Cas::BlobRef & ref, uint64_t)
             {
-                dst_st.pending_blobs.push_back(std::move(*pb_it));
-                src_st.pending_blobs.erase(pb_it);
-            }
-            adoptStagedBlob(findPendingBlob(dst_st, entry.ref), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
+                auto pb_it = std::find_if(src_st.pending_blobs.begin(), src_st.pending_blobs.end(),
+                    [&](const PartStaging::PendingBlob & pb) { return pb.ref == ref; });
+                if (pb_it != src_st.pending_blobs.end())
+                {
+                    dst_st.pending_blobs.push_back(std::move(*pb_it));
+                    src_st.pending_blobs.erase(pb_it);
+                }
+            });
+            adoptStagedEntry(&dst_st, entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
         }
         std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
         dst_st.entries.push_back(std::move(entry));
@@ -1889,26 +2005,140 @@ CaContentWriteBuffer::CaContentWriteBuffer(
     hashing = Cas::makeBlobHashingWriteBuffer(hash_algo, *sink);
 }
 
+CaContentWriteBuffer::CaContentWriteBuffer(
+    std::string temp_dir,
+    Cas::BlobHashAlgo hash_algo,
+    Cas::ChunkerParams chunker_params,
+    size_t buf_size,
+    bool use_adaptive_buffer_size,
+    size_t adaptive_buffer_initial_size,
+    OnChunkedFinalized on_chunked_finalized_)
+    : WriteBufferFromFileBase(clampCasWriteBufferSize(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size), nullptr, 0)
+    , is_chunked(true)
+    , on_chunked_finalized(std::move(on_chunked_finalized_))
+    , chunk_temp_dir(std::move(temp_dir))
+    , chunk_hash_algo(hash_algo)
+    , chunker(std::in_place, chunker_params)
+    , chunk_sink_buf_size(buf_size)
+    , chunk_use_adaptive_buffer_size(use_adaptive_buffer_size)
+    , chunk_adaptive_buffer_initial_size(adaptive_buffer_initial_size)
+{
+    fs::create_directories(chunk_temp_dir);
+    chunker->startChunk();
+    openChunkSink();
+}
+
 CaContentWriteBuffer::~CaContentWriteBuffer()
 {
     /// Best-effort cleanup if finalize was never reached (exception unwind / cancel).
     cancel();
-    /// If on_finalized ran successfully the transaction (Local mode) or a later promote
+    /// If the completion callback ran successfully the transaction (Local mode) or a later promote
     /// path (S3 mode) owns the staged bytes and cleans them up. Do not remove them here. S3-mode
     /// staging objects are never removed by this class at all (see cancelImpl / removeTempFile).
-    if (!temp_ownership_transferred && !is_s3_staging)
+    if (temp_ownership_transferred)
+        return;
+    if (is_chunked)
+    {
+        removeChunkTempFiles();
+        return;
+    }
+    if (!is_s3_staging)
         removeTempFile();
+}
+
+void CaContentWriteBuffer::openChunkSink()
+{
+    current_chunk_path = chunk_temp_dir + "/" + getRandomASCIIString(32) + ".chunk.tmp";
+    current_chunk_bytes = 0;
+    sink = std::make_unique<WriteBufferFromFile>(
+        current_chunk_path,
+        clampCasWriteBufferSize(chunk_sink_buf_size),
+        /*flags=*/-1,
+        /*throttler=*/nullptr,
+        /*mode=*/0666,
+        /*existing_memory=*/nullptr,
+        /*alignment=*/0,
+        chunk_use_adaptive_buffer_size,
+        clampCasWriteBufferSize(chunk_adaptive_buffer_initial_size));
+    hashing = Cas::makeBlobHashingWriteBuffer(chunk_hash_algo, *sink);
+}
+
+void CaContentWriteBuffer::closeChunkSink()
+{
+    /// An empty in-progress chunk is not a chunk, PROVIDED something else was staged: that is the
+    /// file whose last byte landed exactly on a boundary, where the cut opened a fresh sink that
+    /// never received anything. A genuinely empty FILE is different -- it must still produce one
+    /// zero-length entry, which the caller then publishes as an ordinary empty blob, matching the
+    /// unchunked path (whose buffer also stages a zero-byte temp file).
+    if (current_chunk_bytes == 0 && !staged_chunks.empty())
+    {
+        hashing->cancel();
+        sink->cancel();
+        std::error_code ec;
+        fs::remove(current_chunk_path, ec);
+        current_chunk_path.clear();
+        return;
+    }
+
+    const std::string hash_hex = hashing->getHashHex();
+    hashing->finalize();
+    sink->finalize();
+    staged_chunks.push_back(StagedChunk{hash_hex, current_chunk_bytes, current_chunk_path});
+    current_chunk_path.clear();
+    current_chunk_bytes = 0;
+}
+
+void CaContentWriteBuffer::writeChunked(const char * data, size_t size)
+{
+    size_t offset_in_data = 0;
+    while (offset_in_data < size)
+    {
+        const Cas::ChunkerFeedResult res = chunker->feed(std::string_view(data + offset_in_data, size - offset_in_data));
+        if (res.taken != 0)
+        {
+            hashing->write(data + offset_in_data, res.taken);
+            current_chunk_bytes += res.taken;
+            offset_in_data += res.taken;
+        }
+        if (!res.boundary)
+            break;   /// the chunker consumed everything it was given without cutting
+
+        closeChunkSink();
+        chunker->startChunk();
+        openChunkSink();
+    }
 }
 
 void CaContentWriteBuffer::nextImpl()
 {
     if (!offset())
         return;
+    if (is_chunked)
+    {
+        writeChunked(working_buffer.begin(), offset());
+        return;
+    }
     hashing->write(working_buffer.begin(), offset());
 }
 
 void CaContentWriteBuffer::finalizeImpl()
 {
+    if (is_chunked)
+    {
+        next();
+        /// The trailing partial chunk (if any) closes here; `closeChunkSink` drops it when the last
+        /// byte fell exactly on a boundary.
+        closeChunkSink();
+        if (on_chunked_finalized)
+        {
+            on_chunked_finalized(std::move(staged_chunks));
+            /// The callback owns every listed temp file now, so the destructor must not remove them.
+            staged_chunks.clear();
+            temp_ownership_transferred = true;
+        }
+        return;
+    }
+
     next();
     const size_t size = count();
 
@@ -1943,6 +2173,19 @@ void CaContentWriteBuffer::cancelImpl() noexcept
         hashing->cancel();
     if (sink)
         sink->cancel();
+    if (is_chunked)
+    {
+        /// The in-progress chunk plus every completed one: all are private local temp files this
+        /// buffer still owns, because a cancelled write never handed them to the transaction.
+        if (!current_chunk_path.empty())
+        {
+            std::error_code ec;
+            fs::remove(current_chunk_path, ec);
+            current_chunk_path.clear();
+        }
+        removeChunkTempFiles();
+        return;
+    }
     /// S3 mode: `temp_path` is a remote object key, not a path on this filesystem — do NOT attempt
     /// to delete the (possibly partially-written) staging object here. Cancelling `sink` above is
     /// enough to make sure no partial finalize happens; reclaiming an orphaned staging object is the
@@ -1957,6 +2200,14 @@ void CaContentWriteBuffer::removeTempFile() noexcept
     fs::remove(temp_path, ec);
 }
 
+void CaContentWriteBuffer::removeChunkTempFiles() noexcept
+{
+    std::error_code ec;
+    for (const StagedChunk & c : staged_chunks)
+        fs::remove(c.temp_path, ec);
+    staged_chunks.clear();
+}
+
 void CaContentWriteBuffer::sync()
 {
     next();
@@ -1966,6 +2217,10 @@ void CaContentWriteBuffer::sync()
 
 std::string CaContentWriteBuffer::getFileName() const
 {
+    /// Chunked mode has no single staging path; report the chunk directory, which is what a
+    /// diagnostic actually wants to know. `on_chunked_finalized` carries the real per-chunk paths.
+    if (is_chunked)
+        return chunk_temp_dir;
     return temp_path;
 }
 

@@ -832,8 +832,10 @@ void DiskObjectStorage::prepareRead(
         }
     }
 
+    /// A chunked content-addressed file resolves to one object PER CHUNK; a whole-file blob to one
+    /// object plus a payload window applied by the FileView stage below.
     const auto storage_objects = ca_blob_view
-        ? StoredObjects{ca_blob_view->object}
+        ? (ca_blob_view->isChunked() ? ca_blob_view->chunks : StoredObjects{ca_blob_view->object})
         : metadata_storage->getStorageObjects(path);
 
     auto read_settings = updateIOSchedulingSettings(settings, getReadResourceName(), getWriteResourceName());
@@ -873,7 +875,9 @@ void DiskObjectStorage::prepareRead(
         read_settings.remote_fs_settings.buffer_size = std::max<size_t>(read_settings.remote_fs_settings.buffer_size, read_settings.remote_fs_settings.large_buffer_size);
 
     /// Object storage files may be split across multiple blobs — gather joins them.
-    pipeline.needGather();
+    /// Chunked reads carry a per-object payload offset so the gather skips each chunk's envelope;
+    /// every other caller passes zero and behaves exactly as before.
+    pipeline.needGather(ca_blob_view && ca_blob_view->isChunked() ? ca_blob_view->payload_offset : 0);
 
     /// Delegate to the object storage to set source and add cache stage if needed.
     /// CachedObjectStorage::prepareRead adds needFilesystemCache automatically.
@@ -917,7 +921,9 @@ void DiskObjectStorage::prepareRead(
 
     /// A content-addressed blob-backed file is a payload window inside its blob: bound the
     /// chain to it (and skip the CHCA envelope header in front).
-    if (ca_blob_view)
+    /// Only the single-blob plan needs the window: for a chunked file the offset was already
+    /// applied per object by the gather, and one outer window could not express it.
+    if (ca_blob_view && !ca_blob_view->isChunked())
         pipeline.needFileView(path, ca_blob_view->payload_offset, ca_blob_view->payload_end);
 }
 

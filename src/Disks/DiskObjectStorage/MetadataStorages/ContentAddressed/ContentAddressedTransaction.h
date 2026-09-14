@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasContentChunker.h>
 #include <Disks/WriteMode.h>
 #include <Common/ThreadPool_fwd.h>
 #include <span>
@@ -21,6 +22,23 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+namespace DB::Cas
+{
+
+/// One content-defined chunk that finished staging: its own content hash, payload length, and the
+/// local temp file holding it. `CaContentWriteBuffer`'s chunked mode reports a whole part file as an
+/// ordered list of these, and `ContentAddressedTransaction` turns that list into pending blobs plus
+/// one `Chunked` manifest entry. Declared here, ahead of both, because the two sides pass it between
+/// them.
+struct StagedChunk
+{
+    std::string hash_hex;
+    size_t size = 0;
+    std::string temp_path;
+};
+
+}
 
 namespace DB
 {
@@ -173,6 +191,14 @@ private:
                            const Cas::BlobRef & ref, size_t size, const std::string & staging_key,
                            Cas::StagingBackend backend);
 
+    /// The chunked sibling of `stageBlobPartFile`: records one pending blob per chunk and adds a
+    /// single `Chunked` manifest entry naming them in byte order. Only called with two or more
+    /// chunks -- a stream that produced one (or an empty file) is staged as an ordinary whole-file
+    /// blob instead, so the common small-file case is byte-for-byte unchanged.
+    void stageChunkedPartFile(const ContentAddressedMetadataStorage::Route & route,
+                              Cas::BlobHashAlgo hash_algo,
+                              std::vector<Cas::StagedChunk> chunks);
+
     /// Builds the fixed-length CABL envelope header for a staging blob, with a fresh `incarnation_tag`,
     /// so the S3 staging object holds `[header][payload]` and the promote
     /// stays a verbatim server-side copy. `build_id` is left 0 (not known at stream time; diagnostic-only).
@@ -201,20 +227,23 @@ private:
     /// by `cleanupPendingTempFiles`. Used for both new refs and committed-ref repoints.
     void uploadPendingBlobs(PartStaging & st);
 
-    /// Adopts a manifest entry into another part while preserving its storage state. For a pending
-    /// blob, `copy_pending` controls whether the staging record is copied (hardlink semantics) or
-    /// has already been moved by the caller; no dependency exists until its upload succeeds. For
-    /// an uploaded or committed blob, the destination records trusted-manifest evidence and does not
-    /// perform a pool read before precommit.
+    /// Adopts a manifest entry into another part while preserving its storage state, deciding PER
+    /// REFERENCED BLOB whether that blob is still staged in `src_st` or already published. A
+    /// whole-file `Blob` entry has one; a `Chunked` entry has one per chunk and their states can be
+    /// mixed (some uploaded, some not), which is why the decision is per blob rather than per entry.
+    /// `src_st` may be null, meaning "no staging to consult": every blob is then treated as
+    /// published.
     ///
-    /// `pb != nullptr` (pending, not yet uploaded):
-    ///   - `copy_pending=true`  → push a copy of *pb into dst_st.pending_blobs (hardlink semantics:
-    ///     both src and dst upload independently; src's copy is left in place by the caller).
-    ///   - `copy_pending=false` → the pb record is already in dst_st (moved or already there).
+    /// For a blob still pending (not yet uploaded) no dependency exists until publication succeeds:
+    ///   - `copy_pending=true`  → push a copy of the pending record into dst_st.pending_blobs
+    ///     (hardlink semantics: both src and dst upload independently; src's copy is left in place
+    ///     by the caller).
+    ///   - `copy_pending=false` → the record is already in dst_st (moved or already there).
     ///   In both cases the later successful upload records `Materialized` in the destination build.
-    ///
-    void adoptStagedBlob(const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
-                         PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending);
+    /// For an already-published blob the destination records trusted-manifest evidence and performs
+    /// no pool read before precommit.
+    void adoptStagedEntry(const PartStaging * src_st, const Cas::ManifestEntry & entry,
+                          PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending);
 
     /// Publishes one staged part, either by promoting a newly staged manifest or by repointing an
     /// existing ref after carrying its unchanged entries forward. It is idempotent within the commit
@@ -304,6 +333,9 @@ class CaContentWriteBuffer : public WriteBufferFromFileBase
 {
 public:
     using OnFinalized = std::function<void(const std::string & hash_hex, size_t size, const std::string & temp_path)>;
+    /// Chunked-mode completion: the file's chunks in byte order. Ownership of every listed temp file
+    /// transfers to the callback, exactly as `OnFinalized` transfers the single one.
+    using OnChunkedFinalized = std::function<void(std::vector<StagedChunk> chunks)>;
 
     /// Local-staging mode (today's default; BYTE-FOR-BYTE unchanged behavior). Buffer sizing mirrors
     /// the plain object-storage backends: with adaptive sizing on, the working buffer STARTS small
@@ -353,6 +385,28 @@ public:
         OnFinalized on_finalized_,
         std::function<void()> check_fence_before_finalize_ = {});
 
+    /// Chunked local-staging mode. The stream is split at content-defined boundaries
+    /// (`Cas::ContentChunker`) and each chunk is spilled to its OWN local temp file and hashed
+    /// independently, so a chunk that already exists in the pool is recognised by its own content
+    /// hash. On finalize `on_chunked_finalized` receives every chunk in byte order.
+    ///
+    /// The two constructors above are untouched: whether a write is chunked is decided by which
+    /// constructor `writeFile` picks, so the unchunked path stays byte-for-byte as it was. This mode
+    /// is Local staging only -- S3 staging's promote is a verbatim server-side copy of ONE
+    /// `[header][payload]` object, which a chunked write has no single equivalent of.
+    ///
+    /// A stream that yields fewer than two chunks is still reported through this callback (with one
+    /// or zero entries); the caller decides to publish it as an ordinary whole-file blob, so tiny and
+    /// empty files never become degenerate one-chunk manifests.
+    CaContentWriteBuffer(
+        std::string temp_dir,
+        Cas::BlobHashAlgo hash_algo,
+        Cas::ChunkerParams chunker_params,
+        size_t buf_size,
+        bool use_adaptive_buffer_size,
+        size_t adaptive_buffer_initial_size,
+        OnChunkedFinalized on_chunked_finalized_);
+
     ~CaContentWriteBuffer() override;
 
     void sync() override;
@@ -368,6 +422,19 @@ private:
     void cancelImpl() noexcept override;
     /// Removes the local staging path when ownership has not been transferred to the transaction.
     void removeTempFile() noexcept;
+
+    /// Chunked mode: open a fresh local temp file plus hashing wrapper for the next chunk.
+    void openChunkSink();
+    /// Chunked mode: finalize the current chunk's sink and append it to `staged_chunks`. Does
+    /// nothing when the current chunk is empty, so a file whose last byte fell exactly on a boundary
+    /// does not produce a trailing zero-length chunk.
+    void closeChunkSink();
+    /// Chunked mode: feed `data` through the chunker, spilling to per-chunk sinks and cutting where
+    /// the chunker says. Called from `nextImpl` and `finalizeImpl`.
+    void writeChunked(const char * data, size_t size);
+    /// Chunked mode: remove every staged chunk temp file. Used on cancel and on the error paths,
+    /// where ownership never transferred.
+    void removeChunkTempFiles() noexcept;
 
     OnFinalized on_finalized;
     /// Local mode: the local temp file path (removed by removeTempFile). S3 mode: the staging
@@ -389,6 +456,27 @@ private:
     /// rev.7 [C2]: fence-generation re-check invoked immediately before `sink->finalize()` in `finalizeImpl`
     /// (populated only by the S3-staging constructor; a no-op empty `std::function` for Local mode).
     std::function<void()> check_fence_before_finalize;
+
+    /// ---- chunked local-staging mode (empty/unset in the two unchunked modes) ----
+    /// Set by the chunked constructor; selects the chunked branches in nextImpl/finalizeImpl/cancelImpl.
+    bool is_chunked = false;
+    OnChunkedFinalized on_chunked_finalized;
+    /// Directory the per-chunk temp files are created in.
+    std::string chunk_temp_dir;
+    /// The pool's write-mint hash algorithm, retained because each chunk needs its own hasher.
+    Cas::BlobHashAlgo chunk_hash_algo{};
+    /// Boundary detector for this file. Owns no payload.
+    std::optional<Cas::ContentChunker> chunker;
+    /// Chunks completed so far, in byte order.
+    std::vector<StagedChunk> staged_chunks;
+    /// The in-progress chunk's temp path and its byte count. `sink`/`hashing` above are reused per
+    /// chunk in this mode rather than held for the whole stream.
+    std::string current_chunk_path;
+    size_t current_chunk_bytes = 0;
+    /// Buffer sizing for the per-chunk sinks, captured from the constructor.
+    size_t chunk_sink_buf_size = 0;
+    bool chunk_use_adaptive_buffer_size = false;
+    size_t chunk_adaptive_buffer_initial_size = 0;
 };
 
 /// Write buffer for bytes that live INSIDE pool metadata (a small inline part file staged into the

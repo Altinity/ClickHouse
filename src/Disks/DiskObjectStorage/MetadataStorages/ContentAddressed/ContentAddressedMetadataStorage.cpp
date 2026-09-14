@@ -87,6 +87,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
     extern const ContentAddressedSettingsUInt64 gc_read_concurrency;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
+    extern const ContentAddressedSettingsBool chunking_enabled;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
@@ -314,6 +315,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
     , staging_backend(settings_.stagingBackend())
+    , chunking_enabled(settings_[ContentAddressedSetting::chunking_enabled].value)
+    , chunker_params(settings_.chunkerParams())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
     , skip_access_check(settings_.skipAccessCheck())
@@ -1987,6 +1990,16 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     if (const auto * entry = view->findFile(r->file))
     {
+        /// A chunked file is several objects; report them all, in byte order, so a consumer that
+        /// enumerates a part's physical objects (system.remote_data_paths, backup) sees every chunk.
+        if (entry->placement == Cas::EntryPlacement::Chunked)
+        {
+            StoredObjects objects;
+            objects.reserve(entry->chunks.size());
+            for (const auto & location : snap.pool->locateChunks(*entry))
+                objects.emplace_back(location.key, path, location.length);
+            return objects;
+        }
         const auto location = snap.pool->locate(*entry);
         /// StoredObject carries no range (the recorded upstream delta) — the PAYLOAD length is the
         /// size (what every size consumer wants); the header offset is applied by
@@ -2027,6 +2040,14 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
         return std::nullopt;
     if (entry->placement == Cas::EntryPlacement::Inline)
         return StoredObjects{StoredObject("", path, entry->size())};
+    if (entry->placement == Cas::EntryPlacement::Chunked)
+    {
+        StoredObjects objects;
+        objects.reserve(entry->chunks.size());
+        for (const auto & location : snap.pool->locateChunks(*entry))
+            objects.emplace_back(location.key, path, location.length);
+        return objects;
+    }
     const auto location = snap.pool->locate(*entry);
     return StoredObjects{StoredObject(location.key, path, location.length)};
 }
@@ -2107,6 +2128,18 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
         return std::nullopt;
     if (const auto * entry = view->findFile(r->file))
     {
+        if (entry->placement == Cas::EntryPlacement::Chunked)
+        {
+            /// A chunked file is the concatenation of one object per chunk. Report them all with
+            /// their PAYLOAD lengths and one shared payload offset (the pool-wide envelope length);
+            /// `prepareRead` hands that offset to the gather, which skips the prefix per object.
+            BlobViewPlan plan;
+            plan.payload_offset = snap.pool->poolMeta().blob_header_len;
+            plan.chunks.reserve(entry->chunks.size());
+            for (const auto & location : snap.pool->locateChunks(*entry))
+                plan.chunks.emplace_back(physicalKey(location.key), path, location.length);
+            return plan;
+        }
         const auto location = snap.pool->locate(*entry);
         BlobViewPlan plan;
         /// bytes_size is the readable extent of THIS file's window, NOT the whole blob: a

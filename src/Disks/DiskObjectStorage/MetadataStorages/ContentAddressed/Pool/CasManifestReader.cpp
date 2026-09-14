@@ -141,12 +141,40 @@ BlobLocation CasManifestReader::locate(const ManifestEntry & entry) const
                 .length = entry.blob_size,
             };
         }
+        case EntryPlacement::Chunked:
+            /// A chunked file has no single object to point at; its bytes span one object per chunk.
+            /// Callers that serve bytes must use `locateChunks`, and the ones that only need "where
+            /// does this file live" must handle the list. Failing here rather than returning the
+            /// first chunk is deliberate: a caller that silently read chunk 0 would serve a
+            /// truncated file.
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "entry placement 'chunked' spans {} objects and has no single blob location; use locateChunks",
+                entry.chunks.size());
         case EntryPlacement::Inline:
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "entry placement {} has no blob location", static_cast<int>(entry.placement));
     }
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
         "entry placement {} has no blob location", static_cast<int>(entry.placement));
+}
+
+std::vector<BlobLocation> CasManifestReader::locateChunks(const ManifestEntry & entry) const
+{
+    if (entry.placement != EntryPlacement::Chunked)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "locateChunks requires a chunked entry, got placement {}", static_cast<int>(entry.placement));
+
+    /// Every chunk is an ordinary blob, so each one's payload starts at the same pool-wide envelope
+    /// length; only the key and length differ per chunk. Order is the file's byte order.
+    std::vector<BlobLocation> out;
+    out.reserve(entry.chunks.size());
+    for (const ChunkRef & c : entry.chunks)
+        out.push_back(BlobLocation{
+            .key = layout.blobKey(c.ref),
+            .offset = meta.blob_header_len,
+            .length = c.size,
+        });
+    return out;
 }
 
 }

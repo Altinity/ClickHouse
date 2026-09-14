@@ -550,21 +550,25 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     throw Exception(ErrorCodes::LOGICAL_ERROR, "PartWriteTxn::ensureBlobPresent: unreachable retry exit for {}", key);
 }
 
+void PartWriteTxn::adoptEvidenceForRef(const BlobRef & ref, uint64_t size)
+{
+    requireAlive();
+
+    /// Carry `ref` whole (the pair, never re-derived) so mixed-algorithm manifest entries track under
+    /// their own algorithm. The committed source supplies trusted-manifest evidence.
+    deps.insert_or_assign(ref, BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::TrustedManifest, size});
+}
+
 void PartWriteTxn::adoptEvidence(const ManifestEntry & entry)
 {
     requireAlive();
 
     /// W-EVIDENCE: record a TOKENLESS dependency — liveness evidence is the live source manifest, not a
     /// token. Inline entries reference no standalone object, so they record nothing. NO backend call
-    /// (no HEAD, no GET, no PUT) — the caller already holds the resolved entry. Part manifests have only
-    /// Inline / Blob placements (no Subtree): only blobs are content-addressed.
-    if (entry.placement == EntryPlacement::Blob)
-    {
-        /// Carry `entry.ref` whole (the pair, never re-derived) so mixed-algorithm manifest entries
-        /// track under their own algorithm. The committed source supplies trusted-manifest evidence.
-        deps.insert_or_assign(
-            entry.ref, BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::TrustedManifest, entry.blob_size});
-    }
+    /// (no HEAD, no GET, no PUT) — the caller already holds the resolved entry. A `Chunked` entry
+    /// records one dependency per chunk: each chunk is an ordinary blob the destination must be able
+    /// to prove live, exactly as a whole-file blob is.
+    forEachEntryBlobRef(entry, [&](const BlobRef & ref, uint64_t size) { adoptEvidenceForRef(ref, size); });
 }
 
 RootNamespace PartWriteTxn::manifestNamespace() const
@@ -600,6 +604,12 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     uint64_t inline_total = 0;
     for (const ManifestEntry & e : entries)
     {
+        /// A chunk list this build would refuse to decode must never be written. `decodePartManifest`
+        /// enforces the same ceiling on the way back in, so the two directions cannot disagree.
+        if (e.placement == EntryPlacement::Chunked && e.chunks.size() > kMaxChunksPerEntry)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                "stageManifest: chunked entry '{}' has {} chunks, above the cap {}",
+                e.path, e.chunks.size(), kMaxChunksPerEntry);
         if (e.placement == EntryPlacement::Inline)
         {
             if (e.inline_bytes.size() > kMaxLargestInlineEntryBytes)
@@ -908,16 +918,21 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
             /// violation caught by fsck, not here.
+            /// Every blob the manifest references must carry a proof, which for a `Chunked` entry
+            /// means every one of its chunks: a file whose chunk list is only partly materialized is
+            /// exactly as unpublishable as a whole-file blob that never uploaded.
+            std::vector<std::pair<BlobRef, uint64_t>> leaves;
             for (const ManifestEntry & e : body.entries)
+                forEachEntryBlobRef(e, [&](const BlobRef & ref, uint64_t size) { leaves.emplace_back(ref, size); });
+
+            for (const auto & [leaf_ref, leaf_size] : leaves)
             {
-                if (e.placement != EntryPlacement::Blob)
-                    continue;
-                const auto proof = dependencyProof(e.ref);
+                const auto proof = dependencyProof(leaf_ref);
                 if (!proof)
                     throw Exception(ErrorCodes::LOGICAL_ERROR,
                         "promote: blob leaf {} has no dependency proof at commit — a pending upload "
                         "never completed; failing closed",
-                        store->layout().blobKey(e.ref));
+                        store->layout().blobKey(leaf_ref));
 
                 switch (*proof)
                 {
@@ -939,7 +954,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                         {
                             ev.type = CasEventType::BlobReuseAdopt;
                             ev.object_kind = CasEventObjectKind::Blob;
-                            ev.object_hash = blobIdOf(e.ref);
+                            ev.object_hash = blobIdOf(leaf_ref);
                             ev.outcome = "adopt";
                             ev.reason = "manifest-trust";   /// distinguishable trusted-adopt class (empty token)
                         });
@@ -948,7 +963,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "promote: blob leaf {} has an unnamed dependency proof at commit; failing closed",
-                    store->layout().blobKey(e.ref));
+                    store->layout().blobKey(leaf_ref));
             }
 
             /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —

@@ -1755,6 +1755,11 @@ BlobLocation Pool::locate(const ManifestEntry & entry) const
     return manifest_reader.locate(entry);
 }
 
+std::vector<BlobLocation> Pool::locateChunks(const ManifestEntry & entry) const
+{
+    return manifest_reader.locateChunks(entry);
+}
+
 void Pool::reportImpossibleInterference(const String & key, const String & reason,
                                           const std::optional<String> & offending_ns)
 {

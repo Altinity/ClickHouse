@@ -191,9 +191,13 @@ bool blobStillReferenced(CasOperation & op, Pool & store, const Layout & layout,
             const PartManifest body = store.readManifest(ManifestId{rns, rit->second.manifest_ref});
             for (const ManifestEntry & e : body.entries)
             {
-                if (e.placement != EntryPlacement::Blob)
-                    continue;
-                if (layout.blobKey(e.ref) == bkey)
+                bool names_this_blob = false;
+                forEachEntryBlobRef(e, [&](const BlobRef & blob_ref, uint64_t)
+                {
+                    if (layout.blobKey(blob_ref) == bkey)
+                        names_this_blob = true;
+                });
+                if (names_this_blob)
                     return true;   /// an original-life ref still names this exact blob — a real dangle
             }
         }
@@ -687,16 +691,17 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                     continue;
                 }
 
+                /// Reachability counts every blob a manifest references, which for a `Chunked`
+                /// entry is one per chunk; the logical bytes come from the per-chunk sizes.
                 for (const ManifestEntry & e : body.entries)
-                {
-                    if (e.placement != EntryPlacement::Blob)
-                        continue;
-                    const String bkey = layout.blobKey(e.ref);
-                    reachable_blobs.insert(bkey);
-                    ++report.total_blob_refs;
-                    report.referenced_logical_bytes += e.blob_size;
-                    blob_labels[bkey].push_back(label);
-                }
+                    forEachEntryBlobRef(e, [&](const BlobRef & blob_ref, uint64_t blob_bytes)
+                    {
+                        const String bkey = layout.blobKey(blob_ref);
+                        reachable_blobs.insert(bkey);
+                        ++report.total_blob_refs;
+                        report.referenced_logical_bytes += blob_bytes;
+                        blob_labels[bkey].push_back(label);
+                    });
 
                 ++refs_walked;
                 checkDeadline(deadline, "walking refs");
@@ -927,7 +932,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 {
                     const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
                     for (const ManifestEntry & e : body.entries)
-                        if (e.placement == EntryPlacement::Blob)
+                        if (e.placement == EntryPlacement::Blob || e.placement == EntryPlacement::Chunked)
                             live_source_ids.insert(sourceEdgeId(*id, e.path));
                 }
                 catch (...)

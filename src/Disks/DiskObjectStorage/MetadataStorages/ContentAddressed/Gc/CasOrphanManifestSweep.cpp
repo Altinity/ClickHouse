@@ -962,11 +962,14 @@ ManifestSweepResult planManifestCursorPage(
             .key = candidate.key,
             .token = PersistedEtag::capture(got->etag),
             .source_retirements = {}};
+        /// One retirement per referenced blob, so a `Chunked` entry retires every chunk's edge.
         for (const ManifestEntry & entry : body->entries)
-            if (entry.placement == EntryPlacement::Blob)
+            forEachEntryBlobRef(entry, [&](const BlobRef & blob_ref, uint64_t)
+            {
                 nomination.source_retirements.push_back(BlobSourceRetirement{
-                    .ref = entry.ref,
+                    .ref = blob_ref,
                     .source_id = sourceEdgeId(id, entry.path)});
+            });
         result.nominations.push_back(std::move(nomination));
     }
 
