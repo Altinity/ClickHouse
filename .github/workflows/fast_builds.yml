@@ -1401,12 +1401,11 @@ jobs:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        uses: actions/checkout@v6
         with:
-          clear-repository: true
+          clean: true
       - name: Finalize workflow report
         if: ${{ !cancelled() }}
         uses: ./.github/actions/create_workflow_report
         with:
-          workflow_config: ${{ toJson(needs) }}
           final: true

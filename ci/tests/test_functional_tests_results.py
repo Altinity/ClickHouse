@@ -188,7 +188,7 @@ def test_hung_check_no_failures_reports_liveness_leaf_not_server_died(tmp_path):
     assert len(leaves) == 1
     assert leaves[0].status == Result.Status.FAIL
     assert not _named(result, "Server died")
-    assert result.info == "Failed: 0, Passed: 3, Skipped: 0"
+    assert result.info == "Failed: 0, Passed: 3, Skipped: 0, Broken: 0"
 
 
 def test_hung_check_two_failures_still_demoted_to_unknown(tmp_path):

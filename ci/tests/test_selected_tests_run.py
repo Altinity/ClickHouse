@@ -252,7 +252,7 @@ _NO_TESTS_OUTPUT = (
 
 def _process(tmp_path, output, runner_exit_code, allow_no_tests):
     (tmp_path / "test_result.txt").write_text(output, encoding="utf-8")
-    return FTResultsProcessor(wd=str(tmp_path)).run(
+    return FTResultsProcessor(wd=str(tmp_path), test_options=[]).run(
         runner_exit_code=runner_exit_code, allow_no_tests=allow_no_tests
     )
 
@@ -348,7 +348,7 @@ def test_pr_workflow_keeps_full_suite_msan_wasmedge_functional_tests():
             for marker in ("selected tests", "flaky check", "targeted", "azure")
         ), f"full-suite sanitizer functional test job in the PR workflow: {name}"
 
-    assert len(full_suite_msan_wasmedge_jobs) == 5
+    assert len(full_suite_msan_wasmedge_jobs) == 10
     assert not any("selected tests" in name for name in full_suite_msan_wasmedge_jobs)
 
     selected_test_jobs = [

@@ -55,7 +55,7 @@ jobs:
       build_dir: ${{ env.BUILD_DIR }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run script
         run: |
@@ -309,7 +309,7 @@ jobs:
           arch: arm64
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Altinity/ClickHouse
           path: ClickHouse
