@@ -342,6 +342,12 @@ native TCP connection authenticates once during the handshake, so a long-running
 `clickhouse-client --jwt` session keeps presenting the token it connected with and must reconnect
 to pick up a fresh one.
 
+With `async_insert=1`, the queued batch retains the verified token until its flush finishes,
+even if the originating session has already ended with `wait_for_async_insert=0`. The flush
+uses that token to access the catalog. Inserts authenticated with different tokens are placed
+in separate batches, including when the same user rotates their token; rotation does not
+replace the token of an already queued batch.
+
 ## Enabling token authentication for a user in `users.xml` {#enabling-jwt-auth-in-users-xml}
 
 In order to enable token-based authentication for the user, specify `jwt` section instead of `password` or other similar sections in the user definition.

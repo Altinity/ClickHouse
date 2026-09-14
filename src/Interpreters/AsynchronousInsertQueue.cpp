@@ -126,6 +126,7 @@ AsynchronousInsertQueue::InsertQuery::InsertQuery(
     const String & current_user_,
     const String & initial_user_,
     const String & authenticated_user_,
+    const ForwardedAuthTokenPtr & forwarded_auth_token_,
     const Settings & settings_,
     AsynchronousInsertQueueDataKind data_kind_)
     : query(query_->clone())
@@ -135,8 +136,10 @@ AsynchronousInsertQueue::InsertQuery::InsertQuery(
     , current_user(current_user_)
     , initial_user(initial_user_)
     , authenticated_user(authenticated_user_)
+    , forwarded_auth_token(forwarded_auth_token_)
     , settings(std::make_unique<Settings>(settings_))
     , data_kind(data_kind_)
+    , forwarded_auth_token_fingerprint(forwarded_auth_token ? forwarded_auth_token->fingerprint : String{})
 {
     SipHash siphash;
 
@@ -159,6 +162,10 @@ AsynchronousInsertQueue::InsertQuery::InsertQuery(
         siphash.update(identity_field.size());
         siphash.update(identity_field);
     }
+
+    /// A rotated token must start a separate batch even when the authenticated user is unchanged.
+    siphash.update(forwarded_auth_token_fingerprint.size());
+    siphash.update(forwarded_auth_token_fingerprint);
 
     setting_changes = settings->changes();
     for (auto it = setting_changes.begin(); it != setting_changes.end();)
@@ -187,6 +194,8 @@ AsynchronousInsertQueue::InsertQuery::InsertQuery(const InsertQuery & other)
     current_user = other.current_user;
     initial_user = other.initial_user;
     authenticated_user = other.authenticated_user;
+    forwarded_auth_token = other.forwarded_auth_token;
+    forwarded_auth_token_fingerprint = other.forwarded_auth_token_fingerprint;
     settings = std::make_unique<Settings>(*other.settings);
     data_kind = other.data_kind;
     hash = other.hash;
@@ -205,6 +214,8 @@ AsynchronousInsertQueue::InsertQuery::operator=(const InsertQuery & other)
         current_user = other.current_user;
         initial_user = other.initial_user;
         authenticated_user = other.authenticated_user;
+        forwarded_auth_token = other.forwarded_auth_token;
+        forwarded_auth_token_fingerprint = other.forwarded_auth_token_fingerprint;
         settings = std::make_unique<Settings>(*other.settings);
         data_kind = other.data_kind;
         hash = other.hash;
@@ -560,6 +571,7 @@ AsynchronousInsertQueue::PushResult AsynchronousInsertQueue::pushDataChunk(ASTPt
         client_info.current_user,
         client_info.initial_user,
         client_info.authenticated_user,
+        query_context->getForwardedAuthToken(),
         settings,
         data_kind};
     InsertDataPtr data_to_process;
@@ -1015,6 +1027,7 @@ try
     insert_context->setCurrentUserName(key.current_user);
     insert_context->setInitialUserName(key.initial_user);
     insert_context->setAuthenticatedUserName(key.authenticated_user);
+    insert_context->setForwardedAuthToken(key.forwarded_auth_token);
 
     insert_context->setSettings(*key.settings);
 

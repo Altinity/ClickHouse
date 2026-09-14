@@ -26,10 +26,8 @@ from helpers.config_cluster import minio_access_key, minio_secret_key
 SECRET = "datalake_token_forwarding_secret"
 BASE_URL = "http://rest:8181/v1"
 CATALOG_NAME = "demo"
-# `async_insert` defaults to 1 here, and an asynchronous insert is flushed from a background queue
-# whose context carries no forwarded token, so it can only ever fail closed against a forwarding
-# database. These tests are about the synchronous commit in `IcebergStorageSink`, which is the path
-# `docs/en/engines/database-engines/datalake.md` describes, so they pin the setting off.
+# Keep ordinary write tests synchronous; the async tests below explicitly enable the queue
+# to verify that its flush context retains the authenticated token.
 WRITE_SETTINGS = {
     "allow_insert_into_iceberg": 1,
     "write_full_path_in_iceberg_metadata": 1,
@@ -540,6 +538,38 @@ def test_insert_reaches_the_catalog_as_the_querying_user(started_cluster):
     assert (
         query_with_token(node, token, f"SELECT x FROM {CATALOG_NAME}.`{namespace}.{table}`").strip()
         == "written by the token user"
+    )
+
+
+@pytest.mark.parametrize("wait_for_async_insert", [0, 1])
+def test_async_insert_retains_the_querying_user_token(started_cluster, wait_for_async_insert):
+    """A queued `INSERT` must retain its token after the originating HTTP request finishes."""
+    node = started_cluster.instances["node1"]
+    namespace, table = write_fixture(started_cluster, node)
+    token = make_token("async_writer")
+    query_id = f"async-insert-{uuid.uuid4()}"
+    settings = {
+        **WRITE_SETTINGS,
+        "async_insert": 1,
+        "wait_for_async_insert": wait_for_async_insert,
+        "async_insert_use_adaptive_busy_timeout": 0,
+        "async_insert_busy_timeout_ms": 100 if wait_for_async_insert else 60000,
+    }
+    query_with_token(
+        node,
+        token,
+        f"INSERT INTO {CATALOG_NAME}.`{namespace}.{table}` VALUES ('written asynchronously')",
+        params={"query_id": query_id, **settings},
+    )
+
+    if not wait_for_async_insert:
+        # The session has ended before an administrator without a token triggers the flush.
+        node.query("SYSTEM FLUSH ASYNC INSERT QUEUE")
+
+    assert profile_event(node, query_id, "AsyncInsertQuery") == 1
+    assert (
+        query_with_token(node, token, f"SELECT x FROM {CATALOG_NAME}.`{namespace}.{table}`").strip()
+        == "written asynchronously"
     )
 
 
