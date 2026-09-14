@@ -462,12 +462,12 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
 
     /// Rule 2 (residency). Direct slot lookup, never a catalog observation or exact-runtime acquisition:
     /// a read-only query must not let a peer grow this writer's cache or make the next reader pay for a
-    /// recovery it invented. A namespace this mount has never opened has no slot; one it dropped under
-    /// the whole-table cache budget (`enforceRefTableCacheBudget`) erases the slot the same way, so the
-    /// two arms below see identical map state and are counted under one event: what a field `Unknown`
-    /// needs to separate is residency from this mount being unable to speak for a table it DOES hold
-    /// (`MountCannotSpeak`, below), not cold from evicted. The second arm is kept as the safe answer in
-    /// case a future eviction path ever leaves a slot behind with its runtime released.
+    /// recovery it invented. Several unrelated events can leave this mount with no slot for the
+    /// namespace, and they all reach the same map state here, so the two arms below are counted under
+    /// one event: what a field `Unknown` needs to separate is residency from this mount being unable to
+    /// speak for a table it DOES hold (`MountCannotSpeak`, below), not one absence cause from another.
+    /// The second arm is kept as the safe answer in case a future path ever leaves a slot behind with
+    /// its runtime released rather than erasing the slot outright.
     const auto it = ref_name_slots.find(ns.string());
     if (it == ref_name_slots.end())
         return refuse(ProfileEvents::CASRelinkConfirmRefusedTableNotResident,
