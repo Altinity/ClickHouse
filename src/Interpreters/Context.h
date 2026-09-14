@@ -15,6 +15,7 @@
 #include <IO/WriteSettings.h>
 #include <Disks/IO/getThreadPoolReader.h>
 #include <Formats/FormatSettings.h>
+#include <Access/ForwardedAuthToken.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
@@ -361,6 +362,13 @@ protected:
     ContextSharedPart * shared{};
 
     ClientInfo client_info;
+    /// The bearer token this session authenticated with, kept so it can be forwarded to an
+    /// external service on the user's behalf (see `ForwardedAuthToken`). Populated only when the
+    /// server-level `enable_token_forwarding` setting is on and the credentials were a
+    /// `TokenCredentials`. Unlike `client_info` it has no `read`/`write` and is a member of no
+    /// serialized struct, so by construction it can never reach the interserver wire or the
+    /// persisted async-`Distributed`-insert header.
+    ForwardedAuthTokenPtr forwarded_auth_token;
     ExternalTablesInitializer external_tables_initializer_callback;
     QueryPlanDeserializationCallback query_plan_deserialization_callback;
 
@@ -968,6 +976,10 @@ public:
 
     /// Modify stored in the context information about the client executing a query.
     void setClientInfo(const ClientInfo & client_info_);
+
+    /// The token this session authenticated with, or nullptr when there is none to forward.
+    const ForwardedAuthTokenPtr & getForwardedAuthToken() const { return forwarded_auth_token; }
+    void setForwardedAuthToken(ForwardedAuthTokenPtr token);
     void setClientName(const String & client_name);
     void setClientInterface(ClientInfo::Interface interface);
     void setClientVersion(UInt64 client_version_major, UInt64 client_version_minor, UInt64 client_version_patch, unsigned client_tcp_protocol_version);

@@ -3,6 +3,7 @@
 
 #if USE_AVRO && USE_PARQUET
 
+#include <Access/ForwardedAuthToken.h>
 #include <Databases/DataLake/DataLakeConstants.h>
 #include <Databases/DatabasesCommon.h>
 #include <Databases/DataLake/DatabaseDataLakeSettings.h>
@@ -51,7 +52,7 @@ public:
 
     Strings getAllTableNames(ContextPtr context) const override;
 
-    void checkDatabase() const override;
+    void checkDatabase(ContextPtr context) const override;
 
     void shutdown() override {}
 
@@ -91,6 +92,13 @@ private:
     mutable std::shared_ptr<DataLake::ICatalog> catalog_impl TSA_GUARDED_BY(catalog_mutex);
 
     void validateSettings();
+
+    /// Rejects `oauth_forward_user_token` combinations that could not be honoured, or that would
+    /// be silently ignored. Runs on CREATE and on ATTACH.
+    void validateTokenForwardingSettings() const;
+
+    /// The token carried by a query context, or `{}` when there is none (or no context at all).
+    static DB::ForwardedAuthTokenPtr getForwardedAuthToken(const ContextPtr & context_);
 
     /// Builds `catalog_impl` based on the configured catalog type. Constructing a catalog can
     /// validate credentials and perform network I/O (e.g. RestCatalog reads the catalog config),

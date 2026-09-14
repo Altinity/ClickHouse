@@ -27,11 +27,13 @@ public:
 
     ~UnityCatalog() override = default;
 
-    bool empty() const override;
+    /// Unity catalog authenticates with its own configured credential; the user's token is
+    /// accepted and ignored so that "this catalog does not forward" is visible at every call site.
+    bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    DB::Names getTables() const override;
+    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool existsTable(const std::string & schema_name, const std::string & table_name) const override;
+    bool existsTable(const std::string & schema_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
         const std::string & namespace_name,
@@ -82,7 +84,8 @@ private:
         const std::string & table_name,
         TableMetadata & result) const;
 
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & table_id) override;
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & table_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
 };
 
 }

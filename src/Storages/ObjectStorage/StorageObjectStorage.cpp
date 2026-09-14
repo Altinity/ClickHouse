@@ -158,6 +158,7 @@ StorageObjectStorage::StorageObjectStorage(
     , is_table_function(is_table_function_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
     , catalog(catalog_)
+    , catalog_auth_token(context ? context->getForwardedAuthToken() : DB::ForwardedAuthTokenPtr{})
     , storage_id(table_id_)
     , background_operations_assignee(*this, table_id_, BackgroundJobsAssignee::Type::DataProcessing, Context::getGlobalContextInstance())
 {
@@ -1000,7 +1001,7 @@ void StorageObjectStorage::drop()
     if (catalog)
     {
         const auto [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        catalog->dropTable(namespace_name, table_name);
+        catalog->dropTable(namespace_name, table_name, catalog_auth_token);
     }
     /// We cannot use query context here, because drop is executed in the background.
     configuration->drop(Context::getGlobalContextInstance());

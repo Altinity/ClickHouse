@@ -408,7 +408,7 @@ public:
         return database_name;
     }
 
-    virtual void checkDatabase() const
+    virtual void checkDatabase(ContextPtr /*context*/) const
     {
         //No-op
     }

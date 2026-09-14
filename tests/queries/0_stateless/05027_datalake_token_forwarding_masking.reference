@@ -1,0 +1,19 @@
+-- secrets stay hidden
+0
+0
+catalog_credential = '[HIDDEN]'
+-- forwarding settings stay visible
+oauth_forward_user_token = 1
+oauth_forward_actor_token = 1
+oauth_user_token_cache_ttl = 120
+openid-connect/token
+-- the same after a detach/attach round trip
+oauth_forward_user_token = 1
+0
+-- rejected combinations
+cannot be combined with `auth_header`
+only supported for `catalog_type = 'rest'`
+requires a non-empty `catalog_credential`
+has no effect without `oauth_forward_user_token = 1`
+has no effect without `oauth_token_exchange_uri`
+must be one of the token type URNs defined by RFC 8693
