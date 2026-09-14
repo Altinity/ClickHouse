@@ -718,8 +718,7 @@ MultiVersion<AccessToken>::Version RestCatalog::publishServiceToken(AccessToken 
     return result;
 }
 
-String RestCatalog::getForwardedToken(
-    const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const
+void RestCatalog::validateForwardedToken(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     /// Re-read the server-level switch on every forwarded request instead of trusting the decision
     /// `Session::authenticate` made once. `enable_token_forwarding` is hot-reloadable
@@ -761,6 +760,12 @@ String RestCatalog::getForwardedToken(
             "`enable_token_forwarding` setting is on, or recreate the database without "
             "`oauth_forward_user_token`.",
             warehouse);
+}
+
+String RestCatalog::getForwardedToken(
+    const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const
+{
+    validateForwardedToken(auth_token);
 
     /// Passthrough: the user's token is presented to the catalog unchanged. Nothing is cached --
     /// the token arrives with every request anyway.
@@ -804,7 +809,8 @@ String RestCatalog::getForwardedToken(
 }
 
 AccessToken RestCatalog::exchangeUserToken(
-    const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token) const
+    const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token,
+    const AccessToken * prepared_actor_token) const
 {
     TokenRequest request;
     request.grant = TokenRequest::Grant::TokenExchange;
@@ -824,7 +830,7 @@ AccessToken RestCatalog::exchangeUserToken(
     /// enabling the setting was meant to prevent.
     if (token_forwarding.forward_actor_token)
     {
-        request.actor_token = getServicePrincipalToken(catalog_state, generation);
+        request.actor_token = prepared_actor_token ? prepared_actor_token->token : getServicePrincipalToken(catalog_state, generation);
         request.actor_token_type = "urn:ietf:params:oauth:token-type:access_token";
     }
 
@@ -942,12 +948,15 @@ void RestCatalog::validateSettingsChanges(const DB::SettingsChanges & changes, b
 struct RestCatalog::PreparedAuthChanges : ICatalog::PreparedSettingsChanges
 {
     std::unique_ptr<const CatalogState> new_state;
-    /// Set only when the OAuth credentials changed.
+    /// A service token prepared with the proposed credentials, when required for authentication or delegation.
     std::unique_ptr<AccessToken> new_access_token;
 };
 
-ICatalog::PreparedSettingsChangesPtr RestCatalog::prepareSettingsChanges(const DB::SettingsChanges & changes)
+ICatalog::PreparedSettingsChangesPtr RestCatalog::prepareSettingsChanges(
+    const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token)
 {
+    if (token_forwarding.forward_user_token)
+        validateForwardedToken(auth_token);
     const auto old_state = getStateSnapshot();
     CatalogState new_state = *old_state;
 
@@ -955,9 +964,26 @@ ICatalog::PreparedSettingsChangesPtr RestCatalog::prepareSettingsChanges(const D
     std::optional<DB::HTTPHeaderEntries> new_auth_headers;
     applySettingsChangesToState(changes, *old_state, new_state, new_auth_headers, prepared->new_access_token);
 
+    if (token_forwarding.forward_user_token)
+    {
+        /// The proposed credentials do not belong to any published generation yet. Exchange
+        /// directly, without reading or populating the live user cache: preparation may fail
+        /// or be abandoned, and concurrent queries must keep using the committed credentials.
+        if (token_forwarding.exchangeEnabled())
+        {
+            if (token_forwarding.forward_actor_token && !prepared->new_access_token)
+                prepared->new_access_token = std::make_unique<AccessToken>(retrieveAccessToken(new_state.client_id, new_state.client_secret));
+            const auto session = exchangeUserToken(new_state, old_state.generation, *auth_token, prepared->new_access_token.get());
+            new_auth_headers = DB::HTTPHeaderEntries{{"Authorization", "Bearer " + session.token}};
+        }
+        else
+            new_auth_headers = DB::HTTPHeaderEntries{{"Authorization", "Bearer " + auth_token->token}};
+    }
+
     /// The config was loaded with the old credentials; the new ones may resolve the
     /// warehouse to a different prefix or base location, so reload it before publishing.
-    new_state.config = loadConfig(new_state, old_state.generation, /* auth_token */ {}, new_auth_headers);
+    new_state.config = loadConfig(new_state, old_state.generation, auth_token, new_auth_headers);
+    new_state.config_loaded = true;
     prepared->new_state = std::make_unique<const CatalogState>(std::move(new_state));
     return prepared;
 }
@@ -1024,11 +1050,11 @@ void RestCatalog::applySettingsChangesToState(
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Unexpected setting `{}` after validation", change.name);
     }
 
-    if (credential_mode && (new_state.client_id != old_state.client_id || new_state.client_secret != old_state.client_secret))
+    if (credential_mode && (!token_forwarding.forward_user_token || token_forwarding.forward_actor_token)
+        && (new_state.client_id != old_state.client_id || new_state.client_secret != old_state.client_secret))
     {
-        /// Eagerly fetch a token with the not-yet-published credentials: wrong credentials
-        /// fail the ALTER right here, and the config reload authenticates with that token
-        /// instead of the cached one.
+        /// Validate the proposed credentials without publishing the token. Under forwarding
+        /// this token is used only as the exchange actor; otherwise it signs the config reload.
         new_access_token = std::make_unique<AccessToken>(retrieveAccessToken(new_state.client_id, new_state.client_secret));
         new_auth_headers = DB::HTTPHeaderEntries{{"Authorization", "Bearer " + new_access_token->token}};
     }

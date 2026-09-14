@@ -374,7 +374,8 @@ void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*tab
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "dropTable is not implemented");
 }
 
-ICatalog::PreparedSettingsChangesPtr ICatalog::prepareSettingsChanges(const DB::SettingsChanges & /*changes*/)
+ICatalog::PreparedSettingsChangesPtr ICatalog::prepareSettingsChanges(
+    const DB::SettingsChanges & /*changes*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Settings of a catalog of this type cannot be altered");
 }

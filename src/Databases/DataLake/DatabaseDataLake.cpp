@@ -1086,7 +1086,7 @@ void DatabaseDataLake::checkDatabase(ContextPtr context_) const
     LOG_TEST(log, "Database '{}' is OK", getDatabaseName());
 }
 
-void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_changes, ContextPtr /*query_context*/)
+void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_changes, ContextPtr query_context)
 {
     const auto current_settings = database_settings.get();
 
@@ -1135,7 +1135,7 @@ void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_cha
     /// fetch and the config reload may throw, and then nothing has changed yet.
     DataLake::ICatalog::PreparedSettingsChangesPtr prepared_catalog_changes;
     if (local_catalog_snapshot)
-        prepared_catalog_changes = local_catalog_snapshot->prepareSettingsChanges(settings_changes);
+        prepared_catalog_changes = local_catalog_snapshot->prepareSettingsChanges(settings_changes, getForwardedAuthToken(query_context));
 
     /// Persist the new metadata before publishing anything: if the write fails, the live
     /// state is untouched and matches the old metadata on disk. The create query is built

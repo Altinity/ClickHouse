@@ -265,7 +265,8 @@ public:
         return StateSnapshot{generation, state.get()};
     }
 
-    ICatalog::PreparedSettingsChangesPtr prepareSettingsChanges(const DB::SettingsChanges & changes) override;
+    ICatalog::PreparedSettingsChangesPtr prepareSettingsChanges(
+        const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token = {}) override;
 
     void commitSettingsChanges(ICatalog::PreparedSettingsChangesPtr prepared) override;
 
@@ -437,6 +438,8 @@ protected:
 
     virtual DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const;
 
+    void validateForwardedToken(const DB::ForwardedAuthTokenPtr & auth_token) const;
+
     /// The user's own token, or the session token obtained by exchanging it, depending on whether
     /// `oauth_token_exchange_uri` is set. Throws `CATALOG_USER_TOKEN_NOT_AVAILABLE` when there is
     /// no token, and also when the hot-reloadable server-level `enable_token_forwarding` setting
@@ -481,7 +484,8 @@ protected:
     /// RFC 8693 exchange of the user's token for a catalog session token, against
     /// `oauth_token_exchange_uri`.
     AccessToken exchangeUserToken(
-        const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token) const;
+        const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token,
+        const AccessToken * prepared_actor_token = nullptr) const;
 
     AccessToken retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const;
 
@@ -494,9 +498,9 @@ protected:
 
     /// Hook for `prepareSettingsChanges`: validate `changes` and apply them to `new_state`,
     /// building the new auth artifacts, without publishing anything. When the OAuth
-    /// credentials change, the eagerly fetched token goes into `new_access_token` and
-    /// `new_auth_headers`, so that wrong credentials fail the ALTER right here and the
-    /// config reload authenticates with the new token instead of the cached one.
+    /// credentials change, a service token is fetched only for service authentication or
+    /// delegation. With forwarding, `prepareSettingsChanges` validates the credentials by
+    /// exchanging the caller's token and authenticates the config reload as that caller.
     virtual void applySettingsChangesToState(
         const DB::SettingsChanges & changes,
         const CatalogState & old_state,

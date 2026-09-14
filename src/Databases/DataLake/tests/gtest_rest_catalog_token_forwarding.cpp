@@ -629,8 +629,6 @@ TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAnd
     TestServer server;
     installCatalogShape(*server);
     installTokenEndpoint(*server, IDP_TOKEN_PATH);
-    /// The eager `client_credentials` fetch the ALTER makes with the not-yet-published credentials.
-    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
     server->setStaticRoute(TABLE_PATH, loadTableResponse("AKIA_VENDED"));
 
     auto alice = makeToken(ALICE_TOKEN, "alice");
@@ -668,15 +666,211 @@ TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAnd
 
     DB::SettingsChanges changes;
     changes.emplace_back("catalog_credential", "client:rotated_secret");
-    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes));
+    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes, alice));
 
     load();
     EXPECT_EQ(vending_requests(), 2u);
 
     const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
-    ASSERT_EQ(exchanges.size(), 2u);
+    ASSERT_EQ(exchanges.size(), 3u);
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
     /// Re-exchanged, and with the rotated secret rather than the one it replaced.
     EXPECT_EQ(parseForm(exchanges.back().body).at("client_secret"), "rotated_secret");
+}
+
+
+TEST_F(RestCatalogTokenForwarding, CredentialRotationValidatesAsCallerWithoutPublishingTokens)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    server->setRoute(IDP_TOKEN_PATH, [](const RecordedRequest & request)
+    {
+        const auto form = parseForm(request.body);
+        return json(fmt::format(R"({{"access_token":"{}_{}","expires_in":3600}})",
+            form.at("client_secret"), form.at("subject_token")));
+    });
+    server->setRoute(CONFIG_PATH, [](const RecordedRequest & request)
+    {
+        if (request.header("Authorization") != std::string("Bearer rotated_secret_") + ALICE_TOKEN)
+            return respondWithStatus(403);
+        return json(R"({"defaults":{},"overrides":{}})");
+    });
+
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto bob = makeToken(BOB_TOKEN, "bob");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    auto prepared = catalog->prepareSettingsChanges(changes, alice);
+
+    ASSERT_EQ(server->countRequestsTo(CONFIG_PATH), 1u);
+    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+
+    /// Preparing a rotation must not publish either its state or its user token. The first
+    /// query still loads the old configuration and authenticates with the old credentials.
+    server->setStaticRoute(CONFIG_PATH, R"({"defaults":{},"overrides":{}})");
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    EXPECT_EQ(server->requestsTo(CONFIG_PATH).back().header("Authorization"), std::string("Bearer secret_") + ALICE_TOKEN);
+    ASSERT_EQ(catalog->getTables(bob), DB::Names{"ns.t"});
+    EXPECT_EQ(parseForm(server->requestsTo(IDP_TOKEN_PATH).back().body).at("client_secret"), "secret");
+
+    catalog->commitSettingsChanges(std::move(prepared));
+    server->clearRequests();
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    /// The prepared config was already loaded; the first query must not load it again.
+    EXPECT_EQ(server->countRequestsTo(CONFIG_PATH), 0u);
+    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    EXPECT_EQ(parseForm(server->requestsTo(IDP_TOKEN_PATH).front().body).at("client_secret"), "rotated_secret");
+    for (const auto & request : server->requestsTo(NAMESPACES_PATH))
+        EXPECT_EQ(request.header("Authorization"), std::string("Bearer rotated_secret_") + ALICE_TOKEN);
+}
+
+TEST_F(RestCatalogTokenForwarding, RejectedCredentialRotationPreservesCommittedAuthentication)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    server->setRoute(IDP_TOKEN_PATH, [](const RecordedRequest & request)
+    {
+        if (parseForm(request.body).at("client_secret") != "secret")
+            return respondWithStatus(401);
+        return json(R"({"access_token":"old_session","expires_in":3600})");
+    });
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    server->clearRequests();
+
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rejected_secret");
+    EXPECT_THROW(catalog->prepareSettingsChanges(changes, alice), DB::Exception);
+    EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    EXPECT_EQ(server->countRequestsTo(CONFIG_PATH), 0u);
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    for (const auto & request : server->requestsTo(NAMESPACES_PATH))
+        EXPECT_EQ(request.header("Authorization"), "Bearer old_session");
+}
+
+TEST_F(RestCatalogTokenForwarding, RejectedConfigReloadDoesNotPublishPreparedUserSession)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    server->setRoute(IDP_TOKEN_PATH, [](const RecordedRequest & request)
+    {
+        return json(fmt::format(R"({{"access_token":"{}_session","expires_in":3600}})", parseForm(request.body).at("client_secret")));
+    });
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    server->clearRequests();
+    server->setRoute(CONFIG_PATH, [](const RecordedRequest &) { return respondWithStatus(403); });
+
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    EXPECT_THROW(catalog->prepareSettingsChanges(changes, alice), DB::Exception);
+    ASSERT_EQ(server->countRequestsTo(CONFIG_PATH), 1u);
+    EXPECT_EQ(server->requestsTo(CONFIG_PATH).front().header("Authorization"), "Bearer rotated_secret_session");
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    for (const auto & request : server->requestsTo(NAMESPACES_PATH))
+        EXPECT_EQ(request.header("Authorization"), "Bearer secret_session");
+}
+
+TEST_F(RestCatalogTokenForwarding, PassthroughCredentialRotationReloadsConfigWithUserToken)
+{
+    TestServer server;
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, passthrough(), "client:secret");
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    catalog->applySettingsChanges(changes, alice);
+
+    ASSERT_EQ(server->countRequestsTo(CONFIG_PATH), 1u);
+    EXPECT_EQ(server->requestsTo(CONFIG_PATH).front().header("Authorization"), std::string("Bearer ") + ALICE_TOKEN);
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+    EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 0u);
+}
+
+TEST_F(RestCatalogTokenForwarding, UnchangedCredentialStillReloadsConfigAsCaller)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    server->clearRequests();
+
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:secret");
+    catalog->applySettingsChanges(changes, alice);
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    ASSERT_EQ(server->countRequestsTo(CONFIG_PATH), 1u);
+    EXPECT_EQ(server->requestsTo(CONFIG_PATH).front().header("Authorization"), "Bearer session_token_1");
+}
+
+TEST_F(RestCatalogTokenForwarding, CredentialRotationRequiresForwardingAndCallerToken)
+{
+    TestServer server;
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    for (bool enabled : {true, false})
+    {
+        TokenForwardingSwitch::set(enabled);
+        try
+        {
+            catalog->prepareSettingsChanges(changes, enabled ? DB::ForwardedAuthTokenPtr{} : alice);
+            FAIL() << "expected credential rotation to require an enabled forwarding policy and caller token";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE);
+        }
+    }
+    EXPECT_TRUE(server->requests().empty());
+}
+
+TEST_F(RestCatalogTokenForwarding, CredentialRotationUsesNewActorOnlyForDelegation)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    server->setRoute(CATALOG_TOKEN_PATH, [](const RecordedRequest & request)
+    {
+        return json(fmt::format(R"({{"access_token":"actor_{}","expires_in":3600}})", parseForm(request.body).at("client_secret")));
+    });
+    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+    auto alice = makeToken(ALICE_TOKEN, "alice");
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(
+        server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH, /* cache_ttl */ 300, /* actor */ true), "client:secret");
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    server->clearRequests();
+
+    DB::SettingsChanges changes;
+    changes.emplace_back("catalog_credential", "client:rotated_secret");
+    catalog->applySettingsChanges(changes, alice);
+    ASSERT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 1u);
+    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    EXPECT_EQ(parseForm(server->requestsTo(IDP_TOKEN_PATH).front().body).at("actor_token"), "actor_rotated_secret");
+    EXPECT_EQ(server->requestsTo(CONFIG_PATH).front().header("Authorization"), "Bearer session_token_1");
+
+    server->clearRequests();
+    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
+    EXPECT_EQ(parseForm(server->requestsTo(IDP_TOKEN_PATH).front().body).at("actor_token"), "actor_rotated_secret");
 }
 
 
@@ -787,7 +981,7 @@ TEST_F(RestCatalogTokenForwarding, InFlightVendedCredentialsDoNotOutliveTheirGen
 
     DB::SettingsChanges changes;
     changes.emplace_back("catalog_credential", "client:rotated_secret");
-    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes));
+    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes, alice));
 
     parked.release();
     in_flight.join();
@@ -887,7 +1081,7 @@ TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentia
 
     DB::SettingsChanges changes;
     changes.emplace_back("catalog_credential", "client:rotated_secret");
-    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes));
+    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes, alice));
 
     parked.release();
     in_flight.join();

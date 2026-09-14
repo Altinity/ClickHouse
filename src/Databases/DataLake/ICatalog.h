@@ -288,14 +288,15 @@ public:
     /// state without publishing anything (may throw, may do network I/O). The state
     /// becomes visible only after `commitSettingsChanges`, so the caller can persist
     /// the changes in between and abandon the prepared state on failure.
-    virtual PreparedSettingsChangesPtr prepareSettingsChanges(const DB::SettingsChanges & changes);
+    virtual PreparedSettingsChangesPtr prepareSettingsChanges(
+        const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token = {});
 
     /// Publish the state built by `prepareSettingsChanges`. Must not fail.
     virtual void commitSettingsChanges(PreparedSettingsChangesPtr prepared);
 
-    void applySettingsChanges(const DB::SettingsChanges & changes)
+    void applySettingsChanges(const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token = {})
     {
-        commitSettingsChanges(prepareSettingsChanges(changes));
+        commitSettingsChanges(prepareSettingsChanges(changes, auth_token));
     }
 
 protected:

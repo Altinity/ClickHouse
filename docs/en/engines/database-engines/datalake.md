@@ -213,8 +213,11 @@ not issue for that purpose and will normally reject the whole exchange.
 - HTTP re-authenticates on every request, so a rotated token takes effect immediately. A native
   TCP connection authenticates once at handshake time, so a long-lived `clickhouse-client --jwt`
   session must reconnect to pick up a fresh token.
-- Catalog credentials cannot be rotated in place; changing them requires `DROP DATABASE` followed
-  by `CREATE DATABASE`.
+- Rotate `catalog_credential` in place with `ALTER DATABASE ... MODIFY SETTING`. With token
+  forwarding enabled, authenticate the statement with a user token. When token exchange is
+  configured, ClickHouse exchanges that token using the new credentials. It reloads the catalog
+  configuration as that user before applying the change. A successful rotation invalidates cached
+  session tokens and vended storage credentials.
 
 None of the forwarding settings hold a secret, so unlike `catalog_credential` they are shown in
 full by `SHOW CREATE DATABASE` and `system.databases.engine_full`.
