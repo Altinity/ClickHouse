@@ -3824,6 +3824,8 @@ try
 
             is_cancelled = true;
 
+            global_context->stopSwarmMode();
+
             LOG_DEBUG(log, "Waiting for current connections to close.");
 
             size_t current_connections = 0;
@@ -3959,127 +3961,6 @@ try
         systemdNotify("READY=1\n");
 #endif
 
-<<<<<<< HEAD
-=======
-        auto stop_acme_instance = []{
-#if USE_SSL
-            /// Stop ACME tasks.
-            ACME::Client::instance().shutdown();
-#endif
-        };
-
-        /// Wrapping the call to OOM canary stop in a lambda lets us write
-        /// the OS_LINUX guard outside the SCOPE_EXIT_SAFE macro argument list,
-        /// avoiding -Wembedded-directive.
-        auto stop_oom_canary = [&]{
-#if defined(OS_LINUX)
-            if (oom_canary)
-                oom_canary->stop();
-#endif
-        };
-
-        SCOPE_EXIT_SAFE({
-            const auto & logger_shutdown_level_setting = server_settings[ServerSetting::logger_shutdown_level];
-            if (logger_shutdown_level_setting.changed && !logger_shutdown_level_setting.value.empty())
-            {
-                /// Set the root logger level to the shutdown level.
-                /// This is useful for debugging shutdown issues.
-                config().setString("logger.level", logger_shutdown_level_setting.value);
-                Loggers::updateLevels(config(), logger());
-
-                LOG_INFO(log, "Set root logger in level {} before shutdown", logger_shutdown_level_setting.value);
-            }
-
-            if (config().has("logger.shutdown_console_log_level") && !config().getString("logger.shutdown_console_log_level").empty())
-            {
-                /// Set the root logger level to the shutdown level.
-                /// This is useful for debugging shutdown issues.
-                config().setString("logger.console_log_level", config().getString("logger.shutdown_console_log_level"));
-                Loggers::updateLevels(config(), logger());
-
-                LOG_INFO(log, "Set console logger in level {} before shutdown", config().getString("logger.shutdown_console_log_level"));
-            }
-
-            LOG_DEBUG(log, "Received termination signal.");
-
-            CurrentMetrics::set(CurrentMetrics::IsServerShuttingDown, 1);
-
-            /// Stop reloading of the main config. This must be done before everything else because it
-            /// can try to access/modify already deleted objects.
-            /// E.g. it can recreate new servers or it may pass a changed config to some destroyed parts of ContextSharedPart.
-            main_config_reloader.reset();
-            access_control.stopPeriodicReloading();
-
-            stop_acme_instance();
-
-            is_cancelled = true;
-
-            global_context->stopSwarmMode();
-
-            LOG_DEBUG(log, "Waiting for current connections to close.");
-
-            size_t current_connections = 0;
-            {
-                std::lock_guard lock(servers_lock);
-                for (auto & server : servers)
-                {
-                    server.stop();
-                    current_connections += server.currentConnections();
-                }
-            }
-
-            global_context->getRefreshSet().setRefreshesStopped(true);
-
-            if (current_connections)
-                LOG_WARNING(log, "Closed all listening sockets. Waiting for {} outstanding connections.", current_connections);
-            else
-                LOG_INFO(log, "Closed all listening sockets.");
-
-            /// Wait for unfinished backups and restores.
-            /// This must be done after closing listening sockets (no more backups/restores) but before ProcessList::killAllQueries
-            /// (because killAllQueries() will cancel all running backups/restores).
-            if (server_settings[ServerSetting::shutdown_wait_backups_and_restores])
-                global_context->waitAllBackupsAndRestores();
-            else
-                global_context->cancelAllBackupsAndRestores();
-
-            stop_oom_canary();
-
-            /// Killing remaining queries.
-            if (!server_settings[ServerSetting::shutdown_wait_unfinished_queries])
-                global_context->getProcessList().killAllQueries();
-
-            size_t wait_limit_seconds = server_settings[ServerSetting::shutdown_wait_unfinished];
-            auto wait_start = std::chrono::steady_clock::now();
-
-            if (current_connections)
-                current_connections = waitServersToFinish(servers, servers_lock, wait_limit_seconds);
-
-            if (current_connections)
-                LOG_WARNING(log, "Closed connections. But {} remain."
-                    " Tip: To increase wait time add to config: <shutdown_wait_unfinished>60</shutdown_wait_unfinished>", current_connections);
-            else
-                LOG_INFO(log, "Closed connections.");
-
-            bool joined_refresh_tasks = global_context->getRefreshSet().joinBackgroundTasks(wait_start + std::chrono::milliseconds(wait_limit_seconds * 1000));
-
-            dns_cache_updater.reset();
-
-            if (current_connections || !joined_refresh_tasks)
-            {
-                /// There is no better way to force connections to close in Poco.
-                /// Otherwise connection handlers will continue to live
-                /// (they are effectively dangling objects, but they use global thread pool
-                ///  and global thread pool destructor will wait for threads, preventing server shutdown).
-
-                /// Dump coverage here, because std::atexit callback would not be called.
-                dumpCoverageReportIfPossible();
-                LOG_WARNING(log, "Will shutdown forcefully.");
-                safeExit(0);
-            }
-        });
-
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
         std::vector<std::unique_ptr<MetricsTransmitter>> metrics_transmitters;
         for (const auto & graphite_key : DB::getMultipleKeysFromConfig(config(), "", "graphite"))
         {

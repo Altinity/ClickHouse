@@ -25,15 +25,10 @@ namespace ErrorCodes
 }
 
 RemoteQueryExecutorReadContext::RemoteQueryExecutorReadContext(
-<<<<<<< HEAD
-    RemoteQueryExecutor & executor_, bool suspend_when_query_sent_, bool read_packet_type_separately_)
-    : AsyncTaskExecutor(std::make_unique<Task>(*this), "RemoteQueryExecutorReadContext")
-=======
     RemoteQueryExecutor & executor_,
     bool suspend_when_query_sent_,
     bool read_packet_type_separately_)
-    : AsyncTaskExecutor(std::make_unique<Task>(*this))
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
+    : AsyncTaskExecutor(std::make_unique<Task>(*this), "RemoteQueryExecutorReadContext")
     , executor(executor_)
     , suspend_when_query_sent(suspend_when_query_sent_)
     , read_packet_type_separately(read_packet_type_separately_)

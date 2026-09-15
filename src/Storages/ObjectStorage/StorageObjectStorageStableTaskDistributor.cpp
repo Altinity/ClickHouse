@@ -249,9 +249,6 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
     {
         auto it = unprocessed_files.begin();
 
-<<<<<<< HEAD
-        auto file_path = getSchedulingIdentifier(next_file, send_over_whole_archive);
-=======
         while (it != unprocessed_files.end())
         {
             auto number_of_matched_replica = it->second.second;
@@ -264,7 +261,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                 auto next_file = it->second.first;
                 unprocessed_files.erase(it);
 
-                auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getPath();
+                auto file_path = getSchedulingIdentifier(next_file, send_over_whole_archive);
                 LOG_TRACE(
                     log,
                     "Iterator exhausted. Assigning unprocessed file {} to replica {} from matched replica {}",
@@ -281,7 +278,6 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
             ++it;
         }
 
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
         LOG_TRACE(
             log,
             "No unprocessed file for replica {}, need to retry after {} us",
@@ -327,8 +323,9 @@ void StorageObjectStorageStableTaskDistributor::rescheduleTasksFromReplica(size_
 
     for (const auto & file : processed_file_list_ptr->second)
     {
-        auto file_replica_idx = getReplicaForFile(file->getPath());
-        unprocessed_files.emplace(file->getPath(), std::make_pair(file, file_replica_idx));
+        auto file_identifier = getSchedulingIdentifier(file, send_over_whole_archive);
+        auto file_replica_idx = getReplicaForFile(file_identifier);
+        unprocessed_files.emplace(file_identifier, std::make_pair(file, file_replica_idx));
         connection_to_files[file_replica_idx].push_back(file);
     }
     replica_to_files_to_be_processed.erase(number_of_current_replica);

@@ -205,19 +205,8 @@ namespace Setting
     extern const SettingsBool table_engine_read_through_distributed_cache;
     extern const SettingsUInt64 s3_path_filter_limit;
     extern const SettingsBool use_parquet_metadata_cache;
-<<<<<<< HEAD
     extern const SettingsBool s3_validate_etag_on_read;
-=======
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
-}
-
-namespace ErrorCodes
-{
-    extern const int CANNOT_COMPILE_REGEXP;
-    extern const int BAD_ARGUMENTS;
-    extern const int LOGICAL_ERROR;
-    extern const int FILE_DOESNT_EXIST;
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
 }
 
 static void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & log)
@@ -701,7 +690,16 @@ Chunk StorageObjectStorageSource::generate()
                 read_context,
                 format_settings);
 
-<<<<<<< HEAD
+            /// Not empty when allow_experimental_iceberg_read_optimization=true
+            /// and some columns were removed from read list as columns with constant values.
+            /// Restore data for these columns.
+            for (const auto & constant_column : reader.constant_columns_with_values)
+            {
+                chunk.addColumn(constant_column.first,
+                    constant_column.second.name_and_type.type->createColumnConst(
+                        chunk.getNumRows(), constant_column.second.value));
+            }
+
             if (read_from_format_info.requested_virtual_columns.contains("_headers"))
             {
                 auto type = std::make_shared<DataTypeMap>(
@@ -758,16 +756,6 @@ Chunk StorageObjectStorageSource::generate()
                         row_index_column->size(), num_rows, object_info->getPath());
 
                 chunk.addColumn(std::move(row_index_column));
-=======
-            /// Not empty when allow_experimental_iceberg_read_optimization=true
-            /// and some columns were removed from read list as columns with constant values.
-            /// Restore data for these columns.
-            for (const auto & constant_column : reader.constant_columns_with_values)
-            {
-                chunk.addColumn(constant_column.first,
-                    constant_column.second.name_and_type.type->createColumnConst(
-                        chunk.getNumRows(), constant_column.second.value));
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
             }
 
 #if USE_PARQUET
@@ -1112,7 +1100,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         return schema_cache->tryGetNumRows(cache_key, get_last_mod_time);
     };
 
-<<<<<<< HEAD
     /// Row-level delete transformers need real row values: an equality-delete FilterTransform
     /// evaluates its predicate against column values, but the count-only fast path
     /// (`input_format->needOnlyCount()`) makes the format emit synthetic chunks filled with
@@ -1129,7 +1116,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     /// back to the metadata-probe headers (usually a `HEAD`), which can differ from the actual `GET`
     /// response. Skip the shortcut when `_headers` is requested so the real `GET` headers are used.
     const bool headers_requested = read_from_format_info.requested_virtual_columns.contains("_headers");
-=======
+
     /// List of columns with constant value in current file, and values
     std::map<size_t, ConstColumnWithValue> constant_columns_with_values;
     std::unordered_set<String> constant_columns;
@@ -1267,7 +1254,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 need_only_count = true;
         }
     }
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
 
     std::optional<size_t> num_rows_from_cache
         = need_only_count && !headers_requested && context_->getSettingsRef()[Setting::use_cache_for_count_from_files]

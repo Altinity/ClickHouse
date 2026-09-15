@@ -757,12 +757,9 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::processPacket(Packet packet
             /// will return earlier. We should consider doing it.
             if (!packet.block.empty() && (packet.block.rows() > 0))
             {
-<<<<<<< HEAD
                 got_data_from_replica = true;
-=======
                 if (extension && extension->replica_info)
                     replica_has_processed_data.insert(extension->replica_info->number_of_current_replica);
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
                 return ReadResult(adaptBlockStructure(packet.block, *header));
             }
             break;  /// If the block is empty - we will receive other packets before EndOfStream.

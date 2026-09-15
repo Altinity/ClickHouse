@@ -82,11 +82,8 @@ def started_cluster():
                 "configs/users.xml",
                 "configs/s3_retry.xml",
                 "configs/sync_insert.xml",
-<<<<<<< HEAD
                 "configs/allow_server_credentials.xml",
-=======
                 "configs/lock_object_storage_task_distribution_ms.xml",
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
             ],
         )
         cluster.add_instance(

@@ -254,16 +254,13 @@ struct RelativePathWithMetadata
         return std::filesystem::path(path_without_query).filename();
     }
     std::string getPath() const { return relative_path; }
-<<<<<<< HEAD
     std::string getPathForGlobMatching() const { return path_for_glob_matching.value_or(relative_path); }
-=======
 
     void setFileMetaInfo(std::optional<DataFileMetaInfoPtr> file_meta_info_ ) { file_meta_info = file_meta_info_; }
     std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
 
     const CommandInTaskResponse & getCommand() const { return command; }
     std::string getFileNameWithoutExtension() const { return std::filesystem::path(relative_path).stem(); }
->>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
 };
 
 struct ObjectKeyWithMetadata
