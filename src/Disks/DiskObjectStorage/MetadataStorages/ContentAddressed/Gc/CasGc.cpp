@@ -417,14 +417,7 @@ Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & 
     return io;
 }
 
-void Gc::applyRedeleteOutcome(
-    const RetiredEntry & entry,
-    const RedeleteIo & io,
-    uint64_t new_round,
-    uint64_t snap_generation,
-    GcRoundWorkBudget & round_work_budget,
-    RoundReport & report,
-    OutcomeLog & outcome_log)
+void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io)
 {
     if (const auto & hook = store->poolConfig().gc_redelete_apply_hook_for_test)
         hook(entry.ref);
@@ -442,8 +435,8 @@ void Gc::applyRedeleteOutcome(
             e.object_kind = CasEventObjectKind::Blob;
             e.object_hash = blobIdOf(entry.ref);
             e.token = renderIncarnation(entry.token);
-            e.round = new_round;
-            e.gen = snap_generation;
+            e.round = ctx.new_round;
+            e.gen = ctx.snap_generation;
             e.outcome = del_outcome;
             e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
             e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}, {"key", io.blob_key}};
@@ -451,12 +444,12 @@ void Gc::applyRedeleteOutcome(
     /// The audit row is observability only -- the delete in `performRedeleteIo` already executed
     /// regardless of this cap. Skipping it here bounds the per-shard `GcOutcomes` body without
     /// skipping or deferring any destructive work.
-    if (round_work_budget.outcomeEntryAvailable())
+    if (ctx.round_work_budget.outcomeEntryAvailable())
     {
-        outcome_log.entries.push_back(std::move(outcome));
-        ++round_work_budget.outcome_entries_used;
+        ctx.outcomes[ctx.shard].entries.push_back(std::move(outcome));
+        ++ctx.round_work_budget.outcome_entries_used;
     }
-    ++report.redeleted;
+    ++ctx.report.redeleted;
     ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
     /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
     /// writer already published a fresh incarnation at this hash, and that writer's own
@@ -471,15 +464,7 @@ void Gc::applyRedeleteOutcome(
     meta_writer->forgetCondemnMarker(entry.ref, entry.token);
 }
 
-void Gc::redeleteBlob(
-    const RetiredEntry & entry,
-    const Layout & layout,
-    CasOperation & op,
-    uint64_t new_round,
-    uint64_t snap_generation,
-    GcRoundWorkBudget & round_work_budget,
-    RoundReport & report,
-    OutcomeLog & outcome_log)
+void Gc::redeleteBlob(RedeleteRoundContext & ctx, const RetiredEntry & entry, const Layout & layout, CasOperation & op)
 {
     RedeleteIo io;
     try
@@ -495,25 +480,21 @@ void Gc::redeleteBlob(
             blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getCurrentExceptionMessage(false));
         throw;
     }
-    applyRedeleteOutcome(entry, io, new_round, snap_generation, round_work_budget, report, outcome_log);
+    applyRedeleteOutcome(ctx, entry, io);
 }
 
 void Gc::redeleteBlobs(
+    RedeleteRoundContext & ctx,
     const std::vector<RetiredEntry> & entries,
     ThreadPool & pool,
     size_t concurrency,
     const Layout & layout,
-    CasOperation & op,
-    uint64_t new_round,
-    uint64_t snap_generation,
-    GcRoundWorkBudget & round_work_budget,
-    RoundReport & report,
-    OutcomeLog & outcome_log)
+    CasOperation & op)
 {
     if (concurrency <= 1 || entries.size() <= 1)
     {
         for (const RetiredEntry & entry : entries)
-            redeleteBlob(entry, layout, op, new_round, snap_generation, round_work_budget, report, outcome_log);
+            redeleteBlob(ctx, entry, layout, op);
         return;
     }
 
@@ -589,7 +570,7 @@ void Gc::redeleteBlobs(
                 first_error = errors[i];
             continue;
         }
-        applyRedeleteOutcome(entries[i], io_results[i], new_round, snap_generation, round_work_budget, report, outcome_log);
+        applyRedeleteOutcome(ctx, entries[i], io_results[i]);
     }
 
     if (first_error)
@@ -915,9 +896,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         static const std::vector<RetiredEntry> kNothingToDelete;
         const std::vector<RetiredEntry> & redelete_now =
             suppress_destructive ? kNothingToDelete : merge.redelete;
-        redeleteBlobs(
-            redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op, new_round, generation,
-            round_work_budget, report, outcomes[shard]);
+        RedeleteRoundContext redelete_ctx{
+            .new_round = new_round,
+            .snap_generation = generation,
+            .shard = shard,
+            .round_work_budget = round_work_budget,
+            .report = report,
+            .outcomes = outcomes};
+        redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
         for (const RetiredEntry & entry : merge.spared)
         {
             /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted
