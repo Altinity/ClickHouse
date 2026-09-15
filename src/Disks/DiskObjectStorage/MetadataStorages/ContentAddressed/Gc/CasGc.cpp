@@ -426,6 +426,8 @@ void Gc::applyRedeleteOutcome(
     RoundReport & report,
     OutcomeLog & outcome_log)
 {
+    if (const auto & hook = store->poolConfig().gc_redelete_apply_hook_for_test)
+        hook(entry.ref);
     const OutcomeKind outcome_kind = io.del == Removal::Removed ? OutcomeKind::Deleted
         : io.del == Removal::Gone                               ? OutcomeKind::Absent
                                                                 : OutcomeKind::Replaced;
