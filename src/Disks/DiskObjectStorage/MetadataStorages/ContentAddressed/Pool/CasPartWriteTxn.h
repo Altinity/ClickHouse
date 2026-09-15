@@ -196,8 +196,13 @@ public:
     std::optional<BlobDependencyProof> dependencyProof(const BlobRef & ref) const;
 
     /// Record `TrustedManifest` directly from a `ManifestEntry` — no HEAD or backend call. Inline
-    /// entries record nothing.
+    /// entries record nothing; a `Chunked` entry records one dependency per chunk.
     void adoptEvidence(const ManifestEntry & entry);
+
+    /// The single-blob form of `adoptEvidence`, for a caller that adopts a chunk list whose members
+    /// are in MIXED states -- some chunks still in this transaction's staging, others already
+    /// published -- and so must record evidence for exactly the published ones.
+    void adoptEvidenceForRef(const BlobRef & ref, uint64_t size);
 
     /// Mint a root-local part `ManifestId`, write its body under
     /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the pool's shared request

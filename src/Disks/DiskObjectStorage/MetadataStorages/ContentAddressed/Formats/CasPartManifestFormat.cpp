@@ -30,33 +30,65 @@ namespace PartManifestWire
     constexpr WireKey path{"path"};
     constexpr WireKey place{"place"};
     constexpr WireKey size{"size"};
+    /// `!`-prefixed on purpose: this key is the one a build without `Chunked` support must refuse on.
+    /// `JsonObjectReader::skipUnknown` turns an unrecognised `!` key into `UNKNOWN_FORMAT_VERSION`,
+    /// and it fires inside the key loop -- before `entryPlacementFromWireWord` would have reported
+    /// the unknown `place` word as `CORRUPTED_DATA`. So an older reader names the real problem
+    /// (a format it does not understand) instead of accusing the object of corruption, and no
+    /// pool-wide `G_BUILD` bump is needed to get that behaviour.
+    constexpr WireKey nchunks{"!nchunks"};
 }
 
-constexpr EnumWireTable<EntryPlacement, 2> kEntryPlacementWords{{{
+constexpr EnumWireTable<EntryPlacement, 3> kEntryPlacementWords{{{
     {EntryPlacement::Inline, "inline"},
     {EntryPlacement::Blob, "blob"},
+    {EntryPlacement::Chunked, "chunked"},
 }}};
 
 static_assert(casEnumTableCoversEnum<kEntryPlacementWords, EntryPlacement>());
 
-/// One entry-record line: `path`/`place`, followed by either `algo`/`digest`/`size` for a Blob or
-/// `size` for Inline bytes.
+/// One chunk line of a `Chunked` entry's record group: `algo`/`digest`/`size`, the same triple a
+/// `Blob` record carries, so both sides reuse `writeBlobRefFields`/`matchBlobRefFields`.
+void writeChunkRecord(CasJsonWriter & out, const ChunkRef & c)
+{
+    bool first = true;
+    writeBlobRefFields(out, first, c.ref);   /// algo + digest
+    writeNumberField(out, PartManifestWire::size, c.size, first);
+    closeObject(out, first);
+    writeChar('\n', out);
+}
+
+/// One entry-record line: `path`/`place`, followed by `algo`/`digest`/`size` for a Blob, `size` for
+/// Inline bytes, or `size`/`!nchunks` for a Chunked entry. A Chunked record is immediately followed
+/// by its chunk lines, in file order, so the group stays contiguous and the decoder can read them
+/// without a second pass over the object.
 void writeEntryRecord(CasJsonWriter & out, const ManifestEntry & e)
 {
     bool first = true;
     writeStringField(out, PartManifestWire::path, e.path, first);
     writeWordField(out, PartManifestWire::place, entryPlacementToWireWord(e.placement), first);
-    if (e.placement == EntryPlacement::Blob)
+    switch (e.placement)
     {
-        writeBlobRefFields(out, first, e.ref);   /// algo + digest
-        writeNumberField(out, PartManifestWire::size, e.blob_size, first);
-    }
-    else
-    {
-        writeNumberField(out, PartManifestWire::size, e.inline_bytes.size(), first);
+        case EntryPlacement::Blob:
+            writeBlobRefFields(out, first, e.ref);   /// algo + digest
+            writeNumberField(out, PartManifestWire::size, e.blob_size, first);
+            break;
+        case EntryPlacement::Chunked:
+            /// The total is written explicitly, not left to be summed, so decode has an independent
+            /// value to check the chunk list against.
+            writeNumberField(out, PartManifestWire::size, e.size(), first);
+            writeNumberField(out, PartManifestWire::nchunks, e.chunks.size(), first);
+            break;
+        case EntryPlacement::Inline:
+            writeNumberField(out, PartManifestWire::size, e.inline_bytes.size(), first);
+            break;
     }
     closeObject(out, first);
     writeChar('\n', out);
+
+    if (e.placement == EntryPlacement::Chunked)
+        for (const ChunkRef & c : e.chunks)
+            writeChunkRecord(out, c);
 }
 
 /// The path is written into the banner through the SAME escaper the entry-record line uses. It has to be
@@ -226,11 +258,13 @@ PartManifest decodePartManifest(std::string_view data)
         std::optional<String> pm;
         BlobRefFields blob_ref;
         std::optional<uint64_t> size;
+        std::optional<uint64_t> nchunks;
         while (r.nextKey(key))
         {
             if (key == PartManifestWire::place) pm = r.readString();
             else if (matchBlobRefFields(key, r, blob_ref)) {}
             else if (key == PartManifestWire::size) size = r.readU64Number();
+            else if (key == PartManifestWire::nchunks) nchunks = r.readU64Number();
             else r.skipUnknown(key);
         }
         if (!l.eof())
@@ -249,6 +283,66 @@ PartManifest decodePartManifest(std::string_view data)
             e.ref = blob_ref.build(blob_ref_what);
             e.blob_size = *size;
             inline_lens.push_back(0);   /// unused for Blob; keeps inline_lens index-aligned with entries
+        }
+        else if (e.placement == EntryPlacement::Chunked)
+        {
+            if (!size)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: chunked entry '{}' missing size", e.path);
+            if (!nchunks)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: chunked entry '{}' missing !nchunks", e.path);
+            if (*nchunks == 0)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "PartManifest: chunked entry '{}' declares zero chunks; a file with no chunks must be "
+                    "written as a blob entry", e.path);
+            if (*nchunks > kMaxChunksPerEntry)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "PartManifest: chunked entry '{}' declares {} chunks, above the cap {}",
+                    e.path, *nchunks, kMaxChunksPerEntry);
+
+            /// The chunk lines follow this record immediately, in file order. Read exactly the
+            /// declared count: the count is what separates them from the next entry record.
+            e.chunks.reserve(*nchunks);
+            uint64_t chunk_total = 0;
+            for (uint64_t ci = 0; ci < *nchunks; ++ci)
+            {
+                readLineInto(in, row_line, line_cap, "cas_part_manifest chunk");
+                ReadBufferFromMemory cl(row_line.data(), row_line.size());
+                JsonObjectReader cr(cl, KeyStrictness::Tolerant, "cas_part_manifest chunk");
+                BlobRefFields chunk_ref;
+                std::optional<uint64_t> chunk_size;
+                String ckey;
+                while (cr.nextKey(ckey))
+                {
+                    if (matchBlobRefFields(ckey, cr, chunk_ref)) {}
+                    else if (ckey == PartManifestWire::size) chunk_size = cr.readU64Number();
+                    else cr.skipUnknown(ckey);
+                }
+                if (!cl.eof())
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "PartManifest: junk after chunk {} of '{}'", ci, e.path);
+                if (!chunk_size)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "PartManifest: chunk {} of '{}' missing size", ci, e.path);
+                if (*chunk_size == 0)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "PartManifest: chunk {} of '{}' has zero length", ci, e.path);
+
+                blob_ref_what.assign("PartManifest chunk of '");
+                blob_ref_what += e.path;
+                blob_ref_what += '\'';
+                e.chunks.push_back(ChunkRef{chunk_ref.build(blob_ref_what), *chunk_size});
+                chunk_total += *chunk_size;
+            }
+
+            /// The declared total and the chunk lengths are two independent statements of the same
+            /// fact; a disagreement means the record and its group do not describe one file, so the
+            /// read path would serve the wrong number of bytes. Fail closed.
+            if (chunk_total != *size)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "PartManifest: chunked entry '{}' declares size {} but its {} chunks sum to {}",
+                    e.path, *size, e.chunks.size(), chunk_total);
+
+            inline_lens.push_back(0);   /// unused for Chunked; keeps inline_lens index-aligned
         }
         else
         {

@@ -51,13 +51,15 @@ ReadBufferFromRemoteFSGather::ReadBufferFromRemoteFSGather(
     const StoredObjects & blobs_to_read_,
     size_t min_bytes_for_seek_,
     bool use_external_buffer_,
-    size_t buffer_size)
+    size_t buffer_size,
+    size_t object_payload_offset_)
     : ReadBufferFromFileBase(use_external_buffer_ ? 0 : buffer_size, nullptr, 0)
     , min_bytes_for_seek(min_bytes_for_seek_)
     , blobs_to_read(blobs_to_read_)
     , read_buffer_creator(std::move(read_buffer_creator_))
     , query_id(CurrentThread::getQueryId())
     , use_external_buffer(use_external_buffer_)
+    , object_payload_offset(object_payload_offset_)
     , log(getLogger("ReadBufferFromRemoteFSGather"))
 {
     if (!blobs_to_read.empty())
@@ -67,10 +69,24 @@ ReadBufferFromRemoteFSGather::ReadBufferFromRemoteFSGather(
 SeekableReadBufferPtr ReadBufferFromRemoteFSGather::createImplementationBuffer(const StoredObject & object, size_t start_offset)
 {
     current_object = object;
-    auto buf = read_buffer_creator(/* restricted_seek */true, object);
+
+    /// The creator (and any cache layer it wraps) must see the PHYSICAL object, whose size includes
+    /// the non-content prefix; `bytes_size` alone is the logical contribution and would make a cache
+    /// refuse the object's tail.
+    StoredObject physical = object;
+    if (object_payload_offset != 0)
+        physical.bytes_size += object_payload_offset;
+
+    auto buf = read_buffer_creator(/* restricted_seek */true, physical);
 
     if (read_until_position > start_offset && read_until_position < start_offset + object.bytes_size)
-        buf->setReadUntilPosition(read_until_position - start_offset);
+        buf->setReadUntilPosition(read_until_position - start_offset + object_payload_offset);
+
+    /// A freshly created buffer sits at physical offset 0, where the prefix is. `initialize` seeks
+    /// explicitly, but `moveToNextBuffer` relies on a new buffer already being positioned at the
+    /// start of this object's content.
+    if (object_payload_offset != 0)
+        buf->seek(static_cast<off_t>(object_payload_offset), SEEK_SET);
 
     return buf;
 }
@@ -97,7 +113,7 @@ void ReadBufferFromRemoteFSGather::initialize()
                 current_buf = createImplementationBuffer(object, start_offset);
             }
 
-            current_buf->seek(file_offset_of_buffer_end - start_offset, SEEK_SET);
+            current_buf->seek(file_offset_of_buffer_end - start_offset + object_payload_offset, SEEK_SET);
             return;
         }
 
@@ -153,7 +169,7 @@ bool ReadBufferFromRemoteFSGather::readImpl()
         chassert(current_buf->available());
         chassert(
             blobs_to_read.size() != 1
-            || file_offset_of_buffer_end == current_buf->getFileOffsetOfBufferEnd(),
+            || file_offset_of_buffer_end + object_payload_offset == current_buf->getFileOffsetOfBufferEnd(),
             fmt::format(
                 "offset: {}, buf offset: {}, available: {}, nextimpl offset: {}",
                 file_offset_of_buffer_end, current_buf->getFileOffsetOfBufferEnd(),
@@ -271,7 +287,7 @@ bool ReadBufferFromRemoteFSGather::isContentCached(size_t offset, size_t size)
             if (i == current_buf_idx)
             {
                 if (offset + size <= blob.bytes_size)
-                    return current_buf->isContentCached(offset, size);
+                    return current_buf->isContentCached(offset + object_payload_offset, size);
                 return false;
             }
             if (offset < blob.bytes_size)

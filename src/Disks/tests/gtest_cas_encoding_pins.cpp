@@ -186,7 +186,7 @@ TEST(CASWireCutDeltas, BlobPartManifestEntry)
     PartManifest manifest;
     manifest.ref = ManifestRef{1, 2, 3};
     manifest.root_namespace_id = RootNamespace{"root"};
-    manifest.entries = {ManifestEntry{"a", EntryPlacement::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, 9, {}}};
+    manifest.entries = {ManifestEntry{"a", EntryPlacement::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(4))}, 9, {}, {}}};
     const String text = encodePartManifest(manifest);
     /// This literal is the pre-cut baseline this delta is measured against.
     const String old_bytes = "{\"p\":\"a\",\"pm\":\"blob\",\"ha\":\"ch128\",\"h\":\"00000000000000000000000000000004\",\"sz\":9}\n";
@@ -198,7 +198,7 @@ TEST(CASWireCutDeltas, InlinePartManifestEntry)
     PartManifest manifest;
     manifest.ref = ManifestRef{1, 2, 3};
     manifest.root_namespace_id = RootNamespace{"root"};
-    manifest.entries = {ManifestEntry{"a", EntryPlacement::Inline, {}, 0, "x"}};
+    manifest.entries = {ManifestEntry{"a", EntryPlacement::Inline, {}, 0, "x", {}}};
     const String text = encodePartManifest(manifest);
     /// This literal is the pre-cut baseline this delta is measured against.
     const String old_bytes = "{\"p\":\"a\",\"pm\":\"inline\",\"il\":1}\n";

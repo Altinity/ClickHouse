@@ -83,9 +83,10 @@ void ReadPipeline::setSource(BufferCreator creator, StoredObjects objects, const
         .read_settings = read_settings};
 }
 
-void ReadPipeline::needGather()
+void ReadPipeline::needGather(size_t object_payload_offset)
 {
     gather = true;
+    gather_object_payload_offset = object_payload_offset;
 }
 
 void ReadPipeline::needFilesystemCache(FileCachePtr cache, FilesystemCacheSettings cache_settings, std::shared_ptr<FilesystemCacheLog> cache_log)
@@ -379,7 +380,8 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::buildGatherStage(const std
         /// Copy, not move: fallback may be called multiple times (e.g. after
         /// connection pool exhaustion on different read ranges).
         auto fallback_creator = [gather_creator, objects = source->objects,
-                                 captured_settings = settings]() mutable
+                                 captured_settings = settings,
+                                 payload_offset = gather_object_payload_offset]() mutable
             -> std::unique_ptr<ReadBufferFromFileBase>
         {
             auto creator_copy = gather_creator;
@@ -388,7 +390,8 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::buildGatherStage(const std
                 objects,
                 captured_settings.remote_fs_settings.min_bytes_for_seek,
                 /* use_external_buffer */ true,
-                /* buffer_size */ 0);
+                /* buffer_size */ 0,
+                payload_offset);
         };
 
         auto impl = DistributedCache::readWithDistributedCache(
@@ -409,7 +412,8 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::buildGatherStage(const std
         source->objects,
         settings.remote_fs_settings.min_bytes_for_seek,
         use_external_buffer,
-        buffer_size);
+        buffer_size,
+        gather_object_payload_offset);
 }
 
 std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::buildSingleObjectStage(const std::string & query_id) const

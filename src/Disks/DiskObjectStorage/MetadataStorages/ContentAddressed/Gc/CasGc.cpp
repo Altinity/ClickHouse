@@ -1297,11 +1297,15 @@ bool Gc::foldManifestEdges(GcReadAhead & reads, const ManifestId & id, int sign,
     /// in-memory `admitted_algos` cache reading a manifest another node already admitted a new algo
     /// for). Per-entry admission validation refreshes on miss BEFORE
     /// failing closed, so a genuinely fresh admission is never mistaken for corruption.
+    /// Chunks are ordinary blobs and carry their own algorithm, so admission is validated per
+    /// referenced blob rather than per entry.
     for (const ManifestEntry & entry : body.entries)
-        if (entry.placement == EntryPlacement::Blob && !store->isAlgoAdmitted(entry.ref.algo))
+        forEachEntryBlobRef(entry, [&](const BlobRef & ref, uint64_t)
         {
+            if (store->isAlgoAdmitted(ref.algo))
+                return;
             const std::vector<uint8_t> refreshed = store->refreshAdmittedAlgos();
-            if (!store->isAlgoAdmitted(entry.ref.algo))
+            if (!store->isAlgoAdmitted(ref.algo))
             {
                 String names;
                 for (size_t i = 0; i < refreshed.size(); ++i)
@@ -1312,16 +1316,21 @@ bool Gc::foldManifestEdges(GcReadAhead & reads, const ManifestId & id, int sign,
                 }
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS gc fold: manifest entry algo {} not admitted to this pool (algos_used {{{}}})",
-                    blobHashAlgoName(entry.ref.algo), names);
+                    blobHashAlgoName(ref.algo), names);
             }
-        }
+        });
 
+    /// One edge per REFERENCED BLOB, not per entry: a `Chunked` entry keeps every chunk alive, so
+    /// each chunk needs its own edge. They share the entry's `source_id` -- the edge key is
+    /// `(BlobRef, source_id)`, so distinct chunks still produce distinct keys, and two chunks of one
+    /// file that happen to be identical collapse to one edge, which is correct because edges are set
+    /// membership rather than counters and the whole file is referenced and unreferenced atomically.
     for (const ManifestEntry & entry : body.entries)
-        if (entry.placement == EntryPlacement::Blob)
+        forEachEntryBlobRef(entry, [&](const BlobRef & blob_ref, uint64_t)
         {
             /// The fold settles the FULL `BlobRef` pair natively -- no bare-digest bridge remains.
             deltas.push_back(BlobDelta{
-                .ref = entry.ref,
+                .ref = blob_ref,
                 .source_id = sourceEdgeId(id, entry.path),
                 .remove = (sign < 0),
                 .txn_ordinal = txn_ordinal});
@@ -1333,7 +1342,7 @@ bool Gc::foldManifestEdges(GcReadAhead & reads, const ManifestId & id, int sign,
                 ev.type = sign > 0 ? CasEventType::RootAdd : CasEventType::RootRemove;
                 ev.namespace_ = id.root_namespace.string();
                 ev.object_kind = CasEventObjectKind::Blob;
-                ev.object_hash = blobIdOf(entry.ref);
+                ev.object_hash = blobIdOf(blob_ref);
                 ev.outcome = sign > 0 ? "edge_added" : "edge_removed";
                 ev.reason = sign > 0
                     ? "fold: manifest owner activated; +1 blob edge"
@@ -1341,7 +1350,7 @@ bool Gc::foldManifestEdges(GcReadAhead & reads, const ManifestId & id, int sign,
                 ev.detail = {{"manifest_ref_instance", manifestRefDebugString(id.ref)},
                              {"path", entry.path}};
             });
-        }
+        });
 
     if (sign < 0)
         mf_cleanup.emplace(id, got->etag);   /// owner removed: defer the exact body delete to recheck

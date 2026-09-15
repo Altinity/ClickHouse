@@ -26,6 +26,15 @@ mutable state with immutable, hash-addressed objects plus a small CAS
   (`uuid.txt`, `checksums.txt`, ...) live *inside* the manifest as inline tree
   entries, not as separate objects. Keyed under
   `cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<ordinal>.zst`.
+  A file is normally ONE blob, so it deduplicates only against a byte-identical
+  file. With `cas_chunking_enabled` a large file may instead be a `Chunked`
+  entry: an ordered list of blobs whose concatenation is the file, cut at
+  content-defined boundaries (`Primitives/CasContentChunker`) so a rewrite that
+  re-emits most of the same bytes re-references the unchanged runs. A chunk is
+  an ordinary blob in every respect — same key space, envelope, freshness
+  sidecar and GC treatment — so this adds a manifest placement, not an object
+  kind. Consumers must reach an entry's blobs through `forEachEntryBlobRef`
+  rather than reading `entry.ref`, which names nothing for a `Chunked` entry.
 - **Ref table** — the mutable naming layer, one namespace per table
   (`SERVER_ID/TABLE_UUID`), keyed under one LIFE of that namespace: an
   append-only transaction log plus periodic snapshots (`cas/ns/stream/<life_id>/...`), with mutable

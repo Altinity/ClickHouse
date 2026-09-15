@@ -606,6 +606,8 @@ public:
     /// uses this variant.
     std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
     BlobLocation locate(const ManifestEntry & entry) const;       /// Blob placement only
+    /// Chunked placement only: the per-chunk object keys and payload windows, in file byte order.
+    std::vector<BlobLocation> locateChunks(const ManifestEntry & entry) const;
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
     /// Pure existence probe: whether any committed ref name starts with `prefix`, without
     /// materializing `listRefs`'s full map. Empty `prefix` means "any ref at all".

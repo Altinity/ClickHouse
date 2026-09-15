@@ -1,0 +1,11 @@
+multiple_objects_per_file	1
+count_match	1
+sum_match	1
+content_match	1
+point_match	1
+range_match	1
+merged_content_match	1
+merged_count_match	1
+mutated_content_match	1
+content_match_after_gc	1
+dropped_ok

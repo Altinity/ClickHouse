@@ -251,6 +251,16 @@ public:
         StoredObject object;        /// physical blob key; logical path; readable extent (envelope + payload)
         size_t payload_offset = 0;  /// view left bound inside the blob
         size_t payload_end = 0;     /// view right bound (payload_offset + payload length)
+
+        /// Non-empty when the path is a CHUNKED file: its chunk objects in byte order, each
+        /// `bytes_size` being that chunk's PAYLOAD length. `object`/`payload_end` are unset in that
+        /// case and must not be read; `payload_offset` still applies, and applies to EVERY chunk,
+        /// because the envelope length is pool-wide. `prepareRead` drives these through the gather's
+        /// per-object payload offset rather than the FileView stage, which is a single window over
+        /// the whole chain and cannot skip a prefix inside each object.
+        StoredObjects chunks;
+
+        bool isChunked() const { return !chunks.empty(); }
     };
     /// Resolves a blob-backed path to its physical object and payload window. Returns nullopt for
     /// in-manifest, loose, directory, or otherwise unresolved paths.

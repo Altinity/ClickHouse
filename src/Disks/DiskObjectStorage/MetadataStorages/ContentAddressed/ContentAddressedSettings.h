@@ -3,6 +3,7 @@
 #include <Core/BaseSettingsFwdMacros.h>
 #include <Core/SettingsFields.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasContentChunker.h>
 #include <functional>
 #include <memory>
 #include <string>
@@ -79,6 +80,10 @@ struct ContentAddressedSettings
     /// only; the two scopes are deliberately distinct.
     bool skipAccessCheck() const;
     Cas::StagingBackend stagingBackend() const;
+    /// The chunker configuration assembled from the three `cas_chunk_*_bytes` settings. Validated by
+    /// `validate` only when `cas_chunking_enabled` is set, so these values are trustworthy exactly
+    /// when the write path is going to use them.
+    Cas::ChunkerParams chunkerParams() const;
 
 private:
     /// The parsed enum values live inside `impl` (defined in the .cpp, where the forward-declared

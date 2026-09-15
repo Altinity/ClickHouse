@@ -402,6 +402,14 @@ public:
     /// area. Callers append a unique leaf.
     String stagingKeyPrefix() const;
 
+    /// Whether this disk splits large blob-backed part files into content-defined chunks. A file
+    /// below `chunkerParams().min_bytes` is never split even when this is on, because the chunker
+    /// cannot cut below its floor -- such a file yields one chunk and is published as an ordinary
+    /// whole-file blob.
+    bool chunkingEnabled() const { return chunking_enabled; }
+    /// The validated chunker configuration for this disk.
+    const Cas::ChunkerParams & chunkerParams() const { return chunker_params; }
+
     /// Bytes that live INSIDE pool metadata rather than as their own object: an Inline-placement
     /// manifest tree entry, or a verbatim namespace file. nullopt = the path is blob-backed (a real
     /// storage object).
@@ -648,6 +656,11 @@ private:
     const uint64_t cas_lease_safety_margin_ms;
     /// Configured staging backend; `Local` preserves the existing write path.
     const Cas::StagingBackend staging_backend;
+    /// Content-defined chunking of large blob-backed part files; off preserves the existing write
+    /// path byte-for-byte.
+    const bool chunking_enabled;
+    /// Chunker configuration, validated at mount when `chunking_enabled`.
+    const Cas::ChunkerParams chunker_params;
     /// Blob content-hash function passed to `Cas::PoolConfig`.
     const Cas::BlobHashAlgo blob_hash_algo;
     /// Whether `blob_hash_algo` may be admitted into the pool's persisted `algos_used` set.

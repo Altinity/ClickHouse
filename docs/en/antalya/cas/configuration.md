@@ -111,6 +111,10 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: the attempt envelope + `cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, and `cas_mount_renew_period_ms` + 2 × envelope + `cas_lease_safety_margin_ms` too, or the disk refuses to open writable |
 | `cas_unsafe_remount_no_delay` | `0` | Reclaim a mount slot that carries this server's own uuid at once after a hard restart, without observing the slot's token for the lease TTL. Unsafe whenever two processes can hold the same `server_uuid` (a copied uuid file, a stalled predecessor). After such a reclaim the predecessor can still start conditional writes until its own cutoff (`confirmed deadline − cas_lease_safety_margin_ms − 2 × envelope`) or until its next renewal meets the token guard, and a request it already sent may still materialize later. That is not a data hazard: ref-log keys carry `(writer_epoch, sequence)` and creates are conditional, so two writers can never commit different bodies to one key, and recovery's epoch seal settles any straggler (recovery fails closed after 64 successive seal-create attempts displaced by newly materializing old-epoch transactions). The exposure is availability, not data. Intended for test stands and deployments that guarantee one process per uuid |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
+| `cas_chunking_enabled` | `false` | Split large part files into content-defined chunks, so a rewrite that re-emits most of the same bytes re-references the unchanged runs instead of republishing the whole file. Off by default — see [Content-defined chunking](#chunking) for when it pays off and what it costs |
+| `cas_chunk_min_bytes` | 1 MiB | Chunker floor: no content-defined boundary is accepted below this, so it is also the size below which a file is never split at all (it yields one chunk and is published as an ordinary whole-file blob) |
+| `cas_chunk_avg_bytes` | 4 MiB | Boundary period, **not** the realised mean chunk size: since no boundary is taken below `cas_chunk_min_bytes`, the realised mean is about `cas_chunk_min_bytes + cas_chunk_avg_bytes` (~5 MB at the defaults). Only its bit width is used, so the effective value is the enclosing power of two |
+| `cas_chunk_max_bytes` | 16 MiB | Chunker ceiling: a boundary is forced here even when the hash never matches, bounding both the bytes one re-upload can cost and the span of a single-chunk ranged read |
 
 All servers sharing a pool must run the same `cas_mount_lease_ttl_ms` and `cas_mount_renew_period_ms`.
 Startup reclaim and GC's fence-out both judge liveness by the mount slot's write token holding stable
@@ -188,6 +192,40 @@ for the remaining caps, `0` means unbounded.
 | `cas_gc_round_prefix_wholesale_budget` | `20000` | `0` = unbounded | Generation-prefix wholesale-delete object cap during pruning per round |
 | `cas_gc_round_handoff_prefix_wholesale_budget` | `5000` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off |
 | `cas_gc_round_outcome_entry_budget` | `5000` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round |
+
+## Content-defined chunking {#chunking}
+
+By default a blob is one whole part file, so two files deduplicate only when they are byte-for-byte
+identical. That is the right trade for inserts, but it means a merge or mutation that re-emits most
+of its input bytes still publishes entirely new blobs.
+
+With `cas_chunking_enabled`, a part file is split at boundaries chosen by a rolling hash over its
+content rather than at fixed offsets, and each chunk becomes an ordinary blob. Because the boundaries
+follow the content, an unchanged run lands in the same chunk regardless of what moved around it, so a
+rewrite pays only for the chunks that actually changed. A file below `cas_chunk_min_bytes` is never
+split: it yields a single chunk and is published as one whole-file blob, byte-identical to chunking
+being off.
+
+It is off by default because the trade is workload-dependent:
+
+- **It pays off** when a rewrite re-emits byte-identical compressed frames — most visibly a merge of
+  parts whose sort keys concatenate rather than interleave (time-ordered inserts into a time-ordered
+  `ORDER BY`). On the 16 × 42 MB `CODEC(LZ4)` merge from
+  [issue #2314](https://github.com/Altinity/ClickHouse/issues/2314), enabling it cut the bytes
+  written by `OPTIMIZE FINAL` by 85% (1.18 GB to 171 MB) and the pool's total size by 54%
+  (1.86 GB to 846 MB).
+- **It does not pay off** when a merge re-sorts rows so that the compressed frames differ
+  throughout. Content-defined chunking recognises moved bytes, not re-encoded ones, so an
+  interleaving merge produces close to no sharing.
+- **It always costs requests.** Each chunk is a separate object, so a file costs one `HEAD`, one
+  `PUT` and one freshness-meta write per chunk instead of one of each. On the same experiment the
+  pool's object count grew from 197 to 489. Raise `cas_chunk_min_bytes` and `cas_chunk_avg_bytes` to
+  trade dedup granularity for fewer requests.
+
+Chunk boundaries are not a persisted format: a manifest lists its chunks explicitly, so changing
+these settings only affects files written afterwards and can never make an existing part unreadable.
+A part written with chunking on is, however, unreadable by a build that predates the feature, which
+reports `UNKNOWN_FORMAT_VERSION` rather than mistaking the manifest for corrupt.
 
 ## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 

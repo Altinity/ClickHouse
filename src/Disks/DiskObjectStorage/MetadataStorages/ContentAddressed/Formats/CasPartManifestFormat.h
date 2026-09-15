@@ -19,7 +19,19 @@ namespace DB::Cas
 ///                                refsnaplog, `CasWireVocab.h`) + `root_namespace` + `payload_digest`
 ///                                (payload digest, 32 lowercase hex)
 ///   one entry-record line each   {"path":path,"place":placement-word, then either the Blob's
-///                                {"algo","digest","size"} or the Inline's {"size"}}, in canonical path order
+///                                {"algo","digest","size"}, the Inline's {"size"}, or the Chunked's
+///                                {"size","!nchunks"}}, in canonical path order. A Chunked record is
+///                                FOLLOWED IMMEDIATELY by exactly `!nchunks` chunk lines
+///                                {"algo","digest","size"} in file order, which are part of that
+///                                entry's record group and are NOT counted by the trailer.
+///                                The chunk list rides its own lines rather than a nested JSON array
+///                                because `line_cap` is 64 KiB: a multi-GB column file would breach
+///                                it as a single line, while per-chunk lines stay small at any chunk
+///                                count. `!nchunks` is deliberately `!`-prefixed -- a build that does
+///                                not know this placement rejects the object with
+///                                `UNKNOWN_FORMAT_VERSION` at that key (`JsonObjectReader::skipUnknown`)
+///                                rather than reporting corruption, and does so before it would have
+///                                tripped over the unknown `place` word.
 ///   trailer line                 {"n":entry-count}
 ///   PAYLOAD ZONE (raw, follows the trailer): for each Inline entry, in path order, a
 ///                                `head -v`-style banner line `==> "<escaped path>" size=<n> <==\n`, then
@@ -40,7 +52,32 @@ enum class EntryPlacement : uint8_t
 {
     Inline = 1,   /// bytes embedded in `inline_bytes`
     Blob = 2,     /// bytes stored as a content-addressed blob at `blobKey`
+    /// bytes are the ordered concatenation of `chunks`, each an ordinary content-addressed blob.
+    /// This is still whole-file addressing's object model -- a chunk IS a `Blob`, with the same key
+    /// space, envelope, freshness sidecar and GC treatment -- it only splits ONE file across several
+    /// of them so a rewrite that re-emits most of the same bytes can re-reference the unchanged runs
+    /// instead of publishing the whole file again.
+    Chunked = 3,
 };
+
+/// One chunk of a `Chunked` entry: the blob holding it and that blob's payload length. `size` is
+/// carried per chunk rather than derived so the read path can map a file offset onto a chunk without
+/// fetching any blob, and so decode can verify the parts against the entry's declared total.
+struct ChunkRef
+{
+    BlobRef ref{};
+    uint64_t size = 0;
+    bool operator==(const ChunkRef &) const = default;
+};
+
+/// Fail-closed ceiling on one entry's chunk count, enforced by both encode and decode so a manifest
+/// can never be written that this build would refuse to read back. Manifest bytes arrive over the
+/// interserver relink channel, so decode needs a bound that does not depend on the writer being
+/// well-behaved: without one, a declared count would size an allocation directly from untrusted
+/// input. The value is far above anything reachable in practice -- at the ~5 MB realised mean chunk
+/// size it corresponds to roughly 325 GB in a SINGLE column file, where a whole part is capped near
+/// 150 GB across all columns -- while bounding the decoded footprint to a few MB per entry.
+inline constexpr uint64_t kMaxChunksPerEntry = 65536;
 
 /// Canonical wire word for one manifest entry placement.
 std::string_view entryPlacementToWireWord(EntryPlacement placement);
@@ -62,15 +99,62 @@ struct ManifestEntry
     BlobRef ref{};
     uint64_t blob_size = 0;
     String inline_bytes;
+    /// `Chunked` only, in file order: the ordered chunk list whose concatenation is the file. Empty
+    /// for every other placement. `ref` is meaningless for a `Chunked` entry -- there is no single
+    /// blob holding the file -- so consumers must reach the blobs through `forEachEntryBlobRef`
+    /// rather than reading `ref`.
+    std::vector<ChunkRef> chunks;
     bool operator==(const ManifestEntry &) const = default;
 
     /// The single source of truth for this entry's logical file size, independent of where its bytes
     /// live. Decoding an `Inline` entry leaves `blob_size == 0`, because the wire record has no
     /// redundant blob size; a carried-forward inline entry can therefore be non-empty even though
-    /// `blob_size` is zero. Consumers that need the logical file size must use this method rather
-    /// than inspecting the placement-specific fields themselves.
-    uint64_t size() const { return placement == EntryPlacement::Inline ? inline_bytes.size() : blob_size; }
+    /// `blob_size` is zero. A `Chunked` entry sums its chunks, so `blob_size` is unused there.
+    /// Consumers that need the logical file size must use this method rather than inspecting the
+    /// placement-specific fields themselves.
+    uint64_t size() const
+    {
+        switch (placement)
+        {
+            case EntryPlacement::Inline:
+                return inline_bytes.size();
+            case EntryPlacement::Blob:
+                return blob_size;
+            case EntryPlacement::Chunked:
+            {
+                uint64_t total = 0;
+                for (const ChunkRef & c : chunks)
+                    total += c.size;
+                return total;
+            }
+        }
+        return 0;
+    }
 };
+
+/// Visit every blob this entry keeps alive, in file order: nothing for `Inline`, the single `ref` for
+/// `Blob`, each chunk for `Chunked`. `fn` takes `(const BlobRef &, uint64_t size)`.
+///
+/// Every consumer that asks "which blobs does this entry reference" -- GC source-edge emission, fsck
+/// reachability, relink adoption evidence -- must go through this rather than reading `entry.ref`,
+/// which names no blob at all for a `Chunked` entry. Defined as a template in the header so the GC
+/// fold's inner loop pays nothing for the indirection.
+template <typename F>
+void forEachEntryBlobRef(const ManifestEntry & e, F && fn)
+{
+    switch (e.placement)
+    {
+        case EntryPlacement::Inline:
+            return;
+        case EntryPlacement::Blob:
+            fn(e.ref, e.blob_size);
+            return;
+        case EntryPlacement::Chunked:
+            for (const ChunkRef & c : e.chunks)
+                fn(c.ref, c.size);
+            return;
+    }
+}
 
 /// The immutable body of one root-local part manifest. It repeats `ref` and `root_namespace_id` so
 /// readers can validate the journal reference and owning root namespace against the body; neither

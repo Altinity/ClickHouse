@@ -84,6 +84,10 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write), at least 1. With the connect cap it forms the attempt envelope the lease arithmetic reserves", 0) \
     DECLARE(UInt64, lease_safety_margin_ms, 2000, "Startup-only margin validated against the mount lease TTL: attempt envelope + this must be strictly less than the TTL, and renew period + 2 × envelope + this too", 0) \
     DECLARE(String, staging_backend, "local", "Blob staging backend (local | s3); s3 is opt-in", 0) \
+    DECLARE(Bool, chunking_enabled, false, "Split large part files into content-defined chunks so a rewrite that re-emits most of the same bytes re-references the unchanged runs instead of republishing the whole file. OFF by default: it only pays off when a merge re-emits byte-identical compressed frames (parts that concatenate rather than interleave), and it multiplies per-file write requests by the chunk count", 0) \
+    DECLARE(UInt64, chunk_min_bytes, 1ULL << 20, "Chunker floor: no content-defined boundary is accepted below this, so it is also the size below which a file is never split at all (it yields one chunk and is published as an ordinary whole-file blob). Bounds per-chunk request and manifest overhead", 0) \
+    DECLARE(UInt64, chunk_avg_bytes, 4ULL << 20, "Chunker boundary period, NOT the realised mean chunk size: because no boundary is taken below cas_chunk_min_bytes, the realised mean is about cas_chunk_min_bytes + this (~5 MB at the defaults). Only its bit width is used, so the effective value is the enclosing power of two", 0) \
+    DECLARE(UInt64, chunk_max_bytes, 16ULL << 20, "Chunker ceiling: a boundary is forced here even when the hash never matches, which bounds both the bytes one re-upload can cost and the span of a single-chunk ranged read", 0) \
 
 DECLARE_SETTINGS_TRAITS(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, CONTENT_ADDRESSED_SETTINGS_SUPPORTED_TYPES)
 
@@ -95,6 +99,9 @@ struct ContentAddressedSettingsImpl : public BaseSettings<ContentAddressedSettin
     Cas::BlobHashAlgo blob_hash_algo_cached = Cas::BlobHashAlgo::CityHash128;
     bool skip_access_check_cached = false;
     Cas::StagingBackend staging_backend_cached = Cas::StagingBackend::Local;
+    /// Assembled by `validate` from the three chunk-size settings, for the same reason as the enum
+    /// values above: the public header only forward-declares the CAS types it hands out.
+    Cas::ChunkerParams chunker_params_cached{};
 };
 
 IMPLEMENT_SETTINGS_TRAITS_CUSTOM_IMPL(ContentAddressedSettingsTraits, LIST_OF_CONTENT_ADDRESSED_SETTINGS, ContentAddressedSettings, ContentAddressedSetting)
@@ -270,6 +277,18 @@ void ContentAddressedSettings::validate()
 
     impl->blob_hash_algo_cached = Cas::parseBlobHashAlgo(settings[ContentAddressedSetting::blob_hash].value);
     impl->staging_backend_cached = ContentAddressedMetadataStorage::parseStagingBackend(settings[ContentAddressedSetting::staging_backend].value);
+
+    /// The chunker's own ordering and range rules, checked here so a misconfigured disk fails at
+    /// mount rather than producing degenerate chunking (or throwing) on the first large write. Only
+    /// validated when chunking is on, so an operator who leaves the feature off is never blocked by
+    /// a stale or nonsensical chunk-size override.
+    impl->chunker_params_cached = Cas::ChunkerParams{
+        .min_bytes = settings[ContentAddressedSetting::chunk_min_bytes],
+        .avg_bytes = settings[ContentAddressedSetting::chunk_avg_bytes],
+        .max_bytes = settings[ContentAddressedSetting::chunk_max_bytes],
+    };
+    if (settings[ContentAddressedSetting::chunking_enabled])
+        impl->chunker_params_cached.validate();
 }
 
 Cas::BlobHashAlgo ContentAddressedSettings::blobHashAlgo() const
@@ -285,6 +304,11 @@ bool ContentAddressedSettings::skipAccessCheck() const
 Cas::StagingBackend ContentAddressedSettings::stagingBackend() const
 {
     return impl->staging_backend_cached;
+}
+
+Cas::ChunkerParams ContentAddressedSettings::chunkerParams() const
+{
+    return impl->chunker_params_cached;
 }
 
 }
