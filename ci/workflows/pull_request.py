@@ -119,8 +119,8 @@ workflow = Workflow.Config(
         # that is only too slow (or only flaky) without a sanitizer is reported
         # in the PR rather than first bouncing it from the merge queue. Same job
         # config as in `ci/workflows/merge_queue.py`.
-        *JobConfigs.stateless_tests_flaky_mq_jobs,
-        *JobConfigs.integration_test_asan_flaky_pr_jobs,
+        #*JobConfigs.stateless_tests_flaky_mq_jobs,
+        #*JobConfigs.integration_test_asan_flaky_pr_jobs,
         # Per-arch Bugfix Validation Checks (functional + integration tests on
         # both amd64 and aarch64). Each per-arch variant has
         # `allow_failure=True` so an individual FAIL doesn't block PR merge -
