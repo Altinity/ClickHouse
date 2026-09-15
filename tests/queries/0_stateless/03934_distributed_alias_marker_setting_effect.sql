@@ -1,8 +1,11 @@
--- Demonstrates that enable_alias_marker is a correctness toggle for distributed ALIAS columns.
--- Distributed-over-distributed with a String ALIAS (`a_str`) and a UInt64 ALIAS (`inner_c`):
---   * marker ON  -> columns reconciled by name, correct results.
---   * marker OFF -> the inlined ALIAS expansion swaps columns; the String 'aaaa' is routed into
---                   the UInt64 `inner_c` slot and the query fails with CANNOT_PARSE_TEXT.
+-- `enable_alias_marker` must not change results. It exists so an initiator can stop emitting
+-- `__aliasMarker` for a mixed-version cluster whose shards do not understand it, which is a
+-- transport concern, not a correctness one.
+--
+-- Distributed-over-distributed with a String ALIAS (`a_str`) and a UInt64 ALIAS (`inner_c`). This
+-- shape used to swap the two columns with the marker off, routing the String 'aaaa' into the
+-- UInt64 `inner_c` slot and failing with CANNOT_PARSE_TEXT. Upstream fixed the underlying column
+-- ordering, so both settings now return the same rows, and this test holds them to that.
 DROP TABLE IF EXISTS t_se_local;
 DROP TABLE IF EXISTS t_se_inner;
 DROP TABLE IF EXISTS t_se_outer;
@@ -27,12 +30,12 @@ ORDER BY x
 SETTINGS enable_analyzer = 1, enable_alias_marker = 1, prefer_localhost_replica = 0, serialize_query_plan = 0
 FORMAT TSVWithNames;
 
-SELECT 'marker_off_reintroduces_swap';
--- No output format header here: the query errors mid-execution, so it must not stream a header.
+SELECT 'marker_off';
 SELECT x, a_str, inner_c
 FROM t_se_outer
 ORDER BY x
-SETTINGS enable_analyzer = 1, enable_alias_marker = 0, prefer_localhost_replica = 0, serialize_query_plan = 0; -- { serverError CANNOT_PARSE_TEXT }
+SETTINGS enable_analyzer = 1, enable_alias_marker = 0, prefer_localhost_replica = 0, serialize_query_plan = 0
+FORMAT TSVWithNames;
 
 DROP TABLE t_se_outer;
 DROP TABLE t_se_inner;

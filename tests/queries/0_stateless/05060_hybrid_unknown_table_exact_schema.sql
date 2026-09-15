@@ -1,3 +1,13 @@
+-- Hybrid table joined against a MergeTree and an Iceberg table, covering Altinity#1208, #1209 and
+-- #1422. Both `object_storage_cluster_join_mode` values must return the same rows: `'local'` used
+-- to raise UNKNOWN_IDENTIFIER here, and no longer does, so it is held to the `'allow'` result.
+--
+-- Needs the stateless S3 mock on localhost:11111, and a server listening on 127.0.0.3 as well as
+-- 127.0.0.1 and 127.0.0.2, because `icebergCluster` below reads through
+-- `test_cluster_one_shard_three_replicas_localhost`. Without the third address the query still
+-- returns the right rows by failing over, but the connection warnings on stderr fail the test.
+-- Run with `enable_parallel_blocks_marshalling = 0` until the DISTINCT-over-ColumnBLOB abort is
+-- fixed.
 SET allow_experimental_hybrid_table = 1,
     enable_analyzer = 1,
     prefer_localhost_replica = 0,
@@ -201,7 +211,7 @@ FULL OUTER JOIN merge_tree_table_3ef2c546_d5d6_11f0_b816_e0c26496f172 AS m ON h.
 FULL OUTER JOIN database_39afd42b_d5d6_11f0_b919_e0c26496f172.`namespace_39afe1b3_d5d6_11f0_9b00_e0c26496f172.table_39afe20a_d5d6_11f0_8208_e0c26496f172` AS i ON h.string_col = i.string_col
 ORDER BY h.string_col
 LIMIT 10
-SETTINGS object_storage_cluster_join_mode = 'local'; -- { serverError UNKNOWN_IDENTIFIER }
+SETTINGS object_storage_cluster_join_mode = 'local';
 
 SELECT 'issue_1208_join_hybrid_mt_iceberg_allow';
 SELECT
@@ -247,7 +257,7 @@ FULL OUTER JOIN merge_tree_table_3ef2c546_d5d6_11f0_b816_e0c26496f172 AS m ON h.
 FULL OUTER JOIN database_39afd42b_d5d6_11f0_b919_e0c26496f172.`namespace_39afe1b3_d5d6_11f0_9b00_e0c26496f172.table_39afe20a_d5d6_11f0_8208_e0c26496f172` AS i ON h.string_col = i.string_col
 LIMIT 10
 SETTINGS object_storage_cluster_join_mode = 'local'
-FORMAT Null; -- { serverError UNKNOWN_IDENTIFIER }
+FORMAT Null;
 
 SELECT
     h.string_col,
