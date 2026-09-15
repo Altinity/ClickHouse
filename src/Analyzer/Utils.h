@@ -157,6 +157,19 @@ void resolveOrdinaryFunctionNodeByName(FunctionNode & function_node, const Strin
 /// Arguments and parameters are taken from the node.
 void resolveAggregateFunctionNodeByName(FunctionNode & function_node, const String & function_name);
 
+/** Materialize the id argument of every `__aliasMarker` in the tree, turning the `ColumnNode` it carries into the
+  * `String` constant the shard will read.
+  *
+  * Call this immediately before the tree is rendered as SQL for a shard, and no earlier. The id is the column's
+  * analyzer identifier, and `createUniqueAliasesIfNecessary` -- which runs inside `buildQueryTreeForShard` -- is what
+  * settles the `__tableN` part of it. An id frozen before that point names a table alias that no longer exists by the
+  * time the shard header is built.
+  *
+  * A marker whose id is already a `String` constant was materialized on an earlier hop and is left alone. A marker
+  * carrying anything else is a user-written one, not ours, and is also left alone.
+  */
+void finalizeAliasMarkersForDistributedSerialization(QueryTreeNodePtr & node, const ContextPtr & context);
+
 /// Returns single source of expression node.
 /// First element of pair is source node, can be nullptr if there are no sources or multiple sources.
 /// Second element of pair is true if there is at most one source, false if there are multiple sources.

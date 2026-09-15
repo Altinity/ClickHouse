@@ -98,36 +98,31 @@ QueryTreeNodePtr getInlineableAliasColumnExpression(const QueryTreeNodePtr & nod
     return column_node->getExpression()->clone();
 }
 
-/// The id a marker carries for `column_node`. The source's alias qualifies the column name whenever the source has one,
-/// so two same-named `ALIAS` columns coming from different tables stay distinguishable in the shard header.
-String aliasMarkerIdFor(const ColumnNode & column_node)
-{
-    const auto & column_source = column_node.getColumnSourceOrNull();
-    const auto & source_alias = column_source ? column_source->getAlias() : String{};
-    if (source_alias.empty())
-        return column_node.getColumnName();
-    return source_alias + "." + column_node.getColumnName();
-}
-
 /// Wrap an inlined `ALIAS` expression in `__aliasMarker` so it carries the identity of the column it came from.
-/// An expression that is already a marker gets its id refreshed rather than a second wrapper around it.
+///
+/// The id goes in as a live `ColumnNode`, not as a finished string. Later analyzer passes still have to run --
+/// `createUniqueAliasesIfNecessary` in particular, which assigns the `__tableN` aliases the id is built from -- and a
+/// `ColumnNode` is transformed by those passes exactly as the rest of the tree is.
+/// `finalizeAliasMarkersForDistributedSerialization` turns it into a `String` constant at the serialization boundary.
+///
+/// An expression that is already a marker has its id replaced rather than gaining a second wrapper.
 QueryTreeNodePtr wrapInAliasMarker(QueryTreeNodePtr expression, const ColumnNode & column_node, const ContextPtr & context)
 {
-    auto alias_id = aliasMarkerIdFor(column_node);
+    auto marker_id = std::make_shared<ColumnNode>(column_node.getColumn(), column_node.getColumnSourceOrNull());
 
     if (auto * function_node = expression->as<FunctionNode>();
         function_node && function_node->getFunctionName() == "__aliasMarker")
     {
         auto & marker_arguments = function_node->getArguments().getNodes();
         if (marker_arguments.size() == 2)
-            marker_arguments[1] = std::make_shared<ConstantNode>(std::move(alias_id), std::make_shared<DataTypeString>());
+            marker_arguments[1] = std::move(marker_id);
         return expression;
     }
 
     QueryTreeNodes arguments;
     arguments.reserve(2);
     arguments.emplace_back(std::move(expression));
-    arguments.emplace_back(std::make_shared<ConstantNode>(std::move(alias_id), std::make_shared<DataTypeString>()));
+    arguments.emplace_back(std::move(marker_id));
 
     auto marker_node = std::make_shared<FunctionNode>("__aliasMarker");
     marker_node->getArguments().getNodes() = std::move(arguments);
@@ -173,6 +168,20 @@ struct AliasColumnInliner
         /// children below and gets its own marker there, which is what preserves a nested marker chain.
         while (inlineOnce(node))
         {
+        }
+
+        if (auto * marker_node = node->as<FunctionNode>();
+            marker_node && marker_node->getFunctionName() == "__aliasMarker")
+        {
+            auto & marker_arguments = marker_node->getArguments().getNodes();
+            if (marker_arguments.size() == 2)
+            {
+                /// Descend into the payload only. The second argument is the column reference the marker exists to
+                /// record, and inlining it would expand the very `ALIAS` column whose identity it carries. It has to
+                /// reach `finalizeAliasMarkersForDistributedSerialization` as a `ColumnNode`.
+                inlineExpression(marker_arguments[0]);
+                return;
+            }
         }
 
         auto * join_node = node->as<JoinNode>();
@@ -633,7 +642,14 @@ TableNodePtr executeSubqueryNode(const QueryTreeNodePtr & subquery_node,
     ContextMutablePtr & mutable_context,
     size_t subquery_depth)
 {
-    const auto subquery_hash = subquery_node->getTreeHash();
+    /// A `GLOBAL IN` / `GLOBAL JOIN` subquery is materialized here and shipped as a temporary table, so this is a
+    /// serialization boundary too and the marker ids have to be finalized before the subquery runs. Finalizing also
+    /// makes the tree hash below stable: an unmaterialized marker hashes its `ColumnNode`, whose identifier can still
+    /// change, which would key the same subquery under two different temporary table names.
+    auto subquery_node_to_execute = subquery_node->clone();
+    finalizeAliasMarkersForDistributedSerialization(subquery_node_to_execute, mutable_context);
+
+    const auto subquery_hash = subquery_node_to_execute->getTreeHash();
     const auto temporary_table_name = fmt::format("_data_{}", toString(subquery_hash));
 
     const auto & external_tables = mutable_context->getExternalTables();
@@ -651,7 +667,7 @@ TableNodePtr executeSubqueryNode(const QueryTreeNodePtr & subquery_node,
     auto context_copy = Context::createCopy(mutable_context);
     updateContextForSubqueryExecution(context_copy);
 
-    InterpreterSelectQueryAnalyzer interpreter(subquery_node, context_copy, subquery_options);
+    InterpreterSelectQueryAnalyzer interpreter(subquery_node_to_execute, context_copy, subquery_options);
     auto & query_plan = interpreter.getQueryPlan();
 
     auto sample_block_with_unique_names = *query_plan.getCurrentHeader();
