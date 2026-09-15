@@ -40,8 +40,8 @@ TEST(PuffinFilesCacheMetrics, ClearDuringLoadCountsAsMissNotHit)
     ASSERT_TRUE(key.has_value());
 
     auto & counters = CurrentThread::getProfileEvents();
-    const auto hits_before = counters[ProfileEvents::PuffinFilesCacheHits].load();
-    const auto misses_before = counters[ProfileEvents::PuffinFilesCacheMisses].load();
+    const auto hits_before = counters[ProfileEvents::PuffinFilesCacheHits];
+    const auto misses_before = counters[ProfileEvents::PuffinFilesCacheMisses];
 
     size_t load_calls = 0;
     const auto result = cache.getOrSetDeletionVector(
@@ -58,8 +58,8 @@ TEST(PuffinFilesCacheMetrics, ClearDuringLoadCountsAsMissNotHit)
     ASSERT_EQ(load_calls, 1u);
     ASSERT_NE(result, nullptr);
     EXPECT_TRUE(result->rb_contains(1));
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits].load() - hits_before, 0u);
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses].load() - misses_before, 1u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits] - hits_before, 0u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses] - misses_before, 1u);
 
     /// Entry was not inserted after clear; the next lookup must load again.
     const auto second = cache.getOrSetDeletionVector(*key, [&]()
@@ -69,8 +69,8 @@ TEST(PuffinFilesCacheMetrics, ClearDuringLoadCountsAsMissNotHit)
     });
     ASSERT_EQ(load_calls, 2u);
     ASSERT_NE(second, nullptr);
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses].load() - misses_before, 2u);
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits].load() - hits_before, 0u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses] - misses_before, 2u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits] - hits_before, 0u);
 }
 
 TEST(PuffinFilesCacheMetrics, WaiterOfClearDiscardedLoadCountsAsMiss)
@@ -81,8 +81,8 @@ TEST(PuffinFilesCacheMetrics, WaiterOfClearDiscardedLoadCountsAsMiss)
         "Local:////test-prefix", "puffin.bin", "etag-waiter", 100, 200, "data/file-w.parquet", 1, 100);
     ASSERT_TRUE(key.has_value());
 
-    const auto hits_before = ProfileEvents::global_counters[ProfileEvents::PuffinFilesCacheHits].load();
-    const auto misses_before = ProfileEvents::global_counters[ProfileEvents::PuffinFilesCacheMisses].load();
+    const auto hits_before = ProfileEvents::global_counters[ProfileEvents::PuffinFilesCacheHits];
+    const auto misses_before = ProfileEvents::global_counters[ProfileEvents::PuffinFilesCacheMisses];
 
     std::promise<void> load_started;
     auto load_started_future = load_started.get_future();
@@ -151,8 +151,8 @@ TEST(PuffinFilesCacheMetrics, OrdinaryHitAndMissCounters)
     ASSERT_TRUE(key.has_value());
 
     auto & counters = CurrentThread::getProfileEvents();
-    const auto hits_before = counters[ProfileEvents::PuffinFilesCacheHits].load();
-    const auto misses_before = counters[ProfileEvents::PuffinFilesCacheMisses].load();
+    const auto hits_before = counters[ProfileEvents::PuffinFilesCacheHits];
+    const auto misses_before = counters[ProfileEvents::PuffinFilesCacheMisses];
 
     size_t load_calls = 0;
     auto load_fn = [&]()
@@ -165,8 +165,8 @@ TEST(PuffinFilesCacheMetrics, OrdinaryHitAndMissCounters)
     ASSERT_NE(cache.getOrSetDeletionVector(*key, load_fn), nullptr);
 
     EXPECT_EQ(load_calls, 1u);
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses].load() - misses_before, 1u);
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits].load() - hits_before, 1u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses] - misses_before, 1u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits] - hits_before, 1u);
 }
 
 TEST(PuffinFilesCacheMetrics, HitRemainsHitWhenCacheClearedAfterLookup)
@@ -187,17 +187,17 @@ TEST(PuffinFilesCacheMetrics, HitRemainsHitWhenCacheClearedAfterLookup)
 
     ASSERT_NE(cache.getOrSetDeletionVector(*key, load_fn), nullptr);
 
-    const auto hits_before = counters[ProfileEvents::PuffinFilesCacheHits].load();
-    const auto misses_before = counters[ProfileEvents::PuffinFilesCacheMisses].load();
+    const auto hits_before = counters[ProfileEvents::PuffinFilesCacheHits];
+    const auto misses_before = counters[ProfileEvents::PuffinFilesCacheMisses];
 
     ASSERT_NE(cache.getOrSetDeletionVector(*key, load_fn), nullptr);
     EXPECT_EQ(load_calls, 1u);
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits].load() - hits_before, 1u);
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses].load() - misses_before, 0u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits] - hits_before, 1u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses] - misses_before, 0u);
 
     /// Clearing after the hit must not rewrite the already-recorded hit as a miss. The old
     /// contains()-after-getOrSet path could race here with SYSTEM DROP PUFFIN FILES CACHE.
     cache.clear();
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits].load() - hits_before, 1u);
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses].load() - misses_before, 0u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheHits] - hits_before, 1u);
+    EXPECT_EQ(counters[ProfileEvents::PuffinFilesCacheMisses] - misses_before, 0u);
 }
