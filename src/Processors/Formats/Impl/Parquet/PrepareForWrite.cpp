@@ -25,6 +25,10 @@
 #include <DataTypes/DataTypeCustom.h>
 #include <Columns/ColumnVariant.h>
 #include <DataTypes/DataTypeVariant.h>
+#include <AggregateFunctions/IAggregateFunction.h>
+#include <Columns/ColumnAggregateFunction.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <IO/WriteBufferFromVector.h>
 
 /// This file deals with schema conversion and with repetition and definition levels.
 
@@ -810,6 +814,34 @@ void validateIcebergFieldIds(
     }
 }
 
+/// Parquet has no aggregate-state type, so an `AggregateFunction` column is written as an opaque
+/// BYTE_ARRAY of serialized states. writeFileFooter() records the ClickHouse type name, which
+/// includes the state version, in the file's key-value metadata.
+void convertAggregateFunctionColumnToString(ColumnPtr & column, DataTypePtr & type)
+{
+    const auto & aggregate_type = assert_cast<const DataTypeAggregateFunction &>(*type);
+    const auto & function = aggregate_type.getFunction();
+    const size_t version = aggregate_type.getVersion();
+    const auto & states = assert_cast<const ColumnAggregateFunction &>(*column).getData();
+
+    auto result = ColumnString::create();
+    auto & chars = result->getChars();
+    auto & offsets = result->getOffsets();
+    offsets.reserve(states.size());
+    {
+        WriteBufferFromVector<ColumnString::Chars> buffer(chars);
+        for (const auto * state : states)
+        {
+            function->serialize(state, buffer, version);
+            offsets.push_back(buffer.count());
+        }
+        buffer.finalize();
+    }
+
+    column = std::move(result);
+    type = std::make_shared<DataTypeString>();
+}
+
 void prepareColumnRecursive(
     ColumnPtr column, DataTypePtr type, const std::string & name, const WriteOptions & options,
     ColumnChunkWriteStates & states, SchemaElements & schemas, const std::optional<std::unordered_map<String, Int64>> & column_field_ids)
@@ -817,6 +849,29 @@ void prepareColumnRecursive(
     /// Remove const and sparse but leave LowCardinality as the encoder can directly use it for
     /// parquet dictionary-encoding.
     column = column->convertToFullColumnIfReplicated()->convertToFullColumnIfSparse()->convertToFullColumnIfConst();
+
+    if (type->getTypeId() == TypeIndex::AggregateFunction)
+    {
+        /// The states and the type name recorded next to them are a ClickHouse-only convention no
+        /// other reader can interpret, so writing them is opt-in. Without the setting, keep throwing
+        /// `UNKNOWN_TYPE` the way `preparePrimitiveColumn` used to.
+        if (!options.allow_aggregate_function_states)
+            throw Exception(
+                ErrorCodes::UNKNOWN_TYPE,
+                "Internal type '{}' of column '{}' is not supported for conversion into Parquet data format. "
+                "Enable setting allow_experimental_aggregate_function_states_in_parquet to write the "
+                "serialized states",
+                type->getFamilyName(), name);
+
+        convertAggregateFunctionColumnToString(column, type);
+        /// Serialized states are arbitrary bytes, not text: no STRING/UTF8 logical type, even though
+        /// `output_format_parquet_string_as_string` is on by default.
+        WriteOptions binary_options = options;
+        binary_options.output_string_as_string = false;
+        preparePrimitiveColumn(
+            column, type, name, binary_options, states, schemas, lookupLeafFieldId(column_field_ids, name));
+        return;
+    }
 
     switch (type->getTypeId())
     {

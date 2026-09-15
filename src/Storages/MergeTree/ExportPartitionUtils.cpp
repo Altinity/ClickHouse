@@ -257,6 +257,16 @@ namespace ExportPartitionUtils
         /// schema drifts to a lossy target between scheduling and execution.
         context_copy->setSetting("export_merge_tree_part_allow_lossy_cast", manifest.allow_lossy_cast);
 
+        /// Reapply the initiator's aggregate-state opt-ins. The data file this task writes is
+        /// Parquet, so without the first one the writer refuses an `AggregateFunction` column with
+        /// `UNKNOWN_TYPE`. The second one matters when the destination lives in a data lake catalog
+        /// database: resolving it re-parses the destination's Iceberg schema, whose `clickhouse.type`
+        /// annotation is honoured only while that setting is on.
+        context_copy->setSetting(
+            "allow_experimental_aggregate_function_states_in_parquet", manifest.allow_aggregate_function_states_in_parquet);
+        context_copy->setSetting(
+            "allow_experimental_aggregate_function_states_in_iceberg", manifest.allow_aggregate_function_states_in_iceberg);
+
         if (manifest.iceberg_partition_timezone)
         {
             context_copy->setSetting("iceberg_partition_timezone", *manifest.iceberg_partition_timezone);

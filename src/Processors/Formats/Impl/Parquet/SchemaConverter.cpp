@@ -18,6 +18,11 @@
 #include <DataTypes/NestedUtils.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <Core/Defines.h>
+#include <Parsers/ParserDataType.h>
+#include <Parsers/parseQuery.h>
+#include <Poco/JSON/Parser.h>
 
 #include <fmt/ranges.h>
 
@@ -52,6 +57,42 @@ SchemaConverter::SchemaConverter(
                 break;
             }
         }
+    }
+
+    /// Type names recorded by the ClickHouse writer for columns the parquet schema cannot describe on
+    /// its own (aggregate states); see writeFileFooter() in Write.cpp. Only the JSON is parsed here -
+    /// resolving a name is inferSchema()'s job, per column and after the aggregate-state opt-in, so
+    /// that a bad annotation breaks at most the column it belongs to. With an explicit structure
+    /// (sample_block != null) the annotation is ignored, so don't even parse the JSON.
+    for (const auto & kv : file_metadata.key_value_metadata)
+    {
+        if (sample_block)
+            break;
+
+        if (kv.key != clickhouse_column_types_key)
+            continue;
+
+        try
+        {
+            Poco::JSON::Parser parser;
+            const auto object = parser.parse(kv.value).extract<Poco::JSON::Object::Ptr>();
+            for (const auto & name : object->getNames())
+                clickhouse_column_type_names[name] = object->getValue<String>(name);
+        }
+        catch (Exception & e)
+        {
+            e.addMessage("while parsing the `{}` key-value metadata of the parquet file", clickhouse_column_types_key);
+            throw;
+        }
+        catch (const Poco::Exception & e)
+        {
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "Cannot parse the `{}` key-value metadata of the parquet file: {}",
+                clickhouse_column_types_key,
+                e.displayText());
+        }
+        break;
     }
 }
 
@@ -118,6 +159,52 @@ void SchemaConverter::prepareForReading()
     }
 }
 
+DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, const String & type_name) const
+{
+    ASTPtr ast;
+    try
+    {
+        ParserDataType parser;
+        ast = parseQuery(
+            parser, type_name.data(), type_name.data() + type_name.size(), "data type",
+            /*max_query_size=*/ 0, options.format.max_parser_depth, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+    }
+    catch (Exception & e)
+    {
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA,
+            "Parquet file records ClickHouse type {} for column {} in its `{}` metadata, which is not a "
+            "valid type name: {}",
+            type_name, column_name, clickhouse_column_types_key, e.message());
+    }
+
+    /// The file, not the query, names the aggregate function whose deserializer is handed the state
+    /// bytes, hence the opt-in. Ask the parsed name rather than the resolved type, since resolving it
+    /// is what looks the aggregate function up. Reject rather than fall back to the inferred type:
+    /// reading states as strings would be a wrong result, not an error.
+    if (astHasAggregateFunctionType(ast) && !options.format.parquet.allow_aggregate_function_states)
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA,
+            "Parquet file records ClickHouse type {} for column {} in its `{}` metadata. Inferring "
+            "aggregate function states from parquet metadata is disabled: enable setting "
+            "allow_experimental_aggregate_function_states_in_parquet to honour the "
+            "recorded type, or pass the structure explicitly",
+            type_name, column_name, clickhouse_column_types_key);
+
+    try
+    {
+        return DataTypeFactory::instance().get(ast);
+    }
+    catch (Exception & e)
+    {
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA,
+            "Parquet file records ClickHouse type {} for column {} in its `{}` metadata, which this "
+            "server cannot resolve: {}",
+            type_name, column_name, clickhouse_column_types_key, e.message());
+    }
+}
+
 NamesAndTypesList SchemaConverter::inferSchema()
 {
     chassert(!sample_block);
@@ -132,7 +219,41 @@ NamesAndTypesList SchemaConverter::inferSchema()
         if (node.output_idx.has_value())
         {
             const OutputColumnInfo & col = output_columns.at(node.output_idx.value());
-            res.emplace_back(col.name, col.output_type);
+            auto it = clickhouse_column_type_names.find(col.name);
+            if (it == clickhouse_column_type_names.end())
+            {
+                res.emplace_back(col.name, col.output_type);
+                continue;
+            }
+
+            DataTypePtr annotated_type;
+            try
+            {
+                annotated_type = resolveAnnotatedType(col.name, it->second);
+
+                /// Strict: this reader knows the writer that recorded the annotation, so it can
+                /// require the annotated type to be one that writer maps to what the column holds.
+                /// Anything else is stale or crafted, and would re-type the column to whatever it
+                /// names - with no opt-out, `SimpleAggregateFunction` being honoured ungated.
+                if (!annotatedTypeMatchesDerived(annotated_type, col.output_type, /*strict=*/ true))
+                    throw Exception(
+                        ErrorCodes::INCORRECT_DATA,
+                        "Parquet file records ClickHouse type {} for column {} in its `{}` metadata, but the "
+                        "parquet schema for that column reads as {}",
+                        annotated_type->getName(), col.name, clickhouse_column_types_key, col.output_type->getName());
+            }
+            catch (Exception & e)
+            {
+                /// An annotation this server won't honour concerns one column, so let the file's
+                /// other columns still be inferred, the same way processSubtreePrimitive() skips a
+                /// column of a parquet type it can't read.
+                if (options.format.parquet.skip_columns_with_unsupported_types_in_schema_inference
+                    && (e.code() == ErrorCodes::INCORRECT_DATA || e.code() == ErrorCodes::NOT_IMPLEMENTED))
+                    continue;
+                throw;
+            }
+
+            res.emplace_back(col.name, annotated_type);
         }
     }
     return res;
@@ -418,10 +539,11 @@ bool SchemaConverter::processSubtreePrimitive(TraversalNode & node)
     }
 
     /// GeoParquet types like Point or Polygon can't be inside Nullable.
-    /// Geometry (Variant) is also not Nullable-compatible.
+    /// Geometry (Variant) is also not Nullable-compatible, and neither is AggregateFunction.
     if (typeid_cast<const DataTypeArray *>(inferred_type.get())
         || typeid_cast<const DataTypeTuple *>(inferred_type.get())
-        || typeid_cast<const DataTypeVariant *>(inferred_type.get()))
+        || typeid_cast<const DataTypeVariant *>(inferred_type.get())
+        || typeid_cast<const DataTypeAggregateFunction *>(inferred_type.get()))
     {
         output_nullable = false;
         output_nullable_if_not_json = false;
@@ -1007,6 +1129,23 @@ void SchemaConverter::processPrimitiveColumn(
             out_decoder.fixed_size_converter = std::move(converter);
             return;
         }
+    }
+
+    /// Aggregate states are written as opaque BYTE_ARRAY by convertAggregateFunctionColumnToString().
+    if (const auto * aggregate_type = typeid_cast<const DataTypeAggregateFunction *>(type_hint.get()))
+    {
+        if (type != parq::Type::BYTE_ARRAY)
+            throw Exception(
+                ErrorCodes::TYPE_MISMATCH,
+                "Column is requested as {} but its parquet physical type is {}, not BYTE_ARRAY",
+                type_hint->getName(), thriftToString(type));
+
+        out_inferred_type = type_hint;
+        /// Min/max over serialized states is meaningless, so it must not be used for pruning.
+        out_decoder.allow_stats = false;
+        out_decoder.string_converter = std::make_shared<AggregateFunctionStateConverter>(
+            aggregate_type->getFunction(), aggregate_type->getVersion());
+        return;
     }
 
     /// GeoParquet.

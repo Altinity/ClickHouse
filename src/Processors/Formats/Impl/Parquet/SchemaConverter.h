@@ -44,6 +44,13 @@ struct SchemaConverter
     /// The key is the parquet column name, without ColumnMapper.
     std::unordered_map<String, GeoColumnMetadata> geo_columns;
 
+    /// Type names recorded by the ClickHouse writer under the `clickhouse.column_types` key-value
+    /// metadata entry, keyed by top-level column name. Kept as raw strings: the file, not the query,
+    /// controls them, so a name becomes a type only in inferSchema(), only for a column that ends up
+    /// in the schema, and only after the aggregate-state opt-in has been checked. Empty when a sample
+    /// block is given, in which case the requested type wins.
+    std::unordered_map<String, String> clickhouse_column_type_names;
+
     SchemaConverter(const parq::FileMetaData &, const ReadOptions &, const Block *);
 
     void prepareForReading();
@@ -127,6 +134,11 @@ private:
     };
 
     void checkHasColumns();
+
+    /// Turns the type name the writer recorded for `column_name` into a type, applying the
+    /// aggregate-state opt-in before the name reaches `DataTypeFactory`. Every failure is reported as
+    /// `INCORRECT_DATA` naming the column, so inferSchema() can skip just that column.
+    DataTypePtr resolveAnnotatedType(const String & column_name, const String & type_name) const;
 
     void processSubtree(TraversalNode & node);
 

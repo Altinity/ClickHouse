@@ -5,10 +5,20 @@
 
 #include <Common/SipHash.h>
 #include <Common/AlignedBuffer.h>
+#include <Common/quoteString.h>
 #include <Common/FieldVisitorToString.h>
 
 #include <Formats/FormatSettings.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
+#include <DataTypes/DataTypeCustomSimpleAggregateFunction.h>
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeFixedString.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeTime64.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/Serializations/SerializationAggregateFunction.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/transformTypesRecursively.h>
@@ -20,7 +30,9 @@
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/IAggregateFunction.h>
+#include <Parsers/ASTDataType.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTIdentifier_fwd.h>
 #include <Parsers/ASTLiteral.h>
 
@@ -54,13 +66,19 @@ String DataTypeAggregateFunction::getFunctionName() const
 
 String DataTypeAggregateFunction::doGetName() const
 {
-    return getNameImpl(true);
+    return getNameImpl(true, false);
 }
 
 
 String DataTypeAggregateFunction::getNameWithoutVersion() const
 {
-    return getNameImpl(false);
+    return getNameImpl(false, false);
+}
+
+
+String DataTypeAggregateFunction::getNameForAnnotation() const
+{
+    return getNameImpl(true, true);
 }
 
 
@@ -91,14 +109,16 @@ void DataTypeAggregateFunction::updateVersionFromRevision(size_t revision, bool 
     setVersion(function->getVersionFromRevision(revision), if_empty);
 }
 
-String DataTypeAggregateFunction::getNameImpl(bool with_version) const
+String DataTypeAggregateFunction::getNameImpl(bool with_version, bool always_emit_version) const
 {
     WriteBufferFromOwnString stream;
     stream << "AggregateFunction(";
 
     /// If aggregate function does not support versioning its version is 0 and is not printed.
+    /// always_emit_version keeps an explicit 0 for a versioned function, which getName() would drop,
+    /// making it indistinguishable from the default version. Non-versioned functions still omit it.
     auto data_type_version = getVersion();
-    if (with_version && data_type_version)
+    if (with_version && (data_type_version || (always_emit_version && isVersioned())))
         stream << data_type_version << ", ";
     stream << function->getName();
 
@@ -476,6 +496,231 @@ bool hasAggregateFunctionType(const DataTypePtr & type)
     check(*type);
     type->forEachChild(check);
     return result;
+}
+
+bool astHasAggregateFunctionType(const ASTPtr & ast)
+{
+    /// `ParserDataType` represents a type name with arguments as `ASTDataType` and a bare one as
+    /// `ASTIdentifier`. The comparison is exact because `AggregateFunction` is registered
+    /// case-sensitively and has no alias.
+    std::string_view name;
+    if (const auto * data_type = ast->as<ASTDataType>())
+        name = data_type->name;
+    else if (const auto * identifier = ast->as<ASTIdentifier>())
+        name = identifier->name();
+
+    if (name == "AggregateFunction")
+        return true;
+
+    for (const auto & child : ast->children)
+        if (astHasAggregateFunctionType(child))
+            return true;
+
+    return false;
+}
+
+bool needsClickHouseTypeAnnotation(const DataTypePtr & type)
+{
+    auto result = false;
+    auto check = [&](const IDataType & t)
+    {
+        if (WhichDataType(t).isAggregateFunction())
+        {
+            result = true;
+            return;
+        }
+        /// `SimpleAggregateFunction(f, T)` is `T` carrying an `IDataTypeCustomName`.
+        result |= typeid_cast<const DataTypeCustomSimpleAggregateFunction *>(t.getCustomName()) != nullptr;
+    };
+
+    check(*type);
+    type->forEachChild(check);
+    return result;
+}
+
+String getClickHouseTypeAnnotationName(const DataTypePtr & type)
+{
+    /// `SimpleAggregateFunction(f, T)` has no version and its `T` cannot hold an `AggregateFunction`,
+    /// so getName() already round-trips it.
+    if (type->getCustomName())
+        return type->getName();
+
+    switch (type->getTypeId())
+    {
+        case TypeIndex::AggregateFunction:
+            return assert_cast<const DataTypeAggregateFunction &>(*type).getNameForAnnotation();
+        case TypeIndex::Array:
+            return "Array(" + getClickHouseTypeAnnotationName(assert_cast<const DataTypeArray &>(*type).getNestedType()) + ")";
+        case TypeIndex::Map:
+        {
+            const auto & map_type = assert_cast<const DataTypeMap &>(*type);
+            return "Map(" + getClickHouseTypeAnnotationName(map_type.getKeyType()) + ", "
+                + getClickHouseTypeAnnotationName(map_type.getValueType()) + ")";
+        }
+        case TypeIndex::Tuple:
+        {
+            const auto & tuple_type = assert_cast<const DataTypeTuple &>(*type);
+            const auto & elements = tuple_type.getElements();
+            const auto & names = tuple_type.getElementNames();
+            WriteBufferFromOwnString stream;
+            stream << "Tuple(";
+            for (size_t i = 0; i < elements.size(); ++i)
+            {
+                if (i)
+                    stream << ", ";
+                if (tuple_type.hasExplicitNames())
+                    stream << backQuoteIfNeed(names[i]) << ' ';
+                stream << getClickHouseTypeAnnotationName(elements[i]);
+            }
+            stream << ")";
+            return stream.str();
+        }
+        default:
+            return type->getName();
+    }
+}
+
+namespace
+{
+
+/// Neither format's schema inference derives a `LowCardinality`, and either side may carry a
+/// `Nullable` the other does not (an OPTIONAL parquet leaf always derives as one). Neither says
+/// anything about the values, so both wrappers come off before the types are compared.
+DataTypePtr removeNullableAndLowCardinality(const DataTypePtr & type)
+{
+    return removeNullable(removeLowCardinality(type));
+}
+
+bool isFixedStringOfSize(const DataTypePtr & type, size_t size)
+{
+    const auto * fixed_string = typeid_cast<const DataTypeFixedString *>(type.get());
+    return fixed_string && fixed_string->getN() == size;
+}
+
+bool isDateTime64WithScale(const DataTypePtr & type, UInt32 scale)
+{
+    const auto * date_time64 = typeid_cast<const DataTypeDateTime64 *>(type.get());
+    return date_time64 && date_time64->getScale() == scale;
+}
+
+/// True when `derived`, the type a parquet schema alone reads as, is one this server's parquet writer
+/// can produce for a column of type `annotated`. Both arguments are free of `Nullable` and
+/// `LowCardinality`.
+///
+/// A directed relation rather than an equality: the writer's mapping in `preparePrimitiveColumn` is
+/// not injective, since parquet has no logical type for several ClickHouse types and a few
+/// `output_format_parquet_*` settings, not recorded in the file, pick between representations. Each
+/// case below mirrors one of those. Where the mapping is unclear the check is deliberately generous:
+/// a pair wrongly accepted only honours an annotation that would have been honoured anyway, while a
+/// pair wrongly rejected refuses a file that reads fine.
+bool parquetWriterCouldProduce(const DataTypePtr & annotated, const DataTypePtr & derived)
+{
+    if (annotated->equals(*derived))
+        return true;
+
+    /// Parquet timestamps come in milli-, micro- and nanoseconds only, so a scale in between is
+    /// written scaled up to the next unit and reads back with that unit's scale.
+    auto next_timestamp_unit = [](UInt32 scale) -> UInt32
+    {
+        if (scale <= 3)
+            return 3;
+        if (scale <= 6)
+            return 6;
+        return 9;
+    };
+
+    switch (annotated->getTypeId())
+    {
+        /// Parquet has no 16-bit date, so `Date` is written as a DATE, deriving as `Date32` - or, with
+        /// `output_format_parquet_date_as_uint16`, as a UINT_16.
+        case TypeIndex::Date:
+            return WhichDataType(derived).isDate32() || WhichDataType(derived).isUInt16();
+        /// No second-resolution timestamp, so `DateTime` is written as TIMESTAMP_MILLIS, deriving as
+        /// `DateTime64(3)` - or, with `output_format_parquet_datetime_as_uint32`, as a UINT_32.
+        case TypeIndex::DateTime:
+            return isDateTime64WithScale(derived, 3) || WhichDataType(derived).isUInt32();
+        case TypeIndex::DateTime64:
+            return isDateTime64WithScale(
+                derived, next_timestamp_unit(assert_cast<const DataTypeDateTime64 &>(*annotated).getScale()));
+        /// TIME is written with the timestamp units and derives as `DateTime64`, like TIMESTAMP.
+        /// Second-resolution `Time` is written as micros.
+        case TypeIndex::Time:
+            return isDateTime64WithScale(derived, 6);
+        case TypeIndex::Time64:
+            return isDateTime64WithScale(
+                derived, assert_cast<const DataTypeTime64 &>(*annotated).getScale() <= 6 ? 6 : 9);
+        /// An enum is written as an ENUM byte array, deriving as `String` - or, with
+        /// `output_format_parquet_enum_as_byte_array` off, as its underlying integer.
+        case TypeIndex::Enum8:
+            return isString(derived) || WhichDataType(derived).isInt8();
+        case TypeIndex::Enum16:
+            return isString(derived) || WhichDataType(derived).isInt16();
+        /// No logical type for these, so they are written as raw bytes: `IPv4` as a plain UINT_32,
+        /// the rest as a FIXED_LEN_BYTE_ARRAY of their width.
+        case TypeIndex::IPv4:
+            return WhichDataType(derived).isUInt32();
+        case TypeIndex::IPv6:
+        case TypeIndex::UInt128:
+        case TypeIndex::Int128:
+            return isFixedStringOfSize(derived, 16);
+        case TypeIndex::UInt256:
+        case TypeIndex::Int256:
+            return isFixedStringOfSize(derived, 32);
+        /// With `output_format_parquet_fixed_string_as_fixed_byte_array` off a `FixedString` is
+        /// written as a plain BYTE_ARRAY, which derives as `String`.
+        case TypeIndex::FixedString:
+            return isString(derived);
+        /// A JSON column read with `input_format_parquet_enable_json_parsing` off derives as `String`.
+        case TypeIndex::Object:
+            return isString(derived);
+        default:
+            return false;
+    }
+}
+
+}
+
+bool annotatedTypeMatchesDerived(const DataTypePtr & annotated_type, const DataTypePtr & derived_type, bool strict)
+{
+    auto annotated = removeNullableAndLowCardinality(annotated_type);
+    auto derived = removeNullableAndLowCardinality(derived_type);
+
+    if (annotated->getTypeId() == TypeIndex::AggregateFunction)
+        return isString(derived);
+
+    switch (annotated->getTypeId())
+    {
+        case TypeIndex::Array:
+        {
+            const auto * derived_array = typeid_cast<const DataTypeArray *>(derived.get());
+            if (!derived_array)
+                return false;
+            return annotatedTypeMatchesDerived(
+                assert_cast<const DataTypeArray &>(*annotated).getNestedType(), derived_array->getNestedType(), strict);
+        }
+        case TypeIndex::Tuple:
+        {
+            const auto & annotated_tuple = assert_cast<const DataTypeTuple &>(*annotated);
+            const auto * derived_tuple = typeid_cast<const DataTypeTuple *>(derived.get());
+            if (!derived_tuple || derived_tuple->getElements().size() != annotated_tuple.getElements().size())
+                return false;
+            for (size_t i = 0; i < annotated_tuple.getElements().size(); ++i)
+                if (!annotatedTypeMatchesDerived(annotated_tuple.getElement(i), derived_tuple->getElement(i), strict))
+                    return false;
+            return true;
+        }
+        case TypeIndex::Map:
+        {
+            const auto & annotated_map = assert_cast<const DataTypeMap &>(*annotated);
+            const auto * derived_map = typeid_cast<const DataTypeMap *>(derived.get());
+            if (!derived_map)
+                return false;
+            return annotatedTypeMatchesDerived(annotated_map.getKeyType(), derived_map->getKeyType(), strict)
+                && annotatedTypeMatchesDerived(annotated_map.getValueType(), derived_map->getValueType(), strict);
+        }
+        default:
+            return !strict || parquetWriterCouldProduce(annotated, derived);
+    }
 }
 
 }
