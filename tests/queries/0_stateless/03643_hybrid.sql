@@ -193,6 +193,8 @@ SELECT id, name, value FROM test_tiered_multi_segment WHERE id > 2 ORDER BY valu
 SELECT 'Limit results ordered by id';
 SELECT * FROM test_tiered_multi_segment ORDER BY id LIMIT 3;
 SELECT 'Explain plan for filter on value';
+-- The plan shape is asserted below, so print the flat plan instead of the pretty tree.
+SET explain_query_plan_default = 'legacy';
 EXPLAIN SELECT * FROM test_tiered_multi_segment WHERE value > 150 SETTINGS prefer_localhost_replica=0, enable_analyzer=0;
 EXPLAIN SELECT * FROM test_tiered_multi_segment WHERE value > 150 SETTINGS prefer_localhost_replica=0, enable_analyzer=1;
 EXPLAIN SELECT * FROM test_tiered_multi_segment WHERE value > 150 SETTINGS prefer_localhost_replica=1, enable_analyzer=0;

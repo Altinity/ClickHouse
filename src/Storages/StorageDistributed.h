@@ -388,7 +388,6 @@ private:
 
     bool is_remote_function;
 
-<<<<<<< HEAD
     /// The storage is a table of a `Remote` database: a transient proxy over the remote table with
     /// no data of its own. Such a proxy enforces the caller's own rights on
     /// `remote_database.remote_table` in `read`/`write` when a shard points to this server, where
@@ -401,7 +400,7 @@ private:
     bool is_remote_database_proxy;
 
     void checkLocalShardAccess(const AccessFlags & access, const ContextPtr & local_context) const;
-=======
+
     MultiVersion<WatermarkParams> hybrid_watermark_params;
 
     /// Additional filter expression for Hybrid engine
@@ -418,7 +417,6 @@ private:
     /// Subsequent segment DDL changes are not auto-detected;
     /// reattach/recreate the Hybrid table to refresh.
     ColumnsDescription cached_columns_to_cast;
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 };
 
 }

@@ -7,6 +7,7 @@ SET allow_experimental_hybrid_table = 1;
 -- at the defaults the reference was generated with. The settings below pin the few values that
 -- differ from their defaults, plus the timezone, so the assertions do not depend on the server
 -- configuration either. None of these affect pruning logic.
+SET explain_query_plan_default = 'legacy';    -- assert the flat plan shape, not the pretty tree
 SET prefer_localhost_replica = 1;             -- avoid ReadFromRemote vs ReadFromMergeTree flips
 SET query_plan_join_swap_table = 'false';     -- pin JOIN side ordering
 SET use_query_condition_cache = 0;            -- consistent EXPLAIN across runs

@@ -4,6 +4,9 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
+# The assertions below grep the plan header lines, which only the flat plan prints unindented.
+CLICKHOUSE_CLIENT="$CLICKHOUSE_CLIENT --explain_query_plan_default=legacy"
+
 echo "---- stage: with_mergeable_state (analyzer=1, setting=enable_alias_marker=1) ----"
 $CLICKHOUSE_CLIENT --enable_analyzer=1 --stage with_mergeable_state --multiquery 2>&1 <<'EOF' | sed -n '/^Header:/,/^  [^ ]/p' | sed '$d'
 SET enable_alias_marker=1;

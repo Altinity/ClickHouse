@@ -9,12 +9,9 @@
 
 #include <memory>
 #include <optional>
-<<<<<<< HEAD
+#include <span>
 #include <string_view>
 #include <vector>
-=======
-#include <span>
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 
 namespace DB
 {

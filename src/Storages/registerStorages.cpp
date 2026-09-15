@@ -13,11 +13,8 @@ void registerStorageNull(StorageFactory & factory);
 void registerStorageMerge(StorageFactory & factory);
 void registerStorageBuffer(StorageFactory & factory);
 void registerStorageDistributed(StorageFactory & factory);
-<<<<<<< HEAD
 void registerStorageRemote(StorageFactory & factory);
-=======
 void registerStorageHybrid(StorageFactory & factory);
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 void registerStorageMemory(StorageFactory & factory);
 void registerStorageQueryRunner(StorageFactory & factory);
 void registerStorageFile(StorageFactory & factory);
@@ -130,11 +127,8 @@ void registerStorages()
     registerStorageMerge(factory);
     registerStorageBuffer(factory);
     registerStorageDistributed(factory);
-<<<<<<< HEAD
     registerStorageRemote(factory);
-=======
     registerStorageHybrid(factory);
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
     registerStorageMemory(factory);
     registerStorageQueryRunner(factory);
     registerStorageFile(factory);

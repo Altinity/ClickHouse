@@ -96,11 +96,8 @@
 
 #include <TableFunctions/TableFunctionView.h>
 #include <TableFunctions/TableFunctionFactory.h>
-<<<<<<< HEAD
 #include <Storages/Distributed/parseRemoteFunctionArguments.h>
-=======
 #include <Storages/StorageTableFunction.h>
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 
 #include <Storages/buildQueryTreeForShard.h>
 #include <Storages/IStorageCluster.h>
@@ -256,11 +253,8 @@ namespace ErrorCodes
     extern const int ARGUMENT_OUT_OF_BOUND;
     extern const int TOO_LARGE_DISTRIBUTED_DEPTH;
     extern const int ALL_CONNECTION_TRIES_FAILED;
-<<<<<<< HEAD
     extern const int ACCESS_DENIED;
-=======
     extern const int SUPPORT_IS_DISABLED;
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 }
 
 namespace ActionLocks
@@ -906,78 +900,9 @@ StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataP
 namespace
 {
 
-<<<<<<< HEAD
-=======
-class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasColumnsVisitor>
-{
-    QueryTreeNodePtr getColumnNodeAliasExpression(const QueryTreeNodePtr & node) const
-    {
-        const auto * column_node = node->as<ColumnNode>();
-        if (!column_node || !column_node->hasExpression())
-            return nullptr;
-
-        const auto & column_source = column_node->getColumnSourceOrNull();
-        if (!column_source || column_source->getNodeType() == QueryTreeNodeType::JOIN
-                           || column_source->getNodeType() == QueryTreeNodeType::CROSS_JOIN
-                           || column_source->getNodeType() == QueryTreeNodeType::ARRAY_JOIN)
-            return nullptr;
-
-        auto column_expression = column_node->getExpression();
-        const auto & column_name = column_node->getColumnName();
-
-        if (!context->getSettingsRef()[Setting::enable_alias_marker])
-        {
-            column_expression->setAlias(column_name);
-            return column_expression;
-        }
-
-        String alias_id;
-        const auto & source_alias = column_source->getAlias();
-        if (!source_alias.empty())
-            alias_id = source_alias + "." + column_name;
-        else
-            alias_id = column_name;
-
-        if (auto * function_node = column_expression->as<FunctionNode>();
-            function_node && function_node->getFunctionName() == "__aliasMarker")
-        {
-            auto & arguments = function_node->getArguments().getNodes();
-            if (arguments.size() == 2)
-                arguments[1] = std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>());
-
-            column_expression->setAlias(column_name);
-            return column_expression;
-        }
-
-        QueryTreeNodes arguments;
-        arguments.reserve(2);
-        arguments.emplace_back(std::move(column_expression));
-        arguments.emplace_back(std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>()));
-
-        auto alias_marker_node = std::make_shared<FunctionNode>("__aliasMarker");
-        alias_marker_node->getArguments().getNodes() = std::move(arguments);
-        alias_marker_node->setAlias(column_name);
-        resolveOrdinaryFunctionNodeByName(*alias_marker_node, "__aliasMarker", context);
-
-        return alias_marker_node;
-    }
-
-public:
-    explicit ReplaseAliasColumnsVisitor(ContextPtr context_) : context(std::move(context_)) {}
-
-    void visitImpl(QueryTreeNodePtr & node)
-    {
-        if (auto column_expression = getColumnNodeAliasExpression(node))
-            node = column_expression;
-    }
-
-private:
-    ContextPtr context;
-};
-
 using ColumnNameToColumnNodeMap = std::unordered_map<std::string, ColumnNodePtr>;
 
-ColumnNameToColumnNodeMap buildColumnNodesForTableExpression(const QueryTreeNodePtr & table_expression_node, const ContextPtr & context)
+ColumnNameToColumnNodeMap buildColumnNodesForTableExpression(const TableExpressionNodePtr & table_expression_node, const ContextPtr & context)
 {
     const TableNode * table_node = table_expression_node->as<TableNode>();
     const TableFunctionNode * table_function_node = table_expression_node->as<TableFunctionNode>();
@@ -1023,8 +948,8 @@ class ReplaceColumnNodesForTableExpressionVisitor : public InDepthQueryTreeVisit
 {
 public:
     ReplaceColumnNodesForTableExpressionVisitor(
-        const QueryTreeNodePtr & from_,
-        const QueryTreeNodePtr & to_,
+        const TableExpressionNodePtr & from_,
+        const TableExpressionNodePtr & to_,
         const ColumnNameToColumnNodeMap & column_name_to_node_)
         : from(from_), to(to_), column_name_to_node(column_name_to_node_)
     {}
@@ -1063,12 +988,11 @@ public:
     }
 
 private:
-    QueryTreeNodePtr from;
-    QueryTreeNodePtr to;
+    TableExpressionNodePtr from;
+    TableExpressionNodePtr to;
     const ColumnNameToColumnNodeMap & column_name_to_node;
 };
 
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 class RewriteInToGlobalInVisitor : public InDepthQueryTreeVisitorWithContext<RewriteInToGlobalInVisitor>
 {
 public:
@@ -1218,10 +1142,6 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
     replacement_table_expression->setAlias(query_info.table_expression->getAlias());
 
-<<<<<<< HEAD
-    auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(replacement_table_expression));
-    inlineAliasColumns(query_tree_to_modify);
-=======
     QueryTreeNodePtr filter;
     if (additional_filter)
     {
@@ -1261,7 +1181,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
          * (including fully-resolved ALIAS expressions) and rewrite the whole query tree
          * so all references to the replaced table share the same column source and
          * the same alias semantics. This keeps SELECT and WHERE consistent before
-         * ReplaseAliasColumnsVisitor performs final alias expansion.
+         * inlineAliasColumns() performs final alias expansion.
          */
         ReplaceColumnNodesForTableExpressionVisitor replace_query_columns_visitor(
             replacement_table_expression,
@@ -1270,9 +1190,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         replace_query_columns_visitor.visit(query_tree_to_modify);
     }
 
-    ReplaseAliasColumnsVisitor replace_alias_columns_visitor(query_context);
-    replace_alias_columns_visitor.visit(query_tree_to_modify);
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
+    inlineAliasColumns(query_tree_to_modify);
 
     const auto & settings = query_context->getSettingsRef();
 
@@ -2926,7 +2844,6 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
     }
 }
 
-<<<<<<< HEAD
 /// Validate the distributed table settings and propagate the global `distributed_background_insert_*`
 /// defaults to the settings that were not specified in the query. The background `INSERT` queue reads
 /// these table settings directly, so both the `Distributed` and the `Remote`/`RemoteSecure` engines
@@ -2958,7 +2875,6 @@ static void finalizeDistributedSettings(DistributedSettings & distributed_settin
             = context->getSettingsRef()[Setting::distributed_background_insert_max_sleep_time_ms];
 }
 
-=======
 void StorageDistributed::setHybridLayout(std::vector<HybridSegment> segments_)
 {
     segments = std::move(segments_);
@@ -2996,7 +2912,6 @@ ColumnsDescription StorageDistributed::getColumnsToCast() const
 }
 
 
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 void registerStorageDistributed(StorageFactory & factory);
 void registerStorageDistributed(StorageFactory & factory)
 {
@@ -3355,7 +3270,6 @@ Since [`remote`](/reference/functions/table-functions/remote) and [`cluster`](/r
         .related = {"Merge"}});
 }
 
-<<<<<<< HEAD
 void registerStorageRemote(StorageFactory & factory);
 void registerStorageRemote(StorageFactory & factory)
 {
@@ -3527,7 +3441,59 @@ void registerStorageRemote(StorageFactory & factory)
     };
 
     StorageFactory::StorageFeatures features
-=======
+    {
+        .supports_settings = true,
+        .supports_parallel_insert = true,
+        .supports_schema_inference = true,
+        .source_access_type = AccessTypeObjects::Source::REMOTE,
+        .has_builtin_setting_fn = DistributedSettings::hasBuiltin,
+    };
+
+    const String common_description = R"DOCS_MD(
+The `Remote` and `RemoteSecure` table engines are the persistent counterparts of the [`remote` and `remoteSecure`](/reference/functions/table-functions/remote) table functions.
+They accept the same arguments and let you access remote servers without listing a cluster in the server configuration file: the engine builds a [`Distributed`](/reference/engines/table-engines/special/distributed)-like storage over an ad-hoc cluster created from the supplied addresses on the fly.
+
+Unlike the table functions, the addresses and credentials are stored in the table definition, so the password is hidden in `SHOW CREATE TABLE` and the engine is exposed as `Distributed` in `system.tables.engine`.
+
+The first argument `addresses_expr` is a remote server address or an expression that generates several addresses, in the form `host` or `host:port`.
+The `host` can be a server name or an IPv4/IPv6 address (an IPv6 address must be specified in `[]`).
+The address expression supports globbing patterns such as `{a,b,c}`, `{N..M}` and `{a|b}` to expand into multiple shards and replicas.
+If `db` and `table` are omitted, `system.one` is used.
+
+The remaining arguments are `user` (default: `default`), `password` (default: empty) and a `sharding_key` expression.
+
+The settings of the created storage, such as `skip_unavailable_shards`, are specified after the engine definition:
+`ENGINE = Remote('127.0.0.1', system, one) SETTINGS skip_unavailable_shards = 1`.
+Note that the `remote` and `remoteSecure` table functions accept the `SETTINGS` clause among their arguments instead,
+`remote('127.0.0.1', system.one, SETTINGS skip_unavailable_shards = 1)`, because a table function has nowhere else to put it;
+the engines do not accept that form.
+
+The target may also be a table function, e.g. `Remote('127.0.0.1', numbers(10))`. Such a table is read-only: there is no remote table to insert into, so `INSERT` is rejected with a `NOT_IMPLEMENTED` error.
+)DOCS_MD";
+
+    factory.registerStorage("Remote", [create](const StorageFactory::Arguments & args)
+    {
+        return create(args, /* secure = */ false);
+    }, features,
+    Documentation{
+        .description = common_description + R"DOCS_MD(
+`Remote` connects over the plain TCP port (`tcp_port`, `9000` by default) when the port is omitted.
+)DOCS_MD",
+        .syntax = "ENGINE = Remote(addresses_expr[, db, table, user[, password], sharding_key]) [SETTINGS name = value, ...]",
+        .related = {"Distributed"}});
+
+    factory.registerStorage("RemoteSecure", [create](const StorageFactory::Arguments & args)
+    {
+        return create(args, /* secure = */ true);
+    }, features,
+    Documentation{
+        .description = common_description + R"DOCS_MD(
+`RemoteSecure` connects over a secure TLS connection using the secure TCP port (`tcp_port_secure`, `9440` by default) when the port is omitted.
+)DOCS_MD",
+        .syntax = "ENGINE = RemoteSecure(addresses_expr[, db, table, user[, password], sharding_key]) [SETTINGS name = value, ...]",
+        .related = {"Distributed"}});
+}
+
 void registerStorageHybrid(StorageFactory & factory);
 void registerStorageHybrid(StorageFactory & factory)
 {
@@ -3932,66 +3898,16 @@ void registerStorageHybrid(StorageFactory & factory)
 
         return distributed_storage;
     },
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
     {
         .supports_settings = true,
         .supports_parallel_insert = true,
         .supports_schema_inference = true,
         .source_access_type = AccessTypeObjects::Source::REMOTE,
-<<<<<<< HEAD
-        .has_builtin_setting_fn = DistributedSettings::hasBuiltin,
-    };
-
-    const String common_description = R"DOCS_MD(
-The `Remote` and `RemoteSecure` table engines are the persistent counterparts of the [`remote` and `remoteSecure`](/reference/functions/table-functions/remote) table functions.
-They accept the same arguments and let you access remote servers without listing a cluster in the server configuration file: the engine builds a [`Distributed`](/reference/engines/table-engines/special/distributed)-like storage over an ad-hoc cluster created from the supplied addresses on the fly.
-
-Unlike the table functions, the addresses and credentials are stored in the table definition, so the password is hidden in `SHOW CREATE TABLE` and the engine is exposed as `Distributed` in `system.tables.engine`.
-
-The first argument `addresses_expr` is a remote server address or an expression that generates several addresses, in the form `host` or `host:port`.
-The `host` can be a server name or an IPv4/IPv6 address (an IPv6 address must be specified in `[]`).
-The address expression supports globbing patterns such as `{a,b,c}`, `{N..M}` and `{a|b}` to expand into multiple shards and replicas.
-If `db` and `table` are omitted, `system.one` is used.
-
-The remaining arguments are `user` (default: `default`), `password` (default: empty) and a `sharding_key` expression.
-
-The settings of the created storage, such as `skip_unavailable_shards`, are specified after the engine definition:
-`ENGINE = Remote('127.0.0.1', system, one) SETTINGS skip_unavailable_shards = 1`.
-Note that the `remote` and `remoteSecure` table functions accept the `SETTINGS` clause among their arguments instead,
-`remote('127.0.0.1', system.one, SETTINGS skip_unavailable_shards = 1)`, because a table function has nowhere else to put it;
-the engines do not accept that form.
-
-The target may also be a table function, e.g. `Remote('127.0.0.1', numbers(10))`. Such a table is read-only: there is no remote table to insert into, so `INSERT` is rejected with a `NOT_IMPLEMENTED` error.
-)DOCS_MD";
-
-    factory.registerStorage("Remote", [create](const StorageFactory::Arguments & args)
-    {
-        return create(args, /* secure = */ false);
-    }, features,
-    Documentation{
-        .description = common_description + R"DOCS_MD(
-`Remote` connects over the plain TCP port (`tcp_port`, `9000` by default) when the port is omitted.
-)DOCS_MD",
-        .syntax = "ENGINE = Remote(addresses_expr[, db, table, user[, password], sharding_key]) [SETTINGS name = value, ...]",
-        .related = {"Distributed"}});
-
-    factory.registerStorage("RemoteSecure", [create](const StorageFactory::Arguments & args)
-    {
-        return create(args, /* secure = */ true);
-    }, features,
-    Documentation{
-        .description = common_description + R"DOCS_MD(
-`RemoteSecure` connects over a secure TLS connection using the secure TCP port (`tcp_port_secure`, `9440` by default) when the port is omitted.
-)DOCS_MD",
-        .syntax = "ENGINE = RemoteSecure(addresses_expr[, db, table, user[, password], sharding_key]) [SETTINGS name = value, ...]",
-        .related = {"Distributed"}});
-=======
         .has_builtin_setting_fn = [](std::string_view name) -> bool
         {
             return name.starts_with(StorageDistributed::HYBRID_WATERMARK_PREFIX);
         },
     });
->>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 }
 
 bool StorageDistributed::initializeDiskOnConfigChange(const std::set<String> & new_added_disks)
