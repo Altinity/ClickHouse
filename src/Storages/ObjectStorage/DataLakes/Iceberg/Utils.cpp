@@ -45,12 +45,13 @@
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/sortBlock.h>
 #include <Poco/String.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
 #if USE_AVRO
 
 #include <Processors/Formats/Impl/AvroRowInputFormat.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <IO/ReadHelpers.h>
 #include <filesystem>
 #include <regex>
@@ -113,7 +114,6 @@ static constexpr size_t MAX_LIST_RETRIES = 5;
 
 namespace DB::Iceberg
 {
-
 using namespace DB;
 
 /// Best-effort heuristic based on ClickHouse naming conventions.
@@ -1649,3 +1649,29 @@ PartitionColumnValues getIdentityPartitionColumnValues(
 }
 
 #endif
+
+namespace DB
+{
+
+ObjectStoragePtr getResolvedStorageFromObjectInfo([[maybe_unused]] const ObjectInfoPtr & object_info, const ObjectStoragePtr & default_storage)
+{
+#if USE_AVRO
+    if (auto iceberg_info = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object_info))
+    {
+        if (auto resolved = iceberg_info->getResolvedStorage())
+            return resolved;
+    }
+#endif
+    return default_storage;
+}
+
+std::optional<String> getMetadataPathFromObjectInfo([[maybe_unused]] const ObjectInfoPtr & object_info)
+{
+#if USE_AVRO
+    if (auto iceberg_info = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object_info))
+        return iceberg_info->getMetadataPath();
+#endif
+    return std::nullopt;
+}
+
+}
